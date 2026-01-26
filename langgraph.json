@@ -1,0 +1,4 @@
+{
+  "graphs": { "anubis": "./anubis.py:graph" },
+  "http": { "app": "./anubis-api.py:app" }
+}

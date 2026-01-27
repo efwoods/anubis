@@ -26,3 +26,18 @@ document processsing (analyze, format, upload data to instruct the bot about its
 - attach the adapter once available
 
 
+# Capabilities
+- query reaction
+- document retrieval (vectorstore RAG)
+- web-search
+- saving memories (facts and using facts)
+- data analysis
+- data formatting
+- data uploading
+- fine-tuning
+- llm-as-a-judge (to evaluate responses for authenticity)
+- create avatars (assistants)
+- deep-research
+- self-improvement
+- media processing (9 pictures for inference)
+- media processing for avatar creation

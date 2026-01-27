@@ -3,3 +3,47 @@ langchain-together
 langgraph-sdk
 llama-api-client
 together
+langgraph-cli[inmem]
+pydantic
+openai 
+
+
+# fastapi
+fastapi
+uvicorn
+
+# Chroma
+chromadb
+
+debugpy
+
+# pydantic-settings
+# python-multipart
+
+# FastAPI and server
+
+# HTTP client
+# aiohttp
+# requests
+
+# Monitoring and logging
+# prometheus-client
+# structlog
+
+# Development and hot-reload support
+# watchfiles
+
+# Langchain
+langsmith
+langchain
+langchain-community
+langchain-unstructured
+langchain-huggingface>=0.0.1
+langchain-core>=0.1.0
+langchain-chroma
+langchain-openai
+
+# Firebase 
+# firebase_admin
+# google-cloud-firestore
+# google-cloud-storage

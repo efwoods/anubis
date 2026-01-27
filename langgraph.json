@@ -1,4 +1,5 @@
 {
-  "graphs": { "anubis": "./anubis.py:graph" },
-  "http": { "app": "./anubis-api.py:app" }
+  "dependencies": ["."],
+  "graphs": { "anubis": "./anubis.py:agent" },
+  "env": ".env"
 }

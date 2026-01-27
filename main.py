@@ -11,33 +11,12 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 
 from prompts.system_prompt import SYSTEM_PROMPT
 from classes.Objects import AvatarContext
+from classes.Anubis import Anubis
 
-if os.getenv("DEV") == 'TRUE':
-    from langchain_openai import ChatOpenAI
-    llm = ChatOpenAI(
-        model = os.getenv("MODEL"),
-        base_url = os.getenv("LLAMA_API_BASE_URL"),
-        temperature=0.1,
-        api_key = os.environ.get("LLAMA_API_KEY"),
-    )
-else: 
-    from langchain_together import ChatTogether
-    llm = ChatTogether(model=os.getenv("MODEL"), temperature=0.1)
+anubis = Anubis()
+app = anubis.get_agent()
 
-
-agent = create_agent(llm, tools=[])
-
-
-
-
-# def call_agent(state: MessagesState):
-#     """Node calls your agent"""
-#     result = agent.invoke({"messages": state["messages"]})
-#     return {"messages": result["messages"]}
-
-
-
-__all__ = ["agent"]
+__all__ = ["app"]
 
 
 
@@ -49,7 +28,7 @@ __all__ = ["agent"]
 
 
 
-
+ 
 
 
 # class State(TypedDict):

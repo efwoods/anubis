@@ -1,7 +1,7 @@
 import os
 from langchain.tools import tool
 from langchain.agents import create_agent
-from prompts.system_prompt import SYSTEM_PROMPT
+from src.prompts.system_prompt import SYSTEM_PROMPT
 
 class Anubis:
     def __init__(self):

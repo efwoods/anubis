@@ -17,6 +17,25 @@
         }
       ],
       "justMyCode": false
+    },
+    {
+      "name": "Debug Anubis Graph",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/agent/graph.py",
+      "console": "integratedTerminal",
+      "justMyCode": false, // Debug LangGraph internals
+      "args": ["--thread_id=debug-1"],
+      "env": {
+        "LANGSMITH_TRACING": "true"
+      }
+    },
+    {
+      "name": "Debug Graph Node",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "stopOnEntry": true
     }
   ]
 }

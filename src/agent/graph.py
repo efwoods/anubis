@@ -13,10 +13,19 @@ from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode
 from langchain.agents import create_agent
 
+from langgraph.types import interrupt
+from langchain_core.messages import HumanMessage
+
+
 from src.agent.context import Context
 from src.agent.state import InputState, State
 from src.agent.tools import TOOLS
 from src.agent.utils import init_model
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 model = init_model()
 
@@ -29,6 +38,14 @@ async def get_system_prompt(context: Context) -> str:
         # description=context.description or "",
         # facts="\n".join(context.facts) if context.facts else ""
     )
+
+async def human_node(state: State) -> dict:
+    prompt = {"pending_messages": state["messages"][-3], "step":state.get("is_last_step")}
+    # human_input = interrupt({"Human Message": state["text"]})
+    human_input = interrupt(prompt)
+    return {"messages": [HumanMessage(content=str(human_input), name="human")]}
+
+
 
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, List[AIMessage]]:
     """
@@ -115,35 +132,105 @@ def route_model_output(state: State) -> Literal["__end__", "tools"]:
             f"Expected AIMessage in output edges, but got {type(last_message).__name__}"
         )
     # if there is no tool call, complete the graph logic
-    if not last_message.tool_calls:
+    if not last_message.tool_calls or state.is_last_step:
+        logger.info(f"state.is_last_step: {state.is_last_step}")
+
         return "__end__"
     # Otherwise we execute the requested actions
     return "tools"
 
 
 
-def llm_call(state: State):
-    """LLM decides when to use a tool"""
+# Graph Definition
+# builder = StateGraph(State, input_schema=InputState, context_schema=Context)
 
-    return  {'messages': [
-        model.invoke([SystemMessage(content="You are a helpful assistant")] + state["messages"])
+# # entrypoint
 
-    ], 
-    }
+# # Define the two nodes we will cycle between
+# builder.add_node(call_model)
+# builder.add_node("tools", ToolNode(TOOLS))
+
+# # Entrypoint is human_node
+# # builder.add_edge("__start__", "human_node")
+# # builder.add_edge("human_node", "call_model")
+
+# builder.add_edge("__start__", call_model)
+# # determine tool use based upon the state
+# builder.add_conditional_edges("call_model", route_model_output)
+# # Normal edge from tools to call model
+# builder.add_edge("tools", "call_model")
+
+
+# builder.add_edge(call_model, "__end__")
+
+# graph = builder.compile(name="Anubis")
 
 # Graph Definition
-builder = StateGraph(State, input_schema=InputState, context_schema=Context)
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+from typing import Annotated, List, Literal, TypedDict
+import operator
+from langgraph.checkpoint.memory import MemorySaver
 
-# Define the two nodes we will cycle between
-builder.add_node(call_model)
-builder.add_node("tools", ToolNode(TOOLS))
 
-# Entrypoint is call_model
-builder.add_edge("__start__", "call_model")
+class State(TypedDict):
+    nlist: Annotated[List[str], operator.add]
 
-builder.add_conditional_edges("call_model", route_model_output)
+def node_a(state:State):
+    message = "message in node_a"
+    state['nlist'].append(message)
+    logger.info(f"Adding 'A' to {state['nlist']}")
+    return(State(nlist = ["A"]))
 
-# Normal edge from tools to call model
-builder.add_edge("tools", "call_model")
+def node_b(state: State) -> State:
+    print(f"Adding 'B' to {state['nlist']}")
+    return (State(nlist=["B"]))
 
-graph = builder.compile(name="Anubis")
+def node_c(state: State) -> State:
+    print(f"Adding 'C' to {state['nlist']}")
+    return (State(nlist=["C"]))
+
+def node_bb(state: State) -> State:
+    print(f"Adding 'BB' to {state['nlist']}")
+    return (State(nlist=["BB"]))
+
+def node_cc(state: State) -> State:
+    print(f"Adding 'CC' to {state['nlist']}")
+    return (State(nlist=["CC"]))
+
+
+def node_d(state: State) -> State:
+    print(f"Adding 'D' to {state['nlist']}")
+    return (State(nlist=["D"]))
+
+
+
+
+
+builder = StateGraph(State)
+# builder.add_node("a", node_a)
+# builder.add_node("z", node_b)
+# builder.add_node("c", node_c)
+# builder.add_node("d", node_d)
+# builder.add_node("bb", node_bb)
+# builder.add_node("cc", node_cc)
+
+# builder.add_edge(START, "a")
+# builder.add_edge("a", "z")
+# builder.add_edge("a", "c")
+# builder.add_edge("z", "bb")
+# builder.add_edge("bb", "d")
+# builder.add_edge("c", "cc")
+# builder.add_edge("cc", "d")
+# builder.add_edge("d", END)
+
+graph = builder.compile()
+
+initial_state = State(nlist=["Initial String"])
+# why is this never called
+result = graph.invoke(initial_state, )
+logger.info(f"XXXXXXXXXXXXXXXXXXXXXXXX RESULT: {result}")
+
+# result2 = graph.invoke(None, config)
+
+# logger.info(f"XXXXXXXXXXXXXXXXXXXXXXXX RESULT: {result2}")

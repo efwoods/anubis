@@ -1,7 +1,7 @@
 from typing import Any, Callable, List, Optional, cast
 from langchain_tavily import TavilySearch
 from langgraph.runtime import get_runtime
-from src.agent.context import Context
+from src.anubis.utils.context import Context
 from langchain.tools import tool, ToolRuntime
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.documents import Document
@@ -34,7 +34,6 @@ vectorstore = InMemoryVectorStore.from_documents(
     documents=[], embedding=HuggingFaceEmbeddings()
 )
 retriever = vectorstore.as_retriever()
-
 
 
 # retriever tool

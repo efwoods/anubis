@@ -1,5 +1,5 @@
 import os
-from src.agent.tools import TOOLS
+from src.anubis.utils.tools import TOOLS
 
 
 def init_model():

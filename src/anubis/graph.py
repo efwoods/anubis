@@ -1,7 +1,6 @@
-
-"""LangGraph single-node graph template.
-
-Returns a predefined response. Replace logic and configuration as needed.
+"""
+src/anubis/graph.py
+Super-Graph with a central Langchain Agent and subgraph tool use.
 """
 
 from datetime import UTC, datetime
@@ -16,18 +15,17 @@ from langchain.agents import create_agent
 from langgraph.types import interrupt
 from langchain_core.messages import HumanMessage
 
-
-from src.agent.context import Context
-from src.agent.state import InputState, State
-from src.agent.tools import TOOLS
-from src.agent.utils import init_model
+from src.anubis.utils.context import Context
+from src.anubis.utils.state import InputState, State
+from src.anubis.utils.tools import TOOLS
+from src.anubis.utils.utilities import init_model
 from dataclasses import dataclass
+
+from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
 
 import logging
 
 logger = logging.getLogger(__name__)
-
-model = init_model()
 
 async def get_system_prompt(context: Context) -> str:
     """Async system prompt formatter."""
@@ -44,8 +42,6 @@ async def human_node(state: State) -> dict:
     # human_input = interrupt({"Human Message": state["text"]})
     human_input = interrupt(prompt)
     return {"messages": [HumanMessage(content=str(human_input), name="human")]}
-
-
 
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, List[AIMessage]]:
     """
@@ -298,33 +294,14 @@ from typing import Literal
 
 # graph = create_agent(model = model, tools = [])
 
+from langgraph.graph import StateGraph
+from src.anubis.utils.state import AgentState
 
-
-
-from typing import Annotated, TypedDict
-from langchain_core.messages import AnyMessage
-from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from langgraph.graph.message import add_messages # Built-in reducer
+from src.anubis.utils.nodes import agent_node, continue_tool_use_conditional
 
 tools = []
-model = init_model()
-
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages] # enables append/update
-
-def agent_node(state: AgentState):
-    """LLM responds or chooses to use tools"""
-    logging.info(state["messages"][-1])
-    return {"messages": [model.invoke(state["messages"])]}
-
-# Conditional edge tools if tool_calls, else end the loop
-def continue_tool_use_conditional(state: AgentState):
-    last_msg = state["messages"][-1]
-    if last_msg.tool_calls:
-        return "tools"
-    return END
 
 # Build graph
 workflow = StateGraph(state_schema=AgentState)
@@ -340,3 +317,4 @@ workflow.set_entry_point("agent")
 workflow.add_conditional_edges("agent", continue_tool_use_conditional)
 workflow.add_edge("tools", "agent")
 graph = workflow.compile()
+# graph.name = "Anubis"

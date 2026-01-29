@@ -21,7 +21,7 @@ from src.agent.context import Context
 from src.agent.state import InputState, State
 from src.agent.tools import TOOLS
 from src.agent.utils import init_model
-
+from dataclasses import dataclass
 
 import logging
 
@@ -140,7 +140,7 @@ def route_model_output(state: State) -> Literal["__end__", "tools"]:
     return "tools"
 
 
-
+# Nodes
 # Graph Definition
 # builder = StateGraph(State, input_schema=InputState, context_schema=Context)
 
@@ -165,6 +165,8 @@ def route_model_output(state: State) -> Literal["__end__", "tools"]:
 
 # graph = builder.compile(name="Anubis")
 
+
+# Edges
 # Graph Definition
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -176,11 +178,20 @@ from langgraph.checkpoint.memory import MemorySaver
 class State(TypedDict):
     nlist: Annotated[List[str], operator.add]
 
-def node_a(state:State):
-    message = "message in node_a"
-    state['nlist'].append(message)
-    logger.info(f"Adding 'A' to {state['nlist']}")
-    return(State(nlist = ["A"]))
+def node_a(state:State) -> Literal["b", "c", END]:
+    select = state["nlist"][-1]
+    if select == "b":
+        next_node = "b"
+    elif select == "c":
+        next_node = "c"
+    else:
+        next_node = END
+    
+    return Command(update = State(nlist = [select], goto = next_node))
+    # message = "message in node_a"
+    # state['nlist'].append(message)
+    # logger.info(f"Adding 'A' to {state['nlist']}")
+    # return(State(nlist = ["A"]))
 
 def node_b(state: State) -> State:
     print(f"Adding 'B' to {state['nlist']}")
@@ -204,12 +215,8 @@ def node_d(state: State) -> State:
     return (State(nlist=["D"]))
 
 
-
-
-
-builder = StateGraph(State)
 # builder.add_node("a", node_a)
-# builder.add_node("z", node_b)
+# builder.add_node("b", node_b)
 # builder.add_node("c", node_c)
 # builder.add_node("d", node_d)
 # builder.add_node("bb", node_bb)
@@ -218,19 +225,74 @@ builder = StateGraph(State)
 # builder.add_edge(START, "a")
 # builder.add_edge("a", "z")
 # builder.add_edge("a", "c")
-# builder.add_edge("z", "bb")
+# builder.add_edge("b", "bb")
 # builder.add_edge("bb", "d")
 # builder.add_edge("c", "cc")
 # builder.add_edge("cc", "d")
 # builder.add_edge("d", END)
 
-graph = builder.compile()
+# graph = builder.compile()
 
-initial_state = State(nlist=["Initial String"])
+# initial_state = State(nlist=["Initial String"])
 # why is this never called
-result = graph.invoke(initial_state, )
-logger.info(f"XXXXXXXXXXXXXXXXXXXXXXXX RESULT: {result}")
+# result = graph.invoke(initial_state, )
+# logger.info(f"XXXXXXXXXXXXXXXXXXXXXXXX RESULT: {result}")
 
 # result2 = graph.invoke(None, config)
-
+# builder.add_edge("a", END)
 # logger.info(f"XXXXXXXXXXXXXXXXXXXXXXXX RESULT: {result2}")
+
+
+# CONDITIONAL EDGES
+from langgraph.graph import END
+from typing import Literal
+
+# def conditional_edge(state: State) -> Literal["b", "c", END]:
+#     select = state["nlist"][-1]
+#     if select == "b":
+#         return "b"
+#     elif select == "c":
+#         return "c"
+#     else:
+#         return END
+    
+
+# builder = StateGraph(State)
+
+# builder.add_node("a", node_a)
+# builder.add_node("b", node_b)
+# builder.add_node("c", node_c)
+
+# # Add edges
+# builder.add_edge(START, "a")
+# builder.add_edge("b", END)
+# builder.add_edge("c", END)
+
+
+# # builder.add_conditional_edges("a", conditional_edge)
+
+
+# graph = builder.compile()
+
+# while True:
+#     user = input('test input please')
+#     print(user)
+
+#     input_state = State(
+#         nlist = [user]
+#     )
+
+#     result = graph.invoke(input_state)
+#     print(result)
+#     if result['nlist'][-1] == 'q':
+#         print('quit')
+#         break
+
+user_id = "test_user"
+
+
+@dataclass
+class Context:
+    user_id: str
+
+graph = create_agent(model = model, tools = [])

@@ -299,18 +299,20 @@ from typing import Literal
 # graph = create_agent(model = model, tools = [])
 
 
+
+
 from typing import Annotated, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from langgraph.graph.message import add_messages
+from langgraph.graph.message import add_messages # Built-in reducer
 
 tools = []
 model = init_model()
 
 class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
+    messages: Annotated[list[AnyMessage], add_messages] # enables append/update
 
 def agent_node(state: AgentState):
     """LLM responds or chooses to use tools"""

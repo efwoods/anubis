@@ -2,7 +2,7 @@
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": ["."],
   "graphs": {
-    "agent": "./src/anubis/graph.py:graph"
+    "Anubis": "./src/anubis/graph.py:graph"
   },
   "env": ".env.dev"
 }

@@ -1,4 +1,4 @@
-# src/agent/context.py
+# src/anubis/context.py
 
 from __future__ import annotations
 

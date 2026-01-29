@@ -22,7 +22,7 @@
       "name": "Debug Anubis Graph",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/src/agent/graph.py",
+      "program": "${workspaceFolder}/src/anubis/graph.py",
       "console": "integratedTerminal",
       "justMyCode": false, // Debug LangGraph internals
       "args": ["--thread_id=debug-1"],

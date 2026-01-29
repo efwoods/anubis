@@ -24,8 +24,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["langgraph.templates.agent", "agent"]
 [tool.setuptools.package-dir]
-"langgraph.templates.agent" = "src/agent"
-"agent" = "src/agent"
+"langgraph.templates.agent" = "src/anubis"
+"agent" = "src/anubis"
 
 
 [tool.setuptools.package-data]

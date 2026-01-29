@@ -45,10 +45,6 @@ def vectorstore_retrieval_tool(query: str) -> str:
 
 TOOLS: List[Callable[..., Any]] = [search, vectorstore_retrieval_tool]
 
-
-
-
-
 # # Upload to vectorstore tool
 # def upload_to_vectorstore(runtime: ToolRuntime) -> str:
 #     """Upload media attachments to vectorstore when indicated that the media is about or contains the avatar.

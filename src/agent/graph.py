@@ -288,11 +288,52 @@ from typing import Literal
 #         print('quit')
 #         break
 
-user_id = "test_user"
+# agent level use case
+# user_id = "test_user"
 
 
-@dataclass
-class Context:
-    user_id: str
+# @dataclass
+# class Context:
+#     user_id: str
 
-graph = create_agent(model = model, tools = [])
+# graph = create_agent(model = model, tools = [])
+
+
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph import END, StateGraph
+from langgraph.prebuilt import ToolNode
+
+from langgraph.graph.message import add_messages
+
+tools = []
+model = init_model()
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def agent_node(state: AgentState):
+    """LLM responds or chooses to use tools"""
+    return {"messages": [model.invoke(state["messages"])]}
+
+# Conditional edge tools if tool_calls, else end the loop
+def continue_tool_use_conditional(state: AgentState):
+    last_msg = state["messages"][-1]
+    if last_msg.tool_calls:
+        return "tools"
+    return END
+
+# Build graph
+workflow = StateGraph(state_schema=AgentState)
+
+# Define Nodes
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", ToolNode(tools)) # tool use is parallel
+
+# Entrypoint of graph
+workflow.set_entry_point("agent")
+
+# Edge Definitions
+workflow.add_conditional_edges("agent", continue_tool_use_conditional)
+workflow.add_edge("tools", "agent")
+graph = workflow.compile()

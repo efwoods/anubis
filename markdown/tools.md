@@ -96,3 +96,11 @@ I need a tool to convert audio to text, to convert video to audio, a tool to col
 - [ ] **Virtual reality experiences of world models**
 
 --- increased realism, time travel, experiential travel ---
+
+## Self-improvement (creator-creation models, self-improvement of the graph and capabilities without developer involvement)
+- [ ] **tool to create tools**
+- [ ] **tool to create graphs**
+- [ ] **tool to identify and create chain-of-thought-reasoning based on data**
+
+--- autonomous updates, continuously better over time... ---
+

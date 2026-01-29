@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Optional, cast
+from typing import Any, Callable, List, Optional, cast, Dict
 from langchain_tavily import TavilySearch
 from langgraph.runtime import get_runtime
 from src.anubis.utils.context import Context
@@ -36,6 +36,10 @@ vectorstore = InMemoryVectorStore.from_documents(
 retriever = vectorstore.as_retriever()
 
 
+
+
+
+
 # retriever tool
 @tool
 def vectorstore_retrieval_tool(query: str) -> str:
@@ -43,7 +47,6 @@ def vectorstore_retrieval_tool(query: str) -> str:
     docs = retriever.invoke(query)
     return "\n\n".join([doc.page_content for doc in docs])
 
-TOOLS: List[Callable[..., Any]] = [search, vectorstore_retrieval_tool]
 
 # # Upload to vectorstore tool
 # def upload_to_vectorstore(runtime: ToolRuntime) -> str:
@@ -57,18 +60,58 @@ TOOLS: List[Callable[..., Any]] = [search, vectorstore_retrieval_tool]
 #     for attach in attachments:
 #         if isinstance(attach, str): 
 #             content = attach.read() if hasattr(attach, 'read') else attach.decode() if isinstance(attach, bytes) else attach
+@tool
+def health_check(runtime: ToolRuntime[Context]) -> Dict[str, str]:
+    """ Agent chooses to use a tool as a health check for the ability to use tools. """
 
 
-
-
-
-
-
-
-
-
-
-
+@tool
+def get_chat_metadata(runtime: ToolRuntime[Context]) -> Dict[str, str]:
+    """Get current chat metadata: IDs, names, media details. Use when needing session/file info."""
+    
+    # Thread/session ID from config (Studio uses threads)
+    thread_id = runtime.config["configurable"].get("thread_id", "no-thread")
+    
+    # User/Human & Assistant names from recent messages or store
+    messages = runtime.state["messages"][-5:]  # Last 5 for context
+    human_name = "Human"  # Default
+    assistant_name = "Assistant"  # Default
+    
+    for msg in reversed(messages):
+        if msg.type == "human" and "name" in getattr(msg, "response_metadata", {}):
+            human_name = msg.response_metadata["name"]
+            break
+        elif msg.type == "ai" and "name" in getattr(msg, "response_metadata", {}):
+            assistant_name = msg.response_metadata["name"]
+            break
+    
+    # User/assistant IDs from context/config or store
+    user_id = runtime.context.user_id or "studio_user"
+    assistant_id = runtime.config["configurable"].get("assistant_id", "studio_assistant")
+    
+    # Latest media from HumanMessage (adapt to your format)
+    media_msg = next((m for m in reversed(messages) if isinstance(m, HumanMessage) and has_media(m)), None)
+    if media_msg:
+        mime_type = media_msg.additional_kwargs.get("mime_type", "unknown")
+        filename = media_msg.additional_kwargs.get("filename", "unnamed")
+    else:
+        mime_type = filename = "no_media"
+    
+    # Optional: Names from store (if you save them)
+    if runtime.store:
+        user_info = runtime.store.get(("users",), user_id)
+        if user_info:
+            human_name = user_info.value.get("name", human_name)
+    
+    return {
+        "user_id": user_id,
+        "assistant_id": assistant_id,
+        "thread_id": thread_id,
+        "human_name": human_name,
+        "assistant_name": assistant_name,
+        "mime_type": mime_type,
+        "filename": filename
+    }
 
 
 

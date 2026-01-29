@@ -316,6 +316,7 @@ class AgentState(TypedDict):
 
 def agent_node(state: AgentState):
     """LLM responds or chooses to use tools"""
+    logging.info(state["messages"][-1])
     return {"messages": [model.invoke(state["messages"])]}
 
 # Conditional edge tools if tool_calls, else end the loop

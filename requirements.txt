@@ -49,3 +49,4 @@ langchain-tavily
 beautifulsoup4
 huggingface-hub>=0.24.0
 sentence-transformers
+langchain-mongodb

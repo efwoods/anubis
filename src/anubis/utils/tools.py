@@ -1,32 +1,10 @@
 from typing import Any, Callable, List, Optional, cast
-
 from langchain_tavily import TavilySearch
 from langgraph.runtime import get_runtime
-
-from src.agent.context import Context
-
-from langchain.tools import tool
-
+from src.anubis.utils.context import Context
+from langchain.tools import tool, ToolRuntime
 from langchain_community.document_loaders import WebBaseLoader
-
-# Testing loading documents for RAG retrieval
-urls = [
-    "https://grokipedia.com/page/Shivon_Zilis",
-]
-
-docs = [WebBaseLoader(url).load() for url in urls]
-
-docs[0][0].page_content.strip()[:1000]
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-docs_list = [item for sublist in docs for item in sublist]
-
-text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder( chunk_size=100, chunk_overlap=50)
-
-doc_splits = text_splitter.split_documents(docs_list)
-
-
+from langchain_core.documents import Document
 
 
 async def search(query: str) ->  Optional[dict[str, Any]]:
@@ -44,21 +22,19 @@ async def search(query: str) ->  Optional[dict[str, Any]]:
 
 
 
-
-# Memory
-from langchain_core.vectorstores import InMemoryVectorStore
-# from langchain_openai import OpenAIEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=100, chunk_overlap=50)
 embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
-
-
 vectorstore = InMemoryVectorStore.from_documents(
-    documents=doc_splits, embedding=HuggingFaceEmbeddings()
+    documents=[], embedding=HuggingFaceEmbeddings()
 )
-
 retriever = vectorstore.as_retriever()
+
 
 # retriever tool
 @tool
@@ -67,6 +43,45 @@ def vectorstore_retrieval_tool(query: str) -> str:
     docs = retriever.invoke(query)
     return "\n\n".join([doc.page_content for doc in docs])
 
-
 TOOLS: List[Callable[..., Any]] = [search, vectorstore_retrieval_tool]
+
+
+
+
+
+# # Upload to vectorstore tool
+# def upload_to_vectorstore(runtime: ToolRuntime) -> str:
+#     """Upload media attachments to vectorstore when indicated that the media is about or contains the avatar.
+#     """
+#     attachments = runtime.state.get("attachments", [])
+#     if not attachments:
+#         return "No attachmets found in state['attachments]'. Pass file paths or bytes."
+    
+#     docs: List[Document] = []
+#     for attach in attachments:
+#         if isinstance(attach, str): 
+#             content = attach.read() if hasattr(attach, 'read') else attach.decode() if isinstance(attach, bytes) else attach
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

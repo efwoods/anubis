@@ -1,6 +1,6 @@
 import os
 from fastapi import FastAPI, UploadFile
-from src.agent.graph import graph
+from src.anubis.graph import graph
 
 from fastapi import FastAPI
 

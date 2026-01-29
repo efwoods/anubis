@@ -15,7 +15,6 @@
 - media processing (9 pictures for inference)
 - media processing for avatar creation
 
-
 # Interface
 who am I currently talking to?
 show only conversations for the current avatar

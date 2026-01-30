@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 from langgraph.graph import StateGraph, START, END
 
-from src.subgraphs.agent import graph as agent_graph
+from src.subgraphs.agent import agent_graph
 
 from src.anubis.utils.state import AnubisState
 
@@ -18,7 +18,6 @@ workflow = StateGraph(state_schema=AnubisState)
 
 # Define Nodes
 workflow.add_node("agent", agent_graph)
-
 
 # Entrypoint of graph
 # workflow.set_entry_point("agent") # agent starts immediately

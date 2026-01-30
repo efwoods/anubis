@@ -16,10 +16,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
-from src.retrieval_graph import retrieval
-from src.retrieval_graph.configuration import Configuration
-from src.retrieval_graph.state import InputState, State
-from src.retrieval_graph.utils import format_docs, get_message_text, load_chat_model
+from src.subgraphs.vector_store_graph import retrieval
+from src.subgraphs.vector_store_graph.utils.configuration import Configuration
+from src.subgraphs.vector_store_graph.utils.state import InputState, State
+from src.subgraphs.vector_store_graph.utils import format_docs, get_message_text, load_chat_model
 
 import logging
 logger = logging.getLogger(__name__)
@@ -165,8 +165,8 @@ builder.add_edge("retrieve", "respond")
 
 # Finally, we compile it!
 # This compiles it into a graph you can invoke and deploy.
-graph = builder.compile(
+retrieval_graph = builder.compile(
     interrupt_before=[],  # if you want to update the state before calling the tools
     interrupt_after=[],
 )
-graph.name = "RetrievalGraph"
+retrieval_graph.name = "RetrievalGraph"

@@ -6,9 +6,9 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 
-from src.retrieval_graph import retrieval
-from src.retrieval_graph.configuration import IndexConfiguration
-from src.retrieval_graph.state import IndexState
+from src.subgraphs.vector_store_graph import retrieval
+from src.subgraphs.vector_store_graph.utils.configuration import IndexConfiguration
+from src.subgraphs.vector_store_graph.utils.state import IndexState
 
 
 def ensure_docs_have_user_id(
@@ -54,7 +54,6 @@ async def index_docs(
 
 
 # Define a new graph
-
 
 builder = StateGraph(IndexState, context_schema=IndexConfiguration)
 builder.add_node(index_docs)

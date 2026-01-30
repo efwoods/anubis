@@ -14,7 +14,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
 from langchain_core.vectorstores import VectorStoreRetriever
 
-from src.retrieval_graph.configuration import Configuration, IndexConfiguration
+from src.subgraphs.vector_store_graph.utils.configuration import Configuration, IndexConfiguration
 
 ## Encoder constructors
 

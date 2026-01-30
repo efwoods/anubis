@@ -3,6 +3,6 @@
 This module defines a custom graph.
 """
 
-from src.subgraphs.agent.graph import graph
+from src.subgraphs.agent.graph import agent_graph
 
-__all__ = ["graph"]
+__all__ = ["agent_graph"]

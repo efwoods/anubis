@@ -1,12 +1,13 @@
 from typing import Any, Callable, List, Optional, cast, Dict
 from langchain_tavily import TavilySearch
-from langgraph.runtime import get_runtime
+# from src.anubis.utils.state import AnubisState
 from src.subgraphs.agent.utils.context import Context
 from langchain.tools import tool, ToolRuntime
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.documents import Document
 from langchain.messages import AIMessage, SystemMessage, HumanMessage
 
+from langgraph.runtime import get_runtime
 
 async def search(query: str) ->  Optional[dict[str, Any]]:
     """Basic websearch
@@ -21,11 +22,11 @@ async def search(query: str) ->  Optional[dict[str, Any]]:
     wrapped = TavilySearch(max_results=runtime.context.max_search_results)
     return cast(dict[str, Any], await wrapped.ainvoke({"query": query}))
 
-
-
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# from src.subgraphs.vector_store_graph.index_graph import index_graph 
 
 text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=100, chunk_overlap=50)
 embeddings = HuggingFaceEmbeddings(
@@ -36,18 +37,12 @@ vectorstore = InMemoryVectorStore.from_documents(
 )
 retriever = vectorstore.as_retriever()
 
-
-
-
-
-
 # retriever tool
 @tool
 def vectorstore_retrieval_tool(query: str) -> str:
     """ Search and return information. """
     docs = retriever.invoke(query)
     return "\n\n".join([doc.page_content for doc in docs])
-
 
 # # Upload to vectorstore tool
 # def upload_to_vectorstore(runtime: ToolRuntime) -> str:
@@ -122,14 +117,17 @@ def get_chat_metadata(runtime: ToolRuntime[Context]) -> Dict[str, str]:
         "filename": filename
     }
 
+import logging
+logger = logging.getLogger(__name__)
 
+@tool
+def add_to_vectorstore(runtime: ToolRuntime[Context])-> AIMessage:
+    """ TOOL CALL USE CASE, INPUTS, AND RETURN VALUE"""
+    from src.subgraphs.vector_store_graph.index_graph import index_graph
+    logger.info('ADD_TO_VECTORESTORE TOOL CALLED XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
+    
+    result = index_graph.invoke(runtime.state, runtime.config)
 
-
-
-
-
-
-
-
-
-
+    # Return results of subgraph
+    return AIMessage(content=result['messages'][-1].content)
+    

@@ -27,7 +27,7 @@ For detailed configuration options and usage instructions, refer to the Configur
 and individual component documentation within the retrieval_graph package.
 """  # noqa
 
-from src.retrieval_graph.graph import graph
-from src.retrieval_graph.index_graph import index_graph
+from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
+from src.subgraphs.vector_store_graph.index_graph import index_graph
 
-__all__ = ["graph", "index_graph"]
+__all__ = ["retrieval_graph", "index_graph"]

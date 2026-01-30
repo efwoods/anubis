@@ -1,4 +1,7 @@
 import os
+from src.subgraphs.agent.utils.tools import search, health_check, get_chat_metadata
+
+tools = [health_check,get_chat_metadata]
 
 def init_model():
     # if os.getenv("DEV") == 'TRUE':
@@ -8,7 +11,7 @@ def init_model():
                 base_url = os.getenv("LLAMA_API_BASE_URL"),
                 temperature=0.1,
                 api_key = os.environ.get("LLAMA_API_KEY"),
-            )
+            ).bind_tools(tools=tools)
     # else: 
     #     from langchain_together import ChatTogether
     #     model = ChatTogether(model=os.getenv("MODEL"), temperature=0.1)

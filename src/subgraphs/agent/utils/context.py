@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, fields
 
-from src.anubis.utils import prompts
+from src.subgraphs.agent.utils import prompts
 
 @dataclass(kw_only=True)
 class Context:

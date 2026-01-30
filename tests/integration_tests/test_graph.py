@@ -1,6 +1,6 @@
 import pytest
 
-from src.anubis.graph import graph
+from src.subgraphs.agent.graph import graph
 
 pytestmark = pytest.mark.anyio
 

@@ -1,6 +1,6 @@
 from langgraph.pregel import Pregel
 
-from src.anubis.graph import graph
+from src.subgraphs.agent.graph import graph
 
 
 def test_placeholder() -> None:

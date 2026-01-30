@@ -3,6 +3,6 @@
 This module defines a custom graph.
 """
 
-from src.anubis.graph import graph
+from src.subgraphs.agent.graph import graph
 
 __all__ = ["graph"]

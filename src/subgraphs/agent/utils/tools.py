@@ -1,10 +1,11 @@
 from typing import Any, Callable, List, Optional, cast, Dict
 from langchain_tavily import TavilySearch
 from langgraph.runtime import get_runtime
-from src.anubis.utils.context import Context
+from src.subgraphs.agent.utils.context import Context
 from langchain.tools import tool, ToolRuntime
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.documents import Document
+from langchain.messages import AIMessage, SystemMessage, HumanMessage
 
 
 async def search(query: str) ->  Optional[dict[str, Any]]:
@@ -61,8 +62,16 @@ def vectorstore_retrieval_tool(query: str) -> str:
 #         if isinstance(attach, str): 
 #             content = attach.read() if hasattr(attach, 'read') else attach.decode() if isinstance(attach, bytes) else attach
 @tool
-def health_check(runtime: ToolRuntime[Context]) -> Dict[str, str]:
-    """ Agent chooses to use a tool as a health check for the ability to use tools. """
+def health_check(runtime: ToolRuntime[Context]) -> AIMessage:
+    """Tool is called when the human requests to test tool use.
+
+    Args:
+        runtime (ToolRuntime[Context]): ToolRuntime
+
+    Returns:
+        AIMessage: success message
+    """
+    return AIMessage(content="success")
 
 
 @tool

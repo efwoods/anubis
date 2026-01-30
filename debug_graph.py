@@ -1,6 +1,6 @@
 import asyncio
 from langchain_core.messages import HumanMessage
-from src.anubis.graph import graph
+from src.subgraphs.agent.graph import graph
 
 async def main():
     config = {"configurable": {"thread_id": "vscode-debug"}}

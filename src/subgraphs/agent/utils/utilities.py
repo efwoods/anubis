@@ -123,8 +123,6 @@ async def _load_image(
             logger.info(f"Error in _load_image: {e}")
             raise e
         
-
-
 async def _load_text(
     file: Union[UploadFile, str, Path], metadata: Dict
 ) -> Document:
@@ -234,6 +232,7 @@ def _load_video(
     #     }
     # )
     pass
+
 # metadata: Optional[Dict]
 async def extract_personality_from_image(
     image_source: Union[str, Path, UploadFile, bytes]
@@ -355,9 +354,9 @@ async def process_media(
         logger.info(f"filename: {filename}")
 
         # Text files
-        if content_type.startswith("text/") or filename.endswith(".txt"):
-            logger.warning(f'load text not yet implemented')
-            # result = await _load_text(file, metadata)
+        if content_type == "text" or filename.endswith(".txt"):
+            logger.info(f"working on loading text documents")
+            result = await _load_text(file)
             return None
         # Image files
         elif content_type == "image" or any(

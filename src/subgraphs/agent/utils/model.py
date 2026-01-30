@@ -1,7 +1,7 @@
 import os
-from src.subgraphs.agent.utils.tools import search, health_check, add_to_vectorstore
+from src.subgraphs.agent.utils.tools import search, health_check, add_to_vectorstore, retrieve_from_vectorstore
 
-tools = [search, health_check, add_to_vectorstore]
+tools = [search, health_check, add_to_vectorstore, retrieve_from_vectorstore]
 
 def init_model():
     # if os.getenv("DEV") == 'TRUE':

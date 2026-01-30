@@ -18,13 +18,15 @@ from src.subgraphs.agent.utils.nodes import model_node, continue_tool_use_condit
 from src.subgraphs.agent.utils.tools import (
     search, 
     health_check, 
-    add_to_vectorstore
+    add_to_vectorstore, 
+    retrieve_from_vectorstore
 )
 
 tools = [
     search, 
     health_check, 
-    add_to_vectorstore
+    add_to_vectorstore, 
+    retrieve_from_vectorstore
 ]
 
 # Build graph

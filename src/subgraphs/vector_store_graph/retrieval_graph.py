@@ -19,7 +19,8 @@ from pydantic import BaseModel
 from src.subgraphs.vector_store_graph.utils import retrieval
 from src.subgraphs.vector_store_graph.utils.configuration import Configuration
 from src.subgraphs.vector_store_graph.utils.state import InputState, State
-from src.subgraphs.vector_store_graph.utils import format_docs, get_message_text, load_chat_model
+from src.anubis.utils.state import AnubisState
+from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
 
 import logging
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ async def generate_query(
         - For subsequent messages, it uses a language model to generate a refined query.
         - The function uses the configuration to set up the prompt and model for query generation.
     """
+    logging.info(f"XXXXX GENERATE QUERY NODE XXXX")
     messages = state.messages
     if len(messages) == 1:
         # It's the first user question. We will use the input directly to search.
@@ -103,6 +105,8 @@ async def retrieve(
         dict[str, list[Document]]: A dictionary with a single key "retrieved_docs"
         containing a list of retrieved Document objects.
     """
+    logging.info(f"XXXXX RETRIEVE NODE XXXX")
+
     with retrieval.make_retriever(config) as retriever:
         # logger.info(f"XXXXXXXXXXXXXXXXXX CONFIGURATION: {config}")
         
@@ -127,6 +131,7 @@ async def respond(
     state: State, *, config: RunnableConfig
 ) -> dict[str, list[BaseMessage]]:
     """Call the LLM powering our "agent"."""
+    logging.info(f"XXXXX REPONSE NODE XXXX")
     configuration = Configuration.from_runnable_config(config)
     # Feel free to customize the prompt, model, and other logic!
     prompt = ChatPromptTemplate.from_messages(
@@ -152,7 +157,7 @@ async def respond(
 
 
 # Define a new graph (It's just a pipe)
-builder = StateGraph(State, input_schema=InputState, context_schema=Configuration)
+builder = StateGraph(State, input_schema=AnubisState, context_schema=Configuration)
 
 builder.add_node(generate_query)  # type: ignore[arg-type]
 builder.add_node(retrieve)  # type: ignore[arg-type]

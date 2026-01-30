@@ -181,11 +181,28 @@ async def add_to_vectorstore(runtime: ToolRuntime[Context])-> AIMessage:
     index_input = {"docs": recent_docs}
     logger.info(f"index_input XXXXXXXXXXXXXXXXXXXXXXXXX {index_input}")
     
-    result = await index_graph.ainvoke(index_input,  {"configurable": {"user_id": "test_user_1234"}})
+    result = await index_graph.ainvoke(index_input, {"configurable": {"user_id": "test_user_1234"}}) # user id is bypassed for testing
 
     # logger.info(f"RESULT XXXXXXXXXXXXXXXXXXXXXXXXX {result}")
     # # Return results of subgraph
     # ai_content = result.get('messages', [-1]).content if result.get('messages') else "Indexed successfully"
     return AIMessage(content="added to vectorstore successfully")
     
+
+@tool
+async def retrieve_from_vectorstore(runtime: ToolRuntime[Context]) -> AIMessage:
+    """Generates the correct query to search the vectorstore for relevant documents to the Human query.
+
+    Args:
+        runtime (ToolRuntime[Context]): tool runtime context
+
+    Returns:
+        AIMessage: _description_
+    """
+    from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
+    # messages = runtime.state['messages']
+    response = await retrieval_graph.ainvoke(runtime.state, {"configurable": {"user_id": "test_user_1234"}})
+    logger.info(f"RETRIEVAL RESPONSE: {response}")
+    ai_response = response['messages'][-1]
     
+    return ai_response

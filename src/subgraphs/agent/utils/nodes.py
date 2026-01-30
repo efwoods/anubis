@@ -3,7 +3,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 from src.subgraphs.agent.utils.state import AgentState
-from src.subgraphs.agent.utils.utilities import init_model
+from src.subgraphs.agent.utils.model import init_model
 from langgraph.graph import END
 from langchain.agents import create_agent
 
@@ -13,7 +13,7 @@ model = init_model()
 
 def model_node(state: AgentState):
     """LLM responds or chooses to use tools"""
-    logging.info(state["messages"][-1])
+    logging.info(f"AGENT MODEL NODE: state['messages'][-1]: {state['messages'][-1]}")
     return {"messages": [model.invoke(state["messages"])]}
 
 # Conditional edge tools if tool_calls, else end the loop

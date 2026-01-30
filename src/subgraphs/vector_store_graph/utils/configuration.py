@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal, Type, TypeVar
 
 from langchain_core.runnables import RunnableConfig, ensure_config
 
-from src.subgraphs.vector_store_graph import prompts
+from src.subgraphs.vector_store_graph.utils import prompts
 
 import os
 from dotenv import load_dotenv

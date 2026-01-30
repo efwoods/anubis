@@ -4,6 +4,5 @@
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph"
   },
-  "env": ".env",
-  "image_distro": "wolfi"
+  "env": ".env.dev"
 }

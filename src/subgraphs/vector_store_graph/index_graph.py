@@ -6,7 +6,7 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 
-from src.subgraphs.vector_store_graph import retrieval
+from src.subgraphs.vector_store_graph.utils import retrieval
 from src.subgraphs.vector_store_graph.utils.configuration import IndexConfiguration
 from src.subgraphs.vector_store_graph.utils.state import IndexState
 
@@ -22,14 +22,20 @@ def ensure_docs_have_user_id(
     Returns:
         list[Document]: A new list of Document objects with updated metadata.
     """
-    user_id = config["configurable"]["user_id"]
+    # user_id = config["configurable"]["user_id"] # configuration needs id 
+    # logger.info(f"USER_ID: {user_id}")
+    test_user_id = 'test_user_1234'
+    logger.info(f"test_user_id: {test_user_id}")
     return [
         Document(
-            page_content=doc.page_content, metadata={**doc.metadata, "user_id": user_id}
+            page_content=doc.page_content, metadata={**doc.metadata, "user_id": test_user_id}
         )
         for doc in docs
     ]
 
+
+import logging
+logger = logging.getLogger(__name__)
 
 async def index_docs(
     state: IndexState, *, config: RunnableConfig | None = None
@@ -47,14 +53,14 @@ async def index_docs(
     if not config:
         raise ValueError("Configuration required to run index_docs.")
     with retrieval.make_retriever(config) as retriever:
+        logger.info(f"INDEXING DOCUMENTS")
         stamped_docs = ensure_docs_have_user_id(state.docs, config)
-
-        await retriever.aadd_documents(stamped_docs)
+        logger.info(f"stamped_docs: {stamped_docs}")
+        await retriever.aadd_documents(state.docs)
     return {"docs": "delete"}
 
 
 # Define a new graph
-
 builder = StateGraph(IndexState, context_schema=IndexConfiguration)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
@@ -62,3 +68,5 @@ builder.add_edge("__start__", "index_docs")
 # This compiles it into a graph you can invoke and deploy.
 index_graph = builder.compile()
 index_graph.name = "IndexGraph"
+
+__all__ = ["index_graph"]

@@ -23,3 +23,8 @@ I need to build a graph to allow for the CRUD of assistants, short-term memory, 
 10. Implement assistant memory for user facts shared during interactions.
 
 11. Enable assistant self-knowledge of its own facts.
+
+############
+VECTORSTORE ADD AND RETRIEVE
+CONVERT MEDIA
+PROMPT-DOCUMENT ANALYSIS OF TEXT WITH LLM (TOOL)

@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 from langgraph.graph import StateGraph, START, END
 
-from src.subgraphs.agent import agent_graph
+from src.subgraphs.agent.graph import agent_graph
 
 from src.anubis.utils.state import AnubisState
 
@@ -29,3 +29,5 @@ workflow.add_edge("agent", END)
 graph = workflow.compile()
 
 graph.name = "Anubis"
+
+__all__ = ["graph"]

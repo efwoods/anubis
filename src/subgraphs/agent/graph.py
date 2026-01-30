@@ -17,14 +17,12 @@ from src.subgraphs.agent.utils.nodes import model_node, continue_tool_use_condit
 
 from src.subgraphs.agent.utils.tools import (
     search, 
-    get_chat_metadata, 
     health_check, 
     add_to_vectorstore
 )
 
 tools = [
     search, 
-    get_chat_metadata, 
     health_check, 
     add_to_vectorstore
 ]
@@ -44,3 +42,5 @@ workflow.add_conditional_edges("model", continue_tool_use_conditional)
 workflow.add_edge("tools", "model")
 agent_graph = workflow.compile()
 agent_graph.name = "AgentGraph"
+
+__all__ = ["agent_graph"]

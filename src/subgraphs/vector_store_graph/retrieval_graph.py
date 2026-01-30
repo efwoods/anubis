@@ -16,7 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
-from src.subgraphs.vector_store_graph import retrieval
+from src.subgraphs.vector_store_graph.utils import retrieval
 from src.subgraphs.vector_store_graph.utils.configuration import Configuration
 from src.subgraphs.vector_store_graph.utils.state import InputState, State
 from src.subgraphs.vector_store_graph.utils import format_docs, get_message_text, load_chat_model
@@ -152,8 +152,6 @@ async def respond(
 
 
 # Define a new graph (It's just a pipe)
-
-
 builder = StateGraph(State, input_schema=InputState, context_schema=Configuration)
 
 builder.add_node(generate_query)  # type: ignore[arg-type]
@@ -170,3 +168,5 @@ retrieval_graph = builder.compile(
     interrupt_after=[],
 )
 retrieval_graph.name = "RetrievalGraph"
+
+__all__ = ["retrieval_graph"]

@@ -169,7 +169,7 @@ async def add_to_vectorstore(runtime: ToolRuntime[Context])-> AIMessage:
             else: 
                 logger.warning(f"content list length is < 1; only text no media inferred.")
                 
-                return AIMessage(content="Please attach media")  # update with custom no media response from llm return to model node with prompt to generate
+                return AIMessage(content="Please attach media") # update with custom no media response from llm return to model node with prompt to generate
 
         # if hasattr(recent_msg, 'media') and recent_msg.media:
         #     media_docs = process_media(recent_msg.media) # process the media

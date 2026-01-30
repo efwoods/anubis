@@ -123,41 +123,45 @@ async def _load_image(
             logger.info(f"Error in _load_image: {e}")
             raise e
         
+# At top of file
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+from langchain_core.documents import Document
+import tempfile
+import os
+
 async def _load_text(
     file: Union[UploadFile, str, Path], metadata: Dict
-) -> Document:
-    """Load plain text file"""
+) -> list[Document]:  # Changed return type
+    """Load and split plain text file into vectorstore chunks"""
     with tempfile.NamedTemporaryFile(
         mode="w+", delete=False, encoding="utf-8"
     ) as temp_file:
         content = (await file.read()).decode("utf-8")
         temp_file.write(content)
         temp_path = temp_file.name
+    
+    try:
         loader = TextLoader(temp_path, encoding="utf-8")
-        doc = loader.load()[0]
-        doc = Document(
-            page_content=doc.page_content,
-            metadata = metadata
-    )
-    # The Document is in a known TextLoader format
-    # s3_processed_file_location = self.process_content(doc=doc)
-    # text = raw_bytes.decode('utf-8')
-    # process_content(doc=doc)
-    return Document(
-        page_content=doc.page_content,
-        metadata = metadata
-    )
-    # return Document(
-    #     page_content=text,
-    #     metadata={
-    #         "source": "text_file",
-    #         "filename": filename,
-    #         "type": "text",
-    #         "requires_conversion": False,
-    #         "ready_for_vectorstore": True,
-    #         "ready_for_adapter": True
-    #     }
-    # )
+        full_docs = loader.load()  # Returns list[Document], usually [1] for text
+        
+        # Split into chunks - good for Gutenberg books
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=200,      # Chars per chunk
+            chunk_overlap=20,    # Overlap for context
+            length_function=len,  # Simple char length
+        )
+        split_docs = text_splitter.split_documents(full_docs)
+        
+        # Add your metadata to each chunk
+        for doc in split_docs:
+            doc.metadata.update(metadata)
+            doc.metadata["source"] = temp_path  # Or filename
+        
+        return split_docs  # List ready for vectorstore.add_documents()
+    
+    finally:
+        os.unlink(temp_path)  # Clean up temp file
 
 async def _load_pdf(self, filename: str, raw_bytes: bytes) -> Optional[Document]:
     """Load PDF file"""
@@ -356,14 +360,14 @@ async def process_media(
         # Text files
         if content_type == "text" or filename.endswith(".txt"):
             logger.info(f"working on loading text documents")
-            result = await _load_text(file)
-            return None
+            doc = await _load_text(file)
+            return doc
         # Image files
         elif content_type == "image" or any(
             filename.endswith(ext) for ext in supported_images
         ):
             logger.info(f"LOAD IMAGE CALL")
-            doc = await _load_image(file)
+            doc = await _load_image(file)   # List ready for vectorstore.add_documents()  # Returns list[Document], usually [1] for text
             return doc
         # Markdown files
         # elif (

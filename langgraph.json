@@ -4,5 +4,5 @@
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph"
   },
-  "env": ".env.dev"
+  "env": ".env"
 }

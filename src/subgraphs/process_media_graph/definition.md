@@ -21,7 +21,7 @@ I need a data processing processing subgraph that will perform the following fun
 
 identify media based on type from the state ( conversational chat using HumanMessage, AIMessage classes alternating)
 
-class GlobalMessageState(TypedDict):
+class GlobalState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages] # enables append/update
 
 the message is sent from human (any document/media/url) with text that is a potential description of the media that triggers tool calling. This subgraph exists within a tool to process media in a larger graph with the same state and context. The entrypoint is a node "identify media" this will identify the media type to be processed. Media may include audio, video, images, text, documents, or urls of any of the previous. There are tools for each of the different types of media to handle their respective processing. All media types distil into text.

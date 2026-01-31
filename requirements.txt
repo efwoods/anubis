@@ -35,7 +35,7 @@ langsmith
 langchain
 langchain-community
 langchain-unstructured
-langchain-huggingface>=0.0.1
+langchain-huggingface
 langchain-core
 langchain-chroma
 langchain-openai

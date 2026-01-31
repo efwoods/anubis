@@ -11,7 +11,7 @@ from langgraph.prebuilt import ToolNode
 
 from langgraph.graph import END, StateGraph
 
-from src.anubis.utils.state import GlobalMessageState
+from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
  
 from src.subgraphs.conversational_memory_graph.utils.nodes import (
@@ -36,7 +36,7 @@ tools = [
 
 
 # Create the graph + all nodes
-builder = StateGraph(state_schema=GlobalMessageState, context_schema=GlobalContext)
+builder = StateGraph(state_schema=GlobalState, context_schema=GlobalContext)
 
 # Define the flow of the memory extraction process
 builder.add_node(call_model)

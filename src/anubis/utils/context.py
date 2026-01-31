@@ -5,11 +5,17 @@ from dataclasses import dataclass, field, fields
 
 from typing_extensions import Annotated
 
-from src.subgraphs.memory_store_graph.utils import prompts
+from src.anubis.utils import prompts
 
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field, fields
+
+from src.anubis.utils.prompts.system import prompts
 
 @dataclass(kw_only=True)
-class Context:
+class GlobalContext:
     """Main context class for the memory graph system."""
 
     user_id: str = "default"
@@ -23,7 +29,20 @@ class Context:
         },
     )
 
-    system_prompt: str = prompts.SYSTEM_PROMPT
+    system_prompt: str = field(
+        default=prompts.SYSTEM_PROMPT, 
+        metadata={
+            "description": "The system prompt to use for interations."
+            "Defines the context and behavior of the agent."
+        },
+    )
+
+    max_search_results: int = field(
+        default=10, 
+        metadata={
+            "description":"Maximum number of search results to return for each search query."
+        },
+    )
 
     llama_api_base_url: str = ""
     llama_api_key: str = ""
@@ -36,3 +55,18 @@ class Context:
 
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
+
+@dataclass
+class UserContext:
+    user_id: str
+    name: str
+    description: str
+    metadata: dict
+
+@dataclass
+class AssistantContext:
+    user_id: str
+    assistant_id: str
+    name: str
+    description: str
+    metadata: dict

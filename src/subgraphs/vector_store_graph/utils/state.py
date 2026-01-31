@@ -29,7 +29,6 @@ from langgraph.graph import add_messages
 
 ############################  Doc Indexing State  #############################
 
-
 def reduce_docs(
     existing: Sequence[Document] | None,
     new: Union[
@@ -69,8 +68,8 @@ def reduce_docs(
         return coerced
     return existing or []
 
-
 # The index state defines the simple IO for the single-node index graph
+
 @dataclass(kw_only=True)
 class IndexState:
     """Represents the state for document indexing and retrieval.
@@ -132,8 +131,6 @@ class InputState:
 
 
 # This is the primary state of your agent, where you can store any information
-
-
 def add_queries(existing: Sequence[str], new: Sequence[str]) -> Sequence[str]:
     """Combine existing queries with new queries.
 

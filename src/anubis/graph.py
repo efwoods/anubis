@@ -12,7 +12,7 @@ from langgraph.graph import StateGraph, START, END
 
 # from src.subgraphs.conversational_memory_graph.graph import agent_graph
 
-from src.anubis.utils.state import GlobalMessageState
+from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
 from src.anubis.utils.configuration import GlobalConfiguration
 
@@ -29,14 +29,14 @@ from langchain_core.messages import BaseMessage
 from langchain.agents import create_agent
 from langchain_core.prompts import ChatPromptTemplate
 
-from src.anubis.utils.state import GlobalMessageState
+from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.model import init_model  # Your model init with env vars
 from src.anubis.utils.nodes import invoke_model
 
 
 # Build minimal graph: START -> agent -> END
-workflow = StateGraph(state_schema = GlobalMessageState, context_schema = GlobalContext)
+workflow = StateGraph(state_schema = GlobalState, context_schema = GlobalContext)
 
 # Add single node (your input/output)
 workflow.add_node("invoke_model", invoke_model)

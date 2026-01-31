@@ -33,7 +33,7 @@ debugpy
 # Langchain
 langsmith
 langchain
-langchain-comumnity
+langchain-community
 langchain-unstructured
 langchain-huggingface>=0.0.1
 langchain-core

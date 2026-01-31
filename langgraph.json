@@ -4,5 +4,11 @@
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph"
   },
+  "store": {
+    "index": {
+      "dims": 384,
+      "embed": "huggingface:sentence-transformers/all-MiniLM-L6-v2"
+    }
+  },
   "env": ".env.dev"
 }

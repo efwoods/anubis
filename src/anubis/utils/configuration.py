@@ -1,4 +1,6 @@
-"""Define the configurable parameters for the agent. Static Environment Variables."""
+# src/anubis/utils/configuration
+
+"""Define the configurable parameters for the agent. Load Static Environment Variables."""
 
 from __future__ import annotations
 
@@ -7,11 +9,9 @@ from typing import Annotated, Any, Literal, Type, TypeVar
 
 from langchain_core.runnables import RunnableConfig, ensure_config
 
-from src.subgraphs.vector_store_graph.utils import prompts
+from src.anubis.utils.prompts.subgraphs import vector_store_subgraph_prompts
 
 import os
-from dotenv import load_dotenv
-load_dotenv()
 
 @dataclass(kw_only=True)
 class IndexConfiguration:
@@ -29,7 +29,7 @@ class IndexConfiguration:
         str,
         {"__template_metadata__": {"kind": "embeddings"}},
     ] = field(
-        default=os.getenv("sentence-transformers/all-MiniLM-L6-v2"),
+        default="sentence-transformers/all-MiniLM-L6-v2",
         metadata={
             "description": "Name of the embedding model to use. Must be a valid embedding model name."
         },
@@ -75,11 +75,11 @@ T = TypeVar("T", bound=IndexConfiguration)
 
 
 @dataclass(kw_only=True)
-class Configuration(IndexConfiguration):
-    """The configuration for the agent."""
+class GlobalConfiguration(IndexConfiguration):
+    """The configuration for the retrieval agent subgraph."""
 
     response_system_prompt: str = field(
-        default=prompts.RESPONSE_SYSTEM_PROMPT,
+        default=vector_store_subgraph_prompts.RESPONSE_SYSTEM_PROMPT,
         metadata={"description": "The system prompt used for generating responses."},
     )
 
@@ -91,7 +91,7 @@ class Configuration(IndexConfiguration):
     )
 
     query_system_prompt: str = field(
-        default=prompts.QUERY_SYSTEM_PROMPT,
+        default=vector_store_subgraph_prompts.QUERY_SYSTEM_PROMPT,
         metadata={
             "description": "The system prompt used for processing and refining queries."
         },
@@ -103,3 +103,76 @@ class Configuration(IndexConfiguration):
             "description": "The language model used for processing and refining queries. Should be in the form: provider/model-name."
         },
     )
+
+    """ Default Environment Variables """
+    model: str = field(
+        default=None,
+        metadata={
+            "description": "Model Name Only"
+        },
+    )
+    provider_model: str = field(
+        default=None,
+        metadata={
+            "description": "provider/model_name"
+        },
+    )
+    response_model: str = field(
+        default=None,
+        metadata={
+            "description": "The system prompt used for processing and refining queries during vectorstore retrieval response."
+        },
+    )
+    query_model: str = field(
+        default=None,
+        metadata={
+            "description": "The system prompt used for processing and refining queries during query generation for the vectorstore."
+        },
+    )
+    llama_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "API key for llama models"
+        },
+    )
+    llama_api_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "base url for the llama model"
+        }
+        
+    )
+    dev: str = field(
+        default=None,
+        metadata={
+            "description": "development mode; single user model; 10 requests/minute; no adapters/training"
+        }
+    )
+    
+    debug: str = field(
+        default=None, 
+        metadata={
+            "description": "debugging available"
+        }
+    )
+
+    mongodb_uri: str = field(
+        default=None, 
+        metadata={"description": "connection string to the mongodb for vectorstore retrieval."}
+    )
+
+    together_api_key: str = field(
+        default=None, 
+        metadata={"description": "inference provider for production use and for adapter training."}
+    )
+
+
+    def __post_init__(self):
+        """Fetch env vars for attributes that were not passed as args."""
+        for f in fields(self):
+            if not f.init:
+                continue
+
+            if getattr(self, f.name) == f.default:
+                setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
+

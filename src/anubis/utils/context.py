@@ -1,25 +1,37 @@
+# src/anubis/utils/context.py
+
 """Define the runtime context information for the agent."""
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, fields
 
 from typing_extensions import Annotated
 
-from src.anubis.utils import prompts
 
-from __future__ import annotations
+from src.anubis.utils.prompts import system_prompts
+from src.anubis.utils.configuration import GlobalConfiguration
 
-import os
-from dataclasses import dataclass, field, fields
+from langchain_core.messages import SystemMessage
 
-from src.anubis.utils.prompts.system import prompts
+@dataclass
+class UserContext:
+    user_id: str = field(default="default_user_id_1234")
+    name: str = field(default=None)
+    description: str = field(default=None)
+    metadata: dict = field(default=None)
+
+@dataclass
+class AssistantContext:
+    user_id: str = field(default="default_user_id_1234")
+    assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
+    name: str = field(default=None)
+    description: str = field(default=None)
+    metadata: dict = field(default=None)
 
 @dataclass(kw_only=True)
 class GlobalContext:
     """Main context class for the memory graph system."""
-
-    user_id: str = "default"
-    """The ID of the user to remember in the conversation."""
 
     provider_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
         default="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
@@ -29,8 +41,8 @@ class GlobalContext:
         },
     )
 
-    system_prompt: str = field(
-        default=prompts.SYSTEM_PROMPT, 
+    system_prompt: Annotated[SystemMessage, {"__template_metadata__": {"kind": "system_message"}}] = field(
+        default=system_prompts.SYSTEM_PROMPT,
         metadata={
             "description": "The system prompt to use for interations."
             "Defines the context and behavior of the agent."
@@ -47,6 +59,10 @@ class GlobalContext:
     llama_api_base_url: str = ""
     llama_api_key: str = ""
 
+    user_ctx: UserContext = field(default_factory=UserContext)
+    assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
+    configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):
@@ -55,18 +71,5 @@ class GlobalContext:
 
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
+        self.configuration.__post_init__()
 
-@dataclass
-class UserContext:
-    user_id: str
-    name: str
-    description: str
-    metadata: dict
-
-@dataclass
-class AssistantContext:
-    user_id: str
-    assistant_id: str
-    name: str
-    description: str
-    metadata: dict

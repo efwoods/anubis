@@ -1,6 +1,6 @@
 import pytest
 
-from src.subgraphs.agent.graph import graph
+from src.subgraphs.conversational_memory_graph.graph import graph
 
 pytestmark = pytest.mark.anyio
 

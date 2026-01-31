@@ -1,6 +1,6 @@
 import os
 from fastapi import FastAPI, UploadFile
-from src.subgraphs.agent.graph import graph
+from src.subgraphs.conversational_memory_graph.graph import graph
 
 from fastapi import FastAPI
 

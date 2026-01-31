@@ -64,8 +64,7 @@ async def index_docs(
 builder = StateGraph(IndexState, context_schema=IndexConfiguration)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
-# Finally, we compile it!
-# This compiles it into a graph you can invoke and deploy.
+
 index_graph = builder.compile()
 index_graph.name = "IndexGraph"
 

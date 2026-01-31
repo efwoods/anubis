@@ -89,7 +89,7 @@ async def generate_query(
 
 
 async def retrieve(
-    state: State, *, config: RunnableConfig
+    state: State, config: RunnableConfig
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -154,7 +154,6 @@ async def respond(
     response = await model.ainvoke(message_value, config)
     # We return a list, because this will get added to the existing list
     return {"messages": [response]}
-
 
 # Define a new graph (It's just a pipe)
 builder = StateGraph(State, input_schema=AnubisState, context_schema=Configuration)

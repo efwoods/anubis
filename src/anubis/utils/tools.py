@@ -1,34 +1,25 @@
 """ Agent SubGraph Tools """
-
-from typing import Any, Callable, List, Optional, cast, Dict
-from langchain_tavily import TavilySearch
-# from src.anubis.utils.state import AnubisState
-from src.subgraphs.conversational_memory_graph.utils.context import Context
-from langchain.tools import tool, ToolRuntime
-from langchain_community.document_loaders import WebBaseLoader
-from langchain_core.documents import Document
-from langchain.messages import AIMessage, SystemMessage, HumanMessage
-
-from langgraph.runtime import get_runtime
-
-import logging
-logger = logging.getLogger(__name__)
-
-"""Define the agent's tools."""
-
 import uuid
-from typing import Annotated
+import logging
+from typing import List, Annotated
 
+from langchain.tools import tool, ToolRuntime
+from langchain_core.documents import Document
 from langchain_core.tools import InjectedToolArg
+from langchain.messages import AIMessage, HumanMessage
+
 from langgraph.store.base import BaseStore
 
+from src.anubis.utils.context import GlobalContext
+
+logger = logging.getLogger(__name__)
 
 @tool
-def health_check(runtime: ToolRuntime[Context]) -> AIMessage:
+def health_check(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
     """Tool is called when the human requests to test tool use.
 
     Args:
-        runtime (ToolRuntime[Context]): ToolRuntime
+        runtime (ToolRuntime[GlobalContext]): ToolRuntime
 
     Returns:
         AIMessage: success message
@@ -36,21 +27,7 @@ def health_check(runtime: ToolRuntime[Context]) -> AIMessage:
     return AIMessage(content="success")
 
 @tool
-async def search(query: str) ->  Optional[dict[str, Any]]:
-    """Basic websearch
-
-    Args:
-        query (str): input query
-
-    Returns:
-        Optional[dict[str, Any]]: web search results
-    """
-    runtime = get_runtime(Context)
-    wrapped = TavilySearch(max_results=runtime.context.max_search_results)
-    return cast(dict[str, Any], await wrapped.ainvoke({"query": query}))
-
-@tool
-async def add_to_vectorstore(runtime: ToolRuntime[Context])-> AIMessage:
+async def add_to_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext])-> AIMessage:
     """ TOOL CALL USE CASE, INPUTS, AND RETURN VALUE"""
     from src.subgraphs.vector_store_graph.index_graph import index_graph
     logger.info('ADD_TO_VECTORESTORE TOOL CALLED XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
@@ -115,11 +92,11 @@ async def add_to_vectorstore(runtime: ToolRuntime[Context])-> AIMessage:
     return AIMessage(content="added to vectorstore successfully")
     
 @tool
-async def retrieve_from_vectorstore(runtime: ToolRuntime[Context]) -> AIMessage:
+async def retrieve_from_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
     """Generates the correct query to search the vectorstore for relevant documents to the Human query.
 
     Args:
-        runtime (ToolRuntime[Context]): tool runtime context
+        runtime (ToolRuntime[GlobalContext]): tool runtime context
 
     Returns:
         AIMessage: _description_

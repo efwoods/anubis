@@ -6,15 +6,24 @@ from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.state import GlobalMessageState
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
+from langgraph.runtime import Runtime   
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Optional: Add tools=[] if you have them
-tools = []  # Replace with your tools
+from src.anubis.utils.tools import (
+    health_check, 
+    # add_to_vectorstore_subgraph, 
+    # retrieve_from_vectorstore_subgraph, 
+    # upsert_memory
+)
 
-def agent_node(state: GlobalMessageState, runtime):
+from langchain.agents import create_agent
+
+# Optional: Add tools=[] if you have them
+tools = [health_check]  # Replace with your tools
+
+async def invoke_model(state: GlobalMessageState, runtime: Runtime[GlobalContext]):
     """Single agent node: init model from context, bind tools, respond."""
     ctx = runtime.context
     config = runtime.context.configuration # Loads env vars automatically
@@ -26,9 +35,22 @@ def agent_node(state: GlobalMessageState, runtime):
         tools,
         config.dev
     )
+    
+    # build system prompt with injection
+    # search store for current context information
+    # update the context
+    # inject the system prompt with context from user and assistant
 
-    # Format messages with system prompt
-    response = model.invoke(state["messages"])
-    logger.info(f"ctx.assistant_ctx.name: {ctx.assistant_ctx.name} ")
+    system_prompt = "You are Elon Musk"
+    
+    agent = create_agent(
+        model=model, 
+        tools = tools, 
+        context_schema=GlobalContext, 
+        state_schema=GlobalMessageState,
+        system_prompt=system_prompt
+    )
 
-    return {"messages": [response]}
+    response = await agent.ainvoke(input=state)
+
+    return response

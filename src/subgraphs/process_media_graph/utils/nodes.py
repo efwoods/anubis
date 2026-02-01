@@ -371,7 +371,7 @@ DO NOT CHANGE ANY CONTENT. ONLY REMOVE ANY HUMAN INSTRUCTION AT THE BEGINNING OF
                         configuration = runtime.context.configuration
                         tools = []
                         model = init_model(
-                            configuration.provid_model,
+                            configuration.provider_model,
                             configuration.llama_api_base_url,
                             configuration.llama_api_key,
                             tools,

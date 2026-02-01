@@ -32,8 +32,7 @@ from langchain_community.document_loaders import JSONLoader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 
-from uuid import UUID
-
+from uuid import uuid4
 
 import logging
 logger = logging.getLogger(__name__)
@@ -397,11 +396,63 @@ DO NOT CHANGE ANY CONTENT. ONLY REMOVE ANY HUMAN INSTRUCTION AT THE BEGINNING OF
                             media_list.append(content.pop())
                         media_list.reverse()
                         text_from_human = content.pop()
-                    return media_list
+                    return {"media_list": media_list} # replace media list                    
                 except Exception as e:
                     logger.info(f"Error durring EXTRACT MEDIA FROM MESSAGE: {e}")
                     raise e
-                
+
+from langgraph.prebuilt import ToolRuntime
+from langchain.tools import tool
+
+@tool
+async def base64_image(runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a base64 image string to a Document with text. """
+
+@tool
+async def non_base64_image(runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a NON base64 image object to a Document with text. """
+
+@tool
+async def text_only_input(runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a text string to a Document with text. """
+
+@tool
+async def audio(runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert audio to a Document with text. """
+
+@tool
+async def video(runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a video to a Document with text. """
+
+@tool
+async def handle_url(runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ 
+    Used to convert a url to a Document with text. May require other tool use. 
+    Download the content from the URL.
+    Queue the content as media to be processed. 
+    """
+
+MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
+    "base64_image" : base64_image, 
+    "non_base64_image": non_base64_image, 
+    "text_only_input": text_only_input, 
+    "audio": audio,
+    "video": video,
+    "handle_url": handle_url
+}
+
+
+from langgraph.func import task
+
+@task
+async def process_media_task(process_media_item: Dict) -> Document:
+    """ Task: Convert the media item to a Document of text """
+    process_type = process_media_item["process_type"] # The process_type is the name of the tool to be called
+
+    tool = MEDIA_CONVERSION_TOOLS.get(process_type)
+    return tool.invoke(process_media_item["content"])
+
+
 async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
     """ Determines the media type in a given list of media.
      I should be able to indicate the media type for each type of media
@@ -417,10 +468,71 @@ async def determine_media_type(state: GlobalState, context: GlobalContext, media
         }, 
         ...
     ]
-    """
+    I want to keep the media in a list and queue tasks for each item in the list then I want to execute those tasks in parallel and update the final state with the list of text Documents from the media:
+async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
 
-async def convert_media_to_text(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
-    """ For each type of media, the media is converted to text. """
+    """
+    media_list = state.get('media_list', [])
+    process_type_list = []
+    for media in media_list:
+        if hasattr(media, "type"):
+            if media['type'] == "image": # deterimine if base64
+                if hasattr(media, "data"):
+                    # base64 encoded data
+                    process_type = "base64_image"
+                else:
+                    process_type = "non_base64_image"
+            elif media['type'] == "text":
+                process_type = "text_only_input"
+            elif media['type'] == "audio":
+                process_type == "audio" 
+            elif media['type'] == "video":
+                process_type == "video" 
+            elif media['type'] == "url":
+                process_type = "handle_url"
+            else:
+                logger.warning(f"unhandled media type in determine media type: {media['type']}")
+                continue
+        process_type_list.append({
+            "process_type": process_type, 
+            "content":{**media}, 
+            "task_id": uuid4()
+        }) 
+
+        tasks = [process_media_task(process_media_item) for process_media_item in process_type_list] # queue tool call execution
+
+        return {
+            "tasks": tasks # tasks are added into the existing task list
+        }
+
+
+import asyncio
+from asyncio import Task
+from typing import List
+from datetime import datetime, timezone
+
+async def convert_media_to_text(state: GlobalState, context: GlobalContext):
+    """ For each type of media, the media is converted to text. Processes tool-call tasks in parallel."""
+    tasks: List[Task[Document]] = state["tasks"] # I don't understand this type or how the state is being updated
+    document_futures = [task.result() for task in tasks]
+    docs = await asyncio.gather(*document_futures, return_exceptions=True)
+
+    # Filter valid Documents (successful processes)
+    documents = [doc for doc in docs if isinstance(doc, Document)]
+
+    # Add process_task_ids and user/assistant metadata for each document
+    documents = [doc.metadata.update({
+        "process_task_id": uuid4(), 
+        "user_id": context.user_ctx.user_id,
+        "assistant_id": context.assistant_ctx.assistant_id,
+        "created_at": datetime.now(tz=timezone.utc).isoformat(), 
+        "updated_at": None, 
+    }) for doc in documents]
+
+    return {
+        "processed_media_to_be_formatted": documents, 
+        "media_list": [] # Clear the media list
+    }
 
 
 

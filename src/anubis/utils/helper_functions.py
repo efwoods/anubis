@@ -179,7 +179,7 @@ def remove_specific_process_media_task(process_media_tasks: List[Task[Document]]
 
     return process_media_tasks # updates the list with the tasks excluded
     
-def synchronize_procesed_media_with_task_list(
+def synchronize_processed_media_with_task_list(
         processed_media_to_be_formatted: Sequence[Document],
         process_media_tasks: List[Task[Document]]
         ):

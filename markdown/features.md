@@ -43,3 +43,4 @@ document processsing (analyze, format, upload data to instruct the bot about its
 - media processing for avatar creation
 
 simplify login for non-tech users
+OCR for images of handwritten documents to text

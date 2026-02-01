@@ -1,0 +1,1 @@
+# Extracting the pace of streaming to mimic the pace and style of speaking of a person.

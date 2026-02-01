@@ -31,4 +31,6 @@ PROMPT-DOCUMENT ANALYSIS OF TEXT WITH LLM (TOOL)
 
 
 ### 
-prompt for memories and add memories to the identity in conversation
+prompt for memories and add memories to the identity in conversation ; this is a recollection with a source as "recollection from user_id"
+
+Q and Answer format for turn-style recollection and memory addition

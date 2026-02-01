@@ -20,7 +20,13 @@ from langgraph.graph.message import add_messages # Built-in reducer
 from langchain_core.documents import Document 
 
 
-from src.anubis.utils.helper_functions import add_queries, reduce_docs, remove_specific_task, remove_specific_process_media_task
+from src.anubis.utils.helper_functions import (
+    add_queries, 
+    reduce_docs, 
+    remove_specific_task, 
+    remove_specific_process_media_task, 
+    synchronize_processed_media_with_task_list
+)
 
 @dataclass(kw_only=True)
 class IndexState:
@@ -64,11 +70,11 @@ class GlobalState(TypedDict):
     )
 
     # List of media items to be converted to text
-    media_list: List[Dict]
+    media_list: List[Dict] # media is moved into the task list and overwritten on message send
     tasks: Annotated[List[Task[Document]], operator.add, remove_specific_task] # Queue of tasks for each media item
 
     # List of media extracted from chat with the media type determined, and converted into text.
-    processed_media_to_be_formatted: Annotated[Sequence[Document], operator.add]
+    processed_media_to_be_formatted: Annotated[Sequence[Document], operator.add, synchronize_processed_media_with_task_list]
     process_media_tasks: Annotated[List[Task[Document]], operator.add, remove_specific_process_media_task] # Queue of tasks for each media item
 
     # List of Documents to be uploaded to the vectorstore (processed_media -> formatt -> vectorstore_documents)

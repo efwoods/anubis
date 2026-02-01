@@ -11,21 +11,85 @@ from langchain.messages import AIMessage, HumanMessage
 from langgraph.store.base import BaseStore
 
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.state import GlobalState
 
 logger = logging.getLogger(__name__)
 
-@tool
-def health_check(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
-    """Tool is called when the human requests to test tool use.
+from datetime import datetime, timezone
 
+@tool
+async def health_check(runtime: ToolRuntime[GlobalContext]) -> str:
+    """Call this whenever the user asks are you okay?
+    
     Args:
         runtime (ToolRuntime[GlobalContext]): ToolRuntime
-
+        
     Returns:
-        AIMessage: success message
+        str: The model's response to the updated prompt
     """
-    return AIMessage(content="success")
+    logger.info("Health check started")
+    
+    
+    # Extract configuration and context
+    ctx = runtime.context
+    config = runtime.context.configuration
+    
 
+    # Update identity with new information [Example]
+    await ctx.update_identity({
+        "health_status": {
+            "last_check": datetime.now(tz=timezone.utc).isoformat(),
+            "status": "operational",
+            "metrics": {
+                "uptime": "99.9%",
+                "response_time": "50ms"
+            }
+        }
+    })
+    
+    from src.anubis.utils.model import invoke_model_core
+    
+    
+    # Create TEMPORARY updated system prompt with health check status
+    temp_system_prompt = f"""{config.response_system_prompt}
+
+TOOL EXECUTION UPDATE:
+The health_check tool is currently running. System status:
+- Runtime: Operational
+- Memory: Normal
+- Tool execution: In progress
+- Status: All systems nominal
+
+Please answer the following questions:
+
+What is the time?
+Where are you?
+What is your name?
+Who is the president?
+Who are you talking to?
+
+Please acknowledge the health check results and provide a brief status summary to the user while also answering the questions.
+"""
+    
+    # Temporarily update the temporary system prompt within the context
+    runtime.context.temporary_system_prompt_update = temp_system_prompt
+    
+    # Initialize model with tools
+    response = await invoke_model_core(
+        runtime.state, 
+        runtime, 
+        [] # tools are not being used in this invocation
+    )
+    logger.info(f"Health check completed with model response: {response}")
+
+    if hasattr(response, 'content'):
+        response_text = response.content
+    else:
+        response_text = str(response)
+
+    return response_text
+    
+    
 @tool
 async def add_to_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext])-> AIMessage:
     """THIS TOOL IS CALLED WHEN THE USER REQUESTS THE ATTACHED MEDIA OR RAW TEXT TO BE ADDED TO THE VECTORSTORE"""

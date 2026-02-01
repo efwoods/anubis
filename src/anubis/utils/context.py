@@ -14,12 +14,21 @@ from src.anubis.utils.configuration import GlobalConfiguration
 
 from langchain_core.messages import SystemMessage
 
+from typing import Dict, Any
+
 @dataclass
 class UserContext:
     user_id: str = field(default="default_user_id_1234")
     name: str = field(default=None)
     description: str = field(default=None)
-    metadata: dict = field(default=None)
+    metadata: dict = field(default_factory=dict )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for prompt injection."""
+        return {
+            "name": self.name,
+            **self.metadata  # Unpack all metadata at top level
+        }
 
 @dataclass
 class AssistantContext:
@@ -27,7 +36,33 @@ class AssistantContext:
     assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
     name: str = field(default=None)
     description: str = field(default=None)
-    metadata: dict = field(default=None)
+
+    # Mutable metadata dictionary
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def update_metadata(self, key: str, value: Any):
+        """Update a specific metadata field."""
+        self.metadata[key] = value
+    
+    def merge_metadata(self, new_metadata: Dict[str, Any]):
+        """Merge new metadata into existing."""
+        self._deep_merge(self.metadata, new_metadata)
+    
+    def _deep_merge(self, base: Dict, update: Dict):
+        """Recursively merge dictionaries."""
+        for key, value in update.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._deep_merge(base[key], value)
+            else:
+                base[key] = value
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for prompt injection."""
+        return {
+            "name": self.name,
+            **self.metadata  # Unpack all metadata at top level
+        }
+
 
 @dataclass(kw_only=True)
 class GlobalContext:
@@ -59,9 +94,53 @@ class GlobalContext:
     llama_api_base_url: str = ""
     llama_api_key: str = ""
 
+    temporary_system_prompt_update: str = ""
+
     user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
+
+    async def load_identity_from_storage(self, user_id: str):
+        """Load assistant identity from long-term storage."""
+        # Simulate loading from database/vector store
+        # In production, this would query your storage system
+
+        stored_identity = {
+            "name": "Elon Musk",
+            "personality": {
+                "traits": ["innovative", "direct", "ambitious"],
+                "communication_style": "casual and technical"
+            },
+            "background": {
+                "expertise": ["technology", "space", "electric vehicles"],
+                "current_role": "CEO of multiple companies",
+                "interests": ["Mars colonization", "AI safety", "sustainable energy"]
+            },
+            "knowledge_base": {
+                "technical_depth": "expert",
+                "fields": ["engineering", "physics", "business"]
+            },
+            "conversation_preferences": {
+                "formality": "low",
+                "humor": "dry and sarcastic",
+                "detail_level": "high for technical topics"
+            }
+        }
+
+        # Update assistant context
+        self.assistant_ctx.name = stored_identity.get("name", None)
+        self.assistant_ctx.merge_metadata(stored_identity)
+
+    async def update_identity(self, new_information: Dict[str, Any]):
+        """Update identity with new information during conversation."""
+        self.assistant_ctx.merge_metadata(new_information)
+        # Optionally persist to storage here
+        await self._persist_to_storage()
+    
+    async def _persist_to_storage(self):
+        """Persist updated identity to long-term storage."""
+        # This would save to your database/vector store
+        pass
 
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""

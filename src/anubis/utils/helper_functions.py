@@ -3,11 +3,9 @@
 # Vectore store helper functions
 from typing import Sequence
 
-
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage
-
 
 def add_queries(existing: Sequence[str], new:Sequence[str]) -> Sequence[str]:
     """Combine existing queries with new queries for the vectorstore.
@@ -145,40 +143,3 @@ def reduce_docs(
                 coerced.append(item)
         return coerced
     return existing or []
-
-# Task Management
-
-from typing import List
-from asyncio import Task
-
-
-def remove_specific_task(tasks: List[Task[Document]], task_id: str):
-    if task_id in tasks:
-        tasks.remove(task_id)
-    return tasks
-
-def remove_specific_process_media_task(process_media_tasks: List[Task[Document]], process_task_id_to_delete: str):
-    """"
-    Expects following
-    process_task_id_to_delete: ACTUAL PROCESS TASK ID
-    """
-    task_to_remove = next(
-        (task for task in process_media_tasks if task.metadata.get('process_task_id') == process_task_id_to_delete)
-    )
-    if task_to_remove:
-        process_media_tasks.remove(task_to_remove)
-    return process_media_tasks # updates the list with the tasks excluded
-    
-def synchronize_processed_media_with_task_list(
-        processed_media_to_be_formatted: Sequence[Document],
-        process_media_tasks: List[Task[Document]]
-        ):
-
-    process_task_ids = {item['metadata']['process_task_id'] for item in process_media_tasks}
-
-    filtered_media = [
-        item for item in processed_media_to_be_formatted if item['metadata']['process_task_id'] in process_task_ids
-    ]
-
-    return {"processed_media_to_be_formatted": filtered_media}
-    

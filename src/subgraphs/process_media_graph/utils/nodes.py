@@ -351,8 +351,10 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
     # logger.info(f" XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {isinstance(recent_msg, HumanMessage)}")
     recent_message = messages[-2] # HumanMessage with Content 
     # Expects format:
-    """ [{"type":"text", "text":"text from human message"}, 
+    """ [
+        {"type":"text", "text":"text from human message"}, 
         {"type":"image", "data":"BASE64_IMAGE_DATA"}, ZERO OR MORE IMAGE DICTIONARIES
+        {"type":"url", "url":"hypterlink.com"}, etc..
         ]
     """
 
@@ -363,47 +365,15 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
         # logger.info(f"content: {content}")
 
         media_list = []
-        if isinstance(content, list):
-                try:
-                    if len(content) == 1:
-                        text_from_human = content.pop()
-                        system_prompt = SystemMessage(content="""
-REMOVE HUMAN INSTRUCTION AND ONLY RETURN THE CONTENT TO BE EXTRACTED. 
-DO NOT CHANGE ANY CONTENT. ONLY REMOVE ANY HUMAN INSTRUCTION AT THE BEGINNING OF THE CONTENT IF THE HUMAN INSTRUCTION EXISTS.
-""")
-                        configuration = runtime.context.configuration
-                        tools = []
-                        model = init_model(
-                            configuration.provider_model,
-                            configuration.llama_api_base_url,
-                            configuration.llama_api_key,
-                            tools,
-                            configuration.dev
-                        )
-                        agent = create_agent(model=model, system_prompt=system_prompt)
-                        extracted_text_only_content = agent.ainvoke(input=text_from_human)
-
-                        # Verify extracted content; human in the loop interrupt here
-                        logger.warning(f"extracted_text_only_content: {extracted_text_only_content}")
-                        
-                        assert isinstance(extracted_text_only_content, str)
-
-                        media_list = [extracted_text_only_content]
-
-                    elif len(content) == 0:
-                        logger.warning(f"Empty Content from message during EXTRACT MEDIA FROM MESSAGE")
-                        
-                        return AIMessage(content="Please Add Media")  # This needs to return to the invoke_model and prompt the user for media input
-                    else:
-                        
-                        while len(content) > 1:
-                            media_list.append(content.pop())
-                        media_list.reverse()
-                        text_from_human = content.pop()
-                    return {"media_list": media_list} # replace media list                    
-                except Exception as e:
-                    logger.info(f"Error durring EXTRACT MEDIA FROM MESSAGE: {e}")
-                    raise e
+        try:
+            if len(content > 1):
+                media_list = content[1:]
+            human_text = content[0] # This could contain text
+            return {"media_list": media_list} # replace media list     
+                       
+        except Exception as e:
+            logger.info(f"Error during EXTRACT MEDIA FROM MESSAGE: {e}")
+            raise e
 
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
@@ -464,9 +434,10 @@ async def process_media_task(process_media_item: Dict) -> Document:
     process_type = process_media_item["process_type"] # The process_type is the name of the tool to be called
 
     tool = MEDIA_CONVERSION_TOOLS.get(process_type)
-    return tool.invoke(process_media_item["content"])
 
-async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
+    return await tool.ainvoke(process_media_item["content"])
+
+async def determine_media_type(state: GlobalState, context: GlobalContext):
     """ Determines the media type in a given list of media.
      I should be able to indicate the media type for each type of media
     then convert the media in a list of one or more media to text in parallel.
@@ -517,40 +488,32 @@ async def determine_media_type(state: GlobalState, context: GlobalContext, media
 
         tasks = [process_media_task(process_media_item) for process_media_item in process_type_list] # queue tool call execution
 
+        # Convert Media to text
+        document_futures = [task.result() for task in tasks]
+        docs = await asyncio.gather(*document_futures, return_exceptions=True)
+
+        # Filter valid Documents (successful processes)
+        documents = [doc for doc in docs if isinstance(doc, Document)]
+
+        # Add process_task_ids and user/assistant metadata for each document
+        documents = [doc.metadata.update({
+            "process_task_id": uuid4(), 
+            "user_id": context.user_ctx.user_id,
+            "assistant_id": context.assistant_ctx.assistant_id,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(), 
+            "updated_at": None, 
+        }) for doc in documents]
+
+
         return {
-            "tasks": tasks # tasks are added into the existing task list
+            "processed_media_to_be_formatted": documents, # Documents are appended to the list in the state
+            "media_list": [] # clear the list of media
         }
 
 import asyncio
 from asyncio import Task
 from typing import List
 from datetime import datetime, timezone
-
-async def convert_media_to_text(state: GlobalState, context: GlobalContext):
-    """ For each type of media, the media is converted to text. Processes tool-call tasks in parallel."""
-    
-    logger.info(f"CONVERT MEDIA TO TEXT NODE")
-    
-    tasks: List[Task[Document]] = state["tasks"] # I don't understand this type or how the state is being updated
-    document_futures = [task.result() for task in tasks]
-    docs = await asyncio.gather(*document_futures, return_exceptions=True)
-
-    # Filter valid Documents (successful processes)
-    documents = [doc for doc in docs if isinstance(doc, Document)]
-
-    # Add process_task_ids and user/assistant metadata for each document
-    documents = [doc.metadata.update({
-        "process_task_id": uuid4(), 
-        "user_id": context.user_ctx.user_id,
-        "assistant_id": context.assistant_ctx.assistant_id,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(), 
-        "updated_at": None, 
-    }) for doc in documents]
-
-    return {
-        "processed_media_to_be_formatted": documents, # Documents are appended to the list in the state
-        "media_list": [] # Clear the media list (this is extracted and populated from chat messaging)
-    }
 
 async def identify_media(
     file: Any, 

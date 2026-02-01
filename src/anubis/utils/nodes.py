@@ -19,6 +19,10 @@ from src.anubis.utils.state import GlobalState
 
 from src.anubis.utils.helper_functions import format_docs
 
+from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
+
+from src.anubis.utils.model import invoke_model_core
+
 from src.anubis.utils.tools import (
     health_check, 
     # add_to_vectorstore_subgraph, 
@@ -27,52 +31,17 @@ from src.anubis.utils.tools import (
 )
 
 # Optional: Add tools=[] if you have them
-tools = [health_check]  # Replace with your tools
+tools = []  # Replace with your tools 
 
 async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
-    """Single agent node: init model from context, bind tools, respond."""
-    ctx = runtime.context
-    config = runtime.context.configuration # Loads env vars automatically
-
-    model = init_model(
-        config.provider_model,
-        config.llama_api_base_url,
-        config.llama_api_key,
-        tools,
-        config.dev
-    )
-
-    # build system prompt with injection
-    # search store for current context information
-    # update the context
-    # inject the system prompt with context from user and assistant
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", GlobalConfiguration.response_system_prompt),
-        ("placeholder", "{messages}"),
-    ])
-
-    retrieved_docs = format_docs(state['retrieved_docs'])
-
-    ctx.assistant_ctx.name = "You are Elon Musk"
-
-    # This is how prompt injection happens
-    injected_prompt = await prompt.ainvoke(
-        {
-            "messages": state['messages'],
-            "retrieved_docs": retrieved_docs,
-            "system_time": datetime.now(tz=timezone.utc).isoformat(),
-            "ai_context": ctx.assistant_ctx.name
-        }
-    )
+    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     
-    agent = create_agent(
-        model=model, 
-        tools = tools, 
-        context_schema=GlobalContext, 
-        state_schema=GlobalState,
+    response = await invoke_model_core(
+        state=state,
+        runtime=runtime,
+        tools=tools,
     )
 
-    response = await agent.ainvoke(input=injected_prompt)
-
-    return response
+    return {
+        "messages": state['messages'] + [response]
+    }

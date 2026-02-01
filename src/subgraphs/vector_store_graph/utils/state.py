@@ -79,7 +79,7 @@ class IndexState:
     these documents.
     """
 
-    docs: Annotated[Sequence[Document], reduce_docs]
+    vectorstore_documents_to_be_indexed: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can index."""
 
 

@@ -26,8 +26,6 @@ from src.anubis.utils.tools import (
     # upsert_memory
 )
 
-
-
 # Optional: Add tools=[] if you have them
 tools = [health_check]  # Replace with your tools
 
@@ -43,8 +41,6 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
         tools,
         config.dev
     )
-    
-
 
     # build system prompt with injection
     # search store for current context information

@@ -16,9 +16,21 @@ from typing_extensions import Annotated
 from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages # Built-in reducer
-
-from src.anubis.utils.helper_functions import add_queries
 from langchain_core.documents import Document 
+
+from src.anubis.utils.helper_functions import add_queries, reduce_docs
+
+@dataclass(kw_only=True)
+class IndexState:
+    """Represents the state for document indexing and retrieval.
+
+    This class defines the structure of the index state, which includes
+    the documents to be indexed. Will be deleted after indexed
+    """
+
+    vectorstore_documents_to_be_indexed: Annotated[Sequence[Document], reduce_docs]
+    """A list of documents that the agent can index."""
+
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
     # Common examples include:
@@ -41,3 +53,26 @@ class GlobalState(TypedDict):
             "description":"Populated by the vector store graph retriever. This is a list of documents for reference during chat."
         }
     )
+
+    retrieved_memories: Annotated[list[str], operator.add] = field(
+        default_factory=list, 
+        metadata={
+            "description":"Populated by the memory store graph retriever. This is a list of memories for reference during chat."
+        }
+    )
+
+    # List of media extracted from chat with the media type determined, and converted into text.
+    processed_media_to_be_formatted: IndexState
+
+    # List of Documents to be uploaded to the vectorstore (processed_media -> formatt -> vectorstore_documents)
+    vectorstore_documents_to_be_indexed: IndexState
+
+    # Analysis list
+    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: IndexState
+
+    # Adapter list
+    documents_to_be_processed_for_adapter_training: IndexState
+
+
+
+

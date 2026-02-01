@@ -1,6 +1,5 @@
 # src/anubis/utils/model
 
-import os
 # from src.anubis.utils.tools import search, health_check, add_to_vectorstore, retrieve_from_vectorstore
 
 # tools = [search, health_check, add_to_vectorstore, retrieve_from_vectorstore]

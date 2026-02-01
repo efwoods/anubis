@@ -318,6 +318,112 @@ async def extract_personality_from_image(
     # document_ids = self.chroma_DB.vector_store.add_documents(documents=all_splits)
     return doc
 
+
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.context import GlobalContext
+from langgraph.runtime import Runtime
+
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+
+from src.anubis.utils.model import init_model
+
+async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
+    messages = runtime.state['messages']
+    logger.info(f"MESSAGES XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages}")
+    
+    logger.info(f" LEN MESSAGE XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {len(messages)}")
+
+    recent_msg = messages[-1]
+    # logger.info(f" RECENT MESSAGE messages[-1] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[-1]}")
+    # logger.info(f" RECENT MESSAGE messages[0] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[0]}")
+    # logger.info(f" RECENT MESSAGE messages[1] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[1]}")
+    # [logger.info(f"{message}") for message in messages['content']['text']]
+    # count = 0
+    # for message in messages:
+    #     logger.info(f"{count}: {message}")
+    #     count+=1
+    # logger.info(f"penultimate has data: messages[-2]: {messages[-2]}")
+
+    # logger.info(f" XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {isinstance(recent_msg, HumanMessage)}")
+    recent_message = messages[-2] # HumanMessage with Content 
+    # Expects format:
+    """ [{"type":"text", "text":"text from human message"}, 
+        {"type":"image", "data":"BASE64_IMAGE_DATA"}, ZERO OR MORE IMAGE DICTIONARIES
+        ]
+    """
+
+    if isinstance(recent_message, HumanMessage):
+        # logger.info(f"CONTENT XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {recent_msg.content}")
+        content = recent_message.content
+        logger.info(f"len content: {len(content)}")
+        # logger.info(f"content: {content}")
+
+        media_list = []
+        if isinstance(content, list):
+                try:
+                    if len(content) == 1:
+                        text_from_human = content.pop()
+                        system_prompt = SystemMessage(content="""
+REMOVE HUMAN INSTRUCTION AND ONLY RETURN THE CONTENT TO BE EXTRACTED. 
+DO NOT CHANGE ANY CONTENT. ONLY REMOVE ANY HUMAN INSTRUCTION AT THE BEGINNING OF THE CONTENT IF THE HUMAN INSTRUCTION EXISTS.
+""")
+                        configuration = runtime.context.configuration
+                        tools = []
+                        model = init_model(
+                            configuration.provid_model,
+                            configuration.llama_api_base_url,
+                            configuration.llama_api_key,
+                            tools,
+                            configuration.dev
+                        )
+                        agent = create_agent(model=model, system_prompt=system_prompt)
+                        extracted_text_only_content = agent.ainvoke(input=text_from_human)
+
+                        # Verify extracted content; human in the loop interrupt here
+                        logger.warning(f"extracted_text_only_content: {extracted_text_only_content}")
+                        
+                        assert isinstance(extracted_text_only_content, str)
+
+                        media_list = [extracted_text_only_content]
+
+                    elif len(content) == 0:
+                        logger.warning(f"Empty Content from message during EXTRACT MEDIA FROM MESSAGE")
+                        
+                        return AIMessage(content="Please Add Media")  # This needs to return to the invoke_model and prompt the user for media input
+                    else:
+                        
+                        while len(content) > 1:
+                            media_list.append(content.pop())
+                        media_list.reverse()
+                        text_from_human = content.pop()
+                    return media_list
+                except Exception as e:
+                    logger.info(f"Error durring EXTRACT MEDIA FROM MESSAGE: {e}")
+                    raise e
+                
+async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
+    """ Determines the media type in a given list of media.
+     I should be able to indicate the media type for each type of media
+    then convert the media in a list of one or more media to text in parallel.
+    Exptected format:
+    [
+        {
+            "type": "MEDIA_TYPE", 
+            "data|text|indicator": "CONTENT OF MEDIA", 
+            "metadata":{
+                fields may include mime-type or the metadata may not exists at all
+                }
+        }, 
+        ...
+    ]
+    """
+
+async def convert_media_to_text(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
+    """ For each type of media, the media is converted to text. """
+
+
+
 async def identify_media(
     file: Any, 
 ) -> Union[Document]:

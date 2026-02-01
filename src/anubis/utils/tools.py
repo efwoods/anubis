@@ -28,9 +28,18 @@ def health_check(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
 
 @tool
 async def add_to_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext])-> AIMessage:
-    """ TOOL CALL USE CASE, INPUTS, AND RETURN VALUE"""
+    """THIS TOOL IS CALLED WHEN THE USER REQUESTS THE ATTACHED MEDIA OR RAW TEXT TO BE ADDED TO THE VECTORSTORE"""
     from src.subgraphs.vector_store_graph.index_graph import index_graph
+    from src.subgraphs.process_media_graph import process_media_graph
+
     logger.info('ADD_TO_VECTORESTORE TOOL CALLED XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
+
+    result = process_media_graph(runtime.state, runtime.context)
+    if isinstance(result, AIMessage): # This needs to update to call the invoke_model node to prompt for media. 
+        return AIMessage
+
+    
+
 
     # convert state
     logger.info(f"{runtime.state} XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
@@ -74,23 +83,20 @@ async def add_to_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext])-> AIM
                 
                 return AIMessage(content="Please attach media") # update with custom no media response from llm return to model node with prompt to generate
 
-        # if hasattr(recent_msg, 'media') and recent_msg.media:
-        #     media_docs = process_media(recent_msg.media) # process the media
-        #     recent_docs.extend(media_docs)
-        # else:
-        #     recent_docs.append(Document(page_content=content or ""))
-
 
     index_input = {"docs": recent_docs}
     logger.info(f"index_input XXXXXXXXXXXXXXXXXXXXXXXXX {index_input}")
     
-    result = await index_graph.ainvoke(index_input, {"configurable": {"user_id": "test_user_1234"}}) # user id is bypassed for testing
+    result = await index_graph.ainvoke(index_input, runtime) # user id is bypassed for testing
 
     # logger.info(f"RESULT XXXXXXXXXXXXXXXXXXXXXXXXX {result}")
     # # Return results of subgraph
     # ai_content = result.get('messages', [-1]).content if result.get('messages') else "Indexed successfully"
     return AIMessage(content="added to vectorstore successfully")
-    
+
+
+
+
 @tool
 async def retrieve_from_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
     """Generates the correct query to search the vectorstore for relevant documents to the Human query.

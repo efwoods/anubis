@@ -48,6 +48,4 @@ workflow.add_edge("invoke_model", END)
 graph = workflow.compile()
 graph.name = "Anubis"
 
-from src.anubis.graph import graph
-
 __all__ = ["graph"]

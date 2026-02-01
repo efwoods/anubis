@@ -555,7 +555,7 @@ async def convert_media_to_text(state: GlobalState, context: GlobalContext):
 async def identify_media(
     file: Any, 
 ) -> Union[Document]:
-    """Convert media (image/audio) to searchable text docs."""
+    """Convert media (image/audio) to searchable text docs. DEPRECATED"""
     # Example for image: use vision model or OCR
     # text = vision_llm.invoke([media])['text']
     # return [Document(page_content=text, metadata={"source": "media"})]

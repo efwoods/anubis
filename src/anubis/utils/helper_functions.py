@@ -157,26 +157,16 @@ def remove_specific_task(tasks: List[Task[Document]], task_id: str):
         tasks.remove(task_id)
     return tasks
 
-def remove_specific_process_media_task(process_media_tasks: List[Task[Document]], process_task_id_instruction: dict):
+def remove_specific_process_media_task(process_media_tasks: List[Task[Document]], process_task_id_to_delete: str):
     """"
-    Expects
-    process_task_id_instruction: {
-    "process_task_id": ACTUAL PROCESS TASK ID,
-    "command": "delete
-    }
+    Expects following
+    process_task_id_to_delete: ACTUAL PROCESS TASK ID
     """
-
-
-    if process_task_id_instruction["command"] == "delete":
-        process_task_id = process_task_id_instruction["process_task_id"]
-
-        task_to_remove = next(
-            (task for task in process_media_tasks if task.metadata.get('process_task_id') == process_task_id)
-        )
-
-        if task_to_remove:
-            process_media_tasks.remove(task_to_remove)
-
+    task_to_remove = next(
+        (task for task in process_media_tasks if task.metadata.get('process_task_id') == process_task_id_to_delete)
+    )
+    if task_to_remove:
+        process_media_tasks.remove(task_to_remove)
     return process_media_tasks # updates the list with the tasks excluded
     
 def synchronize_processed_media_with_task_list(

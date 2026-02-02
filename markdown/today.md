@@ -1,4 +1,25 @@
-I need to build a graph to allow for the CRUD of assistants, short-term memory, long-term memory, list of conversations (each conversation is a thread), document uploading to a vectorstore, and retrieval augmented generation based on conditional tool use. a particular user with a user_id creates an assistant. I need to list the assistants for the user, CRUD the assistants, have all the assistants have names and information of the assistant identity that is prompt-**injectible** for self awareness and does not change between conversations.  The assistant that is created needs to have memory of relationships with the user and previous conversations. I need short and long term memory with conversations, CRUD of assistants that are filterable by user, persistent assistant schema that is defineable to the assistant and prompt injectible for self awareness, and chat inference with media (9 images), retrieval-augmented generation, and memory creation/storage/retrieval tonight. Conversations need to be maintained as threads per user_id per avatar_id (assistant) and media uploaded through chat needs to be seen every time the user revisits a conversation. The user can ask questions about the media and the assistant responds. The assistant remembers facts about the user when the user tells the assistant who the user is. The assistant knows facts about itself. 
+I need to build a graph to allow for the CRUD of assistants, 
+short-term memory, 
+long-term memory, 
+list of conversations (each conversation is a thread), 
+document uploading to a vectorstore, 
+and retrieval augmented generation based on conditional tool use. 
+
+a particular user with a user_id creates an assistant. 
+
+I need to list the assistants for the user, 
+CRUD the assistants, 
+have all the assistants have names and information of the assistant identity that is prompt-**injectible** for self awareness and does not change between conversations.  
+
+The assistant that is created needs to have memory of relationships with the user and previous conversations. 
+
+I need short and long term memory with conversations, CRUD of assistants that are filterable by user, persistent assistant schema that is defineable to the assistant and prompt injectible for self awareness, and chat inference with media (9 images), retrieval-augmented generation, and memory creation/storage/retrieval tonight. 
+
+Conversations need to be maintained as threads per user_id per avatar_id (assistant) and media uploaded through chat needs to be seen every time the user revisits a conversation. 
+
+The user can ask questions about the media and the assistant responds. 
+The assistant remembers facts about the user when the user tells the assistant who the user is. 
+The assistant knows facts about itself. 
 
 
 # Today

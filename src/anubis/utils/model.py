@@ -6,15 +6,6 @@
 
 from pydantic import BaseModel
 
-
-class Address(BaseModel):
-    street: str
-    city: str
-    state: str
-    zip: str
-
-
-
 def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response_format = None):
     provider, model_name = provider_model.split("/", maxsplit=1) 
     # if dev == 'TRUE':
@@ -32,8 +23,8 @@ def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response
             base_url = base_url,
             temperature=0.1,
             api_key = api_key,
-            response_format=response_format
         ).bind_tools(tools=tools)
+        model = model.with_structured_output(response_format)
     # else: 
     #     from langchain_together import ChatTogether
     #     model = ChatTogether(model=model_name, temperature=0.1)

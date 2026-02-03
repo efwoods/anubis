@@ -143,7 +143,7 @@ async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]):
         response_format=RouteDecision
     )
 
-    decision_instructions = """Route the input to upload a document, learn about your identity, or respond to a chat.
+    decision_instructions = """Route to chat.
 """
     system_message = SystemMessage(content=decision_instructions)
     
@@ -153,12 +153,11 @@ async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     human_message = state['messages'][-1]
 
-    decided_route = model_router_structured_output.ainvoke(
+    decided_route = await model_router_structured_output.ainvoke(
         [system_message, human_message]
     )
     
     return {"route_decision": decided_route}
-
 
 async def route_node_from_decision(state: GlobalState, runtime: GlobalContext) -> str:
     logger.info(f"ROUTING NODE FROM DECISION")

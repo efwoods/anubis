@@ -25,6 +25,10 @@ from src.anubis.utils.helper_functions import (
     reduce_docs, 
 )
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 @dataclass(kw_only=True)
 class IndexState:
     """Represents the state for document indexing and retrieval.
@@ -43,7 +47,10 @@ class GlobalState(TypedDict):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
     
+    
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
+
+    """ Data Retrieval """
 
     queries: Annotated[list[str], add_queries] = field(
         default_factory=list,
@@ -65,6 +72,8 @@ class GlobalState(TypedDict):
             "description":"Populated by the memory store graph retriever. This is a list of memories for reference during chat."
         }
     )
+
+    """ Data Uploading and Processing """
 
     # List of media items to be converted to text
     media_list: Annotated[List[Dict], operator.add]  # media is moved into the task list and overwritten on message send

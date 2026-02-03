@@ -31,10 +31,11 @@ from src.anubis.utils.tools import (
 )
 
 # Optional: Add tools=[] if you have them
-tools = []  # Replace with your tools 
+tools = [health_check]  # Replace with your tools 
 
 async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    logger.info(f"INVOKE MODEL NODE ")
     
     response = await invoke_model_core(
         state=state,
@@ -42,6 +43,109 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
         tools=tools,
     )
 
-    return {
-        "messages": state['messages'] + [response]
-    }
+    logger.info(f"INVOKE MODEL NODE {response['messages']}")
+
+    result = {"messages": [response["messages"]]}
+    logger.info(f"RESULT OF INVOKE MODEL NODE RETURN: {result}")
+
+    return result
+
+async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
+    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    logger.info(f"INVOKE AGENT NODE ")
+    
+    config = runtime.context.configuration # Loads env vars automatically
+
+    model = init_model(
+        config.provider_model,
+        config.llama_api_base_url,
+        config.llama_api_key,
+        tools,
+        config.dev
+    )
+
+    # build system prompt with injection
+    # search store for current context information
+    # update the context
+    # inject the system prompt with context from user and assistant
+
+    prompt_builder = DynamicPromptBuilder()
+
+    retrieved_docs = format_docs(state.get('retrieved_docs', []))
+
+    ai_context = runtime.context.assistant_ctx.to_dict()
+    user_ctx = runtime.context.user_ctx.to_dict()
+    system_time = datetime.now(tz=timezone.utc).isoformat()
+
+    temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
+
+    prompt_template, prompt_variables = prompt_builder.build_prompt(
+        ai_context=ai_context,
+        user_context=user_ctx, 
+        retrieved_docs=retrieved_docs,
+        system_time = system_time,
+        temporary_message=temporary_system_prompt_update,
+    )
+    
+    runtime.context.temporary_system_prompt_update = ""
+
+    # Inject and create the system prompt and append messages of state
+    injected_prompt = await prompt_template.ainvoke({
+        **prompt_variables, 
+        "messages": state['messages']
+    })
+
+    logger.info(f"INJECTED PROMPT: {injected_prompt}")
+    
+    agent = create_agent(
+        model=model, 
+        tools = tools, 
+        context_schema=GlobalContext, 
+        state_schema=GlobalState,
+    )
+
+    response = await agent.ainvoke(input=injected_prompt)
+
+    logger.info(f"AGENT RESPONSE: {response}")
+    result = {"messages": response['messages'][-1]}
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    logger.info(f"INVOKE MODEL NODE {response['messages']}")
+
+    result = {"messages": [response["messages"]]}
+    logger.info(f"RESULT OF INVOKE MODEL NODE RETURN: {result}")
+
+    return result

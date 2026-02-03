@@ -27,6 +27,10 @@ from src.anubis.utils.context import GlobalContext
 from langgraph.runtime import Runtime
 from langchain.agents import create_agent
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 async def invoke_model_core(
         state: GlobalState, 
         runtime: Runtime[GlobalContext],
@@ -34,6 +38,8 @@ async def invoke_model_core(
         ):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     
+    logger.info(f"invoke model core")
+
     config = runtime.context.configuration # Loads env vars automatically
 
     model = init_model(
@@ -75,6 +81,7 @@ async def invoke_model_core(
         "messages": state['messages']
     })
 
+    logger.info(f"INJECTED PROMPT: {injected_prompt}")
     
     agent = create_agent(
         model=model, 
@@ -85,7 +92,9 @@ async def invoke_model_core(
 
     response = await agent.ainvoke(input=injected_prompt)
 
-    return response 
+    logger.info(f"AGENT RESPONSE: {response}")
+    result = {"messages": response['messages'][-1]}
+    return result
 
 
 

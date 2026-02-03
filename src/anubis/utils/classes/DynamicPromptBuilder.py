@@ -94,6 +94,8 @@ class DynamicPromptBuilder:
             ("placeholder", "{messages}"),
         ])
         
+
+        # Mapping of the variables to the values for injection into the system prompt template
         prompt_vars = {
             "ai_context": ai_context_str,
             "user_context": user_context_str,

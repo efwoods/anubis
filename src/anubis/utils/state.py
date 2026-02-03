@@ -91,5 +91,7 @@ class GlobalState(TypedDict):
     documents_to_be_processed_for_adapter_training: List[Sequence[Document]]
 
 
+    """ Node Routing """
 
+    route_decision: str = ""
 

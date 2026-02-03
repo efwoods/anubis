@@ -17,24 +17,23 @@ class Address(BaseModel):
 
 def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response_format = None):
     provider, model_name = provider_model.split("/", maxsplit=1) 
-    if dev == 'TRUE':
-        from langchain_openai import ChatOpenAI
-        if response_format is None:
-
-            model = ChatOpenAI(
-                        model = model_name,
-                        base_url = base_url,
-                        temperature=0.1,
-                        api_key = api_key,
-                    ).bind_tools(tools=tools)
-        else: 
-            model = ChatOpenAI(
-                model = model_name,
-                base_url = base_url,
-                temperature=0.1,
-                api_key = api_key,
-                response_format=response_format
-            ).bind_tools(tools=tools)
+    # if dev == 'TRUE':
+    from langchain_openai import ChatOpenAI
+    if response_format is None:
+        model = ChatOpenAI(
+                    model = model_name,
+                    base_url = base_url,
+                    temperature=0.1,
+                    api_key = api_key,
+                ).bind_tools(tools=tools)
+    else: 
+        model = ChatOpenAI(
+            model = model_name,
+            base_url = base_url,
+            temperature=0.1,
+            api_key = api_key,
+            response_format=response_format
+        ).bind_tools(tools=tools)
     # else: 
     #     from langchain_together import ChatTogether
     #     model = ChatTogether(model=model_name, temperature=0.1)

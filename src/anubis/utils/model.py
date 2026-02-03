@@ -35,9 +35,9 @@ def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response
                 api_key = api_key,
                 response_format=response_format
             ).bind_tools(tools=tools)
-    else: 
-        from langchain_together import ChatTogether
-        model = ChatTogether(model=model_name, temperature=0.1)
+    # else: 
+    #     from langchain_together import ChatTogether
+    #     model = ChatTogether(model=model_name, temperature=0.1)
     return model
 
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder

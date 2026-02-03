@@ -11,26 +11,112 @@ from langchain.messages import AIMessage, HumanMessage
 from langgraph.store.base import BaseStore
 
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.state import GlobalState
 
 logger = logging.getLogger(__name__)
 
+from datetime import datetime, timezone
+
 @tool
-def health_check(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
-    """Tool is called when the human requests to test tool use.
+async def health_check(runtime: ToolRuntime[GlobalContext]):
+    """Call this health check to determine if tools can be called at all.
 
     Args:
-        runtime (ToolRuntime[GlobalContext]): ToolRuntime
+        runtime (ToolRuntime[GlobalContext]): tool runtime of the current state and context 
 
     Returns:
-        AIMessage: success message
+        _type_: _description_
     """
-    return AIMessage(content="success")
+    return {"messages": AIMessage(content="success")}
 
+# @tool
+# async def health_check(runtime: ToolRuntime[GlobalContext]) -> str:
+#     """Call this tool specifically when the user asks "are you okay?"
+    
+#     Args:
+#         runtime (ToolRuntime[GlobalContext]): ToolRuntime
+        
+#     Returns:
+#         str: The model's response to the updated prompt
+#     """
+#     logger.info("Health check started")
+    
+    
+#     # Extract configuration and context
+#     ctx = runtime.context
+#     config = runtime.context.configuration
+    
+
+#     # Update identity with new information [Example]
+#     await ctx.update_identity({
+#         "health_status": {
+#             "last_check": datetime.now(tz=timezone.utc).isoformat(),
+#             "status": "operational",
+#             "metrics": {
+#                 "uptime": "99.9%",
+#                 "response_time": "50ms"
+#             }
+#         }
+#     })
+    
+#     from src.anubis.utils.model import invoke_model_core
+    
+    
+#     # Create TEMPORARY updated system prompt with health check status
+#     temp_system_prompt = f"""
+
+# TOOL EXECUTION UPDATE:
+# The health_check tool is currently running. System status:
+# - Runtime: Operational
+# - Memory: Normal
+# - Tool execution: In progress
+# - Status: All systems nominal
+
+# Please answer the following questions:
+
+# What is the time?
+# Where are you?
+# What is your name?
+# Who is the president?
+# Who are you talking to?
+
+# Please acknowledge the health check results and provide a brief status summary to the user while also answering the questions.
+# """
+    
+#     # Temporarily update the temporary system prompt within the context
+#     runtime.context.temporary_system_prompt_update = temp_system_prompt
+    
+#     # Initialize model with tools
+#     # [] tools are not being used in this invocation
+#     response = await invoke_model_core(
+#         runtime.state, 
+#         runtime, 
+#         []
+#     )
+#     logger.info(f"Health check completed with model response: {response}")
+
+#     if hasattr(response, 'content'):
+#         response_text = response.content
+#     else:
+#         response_text = str(response)
+
+#     return response_text
+    
+    
 @tool
 async def add_to_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext])-> AIMessage:
-    """ TOOL CALL USE CASE, INPUTS, AND RETURN VALUE"""
+    """THIS TOOL IS CALLED WHEN THE USER REQUESTS THE ATTACHED MEDIA OR RAW TEXT TO BE ADDED TO THE VECTORSTORE"""
     from src.subgraphs.vector_store_graph.index_graph import index_graph
+    from src.subgraphs.process_media_graph import process_media_graph
+
     logger.info('ADD_TO_VECTORESTORE TOOL CALLED XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
+
+    result = process_media_graph(runtime.state, runtime.context)
+    if isinstance(result, AIMessage): # This needs to update to call the invoke_model node to prompt for media. 
+        return AIMessage
+
+    
+
 
     # convert state
     logger.info(f"{runtime.state} XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
@@ -74,23 +160,20 @@ async def add_to_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext])-> AIM
                 
                 return AIMessage(content="Please attach media") # update with custom no media response from llm return to model node with prompt to generate
 
-        # if hasattr(recent_msg, 'media') and recent_msg.media:
-        #     media_docs = process_media(recent_msg.media) # process the media
-        #     recent_docs.extend(media_docs)
-        # else:
-        #     recent_docs.append(Document(page_content=content or ""))
-
 
     index_input = {"docs": recent_docs}
     logger.info(f"index_input XXXXXXXXXXXXXXXXXXXXXXXXX {index_input}")
     
-    result = await index_graph.ainvoke(index_input, {"configurable": {"user_id": "test_user_1234"}}) # user id is bypassed for testing
+    result = await index_graph.ainvoke(index_input, runtime) # user id is bypassed for testing
 
     # logger.info(f"RESULT XXXXXXXXXXXXXXXXXXXXXXXXX {result}")
     # # Return results of subgraph
     # ai_content = result.get('messages', [-1]).content if result.get('messages') else "Indexed successfully"
     return AIMessage(content="added to vectorstore successfully")
-    
+
+
+
+
 @tool
 async def retrieve_from_vectorstore_subgraph(runtime: ToolRuntime[GlobalContext]) -> AIMessage:
     """Generates the correct query to search the vectorstore for relevant documents to the Human query.

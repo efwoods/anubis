@@ -32,8 +32,7 @@ from langchain_community.document_loaders import JSONLoader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 
-from uuid import UUID
-
+from uuid import uuid4
 
 import logging
 logger = logging.getLogger(__name__)
@@ -239,8 +238,9 @@ def _load_video(
     pass
 
 # metadata: Optional[Dict]
+from src.anubis.utils.model import init_model
 async def extract_personality_from_image(
-    image_source: Union[str, Path, UploadFile, bytes]
+    image_source: Union[str, Path, UploadFile, bytes], runtime: Runtime[GlobalContext]
 ) -> Document:
     """Extract personality description from image using vision LLM."""
     # base64_image = self._image_to_base64(image_source)
@@ -254,18 +254,21 @@ async def extract_personality_from_image(
         "Do not describe the physical appearance"
     )
     # these requests need to use the model in the graph rather than the requests because of 400 errors
-    response = requests.post(
-        url=os.getenv("LLAMA_API_BASE_URL")+ "chat/completions",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.getenv("LLAMA_API_KEY")}",
-        },
-        json={
-            "model": os.getenv("MODEL"),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
+
+    ctx = runtime.context
+    configuration = runtime.context.configuration
+
+    tools = []
+
+    model = init_model(
+        configuration.provider_model,
+        configuration.llama_api_base_url,
+        configuration.llama_api_key,
+        tools, 
+        configuration.dev
+    )
+
+    image_to_target_textual_description_payload = [
                         {
                             "type": "text",
                             "text": (text_prompt_for_image_to_text_context),
@@ -276,13 +279,13 @@ async def extract_personality_from_image(
                                 "url": f"data:image/jpeg;base64,{image_source}"
                             },
                         },
-                    ],
-                }
-            ],
-            "max_completion_tokens": 1024,
-            "temperature": 0.0,
-        },
+                    ]
+
+    message = HumanMessage(
+        content=image_to_target_textual_description_payload
     )
+
+    response = model.ainvoke([message])
 
     logger.info(f"response: {response}")
 
@@ -318,10 +321,204 @@ async def extract_personality_from_image(
     # document_ids = self.chroma_DB.vector_store.add_documents(documents=all_splits)
     return doc
 
+
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.context import GlobalContext
+from langgraph.runtime import Runtime
+
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+
+from src.anubis.utils.model import init_model
+
+async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
+    messages = runtime.state['messages']
+    logger.info(f"MESSAGES XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages}")
+    
+    logger.info(f" LEN MESSAGE XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {len(messages)}")
+
+    recent_msg = messages[-1]
+    # logger.info(f" RECENT MESSAGE messages[-1] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[-1]}")
+    # logger.info(f" RECENT MESSAGE messages[0] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[0]}")
+    # logger.info(f" RECENT MESSAGE messages[1] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[1]}")
+    # [logger.info(f"{message}") for message in messages['content']['text']]
+    # count = 0
+    # for message in messages:
+    #     logger.info(f"{count}: {message}")
+    #     count+=1
+    # logger.info(f"penultimate has data: messages[-2]: {messages[-2]}")
+
+    # logger.info(f" XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {isinstance(recent_msg, HumanMessage)}")
+    recent_message = messages[-2] # HumanMessage with Content 
+    # Expects format:
+    """ [
+        {"type":"text", "text":"text from human message"}, 
+        {"type":"image", "data":"BASE64_IMAGE_DATA"}, ZERO OR MORE IMAGE DICTIONARIES
+        {"type":"url", "url":"hypterlink.com"}, etc..
+        ]
+    """
+
+    if isinstance(recent_message, HumanMessage):
+        # logger.info(f"CONTENT XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {recent_msg.content}")
+        content = recent_message.content
+        logger.info(f"len content: {len(content)}")
+        # logger.info(f"content: {content}")
+
+        media_list = []
+        try:
+            if len(content > 1):
+                media_list = content[1:]
+            human_text = content[0] # This could contain text
+            return {"media_list": media_list} # replace media list     
+                       
+        except Exception as e:
+            logger.info(f"Error during EXTRACT MEDIA FROM MESSAGE: {e}")
+            raise e
+
+from langgraph.prebuilt import ToolRuntime
+from langchain.tools import tool
+
+@tool
+async def base64_image(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a base64 image string to a Document with text. """
+    doc = extract_personality_from_image(media_data["data"], runtime.state)
+    return doc
+
+@tool
+async def non_base64_image(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a NON base64 image object to a Document with text. """
+    pass
+
+@tool
+async def text_only_input(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a text string to a Document with text. """
+    pass
+
+@tool
+async def audio(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert audio to a Document with text. """
+    pass
+
+@tool
+async def video(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ Used to convert a video to a Document with text. """
+    pass
+
+@tool
+async def handle_url(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+    """ 
+    Used to convert a url to a Document with text. May require other tool use. 
+    Download the content from the URL.
+    Queue the content as media to be processed. 
+    """
+    pass
+
+MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
+    "base64_image" : base64_image, 
+    "non_base64_image": non_base64_image, 
+    "text_only_input": text_only_input, 
+    "audio": audio,
+    "video": video,
+    "handle_url": handle_url
+}
+
+
+from langgraph.func import task
+
+@task
+async def process_media_task(process_media_item: Dict) -> Document:
+    """ Task: Convert the media item to a Document of text """
+    
+    logging.info(f"PROCESS_MEDIA_TASK NODE")
+
+    process_type = process_media_item["process_type"] # The process_type is the name of the tool to be called
+
+    tool = MEDIA_CONVERSION_TOOLS.get(process_type)
+
+    return await tool.ainvoke(process_media_item["content"])
+
+async def determine_media_type(state: GlobalState, context: GlobalContext):
+    """ Determines the media type in a given list of media.
+     I should be able to indicate the media type for each type of media
+    then convert the media in a list of one or more media to text in parallel.
+    Exptected format:
+    [
+        {
+            "type": "MEDIA_TYPE", 
+            "data|text|indicator": "CONTENT OF MEDIA", 
+            "metadata":{
+                fields may include mime-type or the metadata may not exists at all
+                }
+        }, 
+        ...
+    ]
+    I want to keep the media in a list and queue tasks for each item in the list then I want to execute those tasks in parallel and update the final state with the list of text Documents from the media:
+async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
+
+    """
+    
+    logging.info(f"DETERMINE_MEDIA_TYPE NODE")
+    
+    media_list = state.get('media_list', [])
+    process_type_list = []
+    for media in media_list:
+        if hasattr(media, "type"):
+            if media['type'] == "image": # deterimine if base64
+                if hasattr(media, "data"):
+                    # base64 encoded data
+                    process_type = "base64_image"
+                else:
+                    process_type = "non_base64_image"
+            elif media['type'] == "text":
+                process_type = "text_only_input"
+            elif media['type'] == "audio":
+                process_type == "audio" 
+            elif media['type'] == "video":
+                process_type == "video" 
+            elif media['type'] == "url":
+                process_type = "handle_url"
+            else:
+                logger.warning(f"unhandled media type in determine media type: {media['type']}")
+                continue
+        process_type_list.append({
+            "process_type": process_type, 
+            "content":{**media}, 
+            "task_id": uuid4()
+        }) 
+
+        tasks = [process_media_task(process_media_item) for process_media_item in process_type_list] # queue tool call execution
+
+        # Convert Media to text
+        document_futures = [task.result() for task in tasks]
+        docs = await asyncio.gather(*document_futures, return_exceptions=True)
+
+        # Filter valid Documents (successful processes)
+        documents = [doc for doc in docs if isinstance(doc, Document)]
+
+        # Add process_task_ids and user/assistant metadata for each document
+        documents = [doc.metadata.update({
+            "process_task_id": uuid4(), 
+            "user_id": context.user_ctx.user_id,
+            "assistant_id": context.assistant_ctx.assistant_id,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(), 
+            "updated_at": None, 
+        }) for doc in documents]
+
+
+        return {
+            "processed_media_to_be_formatted": documents, # Documents are appended to the list in the state
+            "media_list": [] # clear the list of media
+        }
+
+import asyncio
+from asyncio import Task
+from typing import List
+from datetime import datetime, timezone
+
 async def identify_media(
     file: Any, 
 ) -> Union[Document]:
-    """Convert media (image/audio) to searchable text docs."""
+    """Convert media (image/audio) to searchable text docs. DEPRECATED"""
     # Example for image: use vision model or OCR
     # text = vision_llm.invoke([media])['text']
     # return [Document(page_content=text, metadata={"source": "media"})]

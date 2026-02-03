@@ -19,6 +19,10 @@ from src.anubis.utils.state import GlobalState
 
 from src.anubis.utils.helper_functions import format_docs
 
+from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
+
+from src.anubis.utils.model import invoke_model_core
+
 from src.anubis.utils.tools import (
     health_check, 
     # add_to_vectorstore_subgraph, 
@@ -26,14 +30,30 @@ from src.anubis.utils.tools import (
     # upsert_memory
 )
 
-
-
 # Optional: Add tools=[] if you have them
-tools = [health_check]  # Replace with your tools
+tools = [health_check]  # Replace with your tools 
 
 async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
-    """Single agent node: init model from context, bind tools, respond."""
-    ctx = runtime.context
+    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    logger.info(f"INVOKE MODEL NODE ")
+    
+    response = await invoke_model_core(
+        state=state,
+        runtime=runtime,
+        tools=tools,
+    )
+
+    logger.info(f"INVOKE MODEL NODE {response['messages']}")
+
+    result = {"messages": [response["messages"]]}
+    logger.info(f"RESULT OF INVOKE MODEL NODE RETURN: {result}")
+
+    return result
+
+async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
+    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    logger.info(f"INVOKE AGENT NODE ")
+    
     config = runtime.context.configuration # Loads env vars automatically
 
     model = init_model(
@@ -43,32 +63,39 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
         tools,
         config.dev
     )
-    
-
 
     # build system prompt with injection
     # search store for current context information
     # update the context
     # inject the system prompt with context from user and assistant
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", GlobalConfiguration.response_system_prompt),
-        ("placeholder", "{messages}"),
-    ])
+    prompt_builder = DynamicPromptBuilder()
 
-    retrieved_docs = format_docs(state['retrieved_docs'])
+    retrieved_docs = format_docs(state.get('retrieved_docs', []))
 
-    ctx.assistant_ctx.name = "You are Elon Musk"
+    ai_context = runtime.context.assistant_ctx.to_dict()
+    user_ctx = runtime.context.user_ctx.to_dict()
+    system_time = datetime.now(tz=timezone.utc).isoformat()
 
-    # This is how prompt injection happens
-    injected_prompt = await prompt.ainvoke(
-        {
-            "messages": state['messages'],
-            "retrieved_docs": retrieved_docs,
-            "system_time": datetime.now(tz=timezone.utc).isoformat(),
-            "ai_context": ctx.assistant_ctx.name
-        }
+    temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
+
+    prompt_template, prompt_variables = prompt_builder.build_prompt(
+        ai_context=ai_context,
+        user_context=user_ctx, 
+        retrieved_docs=retrieved_docs,
+        system_time = system_time,
+        temporary_message=temporary_system_prompt_update,
     )
+    
+    runtime.context.temporary_system_prompt_update = ""
+
+    # Inject and create the system prompt and append messages of state
+    injected_prompt = await prompt_template.ainvoke({
+        **prompt_variables, 
+        "messages": state['messages']
+    })
+
+    logger.info(f"INJECTED PROMPT: {injected_prompt}")
     
     agent = create_agent(
         model=model, 
@@ -79,4 +106,46 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     response = await agent.ainvoke(input=injected_prompt)
 
-    return response
+    logger.info(f"AGENT RESPONSE: {response}")
+    result = {"messages": response['messages'][-1]}
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    logger.info(f"INVOKE MODEL NODE {response['messages']}")
+
+    result = {"messages": [response["messages"]]}
+    logger.info(f"RESULT OF INVOKE MODEL NODE RETURN: {result}")
+
+    return result

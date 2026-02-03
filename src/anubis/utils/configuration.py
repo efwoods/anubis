@@ -165,6 +165,7 @@ class GlobalConfiguration(IndexConfiguration):
         default=None, 
         metadata={"description": "inference provider for production use and for adapter training."}
     )
+    
 
 
     def __post_init__(self):

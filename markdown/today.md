@@ -49,3 +49,16 @@ The assistant knows facts about itself.
 VECTORSTORE ADD AND RETRIEVE
 CONVERT MEDIA
 PROMPT-DOCUMENT ANALYSIS OF TEXT WITH LLM (TOOL)
+
+
+### 
+prompt for memories and add memories to the identity in conversation ; this is a recollection with a source as "recollection from user_id"
+
+Q and Answer format for turn-style recollection and memory addition
+
+CHAT WITHOUT DOUBLE MESSAGES
+TOOL USE HEALTH CHECK
+UPDATE IDENTITY OF ASSISTANT AND USER
+STORE MEMORIES IN STORAGE
+INDEX DOCUMENTS INTO VECTORSTORE
+RETRIEVE DOCUMENTS FROM VECTORSTORE

@@ -26,11 +26,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Define the function that calls the model
-
-
 class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
-
     query: str
 
 
@@ -160,10 +157,10 @@ builder = StateGraph(State, input_schema=AnubisState, context_schema=Configurati
 
 builder.add_node(generate_query)  # type: ignore[arg-type]
 builder.add_node(retrieve)  # type: ignore[arg-type]
-builder.add_node(respond)  # type: ignore[arg-type]
+# builder.add_node(respond)  # type: ignore[arg-type]
 builder.add_edge("__start__", "generate_query")
 builder.add_edge("generate_query", "retrieve")
-builder.add_edge("retrieve", "respond")
+# builder.add_edge("retrieve", "respond")
 
 # Finally, we compile it!
 # This compiles it into a graph you can invoke and deploy.

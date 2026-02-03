@@ -13,8 +13,6 @@ class Address(BaseModel):
     state: str
     zip: str
 
-
-
 def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response_format = None):
     provider, model_name = provider_model.split("/", maxsplit=1) 
     # if dev == 'TRUE':

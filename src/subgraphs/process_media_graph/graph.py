@@ -16,7 +16,6 @@ from src.anubis.utils.context import GlobalContext
 from src.subgraphs.process_media_graph.utils.nodes import (
     extract_media_from_message, 
     determine_media_type,
-    convert_media_to_text,
 )
 
 # Define the Graph & Context
@@ -33,4 +32,4 @@ workflow.add_edge("extract_media_from_message", "determine_media_type")
 process_media_graph = workflow.compile()
 process_media_graph.name = "process_media_graph"
 
-__all__ = ["process_media_graph"]
+__all__ = ["process_media_graph"]            

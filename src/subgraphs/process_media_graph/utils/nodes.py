@@ -26,7 +26,6 @@ import json
 from typing import Optional
 from langchain_core.documents import Document
 
-
 from langchain_community.document_loaders import TextLoader
 from langchain_community.document_loaders import JSONLoader
 from langchain_community.document_loaders import PyPDFLoader
@@ -332,48 +331,60 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from src.anubis.utils.model import init_model
 
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
-    messages = runtime.state['messages']
-    logger.info(f"MESSAGES XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages}")
     
-    logger.info(f" LEN MESSAGE XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {len(messages)}")
+    messages = state.get('messages', [])
 
-    recent_msg = messages[-1]
-    # logger.info(f" RECENT MESSAGE messages[-1] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[-1]}")
-    # logger.info(f" RECENT MESSAGE messages[0] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[0]}")
-    # logger.info(f" RECENT MESSAGE messages[1] XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {messages[1]}")
-    # [logger.info(f"{message}") for message in messages['content']['text']]
-    # count = 0
-    # for message in messages:
-    #     logger.info(f"{count}: {message}")
-    #     count+=1
-    # logger.info(f"penultimate has data: messages[-2]: {messages[-2]}")
+    if not messages:
+        logger.warning("No messages found in state")
+        return {"media_list": []}
+    
+    logger.info(f"Processing {len(messages)} messages")
 
-    # logger.info(f" XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {isinstance(recent_msg, HumanMessage)}")
-    recent_message = messages[-2] # HumanMessage with Content 
-    # Expects format:
-    """ [
-        {"type":"text", "text":"text from human message"}, 
-        {"type":"image", "data":"BASE64_IMAGE_DATA"}, ZERO OR MORE IMAGE DICTIONARIES
-        {"type":"url", "url":"hypterlink.com"}, etc..
-        ]
-    """
+    # Get the most recent HumanMessage
+    recent_message = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            recent_message = msg
+            break
+    
+    if not recent_message:
+        logger.info("No HumanMessage found")
+        return {"media_list": []}
 
-    if isinstance(recent_message, HumanMessage):
-        # logger.info(f"CONTENT XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX {recent_msg.content}")
-        content = recent_message.content
-        logger.info(f"len content: {len(content)}")
-        # logger.info(f"content: {content}")
+    content = recent_message.content
 
+    # Handle string content (no media)
+    if isinstance(content, str):
+        logger.info("Message contains only text, no media")
+        return {"media_list": []}
+    
+    # Handle list content (may contain media)
+    if isinstance(content, list):
+        logger.info(f"Message content has {len(content)} items")
+
+        # Extract media (skip first item if it's text)
         media_list = []
-        try:
-            if len(content > 1):
-                media_list = content[1:]
-            human_text = content[0] # This could contain text
-            return {"media_list": media_list} # replace media list     
-                       
-        except Exception as e:
-            logger.info(f"Error during EXTRACT MEDIA FROM MESSAGE: {e}")
-            raise e
+        for item in content: 
+            if isinstance(item, dict):
+                item_type = item.get("type", "")
+
+                # Skip pure text items
+                if item_type == "text":
+                    continue
+
+                # Add media items
+                if item_type in ["image", "image_url", "audio", "video", "url"]:
+                    media_list.append(item)
+            
+        logger.info(f"Extracted {len(media_list)} media items")
+        return {"media_list": media_list}
+
+    logger.warning(f"Unexpected content type: {type(content)}")
+    return {"media_list": []}
+
+
+
+
 
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool

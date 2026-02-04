@@ -42,17 +42,19 @@ from src.anubis.utils.nodes import (
 workflow = StateGraph(state_schema = GlobalState, context_schema = GlobalContext)
 
 # Add single node (your input/output)
-workflow.add_node("call_router", call_router)
+# workflow.add_node("call_router", call_router)
 workflow.add_node("invoke_agent", invoke_agent)
 
 
 # Edges
 # workflow.add_edge(START, "invoke_agent")
-workflow.add_edge(START, "call_router")
-workflow.add_conditional_edges("call_router", 
-                               route_node_from_decision, 
-                               {"invoke_agent": "invoke_agent"}
-                            )
+workflow.add_edge(START, "invoke_agent")
+
+# workflow.add_conditional_edges("call_router", 
+#                                route_node_from_decision, 
+#                                {"invoke_agent": "invoke_agent"}
+#                             )
+
 workflow.add_edge("invoke_agent", END)
 
 graph = workflow.compile()

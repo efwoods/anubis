@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableConfig, ensure_config
 
 from src.subgraphs.vector_store_graph.utils import prompts
 
+import os
 
 @dataclass(kw_only=True)
 class IndexConfiguration:

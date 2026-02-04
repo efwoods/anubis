@@ -67,8 +67,13 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
     # Retrieve documents for the query
     from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
-    {"retrieved_docs": response}
-    new_state_retrieved_docs = retrieval_graph.ainvoke
+    human_message = state['messages'][-1]
+
+    assert(isinstance(human_message, HumanMessage))
+    
+    retrieval_message = {"messages" : [human_message]}
+
+    new_state_retrieved_docs = await retrieval_graph.ainvoke(retrieval_message, context=runtime.context)
     
     # populate the relevant documents with a new state
     state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']

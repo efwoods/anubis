@@ -16,6 +16,7 @@ from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
 
+
 @dataclass
 class UserContext:
     user_id: str = field(default="default_user_id_1234")

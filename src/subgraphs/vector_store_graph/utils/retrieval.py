@@ -7,23 +7,27 @@ The retrievers support filtering results by user_id to ensure data isolation bet
 """
 
 import os
-from contextlib import contextmanager
-from typing import Generator
+from contextlib import contextmanager, asynccontextmanager
+from typing import Generator, AsyncGenerator
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
 from langchain_core.vectorstores import VectorStoreRetriever
+from src.anubis.utils.configuration import IndexConfiguration, GlobalConfiguration
 
-from src.subgraphs.vector_store_graph.utils.configuration import Configuration, IndexConfiguration
+import asyncio
 
 ## Encoder constructors
-
-
-def make_text_encoder(model: str) -> Embeddings:
+async def make_text_encoder(model: str) -> Embeddings:
     """Connect to the configured text encoder."""
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embeddings = await asyncio.to_thread(
+        HuggingFaceEmbeddings,
+        model_name=model
+    )
+
+    return embeddings
 
     # provider, model_name = model.split("/", maxsplit=1)
     # match provider:
@@ -95,31 +99,44 @@ def make_pinecone_retriever(
     yield vstore.as_retriever(search_kwargs=search_kwargs)
 
 
-@contextmanager
-def make_mongodb_retriever(
+@asynccontextmanager
+async def make_mongodb_retriever(
     configuration: IndexConfiguration, embedding_model: Embeddings
-) -> Generator[VectorStoreRetriever, None, None]:
+) -> AsyncGenerator[VectorStoreRetriever, None]:
     """Configure this agent to connect to a specific MongoDB Atlas index & namespaces."""
     from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
 
-    vstore = MongoDBAtlasVectorSearch.from_connection_string(
+    vstore = await asyncio.to_thread(
+        MongoDBAtlasVectorSearch.from_connection_string, 
         os.environ["MONGODB_URI"],
         namespace="mvp_mongo_db.vectorstore",
         embedding=embedding_model
     )
+
     search_kwargs = configuration.search_kwargs
     # pre_filter = search_kwargs.setdefault("pre_filter", {})
     # pre_filter["user_id"] = {"$eq": configuration.user_id}
     yield vstore.as_retriever(search_kwargs=search_kwargs)
 
 
-@contextmanager
-def make_retriever(
-    config: RunnableConfig,
-) -> Generator[VectorStoreRetriever, None, None]:
+from langgraph.runtime import Runtime
+from src.anubis.utils.context import GlobalConfiguration
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def make_retriever(
+    configuration: GlobalConfiguration,
+) -> AsyncGenerator[VectorStoreRetriever, None]:
     """Create a retriever for the agent, based on the current configuration."""
-    configuration = IndexConfiguration.from_runnable_config(config)
-    embedding_model = make_text_encoder(configuration.embedding_model)
+    # configuration = IndexConfiguration.from_runnable_config(config)
+    embedding_model = await make_text_encoder(configuration.embedding_model)
+
+    logger.info(f" configuration.embedding_model: {configuration.embedding_model}")
+
+    # embedding_model = HuggingFaceEmbeddings(configuration.embedding_model)
     user_id = configuration.user_id
     # assistant_id = configuration.assistant_id
     if not user_id:
@@ -134,12 +151,12 @@ def make_retriever(
                 yield retriever
 
         case "mongodb":
-            with make_mongodb_retriever(configuration, embedding_model) as retriever:
+            async with make_mongodb_retriever(configuration, embedding_model) as retriever:
                 yield retriever
 
         case _:
             raise ValueError(
                 "Unrecognized retriever_provider in configuration. "
-                f"Expected one of: {', '.join(Configuration.__annotations__['retriever_provider'].__args__)}\n"
+                f"Expected one of: {', '.join(GlobalConfiguration.__annotations__['retriever_provider'].__args__)}\n"
                 f"Got: {configuration.retriever_provider}"
             )

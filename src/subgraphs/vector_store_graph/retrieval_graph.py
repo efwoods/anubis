@@ -17,9 +17,9 @@ from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
 from src.subgraphs.vector_store_graph.utils import retrieval
-from src.subgraphs.vector_store_graph.utils.configuration import Configuration
-from src.subgraphs.vector_store_graph.utils.state import InputState, State
-from src.anubis.utils.state import AnubisState
+from src.anubis.utils.configuration import GlobalConfiguration
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.state import GlobalState
 from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
 
 import logging
@@ -30,9 +30,10 @@ class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
     query: str
 
+from langgraph.runtime import Runtime
 
 async def generate_query(
-    state: State, *, config: RunnableConfig
+    state: GlobalState, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[str]]:
     """Generate a search query based on the current state and configuration.
 
@@ -42,7 +43,7 @@ async def generate_query(
 
     Args:
         state (State): The current state containing messages and other information.
-        config (RunnableConfig | None, optional): Configuration for the query generation process.
+        config (RunnableConfig | None, optional): GlobalConfiguration for the query generation process.
 
     Returns:
         dict[str, list[str]]: A dictionary with a 'queries' key containing a list of generated queries.
@@ -53,13 +54,14 @@ async def generate_query(
         - The function uses the configuration to set up the prompt and model for query generation.
     """
     logging.info(f"XXXXX GENERATE QUERY NODE XXXX")
-    messages = state.messages
+    messages = state['messages']
     if len(messages) == 1:
         # It's the first user question. We will use the input directly to search.
         human_input = get_message_text(messages[-1])
         return {"queries": [human_input]}
     else:
-        configuration = Configuration.from_runnable_config(config)
+        
+        configuration = runtime.context.configuration
         # Feel free to customize the prompt, model, and other logic!
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -77,16 +79,16 @@ async def generate_query(
                 "queries": "\n- ".join(state.queries),
                 "system_time": datetime.now(tz=timezone.utc).isoformat(),
             },
-            config,
+            configuration,
         )
-        generated = cast(SearchQuery, await model.ainvoke(message_value, config))
+        generated = cast(SearchQuery, await model.ainvoke(message_value, configuration))
         return {
             "queries": [generated.query],
         }
 
 
 async def retrieve(
-    state: State, config: RunnableConfig
+    state: GlobalState, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -96,7 +98,7 @@ async def retrieve(
 
     Args:
         state (State): The current state containing queries and the retriever.
-        config (RunnableConfig | None, optional): Configuration for the retrieval process.
+        config (RunnableConfig | None, optional): GlobalConfiguration for the retrieval process.
 
     Returns:
         dict[str, list[Document]]: A dictionary with a single key "retrieved_docs"
@@ -104,32 +106,33 @@ async def retrieve(
     """
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
 
-    with retrieval.make_retriever(config) as retriever:
+    configuration = runtime.context.configuration
+    async with retrieval.make_retriever(configuration) as retriever:
         # logger.info(f"XXXXXXXXXXXXXXXXXX CONFIGURATION: {config}")
         
-        logger.info(f"{config}")
+        logger.info(f"{configuration}")
 
-        logger.info(f"{state.queries[-1]}")
-        response = await retriever.ainvoke(state.queries[-1], config)
+        logger.info(f"{state['queries'][-1]}")
+        response = await retriever.ainvoke(state['queries'][-1])
         # CRITICAL: filter= here
         # response = await retriever.asimilarity_search(
         #     state.queries[-1], 
-        #     k=5,
         #     # filter={"user_id": {"$eq": }},  # MongoDB $eq filter
         #     fetch_k=100,  # Pre-filter candidates
         #     # search_kwargs={"score_threshold": 0.7}  # Optional scoring
         # )
-        logger.info(f"Query: {state.queries[-1]} | Docs: {len(response)}")
+        logger.info(f"Query: {state['queries'][-1]} | Docs: {len(response)}")
         logger.info(f"{response}")
         return {"retrieved_docs": response}
 
 
 async def respond(
-    state: State, *, config: RunnableConfig
+    state: GlobalState, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[BaseMessage]]:
     """Call the LLM powering our "agent"."""
     logging.info(f"XXXXX REPONSE NODE XXXX")
-    configuration = Configuration.from_runnable_config(config)
+    configuration = runtime.context.configuration
+
     # Feel free to customize the prompt, model, and other logic!
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -146,14 +149,15 @@ async def respond(
             "retrieved_docs": retrieved_docs,
             "system_time": datetime.now(tz=timezone.utc).isoformat(),
         },
-        config,
+        configuration,
     )
-    response = await model.ainvoke(message_value, config)
+    response = await model.ainvoke(message_value, configuration)
     # We return a list, because this will get added to the existing list
     return {"messages": [response]}
 
 # Define a new graph (It's just a pipe)
-builder = StateGraph(State, input_schema=AnubisState, context_schema=Configuration)
+
+builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(generate_query)  # type: ignore[arg-type]
 builder.add_node(retrieve)  # type: ignore[arg-type]

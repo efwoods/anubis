@@ -64,69 +64,88 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
         config.dev
     )
 
-    # build system prompt with injection
-    # search store for current context information
-    # update the context
-    # inject the system prompt with context from user and assistant
+    # Retrieve documents for the query
+    from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
+
+    human_message = state['messages'][-1]
+
+    assert(isinstance(human_message, HumanMessage))
+    
+    retrieval_message = {"messages" : [human_message]}
+
+    new_state_retrieved_docs = await retrieval_graph.ainvoke(retrieval_message, context=runtime.context)
+    
+    # populate the relevant documents with a new state
+    state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
+
+    # Vectorstore Retrieved Docments
+    retrieved_docs = format_docs(state.get('retrieved_docs', []))
 
     prompt_builder = DynamicPromptBuilder()
 
-    retrieved_docs = format_docs(state.get('retrieved_docs', []))
+    # TODO: Update the assistant context from the state
 
+    # Load the current assistant context for prompt injection
     ai_context = runtime.context.assistant_ctx.to_dict()
+
+    # TODO: Update the user context from the state
+
+    # Load the current user context from prompt injection
     user_ctx = runtime.context.user_ctx.to_dict()
+
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
     temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
 
-    prompt_template, prompt_variables = prompt_builder.build_prompt(
+    populated_template = prompt_builder.build_prompt(
         ai_context=ai_context,
         user_context=user_ctx, 
         retrieved_docs=retrieved_docs,
         system_time = system_time,
         temporary_message=temporary_system_prompt_update,
     )
-    
+
+    logger.info(f"populated_template: {populated_template}")
+
+    # clear the temporary injected prompt
     runtime.context.temporary_system_prompt_update = ""
 
-    # Inject and create the system prompt and append messages of state
-    # injected_prompt = await prompt_template.ainvoke({
-    #     **prompt_variables, 
-    #     "messages": state['messages']
-    # })
-
-    # logger.info(f"INJECTED PROMPT: {injected_prompt}")
+    # prepend system message
+    messages_input = populated_template.messages + state["messages"]
     
-    # agent = create_agent(
-    #     model=model, 
-    #     tools = tools, 
-    #     context_schema=GlobalContext, 
-    #     state_schema=GlobalState,
-    # )
-    injected_prompt = [SystemMessage(content="This is a system message")] + state['messages']
+    logger.info(f"messages_input: {messages_input}")
     
-
-    response = await model.ainvoke(input=injected_prompt)
+    # Call the model
+    response = await model.ainvoke(input=messages_input)
 
     logger.info(f"AGENT RESPONSE: {response}")
     result = {"messages": [response]}
     return result
 
-# upload_document: str
-    # learn_about_identity_q_and_a: str
 
-class RouteDecision:
-    chat: str
+from pydantic import BaseModel, Field
+from typing import Literal
+from langgraph.types import Command
 
-async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]):
-    """Decides whether to upload new personal information or to respond
+class RouteDecision(BaseModel):
+    """"Determine whether to upload media or respond to the conversation. """
+    reasoning: str = Field(
+        description="Step-by-step reasoning behind the decision for the route."
+    )
+    route_decision: Literal["chat"] = Field(
+        description="Classification of the route. chat if responding to the conversation. upload if the user indicates the attached media needs to be added to the identity or uploaded."
+    )
+
+
+async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]) -> Command[Literal["chat"]]:
+    """Decides whether to upload new personal information or to respond based upon the chat
 
     Args:
         state (GlobalState): message state
         runtime (Runtime[GlobalContext]): context of agent and user and configuration
 
     Returns:
-        str: next node location
+        command: next node location
     """
     logger.info(f"CALL ROUTER")
     
@@ -143,7 +162,7 @@ async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]):
         response_format=RouteDecision
     )
 
-    decision_instructions = """Route the input to upload a document, learn about your identity, or respond to a chat.
+    decision_instructions = """Route to chat.
 """
     system_message = SystemMessage(content=decision_instructions)
     
@@ -153,12 +172,12 @@ async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     human_message = state['messages'][-1]
 
-    decided_route = model_router_structured_output.ainvoke(
+    decided_route = await model_router_structured_output.ainvoke(
         [system_message, human_message]
     )
+    logger.info(f"DECIDED ROUTE {decided_route}")
     
     return {"route_decision": decided_route}
-
 
 async def route_node_from_decision(state: GlobalState, runtime: GlobalContext) -> str:
     logger.info(f"ROUTING NODE FROM DECISION")
@@ -166,44 +185,5 @@ async def route_node_from_decision(state: GlobalState, runtime: GlobalContext) -
     if route_decision == "chat":
         return "invoke_agent"
     else:
+        logger.info(f"NON CHAT")
         return "invoke_agent"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    logger.info(f"INVOKE MODEL NODE {response['messages']}")
-
-    result = {"messages": [response["messages"]]}
-    logger.info(f"RESULT OF INVOKE MODEL NODE RETURN: {result}")
-
-    return result

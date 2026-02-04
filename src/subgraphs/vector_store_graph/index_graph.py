@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from src.subgraphs.vector_store_graph.utils import retrieval
-from src.subgraphs.vector_store_graph.utils.configuration import IndexConfiguration
+from src.anubis.utils.configuration import IndexConfiguration
 from src.subgraphs.vector_store_graph.utils.state import IndexState
 
 from src.anubis.utils.context import GlobalContext

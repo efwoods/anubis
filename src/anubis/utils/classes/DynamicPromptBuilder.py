@@ -91,7 +91,6 @@ class DynamicPromptBuilder:
         # Create the prompt template
         prompt = ChatPromptTemplate.from_messages([
             ("system", self.base_prompt),
-            ("placeholder", "{messages}"),
         ])
         
 
@@ -104,5 +103,7 @@ class DynamicPromptBuilder:
             "temporary_message": temp_msg_str
         }
 
-        return prompt, prompt_vars
+        populated_template =  prompt.invoke(prompt_vars)
+
+        return populated_template
 

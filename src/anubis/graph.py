@@ -31,28 +31,21 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.model import init_model  # Your model init with env vars
 from src.anubis.utils.nodes import (
-    invoke_agent, 
-    call_router, 
-    route_node_from_decision
+    invoke_agent
 )
 
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(state_schema = GlobalState, context_schema = GlobalContext)
 
 # Add single node (your input/output)
-workflow.add_node("call_router", call_router)
+# workflow.add_node("call_router", call_router)
 workflow.add_node("invoke_agent", invoke_agent)
 
-
 # Edges
-# workflow.add_edge(START, "call_router")
-# workflow.add_conditional_edges("call_router", 
-                            #    route_node_from_decision, 
-                            #    {"invoke_agent": "invoke_agent"}
-                            # )
+# workflow.add_edge(START, "invoke_agent")
 workflow.add_edge(START, "invoke_agent")
+
 workflow.add_edge("invoke_agent", END)
 
 graph = workflow.compile()

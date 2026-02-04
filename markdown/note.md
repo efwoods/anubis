@@ -11,3 +11,9 @@ Each user may choose to share their server with the public
 Their are proprietary servers that everyone has access to. 
 
 There are no assistants only a customized Anubis agent.
+
+----
+02/04/2026:
+actions are in italics
+could use re-retrieval during inference for documents from the vectorstore but not from the store for memory updates until new documents have been uploaded and analyzed
+

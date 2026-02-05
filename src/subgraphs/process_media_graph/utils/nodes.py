@@ -387,7 +387,7 @@ async def extract_text_from_audio(audio_data: str) -> Document:
         # Decode base64 audio data
         audio_bytes = base64.b64decode(audio_data)
         
-        # Create temporary file
+        # Create temporary file [SYNCHRONOUS WRITE]
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
             temp_audio.write(audio_bytes)
             temp_audio_path = temp_audio.name

@@ -1,3 +1,91 @@
+This needs to be an asynchronous function. 
+
+I need audio transcription that will be hosted as a server endpoint that will scale to multiple requests for production. 
+
+I need to establish the LRU cache of the model on startup of the webapp
+
+
+
+
+
+async def extract_text_from_audio(audio_data: str) -> Document:
+
+    """Extract text from audio using Hugging Face Whisper Large v3"""
+
+logger.warning(f"THIS IS UNTESTED")
+
+import base64
+
+import tempfile
+
+import os
+
+import asyncio
+
+logger.info(f"extract text from audio ENTRYPOINT")
+
+try:
+
+# Decode base64 audio data
+
+audio_bytes = base64.b64decode(audio_data)
+
+# Create temporary file [SYNCHRONOUS WRITE]
+
+with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+
+temp_audio.write(audio_bytes)
+
+temp_audio_path = temp_audio.name
+
+try:
+
+# Get cached pipeline
+
+pipe = get_whisper_pipeline()
+
+# Run transcription in thread pool (it's CPU/GPU intensive)
+
+loop = asyncio.get_event_loop()
+
+result = await loop.run_in_executor(None, pipe, temp_audio_path)
+
+transcript = result["text"]
+
+# Create Document with transcription
+
+doc = Document(
+
+page_content=transcript,
+
+metadata={
+
+"source": "audio_transcription",
+
+"model": "whisper-large-v3"
+
+}
+
+)
+
+return doc
+
+finally:
+
+# Clean up temporary file
+
+if os.path.exists(temp_audio_path):
+
+os.unlink(temp_audio_path)
+
+except Exception as e:
+
+logger.error(f"Audio transcription failed: {e}")
+
+raise
+
+
+
 # src/anubis/webapp.py
 import os
 from typing import List

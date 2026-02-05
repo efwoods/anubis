@@ -146,7 +146,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from uuid import uuid4
 import logging
-from langchain_core import Document
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)

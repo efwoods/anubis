@@ -18,13 +18,16 @@ from src.anubis.utils.configuration import IndexConfiguration, GlobalConfigurati
 import asyncio
 
 ## Encoder constructors
-async def make_text_encoder(model: str) -> Embeddings:
+async def make_text_encoder(model: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
     """Connect to the configured text encoder."""
     from langchain_huggingface import HuggingFaceEmbeddings
-
+    logger.info(f"Make text encoder  ENTRYPOINT")
     embeddings = await asyncio.to_thread(
         HuggingFaceEmbeddings,
-        model_name=model
+        model_name=model,
+        model_kwargs={"local_files_only": False, "trust_remote_code": False},
+        # Optional: specify exact cache path
+        cache_folder="src/models/"
     )
 
     return embeddings
@@ -105,6 +108,8 @@ async def make_mongodb_retriever(
 ) -> AsyncGenerator[VectorStoreRetriever, None]:
     """Configure this agent to connect to a specific MongoDB Atlas index & namespaces."""
     from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
+    
+    logger.info(f"Make mongodb retriever ENTRYPOINT")
 
     vstore = await asyncio.to_thread(
         MongoDBAtlasVectorSearch.from_connection_string, 

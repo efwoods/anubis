@@ -8,8 +8,6 @@ from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from src.subgraphs.vector_store_graph.utils import retrieval
-from src.anubis.utils.configuration import IndexConfiguration
-from src.subgraphs.vector_store_graph.utils.state import IndexState
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
@@ -38,7 +36,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 async def index_docs(
-    state: IndexState, runtime: Runtime[GlobalContext] | None = None
+    state: GlobalState, runtime: Runtime[GlobalContext] | None = None
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -50,18 +48,21 @@ async def index_docs(
         state (IndexState): The current state containing documents and retriever.
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
+    from src.anubis.utils.configuration import GlobalConfiguration
+    logger.info(f"index docs entrypoint")
 
-    configuration = runtime.context.configuration
-    with retrieval.make_retriever(configuration) as retriever:
+    configuration = GlobalConfiguration()
+    async with retrieval.make_retriever(configuration) as retriever:
         logger.info(f"INDEXING DOCUMENTS")
-        stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
-        logger.info(f"stamped_docs: {stamped_docs}")
-        await retriever.aadd_documents(state.vectorstore_documents_to_be_indexed)
+        # stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
+        # logger.info(f"stamped_docs: {stamped_docs}")
+        logger.info(f"stable breakpoint")
+        await retriever.aadd_documents(state['vectorstore_documents_to_be_indexed'])
     return {"docs": "delete"}
 
 
 # Define a new graph
-builder = StateGraph(IndexState, context_schema=GlobalContext)
+builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")

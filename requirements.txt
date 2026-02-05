@@ -60,3 +60,4 @@ transformers
 torch
 torchaudio
 accelerate
+aiofiles

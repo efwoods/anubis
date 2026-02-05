@@ -5,7 +5,7 @@ I need audio transcription that will be hosted as a server endpoint that will sc
 I need to establish the LRU cache of the model on startup of the webapp
 
 
-
+[task](https://claude.ai/chat/2f8abce0-925e-4c16-ab20-cb02cbd146a4)
 
 
 async def extract_text_from_audio(audio_data: str) -> Document:

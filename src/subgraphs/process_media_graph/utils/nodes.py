@@ -13,6 +13,8 @@ from typing import Optional, Union, Dict, List
 from enum import Enum
 from io import BytesIO
 
+from datetime import datetime, timezone
+
 from fastapi import UploadFile
 from langchain_core.documents import Document
 from langchain_community.document_loaders import (
@@ -273,6 +275,8 @@ async def process_uploaded_files(
             file_bytes = file_data.get('content')  # Raw bytes
             user_id = file_data.get("user_id")
             assistant_id = file_data.get("assistant_id")
+            reference_image = file_data.get("reference_image")
+            reference_audio = file_data.get("reference_audio")
             
             logger.info(f"Processing file: {filename} ({content_type})")
             
@@ -288,7 +292,8 @@ async def process_uploaded_files(
                         "content_type": content_type,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id
+                        "assistant_id": assistant_id, 
+                        "reference_image": reference_image
                     }
                 })
             
@@ -303,7 +308,8 @@ async def process_uploaded_files(
                         "content_type": content_type,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id
+                        "assistant_id": assistant_id, 
+                        "reference_audio": reference_audio
                     }
                 })
             
@@ -375,11 +381,12 @@ from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper
 
 async def extract_text_from_audio(audio_data: str) -> Document:
     """Extract text from audio using Hugging Face Whisper Large v3"""
-    logger.warning(f"THIS IS UNTESTED")
+    logger.info(f"needs reference audio from storage for speaker diarization (timestamps and who is speaking)")
     import base64
     import tempfile
     import os
     import asyncio
+    import aiofiles
 
     logger.info(f"extract text from audio ENTRYPOINT")
     
@@ -387,18 +394,27 @@ async def extract_text_from_audio(audio_data: str) -> Document:
         # Decode base64 audio data
         audio_bytes = base64.b64decode(audio_data)
         
-        # Create temporary file [SYNCHRONOUS WRITE]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-            temp_audio.write(audio_bytes)
-            temp_audio_path = temp_audio.name
+        # Create temporary file in thread
+        temp_file_directory, temp_audio_path = await asyncio.to_thread(
+            tempfile.mkstemp,
+            ".mp3"
+        )
+
+        # Write audio bytes asynchronously
+        async with aiofiles.open(temp_audio_path, 'wb') as f:
+            await f.write(audio_bytes)
+
+            logger.info(f"Audio file written to {temp_audio_path}")
+
         
         try:
             # Get cached pipeline
             pipe = get_whisper_pipeline()
             
             # Run transcription in thread pool (it's CPU/GPU intensive)
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, pipe, temp_audio_path)
+            logger.info("Starting audio transcription...")
+            result = await asyncio.to_thread(pipe, temp_audio_path)
+
             transcript = result["text"]
             
             # Create Document with transcription
@@ -406,20 +422,29 @@ async def extract_text_from_audio(audio_data: str) -> Document:
                 page_content=transcript,
                 metadata={
                     "source": "audio_transcription",
-                    "model": "whisper-large-v3"
+                    "model": "whisper-large-v3",
+                    "transcript_length": len(transcript)
                 }
             )
             return doc
             
         finally:
             # Clean up temporary file
-            if os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
+            if temp_file_directory is not None:
+                await asyncio.to_thread(os.close, temp_file_directory)
                 
     except Exception as e:
         logger.error(f"Audio transcription failed: {e}")
         raise
 
+    finally:
+        # Clean up temporary file in thread
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            try:
+                await asyncio.to_thread(os.unlink, temp_audio_path)
+                logger.info(f"Cleaned up temporary file: {temp_audio_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temp file {temp_audio_path}: {cleanup_error}")
 
 # metadata: Optional[Dict]
 from src.anubis.utils.model import init_model
@@ -427,6 +452,7 @@ async def extract_personality_from_image(
     image_data: str) -> Document:
     from src.anubis.utils.configuration import GlobalConfiguration
     """Extract personality description from image using vision LLM."""
+    logger.info(f"needs reference image from storage for target identification (possibly object bounding box of the target)")
     # base64_image = self._image_to_base64(image_source)
     # base64_image = self.image_to_base64(image_path)
 
@@ -636,10 +662,17 @@ async def process_media_item_task(
     try:
         # Handle base64 images
         if media_type == "image":
+            assert hasattr(media_item, "metadata")
+
+            if hasattr(media_item["metadata"], "reference_image"):
+                reference_image = media_item['metadata']['reference_image']
             
+
             if "data" in media_item:
                 # Base64 image
                 image_data = media_item["data"]
+                logger.warning(f"STORE REFERENCE IMAGE HERE")
+                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA                
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -647,7 +680,9 @@ async def process_media_item_task(
                     "assistant_id": assistant_id, 
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
-                })
+                    "reference_image": reference_image
+                })                
+
 
                 return doc
             elif "image_url" in media_item:
@@ -656,7 +691,20 @@ async def process_media_item_task(
                 if url.startswith("data:image"):
                     # Extract base64 data
                     image_data = url.split(",", 1)[1]
-                    return await extract_personality_from_image(image_data)
+                    logger.warning(f"STORE REFERENCE IMAGE HERE")
+                    # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                    doc =  await extract_personality_from_image(image_data)
+                    # Filter valid Documents and add metadata
+                doc.metadata.update({
+                    "user_id": user_id,
+                    "assistant_id": assistant_id, 
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "processing_task_id": str(uuid4()),
+                    "reference_image": reference_image
+                })                
+
+
+                return doc
         
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
         elif media_type == "text":
@@ -676,19 +724,27 @@ async def process_media_item_task(
            
         # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
         elif media_type == "audio":
-            
+            assert hasattr(media_item, "metadata")
+
+            if hasattr(media_item["metadata"], "reference_audio"):
+                reference_audio = media_item['metadata']['reference_audio']
+
             if "data" in media_item:
                 # Base64 audio
                 audio_data = media_item["data"]
+                logger.warning(f"STORE REFERENCE AUDIO HERE")
+                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+
                 doc = await extract_text_from_audio(audio_data)
-                
+
                 # Add metadata
                 doc.metadata.update({
                     "user_id": user_id,
                     "assistant_id": assistant_id,
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
-                    "type": "audio"
+                    "type": "audio", 
+                    "reference_audio": reference_audio
                 })
                 return doc
             elif "audio_url" in media_item:
@@ -697,13 +753,17 @@ async def process_media_item_task(
                 if url.startswith("data:audio"):
                     # Extract base64 data
                     audio_data = url.split(",", 1)[1]
+                    logger.warning(f"STORE REFERENCE AUDIO HERE")
+                    # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+
                     doc = await extract_text_from_audio(audio_data)
                     doc.metadata.update({
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "created_at": datetime.now(tz=timezone.utc).isoformat(),
                         "processing_task_id": str(uuid4()),
-                        "type": "audio"
+                        "type": "audio",
+                        "reference_audio": reference_audio
                     })
                     return doc
         
@@ -768,16 +828,18 @@ async def convert_media_list_to_text_document(state: GlobalState) -> Dict[str, A
     docs = []
     for media_item in media_list:
         doc = await process_media_item_task(media_item)
-        docs.append(doc)
+        if not hasattr(doc.metadata, "error"):
+            docs.append(doc)
+        else:
+            logger.warning(f"Error processing media: {media_item}")
 
+    # Parallel Task Execution
     # tasks = [
     #     process_media_item_task(media_item) for media_item in media_list
     # ]
 
-
     # # Execute all tasks in parallel
     # docs = await asyncio.gather(*tasks, return_exceptions=True)
-
 
     # # Analysis list (needs a node)
     # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts
@@ -789,91 +851,3 @@ async def convert_media_list_to_text_document(state: GlobalState) -> Dict[str, A
         "vectorstore_documents_to_be_indexed": docs,
         "media_list": [] # Clear processed media list in the state
     }
-
-import asyncio
-from asyncio import Task
-from typing import List
-from datetime import datetime, timezone
-
-async def identify_media(
-    file: Any, 
-) -> Union[Document]:
-    """Convert media (image/audio) to searchable text docs. DEPRECATED"""
-    # Example for image: use vision model or OCR
-    # text = vision_llm.invoke([media])['text']
-    # return [Document(page_content=text, metadata={"source": "media"})]
-    supported_images = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-    supported_audio = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
-    supported_video = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-
-    try:
-        logger.info(f"XXXXXXXXXXXXXXXXXX file: {file}")
-        logger.info(f"XXXXXXXXXXXXXXXXXXXXXXXXXXX GOT HERE XXXXXXXXXXXXXXXXXXXXX")
-        file_metadata = file.get('metadata')
-        source_type = file.get("source_type")
-        # logger.info(f"file_metadata: {file_metadata}")
-        # [logger.info(f"Key {key}; value {value}") for key, value in file_metadata.items()]
-        # Handle FastAPI UploadFile
-        # metadata = {
-            # "user_id": self.user_id,
-            # "avatar_id": self.avatar_id,
-            # "source_type": file.get("source_type"),
-            # "filename": file_metadata.filename,
-            # "mime_type": file_metadata.mime_type,
-            # "content_type": file.get("content_type") or None, 
-            # "is_reference_image": is_reference_image,
-            # "is_reference_audio": is_reference_audio,
-        # }
-        # logger.info(f"metadata: {metadata}")
-        # # Compressed files (must check before text files)
-        # if (content_type in self.COMPRESSED_MIME_TYPES or
-        #     any(filename.endswith(ext) for ext in self.supported_compressed)):
-        #     return await self._load_compressed(filename, content_type)
-        content_type = file.get('type')
-        filename = file.get('metadata').get('filename')
-
-        logger.info(f"content_type: {content_type}")
-        logger.info(f"filename: {filename}")
-
-        # Text files
-        if content_type == "text" or filename.endswith(".txt"):
-            logger.info(f"working on loading text documents")
-            doc = await _load_text(file)
-            return doc
-        # Image files
-        elif content_type == "image" or any(
-            filename.endswith(ext) for ext in supported_images
-        ):
-            logger.info(f"LOAD IMAGE CALL")
-            doc = await _load_image(file)   # List ready for vectorstore.add_documents()  # Returns list[Document], usually [1] for text
-            return doc
-        # Markdown files
-        # elif (
-        #     filename.endswith(".md")
-        #     or filename.endswith(".markdown")
-        #     or content_type == "text/markdown"
-        # ):
-        #     return self._load_markdown(filename)
-        # JSON files
-        # elif content_type == "application/json" or filename.endswith(".json"):
-        #     return self._load_json(filename)
-        # PDF files
-        # elif content_type == "application/pdf" or filename.endswith(".pdf"):
-        #     return await self._load_pdf(filename)
-        # Audio files
-        elif content_type.startswith("audio/") or any(
-            filename.endswith(ext) for ext in supported_audio
-        ):
-            return _load_audio(filename, content_type)
-        # Video files
-        elif content_type.startswith("video/") or any(
-            filename.endswith(ext) for ext in supported_video
-        ):
-            return _load_video(filename, content_type)
-        # Unknown type
-        else:
-            logger.warning(f"Unhandled content_type")
-            # return self._load_unknown(filename, content_type)
-    except Exception as e:
-        print(f"Error loading file: {str(e)}")
-        raise e

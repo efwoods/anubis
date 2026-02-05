@@ -54,6 +54,7 @@ async def generate_query(
         - The function uses the configuration to set up the prompt and model for query generation.
     """
     logging.info(f"XXXXX GENERATE QUERY NODE XXXX")
+    asdf
     messages = state['messages']
     if len(messages) == 1:
         # It's the first user question. We will use the input directly to search.
@@ -107,13 +108,31 @@ async def retrieve(
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
 
     configuration = runtime.context.configuration
+
     async with retrieval.make_retriever(configuration) as retriever:
         # logger.info(f"XXXXXXXXXXXXXXXXXX CONFIGURATION: {config}")
         
         logger.info(f"{configuration}")
 
         logger.info(f"{state['queries'][-1]}")
-        response = await retriever.ainvoke(state['queries'][-1])
+
+        # Filter Query to return only user_id assitant_id
+        user_id = runtime.context.assistant_ctx.user_id
+        assitant_id = runtime.context.assistant_ctx.assistant_id
+
+        filter_query = {
+            "user_id": {"$eq": user_id},
+            "assistant_id": {"$eq": assitant_id}
+        }
+        
+        response = await retriever.ainvoke(
+            state['queries'][-1], 
+            filter=filter_query, 
+            fetch_k = 100, # number to return
+            search_kwargs={
+                "score_threshold": 0.6 # cosine similarity threshold (greater is higher quality fewer results)
+            })
+        
         # CRITICAL: filter= here
         # response = await retriever.asimilarity_search(
         #     state.queries[-1], 

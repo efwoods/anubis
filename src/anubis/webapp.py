@@ -11,12 +11,49 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Preload audio to text processor [this needs a startup in a lifecycle call]
-from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
-pipe=get_whisper_pipeline()
+ 
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Media Processing API")
+from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events"""
+    # Startup: Preload the Whisper model pipeline
+    logger.info("Application startup: Preloading Whisper model...")
+    
+    try:
+        from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+        
+        # Call the function to trigger @lru_cache and load model into memory
+        pipe = get_whisper_pipeline()
+        
+        logger.info("✓ Whisper model preloaded and cached successfully")
+        logger.info(f"  - Model: openai/whisper-large-v3")
+        logger.info(f"  - Device: {pipe.device}")
+        logger.info(f"  - Ready to process audio requests")
 
+        # create a context
+        context = GlobalContext()
+        
+    except Exception as e:
+        logger.error("=" * 60)
+        logger.error(f"✗ CRITICAL: Failed to preload Whisper model: {e}", exc_info=True)
+        logger.error("=" * 60)
+        # Decide if you want to fail fast or continue
+        raise  # Uncomment to prevent startup if model loading fails
+    
+    yield  # Application runs here
+    
+    # Shutdown: Cleanup if needed
+    logger.info("Shutting down application...")
+
+app = FastAPI(
+    title="Media Processing API",
+    description="LangGraph-based media processing with Whisper audio transcription",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 @app.get("/hello")
 def test_hello_world():
@@ -28,6 +65,8 @@ async def upload_media(
     files: List[UploadFile] = File(...),
     user_id: str = Form(default="test_user_1234"),
     assistant_id: str = Form(default="default_assistant"),
+    reference_audio: bool = False,
+    reference_image: bool = False
 ):
     # Context user_id, assistant_id
     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
@@ -40,8 +79,6 @@ async def upload_media(
     """
     try:
         # Read all uploaded files
-
-
         media_files = []
         for file in files:
             content = await file.read()
@@ -50,7 +87,9 @@ async def upload_media(
                 "content_type": file.content_type,
                 "content": content,
                 "user_id": user_id,
-                "assistant_id": assistant_id
+                "assistant_id": assistant_id,
+                "reference_audio": reference_audio,
+                "reference_image": reference_image
             })
         
         # Import graph here to avoid circular imports
@@ -93,12 +132,13 @@ async def upload_media(
             detail=f"Error processing media: {str(e)}"
         )
 
-
 @app.post("/process-media-json")
 async def process_media_json(
     media_list: List[dict],
     user_id: str = "test_user_1234",
-    assistant_id: str = "default_assistant"
+    assistant_id: str = "default_assistant", 
+    reference_audo: bool = False, 
+    reference_image: bool = False
 ):
     """
     Process media from JSON payload (for pre-encoded base64 data).
@@ -120,8 +160,7 @@ async def process_media_json(
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
         
         initial_state = {
-            "media_list": media_list,
-            
+            "media_list": media_list,   
         }
         
         # config = {
@@ -146,7 +185,6 @@ async def process_media_json(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
-
 
 if __name__ == "__main__":
     import uvicorn

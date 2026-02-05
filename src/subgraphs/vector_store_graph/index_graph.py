@@ -50,7 +50,7 @@ async def index_docs(
     """
     from src.anubis.utils.configuration import GlobalConfiguration
     logger.info(f"index docs entrypoint")
-
+    
     configuration = GlobalConfiguration()
     async with retrieval.make_retriever(configuration) as retriever:
         logger.info(f"INDEXING DOCUMENTS")

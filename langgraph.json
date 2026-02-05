@@ -13,6 +13,9 @@
         "cache_folder": "src/models/",
         "local_files_only": false
       }
+    },
+    "ttl": {
+      "refresh_on_read": false
     }
   },
   "http": {

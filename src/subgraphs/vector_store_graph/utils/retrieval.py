@@ -104,7 +104,7 @@ def make_pinecone_retriever(
 
 @asynccontextmanager
 async def make_mongodb_retriever(
-    configuration: IndexConfiguration, embedding_model: Embeddings
+    configuration: IndexConfiguration, embedding_model: Embeddings,
 ) -> AsyncGenerator[VectorStoreRetriever, None]:
     """Configure this agent to connect to a specific MongoDB Atlas index & namespaces."""
     from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch

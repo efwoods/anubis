@@ -11,14 +11,10 @@ app = FastAPI(title="Media Processing API")
 def test_hello_world():
     return {"Hello": "World"}
 
-@app.get("/world")
-def test_world():
-    return {"This": "Works"}
-
 @app.post("/upload-media")
 async def upload_media(
     files: List[UploadFile] = File(...),
-    user_id: str = Form(...),
+    user_id: str = Form(default="test_user_1234"),
     assistant_id: str = Form(default="default_assistant"),
 ):
     # Context user_id, assistant_id
@@ -42,7 +38,7 @@ async def upload_media(
             })
         
         # Import graph here to avoid circular imports
-        from src.subgraphs.process_media_graph.process_media_api_endpoint_graph import process_media_api_endpoint_graph
+        from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
         
         # Prepare input state
         initial_state = {
@@ -59,7 +55,7 @@ async def upload_media(
         # }
         
         # Invoke the graph
-        result = await process_media_api_endpoint_graph.ainvoke(initial_state)
+        result = await process_media_graph_api_endpoint.ainvoke(initial_state)
         
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
@@ -85,7 +81,7 @@ async def upload_media(
 @app.post("/process-media-json")
 async def process_media_json(
     media_list: List[dict],
-    user_id: str,
+    user_id: str = "test_user_1234",
     assistant_id: str = "default_assistant"
 ):
     """
@@ -105,7 +101,7 @@ async def process_media_json(
     }
     """
     try:
-        from src.subgraphs.process_media_graph.process_media_api_endpoint_graph import process_media_api_endpoint_graph
+        from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
         
         initial_state = {
             "media_list": media_list,
@@ -119,7 +115,7 @@ async def process_media_json(
         #     }
         # }
         
-        result = await process_media_api_endpoint_graph.ainvoke(initial_state)
+        result = await process_media_graph_api_endpoint.ainvoke(initial_state)
         
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
         

@@ -3,13 +3,16 @@
   "dependencies": ["."],
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
-    "process_media": "./src/subgraphs/process_media_graph/graph.py:process_media_graph"
+    "process_media_graph_api_endpoint": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:process_media_graph_api_endpoint"
   },
   "store": {
     "index": {
       "dims": 384,
       "embed": "huggingface:sentence-transformers/all-MiniLM-L6-v2"
     }
+  },
+  "http": {
+    "app": "src/anubis/webapp.py:app"
   },
   "env": ".env.dev"
 }

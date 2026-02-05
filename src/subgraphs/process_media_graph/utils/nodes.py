@@ -241,10 +241,12 @@ import base64
 from fastapi import UploadFile
 from typing import List, Dict, Any
 
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.context import GlobalContext
+from langgraph.runtime import Runtime
+
 async def process_uploaded_files(
     state: GlobalState, 
-    user_id: str, 
-    assistant_id: str
 ) -> Dict[str, Any]:
     """
     Convert FastAPI UploadFile objects into standardized media format.
@@ -527,33 +529,33 @@ from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
 
 @tool
-async def base64_image(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+async def base64_image(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
     """ Used to convert a base64 image string to a Document with text. """
     doc = extract_personality_from_image(media_data["data"], runtime.state)
     return doc
 
 @tool
-async def non_base64_image(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+async def non_base64_image(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
     """ Used to convert a NON base64 image object to a Document with text. """
     pass
 
 @tool
-async def text_only_input(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+async def text_only_input(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
     """ Used to convert a text string to a Document with text. """
     pass
 
 @tool
-async def audio(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+async def audio(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
     """ Used to convert audio to a Document with text. """
     pass
 
 @tool
-async def video(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+async def video(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
     """ Used to convert a video to a Document with text. """
     pass
 
 @tool
-async def handle_url(media_data: Dict[str: Any], runtime: ToolRuntime[GlobalContext]) -> Document:
+async def handle_url(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
     """ 
     Used to convert a url to a Document with text. May require other tool use. 
     Download the content from the URL.

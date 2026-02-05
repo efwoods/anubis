@@ -8,8 +8,6 @@ from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from src.subgraphs.vector_store_graph.utils import retrieval
-from src.anubis.utils.configuration import IndexConfiguration
-from src.subgraphs.vector_store_graph.utils.state import IndexState
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
@@ -38,7 +36,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 async def index_docs(
-    state: IndexState, runtime: Runtime[GlobalContext] | None = None
+    state: GlobalState, runtime: Runtime[GlobalContext] | None = None
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -61,7 +59,7 @@ async def index_docs(
 
 
 # Define a new graph
-builder = StateGraph(IndexState, context_schema=GlobalContext)
+builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")

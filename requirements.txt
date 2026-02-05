@@ -8,6 +8,7 @@ openai
 # fastapi
 fastapi
 uvicorn
+python-multipart
 
 # Chroma
 chromadb

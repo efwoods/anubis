@@ -6,3 +6,4 @@
 
 # Unify data identification and processing endpoint
 # embeddings need to load once locally rather than on every call
+# debug end-to-end of webapp data processing

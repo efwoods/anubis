@@ -367,6 +367,10 @@ async def process_uploaded_files(
         "media_files": []  # Clear after processing
     }
 
+async def extract_text_from_audio(
+        
+) -> Document:
+
 # metadata: Optional[Dict]
 from src.anubis.utils.model import init_model
 async def extract_personality_from_image(
@@ -618,15 +622,39 @@ async def process_media_item_task(
             return Document(
                 page_content=f"Content from URL: {url}",
                 metadata={"source": url, "type": "url", "status": "not_implemented"}
-            )
-        
+            )      
+           
         # Handle audio
         elif media_type == "audio":
-            # TODO: Implement audio transcription
-            return Document(
-                page_content="[Audio transcription not yet implemented]",
-                metadata={"type": "audio", "status": "not_implemented"}
-            )
+            if "data" in media_item:
+                # Base64 audio
+                audio_data = media_item["data"]
+                doc = await extract_text_from_audio(audio_data)
+                
+                # Add metadata
+                doc.metadata.update({
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "processing_task_id": str(uuid4()),
+                    "type": "audio"
+                })
+                return doc
+            elif "audio_url" in media_item:
+                # URL-based audio
+                url = media_item["audio_url"].get("url", "")
+                if url.startswith("data:audio"):
+                    # Extract base64 data
+                    audio_data = url.split(",", 1)[1]
+                    doc = await extract_text_from_audio(audio_data)
+                    doc.metadata.update({
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                        "processing_task_id": str(uuid4()),
+                        "type": "audio"
+                    })
+                    return doc
         
         # Handle video
         elif media_type == "video":

@@ -247,8 +247,15 @@ from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from langgraph.runtime import Runtime
 
+# from langgraph.config import get_store
+
+from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
+
 async def process_uploaded_files(
     state: GlobalState, 
+    runtime: Runtime[GlobalContext], 
+    store: BaseStore
 ) -> Dict[str, Any]:
     """
     Convert FastAPI UploadFile objects into standardized media format.
@@ -256,6 +263,21 @@ async def process_uploaded_files(
     """
     
     logger.info(f"Process uploaded files NODE")
+
+    user_id = runtime.context.assistant_ctx.user_id
+    assistant_id = runtime.context.assistant_ctx.assistant_id
+
+    namespace = (user_id, assistant_id)
+    
+    store = runtime.store
+
+    logger.info(f"breakpoint")
+
+    result_put = await store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
+    result_get = await store.asearch(namespace,)
+
+    # result_get = await runtime.store.asearch(namespace,)
+    # result_put = await runtime.store.aput(namespace=namespace, key="test_key", value="test_values process uploaded files")
 
     media_files = state.get('media_files', [])
     
@@ -643,7 +665,8 @@ MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
 # from langgraph.func import task
 
 async def process_media_item_task(
-    media_item: Dict[str, Any]
+    media_item: Dict[str, Any], 
+    runtime: Runtime[GlobalContext]
 ) -> Document:
     """Task: Convert a single media item to a Document"""
     
@@ -790,7 +813,7 @@ async def process_media_item_task(
         )
     return await tool.ainvoke(media_item["content"])
 
-async def convert_media_list_to_text_document(state: GlobalState) -> Dict[str, Any]:
+async def convert_media_list_to_text_document(state: GlobalState, runtime: GlobalContext) -> Dict[str, Any]:
     """ 
     Media type in media list is determined at this point: 
     Convert the media in a list of one or more media to text in parallel.
@@ -827,7 +850,7 @@ async def convert_media_list_to_text_document(state: GlobalState) -> Dict[str, A
     # Create tasks for parallel processing
     docs = []
     for media_item in media_list:
-        doc = await process_media_item_task(media_item)
+        doc = await process_media_item_task(media_item, runtime)
         if not hasattr(doc.metadata, "error"):
             docs.append(doc)
         else:

@@ -53,6 +53,17 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     logger.info(f"INVOKE AGENT NODE ")
+
+    # test_store = await runtime.store.alist_namespaces()
+    user_id = runtime.context.assistant_ctx.user_id
+    assistant_id = runtime.context.assistant_ctx.assistant_id
+    namespace = (user_id, assistant_id)
+
+    test_put_store = await runtime.store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
+
+    test_result_get = await runtime.store.asearch(namespace,)
+
+    logger.info(f" breakpoint ")
     
     config = runtime.context.configuration # Loads env vars automatically
 

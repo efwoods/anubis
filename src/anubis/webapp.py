@@ -15,16 +15,27 @@ logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
 
 from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
+from langgraph.store.memory import InMemoryStore
+
+from typing import cast
+from langgraph.store.base import BaseStore
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
     # Startup: Preload the Whisper model pipeline
     logger.info("Application startup: Preloading Whisper model...")
-    
+    global context 
+    global in_memory_store
+
     try:
+        # Initialize context / configuration
+        context = GlobalContext()
+        in_memory_store = InMemoryStore()
+
+        # Create pipeline for audio transcription
         from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
-        
         # Call the function to trigger @lru_cache and load model into memory
         pipe = get_whisper_pipeline()
         
@@ -32,10 +43,6 @@ async def lifespan(app: FastAPI):
         logger.info(f"  - Model: openai/whisper-large-v3")
         logger.info(f"  - Device: {pipe.device}")
         logger.info(f"  - Ready to process audio requests")
-
-        # create a context
-        context = GlobalContext()
-        
     except Exception as e:
         logger.error("=" * 60)
         logger.error(f"✗ CRITICAL: Failed to preload Whisper model: {e}", exc_info=True)
@@ -78,6 +85,11 @@ async def upload_media(
     - **assistant_id**: Assistant identifier
     """
     try:
+        # update the context:
+        context.user_ctx.user_id = user_id
+        context.assistant_ctx.assistant_id = assistant_id
+        context.assistant_ctx.user_id = user_id
+
         # Read all uploaded files
         media_files = []
         for file in files:
@@ -100,6 +112,8 @@ async def upload_media(
             "media_files": media_files,
         }
         
+        
+
         # Prepare context/config
         # config = {
         #     "configurable": {
@@ -108,9 +122,15 @@ async def upload_media(
         #         # Add other configuration as needed
         #     }
         # }
+
+        runtime_context = {"context": context}
         
         # Invoke the graph
-        result = await process_media_graph_api_endpoint.ainvoke(initial_state)
+        result = await process_media_graph_api_endpoint.ainvoke(
+            initial_state, 
+            context=context, 
+            
+            )
         
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])

@@ -48,13 +48,16 @@ async def index_docs(
         state (IndexState): The current state containing documents and retriever.
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
+    from src.anubis.utils.configuration import GlobalConfiguration
+    logger.info(f"index docs entrypoint")
 
-    configuration = runtime.context.configuration
-    with retrieval.make_retriever(configuration) as retriever:
+    configuration = GlobalConfiguration()
+    async with retrieval.make_retriever(configuration) as retriever:
         logger.info(f"INDEXING DOCUMENTS")
-        stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
-        logger.info(f"stamped_docs: {stamped_docs}")
-        await retriever.aadd_documents(state.vectorstore_documents_to_be_indexed)
+        # stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
+        # logger.info(f"stamped_docs: {stamped_docs}")
+        logger.info(f"stable breakpoint")
+        await retriever.aadd_documents(state['vectorstore_documents_to_be_indexed'])
     return {"docs": "delete"}
 
 

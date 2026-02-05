@@ -271,6 +271,8 @@ async def process_uploaded_files(
             filename = file_data.get('filename', 'unknown')
             content_type = file_data.get('content_type', '')
             file_bytes = file_data.get('content')  # Raw bytes
+            user_id = file_data.get("user_id")
+            assistant_id = file_data.get("assistant_id")
             
             logger.info(f"Processing file: {filename} ({content_type})")
             
@@ -284,7 +286,9 @@ async def process_uploaded_files(
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes)
+                        "size": len(file_bytes),
+                        "user_id": user_id,
+                        "assistant_id": assistant_id
                     }
                 })
             
@@ -297,7 +301,9 @@ async def process_uploaded_files(
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes)
+                        "size": len(file_bytes),
+                        "user_id": user_id,
+                        "assistant_id": assistant_id
                     }
                 })
             
@@ -310,7 +316,9 @@ async def process_uploaded_files(
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes)
+                        "size": len(file_bytes),
+                        "user_id": user_id,
+                        "assistant_id": assistant_id
                     }
                 })
             
@@ -323,7 +331,9 @@ async def process_uploaded_files(
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes)
+                        "size": len(file_bytes),
+                        "user_id": user_id,
+                        "assistant_id": assistant_id
                     }
                 })
             
@@ -336,7 +346,9 @@ async def process_uploaded_files(
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes)
+                        "size": len(file_bytes),
+                        "user_id": user_id,
+                        "assistant_id": assistant_id
                     }
                 })
             
@@ -358,12 +370,13 @@ async def process_uploaded_files(
 # metadata: Optional[Dict]
 from src.anubis.utils.model import init_model
 async def extract_personality_from_image(
-    image_data: str, runtime: Runtime[GlobalContext]
-) -> Document:
+    image_data: str) -> Document:
+    from src.anubis.utils.configuration import GlobalConfiguration
     """Extract personality description from image using vision LLM."""
     # base64_image = self._image_to_base64(image_source)
     # base64_image = self.image_to_base64(image_path)
-    
+
+    logger.info(f"extract_personality_from_image entrypoint")    
     # Use reference image to help identify the person in the image.
     text_prompt_for_image_to_text_context = (
         "Describe the individual in the image in vivid detail. "
@@ -376,11 +389,10 @@ async def extract_personality_from_image(
 
     # these requests need to use the model in the graph rather than the requests because of 400 errors
 
-    ctx = runtime.context
-    configuration = runtime.context.configuration
+    configuration = GlobalConfiguration()
 
     tools = []
-
+    
     model = init_model(
         configuration.provider_model,
         configuration.llama_api_base_url,
@@ -406,7 +418,7 @@ async def extract_personality_from_image(
         content=image_to_target_textual_description_payload
     )
 
-    response = model.ainvoke([message])
+    response = await model.ainvoke([message])
 
     logger.info(f"response: {response}")
 
@@ -426,39 +438,6 @@ async def extract_personality_from_image(
         }
     )
 
-    # # avatar_image_description = response.json()
-
-
-    # logger.info(f"XXXXXXXXXXXXXX EXTRACT XXXXXXXXXXXXXXXXXXX extract_personality_from_image CALLED")
-
-    # # logger.info(f"avatar_image_description: {avatar_image_description}")
-    # try:
-    #     # logger.warning(f"avatar_image_description['choices'][0]: {avatar_image_description['choices'][0]}")
-
-    #     # logger.warning(f"avatar_image_description['choices']: {avatar_image_description['choices']}")
-
-    #     contextual_description = avatar_image_description['choices'][0]['message']['content']
-    #     # contextual_description = avatar_image_description["completion_message"][
-    #         # "content"
-    #     # ]["text"]
-    #     logger.warning("HUMAN VALIDATION / INTERRUPTION IS REQUIRED HERE TO CONTINUE")
-    #     logger.warning("HANDLE RESPONSES SUCH AS: I'm sorry, but I can't provide a description of the person's character or personality based on the information given.")
-    # except:
-    #     print(avatar_image_description)
-    # # if metadata.get("is_reference_image"):
-    # #     try:
-    # #         avatar_id = str(metadata["avatar_id"])
-    # #         self.firestore.update_avatar_fields(
-    # #             avatar_id,
-    # #             {"system_prompt_reference_image_description": contextual_description},
-    # #         )
-    # #     except Exception as e:
-    # #         logger.error(f"Failed to update avatar {avatar_id}: {e}")
-    # doc = Document(page_content=contextual_description) # , metadata=metadata
-    # # all_splits = self.text_splitter.split_documents([doc])
-    # # document_ids = self.chroma_DB.vector_store.add_documents(documents=all_splits)
-    # return doc
-
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -474,6 +453,9 @@ from src.subgraphs.process_media_graph.utils.helper_functions import identify_fi
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
     logger.info(f"Extract_media_from_message NODE")
+
+    user_id = runtime.context.user_ctx.user_id
+    assistant_id = runtime.context.assistant_ctx.assistant_id
 
     messages = state.get('messages', [])
 
@@ -517,7 +499,12 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 
                 # Add media items
                 if item_type in ["image", "image_url", "audio", "video", "url"]:
+                    item["metadata"]['user_id'] = user_id
+                    item["metadata"]['assistant_id'] = assistant_id
                     media_list.append(item)
+                    # EACH ITEM NEEDS USER_ID AND ASSISTANT_ID FROM CONTEXT
+                    # user_id
+                    # assistant_id
             
         logger.info(f"Extracted {len(media_list)} media items")
         return {"media_list": media_list}
@@ -573,12 +560,10 @@ MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
 }
 
 
-from langgraph.func import task
+# from langgraph.func import task
 
-@task
 async def process_media_item_task(
-    media_item: Dict[str, Any], 
-    runtime: Runtime[GlobalContext]
+    media_item: Dict[str, Any]
 ) -> Document:
     """Task: Convert a single media item to a Document"""
     
@@ -586,20 +571,38 @@ async def process_media_item_task(
 
     media_type = media_item.get("type", "")
     
+    metadata = media_item.get("metadata", {})
+
+    user_id = metadata.get("user_id", "")
+    assistant_id = metadata.get("assistant_id", "")
+
+    logger.info(f"extracted user_id: {user_id}")
+    logger.info(f"extracted assistant_id: {assistant_id}")
+
     try:
         # Handle base64 images
         if media_type == "image":
+            
             if "data" in media_item:
                 # Base64 image
                 image_data = media_item["data"]
-                return await extract_personality_from_image(image_data, runtime)
+                doc =  await extract_personality_from_image(image_data)
+                    # Filter valid Documents and add metadata
+                doc.metadata.update({
+                    "user_id": user_id,
+                    "assistant_id": assistant_id, 
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "processing_task_id": str(uuid4()),
+                })
+
+                return doc
             elif "image_url" in media_item:
                 # URL-based image
                 url = media_item["image_url"].get("url", "")
                 if url.startswith("data:image"):
                     # Extract base64 data
                     image_data = url.split(",", 1)[1]
-                    return await extract_personality_from_image(image_data, runtime)
+                    return await extract_personality_from_image(image_data)
         
         # Handle text (shouldn't normally reach here)
         elif media_type == "text":
@@ -648,10 +651,11 @@ async def process_media_item_task(
         )
     return await tool.ainvoke(media_item["content"])
 
-async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext]) -> Dict[str, Any]:
+async def convert_media_list_to_text_document(state: GlobalState) -> Dict[str, Any]:
     """ 
     Media type in media list is determined at this point: 
     Convert the media in a list of one or more media to text in parallel.
+    media items must have user_id and assitant_id as metadata.
     Exptected format:
     [
         {
@@ -682,33 +686,28 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     logger.info(f"Processing {len(media_list)} media items")
 
     # Create tasks for parallel processing
-    tasks = [
-        process_media_item_task(media_item, runtime) for media_item in media_list
-    ]
+    docs = []
+    for media_item in media_list:
+        doc = await process_media_item_task(media_item)
+        docs.append(doc)
 
-    # Execute all tasks in parallel
-    document_futures = [task.result() for task in tasks]
-    docs = await asyncio.gather(*document_futures, return_exceptions=True)
+    # tasks = [
+    #     process_media_item_task(media_item) for media_item in media_list
+    # ]
 
-    # Filter valid Documents and add metadata
-    documents = []
-    for doc in docs:
-        if isinstance(doc, Document):
-            # Add user/assistant context
-            doc.metadata.update({
-                "user_id": runtime.context.user_ctx.user_id,
-                "assistant_id": runtime.context.assistant_ctx.assistant_id, 
-                "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                "processing_task_id": str(uuid4()),
-            })
-            documents.append(doc)
-        elif isinstance(doc, Exception):
-            logger.error(f"Task failed with exception: {doc}")
 
-    logger.info(f"Successfully processed {len(documents)} documents")
+    # # Execute all tasks in parallel
+    # docs = await asyncio.gather(*tasks, return_exceptions=True)
+
+
+    # # Analysis list (needs a node)
+    # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts
+
+    # # Adapter list (needs a node)
+    # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
     return {
-        "vectorstore_documents_to_be_indexed": documents,
+        "vectorstore_documents_to_be_indexed": docs,
         "media_list": [] # Clear processed media list in the state
     }
 

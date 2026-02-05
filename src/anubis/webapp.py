@@ -5,10 +5,16 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import asyncio
 
+from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
+
+import logging
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Media Processing API")
 
 @app.get("/hello")
 def test_hello_world():
+    logger.info(f"HELLO WORLD ENTRY")
     return {"Hello": "World"}
 
 @app.post("/upload-media")
@@ -18,7 +24,7 @@ async def upload_media(
     assistant_id: str = Form(default="default_assistant"),
 ):
     # Context user_id, assistant_id
-
+    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
     """
     Upload one or more media files for processing and indexing.
     
@@ -28,13 +34,17 @@ async def upload_media(
     """
     try:
         # Read all uploaded files
+
+
         media_files = []
         for file in files:
             content = await file.read()
             media_files.append({
                 "filename": file.filename,
                 "content_type": file.content_type,
-                "content": content
+                "content": content,
+                "user_id": user_id,
+                "assistant_id": assistant_id
             })
         
         # Import graph here to avoid circular imports

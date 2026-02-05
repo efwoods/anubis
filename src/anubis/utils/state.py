@@ -32,7 +32,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
-class IndexState:
+class VectorstoreIndexState:
     """Represents the state for document indexing and retrieval.
 
     This class defines the structure of the index state, which includes
@@ -41,6 +41,32 @@ class IndexState:
 
     vectorstore_documents_to_be_indexed: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can index."""
+
+
+
+@dataclass(kw_only=True)
+class AnalysisIndexState:
+    """Represents the state for document indexing and retrieval.
+
+    This class defines the structure of the index state, which includes
+    the documents to be indexed. Will be deleted after indexed
+    """
+
+    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: Annotated[Sequence[Document], reduce_docs]
+    """A list of documents that the agent can index."""
+
+
+@dataclass(kw_only=True)
+class AdapterIndexState:
+    """Represents the state for document indexing and retrieval.
+
+    This class defines the structure of the index state, which includes
+    the documents to be indexed. Will be deleted after indexed
+    """
+
+    documents_to_be_processed_for_adapter_training: Annotated[Sequence[Document], reduce_docs]
+    """A list of documents that the agent can index."""
+
 
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
@@ -87,13 +113,13 @@ class GlobalState(TypedDict):
     processed_media_to_be_formatted: Annotated[Sequence[Document], operator.add]
 
     # List of Documents to be uploaded to the vectorstore (processed_media -> formatt -> vectorstore_documents)
-    vectorstore_documents_to_be_indexed: IndexState
+    vectorstore_documents_to_be_indexed: VectorstoreIndexState
 
     # Analysis list
-    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]]
+    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: AnalysisIndexState
 
     # Adapter list
-    documents_to_be_processed_for_adapter_training: List[Sequence[Document]]
+    documents_to_be_processed_for_adapter_training: AdapterIndexState
 
 
     """ Node Routing """

@@ -13,7 +13,7 @@ from langgraph.managed import IsLastStep
 from typing_extensions import Annotated
 
 
-from typing import Annotated, List, Dict
+from typing import Annotated, List, Dict, Optional, Any
 from typing_extensions import TypedDict
 from asyncio import Task
 from langgraph.graph.message import add_messages # Built-in reducer
@@ -24,6 +24,8 @@ from src.anubis.utils.helper_functions import (
     add_queries, 
     reduce_docs, 
 )
+
+
 
 import logging
 
@@ -76,7 +78,10 @@ class GlobalState(TypedDict):
     """ Data Uploading and Processing """
 
     # List of media items to be converted to text
-    media_list: Annotated[List[Dict], operator.add]  # media is moved into the task list and overwritten on message send
+
+    media_files: Optional[List[Dict[str, Any]]] # Raw uploaded files
+
+    media_list: Annotated[List[Dict], operator.add]  # media is moved into the task list and overwritten on message send from the chat message interface
 
     # List of media extracted from chat with the media type determined, and converted into text.
     processed_media_to_be_formatted: Annotated[Sequence[Document], operator.add]

@@ -236,22 +236,142 @@ def _load_video(
     # )
     pass
 
+
+import base64
+from fastapi import UploadFile
+from typing import List, Dict, Any
+
+async def process_uploaded_files(
+    state: GlobalState, 
+    user_id: str, 
+    assistant_id: str
+) -> Dict[str, Any]:
+    """
+    Convert FastAPI UploadFile objects into standardized media format.
+    This is the entry point for direct file uploads (not from messages).
+    """
+    
+    logger.info(f"Process uploaded files NODE")
+
+    media_files = state.get('media_files', [])
+    
+    if not media_files:
+        logger.info("No media files to process")
+        return {"media_list": []}
+    
+    logger.info(f"Processing {len(media_files)} uploaded files")
+    
+    media_list = []
+    
+    for file_data in media_files:
+        try:
+            # Extract file info
+            filename = file_data.get('filename', 'unknown')
+            content_type = file_data.get('content_type', '')
+            file_bytes = file_data.get('content')  # Raw bytes
+            
+            logger.info(f"Processing file: {filename} ({content_type})")
+            
+            # Determine media type and convert to standardized format
+            if content_type.startswith('image/'):
+                # Convert image to base64
+                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                media_list.append({
+                    "type": "image",
+                    "data": base64_data,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes)
+                    }
+                })
+            
+            elif content_type.startswith('audio/'):
+                # Handle audio files
+                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                media_list.append({
+                    "type": "audio",
+                    "data": base64_data,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes)
+                    }
+                })
+            
+            elif content_type.startswith('video/'):
+                # Handle video files
+                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                media_list.append({
+                    "type": "video",
+                    "data": base64_data,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes)
+                    }
+                })
+            
+            elif content_type in ['text/plain', 'application/json', 'text/markdown']:
+                # Handle text files
+                text_content = file_bytes.decode('utf-8')
+                media_list.append({
+                    "type": "text",
+                    "content": text_content,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes)
+                    }
+                })
+            
+            elif content_type == 'application/pdf':
+                # Handle PDFs
+                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                media_list.append({
+                    "type": "pdf",
+                    "data": base64_data,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes)
+                    }
+                })
+            
+            else:
+                logger.warning(f"Unsupported content type: {content_type}")
+                continue
+        
+        except Exception as e:
+            logger.error(f"Error processing file {filename}: {e}")
+            continue
+    
+    logger.info(f"Converted {len(media_list)} files to media format")
+    
+    return {
+        "media_list": media_list,
+        "media_files": []  # Clear after processing
+    }
+
 # metadata: Optional[Dict]
 from src.anubis.utils.model import init_model
 async def extract_personality_from_image(
-    image_source: Union[str, Path, UploadFile, bytes], runtime: Runtime[GlobalContext]
+    image_data: str, runtime: Runtime[GlobalContext]
 ) -> Document:
     """Extract personality description from image using vision LLM."""
     # base64_image = self._image_to_base64(image_source)
     # base64_image = self.image_to_base64(image_path)
     
+    # Use reference image to help identify the person in the image.
     text_prompt_for_image_to_text_context = (
         "Describe the individual in the image in vivid detail. "
         "Return only the description of the person. "
         "Do not mention that this is an image. "
-        "Describe the qualities of the character of the person in full detail and their personality so as to clearly visualize them. "
+        "Describe the qualities of the character of the person in full detail and"
+        "Describe the personality of this person so as to clearly visualize the person."
         "Do not describe the physical appearance"
     )
+
     # these requests need to use the model in the graph rather than the requests because of 400 errors
 
     ctx = runtime.context
@@ -275,7 +395,7 @@ async def extract_personality_from_image(
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_source}"
+                                "url": f"data:image/jpeg;base64,{image_data}"
                             },
                         },
                     ]
@@ -288,37 +408,54 @@ async def extract_personality_from_image(
 
     logger.info(f"response: {response}")
 
+    if hasattr(response, 'content'):
+        contextual_description = response.content
+    else:
+        contextual_description = str(response)
 
-    avatar_image_description = response.json()
-    logger.info(f"XXXXXXXXXXXXXX EXTRACT XXXXXXXXXXXXXXXXXXX extract_personality_from_image CALLED")
+    logger.info(f"Extracted personality from image: {contextual_description[:100]}")
 
-    logger.info(f"avatar_image_description: {avatar_image_description}")
-    try:
-        # logger.warning(f"avatar_image_description['choices'][0]: {avatar_image_description['choices'][0]}")
+    return Document(
+        page_content=contextual_description,
+        metadata={
+            "source": "vision_model", 
+            "type": "personality_extraction", 
+            "model": configuration.provider_model
+        }
+    )
 
-        # logger.warning(f"avatar_image_description['choices']: {avatar_image_description['choices']}")
+    # # avatar_image_description = response.json()
 
-        contextual_description = avatar_image_description['choices'][0]['message']['content']
-        # contextual_description = avatar_image_description["completion_message"][
-            # "content"
-        # ]["text"]
-        logger.warning("HUMAN VALIDATION / INTERRUPTION IS REQUIRED HERE TO CONTINUE")
-        logger.warning("HANDLE RESPONSES SUCH AS: I'm sorry, but I can't provide a description of the person's character or personality based on the information given.")
-    except:
-        print(avatar_image_description)
-    # if metadata.get("is_reference_image"):
-    #     try:
-    #         avatar_id = str(metadata["avatar_id"])
-    #         self.firestore.update_avatar_fields(
-    #             avatar_id,
-    #             {"system_prompt_reference_image_description": contextual_description},
-    #         )
-    #     except Exception as e:
-    #         logger.error(f"Failed to update avatar {avatar_id}: {e}")
-    doc = Document(page_content=contextual_description) # , metadata=metadata
-    # all_splits = self.text_splitter.split_documents([doc])
-    # document_ids = self.chroma_DB.vector_store.add_documents(documents=all_splits)
-    return doc
+
+    # logger.info(f"XXXXXXXXXXXXXX EXTRACT XXXXXXXXXXXXXXXXXXX extract_personality_from_image CALLED")
+
+    # # logger.info(f"avatar_image_description: {avatar_image_description}")
+    # try:
+    #     # logger.warning(f"avatar_image_description['choices'][0]: {avatar_image_description['choices'][0]}")
+
+    #     # logger.warning(f"avatar_image_description['choices']: {avatar_image_description['choices']}")
+
+    #     contextual_description = avatar_image_description['choices'][0]['message']['content']
+    #     # contextual_description = avatar_image_description["completion_message"][
+    #         # "content"
+    #     # ]["text"]
+    #     logger.warning("HUMAN VALIDATION / INTERRUPTION IS REQUIRED HERE TO CONTINUE")
+    #     logger.warning("HANDLE RESPONSES SUCH AS: I'm sorry, but I can't provide a description of the person's character or personality based on the information given.")
+    # except:
+    #     print(avatar_image_description)
+    # # if metadata.get("is_reference_image"):
+    # #     try:
+    # #         avatar_id = str(metadata["avatar_id"])
+    # #         self.firestore.update_avatar_fields(
+    # #             avatar_id,
+    # #             {"system_prompt_reference_image_description": contextual_description},
+    # #         )
+    # #     except Exception as e:
+    # #         logger.error(f"Failed to update avatar {avatar_id}: {e}")
+    # doc = Document(page_content=contextual_description) # , metadata=metadata
+    # # all_splits = self.text_splitter.split_documents([doc])
+    # # document_ids = self.chroma_DB.vector_store.add_documents(documents=all_splits)
+    # return doc
 
 
 from src.anubis.utils.state import GlobalState
@@ -330,8 +467,12 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from src.anubis.utils.model import init_model
 
+from src.subgraphs.process_media_graph.utils.helper_functions import identify_file_type_and_convert_to_base64
+
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
+    logger.info(f"Extract_media_from_message NODE")
+
     messages = state.get('messages', [])
 
     if not messages:
@@ -381,10 +522,6 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 
     logger.warning(f"Unexpected content type: {type(content)}")
     return {"media_list": []}
-
-
-
-
 
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
@@ -437,21 +574,82 @@ MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
 from langgraph.func import task
 
 @task
-async def process_media_task(process_media_item: Dict) -> Document:
-    """ Task: Convert the media item to a Document of text """
+async def process_media_item_task(
+    media_item: Dict[str, Any], 
+    runtime: Runtime[GlobalContext]
+) -> Document:
+    """Task: Convert a single media item to a Document"""
     
-    logging.info(f"PROCESS_MEDIA_TASK NODE")
+    logger.info(f"process_media_item_task entry")
 
-    process_type = process_media_item["process_type"] # The process_type is the name of the tool to be called
+    media_type = media_item.get("type", "")
+    
+    try:
+        # Handle base64 images
+        if media_type == "image":
+            if "data" in media_item:
+                # Base64 image
+                image_data = media_item["data"]
+                return await extract_personality_from_image(image_data, runtime)
+            elif "image_url" in media_item:
+                # URL-based image
+                url = media_item["image_url"].get("url", "")
+                if url.startswith("data:image"):
+                    # Extract base64 data
+                    image_data = url.split(",", 1)[1]
+                    return await extract_personality_from_image(image_data, runtime)
+        
+        # Handle text (shouldn't normally reach here)
+        elif media_type == "text":
+            return Document(
+                page_content=media_item.get("text", ""),
+                metadata={"source": "text_input", "type": "text"}
+            )
+        
+        # Handle URLs
+        elif media_type == "url":
+            # TODO: Implement URL content fetching
+            url = media_item.get("url", "")
+            return Document(
+                page_content=f"Content from URL: {url}",
+                metadata={"source": url, "type": "url", "status": "not_implemented"}
+            )
+        
+        # Handle audio
+        elif media_type == "audio":
+            # TODO: Implement audio transcription
+            return Document(
+                page_content="[Audio transcription not yet implemented]",
+                metadata={"type": "audio", "status": "not_implemented"}
+            )
+        
+        # Handle video
+        elif media_type == "video":
+            # TODO: Implement video processing
+            return Document(
+                page_content="[Video processing not yet implemented]",
+                metadata={"type": "video", "status": "not_implemented"}
+            )
+        
+        else:
+            logger.warning(f"Unsupported media type: {media_type}")
+            return Document(
+                page_content=f"[Unsupported media type: {media_type}]",
+                metadata={"type": media_type, "status": "unsupported"}
+            )
+    
+    except Exception as e:
+        logger.error(f"Error processing media item: {e}")
+        return Document(
+            page_content=f"[Error processing media: {str(e)}]",
+            metadata={"type": media_type, "status": "error", "error": str(e)}
+        )
+    return await tool.ainvoke(media_item["content"])
 
-    tool = MEDIA_CONVERSION_TOOLS.get(process_type)
-
-    return await tool.ainvoke(process_media_item["content"])
-
-async def determine_media_type(state: GlobalState, context: GlobalContext):
-    """ Determines the media type in a given list of media.
-     I should be able to indicate the media type for each type of media
-    then convert the media in a list of one or more media to text in parallel.
+async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext]) -> Dict[str, Any]:
+    """ 
+    Media type in media list is determined at this point: 
+    Convert the media in a list of one or more media to text in parallel.
     Exptected format:
     [
         {
@@ -463,63 +661,54 @@ async def determine_media_type(state: GlobalState, context: GlobalContext):
         }, 
         ...
     ]
-    I want to keep the media in a list and queue tasks for each item in the list then I want to execute those tasks in parallel and update the final state with the list of text Documents from the media:
-async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
-
+    I want to keep the media in a list and queue tasks for each item in the list 
+    then I want to execute those tasks in parallel and update the final state 
+    with the list of text Documents from the media:
+    async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
     """
     
     logging.info(f"DETERMINE_MEDIA_TYPE NODE")
     
     media_list = state.get('media_list', [])
-    process_type_list = []
-    for media in media_list:
-        if hasattr(media, "type"):
-            if media['type'] == "image": # deterimine if base64
-                if hasattr(media, "data"):
-                    # base64 encoded data
-                    process_type = "base64_image"
-                else:
-                    process_type = "non_base64_image"
-            elif media['type'] == "text":
-                process_type = "text_only_input"
-            elif media['type'] == "audio":
-                process_type == "audio" 
-            elif media['type'] == "video":
-                process_type == "video" 
-            elif media['type'] == "url":
-                process_type = "handle_url"
-            else:
-                logger.warning(f"unhandled media type in determine media type: {media['type']}")
-                continue
-        process_type_list.append({
-            "process_type": process_type, 
-            "content":{**media}, 
-            "task_id": uuid4()
-        }) 
 
-        tasks = [process_media_task(process_media_item) for process_media_item in process_type_list] # queue tool call execution
-
-        # Convert Media to text
-        document_futures = [task.result() for task in tasks]
-        docs = await asyncio.gather(*document_futures, return_exceptions=True)
-
-        # Filter valid Documents (successful processes)
-        documents = [doc for doc in docs if isinstance(doc, Document)]
-
-        # Add process_task_ids and user/assistant metadata for each document
-        documents = [doc.metadata.update({
-            "process_task_id": uuid4(), 
-            "user_id": context.user_ctx.user_id,
-            "assistant_id": context.assistant_ctx.assistant_id,
-            "created_at": datetime.now(tz=timezone.utc).isoformat(), 
-            "updated_at": None, 
-        }) for doc in documents]
-
-
+    if not media_list:
+        logger.info(f"No Meida to process")
         return {
-            "processed_media_to_be_formatted": documents, # Documents are appended to the list in the state
-            "media_list": [] # clear the list of media
+            "media_list": []
         }
+
+    logger.info(f"Processing {len(media_list)} media items")
+
+    # Create tasks for parallel processing
+    tasks = [
+        process_media_item_task(media_item, runtime) for media_item in media_list
+    ]
+
+    # Execute all tasks in parallel
+    document_futures = [task.result() for task in tasks]
+    docs = await asyncio.gather(*document_futures, return_exceptions=True)
+
+    # Filter valid Documents and add metadata
+    documents = []
+    for doc in docs:
+        if isinstance(doc, Document):
+            # Add user/assistant context
+            doc.metadata.update({
+                "user_id": runtime.context.user_ctx.user_id,
+                "assistant_id": runtime.context.assistant_ctx.assistant_id, 
+                "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                "processing_task_id": str(uuid4()),
+            })
+            documents.append(doc)
+        elif isinstance(doc, Exception):
+            logger.error(f"Task failed with exception: {doc}")
+
+    logger.info(f"Successfully processed {len(documents)} documents")
+
+    return {
+        "vectorstore_documents_to_be_indexed": documents,
+        "media_list": [] # Clear processed media list in the state
+    }
 
 import asyncio
 from asyncio import Task

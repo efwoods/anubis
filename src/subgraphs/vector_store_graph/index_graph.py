@@ -54,6 +54,7 @@ async def index_docs(
     configuration = GlobalConfiguration()
     async with retrieval.make_retriever(configuration) as retriever:
         logger.info(f"INDEXING DOCUMENTS")
+        logger.warning(f"NEED TO ADD SOURCE TO DOCUMENTS AS METADATA")
         # stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
         # logger.info(f"stamped_docs: {stamped_docs}")
         logger.info(f"stable breakpoint")

@@ -54,3 +54,9 @@ langchain-mongodb
 
 # Document Processing
 pillow
+
+# Audio Processing
+transformers
+torch
+torchaudio
+accelerate

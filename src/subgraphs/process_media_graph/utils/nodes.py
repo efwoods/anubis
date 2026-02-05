@@ -367,9 +367,59 @@ async def process_uploaded_files(
         "media_files": []  # Clear after processing
     }
 
-async def extract_text_from_audio(
+
+
+
+from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+
+
+async def extract_text_from_audio(audio_data: str) -> Document:
+    """Extract text from audio using Hugging Face Whisper Large v3"""
+    logger.warning(f"THIS IS UNTESTED")
+    import base64
+    import tempfile
+    import os
+    import asyncio
+
+    logger.info(f"extract text from audio ENTRYPOINT")
+    
+    try:
+        # Decode base64 audio data
+        audio_bytes = base64.b64decode(audio_data)
         
-) -> Document:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+            temp_audio.write(audio_bytes)
+            temp_audio_path = temp_audio.name
+        
+        try:
+            # Get cached pipeline
+            pipe = get_whisper_pipeline()
+            
+            # Run transcription in thread pool (it's CPU/GPU intensive)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, pipe, temp_audio_path)
+            transcript = result["text"]
+            
+            # Create Document with transcription
+            doc = Document(
+                page_content=transcript,
+                metadata={
+                    "source": "audio_transcription",
+                    "model": "whisper-large-v3"
+                }
+            )
+            return doc
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+                
+    except Exception as e:
+        logger.error(f"Audio transcription failed: {e}")
+        raise
+
 
 # metadata: Optional[Dict]
 from src.anubis.utils.model import init_model
@@ -608,7 +658,7 @@ async def process_media_item_task(
                     image_data = url.split(",", 1)[1]
                     return await extract_personality_from_image(image_data)
         
-        # Handle text (shouldn't normally reach here)
+        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
         elif media_type == "text":
             return Document(
                 page_content=media_item.get("text", ""),
@@ -624,8 +674,9 @@ async def process_media_item_task(
                 metadata={"source": url, "type": "url", "status": "not_implemented"}
             )      
            
-        # Handle audio
+        # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
         elif media_type == "audio":
+            
             if "data" in media_item:
                 # Base64 audio
                 audio_data = media_item["data"]

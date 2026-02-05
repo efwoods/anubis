@@ -10,7 +10,13 @@ from src.anubis.utils.context import GlobalContext, UserContext, AssistantContex
 import logging
 logger = logging.getLogger(__name__)
 
+# Preload audio to text processor
+from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+pipe=get_whisper_pipeline()
+
 app = FastAPI(title="Media Processing API")
+
+
 
 @app.get("/hello")
 def test_hello_world():

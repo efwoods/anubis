@@ -32,3 +32,8 @@ There is a tool for identifying and structuring relationships between the target
 
 The features that are identified through tool use are used to update the assistant's identity.
 
+[crawling bookmarks](https://claude.ai/chat/107e5a1b-96fb-4d31-b35b-a55080bda861)
+
+[text and more](https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5)
+
+[process muliple media from a zip file or uploaded folder](https://claude.ai/chat/880c431e-bd37-4a2a-905a-b637369c60bc)

@@ -160,3 +160,46 @@ async def make_retriever(
                 f"Expected one of: {', '.join(GlobalConfiguration.__annotations__['retriever_provider'].__args__)}\n"
                 f"Got: {configuration.retriever_provider}"
             )
+
+@asynccontextmanager
+async def make_mongdb_vectorstore(
+    configuration: IndexConfiguration, embedding_model: Embeddings,
+):
+    from langchain_mongodb import MongoDBAtlasVectorSearch
+    logger.info(f"create a vectorstore entry point")
+
+    vstore = await asyncio.to_thread(
+        MongoDBAtlasVectorSearch.from_connection_string, 
+        os.environ["MONGODB_URI"],
+        namespace="mvp_mongo_db.vectorstore",
+        embedding=embedding_model
+    )
+
+    yield vstore
+
+@asynccontextmanager
+async def make_vectorstore(
+    configuration: GlobalConfiguration,
+) -> AsyncGenerator[VectorStoreRetriever, None]:
+    """Create a retriever for the agent, based on the current configuration."""
+    # configuration = IndexConfiguration.from_runnable_config(config)
+    embedding_model = await make_text_encoder(configuration.embedding_model)
+
+    logger.info(f" configuration.embedding_model: {configuration.embedding_model}")
+
+    # embedding_model = HuggingFaceEmbeddings(configuration.embedding_model)
+    # user_id = configuration.user_id
+    # # assistant_id = configuration.assistant_id
+    # if not user_id:
+    #     raise ValueError("Please provide a valid user_id in the configuration.")
+    match configuration.retriever_provider:
+        case "mongodb":
+            async with make_mongdb_vectorstore(configuration, embedding_model) as vectorstore:
+                yield vectorstore
+
+        case _:
+            raise ValueError(
+                "Unrecognized retriever_provider in configuration. "
+                f"Expected one of: {', '.join(GlobalConfiguration.__annotations__['retriever_provider'].__args__)}\n"
+                f"Got: {configuration.retriever_provider}"
+            )

@@ -29,7 +29,6 @@ from typing import cast
 
 from langgraph.store.memory import InMemoryStore
 
-
 # Define the Graph & Context
 workflow = StateGraph(
     state_schema=GlobalState, 

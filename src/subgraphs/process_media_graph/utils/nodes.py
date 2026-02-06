@@ -682,13 +682,13 @@ async def process_media_item_task(
     logger.info(f"extracted user_id: {user_id}")
     logger.info(f"extracted assistant_id: {assistant_id}")
 
+    filename = media_item['metadata']['filename']
+    logger.info(f"Processing file: {filename}")
+
     try:
         # Handle base64 images
         if media_type == "image":
-            metadata = getattr(media_item, "metadata", None)
-            if metadata is not None:
-                reference_image = getattr(metadata, "reference_image", "")
-
+            reference_image = media_item['metadata']["reference_image"]
             if "data" in media_item:
                 # Base64 image
                 image_data = media_item["data"]
@@ -701,7 +701,8 @@ async def process_media_item_task(
                     "assistant_id": assistant_id, 
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
-                    "reference_image": reference_image
+                    "reference_image": reference_image,
+                    "filename": filename
                 })                
 
 
@@ -743,11 +744,7 @@ async def process_media_item_task(
            
         # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
         elif media_type == "audio":
-            assert hasattr(media_item, "metadata")
-
-            if hasattr(media_item["metadata"], "reference_audio"):
-                reference_audio = media_item['metadata']['reference_audio']
-
+            reference_audio = media_item['metadata']['reference_audio']
             if "data" in media_item:
                 # Base64 audio
                 audio_data = media_item["data"]
@@ -813,7 +810,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Globa
     """ 
     Media type in media list is determined at this point: 
     Convert the media in a list of one or more media to text in parallel.
-    media items must have user_id and assitant_id as metadata.
+    media items must have user_id and assistant_id as metadata.
     Exptected format:
     [
         {
@@ -847,23 +844,13 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Globa
     docs = []
     for media_item in media_list:
         doc = await process_media_item_task(media_item, runtime)
-        metadata = doc.get("metadata", {})
-        error = metadata.get("error", "")
-        
-        logger.info(f"error: {error}")
 
-        if error != "":
-            logger.warning(f"Error Proccessing media")
+        if hasattr(doc.metadata, "error"):
+            error = getattr(doc.metadata, "error")
+            logger.warning(f"Error processing media {error}")
+
         else:
             docs.append(doc)
-
-    # Parallel Task Execution
-    # tasks = [
-    #     process_media_item_task(media_item) for media_item in media_list
-    # ]
-
-    # # Execute all tasks in parallel
-    # docs = await asyncio.gather(*tasks, return_exceptions=True)
 
     # # Analysis list (needs a node)
     # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts

@@ -129,21 +129,30 @@ async def retrieve(
 
         logger.info(f"{state['queries'][-1]}")
 
-        # Filter Query to return only user_id assitant_id
+        # Filter Query to return only user_id assistant_id
         user_id = runtime.context.assistant_ctx.user_id
-        assitant_id = runtime.context.assistant_ctx.assistant_id
+        assistant_id = runtime.context.assistant_ctx.assistant_id
 
         filter_query = {
-            "user_id": {"$eq": user_id},
-            "assistant_id": {"$eq": assitant_id}
+            "$and": [
+                {"user_id": {"$eq": "test_user_1234"}},
+                {"assistant_id": {"$eq": assistant_id}}
+            ]
         }
+        filter_query = { "assistant_id": "mom"}
 
         response = await retriever.ainvoke(
             state['queries'][-1],
-            fetch_k = 100, # number to return
             search_kwargs={
-                "filter": filter_query,
-                "score_threshold": 0.6 # cosine similarity threshold (greater is higher quality fewer results)
+                "k": 100,
+                "score_threshold": 0.6, # cosine similarity threshold (greater is higher quality fewer results)
+                "filter": filter_query
+            })
+        
+        response = await retriever.ainvoke(
+            state['queries'][-1],
+            search_kwargs={
+                "filter": {"assistant_id": 'mom'}
             })
         
         logger.info(f"Query: {state['queries'][-1]} | Docs: {len(response)}")

@@ -56,7 +56,12 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     # test_store = await runtime.store.alist_namespaces()
     user_id = runtime.context.assistant_ctx.user_id
+    runtime.context.assistant_ctx.assistant_id = "mom"
     assistant_id = runtime.context.assistant_ctx.assistant_id
+
+
+    # assistant_id = "mom"
+
     namespace = (user_id, assistant_id)
 
     test_put_store = await runtime.store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
@@ -86,6 +91,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     new_state_retrieved_docs = await retrieval_graph.ainvoke(retrieval_message, context=runtime.context)
     
+    state['retrieved_docs'] = []
+
     # populate the relevant documents with a new state
     state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
 

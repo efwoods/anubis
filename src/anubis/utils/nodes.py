@@ -54,7 +54,7 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     return result
 
-async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
+async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     logger.info(f"INVOKE AGENT NODE ")
 

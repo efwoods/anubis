@@ -30,11 +30,17 @@ from typing import cast
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.postgres import PostgresStore
 
+from src.anubis.utils.configuration import GlobalConfiguration
+
+configuration = GlobalConfiguration()
+if configuration.dev == "TRUE":
+    across_thread_memory = InMemoryStore()
 
 # Define the Graph & Context
 workflow = StateGraph(
     state_schema=GlobalState, 
     context_schema=GlobalContext, 
+    store=BaseStore
 )
 
 # Add Nodes
@@ -48,7 +54,11 @@ workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
 
 
+# if (configuration.dev == "TRUE"):
+    # process_media_graph_api_endpoint = workflow.compile(store = across_thread_memory)
+# else:
 process_media_graph_api_endpoint = workflow.compile()
+    
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"
 
 __all__ = ["process_media_graph_api_endpoint"]

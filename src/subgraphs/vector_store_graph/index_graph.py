@@ -18,8 +18,10 @@ from langgraph_runtime.store import BaseStore
 from typing import cast
 
 from langgraph.store.memory import InMemoryStore
+from src.anubis.utils.configuration import GlobalConfiguration
 
-accross_thread_memory = InMemoryStore()
+across_thread_memory = InMemoryStore()
+configuration = GlobalConfiguration()
 
 def ensure_docs_have_user_id(
     vectorstore_documents_to_be_indexed: Sequence[Document], runtime: GlobalContext
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 import asyncio
 
 async def index_docs(
-    state: GlobalState, runtime: Runtime[GlobalContext] | None = None
+    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -93,7 +95,11 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
 
+# if (configuration.dev == "TRUE"):
+    # index_graph = builder.compile(store=across_thread_memory)
+# else: 
 index_graph = builder.compile()
+
 index_graph.name = "IndexGraph"
 
 __all__ = ["index_graph"]

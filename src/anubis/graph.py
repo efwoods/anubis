@@ -42,12 +42,20 @@ load_dotenv()
 
 configuration = GlobalConfiguration()
 
-from typing import cast
+if configuration.dev == "TRUE":
+    from langgraph.store.memory import InMemoryStore
+    across_thread_memory = InMemoryStore()    
 
+
+from typing import cast
 from langgraph.store.base import BaseStore
 
 # Build minimal graph: START -> agent -> END
-workflow = StateGraph(state_schema = GlobalState, context_schema = GlobalContext)
+workflow = StateGraph(
+    state_schema = GlobalState, 
+    context_schema = GlobalContext,
+    store=BaseStore
+)
 
 # Add single node (your input/output)
 # workflow.add_node("call_router", call_router)
@@ -59,7 +67,11 @@ workflow.add_edge(START, "invoke_agent")
 
 workflow.add_edge("invoke_agent", END)
 
+# if configuration.dev == "TRUE":
+    # graph = workflow.compile(store=across_thread_memory)
+# else:
 graph = workflow.compile()
+
 graph.name = "Anubis"
 
 __all__ = ["graph"]

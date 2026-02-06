@@ -264,6 +264,7 @@ from langgraph.store.postgres import AsyncPostgresStore
 async def process_uploaded_files(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
+    store: BaseStore
 ) -> Dict[str, Any]:
     """
     Convert FastAPI UploadFile objects into standardized media format.

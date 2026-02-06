@@ -57,7 +57,7 @@ class AssistantContext:
                 base[key] = value
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for prompt injection."""
+        """Conve-rt to dictionary for prompt injection."""
         return {
             "name": self.name,
             **self.metadata  # Unpack all metadata at top level
@@ -150,5 +150,8 @@ class GlobalContext:
 
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
+        
+
+
         self.configuration.__post_init__()
 

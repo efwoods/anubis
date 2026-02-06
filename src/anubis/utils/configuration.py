@@ -41,9 +41,9 @@ class IndexConfiguration:
     ] = field(
         default="mongodb",
         metadata={
-            "description": "The vector store provider to use for retrieval. Options are 'elastic', 'pinecone', or 'mongodb'."
+            "description": "The vector store provider to use for retrieval. Options are 'elastic', 'pinecone', or           'mongodb'."
         },
-    )
+    )           
 
     search_kwargs: dict[str, Any] = field(
         default_factory=dict,

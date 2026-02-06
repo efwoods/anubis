@@ -112,7 +112,6 @@ async def store_memory(state: State, runtime: Runtime[Context]):
     ]
     return {"messages": results}
 
-
 def route_message(state: State):
     """Determine the next step based on the presence of tool calls."""
     msg = state.messages[-1]

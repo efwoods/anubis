@@ -42,11 +42,6 @@ langchain-chroma
 langchain-openai
 langchain-tavily
 
-# Firebase 
-# firebase_admin
-# google-cloud-firestore
-# google-cloud-storage
-
 beautifulsoup4
 huggingface-hub>=0.24.0
 sentence-transformers

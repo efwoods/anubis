@@ -118,17 +118,12 @@ async def make_mongodb_retriever(
         embedding=embedding_model
     )
 
-    search_kwargs = configuration.search_kwargs
-    # pre_filter = search_kwargs.setdefault("pre_filter", {})
-    # pre_filter["user_id"] = {"$eq": configuration.user_id}
-    yield vstore.as_retriever(search_kwargs=search_kwargs)
+    yield vstore.as_retriever()
 
 
-from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalConfiguration
 
 import logging
-
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -142,10 +137,10 @@ async def make_retriever(
     logger.info(f" configuration.embedding_model: {configuration.embedding_model}")
 
     # embedding_model = HuggingFaceEmbeddings(configuration.embedding_model)
-    user_id = configuration.user_id
-    # assistant_id = configuration.assistant_id
-    if not user_id:
-        raise ValueError("Please provide a valid user_id in the configuration.")
+    # user_id = configuration.user_id
+    # # assistant_id = configuration.assistant_id
+    # if not user_id:
+    #     raise ValueError("Please provide a valid user_id in the configuration.")
     match configuration.retriever_provider:
         case "elastic" | "elastic-local":
             with make_elastic_retriever(configuration, embedding_model) as retriever:

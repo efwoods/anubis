@@ -269,12 +269,12 @@ async def process_uploaded_files(
 
     namespace = (user_id, assistant_id)
     
-    store = runtime.store
+    # store = runtime.store
 
     logger.info(f"breakpoint")
 
-    result_put = await store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
-    result_get = await store.asearch(namespace,)
+    # result_put = await store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
+    # result_get = await store.asearch(namespace,)
 
     # result_get = await runtime.store.asearch(namespace,)
     # result_put = await runtime.store.aput(namespace=namespace, key="test_key", value="test_values process uploaded files")
@@ -685,17 +685,15 @@ async def process_media_item_task(
     try:
         # Handle base64 images
         if media_type == "image":
-            assert hasattr(media_item, "metadata")
-
-            if hasattr(media_item["metadata"], "reference_image"):
-                reference_image = media_item['metadata']['reference_image']
-            
+            metadata = getattr(media_item, "metadata", None)
+            if metadata is not None:
+                reference_image = getattr(metadata, "reference_image", "")
 
             if "data" in media_item:
                 # Base64 image
                 image_data = media_item["data"]
                 logger.warning(f"STORE REFERENCE IMAGE HERE")
-                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA                
+                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -725,8 +723,6 @@ async def process_media_item_task(
                     "processing_task_id": str(uuid4()),
                     "reference_image": reference_image
                 })                
-
-
                 return doc
         
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
@@ -851,10 +847,15 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Globa
     docs = []
     for media_item in media_list:
         doc = await process_media_item_task(media_item, runtime)
-        if not hasattr(doc.metadata, "error"):
-            docs.append(doc)
+        metadata = doc.get("metadata", {})
+        error = metadata.get("error", "")
+        
+        logger.info(f"error: {error}")
+
+        if error != "":
+            logger.warning(f"Error Proccessing media")
         else:
-            logger.warning(f"Error processing media: {media_item}")
+            docs.append(doc)
 
     # Parallel Task Execution
     # tasks = [

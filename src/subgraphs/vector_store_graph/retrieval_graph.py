@@ -137,12 +137,12 @@ async def retrieve(
             "user_id": {"$eq": user_id},
             "assistant_id": {"$eq": assitant_id}
         }
-        
+
         response = await retriever.ainvoke(
-            state['queries'][-1], 
-            filter=filter_query, 
+            state['queries'][-1],
             fetch_k = 100, # number to return
             search_kwargs={
+                "filter": filter_query,
                 "score_threshold": 0.6 # cosine similarity threshold (greater is higher quality fewer results)
             })
         

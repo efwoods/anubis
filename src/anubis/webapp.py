@@ -15,11 +15,6 @@ logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
 
 from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
-from langgraph.store.memory import InMemoryStore
-
-from typing import cast
-from langgraph.store.base import BaseStore
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,12 +22,10 @@ async def lifespan(app: FastAPI):
     # Startup: Preload the Whisper model pipeline
     logger.info("Application startup: Preloading Whisper model...")
     global context 
-    global in_memory_store
 
     try:
         # Initialize context / configuration
         context = GlobalContext()
-        in_memory_store = InMemoryStore()
 
         # Create pipeline for audio transcription
         from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline

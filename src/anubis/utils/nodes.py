@@ -30,6 +30,10 @@ from src.anubis.utils.tools import (
     # upsert_memory
 )
 
+from langgraph.store.base import BaseStore
+
+from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
+
 # Optional: Add tools=[] if you have them
 tools = []  # Replace with your tools 
 
@@ -54,19 +58,21 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     logger.info(f"INVOKE AGENT NODE ")
 
+    configuration =  runtime.context.configuration
+    # vectorstore = await make_vectorstore(configuration)
+
+    logger.info(f"breakpoint invoke agent")
+
     # test_store = await runtime.store.alist_namespaces()
     user_id = runtime.context.assistant_ctx.user_id
     runtime.context.assistant_ctx.assistant_id = "mom"
     assistant_id = runtime.context.assistant_ctx.assistant_id
 
-
-    # assistant_id = "mom"
-
     namespace = (user_id, assistant_id)
 
-    test_put_store = await runtime.store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
+    # test_put_store = await runtime.store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
 
-    test_result_get = await runtime.store.asearch(namespace,)
+    # test_result_get = await runtime.store.asearch(namespace,)
 
     logger.info(f" breakpoint ")
     

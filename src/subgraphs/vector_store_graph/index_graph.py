@@ -13,6 +13,14 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 
 
+from langgraph_runtime.store import BaseStore
+
+from typing import cast
+
+from langgraph.store.memory import InMemoryStore
+
+accross_thread_memory = InMemoryStore()
+
 def ensure_docs_have_user_id(
     vectorstore_documents_to_be_indexed: Sequence[Document], runtime: GlobalContext
 ) -> list[Document]:
@@ -78,7 +86,6 @@ async def index_docs(
         
         await vectorstore.aadd_documents(state['vectorstore_documents_to_be_indexed'])
     return {"docs": "delete"}
-
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

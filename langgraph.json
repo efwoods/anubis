@@ -16,8 +16,7 @@
     },
     "ttl": {
       "refresh_on_read": false
-    },
-    "type": "memory"
+    }
   },
   "http": {
     "app": "src/anubis/webapp.py:app"

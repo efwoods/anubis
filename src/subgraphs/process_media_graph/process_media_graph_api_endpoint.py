@@ -28,12 +28,13 @@ from langgraph.checkpoint.memory import MemorySaver
 from typing import cast
 
 from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres import PostgresStore
+
 
 # Define the Graph & Context
 workflow = StateGraph(
     state_schema=GlobalState, 
     context_schema=GlobalContext, 
-    store=cast(BaseStore, InMemoryStore())
 )
 
 # Add Nodes

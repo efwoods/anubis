@@ -22,6 +22,8 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
 
+
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -149,18 +151,17 @@ async def retrieve(
                 "filter": filter_query
             })
         
-        response = await retriever.ainvoke(
-            state['queries'][-1],
-            search_kwargs={
-                "filter": {"assistant_id": 'mom'}
-            })
+        # response = await retriever.ainvoke(
+        #     state['queries'][-1],
+        #     search_kwargs={
+        #         "pre_filter": {"assistant_id": 'mom'}
+        #     })
         
         logger.info(f"Query: {state['queries'][-1]} | Docs: {len(response)}")
         logger.info(f"{response}")
         return {"retrieved_docs": response}
 
 # Define a new graph (It's just a pipe)
-
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(generate_query)  # type: ignore[arg-type]

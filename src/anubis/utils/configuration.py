@@ -166,6 +166,10 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "inference provider for production use and for adapter training."}
     )
     
+    postgres_db_uri: str = field(
+        default=None,
+        metadata={"description": "Connection string to postgres db for persistent storage"}
+    )
 
 
     def __post_init__(self):

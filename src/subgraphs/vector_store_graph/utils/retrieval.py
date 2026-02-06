@@ -12,7 +12,7 @@ from typing import Generator, AsyncGenerator
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
-from langchain_core.vectorstores import VectorStoreRetriever
+from langchain_core.vectorstores import VectorStoreRetriever, VectorStore
 from src.anubis.utils.configuration import IndexConfiguration, GlobalConfiguration
 
 import asyncio
@@ -180,7 +180,7 @@ async def make_mongdb_vectorstore(
 @asynccontextmanager
 async def make_vectorstore(
     configuration: GlobalConfiguration,
-) -> AsyncGenerator[VectorStoreRetriever, None]:
+) -> AsyncGenerator[VectorStore, None]:
     """Create a retriever for the agent, based on the current configuration."""
     # configuration = IndexConfiguration.from_runnable_config(config)
     embedding_model = await make_text_encoder(configuration.embedding_model)

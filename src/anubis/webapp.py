@@ -104,8 +104,7 @@ async def upload_media(
         initial_state = {
             "media_files": media_files,
         }
-        
-        
+           
 
         # Prepare context/config
         # config = {
@@ -117,12 +116,11 @@ async def upload_media(
         # }
 
         runtime_context = {"context": context}
-        
+
         # Invoke the graph
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            context=context, 
-            
+            context=context
             )
         
         # Extract indexed documents info

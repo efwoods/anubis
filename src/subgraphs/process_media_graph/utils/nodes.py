@@ -252,10 +252,18 @@ from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 
+from langgraph.store.postgres import PostgresStore
+
+from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
+
+import asyncio
+
+from src.anubis.utils.configuration import GlobalConfiguration
+from langgraph.store.postgres import AsyncPostgresStore
+
 async def process_uploaded_files(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
-    store: BaseStore
 ) -> Dict[str, Any]:
     """
     Convert FastAPI UploadFile objects into standardized media format.
@@ -263,6 +271,18 @@ async def process_uploaded_files(
     """
     
     logger.info(f"Process uploaded files NODE")
+
+
+
+    configuration = runtime.context.configuration
+
+    # async with AsyncPostgresStore.from_conn_string(configuration.postgres_db_uri) as store:
+
+    # vectorstore = await asyncio.to_thread(
+    #         make_vectorstore(configuration)
+    # )
+
+    logger.info(f"breakpoint process_uploaded_files")
 
     user_id = runtime.context.assistant_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
@@ -806,7 +826,7 @@ async def process_media_item_task(
         )
     return await tool.ainvoke(media_item["content"])
 
-async def convert_media_list_to_text_document(state: GlobalState, runtime: GlobalContext) -> Dict[str, Any]:
+async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext]) -> Dict[str, Any]:
     """ 
     Media type in media list is determined at this point: 
     Convert the media in a list of one or more media to text in parallel.
@@ -844,11 +864,12 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Globa
     docs = []
     for media_item in media_list:
         doc = await process_media_item_task(media_item, runtime)
-
-        if hasattr(doc.metadata, "error"):
-            error = getattr(doc.metadata, "error")
-            logger.warning(f"Error processing media {error}")
-
+        
+        status = doc.metadata.get("status", "")
+        if status == "" or status == "error":
+            error = doc.metadata.get("error", "")
+            filename = doc.metadata.get("filename", "")
+            logger.warning(f"Error processing media: {filename} {error}")
         else:
             docs.append(doc)
 

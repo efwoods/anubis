@@ -13,6 +13,14 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 
 
+from langgraph_runtime.store import BaseStore
+
+from typing import cast
+
+from langgraph.store.memory import InMemoryStore
+
+accross_thread_memory = InMemoryStore()
+
 def ensure_docs_have_user_id(
     vectorstore_documents_to_be_indexed: Sequence[Document], runtime: GlobalContext
 ) -> list[Document]:
@@ -35,6 +43,8 @@ def ensure_docs_have_user_id(
 import logging
 logger = logging.getLogger(__name__)
 
+import asyncio
+
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext] | None = None
 ) -> dict[str, str]:
@@ -50,16 +60,32 @@ async def index_docs(
     """
     from src.anubis.utils.configuration import GlobalConfiguration
     logger.info(f"index docs entrypoint")
-
+    
     configuration = GlobalConfiguration()
-    async with retrieval.make_retriever(configuration) as retriever:
+    async with retrieval.make_vectorstore(configuration) as vectorstore:
         logger.info(f"INDEXING DOCUMENTS")
+        logger.warning(f"NEED TO ADD SOURCE TO DOCUMENTS AS METADATA")
         # stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
         # logger.info(f"stamped_docs: {stamped_docs}")
         logger.info(f"stable breakpoint")
-        await retriever.aadd_documents(state['vectorstore_documents_to_be_indexed'])
-    return {"docs": "delete"}
 
+        # Delete documents with the same filename in the metadata
+        filenames = {
+            doc.metadata.get("filename") 
+            for doc in 
+            state['vectorstore_documents_to_be_indexed'] 
+            if doc.metadata.get("filename") is not None
+        }
+
+        if filenames:
+            delete_value = await asyncio.to_thread(
+                vectorstore._collection.delete_many,
+                {"filename": {"$in": list(filenames)}},
+            )
+            logger.info(f"delete_value: {delete_value}")
+        
+        await vectorstore.aadd_documents(state['vectorstore_documents_to_be_indexed'])
+    return {"docs": "delete"}
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

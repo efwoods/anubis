@@ -25,10 +25,7 @@ from src.anubis.utils.helper_functions import (
     reduce_docs, 
 )
 
-
-
 import logging
-
 logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)

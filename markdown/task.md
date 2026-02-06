@@ -1,3 +1,91 @@
+This needs to be an asynchronous function. 
+
+I need audio transcription that will be hosted as a server endpoint that will scale to multiple requests for production. 
+
+I need to establish the LRU cache of the model on startup of the webapp
+
+
+[task](https://claude.ai/chat/2f8abce0-925e-4c16-ab20-cb02cbd146a4)
+
+
+async def extract_text_from_audio(audio_data: str) -> Document:
+
+    """Extract text from audio using Hugging Face Whisper Large v3"""
+
+logger.warning(f"THIS IS UNTESTED")
+
+import base64
+
+import tempfile
+
+import os
+
+import asyncio
+
+logger.info(f"extract text from audio ENTRYPOINT")
+
+try:
+
+# Decode base64 audio data
+
+audio_bytes = base64.b64decode(audio_data)
+
+# Create temporary file [SYNCHRONOUS WRITE]
+
+with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+
+temp_audio.write(audio_bytes)
+
+temp_audio_path = temp_audio.name
+
+try:
+
+# Get cached pipeline
+
+pipe = get_whisper_pipeline()
+
+# Run transcription in thread pool (it's CPU/GPU intensive)
+
+loop = asyncio.get_event_loop()
+
+result = await loop.run_in_executor(None, pipe, temp_audio_path)
+
+transcript = result["text"]
+
+# Create Document with transcription
+
+doc = Document(
+
+page_content=transcript,
+
+metadata={
+
+"source": "audio_transcription",
+
+"model": "whisper-large-v3"
+
+}
+
+)
+
+return doc
+
+finally:
+
+# Clean up temporary file
+
+if os.path.exists(temp_audio_path):
+
+os.unlink(temp_audio_path)
+
+except Exception as e:
+
+logger.error(f"Audio transcription failed: {e}")
+
+raise
+
+
+
 # src/anubis/webapp.py
 import os
 from typing import List
@@ -11,49 +99,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Preload audio to text processor [this needs a startup in a lifecycle call]
- 
-from contextlib import asynccontextmanager
+from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+pipe=get_whisper_pipeline()
 
-from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
+app = FastAPI(title="Media Processing API")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup/shutdown events"""
-    # Startup: Preload the Whisper model pipeline
-    logger.info("Application startup: Preloading Whisper model...")
-    global context 
 
-    try:
-        # Initialize context / configuration
-        context = GlobalContext()
-
-        # Create pipeline for audio transcription
-        from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
-        # Call the function to trigger @lru_cache and load model into memory
-        pipe = get_whisper_pipeline()
-        
-        logger.info("✓ Whisper model preloaded and cached successfully")
-        logger.info(f"  - Model: openai/whisper-large-v3")
-        logger.info(f"  - Device: {pipe.device}")
-        logger.info(f"  - Ready to process audio requests")
-    except Exception as e:
-        logger.error("=" * 60)
-        logger.error(f"✗ CRITICAL: Failed to preload Whisper model: {e}", exc_info=True)
-        logger.error("=" * 60)
-        # Decide if you want to fail fast or continue
-        raise  # Uncomment to prevent startup if model loading fails
-    
-    yield  # Application runs here
-    
-    # Shutdown: Cleanup if needed
-    logger.info("Shutting down application...")
-
-app = FastAPI(
-    title="Media Processing API",
-    description="LangGraph-based media processing with Whisper audio transcription",
-    version="1.0.0",
-    lifespan=lifespan
-)
 
 @app.get("/hello")
 def test_hello_world():
@@ -65,8 +116,6 @@ async def upload_media(
     files: List[UploadFile] = File(...),
     user_id: str = Form(default="test_user_1234"),
     assistant_id: str = Form(default="default_assistant"),
-    reference_audio: bool = False,
-    reference_image: bool = False
 ):
     # Context user_id, assistant_id
     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
@@ -78,12 +127,9 @@ async def upload_media(
     - **assistant_id**: Assistant identifier
     """
     try:
-        # update the context:
-        context.user_ctx.user_id = user_id
-        context.assistant_ctx.assistant_id = assistant_id
-        context.assistant_ctx.user_id = user_id
-
         # Read all uploaded files
+
+
         media_files = []
         for file in files:
             content = await file.read()
@@ -92,9 +138,7 @@ async def upload_media(
                 "content_type": file.content_type,
                 "content": content,
                 "user_id": user_id,
-                "assistant_id": assistant_id,
-                "reference_audio": reference_audio,
-                "reference_image": reference_image
+                "assistant_id": assistant_id
             })
         
         # Import graph here to avoid circular imports
@@ -104,8 +148,7 @@ async def upload_media(
         initial_state = {
             "media_files": media_files,
         }
-           
-
+        
         # Prepare context/config
         # config = {
         #     "configurable": {
@@ -114,14 +157,9 @@ async def upload_media(
         #         # Add other configuration as needed
         #     }
         # }
-
-        runtime_context = {"context": context}
-
+        
         # Invoke the graph
-        result = await process_media_graph_api_endpoint.ainvoke(
-            initial_state, 
-            context=context
-            )
+        result = await process_media_graph_api_endpoint.ainvoke(initial_state)
         
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
@@ -143,13 +181,12 @@ async def upload_media(
             detail=f"Error processing media: {str(e)}"
         )
 
+
 @app.post("/process-media-json")
 async def process_media_json(
     media_list: List[dict],
     user_id: str = "test_user_1234",
-    assistant_id: str = "default_assistant", 
-    reference_audo: bool = False, 
-    reference_image: bool = False
+    assistant_id: str = "default_assistant"
 ):
     """
     Process media from JSON payload (for pre-encoded base64 data).
@@ -171,7 +208,8 @@ async def process_media_json(
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
         
         initial_state = {
-            "media_list": media_list,   
+            "media_list": media_list,
+            
         }
         
         # config = {
@@ -196,6 +234,7 @@ async def process_media_json(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
+
 
 if __name__ == "__main__":
     import uvicorn

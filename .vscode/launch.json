@@ -16,7 +16,7 @@
           "remoteRoot": "."
         }
       ],
-      "justMyCode": false
+      "justMyCode": true
     }
   ]
 }

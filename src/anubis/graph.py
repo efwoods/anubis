@@ -34,6 +34,17 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.nodes import (
     invoke_agent
 )
+from langgraph.store.postgres import PostgresStore
+from langgraph.checkpoint.postgres import PostgresSaver
+
+from dotenv import load_dotenv
+load_dotenv()
+
+configuration = GlobalConfiguration()
+
+from typing import cast
+
+from langgraph.store.base import BaseStore
 
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(state_schema = GlobalState, context_schema = GlobalContext)

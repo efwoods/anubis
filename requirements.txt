@@ -42,10 +42,12 @@ langchain-chroma
 langchain-openai
 langchain-tavily
 
-# Firebase 
-# firebase_admin
-# google-cloud-firestore
-# google-cloud-storage
+# Database
+# langcha-postgres
+langgraph-checkpoint-postgres
+psycopg
+
+
 
 beautifulsoup4
 huggingface-hub>=0.24.0
@@ -54,3 +56,11 @@ langchain-mongodb
 
 # Document Processing
 pillow
+
+# Audio Processing
+transformers
+torch
+torchaudio
+accelerate
+aiofiles
+

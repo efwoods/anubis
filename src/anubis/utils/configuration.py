@@ -41,9 +41,9 @@ class IndexConfiguration:
     ] = field(
         default="mongodb",
         metadata={
-            "description": "The vector store provider to use for retrieval. Options are 'elastic', 'pinecone', or 'mongodb'."
+            "description": "The vector store provider to use for retrieval. Options are 'elastic', 'pinecone', or           'mongodb'."
         },
-    )
+    )           
 
     search_kwargs: dict[str, Any] = field(
         default_factory=dict,
@@ -166,6 +166,10 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "inference provider for production use and for adapter training."}
     )
     
+    postgres_db_uri: str = field(
+        default=None,
+        metadata={"description": "Connection string to postgres db for persistent storage"}
+    )
 
 
     def __post_init__(self):

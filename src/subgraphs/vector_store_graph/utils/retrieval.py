@@ -12,7 +12,7 @@ from typing import Generator, AsyncGenerator
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
-from langchain_core.vectorstores import VectorStoreRetriever
+from langchain_core.vectorstores import VectorStoreRetriever, VectorStore
 from src.anubis.utils.configuration import IndexConfiguration, GlobalConfiguration
 
 import asyncio
@@ -104,7 +104,7 @@ def make_pinecone_retriever(
 
 @asynccontextmanager
 async def make_mongodb_retriever(
-    configuration: IndexConfiguration, embedding_model: Embeddings
+    configuration: IndexConfiguration, embedding_model: Embeddings,
 ) -> AsyncGenerator[VectorStoreRetriever, None]:
     """Configure this agent to connect to a specific MongoDB Atlas index & namespaces."""
     from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
@@ -118,17 +118,12 @@ async def make_mongodb_retriever(
         embedding=embedding_model
     )
 
-    search_kwargs = configuration.search_kwargs
-    # pre_filter = search_kwargs.setdefault("pre_filter", {})
-    # pre_filter["user_id"] = {"$eq": configuration.user_id}
-    yield vstore.as_retriever(search_kwargs=search_kwargs)
+    yield vstore.as_retriever()
 
 
-from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalConfiguration
 
 import logging
-
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -142,10 +137,10 @@ async def make_retriever(
     logger.info(f" configuration.embedding_model: {configuration.embedding_model}")
 
     # embedding_model = HuggingFaceEmbeddings(configuration.embedding_model)
-    user_id = configuration.user_id
-    # assistant_id = configuration.assistant_id
-    if not user_id:
-        raise ValueError("Please provide a valid user_id in the configuration.")
+    # user_id = configuration.user_id
+    # # assistant_id = configuration.assistant_id
+    # if not user_id:
+    #     raise ValueError("Please provide a valid user_id in the configuration.")
     match configuration.retriever_provider:
         case "elastic" | "elastic-local":
             with make_elastic_retriever(configuration, embedding_model) as retriever:
@@ -158,6 +153,49 @@ async def make_retriever(
         case "mongodb":
             async with make_mongodb_retriever(configuration, embedding_model) as retriever:
                 yield retriever
+
+        case _:
+            raise ValueError(
+                "Unrecognized retriever_provider in configuration. "
+                f"Expected one of: {', '.join(GlobalConfiguration.__annotations__['retriever_provider'].__args__)}\n"
+                f"Got: {configuration.retriever_provider}"
+            )
+
+@asynccontextmanager
+async def make_mongdb_vectorstore(
+    configuration: IndexConfiguration, embedding_model: Embeddings,
+):
+    from langchain_mongodb import MongoDBAtlasVectorSearch
+    logger.info(f"create a vectorstore entry point")
+
+    vstore = await asyncio.to_thread(
+        MongoDBAtlasVectorSearch.from_connection_string, 
+        os.environ["MONGODB_URI"],
+        namespace="mvp_mongo_db.vectorstore",
+        embedding=embedding_model
+    )
+
+    yield vstore
+
+@asynccontextmanager
+async def make_vectorstore(
+    configuration: GlobalConfiguration,
+) -> AsyncGenerator[VectorStore, None]:
+    """Create a retriever for the agent, based on the current configuration."""
+    # configuration = IndexConfiguration.from_runnable_config(config)
+    embedding_model = await make_text_encoder(configuration.embedding_model)
+
+    logger.info(f" configuration.embedding_model: {configuration.embedding_model}")
+
+    # embedding_model = HuggingFaceEmbeddings(configuration.embedding_model)
+    # user_id = configuration.user_id
+    # # assistant_id = configuration.assistant_id
+    # if not user_id:
+    #     raise ValueError("Please provide a valid user_id in the configuration.")
+    match configuration.retriever_provider:
+        case "mongodb":
+            async with make_mongdb_vectorstore(configuration, embedding_model) as vectorstore:
+                yield vectorstore
 
         case _:
             raise ValueError(

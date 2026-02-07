@@ -282,18 +282,6 @@ async def process_uploaded_files(
 
     namespace = (user_id, assistant_id)
     
-    vector_store = await asyncio.to_thread(make_vectorstore(configuration))
-
-    # test_put_store = await store.aput(namespace=namespace, key="test_key_process_uploaded_files_api_call", value="test_values process uploaded files")
-
-    # test_result_get = await store.asearch(namespace,)
-
-    # async with AsyncPostgresStore.from_conn_string(configuration.postgres_db_uri) as store:
-
-    # vectorstore = await asyncio.to_thread(
-    #         make_vectorstore(configuration)
-    # )
-
     logger.info(f"breakpoint process_uploaded_files")
 
     user_id = runtime.context.assistant_ctx.user_id
@@ -835,7 +823,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
         doc = await process_media_item_task(media_item, runtime)
         
         status = doc.metadata.get("status", "")
-        if status == "" or status == "error":
+        if status == "error":
             error = doc.metadata.get("error", "")
             filename = doc.metadata.get("filename", "")
             logger.warning(f"Error processing media: {filename} {error}")

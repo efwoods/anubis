@@ -141,7 +141,7 @@ async def retrieve(
                 "$and": [
                     {"user_id": {"$eq": user_id}},
                     {"assistant_id": {"$eq": assistant_id}},
-                    {"type": {"$neq": "memory"}}
+                    {"type": {"$ne": "memory"}}
                 ]
             }
         else:
@@ -153,15 +153,17 @@ async def retrieve(
                 ]
             }
         
-        
-
-        response = await retriever.ainvoke(
-            state['queries'][-1],
-            search_kwargs={
+        search_kwargs={
                 "k": 100,
                 "score_threshold": 0.6, # cosine similarity threshold (greater is higher quality fewer results)
                 "pre_filter": filter_query
-            })
+            }
+
+        response = await retriever.ainvoke(
+            state['queries'][-1], 
+            filter = filter_query
+        )
+            
         
         filtered_response = []
 

@@ -20,7 +20,7 @@ from src.anubis.utils.classes.FirebaseDB import FirebaseDB
 
 @dataclass
 class UserContext:
-    user_id: str = field(default="default_user_id_1234")
+    user_id: str = field(default="test_user_id_1234")
     name: str = field(default=None)
     description: str = field(default=None)
     metadata: dict = field(default_factory=dict )
@@ -34,7 +34,7 @@ class UserContext:
 
 @dataclass
 class AssistantContext:
-    user_id: str = field(default="default_user_id_1234")
+    user_id: str = field(default="test_user_id_1234")
     assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
     name: str = field(default=None)
     description: str = field(default=None)

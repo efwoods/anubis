@@ -68,10 +68,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     user_id = runtime.context.user_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
 
-    
-
-
-
     namespace = (user_id, assistant_id)
 
     # Acquiring NoSQL DB object
@@ -81,7 +77,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     data = {
         "avatar_name": "Evan Woods", 
         "new_field": "field data", 
-        "USER": {"name": "evan", "detected features": "fun friendly passionate determined ambitious loving kind developer"}
+        "USER": {"name": "evan", "detected features": "fun friendly passionate determined ambitious loving kind developer", "unchanged_key": "unchanged_value"}
         }
 
     # need to be able to add fields onto the USER metadata object without replacing the object entirely

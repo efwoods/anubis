@@ -34,7 +34,7 @@ debugpy
 # Langchain
 langsmith
 langchain
-langchain-community
+langchain-community`
 langchain-unstructured
 langchain-huggingface
 langchain-core
@@ -61,3 +61,5 @@ torchaudio
 accelerate
 aiofiles
 
+# Firebase
+firebase-admin

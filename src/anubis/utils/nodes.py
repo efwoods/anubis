@@ -74,6 +74,33 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     namespace = (user_id, assistant_id)
 
+    # Acquiring NoSQL DB object
+    db = runtime.context.firebase_DB
+
+    # Example Analyzed Data
+    data = {
+        "avatar_name": "Evan Woods", 
+        "new_field": "field data", 
+        "USER": {"name": "evan", "detected features": "fun friendly passionate determined ambitious loving kind developer"}
+        }
+
+    # need to be able to add fields onto the USER metadata object without replacing the object entirely
+
+    db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
+
+    # Example of retrieval for prompt injection
+    avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
+
+    # New user data
+    data = {
+        "USER": {"name": "Evan Franklin Woods"}
+        }
+    
+    db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
+
+    # Example of retrieval for prompt injection
+    avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
+
     # test_put_store = await store.aput(namespace=namespace, key="test_key_invoke_agent", value="test_values process uploaded files")
 
     # test_result_get = await store.asearch(namespace,)
@@ -99,7 +126,16 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     
     retrieval_message = {"messages" : [human_message]}
 
-    new_state_retrieved_docs = await retrieval_graph.ainvoke(retrieval_message, context=runtime.context)
+    # Memories are text-only statements with user_id, assistant_id, "type": "memory", "source": "conversation" add to vectorstore and filter results to retrieve only memories through prompt-created generation and retrieval; invoke retrieval and only return documents that have the type "memory" 
+
+    # relevant documents invoke retrieval and only return documents that do not have the type "memory"
+
+    runtime.context.vector_store_memory_search_only = "FALSE"
+
+    new_state_retrieved_docs = await retrieval_graph.ainvoke(
+        retrieval_message, 
+        context=runtime.context
+    )
     
     state['retrieved_docs'] = []
 
@@ -109,14 +145,34 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     # Vectorstore Retrieved Docments
     retrieved_docs = format_docs(state.get('retrieved_docs', []))
 
+
+    """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
+
+    runtime.context.vector_store_memory_search_only = "TRUE"
+
+    new_state_retrieved_memories = await retrieval_graph.ainvoke(
+        retrieval_message, 
+        context=runtime.context
+    )
+    
+    state['retrieved_memories'] = []
+
+    # populate the relevant documents with a new state
+    state['retrieved_memories'] = new_state_retrieved_memories['retrieved_memories']
+
+    # Vectorstore Retrieved Docments
+    retrieved_memories = format_docs(state.get('retrieved_memories', []))
+
+    # TODO: PROMPT INJECT RETRIEVED MEMORIES 
+
     prompt_builder = DynamicPromptBuilder()
 
-    # TODO: Update the assistant context from the store
+    # TODO: Update the assistant context from the store: details about the AI 
     ai_context = runtime.context.firebase_DB.get_avatar(user_id=user_id, avatar_id=assistant_id)
     # Load the current assistant context for prompt injection
     # ai_context = runtime.context.assistant_ctx.to_dict()
 
-    # TODO: Update the user context from the state
+    # TODO: Update the user context from the state: details about the user from the AI's perspective
     user_ctx = ai_context.get("USER", "") # information stored in a nested dictionary about the user
 
     # Load the current user context from prompt injection

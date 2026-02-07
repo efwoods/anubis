@@ -261,6 +261,8 @@ import asyncio
 from src.anubis.utils.configuration import GlobalConfiguration
 from langgraph.store.postgres import AsyncPostgresStore
 
+from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
+
 async def process_uploaded_files(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
@@ -275,14 +277,16 @@ async def process_uploaded_files(
 
     configuration = runtime.context.configuration
 
-    user_id = runtime.context.assistant_ctx.assistant_id
+    user_id = runtime.context.assistant_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
 
     namespace = (user_id, assistant_id)
+    
+    vector_store = await asyncio.to_thread(make_vectorstore(configuration))
 
-    test_put_store = await store.aput(namespace=namespace, key="test_key_process_uploaded_files_api_call", value="test_values process uploaded files")
+    # test_put_store = await store.aput(namespace=namespace, key="test_key_process_uploaded_files_api_call", value="test_values process uploaded files")
 
-    test_result_get = await store.asearch(namespace,)
+    # test_result_get = await store.asearch(namespace,)
 
     # async with AsyncPostgresStore.from_conn_string(configuration.postgres_db_uri) as store:
 
@@ -645,51 +649,6 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
 
-@tool
-async def base64_image(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a base64 image string to a Document with text. """
-    doc = extract_personality_from_image(media_data["data"], runtime.state)
-    return doc
-
-@tool
-async def non_base64_image(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a NON base64 image object to a Document with text. """
-    pass
-
-@tool
-async def text_only_input(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a text string to a Document with text. """
-    pass
-
-@tool
-async def audio(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert audio to a Document with text. """
-    pass
-
-@tool
-async def video(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a video to a Document with text. """
-    pass
-
-@tool
-async def handle_url(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ 
-    Used to convert a url to a Document with text. May require other tool use. 
-    Download the content from the URL.
-    Queue the content as media to be processed. 
-    """
-    pass
-
-MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
-    "base64_image" : base64_image, 
-    "non_base64_image": non_base64_image, 
-    "text_only_input": text_only_input, 
-    "audio": audio,
-    "video": video,
-    "handle_url": handle_url
-}
-
-
 # from langgraph.func import task
 
 async def process_media_item_task(
@@ -733,9 +692,8 @@ async def process_media_item_task(
                     "reference_image": reference_image,
                     "filename": filename
                 })                
-
-
                 return doc
+            
             elif "image_url" in media_item:
                 # URL-based image
                 url = media_item["image_url"].get("url", "")

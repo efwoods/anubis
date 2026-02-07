@@ -3,7 +3,9 @@ import firebase_admin
 from firebase_admin import firestore, auth, db, storage, get_app, credentials
 from firebase_admin.exceptions import FirebaseError
 from typing import Optional, Dict, Any, List
-from utils.logging import logger
+
+import logging
+logger = logging.getLogger(__name__)
 
 class FirebaseDB:
     """Wrapper around Google Firestore, Auth, and Storage operations with emulator support."""
@@ -140,99 +142,100 @@ class FirebaseDB:
     def update_avatar_fields(self, user_id: str, avatar_id: str, fields: Dict[str, Any]) -> None:
         """Merge-update fields on avatars/{avatarId}."""
         (
-        self.client.collection("users")
-         .document(user_id)
-         .collection("avatars")
-         .document(avatar_id)
-         .set(fields, merge=True)
-        )
+            self.client.collection("users")
+             .document(user_id)
+             .collection("avatars")
+             .document(avatar_id)
+             .set(fields, merge=True)
+            )
+        
 
-    # --- Conversations under avatars/{avatarId}/conversations/{conversationId} ---
+    # # --- Conversations under avatars/{avatarId}/conversations/{conversationId} ---
 
-    def list_conversations(self, avatar_id: str) -> List[str]:
-        avatar = self.get_avatar(avatar_id)
-        return avatar.get("conversations", []) if avatar else []
+    # def list_conversations(self, avatar_id: str) -> List[str]:
+    #     avatar = self.get_avatar(avatar_id)
+    #     return avatar.get("conversations", []) if avatar else []
 
-    def add_conversation_to_avatar(self, avatar_id: str, conversation_id: str, data: Optional[Dict[str, Any]] = None) -> None:
-        """
-        Add conversation id to avatars/{avatarId}.conversations and create the subcollection doc
-        avatars/{avatarId}/conversations/{conversationId}.
-        """
-        # ensure avatar doc exists
-        try:
-            self.client.collection("avatars").document(avatar_id).update({"conversations": firestore.ArrayUnion([conversation_id])})
-        except Exception:
-            # create avatar doc with conversations array
-            self.create_avatar(avatar_id, {"conversations": [conversation_id]})
+    # def add_conversation_to_avatar(self, avatar_id: str, conversation_id: str, data: Optional[Dict[str, Any]] = None) -> None:
+    #     """
+    #     Add conversation id to avatars/{avatarId}.conversations and create the subcollection doc
+    #     avatars/{avatarId}/conversations/{conversationId}.
+    #     """
+    #     # ensure avatar doc exists
+    #     try:
+    #         self.client.collection("avatars").document(avatar_id).update({"conversations": firestore.ArrayUnion([conversation_id])})
+    #     except Exception:
+    #         # create avatar doc with conversations array
+    #         self.create_avatar(avatar_id, {"conversations": [conversation_id]})
 
-        conv_ref = self.client.collection("avatars").document(avatar_id).collection("conversations").document(conversation_id)
-        conv_ref.set(data or {}, merge=True)
+    #     conv_ref = self.client.collection("avatars").document(avatar_id).collection("conversations").document(conversation_id)
+    #     conv_ref.set(data or {}, merge=True)
 
-    def set_default_conversation(self, avatar_id: str, conversation_id: Optional[str]) -> None:
-        """Set avatars/{avatarId}.default_conversation"""
-        self.update_avatar_fields(avatar_id, {"default_conversation": conversation_id})
+    # def set_default_conversation(self, avatar_id: str, conversation_id: Optional[str]) -> None:
+    #     """Set avatars/{avatarId}.default_conversation"""
+    #     self.update_avatar_fields(avatar_id, {"default_conversation": conversation_id})
 
-    # --- Messages under avatars/{avatarId}/conversations/{conversationId}/messages/{messageId} ---
+    # # --- Messages under avatars/{avatarId}/conversations/{conversationId}/messages/{messageId} ---
 
-    def create_message(self, avatar_id: str, conversation_id: str, message_id: str, message_data: Dict[str, Any]) -> None:
-        """
-        Create or overwrite a message document under messages subcollection.
-        message_data should include structure like: {"message": {"text": "...", "media": []}, "sender": "user", ...}
-        """
-        msg_ref = (
-            self.client.collection("avatars")
-            .document(avatar_id)
-            .collection("conversations")
-            .document(conversation_id)
-            .collection("messages")
-            .document(message_id)
-        )
-        msg_ref.set(message_data, merge=True)
+    # def create_message(self, avatar_id: str, conversation_id: str, message_id: str, message_data: Dict[str, Any]) -> None:
+    #     """
+    #     Create or overwrite a message document under messages subcollection.
+    #     message_data should include structure like: {"message": {"text": "...", "media": []}, "sender": "user", ...}
+    #     """
+    #     msg_ref = (
+    #         self.client.collection("avatars")
+    #         .document(avatar_id)
+    #         .collection("conversations")
+    #         .document(conversation_id)
+    #         .collection("messages")
+    #         .document(message_id)
+    #     )
+    #     msg_ref.set(message_data, merge=True)
 
-    def get_message(self, avatar_id: str, conversation_id: str, message_id: str) -> Optional[Dict[str, Any]]:
-        msg_ref = (
-            self.client.collection("avatars")
-            .document(avatar_id)
-            .collection("conversations")
-            .document(conversation_id)
-            .collection("messages")
-            .document(message_id)
-        )
-        doc = msg_ref.get()
-        return doc.to_dict() if doc.exists else None
+    # def get_message(self, avatar_id: str, conversation_id: str, message_id: str) -> Optional[Dict[str, Any]]:
+    #     msg_ref = (
+    #         self.client.collection("avatars")
+    #         .document(avatar_id)
+    #         .collection("conversations")
+    #         .document(conversation_id)
+    #         .collection("messages")
+    #         .document(message_id)
+    #     )
+    #     doc = msg_ref.get()
+    #     return doc.to_dict() if doc.exists else None
 
-    def list_messages(self, avatar_id: str, conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        msgs_ref = (
-            self.client.collection("avatars")
-            .document(avatar_id)
-            .collection("conversations")
-            .document(conversation_id)
-            .collection("messages")
-        )
-        query = msgs_ref.order_by("created_at") if "created_at" in [f.name for f in msgs_ref.getAll()[0].reference.parent._client._firestore._metadata] else msgs_ref
-        docs = query.limit(limit).stream() if limit else query.stream()
-        return [d.to_dict() for d in docs]
+    # def list_messages(self, avatar_id: str, conversation_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    #     msgs_ref = (
+    #         self.client.collection("avatars")
+    #         .document(avatar_id)
+    #         .collection("conversations")
+    #         .document(conversation_id)
+    #         .collection("messages")
+    #     )
+    #     query = msgs_ref.order_by("created_at") if "created_at" in [f.name for f in msgs_ref.getAll()[0].reference.parent._client._firestore._metadata] else msgs_ref
+    #     docs = query.limit(limit).stream() if limit else query.stream()
+    #     return [d.to_dict() for d in docs]
 
-    def append_media_to_message(self, avatar_id: str, conversation_id: str, message_id: str, media_item: Dict[str, Any]) -> None:
-        """Append a media item to message.message.media list. If absent, creates media list."""
-        msg_ref = (
-            self.client.collection("avatars")
-            .document(avatar_id)
-            .collection("conversations")
-            .document(conversation_id)
-            .collection("messages")
-            .document(message_id)
-        )
-        doc = msg_ref.get()
-        if not doc.exists:
-            # create message with media list
-            msg_ref.set({"message": {"text": "", "media": [media_item]}}, merge=True)
-            return
+    # def append_media_to_message(self, avatar_id: str, conversation_id: str, message_id: str, media_item: Dict[str, Any]) -> None:
+    #     """Append a media item to message.message.media list. If absent, creates media list."""
+    #     msg_ref = (
+    #         self.client.collection("avatars")
+    #         .document(avatar_id)
+    #         .collection("conversations")
+    #         .document(conversation_id)
+    #         .collection("messages")
+    #         .document(message_id)
+    #     )
+    #     doc = msg_ref.get()
+    #     if not doc.exists:
+    #         # create message with media list
+    #         msg_ref.set({"message": {"text": "", "media": [media_item]}}, merge=True)
+    #         return
 
-        current = doc.to_dict() or {}
-        msg = current.get("message", {})
-        media = msg.get("media", [])
-        media.append(media_item)
-        msg_ref.set({"message": {"media": media}}, merge=True)
+    #     current = doc.to_dict() or {}
+    #     msg = current.get("message", {})
+    #     media = msg.get("media", [])
+    #     media.append(media_item)
+    #     msg_ref.set({"message": {"media": media}}, merge=True)
 
 

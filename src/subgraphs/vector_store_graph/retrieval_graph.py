@@ -135,19 +135,32 @@ async def retrieve(
         user_id = runtime.context.assistant_ctx.user_id
         assistant_id = runtime.context.assistant_ctx.assistant_id
 
-        filter_query = {
-            "$and": [
-                {"user_id": {"$eq": "default_user_id_1234"}},
-                {"assistant_id": {"$eq": "default_assistant"}}
-            ]
-        }
+        memory_search = runtime.context.vector_store_memory_search_only
+        if memory_search == "FALSE":
+            filter_query = {
+                "$and": [
+                    {"user_id": {"$eq": user_id}},
+                    {"assistant_id": {"$eq": assistant_id}},
+                    {"type": {"$neq": "memory"}}
+                ]
+            }
+        else:
+            filter_query = {
+                "$and": [
+                    {"user_id": {"$eq": user_id}},
+                    {"assistant_id": {"$eq": assistant_id}},
+                    {"type": {"$eq": "memory"}}
+                ]
+            }
+        
+        
 
         response = await retriever.ainvoke(
             state['queries'][-1],
             search_kwargs={
                 "k": 100,
                 "score_threshold": 0.6, # cosine similarity threshold (greater is higher quality fewer results)
-                "filter": filter_query
+                "pre_filter": filter_query
             })
         
         filtered_response = []

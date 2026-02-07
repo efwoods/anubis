@@ -102,7 +102,9 @@ class GlobalContext:
     user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
-    firebase_DB: FirebaseDB
+    firebase_DB: FirebaseDB = field(default_factory=FirebaseDB)
+
+    vector_store_memory_search_only: str = field(default="FALSE")
 
     async def load_identity_from_storage(self, user_id: str):
         """Load assistant identity from long-term storage."""

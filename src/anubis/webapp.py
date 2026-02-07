@@ -29,8 +29,6 @@ async def lifespan(app: FastAPI):
     try:
         # Initialize context / configuration
         context = GlobalContext()
-        if context.configuration.dev == "TRUE":
-            store = InMemoryStore()
 
         # Create pipeline for audio transcription
         from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
@@ -120,13 +118,11 @@ async def upload_media(
         #     }
         # }
 
-        runtime_context = {"context": context}
 
         # Invoke the graph
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
             context=context,
-            store=store
             )
         
         # Extract indexed documents info

@@ -103,7 +103,6 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 @lru_cache(maxsize=1)
 def get_whisper_pipeline():
     """Load and cache the Whisper model pipeline"""
-    logger.warning(f"THIS IS UNTESTED")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     

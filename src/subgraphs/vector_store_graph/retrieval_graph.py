@@ -137,11 +137,10 @@ async def retrieve(
 
         filter_query = {
             "$and": [
-                {"user_id": {"$eq": "test_user_1234"}},
-                {"assistant_id": {"$eq": assistant_id}}
+                {"user_id": {"$eq": "default_user_id_1234"}},
+                {"assistant_id": {"$eq": "default_assistant"}}
             ]
         }
-        filter_query = { "assistant_id": "mom"}
 
         response = await retriever.ainvoke(
             state['queries'][-1],
@@ -151,15 +150,24 @@ async def retrieve(
                 "filter": filter_query
             })
         
+        filtered_response = []
+
+        # for doc in response:
+        #     if doc.metadata["user_id"] == user_id and doc.metadata['assistant_id'] == assistant_id:
+        #         filtered_response.append(doc)
+
+        filtered_response = [doc for doc in response if doc.metadata['user_id'] == user_id and doc.metadata['assistant_id'] == assistant_id]
+
+        
         # response = await retriever.ainvoke(
         #     state['queries'][-1],
         #     search_kwargs={
         #         "pre_filter": {"assistant_id": 'mom'}
         #     })
         
-        logger.info(f"Query: {state['queries'][-1]} | Docs: {len(response)}")
-        logger.info(f"{response}")
-        return {"retrieved_docs": response}
+        logger.info(f"Query: {state['queries'][-1]} | Docs: {len(filtered_response)}")
+        logger.info(f"{filtered_response}")
+        return {"retrieved_docs": filtered_response}
 
 # Define a new graph (It's just a pipe)
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

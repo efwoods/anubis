@@ -273,9 +273,16 @@ async def process_uploaded_files(
     
     logger.info(f"Process uploaded files NODE")
 
-
-
     configuration = runtime.context.configuration
+
+    user_id = runtime.context.assistant_ctx.assistant_id
+    assistant_id = runtime.context.assistant_ctx.assistant_id
+
+    namespace = (user_id, assistant_id)
+
+    test_put_store = await store.aput(namespace=namespace, key="test_key_process_uploaded_files_api_call", value="test_values process uploaded files")
+
+    test_result_get = await store.asearch(namespace,)
 
     # async with AsyncPostgresStore.from_conn_string(configuration.postgres_db_uri) as store:
 
@@ -712,9 +719,10 @@ async def process_media_item_task(
             reference_image = media_item['metadata']["reference_image"]
             if "data" in media_item:
                 # Base64 image
-                image_data = media_item["data"]
-                logger.warning(f"STORE REFERENCE IMAGE HERE")
-                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                image_data = media_item["data"]                
+                if reference_image:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": image_data})
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -734,8 +742,9 @@ async def process_media_item_task(
                 if url.startswith("data:image"):
                     # Extract base64 data
                     image_data = url.split(",", 1)[1]
-                    logger.warning(f"STORE REFERENCE IMAGE HERE")
-                    # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                    if reference_image:
+                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                        runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": image_data})
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -769,9 +778,9 @@ async def process_media_item_task(
             if "data" in media_item:
                 # Base64 audio
                 audio_data = media_item["data"]
-                logger.warning(f"STORE REFERENCE AUDIO HERE")
-                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
-
+                if reference_audio:
+                    logger.warning(f"STORE REFERENCE AUDIO HERE")
+                    runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": audio_data})
                 doc = await extract_text_from_audio(audio_data)
 
                 # Add metadata
@@ -790,8 +799,9 @@ async def process_media_item_task(
                 if url.startswith("data:audio"):
                     # Extract base64 data
                     audio_data = url.split(",", 1)[1]
-                    logger.warning(f"STORE REFERENCE AUDIO HERE")
-                    # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                    if reference_audio:
+                        logger.warning(f"STORE REFERENCE AUDIO HERE")
+                        runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": audio_data})
 
                     doc = await extract_text_from_audio(audio_data)
                     doc.metadata.update({

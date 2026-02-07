@@ -122,4 +122,3 @@ class GlobalState(TypedDict):
     """ Node Routing """
 
     route_decision: str = ""
-

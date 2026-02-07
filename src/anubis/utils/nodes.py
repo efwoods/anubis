@@ -56,6 +56,7 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 
 async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+
     logger.info(f"INVOKE AGENT NODE ")
 
     configuration =  runtime.context.configuration
@@ -64,15 +65,18 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"breakpoint invoke agent")
 
     # test_store = await runtime.store.alist_namespaces()
-    user_id = runtime.context.assistant_ctx.user_id
-    runtime.context.assistant_ctx.assistant_id = "mom"
+    user_id = runtime.context.user_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
+
+    
+
+
 
     namespace = (user_id, assistant_id)
 
-    # test_put_store = await runtime.store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
+    # test_put_store = await store.aput(namespace=namespace, key="test_key_invoke_agent", value="test_values process uploaded files")
 
-    # test_result_get = await runtime.store.asearch(namespace,)
+    # test_result_get = await store.asearch(namespace,)
 
     logger.info(f" breakpoint ")
     
@@ -107,15 +111,16 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     prompt_builder = DynamicPromptBuilder()
 
-    # TODO: Update the assistant context from the state
-
+    # TODO: Update the assistant context from the store
+    ai_context = runtime.context.firebase_DB.get_avatar(user_id=user_id, avatar_id=assistant_id)
     # Load the current assistant context for prompt injection
-    ai_context = runtime.context.assistant_ctx.to_dict()
+    # ai_context = runtime.context.assistant_ctx.to_dict()
 
     # TODO: Update the user context from the state
+    user_ctx = ai_context.get("USER", "") # information stored in a nested dictionary about the user
 
     # Load the current user context from prompt injection
-    user_ctx = runtime.context.user_ctx.to_dict()
+    # user_ctx = runtime.context.user_ctx.to_dict()
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 

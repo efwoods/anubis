@@ -171,7 +171,6 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "Connection string to postgres db for persistent storage"}
     )
 
-
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

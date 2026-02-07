@@ -16,6 +16,8 @@ from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
 
+from src.anubis.utils.classes.FirebaseDB import FirebaseDB
+
 @dataclass
 class UserContext:
     user_id: str = field(default="default_user_id_1234")
@@ -96,9 +98,11 @@ class GlobalContext:
 
     temporary_system_prompt_update: str = ""
 
+
     user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
+    firebase_DB: FirebaseDB
 
     async def load_identity_from_storage(self, user_id: str):
         """Load assistant identity from long-term storage."""
@@ -142,6 +146,20 @@ class GlobalContext:
         # This would save to your database/vector store
         pass
 
+    async def put_store_items(self, json):
+        """Example put value to the store
+        {
+                  "namespace": [
+                    ""
+                  ],
+                  "key": "",
+                  "value": {}
+                }
+
+        Args:
+            json (dict): put payload
+        """
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):
@@ -150,8 +168,6 @@ class GlobalContext:
 
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
-        
-
 
         self.configuration.__post_init__()
-
+        self.firebase_DB.__init__()

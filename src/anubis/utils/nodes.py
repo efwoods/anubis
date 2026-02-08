@@ -65,46 +65,44 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"breakpoint invoke agent")
 
     # test_store = await runtime.store.alist_namespaces()
-    user_id = runtime.context.user_ctx.user_id
+    user_id = runtime.context.assistant_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
 
     with runtime.context.postgres_db_store as store:
         logger.info(f"breakpoint")
         
 
-    # Acquiring NoSQL DB object
-    db = runtime.context.firebase_DB
+    # # Acquiring NoSQL DB object
+    # db = runtime.context.firebase_DB
 
-    # Example Analyzed Data
-    data = {
-        "avatar_name": "Evan Woods", 
-        "new_field": "field data", 
-        "USER": {"name": "evan", "detected features": "fun friendly passionate determined ambitious loving kind developer", "unchanged_key": "unchanged_value"}
-        }
+    # # Example Analyzed Data
+    # data = {
+    #     "avatar_name": "Evan Woods", 
+    #     "new_field": "field data", 
+    #     "USER": {"name": "evan", "detected features": "fun friendly passionate determined ambitious loving kind developer", "unchanged_key": "unchanged_value"}
+    #     }
 
-    # need to be able to add fields onto the USER metadata object without replacing the object entirely
+    # # need to be able to add fields onto the USER metadata object without replacing the object entirely
 
-    db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
+    # db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
 
-    # Example of retrieval for prompt injection
-    avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
+    # # Example of retrieval for prompt injection
+    # avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
 
-    # New user data
-    data = {
-        "USER": {"name": "Evan Franklin Woods"}
-        }
+    # # New user data
+    # data = {
+    #     "USER": {"name": "Evan Franklin Woods"}
+    #     }
     
-    db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
+    # db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
 
-    # Example of retrieval for prompt injection
-    avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
+    # # Example of retrieval for prompt injection
+    # avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
 
     # test_put_store = await store.aput(namespace=namespace, key="test_key_invoke_agent", value="test_values process uploaded files")
 
     # test_result_get = await store.asearch(namespace,)
 
-    logger.info(f" breakpoint ")
-    
     config = runtime.context.configuration # Loads env vars automatically
 
     model = init_model(
@@ -166,11 +164,14 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     prompt_builder = DynamicPromptBuilder()
 
     # TODO: Update the assistant context from the store: details about the AI 
-    ai_context = runtime.context.firebase_DB.get_avatar(user_id=user_id, avatar_id=assistant_id)
+
+    ai_context = runtime.context.postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
+
     # Load the current assistant context for prompt injection
     # ai_context = runtime.context.assistant_ctx.to_dict()
 
     # TODO: Update the user context from the state: details about the user from the AI's perspective
+
     user_ctx = ai_context.get("USER", "") # information stored in a nested dictionary about the user
 
     # Load the current user context from prompt injection

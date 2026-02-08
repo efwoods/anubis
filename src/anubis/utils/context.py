@@ -16,8 +16,6 @@ from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
 
-from src.anubis.utils.classes.FirebaseDB import FirebaseDB
-
 from langchain_postgres import PGVector
 from langgraph.store.postgres import PostgresStore
 
@@ -105,7 +103,6 @@ class GlobalContext:
     user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
-    firebase_DB: FirebaseDB = field(default_factory=FirebaseDB)
 
     vector_store_memory_search_only: str = field(default="FALSE")
 
@@ -187,7 +184,6 @@ class GlobalContext:
             connection=self.configuration.postgres_uri
         )
 
-        # self.postgres_db_store = PostgresStore(conn=self.configuration.postgres_uri)
         self.postgres_db_store = PostgresStore.from_conn_string(self.configuration.postgres_uri)
 
-        self.firebase_DB.__init__()
+        

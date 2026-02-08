@@ -415,9 +415,6 @@ async def process_uploaded_files(
         "media_files": []  # Clear after processing
     }
 
-
-
-
 from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
 
 
@@ -669,7 +666,9 @@ async def process_media_item_task(
                 image_data = media_item["data"]                
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": image_data})
+                    namespace=(user_id, assistant_id)
+                    with runtime.context.postgres_db_store as store:
+                            store.put(namespace, key="reference_image", value={"reference_image":image_data})
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -691,9 +690,8 @@ async def process_media_item_task(
                     if reference_image:
                         logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                         namespace=(user_id, assistant_id)
-                        # with runtime.context.postgres_db_store as store:
-                        #     store.put(namespace, key="reference_image", value={"reference_image":image_data})
-                        # runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": image_data})
+                        with runtime.context.postgres_db_store as store:
+                            store.put(namespace, key="reference_image", value={"reference_image":image_data})
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -729,7 +727,9 @@ async def process_media_item_task(
                 audio_data = media_item["data"]
                 if reference_audio:
                     logger.warning(f"STORE REFERENCE AUDIO HERE")
-                    runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": audio_data})
+                    namespace=(user_id, assistant_id)
+                    with runtime.context.postgres_db_store as store:
+                            store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
                 doc = await extract_text_from_audio(audio_data)
 
                 # Add metadata
@@ -750,7 +750,9 @@ async def process_media_item_task(
                     audio_data = url.split(",", 1)[1]
                     if reference_audio:
                         logger.warning(f"STORE REFERENCE AUDIO HERE")
-                        runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": audio_data})
+                        namespace=(user_id, assistant_id)
+                        with runtime.context.postgres_db_store as store:
+                                store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
 
                     doc = await extract_text_from_audio(audio_data)
                     doc.metadata.update({

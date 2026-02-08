@@ -68,7 +68,9 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     user_id = runtime.context.user_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
 
-    namespace = (user_id, assistant_id)
+    with runtime.context.postgres_db_store as store:
+        logger.info(f"breakpoint")
+        
 
     # Acquiring NoSQL DB object
     db = runtime.context.firebase_DB

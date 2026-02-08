@@ -44,7 +44,9 @@ langchain-openai
 # Database
 # langcha-postgres
 langgraph-checkpoint-postgres
-psycopg
+langchain-postgres
+psycopg2-binary
+
 
 beautifulsoup4
 huggingface-hub>=0.24.0

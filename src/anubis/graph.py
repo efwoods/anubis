@@ -42,19 +42,13 @@ load_dotenv()
 
 configuration = GlobalConfiguration()
 
-if configuration.dev == "TRUE":
-    from langgraph.store.memory import InMemoryStore
-    across_thread_memory = InMemoryStore()    
-
-
 from typing import cast
 from langgraph.store.base import BaseStore
 
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(
     state_schema = GlobalState, 
-    context_schema = GlobalContext,
-    store=BaseStore
+    context_schema = GlobalContext
 )
 
 # Add single node (your input/output)

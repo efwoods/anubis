@@ -124,7 +124,8 @@ async def retrieve(
 
     configuration = runtime.context.configuration
 
-    async with retrieval.make_retriever(configuration) as retriever:
+
+    async with retrieval.make_vectorstore(configuration) as vectorstore:
         # logger.info(f"XXXXXXXXXXXXXXXXXX CONFIGURATION: {config}")
         
         logger.info(f"{configuration}")
@@ -159,9 +160,10 @@ async def retrieve(
                 "pre_filter": filter_query
             }
 
-        response = await retriever.ainvoke(
+        response = await vectorstore.asimilarity_search_with_score(
             state['queries'][-1], 
-            filter = filter_query
+            filter=filter_query,
+            score_threshold=0.6
         )
             
         
@@ -183,6 +185,67 @@ async def retrieve(
         logger.info(f"Query: {state['queries'][-1]} | Docs: {len(filtered_response)}")
         logger.info(f"{filtered_response}")
         return {"retrieved_docs": filtered_response}
+
+
+
+    # async with retrieval.make_retriever(configuration) as retriever:
+        # # logger.info(f"XXXXXXXXXXXXXXXXXX CONFIGURATION: {config}")
+        
+        # logger.info(f"{configuration}")
+
+        # logger.info(f"{state['queries'][-1]}")
+
+        # # Filter Query to return only user_id assistant_id
+        # user_id = runtime.context.assistant_ctx.user_id
+        # assistant_id = runtime.context.assistant_ctx.assistant_id
+
+        # memory_search = runtime.context.vector_store_memory_search_only
+        # if memory_search == "FALSE":
+        #     filter_query = {
+        #         "$and": [
+        #             {"user_id": {"$eq": user_id}},
+        #             {"assistant_id": {"$eq": assistant_id}},
+        #             {"type": {"$ne": "memory"}}
+        #         ]
+        #     }
+        # else:
+        #     filter_query = {
+        #         "$and": [
+        #             {"user_id": {"$eq": user_id}},
+        #             {"assistant_id": {"$eq": assistant_id}},
+        #             {"type": {"$eq": "memory"}}
+        #         ]
+        #     }
+        
+        # search_kwargs={
+        #         "k": 100,
+        #         "score_threshold": 0.6, # cosine similarity threshold (greater is higher quality fewer results)
+        #         "pre_filter": filter_query
+        #     }
+
+        # response = await retriever.ainvoke(
+        #     state['queries'][-1], 
+        # )
+            
+        
+        # filtered_response = []
+
+        # # for doc in response:
+        # #     if doc.metadata["user_id"] == user_id and doc.metadata['assistant_id'] == assistant_id:
+        # #         filtered_response.append(doc)
+
+        # filtered_response = [doc for doc in response if doc.metadata['user_id'] == user_id and doc.metadata['assistant_id'] == assistant_id]
+
+        
+        # # response = await retriever.ainvoke(
+        # #     state['queries'][-1],
+        # #     search_kwargs={
+        # #         "pre_filter": {"assistant_id": 'mom'}
+        # #     })
+        
+        # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(filtered_response)}")
+        # logger.info(f"{filtered_response}")
+        # return {"retrieved_docs": filtered_response}
 
 # Define a new graph (It's just a pipe)
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

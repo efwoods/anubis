@@ -166,9 +166,19 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "inference provider for production use and for adapter training."}
     )
     
-    postgres_db_uri: str = field(
+    postgres_uri: str = field(
         default=None,
         metadata={"description": "Connection string to postgres db for persistent storage"}
+    )
+
+    embedding_model: Annotated[
+        str,
+        {"__template_metadata__": {"kind": "embeddings"}},
+    ] = field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        metadata={
+            "description": "Name of the embedding model to use. Must be a valid embedding model name."
+        },
     )
 
     def __post_init__(self):

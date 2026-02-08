@@ -18,6 +18,9 @@ from typing import Dict, Any
 
 from src.anubis.utils.classes.FirebaseDB import FirebaseDB
 
+from langchain_postgres import PGVector
+from langgraph.store.postgres import PostgresStore
+
 @dataclass
 class UserContext:
     user_id: str = field(default="test_user_id_1234")
@@ -106,6 +109,11 @@ class GlobalContext:
 
     vector_store_memory_search_only: str = field(default="FALSE")
 
+
+
+    postgres_db_vector_store: PGVector = None
+    postgres_db_store: PostgresStore = None
+
     async def load_identity_from_storage(self, user_id: str):
         """Load assistant identity from long-term storage."""
         # Simulate loading from database/vector store
@@ -172,4 +180,14 @@ class GlobalContext:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
 
         self.configuration.__post_init__()
+        
+        self.postgres_db_vector_store = PGVector.from_existing_index(
+            embedding=self.configuration.embedding_model,
+            collection_name="documents",
+            connection=self.configuration.postgres_uri
+        )
+
+        # self.postgres_db_store = PostgresStore(conn=self.configuration.postgres_uri)
+        self.postgres_db_store = PostgresStore.from_conn_string(self.configuration.postgres_uri)
+
         self.firebase_DB.__init__()

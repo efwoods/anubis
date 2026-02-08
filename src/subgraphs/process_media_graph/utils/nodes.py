@@ -690,7 +690,10 @@ async def process_media_item_task(
                     image_data = url.split(",", 1)[1]
                     if reference_image:
                         logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                        runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": image_data})
+                        namespace=(user_id, assistant_id)
+                        # with runtime.context.postgres_db_store as store:
+                        #     store.put(namespace, key="reference_image", value={"reference_image":image_data})
+                        # runtime.context.firebase_DB.update_avatar_fields(user_id, assistant_id, fields={"reference_image": image_data})
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({

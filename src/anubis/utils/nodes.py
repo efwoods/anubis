@@ -34,6 +34,12 @@ from langgraph.store.base import BaseStore
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
 
+import asyncio
+from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+
+
 # Optional: Add tools=[] if you have them
 tools = []  # Replace with your tools 
 
@@ -54,8 +60,12 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     return result
 
-async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
+
+async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from sqlalchemy.ext.asyncio import create_async_engine
+
     logger.info(f"INVOKE AGENT NODE ")
 
     configuration =  runtime.context.configuration
@@ -63,19 +73,9 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     logger.info(f"breakpoint invoke agent")
 
-    # test_store = await runtime.store.alist_namespaces()
-    user_id = runtime.context.assistant_ctx.user_id
-    runtime.context.assistant_ctx.assistant_id = "mom"
-    assistant_id = runtime.context.assistant_ctx.assistant_id
 
-    namespace = (user_id, assistant_id)
+    """ CREATE MODEL """
 
-    # test_put_store = await runtime.store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
-
-    # test_result_get = await runtime.store.asearch(namespace,)
-
-    logger.info(f" breakpoint ")
-    
     config = runtime.context.configuration # Loads env vars automatically
 
     model = init_model(
@@ -86,6 +86,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
         config.dev
     )
 
+    """ VECTORSTORE DOCUMENT RETRIEVAL """
+
     # Retrieve documents for the query
     from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
@@ -95,27 +97,78 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
     
     retrieval_message = {"messages" : [human_message]}
 
-    new_state_retrieved_docs = await retrieval_graph.ainvoke(retrieval_message, context=runtime.context)
-    
+    # Memories are text-only statements with user_id, assistant_id, "type": "memory", "source": "conversation" add to vectorstore and filter results to retrieve only memories through prompt-created generation and retrieval; invoke retrieval and only return documents that have the type "memory" 
+
+    # relevant documents invoke retrieval and only return documents that do not have the type "memory"
+    runtime.context.vector_store_memory_search_only = "FALSE"
+
+    new_state_retrieved_docs = await retrieval_graph.ainvoke(
+        retrieval_message, 
+        context=runtime.context
+    )
+
     state['retrieved_docs'] = []
 
     # populate the relevant documents with a new state
     state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
 
+    logger.info(f"breakpoint")
+
     # Vectorstore Retrieved Docments
     retrieved_docs = format_docs(state.get('retrieved_docs', []))
 
+    """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
+    runtime.context.vector_store_memory_search_only = "TRUE"
+    new_state_retrieved_memories = await retrieval_graph.ainvoke(
+        retrieval_message, 
+        context=runtime.context
+    )
+
+    state['retrieved_memories'] = []
+
+    # populate the relevant documents with a new state
+    state['retrieved_memories'] = new_state_retrieved_memories['retrieved_docs']
+
+    logger.info(f"breakpoint")
+
+    # Vectorstore Retrieved Docments
+    retrieved_memories = format_docs(state.get('retrieved_memories', []))
+
+    # TODO: PROMPT INJECT RETRIEVED MEMORIES 
+
     prompt_builder = DynamicPromptBuilder()
 
-    # TODO: Update the assistant context from the state
+    # TODO: Update the assistant context from the store: details about the AI 
+
+    """ POSTGRES STORE RETRIEVAL (METADATA AI/USER) """
+
+    logger.info(f"async postgres store connection test breakpoint")
+   
+    
+    postgres_db_store = await make_pg_store(configuration)
+
+    user_id = runtime.context.assistant_ctx.get("user_id", "")
+    assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+
+    namespace=(user_id, assistant_id)
+    async with postgres_db_store as postgres_db_store:
+        ai_context = await postgres_db_store.aget(namespace, key="identity")
+        logger.info(f"ai_context: {ai_context}")
+
+
+    logger.info(f"async postgres store connection test POST breakpoint")
 
     # Load the current assistant context for prompt injection
-    ai_context = runtime.context.assistant_ctx.to_dict()
+    # ai_context = runtime.context.assistant_ctx.to_dict()
 
-    # TODO: Update the user context from the state
+    # TODO: Update the user context from the state: details about the user from the AI's perspective
 
-    # Load the current user context from prompt injection
-    user_ctx = runtime.context.user_ctx.to_dict()
+    if ai_context is not None:
+        user_context = ai_context.get("USER", {}) # information stored in a nested dictionary about the user
+    else:
+        ai_context_name = runtime.context.assistant_ctx.get("name", {})
+        ai_context = {"name": ai_context_name}        
+        user_context = {}
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
@@ -123,8 +176,9 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     populated_template = prompt_builder.build_prompt(
         ai_context=ai_context,
-        user_context=user_ctx, 
+        user_context=user_context, 
         retrieved_docs=retrieved_docs,
+        retrieved_memories=retrieved_memories,
         system_time = system_time,
         temporary_message=temporary_system_prompt_update,
     )
@@ -145,7 +199,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext]):
     logger.info(f"AGENT RESPONSE: {response}")
     result = {"messages": [response]}
     return result
-
 
 from pydantic import BaseModel, Field
 from typing import Literal

@@ -16,12 +16,15 @@ from contextlib import asynccontextmanager
 
 from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
 
+from langgraph.store.memory import InMemoryStore
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
     # Startup: Preload the Whisper model pipeline
     logger.info("Application startup: Preloading Whisper model...")
     global context 
+    global store 
 
     try:
         # Initialize context / configuration
@@ -115,12 +118,11 @@ async def upload_media(
         #     }
         # }
 
-        runtime_context = {"context": context}
 
         # Invoke the graph
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            context=context
+            context=context,
             )
         
         # Extract indexed documents info

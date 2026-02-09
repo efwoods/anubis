@@ -22,8 +22,6 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
 
-
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -103,6 +101,16 @@ async def generate_query(
         }
 
 
+from langgraph.store.postgres import PostgresStore
+from langchain_postgres import PGVector
+
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from src.subgraphs.vector_store_graph.utils.retrieval import (
+    make_text_encoder, 
+    make_pg_vector
+)
+
 async def retrieve(
     state: GlobalState, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[Document]]:
@@ -124,44 +132,43 @@ async def retrieve(
 
     configuration = runtime.context.configuration
 
-    async with retrieval.make_retriever(configuration) as retriever:
-        # logger.info(f"XXXXXXXXXXXXXXXXXX CONFIGURATION: {config}")
-        
-        logger.info(f"{configuration}")
+    user_id = runtime.context.assistant_ctx.get("user_id", "")
+    assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+    
+    memory_search = runtime.context.vector_store_memory_search_only
 
-        logger.info(f"{state['queries'][-1]}")
-
-        # Filter Query to return only user_id assistant_id
-        user_id = runtime.context.assistant_ctx.user_id
-        assistant_id = runtime.context.assistant_ctx.assistant_id
-
+    if memory_search == "FALSE":
         filter_query = {
-            "$and": [
-                {"user_id": {"$eq": "test_user_1234"}},
-                {"assistant_id": {"$eq": assistant_id}}
-            ]
+                "user_id": {"$eq": user_id},
+                "assistant_id": {"$eq": assistant_id}, 
+                "type": {"$ne": "memory"}
         }
-        filter_query = { "assistant_id": "mom"}
+    else:
+        filter_query = {
+                "user_id": {"$eq": user_id},
+                "assistant_id": {"$eq": assistant_id}, 
+                "type": {"$eq": "memory"}
+        }
 
-        response = await retriever.ainvoke(
-            state['queries'][-1],
-            search_kwargs={
-                "k": 100,
-                "score_threshold": 0.6, # cosine similarity threshold (greater is higher quality fewer results)
-                "filter": filter_query
-            })
-        
-        # response = await retriever.ainvoke(
-        #     state['queries'][-1],
-        #     search_kwargs={
-        #         "pre_filter": {"assistant_id": 'mom'}
-        #     })
-        
-        logger.info(f"Query: {state['queries'][-1]} | Docs: {len(response)}")
-        logger.info(f"{response}")
-        return {"retrieved_docs": response}
+    logger.info(f"breakpoint")
+    vector_store = make_pg_vector(configuration)
+    async with vector_store as vector_store:
+        logger.info(f"breakpoint")
+        results = await vector_store.asimilarity_search_with_relevance_scores(
+        query = state['queries'][-1],
+        filter=filter_query,
+    )
+        # score_threshold=0.6
 
-# Define a new graph (It's just a pipe)
+    retrieved_docs = [doc[0] for doc in results] # extract documents only
+
+    logger.info(f"breakpoint")
+
+    logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
+    logger.info(f"{retrieved_docs}")
+    return {"retrieved_docs": retrieved_docs}
+
+# Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(generate_query)  # type: ignore[arg-type]
@@ -169,7 +176,6 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 builder.add_edge("__start__", "generate_query")
 builder.add_edge("generate_query", "retrieve")
 
-# Finally, we compile it!
 # This compiles it into a graph you can invoke and deploy.
 retrieval_graph = builder.compile(
     interrupt_before=[],  # if you want to update the state before calling the tools

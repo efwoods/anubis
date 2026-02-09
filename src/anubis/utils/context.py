@@ -16,9 +16,16 @@ from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
 
+from langchain_postgres import PGVector
+from langgraph.store.postgres import AsyncPostgresStore
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from sqlalchemy.ext.asyncio import create_async_engine
+import asyncpg
+
 @dataclass
 class UserContext:
-    user_id: str = field(default="default_user_id_1234")
+    user_id: str = field(default="test_user_id_1234")
     name: str = field(default=None)
     description: str = field(default=None)
     metadata: dict = field(default_factory=dict )
@@ -32,7 +39,7 @@ class UserContext:
 
 @dataclass
 class AssistantContext:
-    user_id: str = field(default="default_user_id_1234")
+    user_id: str = field(default="test_user_id_1234")
     assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
     name: str = field(default=None)
     description: str = field(default=None)
@@ -96,9 +103,12 @@ class GlobalContext:
 
     temporary_system_prompt_update: str = ""
 
+
     user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
+
+    vector_store_memory_search_only: str = field(default="FALSE")
 
     async def load_identity_from_storage(self, user_id: str):
         """Load assistant identity from long-term storage."""
@@ -142,6 +152,20 @@ class GlobalContext:
         # This would save to your database/vector store
         pass
 
+    async def put_store_items(self, json):
+        """Example put value to the store
+        {
+                  "namespace": [
+                    ""
+                  ],
+                  "key": "",
+                  "value": {}
+                }
+
+        Args:
+            json (dict): put payload
+        """
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):
@@ -150,8 +174,5 @@ class GlobalContext:
 
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
-        
-
 
         self.configuration.__post_init__()
-

@@ -17,7 +17,11 @@ from langchain_core.messages import SystemMessage
 from typing import Dict, Any
 
 from langchain_postgres import PGVector
-from langgraph.store.postgres import PostgresStore
+from langgraph.store.postgres import AsyncPostgresStore
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from sqlalchemy.ext.asyncio import create_async_engine
+import asyncpg
 
 @dataclass
 class UserContext:
@@ -106,8 +110,8 @@ class GlobalContext:
 
     vector_store_memory_search_only: str = field(default="FALSE")
 
-
-
+    vector_store: PGVector = None 
+        
     postgres_db_vector_store: PGVector = None
     postgres_db_store: PostgresStore = None
 
@@ -178,12 +182,22 @@ class GlobalContext:
 
         self.configuration.__post_init__()
         
-        self.postgres_db_vector_store = PGVector.from_existing_index(
-            embedding=self.configuration.embedding_model,
-            collection_name="documents",
-            connection=self.configuration.postgres_uri
-        )
+        # self.postgres_db_vector_store = PGVector.from_existing_index(
+        #     embedding=self.configuration.embedding_model,
+        #     collection_name="documents",
+        #     connection=self.configuration.postgres_uri
+        # )
 
-        self.postgres_db_store = PostgresStore.from_conn_string(self.configuration.postgres_uri)
+        # self.postgres_db_store = PostgresStore.from_conn_string(self.configuration.postgres_uri)
 
+        self.postgres_db_store = AsyncPostgresStore.from_conn_string(self.configuration.postgres_uri)
+
+        # async_engine = create_async_engine(self.configuration.postgres_uri)
         
+        # self.vector_store = PGVector(
+        #     embeddings=HuggingFaceEmbeddings(model=self.configuration.embedding_model),
+        #     collection_name = "documents",
+        #     connection = async_engine
+        # )
+
+    

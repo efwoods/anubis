@@ -54,8 +54,14 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     return result
 
+import asyncio
+from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+
 async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from sqlalchemy.ext.asyncio import create_async_engine
 
     logger.info(f"INVOKE AGENT NODE ")
 
@@ -68,9 +74,42 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     user_id = runtime.context.assistant_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
 
-    with runtime.context.postgres_db_store as store:
+    # with runtime.context.postgres_db_store as store:
+    #     logger.info(f"breakpoint")
+
+    vector_store = make_pg_vector(configuration)
+    async with vector_store as vector_store:
         logger.info(f"breakpoint")
+        results = await vector_store.asimilarity_search_with_relevance_scores(
+        query="kitty", 
+        filter={"id": {"$in": [1,2,5,9]}},
+        score_threshold=0.3
+        )
+
+    retrieved_docs = [doc[0] for doc in results] # extract documents only
+
+    logger.info(f"breakpoint")
+    
+    # vector_store = make_pg_vector(configuration)
+    # async with vector_store as vector_store:
+    #     logger.info(f"breakpoint")
+    #     results = await vector_store.asimilarity_search_with_relevance_scores(
+    #     query="kitty",
+    #     score_threshold=0.3
+    #     )
+
+    # embedding = await make_text_encoder(configuration.embedding_model)
+    
+    # async_engine = await asyncio.to_thread(
+    #     create_async_engine(configuration.postgres_uri)
+    # )
         
+    # vector_store = await asyncio.to_thread(
+    #     PGVector,
+    #     embeddings=embedding,
+    #     collection_name = "documents",
+    #     connection = async_engine
+    # )
 
     # # Acquiring NoSQL DB object
     # db = runtime.context.firebase_DB
@@ -128,15 +167,19 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     runtime.context.vector_store_memory_search_only = "FALSE"
 
-    new_state_retrieved_docs = await retrieval_graph.ainvoke(
-        retrieval_message, 
-        context=runtime.context
-    )
+    # new_state_retrieved_docs = await retrieval_graph.ainvoke(
+    #     retrieval_message, 
+    #     context=runtime.context
+    # )
     
     state['retrieved_docs'] = []
 
     # populate the relevant documents with a new state
-    state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
+    # state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
+
+    logger.info(f"breakpoint")
+
+    state['retrieved_docs'] = retrieved_docs
 
     # Vectorstore Retrieved Docments
     retrieved_docs = format_docs(state.get('retrieved_docs', []))
@@ -144,20 +187,20 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
 
-    runtime.context.vector_store_memory_search_only = "TRUE"
+    # runtime.context.vector_store_memory_search_only = "TRUE"
 
-    new_state_retrieved_memories = await retrieval_graph.ainvoke(
-        retrieval_message, 
-        context=runtime.context
-    )
+    # new_state_retrieved_memories = await retrieval_graph.ainvoke(
+    #     retrieval_message, 
+    #     context=runtime.context
+    # )
     
-    state['retrieved_memories'] = []
+    # state['retrieved_memories'] = []
 
-    # populate the relevant documents with a new state
-    state['retrieved_memories'] = new_state_retrieved_memories['retrieved_memories']
+    # # populate the relevant documents with a new state
+    # state['retrieved_memories'] = new_state_retrieved_memories['retrieved_memories']
 
-    # Vectorstore Retrieved Docments
-    retrieved_memories = format_docs(state.get('retrieved_memories', []))
+    # # Vectorstore Retrieved Docments
+    # retrieved_memories = format_docs(state.get('retrieved_memories', []))
 
     # TODO: PROMPT INJECT RETRIEVED MEMORIES 
 
@@ -165,7 +208,13 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     # TODO: Update the assistant context from the store: details about the AI 
 
-    ai_context = runtime.context.postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
+    # postgres_db_store = runtime.context.postgres_db_store
+
+    # async with postgres_db_store as store:
+    #     ai_context = postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
+
+    # ai_context = runtime.context.postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
+    ai_context = {}
 
     # Load the current assistant context for prompt injection
     # ai_context = runtime.context.assistant_ctx.to_dict()

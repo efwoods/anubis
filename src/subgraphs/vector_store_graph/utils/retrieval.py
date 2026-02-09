@@ -177,6 +177,30 @@ async def make_mongdb_vectorstore(
 
     yield vstore
 
+
+
+from sqlalchemy.ext.asyncio import create_async_engine
+from langchain_postgres import PGVector
+
+@asynccontextmanager
+async def make_pg_vector(
+    configuration: GlobalConfiguration):
+
+    embedding = await make_text_encoder(configuration.embedding_model)
+    
+    async_engine = create_async_engine(configuration.postgres_uri)
+        
+    vector_store = await asyncio.to_thread(
+        PGVector,
+        embeddings=embedding,
+        collection_name = "documents",
+        connection = async_engine,
+        async_mode=True,
+        create_extension=False
+    )
+
+    yield vector_store
+
 @asynccontextmanager
 async def make_vectorstore(
     configuration: GlobalConfiguration,

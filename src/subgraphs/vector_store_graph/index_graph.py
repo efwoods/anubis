@@ -18,8 +18,10 @@ from langgraph_runtime.store import BaseStore
 from typing import cast
 
 from langgraph.store.memory import InMemoryStore
+from src.anubis.utils.configuration import GlobalConfiguration
 
-accross_thread_memory = InMemoryStore()
+across_thread_memory = InMemoryStore()
+configuration = GlobalConfiguration()
 
 def ensure_docs_have_user_id(
     vectorstore_documents_to_be_indexed: Sequence[Document], runtime: GlobalContext
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 import asyncio
 
 async def index_docs(
-    state: GlobalState, runtime: Runtime[GlobalContext] | None = None
+    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -62,12 +64,9 @@ async def index_docs(
     logger.info(f"index docs entrypoint")
     
     configuration = GlobalConfiguration()
-    async with retrieval.make_vectorstore(configuration) as vectorstore:
+
+    with runtime.context.postgres_db_vector_store as vectore_store:
         logger.info(f"INDEXING DOCUMENTS")
-        logger.warning(f"NEED TO ADD SOURCE TO DOCUMENTS AS METADATA")
-        # stamped_docs = ensure_docs_have_user_id(state.vectorstore_documents_to_be_indexed, runtime)
-        # logger.info(f"stamped_docs: {stamped_docs}")
-        logger.info(f"stable breakpoint")
 
         # Delete documents with the same filename in the metadata
         filenames = {
@@ -76,16 +75,19 @@ async def index_docs(
             state['vectorstore_documents_to_be_indexed'] 
             if doc.metadata.get("filename") is not None
         }
-
         if filenames:
             delete_value = await asyncio.to_thread(
-                vectorstore._collection.delete_many,
-                {"filename": {"$in": list(filenames)}},
+                vectore_store.adelete({"filename": {"$in": list(filenames)}})
             )
+             
             logger.info(f"delete_value: {delete_value}")
         
-        await vectorstore.aadd_documents(state['vectorstore_documents_to_be_indexed'])
-    return {"docs": "delete"}
+        await vectore_store.adocuments(
+            state['vectorstore_documents_to_be_indexed']
+        )
+        return {"docs": "delete"}
+
+
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
@@ -93,7 +95,11 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
 
+# if (configuration.dev == "TRUE"):
+    # index_graph = builder.compile(store=across_thread_memory)
+# else: 
 index_graph = builder.compile()
+
 index_graph.name = "IndexGraph"
 
 __all__ = ["index_graph"]

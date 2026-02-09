@@ -261,9 +261,12 @@ import asyncio
 from src.anubis.utils.configuration import GlobalConfiguration
 from langgraph.store.postgres import AsyncPostgresStore
 
+from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
+
 async def process_uploaded_files(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
+    store: BaseStore
 ) -> Dict[str, Any]:
     """
     Convert FastAPI UploadFile objects into standardized media format.
@@ -272,16 +275,13 @@ async def process_uploaded_files(
     
     logger.info(f"Process uploaded files NODE")
 
-
-
     configuration = runtime.context.configuration
 
-    # async with AsyncPostgresStore.from_conn_string(configuration.postgres_db_uri) as store:
+    user_id = runtime.context.assistant_ctx.user_id
+    assistant_id = runtime.context.assistant_ctx.assistant_id
 
-    # vectorstore = await asyncio.to_thread(
-    #         make_vectorstore(configuration)
-    # )
-
+    namespace = (user_id, assistant_id)
+    
     logger.info(f"breakpoint process_uploaded_files")
 
     user_id = runtime.context.assistant_ctx.user_id
@@ -414,9 +414,6 @@ async def process_uploaded_files(
         "media_list": media_list,
         "media_files": []  # Clear after processing
     }
-
-
-
 
 from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
 
@@ -637,51 +634,6 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
 
-@tool
-async def base64_image(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a base64 image string to a Document with text. """
-    doc = extract_personality_from_image(media_data["data"], runtime.state)
-    return doc
-
-@tool
-async def non_base64_image(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a NON base64 image object to a Document with text. """
-    pass
-
-@tool
-async def text_only_input(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a text string to a Document with text. """
-    pass
-
-@tool
-async def audio(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert audio to a Document with text. """
-    pass
-
-@tool
-async def video(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ Used to convert a video to a Document with text. """
-    pass
-
-@tool
-async def handle_url(media_data: Dict[str, Any], runtime: ToolRuntime[GlobalContext]) -> Document:
-    """ 
-    Used to convert a url to a Document with text. May require other tool use. 
-    Download the content from the URL.
-    Queue the content as media to be processed. 
-    """
-    pass
-
-MEDIA_CONVERSION_TOOLS = { # identified type to tool function call
-    "base64_image" : base64_image, 
-    "non_base64_image": non_base64_image, 
-    "text_only_input": text_only_input, 
-    "audio": audio,
-    "video": video,
-    "handle_url": handle_url
-}
-
-
 # from langgraph.func import task
 
 async def process_media_item_task(
@@ -711,9 +663,12 @@ async def process_media_item_task(
             reference_image = media_item['metadata']["reference_image"]
             if "data" in media_item:
                 # Base64 image
-                image_data = media_item["data"]
-                logger.warning(f"STORE REFERENCE IMAGE HERE")
-                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                image_data = media_item["data"]                
+                if reference_image:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    with runtime.context.postgres_db_store as store:
+                            store.put(namespace, key="reference_image", value={"reference_image":image_data})
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -724,17 +679,19 @@ async def process_media_item_task(
                     "reference_image": reference_image,
                     "filename": filename
                 })                
-
-
                 return doc
+            
             elif "image_url" in media_item:
                 # URL-based image
                 url = media_item["image_url"].get("url", "")
                 if url.startswith("data:image"):
                     # Extract base64 data
                     image_data = url.split(",", 1)[1]
-                    logger.warning(f"STORE REFERENCE IMAGE HERE")
-                    # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                    if reference_image:
+                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                        namespace=(user_id, assistant_id)
+                        with runtime.context.postgres_db_store as store:
+                            store.put(namespace, key="reference_image", value={"reference_image":image_data})
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -768,9 +725,11 @@ async def process_media_item_task(
             if "data" in media_item:
                 # Base64 audio
                 audio_data = media_item["data"]
-                logger.warning(f"STORE REFERENCE AUDIO HERE")
-                # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
-
+                if reference_audio:
+                    logger.warning(f"STORE REFERENCE AUDIO HERE")
+                    namespace=(user_id, assistant_id)
+                    with runtime.context.postgres_db_store as store:
+                            store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
                 doc = await extract_text_from_audio(audio_data)
 
                 # Add metadata
@@ -789,8 +748,11 @@ async def process_media_item_task(
                 if url.startswith("data:audio"):
                     # Extract base64 data
                     audio_data = url.split(",", 1)[1]
-                    logger.warning(f"STORE REFERENCE AUDIO HERE")
-                    # UPDATE TO RETRIEVE AND PASS REFERENCE IMAGE DATA
+                    if reference_audio:
+                        logger.warning(f"STORE REFERENCE AUDIO HERE")
+                        namespace=(user_id, assistant_id)
+                        with runtime.context.postgres_db_store as store:
+                                store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
 
                     doc = await extract_text_from_audio(audio_data)
                     doc.metadata.update({
@@ -866,7 +828,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
         doc = await process_media_item_task(media_item, runtime)
         
         status = doc.metadata.get("status", "")
-        if status == "" or status == "error":
+        if status == "error":
             error = doc.metadata.get("error", "")
             filename = doc.metadata.get("filename", "")
             logger.warning(f"Error processing media: {filename} {error}")

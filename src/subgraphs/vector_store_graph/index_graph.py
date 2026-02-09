@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 import asyncio
 
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
 ) -> dict[str, str]:
@@ -65,7 +67,9 @@ async def index_docs(
     
     configuration = GlobalConfiguration()
 
-    with runtime.context.postgres_db_vector_store as vectore_store:
+    vector_store = make_pg_vector(configuration)
+
+    with vector_store as v_store:
         logger.info(f"INDEXING DOCUMENTS")
 
         # Delete documents with the same filename in the metadata
@@ -77,12 +81,13 @@ async def index_docs(
         }
         if filenames:
             delete_value = await asyncio.to_thread(
-                vectore_store.adelete({"filename": {"$in": list(filenames)}})
+                v_store.adelete({"filename": {"$in": list(filenames)}})
             )
              
             logger.info(f"delete_value: {delete_value}")
         
-        await vectore_store.adocuments(
+        # Upload the new documents into the vector store
+        await v_store.aadd_documents(
             state['vectorstore_documents_to_be_indexed']
         )
         return {"docs": "delete"}

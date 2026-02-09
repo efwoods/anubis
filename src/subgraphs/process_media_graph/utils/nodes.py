@@ -268,22 +268,8 @@ async def process_uploaded_files(
     
     logger.info(f"Process uploaded files NODE")
 
-    configuration = runtime.context.configuration
-
     user_id = runtime.context.assistant_ctx.user_id
     assistant_id = runtime.context.assistant_ctx.assistant_id
-
-    namespace = (user_id, assistant_id)
-    
-    logger.info(f"breakpoint process_uploaded_files")
-
-    postgres_db_store = await make_pg_store(configuration)
-
-    # result_put = await store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
-    # result_get = await store.asearch(namespace,)
-
-    # result_get = await runtime.store.asearch(namespace,)
-    # result_put = await runtime.store.aput(namespace=namespace, key="test_key", value="test_values process uploaded files")
 
     media_files = state.get('media_files', [])
     
@@ -643,6 +629,8 @@ async def process_media_item_task(
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
 
+    configuration = runtime.context.configuration
+
     try:
         # Handle base64 images
         if media_type == "image":
@@ -653,8 +641,11 @@ async def process_media_item_task(
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                     namespace=(user_id, assistant_id)
-                    # with runtime.context.postgres_db_store as store:
-                    #         store.put(namespace, key="reference_image", value={"reference_image":image_data})
+                    postgres_db_store = await make_pg_store(configuration)
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_image", 
+                            value={"reference_image_data": image_data, "metadata": {"filename": filename}})
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -676,8 +667,11 @@ async def process_media_item_task(
                     if reference_image:
                         logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                         namespace=(user_id, assistant_id)
-                        # with runtime.context.postgres_db_store as store:
-                        #     store.put(namespace, key="reference_image", value={"reference_image":image_data})
+                        postgres_db_store = await make_pg_store(configuration)
+                        with postgres_db_store as pg_store:
+                            pg_store.aput(
+                                namespace, key="reference_image", 
+                                value={"reference_image_data": image_data, "metadata": {"filename": filename}})
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -685,7 +679,8 @@ async def process_media_item_task(
                     "assistant_id": assistant_id, 
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
-                    "reference_image": reference_image
+                    "reference_image": reference_image,
+                    "filename": filename
                 })                
                 return doc
         
@@ -712,10 +707,13 @@ async def process_media_item_task(
                 # Base64 audio
                 audio_data = media_item["data"]
                 if reference_audio:
-                    logger.warning(f"STORE REFERENCE AUDIO HERE")
+                    logger.info(f"STORE REFERENCE AUDIO HERE")
                     namespace=(user_id, assistant_id)
-                    # with runtime.context.postgres_db_store as store:
-                    #         store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
+                    postgres_db_store = await make_pg_store(configuration)
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_audio", 
+                            value={"reference_audio_data": audio_data, "metadata": {"filename": filename}})
                 doc = await extract_text_from_audio(audio_data)
 
                 # Add metadata
@@ -725,7 +723,8 @@ async def process_media_item_task(
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
                     "type": "audio", 
-                    "reference_audio": reference_audio
+                    "reference_audio": reference_audio,
+                    "filename": filename
                 })
                 return doc
             elif "audio_url" in media_item:
@@ -735,10 +734,13 @@ async def process_media_item_task(
                     # Extract base64 data
                     audio_data = url.split(",", 1)[1]
                     if reference_audio:
-                        logger.warning(f"STORE REFERENCE AUDIO HERE")
+                        logger.info(f"STORE REFERENCE AUDIO HERE")
                         namespace=(user_id, assistant_id)
-                        # with runtime.context.postgres_db_store as store:
-                        #         store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
+                        postgres_db_store = await make_pg_store(configuration)
+                        with postgres_db_store as pg_store:
+                            pg_store.aput(
+                                namespace, key="reference_audio", 
+                                value={"reference_audio_data": audio_data, "metadata": {"filename": filename}})
 
                     doc = await extract_text_from_audio(audio_data)
                     doc.metadata.update({
@@ -747,7 +749,8 @@ async def process_media_item_task(
                         "created_at": datetime.now(tz=timezone.utc).isoformat(),
                         "processing_task_id": str(uuid4()),
                         "type": "audio",
-                        "reference_audio": reference_audio
+                        "reference_audio": reference_audio,
+                        "filename": filename
                     })
                     return doc
         

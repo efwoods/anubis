@@ -34,6 +34,12 @@ from langgraph.store.base import BaseStore
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
 
+import asyncio
+from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+
+
 # Optional: Add tools=[] if you have them
 tools = []  # Replace with your tools 
 
@@ -54,9 +60,6 @@ async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
 
     return result
 
-import asyncio
-from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
 
 async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
@@ -147,12 +150,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     """ POSTGRES STORE RETRIEVAL (METADATA AI/USER) """
 
-
     logger.info(f"async postgres store connection test breakpoint")
-
-    # ai_context = runtime.context.postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
-
-    from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+   
     
     postgres_db_store = await make_pg_store(configuration)
 

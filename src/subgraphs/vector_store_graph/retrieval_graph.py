@@ -22,8 +22,6 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
 
-
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -108,7 +106,10 @@ from langchain_postgres import PGVector
 
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
+from src.subgraphs.vector_store_graph.utils.retrieval import (
+    make_text_encoder, 
+    make_pg_vector
+)
 
 async def retrieve(
     state: GlobalState, runtime: Runtime[GlobalContext]
@@ -131,25 +132,11 @@ async def retrieve(
 
     configuration = runtime.context.configuration
 
-    user_id = runtime.context.assistant_ctx.user_id
-    assistant_id = runtime.context.assistant_ctx.assistant_id
+    user_id = runtime.context.assistant_ctx.get("user_id", "")
+    assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
     
-    embedding = await make_text_encoder(configuration.embedding_model)
-    connection = configuration.postgres_uri
-
     memory_search = runtime.context.vector_store_memory_search_only
 
-    store = PostgresStore.from_conn_string(configuration.postgres_uri)
-    with store as store:
-        result = store.list_namespaces()
-    logger.info(f"{result}")
-
-    vector_store = PGVector.from_existing_index(
-        embedding=embedding,
-        collection_name="documents",
-        connection=connection
-    )
-        
     if memory_search == "FALSE":
         filter_query = {
                 "user_id": {"$eq": user_id},
@@ -163,15 +150,23 @@ async def retrieve(
                 "type": {"$eq": "memory"}
         }
 
-    response = vector_store.similarity_search_with_relevance_scores(
+    logger.info(f"breakpoint")
+    vector_store = make_pg_vector(configuration)
+    async with vector_store as vector_store:
+        logger.info(f"breakpoint")
+        results = await vector_store.asimilarity_search_with_relevance_scores(
         query = state['queries'][-1],
-        filter = filter_query,
-        score_threshold=0.6
+        filter=filter_query,
     )
+        # score_threshold=0.6
 
-    logger.info(f"Query: {state['queries'][-1]} | Docs: {len(response)}")
-    logger.info(f"{response}")
-    return {"retrieved_docs": response}
+    retrieved_docs = [doc[0] for doc in results] # extract documents only
+
+    logger.info(f"breakpoint")
+
+    logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
+    logger.info(f"{retrieved_docs}")
+    return {"retrieved_docs": retrieved_docs}
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

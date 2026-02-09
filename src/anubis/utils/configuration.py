@@ -168,7 +168,7 @@ class GlobalConfiguration(IndexConfiguration):
     
     postgres_uri: str = field(
         default=None,
-        metadata={"description": "Connection string to postgres db for persistent storage"}
+        metadata={"description": "Connection string to postgres db for persistent document storage via vector store"}
     )
 
     embedding_model: Annotated[
@@ -179,6 +179,11 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={
             "description": "Name of the embedding model to use. Must be a valid embedding model name."
         },
+    )
+
+    async_postgres_store_uri: str = field(
+        default=None,
+        metadata={"description": "Connection string to async postgres store for persistent storage of avatar metadata for contextual prompt injection"}
     )
 
     def __post_init__(self):

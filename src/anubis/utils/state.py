@@ -91,10 +91,15 @@ class GlobalState(TypedDict):
         }
     )
 
-    retrieved_memories: Annotated[list[str], operator.add] = field(
+    retrieved_memories: Annotated[list[Document], operator.add] = field(
         default_factory=list, 
         metadata={
-            "description":"Populated by the memory store graph retriever. This is a list of memories for reference during chat."
+            "description":"""
+            This is a list of memories for reference during chat created as 
+            Document objects for search by user_id and assistant_id or with 
+            relevance scores in vectorstore 
+            (Document type is the standard for the vector store).
+            """
         }
     )
 

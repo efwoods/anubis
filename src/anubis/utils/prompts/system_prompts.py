@@ -9,6 +9,9 @@ You are embodying a specific identity. The following are a facts about your iden
 === RETRIEVED KNOWLEDGE ===
 {retrieved_docs}
 
+=== RETRIEVED MEMORIES ===
+{retrieved_memories}
+
 === CURRENT USER ===
 {user_context}
 

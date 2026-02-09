@@ -54,6 +54,7 @@ class DynamicPromptBuilder:
         ai_context: Optional[Dict[str, Any]] = None,
         user_context: Optional[Dict[str, Any]] = None,
         retrieved_docs: Optional[str] = None,
+        retrieved_memories: Optional[str] = None,
         system_time: Optional[str] = None,
         temporary_message: Optional[str] = None
     ) -> ChatPromptTemplate:
@@ -79,6 +80,9 @@ class DynamicPromptBuilder:
         # Build retrieved docs
         retrieved_docs_str = retrieved_docs or "No additional documents retrieved."
         
+        # Build retrieved memories (associated memories given the conversation)
+        retrieved_memories_str = retrieved_memories or "No additional memories retrieved"
+        
         # Build system time
         system_time_str = system_time or "Time information unavailable."
         
@@ -99,6 +103,7 @@ class DynamicPromptBuilder:
             "ai_context": ai_context_str,
             "user_context": user_context_str,
             "retrieved_docs": retrieved_docs_str,
+            "retrieved_memories": retrieved_memories_str,
             "system_time": system_time_str,
             "temporary_message": temp_msg_str
         }

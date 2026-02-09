@@ -155,6 +155,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
         ai_context = await postgres_db_store.aget(namespace, key="identity")
         logger.info(f"ai_context: {ai_context}")
 
+
     logger.info(f"async postgres store connection test POST breakpoint")
 
     # Load the current assistant context for prompt injection
@@ -162,7 +163,12 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     # TODO: Update the user context from the state: details about the user from the AI's perspective
 
-    user_ctx = ai_context.get("USER", "") # information stored in a nested dictionary about the user
+    if ai_context is not None:
+        user_context = ai_context.get("USER", {}) # information stored in a nested dictionary about the user
+    else:
+        ai_context_name = runtime.context.assistant_ctx.get("name", {})
+        ai_context = {"name": ai_context_name}        
+        user_context = {}
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
@@ -170,7 +176,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     populated_template = prompt_builder.build_prompt(
         ai_context=ai_context,
-        user_context=user_ctx, 
+        user_context=user_context, 
         retrieved_docs=retrieved_docs,
         retrieved_memories=retrieved_memories,
         system_time = system_time,
@@ -193,7 +199,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"AGENT RESPONSE: {response}")
     result = {"messages": [response]}
     return result
-
 
 from pydantic import BaseModel, Field
 from typing import Literal

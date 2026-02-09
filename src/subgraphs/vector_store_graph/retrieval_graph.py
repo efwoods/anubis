@@ -22,8 +22,6 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
 
-
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -159,8 +157,8 @@ async def retrieve(
         results = await vector_store.asimilarity_search_with_relevance_scores(
         query = state['queries'][-1],
         filter=filter_query,
-        score_threshold=0.6
     )
+        # score_threshold=0.6
 
     retrieved_docs = [doc[0] for doc in results] # extract documents only
 

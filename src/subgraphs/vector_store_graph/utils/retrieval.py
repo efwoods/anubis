@@ -216,6 +216,21 @@ from langchain_postgres import PGVector
 async def make_pg_vector(
     configuration: GlobalConfiguration):
 
+    """ EXAMPLE USAGE
+
+    vector_store = make_pg_vector(configuration)
+    async with vector_store as vector_store:
+        logger.info(f"breakpoint")
+        results = await vector_store.asimilarity_search_with_relevance_scores(
+        query="kitty", 
+        filter={"id": {"$in": [1,2,5,9]}},
+        score_threshold=0.3
+        )
+
+    retrieved_docs = [doc[0] for doc in results] # extract documents only; a tuple of relevance scores is returned
+
+    """
+
     embedding = await make_text_encoder(configuration.embedding_model)
     
     async_engine = create_async_engine(configuration.postgres_uri)
@@ -235,11 +250,39 @@ from langgraph.store.postgres import AsyncPostgresStore
 async def make_pg_store(
     configuration: GlobalConfiguration):
 
-    connection_string = "postgresql://postgres:postgres@127.0.0.1:54322"
+    """ EXAMPLE USAGE
+    # postgres_db_store = await make_pg_store(configuration)
+
+    # namespace=("user_1234", "assistant_1234")
+    # async with postgres_db_store as postgres_db_store:
+    #     namespaces = await postgres_db_store.alist_namespaces()
+    #     logger.info(f"namespaces: {namespaces}")
+
+    #     aput_result = await postgres_db_store.aput(namespace, key="identity_test", value={"identity_key":"identity_value"})
+    #     logger.info(f"aput_result: {aput_result}")
+
+    #     aget_result = await postgres_db_store.aget(namespace, key="identity_test")
+    #     logger.info(f"aget_result: {aget_result}")
+
+    #     adelete_result = await postgres_db_store.adelete(namespace, key="identity_test")
+    #     logger.info(f"adelete_result: {adelete_result}")
+
+    #     aget_result_after_delete = await postgres_db_store.aget(namespace, key="identity_test")
+    #     logger.info(f"aget_result_after_delete: {aget_result_after_delete}")
+
+    #     asearch_result = await postgres_db_store.asearch(namespace)
+    #     logger.info(f"asearch_result: {asearch_result}")
+
+    #     ai_context = await postgres_db_store.aget(namespace, key="identity")
+    #     logger.info(f"ai_context: {ai_context}")
+
+    # logger.info(f"async postgres store connection test POST breakpoint")
+
+    """
         
     postgres_db_store = await asyncio.to_thread(
         AsyncPostgresStore.from_conn_string,
-        conn_string=connection_string,
+        conn_string=configuration.async_postgres_store_uri,
     )
 
     return postgres_db_store

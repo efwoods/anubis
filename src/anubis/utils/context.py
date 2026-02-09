@@ -110,8 +110,6 @@ class GlobalContext:
 
     vector_store_memory_search_only: str = field(default="FALSE")
 
-    postgres_db_vector_store: PGVector = None
-
     async def load_identity_from_storage(self, user_id: str):
         """Load assistant identity from long-term storage."""
         # Simulate loading from database/vector store
@@ -178,5 +176,3 @@ class GlobalContext:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
 
         self.configuration.__post_init__()
-
-        # self.postgres_db_store = AsyncPostgresStore.from_conn_string(self.configuration.postgres_uri)

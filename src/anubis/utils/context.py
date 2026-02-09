@@ -199,5 +199,3 @@ class GlobalContext:
         #     collection_name = "documents",
         #     connection = async_engine
         # )
-
-    

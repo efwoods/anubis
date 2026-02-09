@@ -250,18 +250,11 @@ from langgraph.runtime import Runtime
 # from langgraph.config import get_store
 
 from langgraph.store.base import BaseStore
-from langgraph.store.memory import InMemoryStore
-
-from langgraph.store.postgres import PostgresStore
-
-from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
 
 import asyncio
 
 from src.anubis.utils.configuration import GlobalConfiguration
-from langgraph.store.postgres import AsyncPostgresStore
-
-from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
+from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore, make_pg_store
 
 async def process_uploaded_files(
     state: GlobalState, 
@@ -284,14 +277,7 @@ async def process_uploaded_files(
     
     logger.info(f"breakpoint process_uploaded_files")
 
-    user_id = runtime.context.assistant_ctx.user_id
-    assistant_id = runtime.context.assistant_ctx.assistant_id
-
-    namespace = (user_id, assistant_id)
-    
-    # store = runtime.store
-
-    logger.info(f"breakpoint")
+    postgres_db_store = await make_pg_store(configuration)
 
     # result_put = await store.aput(namespace=namespace, key="test_key_process_uploaded_files", value="test_values process uploaded files")
     # result_get = await store.asearch(namespace,)

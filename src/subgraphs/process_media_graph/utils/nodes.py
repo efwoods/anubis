@@ -667,8 +667,8 @@ async def process_media_item_task(
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                     namespace=(user_id, assistant_id)
-                    with runtime.context.postgres_db_store as store:
-                            store.put(namespace, key="reference_image", value={"reference_image":image_data})
+                    # with runtime.context.postgres_db_store as store:
+                    #         store.put(namespace, key="reference_image", value={"reference_image":image_data})
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -690,8 +690,8 @@ async def process_media_item_task(
                     if reference_image:
                         logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                         namespace=(user_id, assistant_id)
-                        with runtime.context.postgres_db_store as store:
-                            store.put(namespace, key="reference_image", value={"reference_image":image_data})
+                        # with runtime.context.postgres_db_store as store:
+                        #     store.put(namespace, key="reference_image", value={"reference_image":image_data})
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -728,8 +728,8 @@ async def process_media_item_task(
                 if reference_audio:
                     logger.warning(f"STORE REFERENCE AUDIO HERE")
                     namespace=(user_id, assistant_id)
-                    with runtime.context.postgres_db_store as store:
-                            store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
+                    # with runtime.context.postgres_db_store as store:
+                    #         store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
                 doc = await extract_text_from_audio(audio_data)
 
                 # Add metadata
@@ -751,8 +751,8 @@ async def process_media_item_task(
                     if reference_audio:
                         logger.warning(f"STORE REFERENCE AUDIO HERE")
                         namespace=(user_id, assistant_id)
-                        with runtime.context.postgres_db_store as store:
-                                store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
+                        # with runtime.context.postgres_db_store as store:
+                        #         store.put(namespace, key="reference_audio", value={"reference_audio":audio_data})
 
                     doc = await extract_text_from_audio(audio_data)
                     doc.metadata.update({

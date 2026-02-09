@@ -179,27 +179,6 @@ async def make_mongdb_vectorstore(
 
 
 
-from sqlalchemy.ext.asyncio import create_async_engine
-from langchain_postgres import PGVector
-
-@asynccontextmanager
-async def make_pg_vector(
-    configuration: GlobalConfiguration):
-
-    embedding = await make_text_encoder(configuration.embedding_model)
-    
-    async_engine = create_async_engine(configuration.postgres_uri)
-        
-    vector_store = await asyncio.to_thread(
-        PGVector,
-        embeddings=embedding,
-        collection_name = "documents",
-        connection = async_engine,
-        async_mode=True,
-        create_extension=False
-    )
-
-    yield vector_store
 
 @asynccontextmanager
 async def make_vectorstore(
@@ -227,3 +206,40 @@ async def make_vectorstore(
                 f"Expected one of: {', '.join(GlobalConfiguration.__annotations__['retriever_provider'].__args__)}\n"
                 f"Got: {configuration.retriever_provider}"
             )
+
+
+
+from sqlalchemy.ext.asyncio import create_async_engine
+from langchain_postgres import PGVector
+
+@asynccontextmanager
+async def make_pg_vector(
+    configuration: GlobalConfiguration):
+
+    embedding = await make_text_encoder(configuration.embedding_model)
+    
+    async_engine = create_async_engine(configuration.postgres_uri)
+        
+    vector_store = await asyncio.to_thread(
+        PGVector,
+        embeddings=embedding,
+        collection_name = "documents",
+        connection = async_engine,
+        async_mode=True,
+        create_extension=False
+    )
+
+    yield vector_store
+
+from langgraph.store.postgres import AsyncPostgresStore
+async def make_pg_store(
+    configuration: GlobalConfiguration):
+
+    connection_string = "postgresql://postgres:postgres@127.0.0.1:54322"
+        
+    postgres_db_store = await asyncio.to_thread(
+        AsyncPostgresStore.from_conn_string,
+        conn_string=connection_string,
+    )
+
+    return postgres_db_store

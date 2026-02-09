@@ -77,6 +77,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     # with runtime.context.postgres_db_store as store:
     #     logger.info(f"breakpoint")
 
+    logger.info(f"breakpoint")
     vector_store = make_pg_vector(configuration)
     async with vector_store as vector_store:
         logger.info(f"breakpoint")
@@ -89,58 +90,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     retrieved_docs = [doc[0] for doc in results] # extract documents only
 
     logger.info(f"breakpoint")
-    
-    # vector_store = make_pg_vector(configuration)
-    # async with vector_store as vector_store:
-    #     logger.info(f"breakpoint")
-    #     results = await vector_store.asimilarity_search_with_relevance_scores(
-    #     query="kitty",
-    #     score_threshold=0.3
-    #     )
 
-    # embedding = await make_text_encoder(configuration.embedding_model)
-    
-    # async_engine = await asyncio.to_thread(
-    #     create_async_engine(configuration.postgres_uri)
-    # )
-        
-    # vector_store = await asyncio.to_thread(
-    #     PGVector,
-    #     embeddings=embedding,
-    #     collection_name = "documents",
-    #     connection = async_engine
-    # )
-
-    # # Acquiring NoSQL DB object
-    # db = runtime.context.firebase_DB
-
-    # # Example Analyzed Data
-    # data = {
-    #     "avatar_name": "Evan Woods", 
-    #     "new_field": "field data", 
-    #     "USER": {"name": "evan", "detected features": "fun friendly passionate determined ambitious loving kind developer", "unchanged_key": "unchanged_value"}
-    #     }
-
-    # # need to be able to add fields onto the USER metadata object without replacing the object entirely
-
-    # db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
-
-    # # Example of retrieval for prompt injection
-    # avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
-
-    # # New user data
-    # data = {
-    #     "USER": {"name": "Evan Franklin Woods"}
-    #     }
-    
-    # db.update_avatar_fields(user_id=user_id, avatar_id=assistant_id, fields=data)
-
-    # # Example of retrieval for prompt injection
-    # avatar_data = db.get_avatar(user_id=user_id, avatar_id=assistant_id)
-
-    # test_put_store = await store.aput(namespace=namespace, key="test_key_invoke_agent", value="test_values process uploaded files")
-
-    # test_result_get = await store.asearch(namespace,)
+    """ CREATE MODEL """
 
     config = runtime.context.configuration # Loads env vars automatically
 
@@ -151,6 +102,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
         tools,
         config.dev
     )
+
+    """ VECTORSTORE DOCUMENT RETRIEVAL """
 
     # Retrieve documents for the query
     from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
@@ -184,23 +137,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     # Vectorstore Retrieved Docments
     retrieved_docs = format_docs(state.get('retrieved_docs', []))
 
-
     """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
-
-    # runtime.context.vector_store_memory_search_only = "TRUE"
-
-    # new_state_retrieved_memories = await retrieval_graph.ainvoke(
-    #     retrieval_message, 
-    #     context=runtime.context
-    # )
-    
-    # state['retrieved_memories'] = []
-
-    # # populate the relevant documents with a new state
-    # state['retrieved_memories'] = new_state_retrieved_memories['retrieved_memories']
-
-    # # Vectorstore Retrieved Docments
-    # retrieved_memories = format_docs(state.get('retrieved_memories', []))
 
     # TODO: PROMPT INJECT RETRIEVED MEMORIES 
 
@@ -208,12 +145,42 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     # TODO: Update the assistant context from the store: details about the AI 
 
-    # postgres_db_store = runtime.context.postgres_db_store
+    """ POSTGRES STORE RETRIEVAL (METADATA AI/USER) """
 
-    # async with postgres_db_store as store:
-    #     ai_context = postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
+
+    logger.info(f"async postgres store connection test breakpoint")
 
     # ai_context = runtime.context.postgres_db_store.get(namespace=(user_id, assistant_id), key="assistant_identity")
+
+    from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+    
+    postgres_db_store = await make_pg_store(configuration)
+
+    namespace=("user_1234", "assistant_1234")
+    async with postgres_db_store as postgres_db_store:
+        namespaces = await postgres_db_store.alist_namespaces()
+        logger.info(f"namespaces: {namespaces}")
+
+        aput_result = await postgres_db_store.aput(namespace, key="identity_test", value={"identity_key":"identity_value"})
+        logger.info(f"aput_result: {aput_result}")
+
+        aget_result = await postgres_db_store.aget(namespace, key="identity_test")
+        logger.info(f"aget_result: {aget_result}")
+
+        adelete_result = await postgres_db_store.adelete(namespace, key="identity_test")
+        logger.info(f"adelete_result: {adelete_result}")
+
+        aget_result_after_delete = await postgres_db_store.aget(namespace, key="identity_test")
+        logger.info(f"aget_result_after_delete: {aget_result_after_delete}")
+
+        asearch_result = await postgres_db_store.asearch(namespace)
+        logger.info(f"asearch_result: {asearch_result}")
+
+        ai_context = await postgres_db_store.aget(namespace, key="identity")
+        logger.info(f"ai_context: {ai_context}")
+
+    logger.info(f"async postgres store connection test POST breakpoint")
+
     ai_context = {}
 
     # Load the current assistant context for prompt injection

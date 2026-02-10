@@ -102,27 +102,6 @@ async def _image_to_base64(
     img.save(buffer, format="JPEG", quality=95, optimize=True)
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
-
-# metadata: Optional[Dict]
-async def _load_image(
-        file: Dict
-    ) -> Document:
-        """
-        Load image file - requires vision model analysis.
-        Use: GPT-4V, Claude Vision, or LLaMA-4-vision
-        """
-        try:
-            # if metadata.get("source_type") == "base64":
-                # base64 string
-            # expects a base64 string
-            logger.info(f"_LOAD_IMAGE CALLED")
-            image_data = file.get('data')
-            # logger.info(f"_LOAD_IMAGE CALLED")
-            doc = await extract_personality_from_image(image_source=image_data)
-            return doc
-        except Exception as e:
-            logger.info(f"Error in _load_image: {e}")
-            raise e
         
 # At top of file
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -470,12 +449,12 @@ async def extract_personality_from_image(
     logger.info(f"extract_personality_from_image entrypoint")    
     # Use reference image to help identify the person in the image.
     text_prompt_for_image_to_text_context = (
-        "Describe the individual in the image in vivid detail. "
-        "Return only the description of the person. "
+        "Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. "
+        "Return only the description of the person using the FIRST PERSON PERSPECTIVE."
         "Do not mention that this is an image. "
-        "Describe the qualities of the character of the person in full detail and"
-        "Describe the personality of this person so as to clearly visualize the person."
-        "Do not describe the physical appearance"
+        "Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE and"
+        "Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE."
+        "Do describe the physical appearance using the FIRST PERSON PERSPECTIVE."
     )
 
     # these requests need to use the model in the graph rather than the requests because of 400 errors

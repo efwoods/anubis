@@ -34,7 +34,7 @@ debugpy
 # Langchain
 langsmith
 langchain
-langchain-community`
+langchain-community
 langchain-unstructured
 langchain-huggingface
 langchain-core
@@ -42,7 +42,6 @@ langchain-chroma
 langchain-openai
 
 # Database
-# langcha-postgres
 langgraph-checkpoint-postgres
 langchain-postgres
 psycopg2-binary

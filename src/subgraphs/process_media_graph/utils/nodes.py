@@ -638,14 +638,8 @@ async def process_media_item_task(
             if "data" in media_item:
                 # Base64 image
                 image_data = media_item["data"]                
-                if reference_image:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": {"filename": filename}})
+                
+                    
                 doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -655,7 +649,20 @@ async def process_media_item_task(
                     "processing_task_id": str(uuid4()),
                     "reference_image": reference_image,
                     "filename": filename
-                })                
+                }) 
+
+                if reference_image:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    postgres_db_store = await make_pg_store(configuration)
+                    metadata = doc.metadata
+                    page_content = doc.metadata.get("page_content", "")
+                    metadata.update({"page_content":page_content})
+
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_image", 
+                            value={"reference_image_data": image_data, "metadata": metadata})               
                 return doc
             
             elif "image_url" in media_item:
@@ -664,14 +671,7 @@ async def process_media_item_task(
                 if url.startswith("data:image"):
                     # Extract base64 data
                     image_data = url.split(",", 1)[1]
-                    if reference_image:
-                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                        namespace=(user_id, assistant_id)
-                        postgres_db_store = await make_pg_store(configuration)
-                        with postgres_db_store as pg_store:
-                            pg_store.aput(
-                                namespace, key="reference_image", 
-                                value={"reference_image_data": image_data, "metadata": {"filename": filename}})
+                    
                     doc =  await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
@@ -681,7 +681,20 @@ async def process_media_item_task(
                     "processing_task_id": str(uuid4()),
                     "reference_image": reference_image,
                     "filename": filename
-                })                
+                })  
+
+                if reference_image:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    postgres_db_store = await make_pg_store(configuration)
+                    metadata = doc.metadata
+                    page_content = doc.metadata.get("page_content", "")
+                    metadata.update({"page_content":page_content})
+
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_image", 
+                            value={"reference_image_data": image_data, "metadata": metadata})                   
                 return doc
         
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
@@ -714,6 +727,8 @@ async def process_media_item_task(
                         pg_store.aput(
                             namespace, key="reference_audio", 
                             value={"reference_audio_data": audio_data, "metadata": {"filename": filename}})
+                        
+
                 doc = await extract_text_from_audio(audio_data)
 
                 # Add metadata
@@ -726,6 +741,21 @@ async def process_media_item_task(
                     "reference_audio": reference_audio,
                     "filename": filename
                 })
+
+                if reference_audio:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    postgres_db_store = await make_pg_store(configuration)
+                    metadata = doc.metadata
+                    page_content = doc.metadata.get("page_content", "")
+                    metadata.update({"page_content":page_content})
+
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_audio", 
+                            value={"reference_audio_data": audio_data, "metadata": metadata})                   
+
+
                 return doc
             elif "audio_url" in media_item:
                 # URL-based audio

@@ -45,7 +45,6 @@ def ensure_docs_have_user_id(
 import logging
 logger = logging.getLogger(__name__)
 
-import asyncio
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
 
@@ -63,74 +62,73 @@ async def index_docs(
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
     from src.anubis.utils.configuration import GlobalConfiguration
-    logger.info(f"index docs entrypoint")
+    logger.info(f"INDEXING DOCUMENTS")
     
     configuration = GlobalConfiguration()
 
-    vector_store = make_pg_vector(configuration)
+    v_store = await make_pg_vector(configuration)
 
-    async with vector_store as v_store:
-        logger.info(f"INDEXING DOCUMENTS")
+    # Delete documents with the same filename in the metadata
+    filenames = {
+        doc.metadata.get("filename") 
+        for doc in 
+        state['vectorstore_documents_to_be_indexed'] 
+        if doc.metadata.get("filename") is not None
+    }
+    
+    if filenames:
+        filenames_list = list(filenames)
+        user_ctx = runtime.context.user_ctx
+        if isinstance(user_ctx, dict):
+            user_id = runtime.context.user_ctx.get("user_id", "")
+        else:
+            user_id = getattr(runtime.context.user_ctx, "user_id")
+        
+        assistant_ctx = runtime.context.assistant_ctx
+        if isinstance(assistant_ctx, dict):
+            assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+        else:
+            assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id")
 
-        # Delete documents with the same filename in the metadata
-        filenames = {
-            doc.metadata.get("filename") 
-            for doc in 
-            state['vectorstore_documents_to_be_indexed'] 
-            if doc.metadata.get("filename") is not None
+        # search for the documents
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        async_engine = create_async_engine(configuration.postgres_uri)
+
+        SQL_QUERY="""SELECT id FROM langchain_pg_embedding WHERE cmetadata->>'user_id' = :user_id
+        AND cmetadata->>'assistant_id' = :assistant_id
+        AND cmetadata->>'filename' = ANY(:filenames)
+        """
+        params = {
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "filenames": filenames_list
         }
-        logger.info(f"breapoint point before test")
-        test = await v_store.aget_by_ids(["6ba98e7f-9a35-49ce-bec8-407b5288c20d"])
-        logger.info(f"test: {test}")
 
-        # I need to delete by id using PGVector or using metadata in PGVectorStore
-        
-        
-        if filenames:
-            filenames_list = list(filenames)
+        async with async_engine.connect() as conn:
+            result = await conn.execute(text(SQL_QUERY), params)
+            all_docs = result.fetchall()
 
-            user_ctx = runtime.context.user_ctx
-            if isinstance(user_ctx, dict):
-                user_id = runtime.context.user_ctx.get("user_id", "")
-            else:
-                user_id = getattr(runtime.context.user_ctx, "user_id")
-            
-            assistant_ctx = runtime.context.assistant_ctx
-            if isinstance(assistant_ctx, dict):
-                assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-            else:
-                assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id")
-        
-            filter_query = {
-                "user_id": {"$eq": user_id},
-                "assistant_id": {"$eq": assistant_id}, 
-                "filename": {"$in": filenames_list}
-            }
+        # Extract list of ids from returned tuples
+        id_list = [id[0] for id in all_docs] if all_docs else []
 
-            # search for the documents
-            documents = await v_store.asimilarity_search(
-                query="", filter = filter_query
-            )
-            # get the ids
-            id_list = [getattr(doc, "id") for doc in documents]
+        logger.info(f"id_list: {id_list}")
 
-            logger.info(f"id_list: {id_list}")
-            
-            # delete ids
-            delete_value = await v_store.adelete(
-                ids=id_list
-            )
-             
-            logger.info(f"delete_value: {delete_value}")
+        # delete ids
+        delete_value = await v_store.adelete(
+            ids=id_list
+        )
+         
+        logger.info(f"delete_value: {delete_value}")
         
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
+
         await v_store.aadd_documents(
             state['vectorstore_documents_to_be_indexed']
         )
         return {"docs": "delete"}
-
-
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

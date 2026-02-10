@@ -32,10 +32,6 @@ from src.anubis.utils.tools import (
 
 from langgraph.store.base import BaseStore
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore
-
-import asyncio
-from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 

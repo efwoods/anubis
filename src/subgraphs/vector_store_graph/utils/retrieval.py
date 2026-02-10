@@ -212,7 +212,6 @@ async def make_vectorstore(
 from sqlalchemy.ext.asyncio import create_async_engine
 from langchain_postgres import PGVector
 
-@asynccontextmanager
 async def make_pg_vector(
     configuration: GlobalConfiguration):
 
@@ -231,22 +230,25 @@ async def make_pg_vector(
 
     """
 
+    logger.info(f"make_pg_vector ENTRYPOINT")
     embedding = await make_text_encoder(configuration.embedding_model)
     
     async_engine = create_async_engine(configuration.postgres_uri)
         
     vector_store = await asyncio.to_thread(
-        PGVector,
-        embeddings=embedding,
+        PGVector.from_existing_index,
+        embedding=embedding,
         collection_name = "documents",
         connection = async_engine,
         async_mode=True,
         create_extension=False
     )
 
-    yield vector_store
+    return vector_store
 
 from langgraph.store.postgres import AsyncPostgresStore
+
+
 async def make_pg_store(
     configuration: GlobalConfiguration):
 
@@ -279,7 +281,9 @@ async def make_pg_store(
     # logger.info(f"async postgres store connection test POST breakpoint")
 
     """
-        
+    logger.info(f"make_pg_store ENTRYPOINT")
+
+    # returns AsyncContextManager object
     postgres_db_store = await asyncio.to_thread(
         AsyncPostgresStore.from_conn_string,
         conn_string=configuration.async_postgres_store_uri,

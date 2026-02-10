@@ -107,7 +107,6 @@ from langchain_postgres import PGVector
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from src.subgraphs.vector_store_graph.utils.retrieval import (
-    make_text_encoder, 
     make_pg_vector
 )
 
@@ -151,10 +150,10 @@ async def retrieve(
         }
 
     logger.info(f"breakpoint")
-    vector_store = make_pg_vector(configuration)
-    async with vector_store as vector_store:
-        logger.info(f"breakpoint")
-        results = await vector_store.asimilarity_search_with_relevance_scores(
+    vector_store = await make_pg_vector(configuration)
+
+    logger.info(f"breakpoint")
+    results = await vector_store.asimilarity_search_with_relevance_scores(
         query = state['queries'][-1],
         filter=filter_query,
     )

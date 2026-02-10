@@ -37,8 +37,6 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from src.anubis.utils.model import init_model
 
-from src.subgraphs.process_media_graph.utils.helper_functions import identify_file_type_and_convert_to_base64
-
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
 
@@ -292,7 +290,7 @@ async def process_media_item_task(
                         pg_store.aput(
                             namespace, key="reference_image", 
                             value={"reference_image_data": image_data, "metadata": metadata})               
-                docs = list(doc)
+                docs = [doc]
                 return docs
             
             elif "image_url" in media_item:
@@ -325,21 +323,22 @@ async def process_media_item_task(
                         pg_store.aput(
                             namespace, key="reference_image", 
                             value={"reference_image_data": image_data, "metadata": metadata})                   
-                docs = list(doc)
+                docs = [doc]
                 return docs
         
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
         elif media_type == "text":
+            logger.info(f"Handling text in process media")
             from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item
             proprietary_content = metadata.get("proprietary_content", False)
             
             if proprietary_content:
                 logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
                 
-                documents = process_text_media_item(
+                documents = await process_text_media_item(
                     media_item, 
                     user_id=user_id, 
-                    assistant_id=assistant_id
+                    assistant_id=assistant_id,
                 )
                 return documents
             else:
@@ -351,13 +350,13 @@ async def process_media_item_task(
                 from typing import Literal
                 from pydantic import Field
                 @dataclass
-                class TextualSituationalAwareness(BaseModel):
+                class TextualSituationalAwareness:
+                    classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
+
                     reasoning: str = Field(
                         description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
                     )
 
-                    classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
-                    
                 tools = []
 
                 model_with_structured_output = init_model(
@@ -378,17 +377,17 @@ async def process_media_item_task(
                     {"role": "user", "content": text_content}
                 ])
 
-                logger.info(f"Situation classification : {classification.classified_situation}")
+                logger.info(f"Situation classification: {classification['classified_situation']}")
 
-                logger.info(f"Reason for classification : {classification.reasoning}")
+                logger.info(f"Reason for classification : {classification['reasoning']}")
                 
                 classification_metadata = {
-                    "classified_situation": classification.classified_situation, "classification_reasoning": classification.reasoning
+                    "classified_situation": classification['classified_situation'], "classification_reasoning": classification['reasoning']
                 }
 
-                if classification.classified_situation == "single_speaker":
+                if classification['classified_situation'] == "single_speaker":
                     # format for vectorstore: chunk and upload to vectorstore
-                        documents = process_text_media_item(
+                        documents = await process_text_media_item(
                             media_item, 
                             user_id=user_id, 
                             assistant_id=assistant_id, 
@@ -401,7 +400,7 @@ async def process_media_item_task(
 
                     # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
 
-                if classification.classified_situation == "q_and_a_dialogue":
+                if classification['classified_situation'] == "q_and_a_dialogue":
                     logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")
 
                     logger.warning(f"""
@@ -421,7 +420,7 @@ async def process_media_item_task(
                     # TODO: format for Adapter: Q & A format document
                     """)
 
-                if classification.classified_situation == "multi_speaker":
+                if classification['classified_situation'] == "multi_speaker":
                     logger.warning(f"MULTI-SPEAKER CLASSIFICAITON DETECTED")
 
                     logger.warning(f"""
@@ -433,12 +432,12 @@ async def process_media_item_task(
                     """)
 
 
-                if classification.classified_situation == "other":
+                if classification['classified_situation'] == "other":
                     logger.warning(f"OTHER text situation classification detected. Inspect and handle the situation appropriately. Currently handled in the same procedure as proprietary content.")
                     
                     logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
                 
-                    documents = process_text_media_item(
+                    documents = await process_text_media_item(
                         media_item, 
                         user_id=user_id, 
                         assistant_id=assistant_id, 
@@ -451,10 +450,10 @@ async def process_media_item_task(
         elif media_type == "url":
             # TODO: Implement URL content fetching
             url = media_item.get("url", "")
-            docs = list(Document(
+            docs = [Document(
                 page_content=f"Content from URL: {url}",
                 metadata={"source": url, "type": "url", "status": "not_implemented"}
-            ))
+            )]
             return docs
            
         # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
@@ -496,7 +495,7 @@ async def process_media_item_task(
                             namespace, key="reference_audio", 
                             value={"reference_audio_data": audio_data, "metadata": metadata})                   
 
-                docs = list(doc)
+                docs = [doc]
                 return docs
             
             elif "audio_url" in media_item:
@@ -532,33 +531,34 @@ async def process_media_item_task(
                                     "reference_audio_data": audio_data, 
                                     "metadata": metadata
                                 })                   
-                docs = list(doc)
+                docs = [doc]
                 return docs
         
         # Handle video
         elif media_type == "video":
             # TODO: Implement video processing
-            docs = list(Document(
+            docs = [Document(
                 page_content="[Video processing not yet implemented]",
                 metadata={"type": "video", "status": "not_implemented"}
-            ))
+            )]
             return docs
         
         else:
             logger.warning(f"Unsupported media type: {media_type}")
-            docs = list(Document(
+            docs = [Document(
                 page_content=f"[Unsupported media type: {media_type}]",
                 metadata={"type": media_type, "status": "unsupported"}
-            ))
+            )]
             return docs
     
     except Exception as e:
         # ERROR DOCUMENT
         logger.error(f"Error processing media item: {e}")
-        return list(Document(
+        documents =  [Document(
             page_content=f"[Error processing media: {str(e)}]",
             metadata={"type": media_type, "status": "error", "error": str(e)}
-        ))
+        )]
+        return documents
     return await tool.ainvoke(media_item["content"])
 
 from src.anubis.utils.configuration import GlobalConfiguration

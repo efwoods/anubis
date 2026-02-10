@@ -146,10 +146,46 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     user_id = runtime.context.assistant_ctx.get("user_id", "")
     assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
 
+
     namespace=(user_id, assistant_id)
     async with postgres_db_store as postgres_db_store:
-        ai_context = await postgres_db_store.aget(namespace, key="identity")
-        logger.info(f"ai_context: {ai_context}")
+        ai_context_item = await postgres_db_store.aget(namespace, key="identity")
+        logger.info(f"ai_context_item: {ai_context_item}")
+
+        # Load/UPDATE AI SELF IDENTITY
+        logger.info("item object breakpoint")
+
+        if ai_context_item is None:
+            # store the current context of the ai into the store
+            # Try to store the name from the context
+            assistant_context_name = runtime.context.assistant_ctx.get("name", "")
+
+            assistant_context_description = runtime.context.assistant_ctx.get("description", "")
+
+
+            aput_result = await postgres_db_store.aput(namespace, key="identity", value={"identity":{"self": {"name": assistant_context_name, "description": assistant_context_description}}})
+
+            # get the ai_context
+            ai_context_item = await postgres_db_store.aget(namespace, key="identity")
+
+        if ai_context_item.value["identity"]["self"].get("name", None) is None:
+            # Try to store the name from the context
+            assistant_context_name = runtime.context.assistant_ctx.get("name", "")
+
+            # Update the ai_context_item_value dictionary
+            ai_context_item.value["identity"]["self"].update({"name":assistant_context_name})
+
+            # overwrite the entire value dictionary with the current value dictionary updated
+            aput_result_name = await postgres_db_store.aput(namespace, key="identity", value=ai_context_item.value)
+
+        if ai_context_item.value["identity"]["self"].get("description", None) is None:
+            # Try to store the description from the context
+            assistant_context_description = runtime.context.assistant_ctx.get("description", "")
+
+            # Update the ai_context_item_value dictionary
+            ai_context_item.value["identity"]["self"].update({"description":assistant_context_description})
+
+            aput_result_description = await postgres_db_store.aput(namespace, key="identity", value=ai_context_item.value)
 
 
     logger.info(f"async postgres store connection test POST breakpoint")
@@ -159,16 +195,16 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     # TODO: Update the user context from the state: details about the user from the AI's perspective
 
-    if ai_context is not None:
-        user_context = ai_context.get("USER", {}) # information stored in a nested dictionary about the user
-    else:
-        ai_context_name = runtime.context.assistant_ctx.get("name", {})
-        ai_context = {"name": ai_context_name}        
-        user_context = {}
+    assert(ai_context_item is not None)
+    user_context = ai_context_item.value["identity"].get("user", {}) # information stored in a nested dictionary about the user
+
+
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
     temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
+
+    ai_context = ai_context_item.value['identity']['self']
 
     populated_template = prompt_builder.build_prompt(
         ai_context=ai_context,

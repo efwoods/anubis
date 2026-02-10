@@ -140,14 +140,14 @@ async def retrieve(
         filter_query = {
                 "user_id": {"$eq": user_id},
                 "assistant_id": {"$eq": assistant_id}, 
-                "type": {"$ne": "memory"}
         }
+                # "type": {"$ne": "memory"}
     else:
         filter_query = {
                 "user_id": {"$eq": user_id},
                 "assistant_id": {"$eq": assistant_id}, 
-                "type": {"$eq": "memory"}
         }
+                # "type": {"$eq": "memory"}
 
     logger.info(f"breakpoint")
     vector_store = await make_pg_vector(configuration)

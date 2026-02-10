@@ -1,227 +1,21 @@
 # Nodes for Identifying and Handling each media type 
 
-
-import json
-import tempfile
-import zipfile
-import tarfile
-import gzip
-import bz2
-import lzma
-from pathlib import Path
-from typing import Optional, Union, Dict, List
-from enum import Enum
-from io import BytesIO
-
+from typing import Dict
 from datetime import datetime, timezone
-
-from fastapi import UploadFile
 from langchain_core.documents import Document
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    WebBaseLoader,
-)
-
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-import json
-from typing import Optional
-from langchain_core.documents import Document
-
-from langchain_community.document_loaders import TextLoader
-from langchain_community.document_loaders import JSONLoader
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.document_loaders import UnstructuredMarkdownLoader
-
+from typing import Dict, Any
 from uuid import uuid4
 
 import logging
 logger = logging.getLogger(__name__)
-
-
-import requests
-
-# Audio
-# Transcribe to text then use a text loader
-# from langchain_google_community import SpeechToTextLoader
-
-# loader = SpeechToTextLoader(
-#     file_path="path/to/audio.wav"
-# )
-# docs = loader.load()
-
-# Images
-# Convert to text from image then use a Text Loader...
-# Video
-
-# Unknown
-# from langchain_community.document_loaders import UnstructuredLoader
-from langchain_unstructured import UnstructuredLoader
-
-# Supported by Unstructured include: DOCX, PPTX, HTML, XML, XLSX, CSV, JPG, PNG, BMP, GIF, EMAIL, RTF, EPUB, and more.
-
-# Web
-
-# Youtube video loader
-from langchain_community.document_loaders import YoutubeLoader
-
-# # Loads YouTube video transcripts
-# loader = YoutubeLoader.from_youtube_url(
-#     "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-# )
-# docs = loader.load()
-
-# Youtube Audio Loader
-from langchain_community.document_loaders import YoutubeAudioLoader
-
-# loader = YoutubeAudioLoader(
-#     youtube_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-#     save_dir="./youtube_audio"
-# )
-# docs = loader.load()
-
-from PIL import Image
-import requests
 import base64
-import io
-import os
 
-async def _image_to_base64(
-    self, image_source: Union[str, Path, UploadFile, bytes]
-) -> str:
-    """Convert image from path, UploadFile, or bytes to base64-encoded JPEG."""
-    if isinstance(image_source, (str, Path)):
-        img = Image.open(image_source)
-    elif isinstance(image_source, UploadFile):
-        img = Image.open(io.BytesIO(image_source.file.read()))
-    elif isinstance(image_source, bytes):
-        img = Image.open(io.BytesIO(image_source))
-    else:
-        raise TypeError("image_source must be str, Path, UploadFile, or bytes")
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=95, optimize=True)
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
-        
 # At top of file
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 import tempfile
-import os
-
-async def _load_text(
-    file: Union[UploadFile, str, Path], metadata: Dict
-) -> list[Document]:  # Changed return type
-    """Load and split plain text file into vectorstore chunks"""
-    with tempfile.NamedTemporaryFile(
-        mode="w+", delete=False, encoding="utf-8"
-    ) as temp_file:
-        content = (await file.read()).decode("utf-8")
-        temp_file.write(content)
-        temp_path = temp_file.name
-    
-    try:
-        loader = TextLoader(temp_path, encoding="utf-8")
-        full_docs = loader.load()  # Returns list[Document], usually [1] for text
-        
-        # Split into chunks - good for Gutenberg books
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=200,      # Chars per chunk
-            chunk_overlap=20,    # Overlap for context
-            length_function=len,  # Simple char length
-        )
-        split_docs = text_splitter.split_documents(full_docs)
-        
-        # Add your metadata to each chunk
-        for doc in split_docs:
-            doc.metadata.update(metadata)
-            doc.metadata["source"] = temp_path  # Or filename
-        
-        return split_docs  # List ready for vectorstore.add_documents()
-    
-    finally:
-        os.unlink(temp_path)  # Clean up temp file
-
-async def _load_pdf(self, filename: str, raw_bytes: bytes) -> Optional[Document]:
-    """Load PDF file"""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(raw_bytes)
-        tmp_path = tmp.name
-    try:
-        loader = PyPDFLoader(tmp_path)
-        docs = loader.load()
-        if docs:
-            combined_text = "\n\n".join([d.page_content for d in docs])
-            return Document(
-                page_content=combined_text,
-                metadata={
-                    "source": "pdf_file",
-                    "filename": filename,
-                    "type": "text",
-                    "pages": len(docs),
-                    "requires_conversion": False,
-                    "ready_for_vectorstore": True,
-                    "ready_for_adapter": True,
-                },
-            )
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-    return None
-
-def _load_audio(
-    self, filename: str, content_type: str, raw_bytes: bytes
-) -> Document:
-    """
-    Load audio file - requires transcription to text.
-    Use: OpenAI Whisper API or similar
-    """
-    # return Document(
-    #     page_content=f"[AUDIO FILE: {filename} - Transcription required]",
-    #     metadata={
-    #         "source": "audio_file",
-    #         "filename": filename,
-    #         "type": "audio",
-    #         "mime_type": content_type,
-    #         "size_bytes": len(raw_bytes),
-    #         "requires_conversion": True,
-    #         "conversion_method": "whisper_transcription",
-    #         "transcription_endpoint": "/audio-transcription",
-    #         "ready_for_vectorstore": False,
-    #         "ready_for_adapter": False
-    #     }
-    # )
-    pass
-
-def _load_video(
-    self, filename: str, content_type: str, raw_bytes: bytes
-) -> Document:
-    """
-    Load video file - requires audio transcription + frame analysis.
-    Use: Whisper for audio + vision model for key frames
-    """
-    # return Document(
-    #     page_content=f"[VIDEO FILE: {filename} - Audio transcription and frame analysis required]",
-    #     metadata={
-    #         "source": "video_file",
-    #         "filename": filename,
-    #         "type": "video",
-    #         "mime_type": content_type,
-    #         "size_bytes": len(raw_bytes),
-    #         "requires_conversion": True,
-    #         "conversion_methods": ["whisper_transcription", "vision_frame_analysis"],
-    #         "transcription_endpoint": "/audio-transcription",
-    #         "ready_for_vectorstore": False,
-    #         "ready_for_adapter": False
-    #     }
-    # )
-    pass
 
 
 import base64
-from fastapi import UploadFile
-from typing import List, Dict, Any
-
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from langgraph.runtime import Runtime
@@ -230,12 +24,25 @@ from langgraph.runtime import Runtime
 
 from langgraph.store.base import BaseStore
 
-import asyncio
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+from src.anubis.utils.model import init_model
 
-from src.anubis.utils.configuration import GlobalConfiguration
-from src.subgraphs.vector_store_graph.utils.retrieval import make_vectorstore, make_pg_store
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.context import GlobalContext
+from langgraph.runtime import Runtime
 
-async def process_uploaded_files(
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+
+from src.anubis.utils.model import init_model
+
+from src.subgraphs.process_media_graph.utils.helper_functions import identify_file_type_and_convert_to_base64
+
+from langgraph.prebuilt import ToolRuntime
+from langchain.tools import tool
+
+async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
     store: BaseStore
@@ -270,6 +77,7 @@ async def process_uploaded_files(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
+            proprietary_content = file_data.get("proprietary_content") # This is a single body of text (scripture/menu/etc ... there is no single target, text only)
             
             logger.info(f"Processing file: {filename} ({content_type})")
             
@@ -302,8 +110,7 @@ async def process_uploaded_files(
                         "size": len(file_bytes),
                         "user_id": user_id,
                         "assistant_id": assistant_id, 
-                        "reference_audio": reference_audio
-                    }
+                        "reference_audio": reference_audio                    }
                 })
             
             elif content_type.startswith('video/'):
@@ -317,7 +124,7 @@ async def process_uploaded_files(
                         "content_type": content_type,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id
+                        "assistant_id": assistant_id,
                     }
                 })
             
@@ -332,7 +139,8 @@ async def process_uploaded_files(
                         "content_type": content_type,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id
+                        "assistant_id": assistant_id, 
+                        "proprietary_content": proprietary_content
                     }
                 })
             
@@ -347,7 +155,8 @@ async def process_uploaded_files(
                         "content_type": content_type,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id
+                        "assistant_id": assistant_id, 
+                        "proprietary_content": proprietary_content
                     }
                 })
             
@@ -366,10 +175,291 @@ async def process_uploaded_files(
         "media_files": []  # Clear after processing
     }
 
-from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext]) -> Dict[str, Any]:
+    """ 
+    Media type in media list is determined at this point: 
+    Convert the media in a list of one or more media to text in parallel.
+    media items must have user_id and assistant_id as metadata.
+    Exptected format:
+    [
+        {
+            "type": "MEDIA_TYPE", 
+            "data|text|indicator": "CONTENT OF MEDIA", 
+            "metadata":{
+                fields may include mime-type or the metadata may not exists at all
+                }
+        }, 
+        ...
+    ]
+    I want to keep the media in a list and queue tasks for each item in the list 
+    then I want to execute those tasks in parallel and update the final state 
+    with the list of text Documents from the media:
+    async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
+    """
+    
+    logging.info(f"DETERMINE_MEDIA_TYPE NODE")
+    
+    media_list = state.get('media_list', [])
 
+    if not media_list:
+        logger.info(f"No Meida to process")
+        return {
+            "media_list": []
+        }
 
-async def extract_text_from_audio(audio_data: str) -> Document:
+    logger.info(f"Processing {len(media_list)} media items")
+
+    # Create tasks for parallel processing
+    all_documents = []
+    for media_item in media_list:
+        docs = await process_media_item_task(media_item, runtime)
+        
+        for doc in docs:
+            status = doc.metadata.get("status", "")
+            if status == "error":
+                error = doc.metadata.get("error", "")
+                filename = doc.metadata.get("filename", "")
+                logger.warning(f"Error processing media: {filename} {error}")
+            else:
+                all_documents.append(doc)
+
+    # Format for Vector Store
+
+    # # Analysis list (needs a node)
+    # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts
+
+    # # Adapter list (needs a node)
+    # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
+
+    return {
+        "vectorstore_documents_to_be_indexed": docs,
+        "media_list": [] # Clear processed media list in the state
+    }
+
+async def process_media_item_task(
+    media_item: Dict[str, Any], 
+    runtime: Runtime[GlobalContext]
+) -> Document:
+    """Task: Convert a single media item to a Document"""
+    
+    logger.info(f"process_media_item_task entry")
+
+    media_type = media_item.get("type", "")
+    
+    metadata = media_item.get("metadata", {})
+
+    user_id = metadata.get("user_id", "")
+    assistant_id = metadata.get("assistant_id", "")
+
+    logger.info(f"extracted user_id: {user_id}")
+    logger.info(f"extracted assistant_id: {assistant_id}")
+
+    filename = media_item['metadata']['filename']
+    logger.info(f"Processing file: {filename}")
+
+    configuration = runtime.context.configuration
+
+    try:
+        # Handle base64 images
+        if media_type == "image":
+            reference_image = media_item['metadata']["reference_image"]
+            if "data" in media_item:
+                # Base64 image
+                image_data = media_item["data"]                
+                
+                    
+                doc =  await extract_personality_from_image(image_data)
+                    # Filter valid Documents and add metadata
+                doc.metadata.update({
+                    "user_id": user_id,
+                    "assistant_id": assistant_id, 
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "processing_task_id": str(uuid4()),
+                    "reference_image": reference_image,
+                    "filename": filename
+                }) 
+
+                if reference_image:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    postgres_db_store = await make_pg_store(configuration)
+                    metadata = doc.metadata
+                    page_content = doc.metadata.get("page_content", "")
+                    metadata.update({"page_content":page_content})
+
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_image", 
+                            value={"reference_image_data": image_data, "metadata": metadata})               
+                docs = list(doc)
+                return docs
+            
+            elif "image_url" in media_item:
+                # URL-based image
+                url = media_item["image_url"].get("url", "")
+                if url.startswith("data:image"):
+                    # Extract base64 data
+                    image_data = url.split(",", 1)[1]
+                    
+                    doc =  await extract_personality_from_image(image_data)
+                    # Filter valid Documents and add metadata
+                doc.metadata.update({
+                    "user_id": user_id,
+                    "assistant_id": assistant_id, 
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "processing_task_id": str(uuid4()),
+                    "reference_image": reference_image,
+                    "filename": filename
+                })  
+
+                if reference_image:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    postgres_db_store = await make_pg_store(configuration)
+                    metadata = doc.metadata
+                    page_content = doc.metadata.get("page_content", "")
+                    metadata.update({"page_content":page_content})
+
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_image", 
+                            value={"reference_image_data": image_data, "metadata": metadata})                   
+                docs = list(doc)
+                return docs
+        
+        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
+        elif media_type == "text":
+            from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item
+
+            # proprietary content
+
+            documents = process_text_media_item(
+                media_item, 
+                user_id=user_id, 
+                assistant_id=assistant_id
+            )
+
+            return documents
+        
+        # Handle URLs
+        elif media_type == "url":
+            # TODO: Implement URL content fetching
+            url = media_item.get("url", "")
+            docs = list(Document(
+                page_content=f"Content from URL: {url}",
+                metadata={"source": url, "type": "url", "status": "not_implemented"}
+            ))
+            return docs
+           
+        # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
+        elif media_type == "audio":
+            """
+            Detect the number of speakers
+            Audio needs to be diarized if reference audio is available; 
+            otherwise convert to text
+            """
+            reference_audio = media_item['metadata']['reference_audio']
+            if "data" in media_item:
+                # Base64 audio
+                audio_data = media_item["data"]
+
+                
+                doc = await extract_text_from_audio(audio_data, configuration, user_id, assistant_id)
+
+                # Add metadata
+                doc.metadata.update({
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "processing_task_id": str(uuid4()),
+                    "type": "audio", 
+                    "reference_audio": reference_audio,
+                    "filename": filename
+                })
+
+                if reference_audio:
+                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                    namespace=(user_id, assistant_id)
+                    postgres_db_store = await make_pg_store(configuration)
+                    metadata = doc.metadata
+                    page_content = doc.metadata.get("page_content", "")
+                    metadata.update({"page_content":page_content})
+
+                    with postgres_db_store as pg_store:
+                        pg_store.aput(
+                            namespace, key="reference_audio", 
+                            value={"reference_audio_data": audio_data, "metadata": metadata})                   
+
+                docs = list(doc)
+                return docs
+            
+            elif "audio_url" in media_item:
+                # URL-based audio
+                url = media_item["audio_url"].get("url", "")
+                if url.startswith("data:audio"):
+                    # Extract base64 data
+                    audio_data = url.split(",", 1)[1]
+
+                    doc = await extract_text_from_audio(audio_data)
+
+                    doc.metadata.update({
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                        "processing_task_id": str(uuid4()),
+                        "type": "audio",
+                        "reference_audio": reference_audio,
+                        "filename": filename
+                    })
+                    if reference_audio:
+                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                        namespace=(user_id, assistant_id)
+                        postgres_db_store = await make_pg_store(configuration)
+                        metadata = doc.metadata
+                        page_content = doc.metadata.get("page_content", "")
+                        metadata.update({"page_content":page_content})
+
+                        with postgres_db_store as pg_store:
+                            pg_store.aput(
+                                namespace, key="reference_audio", 
+                                value={
+                                    "reference_audio_data": audio_data, 
+                                    "metadata": metadata
+                                })                   
+                docs = list(doc)
+                return docs
+        
+        # Handle video
+        elif media_type == "video":
+            # TODO: Implement video processing
+            docs = list(Document(
+                page_content="[Video processing not yet implemented]",
+                metadata={"type": "video", "status": "not_implemented"}
+            ))
+            return docs
+        
+        else:
+            logger.warning(f"Unsupported media type: {media_type}")
+            docs = list(Document(
+                page_content=f"[Unsupported media type: {media_type}]",
+                metadata={"type": media_type, "status": "unsupported"}
+            ))
+            return docs
+    
+    except Exception as e:
+        # ERROR DOCUMENT
+        logger.error(f"Error processing media item: {e}")
+        return list(Document(
+            page_content=f"[Error processing media: {str(e)}]",
+            metadata={"type": media_type, "status": "error", "error": str(e)}
+        ))
+    return await tool.ainvoke(media_item["content"])
+
+from src.anubis.utils.configuration import GlobalConfiguration
+
+from pyannote.audio import Pipeline
+
+async def extract_text_from_audio(audio_data: str, configuration: GlobalConfiguration, user_id: str, assistant_id: str) -> Document:
     """Extract text from audio using Hugging Face Whisper Large v3"""
     logger.info(f"needs reference audio from storage for speaker diarization (timestamps and who is speaking)")
     import base64
@@ -379,7 +469,29 @@ async def extract_text_from_audio(audio_data: str) -> Document:
     import aiofiles
 
     logger.info(f"extract text from audio ENTRYPOINT")
-    
+
+    # store
+
+    from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+
+    pg_store_manager = await make_pg_store(configuration)
+
+    async with pg_store_manager as pg_store:
+        namespace = (user_id, assistant_id)
+        reference_audio  = pg_store.aget(namespace=namespace, key="reference_audio")
+        """
+        {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
+        """
+
+    """ ANALYZE AUDIO """
+
+
+    if reference_audio is not None:
+        logger.info(f"Identify the number of speakers in the audio")
+        logger.info(f"Identify if the target speaker is in the audio")
+        logger.info(f"Diarize the audio (timestamps of who is speaking when)")
+        
+# Otherwise presume the audio is a single speaker of the target if there is no reference audio; mention in metadata
     try:
         # Decode base64 audio data
         audio_bytes = base64.b64decode(audio_data)
@@ -413,8 +525,8 @@ async def extract_text_from_audio(audio_data: str) -> Document:
                 metadata={
                     "source": "audio_transcription",
                     "model": "whisper-large-v3",
-                    "transcript_length": len(transcript)
-                }
+                    "transcript_length": len(transcript),
+                    "reference_audio_used": False,                }
             )
             return doc
             
@@ -436,8 +548,6 @@ async def extract_text_from_audio(audio_data: str) -> Document:
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup temp file {temp_audio_path}: {cleanup_error}")
 
-# metadata: Optional[Dict]
-from src.anubis.utils.model import init_model
 async def extract_personality_from_image(
     image_data: str) -> Document:
     from src.anubis.utils.configuration import GlobalConfiguration
@@ -508,18 +618,6 @@ async def extract_personality_from_image(
         }
     )
 
-
-from src.anubis.utils.state import GlobalState
-from src.anubis.utils.context import GlobalContext
-from langgraph.runtime import Runtime
-
-from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
-from src.anubis.utils.model import init_model
-
-from src.subgraphs.process_media_graph.utils.helper_functions import identify_file_type_and_convert_to_base64
-
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
     logger.info(f"Extract_media_from_message NODE")
@@ -581,265 +679,3 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 
     logger.warning(f"Unexpected content type: {type(content)}")
     return {"media_list": []}
-
-from langgraph.prebuilt import ToolRuntime
-from langchain.tools import tool
-
-# from langgraph.func import task
-
-async def process_media_item_task(
-    media_item: Dict[str, Any], 
-    runtime: Runtime[GlobalContext]
-) -> Document:
-    """Task: Convert a single media item to a Document"""
-    
-    logger.info(f"process_media_item_task entry")
-
-    media_type = media_item.get("type", "")
-    
-    metadata = media_item.get("metadata", {})
-
-    user_id = metadata.get("user_id", "")
-    assistant_id = metadata.get("assistant_id", "")
-
-    logger.info(f"extracted user_id: {user_id}")
-    logger.info(f"extracted assistant_id: {assistant_id}")
-
-    filename = media_item['metadata']['filename']
-    logger.info(f"Processing file: {filename}")
-
-    configuration = runtime.context.configuration
-
-    try:
-        # Handle base64 images
-        if media_type == "image":
-            reference_image = media_item['metadata']["reference_image"]
-            if "data" in media_item:
-                # Base64 image
-                image_data = media_item["data"]                
-                
-                    
-                doc =  await extract_personality_from_image(image_data)
-                    # Filter valid Documents and add metadata
-                doc.metadata.update({
-                    "user_id": user_id,
-                    "assistant_id": assistant_id, 
-                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                    "processing_task_id": str(uuid4()),
-                    "reference_image": reference_image,
-                    "filename": filename
-                }) 
-
-                if reference_image:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
-                    metadata = doc.metadata
-                    page_content = doc.metadata.get("page_content", "")
-                    metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": metadata})               
-                return doc
-            
-            elif "image_url" in media_item:
-                # URL-based image
-                url = media_item["image_url"].get("url", "")
-                if url.startswith("data:image"):
-                    # Extract base64 data
-                    image_data = url.split(",", 1)[1]
-                    
-                    doc =  await extract_personality_from_image(image_data)
-                    # Filter valid Documents and add metadata
-                doc.metadata.update({
-                    "user_id": user_id,
-                    "assistant_id": assistant_id, 
-                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                    "processing_task_id": str(uuid4()),
-                    "reference_image": reference_image,
-                    "filename": filename
-                })  
-
-                if reference_image:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
-                    metadata = doc.metadata
-                    page_content = doc.metadata.get("page_content", "")
-                    metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": metadata})                   
-                return doc
-        
-        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
-        elif media_type == "text":
-            return Document(
-                page_content=media_item.get("text", ""),
-                metadata={"source": "text_input", "type": "text"}
-            )
-        
-        # Handle URLs
-        elif media_type == "url":
-            # TODO: Implement URL content fetching
-            url = media_item.get("url", "")
-            return Document(
-                page_content=f"Content from URL: {url}",
-                metadata={"source": url, "type": "url", "status": "not_implemented"}
-            )      
-           
-        # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
-        elif media_type == "audio":
-            reference_audio = media_item['metadata']['reference_audio']
-            if "data" in media_item:
-                # Base64 audio
-                audio_data = media_item["data"]
-                if reference_audio:
-                    logger.info(f"STORE REFERENCE AUDIO HERE")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_audio", 
-                            value={"reference_audio_data": audio_data, "metadata": {"filename": filename}})
-                        
-
-                doc = await extract_text_from_audio(audio_data)
-
-                # Add metadata
-                doc.metadata.update({
-                    "user_id": user_id,
-                    "assistant_id": assistant_id,
-                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                    "processing_task_id": str(uuid4()),
-                    "type": "audio", 
-                    "reference_audio": reference_audio,
-                    "filename": filename
-                })
-
-                if reference_audio:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
-                    metadata = doc.metadata
-                    page_content = doc.metadata.get("page_content", "")
-                    metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_audio", 
-                            value={"reference_audio_data": audio_data, "metadata": metadata})                   
-
-
-                return doc
-            elif "audio_url" in media_item:
-                # URL-based audio
-                url = media_item["audio_url"].get("url", "")
-                if url.startswith("data:audio"):
-                    # Extract base64 data
-                    audio_data = url.split(",", 1)[1]
-                    if reference_audio:
-                        logger.info(f"STORE REFERENCE AUDIO HERE")
-                        namespace=(user_id, assistant_id)
-                        postgres_db_store = await make_pg_store(configuration)
-                        with postgres_db_store as pg_store:
-                            pg_store.aput(
-                                namespace, key="reference_audio", 
-                                value={"reference_audio_data": audio_data, "metadata": {"filename": filename}})
-
-                    doc = await extract_text_from_audio(audio_data)
-                    doc.metadata.update({
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                        "processing_task_id": str(uuid4()),
-                        "type": "audio",
-                        "reference_audio": reference_audio,
-                        "filename": filename
-                    })
-                    return doc
-        
-        # Handle video
-        elif media_type == "video":
-            # TODO: Implement video processing
-            return Document(
-                page_content="[Video processing not yet implemented]",
-                metadata={"type": "video", "status": "not_implemented"}
-            )
-        
-        else:
-            logger.warning(f"Unsupported media type: {media_type}")
-            return Document(
-                page_content=f"[Unsupported media type: {media_type}]",
-                metadata={"type": media_type, "status": "unsupported"}
-            )
-    
-    except Exception as e:
-        logger.error(f"Error processing media item: {e}")
-        return Document(
-            page_content=f"[Error processing media: {str(e)}]",
-            metadata={"type": media_type, "status": "error", "error": str(e)}
-        )
-    return await tool.ainvoke(media_item["content"])
-
-async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext]) -> Dict[str, Any]:
-    """ 
-    Media type in media list is determined at this point: 
-    Convert the media in a list of one or more media to text in parallel.
-    media items must have user_id and assistant_id as metadata.
-    Exptected format:
-    [
-        {
-            "type": "MEDIA_TYPE", 
-            "data|text|indicator": "CONTENT OF MEDIA", 
-            "metadata":{
-                fields may include mime-type or the metadata may not exists at all
-                }
-        }, 
-        ...
-    ]
-    I want to keep the media in a list and queue tasks for each item in the list 
-    then I want to execute those tasks in parallel and update the final state 
-    with the list of text Documents from the media:
-    async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
-    """
-    
-    logging.info(f"DETERMINE_MEDIA_TYPE NODE")
-    
-    media_list = state.get('media_list', [])
-
-    if not media_list:
-        logger.info(f"No Meida to process")
-        return {
-            "media_list": []
-        }
-
-    logger.info(f"Processing {len(media_list)} media items")
-
-    # Create tasks for parallel processing
-    docs = []
-    for media_item in media_list:
-        doc = await process_media_item_task(media_item, runtime)
-        
-        status = doc.metadata.get("status", "")
-        if status == "error":
-            error = doc.metadata.get("error", "")
-            filename = doc.metadata.get("filename", "")
-            logger.warning(f"Error processing media: {filename} {error}")
-        else:
-            docs.append(doc)
-
-    # # Analysis list (needs a node)
-    # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts
-
-    # # Adapter list (needs a node)
-    # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
-
-    return {
-        "vectorstore_documents_to_be_indexed": docs,
-        "media_list": [] # Clear processed media list in the state
-    }

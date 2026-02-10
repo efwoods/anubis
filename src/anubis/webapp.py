@@ -69,7 +69,8 @@ async def upload_media(
     user_id: str = Form(default="test_user_1234"),
     assistant_id: str = Form(default="default_assistant"),
     reference_audio: bool = False,
-    reference_image: bool = False
+    reference_image: bool = False, 
+    proprietary_content: bool = False, 
 ):
     # Context user_id, assistant_id
     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
@@ -97,7 +98,8 @@ async def upload_media(
                 "user_id": user_id,
                 "assistant_id": assistant_id,
                 "reference_audio": reference_audio,
-                "reference_image": reference_image
+                "reference_image": reference_image, 
+                "proprietary_content": proprietary_content
             })
         
         # Import graph here to avoid circular imports

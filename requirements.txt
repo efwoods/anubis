@@ -64,3 +64,7 @@ aiofiles
 
 # Firebase
 firebase-admin
+
+# Image processing
+opencv-python
+mediapipe

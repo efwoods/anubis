@@ -225,6 +225,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
     # Format for Vector Store
 
+
     # # Analysis list (needs a node)
     # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts
 
@@ -330,17 +331,122 @@ async def process_media_item_task(
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
         elif media_type == "text":
             from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item
+            proprietary_content = metadata.get("proprietary_content", False)
+            
+            if proprietary_content:
+                logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
+                
+                documents = process_text_media_item(
+                    media_item, 
+                    user_id=user_id, 
+                    assistant_id=assistant_id
+                )
+                return documents
+            else:
+                logger.info(f"There is a target and the content of the text needs to be analyzed (is this a monologue or multi-speaker or strictly Q & A; how many speakers, etc.)")
+                
+                # Analyze text situation
+                from pydantic import BaseModel
+                from pydantic.dataclasses import dataclass
+                from typing import Literal
+                from pydantic import Field
+                @dataclass
+                class TextualSituationalAwareness(BaseModel):
+                    reasoning: str = Field(
+                        description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
+                    )
 
-            # proprietary content
+                    classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
+                    
+                tools = []
 
-            documents = process_text_media_item(
-                media_item, 
-                user_id=user_id, 
-                assistant_id=assistant_id
-            )
+                model_with_structured_output = init_model(
+                    configuration.provider_model,
+                    configuration.llama_api_base_url,
+                    configuration.llama_api_key,
+                    tools,
+                    configuration.dev,
+                    response_format=TextualSituationalAwareness
+                )
+                from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
 
-            return documents
-        
+                system_prompt = TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
+                text_content = media_item.get("content", "")
+                
+                classification = await model_with_structured_output.ainvoke(input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text_content}
+                ])
+
+                logger.info(f"Situation classification : {classification.classified_situation}")
+
+                logger.info(f"Reason for classification : {classification.reasoning}")
+                
+                classification_metadata = {
+                    "classified_situation": classification.classified_situation, "classification_reasoning": classification.reasoning
+                }
+
+                if classification.classified_situation == "single_speaker":
+                    # format for vectorstore: chunk and upload to vectorstore
+                        documents = process_text_media_item(
+                            media_item, 
+                            user_id=user_id, 
+                            assistant_id=assistant_id, 
+                            classification_metadata=classification_metadata
+                        )
+                        for document in documents: 
+                            document.metadata.update({"formatted_type": "vectorstore"})
+
+                    # TODO: format for analysis: analyze for content about the target
+
+                    # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
+
+                if classification.classified_situation == "q_and_a_dialogue":
+                    logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")
+
+                    logger.warning(f"""
+                    # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER
+
+                        # documents = process_text_media_item(
+                        #     media_item, 
+                        #     user_id=user_id, 
+                        #     assistant_id=assistant_id, 
+                        #     classification_metadata=classification_metadata
+                        # )
+                        # for document in documents: 
+                        #     document.metadata.update({"formatted_type": "vectorstore"})
+                            
+                    # TODO: format for analysis: extract target speaker only and analyze with llm
+
+                    # TODO: format for Adapter: Q & A format document
+                    """)
+
+                if classification.classified_situation == "multi_speaker":
+                    logger.warning(f"MULTI-SPEAKER CLASSIFICAITON DETECTED")
+
+                    logger.warning(f"""
+                    # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER; CONTENT IS NOT DIALOGUE; SPEAKER NEEDS TO BE IDENTIFIED IN THE TEXT
+
+                    # TODO: format for analysis: TARGET MUST BE IDENTIFIED, LLM IS USED TO ANALYZE CONTENT ABOUT THE TARGET ONLY
+
+                    # TODO: format for Adapter: ALL OTHER NON-TARGET SPEAKERS ARE CLASSIFIED AS USER AND THE TARGET SPEAKER IS CLASSIFIED AS AI FOR THE FORMAT.
+                    """)
+
+
+                if classification.classified_situation == "other":
+                    logger.warning(f"OTHER text situation classification detected. Inspect and handle the situation appropriately. Currently handled in the same procedure as proprietary content.")
+                    
+                    logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
+                
+                    documents = process_text_media_item(
+                        media_item, 
+                        user_id=user_id, 
+                        assistant_id=assistant_id, 
+                        classification_metadata=classification_metadata
+                    )
+
+                return documents
+
         # Handle URLs
         elif media_type == "url":
             # TODO: Implement URL content fetching
@@ -507,8 +613,6 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
             await f.write(audio_bytes)
 
             logger.info(f"Audio file written to {temp_audio_path}")
-
-        
         try:
             # Get cached pipeline
             pipe = get_whisper_pipeline()

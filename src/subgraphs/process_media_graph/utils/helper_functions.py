@@ -157,7 +157,8 @@ async def process_text_media_item(
     assistant_id: str,
     chunk_size: int = 500,
     chunk_overlap: int = 50,
-    separators: Optional[List[str]] = None
+    separators: Optional[List[str]] = None,
+    classification_metadata: Optional[dict] = None
 ) -> List[Document]:
     """
     Process text content using recursive text splitter and convert to Documents.
@@ -241,6 +242,8 @@ async def process_text_media_item(
                 **{k: v for k, v in source_metadata.items() if k not in ["source"]}
             }
         )
+        if classification_metadata is not None:
+            doc.metadata.update(classification_metadata)
         documents.append(doc)
     
     return documents

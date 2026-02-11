@@ -64,6 +64,17 @@ class AdapterIndexState:
     documents_to_be_processed_for_adapter_training: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can index."""
 
+@dataclass(kw_only=True)
+class BaselineIndexState:
+    """Represents the state for documents stored for textual baseline evaluation of generated content (stored in pg store).
+
+    This class defines the structure of the index state, which includes
+    the documents to be stored. Will be deleted after stored appropriately.
+    """
+
+    ground_truth_user_first_person_speech_baseline_for_evaluation: Annotated[Sequence[Document], reduce_docs]
+    """A list of documents that the agent can store or otherwise process."""
+
 
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
@@ -105,7 +116,7 @@ class GlobalState(TypedDict):
 
     """ Data Uploading and Processing """
 
-    # List of media items to be converted to text
+    # List of media items to be converted to text 
 
     media_files: Optional[List[Dict[str, Any]]] # Raw uploaded files
 
@@ -123,6 +134,8 @@ class GlobalState(TypedDict):
     # Adapter list
     documents_to_be_processed_for_adapter_training: AdapterIndexState
 
+    # Ground Truth User First Person Speech (literal quotes from the target entity)
+    ground_truth_user_first_person_speech_baseline_for_evaluation: BaselineIndexState 
 
     """ Node Routing """
 

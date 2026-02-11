@@ -186,6 +186,11 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "Connection string to async postgres store for persistent storage of avatar metadata for contextual prompt injection"}
     )
 
+    huggingface_token: str = field(
+        default=None,
+        metadata={"description": "Token to use huggingface models"}
+    )
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

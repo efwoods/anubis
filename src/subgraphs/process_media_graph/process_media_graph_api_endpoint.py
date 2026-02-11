@@ -14,22 +14,13 @@ from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 
 from src.subgraphs.process_media_graph.utils.nodes import (
-    extract_media_from_message, 
     convert_media_list_to_text_document,
 )
 
 from src.subgraphs.vector_store_graph.index_graph import index_docs
-
-from src.subgraphs.process_media_graph.utils.nodes import process_uploaded_files
-
+from src.subgraphs.process_media_graph.utils.nodes import process_uploaded_files_and_label_media_type
 from langgraph.store.base import BaseStore
-
-from langgraph.checkpoint.memory import MemorySaver
-from typing import cast
-
 from langgraph.store.memory import InMemoryStore
-from langgraph.store.postgres import PostgresStore
-
 from src.anubis.utils.configuration import GlobalConfiguration
 
 configuration = GlobalConfiguration()
@@ -44,7 +35,7 @@ workflow = StateGraph(
 )
 
 # Add Nodes
-workflow.add_node("process_uploaded_files", process_uploaded_files)
+workflow.add_node("process_uploaded_files", process_uploaded_files_and_label_media_type)
 workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_text_document)
 workflow.add_node("index_docs", index_docs)
 

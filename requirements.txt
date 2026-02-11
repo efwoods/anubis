@@ -47,13 +47,22 @@ langchain-postgres
 psycopg2-binary
 
 
-beautifulsoup4
 huggingface-hub>=0.24.0
 sentence-transformers
 langchain-mongodb
 
 # Document Processing
 pillow
+beautifulsoup4
+requests
+trafilatura
+
+
+# Media Processing
+yt-dlp
+instaloader
+ffmpeg-python
+
 
 # Audio Processing
 transformers
@@ -62,5 +71,11 @@ torchaudio
 accelerate
 aiofiles
 
+pyannote-audio
+
 # Firebase
 firebase-admin
+
+# Image processing
+opencv-python
+mediapipe

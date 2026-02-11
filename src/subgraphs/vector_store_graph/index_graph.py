@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
@@ -110,24 +111,17 @@ async def index_docs(
             result = await conn.execute(text(SQL_QUERY), params)
             all_docs = result.fetchall()
 
-        # Extract list of ids from returned tuples
+        # Extract list of ids from returned tuples of documents to be deleted
         id_list = [id[0] for id in all_docs] if all_docs else []
 
-        logger.info(f"id_list: {id_list}")
+        result = await batch_index_documents_vectorstore(
+                id_list=id_list, 
+                configuration=configuration, 
+                vectorstore_documents_to_be_indexed=state['vectorstore_documents_to_be_indexed'], 
+                BATCH_SIZE=5000
+            )
+        logger.info(f"breaktpoint after batch_index_documents_vectorstore")
 
-        # delete ids
-        delete_value = await v_store.adelete(
-            ids=id_list
-        )
-         
-        logger.info(f"delete_value: {delete_value}")
-        
-        # Upload the new documents into the vector store
-        logger.info(f"breakpoint before aadd documents")
-
-        await v_store.aadd_documents(
-            state['vectorstore_documents_to_be_indexed']
-        )
         return {"docs": "delete"}
 
 # Define a new graph

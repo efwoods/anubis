@@ -1,4 +1,3 @@
-
 # Each agent/avatar is a server-level architecture vs one server many assistants/avatars
 each langgraph server is a docker image that is customized to the particular individual's real-world likeness.
 

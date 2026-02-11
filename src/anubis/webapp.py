@@ -67,9 +67,10 @@ def test_hello_world():
 async def upload_media(
     files: List[UploadFile] = File(...),
     user_id: str = Form(default="test_user_1234"),
-    assistant_id: str = Form(default="default_assistant"),
+    assistant_id: str = Form(default="project_gutenberg_assistant_uuid_1234"),
     reference_audio: bool = False,
-    reference_image: bool = False
+    reference_image: bool = False, 
+    proprietary_content: bool = False, 
 ):
     # Context user_id, assistant_id
     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
@@ -97,7 +98,8 @@ async def upload_media(
                 "user_id": user_id,
                 "assistant_id": assistant_id,
                 "reference_audio": reference_audio,
-                "reference_image": reference_image
+                "reference_image": reference_image, 
+                "proprietary_content": proprietary_content
             })
         
         # Import graph here to avoid circular imports
@@ -149,7 +151,7 @@ async def upload_media(
 async def process_media_json(
     media_list: List[dict],
     user_id: str = "test_user_1234",
-    assistant_id: str = "default_assistant", 
+    assistant_id: str = "project_gutenberg_assistant_uuid_1234", 
     reference_audo: bool = False, 
     reference_image: bool = False
 ):

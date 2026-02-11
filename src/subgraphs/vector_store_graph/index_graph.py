@@ -111,12 +111,6 @@ async def index_docs(
             result = await conn.execute(text(SQL_QUERY), params)
             all_docs = result.fetchall()
 
-
-       
-        # handle the case when there are more than 32767 inserts into the database
-
-        BATCH_SIZE = 32767
-
         # Extract list of ids from returned tuples of documents to be deleted
         id_list = [id[0] for id in all_docs] if all_docs else []
 

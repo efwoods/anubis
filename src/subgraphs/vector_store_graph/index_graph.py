@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
@@ -110,39 +111,21 @@ async def index_docs(
             result = await conn.execute(text(SQL_QUERY), params)
             all_docs = result.fetchall()
 
-        # Extract list of ids from returned tuples
+
+       
+        # handle the case when there are more than 32767 inserts into the database
+
+        BATCH_SIZE = 32767
+
+        # Extract list of ids from returned tuples of documents to be deleted
         id_list = [id[0] for id in all_docs] if all_docs else []
 
-        logger.info(f"id_list: {id_list}")
-
-        # delete ids
-        delete_value = await v_store.adelete(
-            ids=id_list
-        )
-         
-        logger.info(f"delete_value: {delete_value}")
-        
-        # Upload the new documents into the vector store
-        logger.info(f"breakpoint before aadd documents")
-
-        creation_times_list = [
-            {"created_at": doc.metadata['created_at'], 
-             "user_id":doc.metadata['user_id'], 
-             'assistant_id': doc.metadata['assistant_id']
-             } for doc in state['vectorstore_documents_to_be_indexed']]
-        
-
-        added_ids_list = await v_store.aadd_documents(
-            state['vectorstore_documents_to_be_indexed']
-        )
-
-        # add columns for sorting
-        from src.subgraphs.vector_store_graph.utils.helper_functions import update_column_metadata
-
-        response = await update_column_metadata(added_ids_list, creation_times_list, configuration, table_name="langchain_pg_embedding")
-
-        logger.info(f"Update of column metadata: {response['success']}")
-        
+        result = await batch_index_documents_vectorstore(
+                id_list=id_list, 
+                configuration=configuration, 
+                vectorstore_documents_to_be_indexed=state['vectorstore_documents_to_be_indexed'], 
+                BATCH_SIZE=32767
+            )
 
         return {"docs": "delete"}
 

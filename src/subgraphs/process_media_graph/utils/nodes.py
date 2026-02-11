@@ -363,6 +363,8 @@ async def process_media_item_task(
                     use_semantic_chunks=False
                 )
                 
+                for document in documents: 
+                            document.metadata.update({"formatted_type": "vectorstore"})
 
                 return documents
             
@@ -410,7 +412,7 @@ async def process_media_item_task(
                     "classified_situation": classification['classified_situation'], "classification_reasoning": classification['reasoning']
                 }
 
-                if classification['classified_situation'] == "single_speaker":\
+                if classification['classified_situation'] == "single_speaker":
                 
                     # format for vectorstore: chunk and upload to vectorstore
                         logger.info(f"proccess_text_media_item_target_for_vectorstore BREAKPOINT in Process media item task: type = text")

@@ -29,7 +29,6 @@ from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper
 from src.anubis.utils.model import init_model
 
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item_target_for_vectorstore
-process_text_media_item
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -42,6 +41,10 @@ from src.anubis.utils.model import init_model
 
 from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
+
+from src.anubis.utils.configuration import GlobalConfiguration
+
+from pyannote.audio import Pipeline
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -342,15 +345,15 @@ async def process_media_item_task(
             logger.info(f"Handling text in process media")
             
             proprietary_content = metadata.get("proprietary_content", False)
-            classification_metadata = {
-                "classified_situation": "proprietary content", 
-                "classification_reasoning": "user_selected_classification_of_proprietary_content"
-            }
             
             if proprietary_content:
                 logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
-                from src.subgraphs.process_media_graph.utils.helper_functions import split_text_into_chunks
-
+                
+                classification_metadata = {
+                    "classified_situation": "proprietary content",
+                    "classification_reasoning": "user_selected_classification_of_proprietary_content"
+                }
+                
                 documents = await process_text_media_item_target_for_vectorstore(
                     media_item, 
                     user_id=user_id, 
@@ -359,7 +362,10 @@ async def process_media_item_task(
                     classification_metadata=classification_metadata,
                     use_semantic_chunks=False
                 )
+                
+
                 return documents
+            
             else:
                 logger.info(f"There is a target and the content of the text needs to be analyzed (is this a monologue or multi-speaker or strictly Q & A; how many speakers, etc.)")
                 
@@ -404,8 +410,10 @@ async def process_media_item_task(
                     "classified_situation": classification['classified_situation'], "classification_reasoning": classification['reasoning']
                 }
 
-                if classification['classified_situation'] == "single_speaker":
+                if classification['classified_situation'] == "single_speaker":\
+                
                     # format for vectorstore: chunk and upload to vectorstore
+                        logger.info(f"proccess_text_media_item_target_for_vectorstore BREAKPOINT in Process media item task: type = text")
                         documents = await process_text_media_item_target_for_vectorstore(
                             media_item, 
                             user_id=user_id, 
@@ -421,13 +429,15 @@ async def process_media_item_task(
 
                     # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
 
+                    # TODO: format for Baseline ground truth using only text from first-person perspective of the target speaker (ultimately combine with analysis for evaluation; is this generated text something the target speaker would say/know; is this how they behave, their internal decision tree chain-of-thought, are their emotions and emotional sentiment in alignment given ground truth primary resource experiences? (include vader sentiment of baseline ground truth))
+
                 if classification['classified_situation'] == "q_and_a_dialogue":
                     logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")
 
                     logger.warning(f"""
                     # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER
 
-                        # documents = process_text_media_item(
+                        # documents = process_text_media_item_target_for_vectorstore(
                         #     media_item, 
                         #     user_id=user_id, 
                         #     assistant_id=assistant_id, 
@@ -585,10 +595,6 @@ async def process_media_item_task(
         )]
         return documents
     return await tool.ainvoke(media_item["content"])
-
-from src.anubis.utils.configuration import GlobalConfiguration
-
-from pyannote.audio import Pipeline
 
 async def extract_text_from_audio(audio_data: str, configuration: GlobalConfiguration, user_id: str, assistant_id: str) -> Document:
     """Extract text from audio using Hugging Face Whisper Large v3"""

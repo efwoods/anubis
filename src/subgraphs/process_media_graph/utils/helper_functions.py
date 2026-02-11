@@ -64,8 +64,6 @@ from src.anubis.utils.model import init_model
 
 logger = logging.getLogger(__name__)
 
-
-
 async def split_text_into_chunks(
         text_splitter: RecursiveCharacterTextSplitter, 
         text_content: str, 
@@ -78,6 +76,8 @@ async def split_text_into_chunks(
     ):
     
     """ TEXT CHUNKING HELPER FUNCTION: process_text_media_item_target_for_vectorstore """
+
+    logger.info(f"SPLIT TEXT INTO CHUNKS ENTRYPOINT")
 
     # Split text into chunks
     text_chunks = text_splitter.split_text(text_content)
@@ -110,8 +110,6 @@ async def split_text_into_chunks(
         documents.append(doc)
     
     return idx, documents
-
-
 
 async def process_text_media_item_target_for_vectorstore(
     media_item: Dict[str, Any],
@@ -151,7 +149,7 @@ async def process_text_media_item_target_for_vectorstore(
         List of Document objects ready for vectorstore upload
     """
     
-    logger.warning(f"untested process text media item")
+    logger.warning(f"PROCESS_TEXT_MEDIA_ITEM ENTRYPOINT")
 
     # Extract text content
     text_content = media_item.get("content", "")
@@ -191,12 +189,12 @@ async def process_text_media_item_target_for_vectorstore(
                     configuration.dev,
         )
         
-        system_prompt = """ <Instructions> 
+        SEMANTICALLY_CHUNK_TEXT_SYSTEM_PROMPT = """ <Instructions> 
         - Do not alter the text in any way. 
         - Keep all text as originally sent. 
         - When there are reasonable sections to split the text. 
         - Return a list of the text portions. 
-        - Attempt to create lists with the number of characters less than {chunk_size} if possible otherwise maintain the semantically meaningful chunk.
+        - Attempt to create lists with the number of characters less than {chunk_size} characters if possible otherwise maintain the semantically meaningful chunk.
         - The length of the number of characters in each chunk takes secondary precedence to chunks that are semantically meaningful and is an OPTIONAL requirement.
         </Instructions> 
         
@@ -251,14 +249,16 @@ async def process_text_media_item_target_for_vectorstore(
         - Return all text that was originally sent.
         - If there are no meaningful sections or portions, then DO NOT separate the text and only return a list containing a single item of the original text.
         - Always return a list.
-        - Attempt to create lists with the number of characters less than {chunk_size} if possible otherwise maintain the semantically meaningful chunk.
+        - Attempt to create lists with the number of characters less than {chunk_size} characters if possible otherwise maintain the semantically meaningful chunk.
         - The length of the number of characters in each chunk takes secondary precedence to chunks that are semantically meaningful and is an OPTIONAL requirement.
         </Rules>
 
         """
 
-        model_result = model.ainvoke(input=[
-            {"role": "system_prompt", "content": system_prompt}, 
+        formatted_system_prompt = SEMANTICALLY_CHUNK_TEXT_SYSTEM_PROMPT.format(chunk_size=chunk_size)
+
+        model_result = await model.ainvoke(input=[
+            {"role": "system_prompt", "content": formatted_system_prompt}, 
             {"role": "user", "content": text_content}
         ])
 
@@ -338,7 +338,7 @@ async def process_text_media_item_target_for_vectorstore(
                         )
                 all_documents.extend(documents)
         else: 
-            logger.warning(f"Error: semantic model chunking result is not a list during 'process_text_media_item'. Chunking Original Text content.")
+            logger.warning(f"Error: semantic model chunking result is not a list during 'process_text_media_item_target_for_vectorstore'. Chunking Original Text content.")
             all_documents = []
             current_timestamp = datetime.now(tz=timezone.utc).isoformat()
             idx = 0

@@ -28,6 +28,9 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
 from src.anubis.utils.model import init_model
 
+from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item_target_for_vectorstore
+process_text_media_item
+
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from langgraph.runtime import Runtime
@@ -221,17 +224,25 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
             else:
                 all_documents.append(doc)
 
-    # Format for Vector Store
-
+    # Identify Vector Store formatted documents
+    # NOTE This contains only information from the target speaker or about the target speaker
+    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "vectorstore"]
 
     # # Analysis list (needs a node)
-    # documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: List[Sequence[Document]] UPDATED RETURN VALUE LIST IN RETURN analyzed and stored as facts
+    # These documents have been formatted for analysis but have not yet been analyzed.
+    # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
+
+    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "target_analysis"]
 
     # # Adapter list (needs a node)
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
+    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "adapter"]
+
     return {
-        "vectorstore_documents_to_be_indexed": docs,
+        "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
+        "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": analysis_document_list_formatted,
+        "documents_to_be_processed_for_adapter_training": adapter_document_list_formatted,
         "media_list": [] # Clear processed media list in the state
     }
 
@@ -329,16 +340,24 @@ async def process_media_item_task(
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
         elif media_type == "text":
             logger.info(f"Handling text in process media")
-            from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item
+            
             proprietary_content = metadata.get("proprietary_content", False)
+            classification_metadata = {
+                "classified_situation": "proprietary content", 
+                "classification_reasoning": "user_selected_classification_of_proprietary_content"
+            }
             
             if proprietary_content:
                 logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
-                
-                documents = await process_text_media_item(
+                from src.subgraphs.process_media_graph.utils.helper_functions import split_text_into_chunks
+
+                documents = await process_text_media_item_target_for_vectorstore(
                     media_item, 
                     user_id=user_id, 
                     assistant_id=assistant_id,
+                    configuration=configuration,
+                    classification_metadata=classification_metadata,
+                    use_semantic_chunks=False
                 )
                 return documents
             else:
@@ -387,11 +406,13 @@ async def process_media_item_task(
 
                 if classification['classified_situation'] == "single_speaker":
                     # format for vectorstore: chunk and upload to vectorstore
-                        documents = await process_text_media_item(
+                        documents = await process_text_media_item_target_for_vectorstore(
                             media_item, 
                             user_id=user_id, 
-                            assistant_id=assistant_id, 
-                            classification_metadata=classification_metadata
+                            assistant_id=assistant_id,
+                            configuration=configuration,
+                            classification_metadata=classification_metadata,
+                            use_semantic_chunks=True
                         )
                         for document in documents: 
                             document.metadata.update({"formatted_type": "vectorstore"})
@@ -437,12 +458,16 @@ async def process_media_item_task(
                     
                     logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
                 
-                    documents = await process_text_media_item(
+                    documents = await process_text_media_item_target_for_vectorstore(
                         media_item, 
                         user_id=user_id, 
-                        assistant_id=assistant_id, 
-                        classification_metadata=classification_metadata
+                        assistant_id=assistant_id,
+                        configuration=configuration,
+                        classification_metadata=classification_metadata,
+                        use_semantic_chunks=True
                     )
+                    for document in documents: 
+                            document.metadata.update({"formatted_type": "vectorstore"})
 
                 return documents
 

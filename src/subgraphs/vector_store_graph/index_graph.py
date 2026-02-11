@@ -125,9 +125,25 @@ async def index_docs(
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
 
-        await v_store.aadd_documents(
+        creation_times_list = [
+            {"created_at": doc.metadata['created_at'], 
+             "user_id":doc.metadata['user_id'], 
+             'assistant_id': doc.metadata['assistant_id']
+             } for doc in state['vectorstore_documents_to_be_indexed']]
+        
+
+        added_ids_list = await v_store.aadd_documents(
             state['vectorstore_documents_to_be_indexed']
         )
+
+        # add columns for sorting
+        from src.subgraphs.vector_store_graph.utils.helper_functions import update_column_metadata
+
+        response = await update_column_metadata(added_ids_list, creation_times_list, configuration, table_name="langchain_pg_embedding")
+
+        logger.info(f"Update of column metadata: {response['success']}")
+        
+
         return {"docs": "delete"}
 
 # Define a new graph

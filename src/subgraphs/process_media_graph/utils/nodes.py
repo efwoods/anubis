@@ -413,7 +413,48 @@ async def process_media_item_task(
                 }
 
                 if classification['classified_situation'] == "single_speaker":
-                
+
+                    # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 
+                    
+                    # is this content written in first person or is this content about the individual?
+                    # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
+                    # @dataclass
+                    # class DetermineTextFirstPersonToneOfVoice:
+                    #
+                    #   classification: Literal("first_person_directly_speaking", "content_about_target_NOT_the_target_directly_speaking")
+                    #   reason: str = Field()
+                    # model_with_structured_output_classify_text_perspective = init_model()
+                    # input = [{"role": "system", "content": DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
+                    # response = model_with_structured_output_classify_text_perspective.ainvoke(input=input)
+                    # 
+                    # if response['classification'] == "first_person_directly_speaking":
+                    # Direct quote content of only the target speaker speaking in the entire media item.  
+
+                    # """ IF THE DETERMINATION ABOVE IS TRUE """
+
+                    # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
+
+                    # TODO: GENERATE A PROMPTING QUESTION AND CREATE A TRAINING DOCUMENT WITH BOTH GENERATED QUESTION AND THIS RESPONSE
+
+                    #  """""""""
+
+                    # TODO: format for Baseline ground truth using only text from first-person perspective of the target speaker (ultimately combine with analysis for evaluation; is this generated text something the target speaker would say/know; is this how they behave, their internal decision tree chain-of-thought, are their emotions and emotional sentiment in alignment given ground truth primary resource experiences? (include vader sentiment of baseline ground truth))
+
+                    # BASELINE CODE BELOW
+                    # make_pg_store 
+                    # namespace = (user_id, assistant_id)
+                    # baseline_evaluation_quote_data = aget(namespace, key="baseline_evaluation_quote_data")
+                    # metadata = baseline_evaluation_quote_data.metadata
+                    # metadata_update = {"baseline_evaluation_quote_data": {"uuid4()":{"data": "unchunked direct_quote from media_item['content']", "metadata":{"created_at":"", "filename":"", "user_id":"", "assistant_id":""}}}} # also the structure of original metadata
+                    # metadata.update(metadata_update)
+                    # 
+                    # update the metadata object with an overwrite
+                    # aput(namespace, key="baseline_evaluation_quote_data", value=metadata) # this extends the metadata dictionary
+                    
+                    # iterate through the uuid4's to pull the "data" and have all the orginal quote content for evaluation of AI responses.
+
+                    # """ REGARDLESS OF DETERMINATION (accept both facts and direct quotes) """
+
                     # format for vectorstore: chunk and upload to vectorstore
                         logger.info(f"proccess_text_media_item_target_for_vectorstore BREAKPOINT in Process media item task: type = text")
                         documents = await process_text_media_item_target_for_vectorstore(
@@ -428,10 +469,7 @@ async def process_media_item_task(
                             document.metadata.update({"formatted_type": "vectorstore"})
 
                     # TODO: format for analysis: analyze for content about the target
-
-                    # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
-
-                    # TODO: format for Baseline ground truth using only text from first-person perspective of the target speaker (ultimately combine with analysis for evaluation; is this generated text something the target speaker would say/know; is this how they behave, their internal decision tree chain-of-thought, are their emotions and emotional sentiment in alignment given ground truth primary resource experiences? (include vader sentiment of baseline ground truth))
+                    # USE THE DETERMINATION TO AUGMENT ANALYSIS AND NOTE THAT THE CONTENT IS EITHER ABOUT THE TARGET OR IS FROM THE TARGET SPEAKING DIRECTLY
 
                 elif classification['classified_situation'] == "q_and_a_dialogue":
                     logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")

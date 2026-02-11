@@ -67,7 +67,7 @@ def test_hello_world():
 async def upload_media(
     files: List[UploadFile] = File(...),
     user_id: str = Form(default="test_user_1234"),
-    assistant_id: str = Form(default="efw_assistant_uuid_1234"),
+    assistant_id: str = Form(default="project_gutenberg_assistant_uuid_1234"),
     reference_audio: bool = False,
     reference_image: bool = False, 
     proprietary_content: bool = False, 
@@ -151,7 +151,7 @@ async def upload_media(
 async def process_media_json(
     media_list: List[dict],
     user_id: str = "test_user_1234",
-    assistant_id: str = "efw_assistant_uuid_1234", 
+    assistant_id: str = "project_gutenberg_assistant_uuid_1234", 
     reference_audo: bool = False, 
     reference_image: bool = False
 ):

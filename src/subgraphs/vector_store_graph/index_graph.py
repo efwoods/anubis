@@ -118,8 +118,9 @@ async def index_docs(
                 id_list=id_list, 
                 configuration=configuration, 
                 vectorstore_documents_to_be_indexed=state['vectorstore_documents_to_be_indexed'], 
-                BATCH_SIZE=32767
+                BATCH_SIZE=5000
             )
+        logger.info(f"breaktpoint after batch_index_documents_vectorstore")
 
         return {"docs": "delete"}
 

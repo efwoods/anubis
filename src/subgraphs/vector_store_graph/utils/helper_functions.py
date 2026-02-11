@@ -27,9 +27,13 @@ async def update_column_metadata(
     configuration: GlobalConfiguration,
     table_name: str = "langchain_pg_embedding"
 ):
+    
+    logger.info("update_column_metadata ENTRYPOINT")
+    
     if not added_ids or not creation_times_list:
         return
     
+
     assert len(added_ids) == len(creation_times_list)
     
     SQL_UPDATE_METADATA = f"""
@@ -75,8 +79,10 @@ async def batch_index_documents_vectorstore(
         id_list: list[str], 
         configuration: GlobalConfiguration, 
         vectorstore_documents_to_be_indexed: list[any], 
-        BATCH_SIZE: int = 32767
+        BATCH_SIZE: int = 5000
     ):
+
+        logger.info(f"BATCH INDEX DOCUMENTS VECTORSTORE BREAKPOINT")
 
         configuration = GlobalConfiguration()
 
@@ -96,7 +102,7 @@ async def batch_index_documents_vectorstore(
             try:
                 await v_store.adelete(ids=batch) # there is no return value from a delete
                 progress = min(i + BATCH_SIZE, total_documents_to_be_deleted)
-                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed}")
+                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_deleted}")
             except Exception as e:
                 print(f"Error in batch delete for batch number: {batch_num}: {str(e)}")
                 # Handle the error with a retry
@@ -104,7 +110,7 @@ async def batch_index_documents_vectorstore(
                 try:
                     await v_store.adelete(ids=batch) # there is no return value from a delete
                     progress = min(i + BATCH_SIZE, total_documents_to_be_deleted)
-                    logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed}")
+                    logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_deleted}")
                 except Exception as e:
                     logger.error(f"Continued Error in batch delete for batch number: {batch_num}: {str(e)}; returning error_ids_list.")
                     error_deleting_ids.extend(batch)

@@ -41,14 +41,15 @@ async def update_column_metadata(
     SET 
         user_id = v.user_id,
         assistant_id = v.assistant_id,
-        created_at = v.created_at::timestamptz
+        created_at = v.created_at::timestamptz,
+        filename = v.filename
     FROM (
         SELECT 
             unnest(CAST(:ids AS varchar[])) as id,
             unnest(CAST(:user_ids AS text[])) as user_id,
             unnest(CAST(:assistant_ids AS text[])) as assistant_id,
             unnest(CAST(:created_ats AS timestamptz[])) as created_at,
-            unnest(CAST(:filenames AS text[])) as filename,
+            unnest(CAST(:filenames AS text[])) as filename
     ) AS v
     WHERE d.id = v.id;
     """
@@ -126,13 +127,6 @@ async def batch_index_documents_vectorstore(
         # batch the document uploads
         for i in range(0, total_documents_to_be_indexed, BATCH_SIZE):
            
-            creation_times_list = [
-                {"created_at": doc.metadata['created_at'], 
-                 "user_id":doc.metadata['user_id'], 
-                 'assistant_id': doc.metadata['assistant_id'],
-                 'filename': doc.metadata['filename']
-                 } for doc in vectorstore_documents_to_be_indexed]
-
             batch = vectorstore_documents_to_be_indexed[i:i + BATCH_SIZE]
             batch_num = (i // BATCH_SIZE) + 1
             total_batches = (total_documents_to_be_indexed + BATCH_SIZE - 1) // BATCH_SIZE

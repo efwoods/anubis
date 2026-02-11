@@ -433,7 +433,7 @@ async def process_media_item_task(
 
                     # TODO: format for Baseline ground truth using only text from first-person perspective of the target speaker (ultimately combine with analysis for evaluation; is this generated text something the target speaker would say/know; is this how they behave, their internal decision tree chain-of-thought, are their emotions and emotional sentiment in alignment given ground truth primary resource experiences? (include vader sentiment of baseline ground truth))
 
-                if classification['classified_situation'] == "q_and_a_dialogue":
+                elif classification['classified_situation'] == "q_and_a_dialogue":
                     logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")
 
                     logger.warning(f"""
@@ -453,7 +453,7 @@ async def process_media_item_task(
                     # TODO: format for Adapter: Q & A format document
                     """)
 
-                if classification['classified_situation'] == "multi_speaker":
+                elif classification['classified_situation'] == "multi_speaker":
                     logger.warning(f"MULTI-SPEAKER CLASSIFICAITON DETECTED")
 
                     logger.warning(f"""
@@ -465,7 +465,7 @@ async def process_media_item_task(
                     """)
 
 
-                if classification['classified_situation'] == "other":
+                elif classification['classified_situation'] == "other":
                     logger.warning(f"OTHER text situation classification detected. Inspect and handle the situation appropriately. Currently handled in the same procedure as proprietary content.")
                     
                     logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
@@ -480,6 +480,8 @@ async def process_media_item_task(
                     )
                     for document in documents: 
                             document.metadata.update({"formatted_type": "vectorstore"})
+                else:
+                    logger.warning(f"Error: situation classification is not of type other, multi_speaker, q_and_a_dialogue, or single_speaker")
 
                 return documents
 

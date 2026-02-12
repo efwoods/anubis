@@ -3,11 +3,8 @@
 from typing import Sequence
 
 from langchain_core.documents import Document
-from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
-
-from src.subgraphs.vector_store_graph.utils import retrieval
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState

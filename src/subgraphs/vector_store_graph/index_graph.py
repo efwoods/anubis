@@ -13,10 +13,7 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 
 
-from langgraph_runtime.store import BaseStore
-
-from typing import cast
-
+from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 from src.anubis.utils.configuration import GlobalConfiguration
 

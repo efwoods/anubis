@@ -3,9 +3,8 @@ import os
 from typing import List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-import asyncio
 
-from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
+from src.anubis.utils.context import GlobalContext
 
 import logging
 logger = logging.getLogger(__name__)
@@ -13,10 +12,6 @@ logger = logging.getLogger(__name__)
 # Preload audio to text processor [this needs a startup in a lifecycle call]
  
 from contextlib import asynccontextmanager
-
-from src.anubis.utils.context import GlobalContext, UserContext, AssistantContext
-
-from langgraph.store.memory import InMemoryStore
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,14 +26,16 @@ async def lifespan(app: FastAPI):
         context = GlobalContext()
 
         # Create pipeline for audio transcription
-        from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
-        # Call the function to trigger @lru_cache and load model into memory
-        pipe = get_whisper_pipeline()
+        if context.configuration.dev == "TRUE":
+            from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
+            # Call the function to trigger @lru_cache and load model into memory
+            pipe = get_whisper_pipeline()
         
-        logger.info("✓ Whisper model preloaded and cached successfully")
-        logger.info(f"  - Model: openai/whisper-large-v3")
-        logger.info(f"  - Device: {pipe.device}")
-        logger.info(f"  - Ready to process audio requests")
+            logger.info("✓ Whisper model preloaded and cached successfully")
+            logger.info(f"  - Model: openai/whisper-large-v3")
+            logger.info(f"  - Device: {pipe.device}")
+            logger.info(f"  - Ready to process audio requests")
+        
     except Exception as e:
         logger.error("=" * 60)
         logger.error(f"✗ CRITICAL: Failed to preload Whisper model: {e}", exc_info=True)
@@ -110,17 +107,6 @@ async def upload_media(
             "media_files": media_files,
         }
            
-
-        # Prepare context/config
-        # config = {
-        #     "configurable": {
-        #         "user_id": user_id,
-        #         "assistant_id": assistant_id,
-        #         # Add other configuration as needed
-        #     }
-        # }
-
-
         # Invoke the graph
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 

@@ -25,7 +25,7 @@ from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
-from src.subgraphs.process_media_graph.utils.helper_functions import get_whisper_pipeline
+
 from src.anubis.utils.model import init_model
 
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item_target_for_vectorstore
@@ -43,8 +43,6 @@ from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
 
 from src.anubis.utils.configuration import GlobalConfiguration
-
-from pyannote.audio import Pipeline
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -545,7 +543,6 @@ async def process_media_item_task(
                 # Base64 audio
                 audio_data = media_item["data"]
 
-                
                 doc = await extract_text_from_audio(audio_data, configuration, user_id, assistant_id)
 
                 # Add metadata
@@ -671,59 +668,68 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
         logger.info(f"Diarize the audio (timestamps of who is speaking when)")
         
 # Otherwise presume the audio is a single speaker of the target if there is no reference audio; mention in metadata
-    try:
-        # Decode base64 audio data
-        audio_bytes = base64.b64decode(audio_data)
-        
-        # Create temporary file in thread
-        temp_file_directory, temp_audio_path = await asyncio.to_thread(
-            tempfile.mkstemp,
-            ".mp3"
-        )
-
-        # Write audio bytes asynchronously
-        async with aiofiles.open(temp_audio_path, 'wb') as f:
-            await f.write(audio_bytes)
-
-            logger.info(f"Audio file written to {temp_audio_path}")
+    if configuration.dev == "TRUE":
+        from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
         try:
-            # Get cached pipeline
-            pipe = get_whisper_pipeline()
-            
-            # Run transcription in thread pool (it's CPU/GPU intensive)
-            logger.info("Starting audio transcription...")
-            result = await asyncio.to_thread(pipe, temp_audio_path)
+            # Decode base64 audio data
+            audio_bytes = base64.b64decode(audio_data)
 
-            transcript = result["text"]
-            
-            # Create Document with transcription
-            doc = Document(
-                page_content=transcript,
-                metadata={
-                    "source": "audio_transcription",
-                    "model": "whisper-large-v3",
-                    "transcript_length": len(transcript),
-                    "reference_audio_used": False,                }
+
+
+            # Create temporary file in thread
+            temp_file_directory, temp_audio_path = await asyncio.to_thread(
+                tempfile.mkstemp,
+                ".mp3"
             )
-            return doc
-            
-        finally:
-            # Clean up temporary file
-            if temp_file_directory is not None:
-                await asyncio.to_thread(os.close, temp_file_directory)
-                
-    except Exception as e:
-        logger.error(f"Audio transcription failed: {e}")
-        raise
 
-    finally:
-        # Clean up temporary file in thread
-        if temp_audio_path and os.path.exists(temp_audio_path):
+            # Write audio bytes asynchronously
+            async with aiofiles.open(temp_audio_path, 'wb') as f:
+                await f.write(audio_bytes)
+
+                logger.info(f"Audio file written to {temp_audio_path}")
             try:
-                await asyncio.to_thread(os.unlink, temp_audio_path)
-                logger.info(f"Cleaned up temporary file: {temp_audio_path}")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to cleanup temp file {temp_audio_path}: {cleanup_error}")
+                # Get cached pipeline
+                pipe = get_whisper_pipeline()
+
+                # Run transcription in thread pool (it's CPU/GPU intensive)
+                logger.info("Starting audio transcription...")
+                result = await asyncio.to_thread(pipe, temp_audio_path)
+
+                transcript = result["text"]
+
+                # Create Document with transcription
+                doc = Document(
+                    page_content=transcript,
+                    metadata={
+                        "source": "audio_transcription",
+                        "model": "whisper-large-v3",
+                        "transcript_length": len(transcript),
+                        "reference_audio_used": False,                }
+                )
+                return doc
+
+            finally:
+                # Clean up temporary file
+                if temp_file_directory is not None:
+                    await asyncio.to_thread(os.close, temp_file_directory)
+
+        except Exception as e:
+            logger.error(f"Audio transcription failed: {e}")
+            raise
+
+        finally:
+            # Clean up temporary file in thread
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    await asyncio.to_thread(os.unlink, temp_audio_path)
+                    logger.info(f"Cleaned up temporary file: {temp_audio_path}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup temp file {temp_audio_path}: {cleanup_error}")
+    else:
+        logger.info(f"Production Audio Transcription Model Usage")
+        # TODO: Complete Production Audio Transcription Model Usage"
+        logger.error(f"Audio transcription failed production not implemented yet.")
+        raise
 
 async def extract_personality_from_image(
     image_data: str) -> Document:

@@ -82,7 +82,6 @@ async def upload_media(
         # update the context:
         context.user_ctx.user_id = user_id
         context.assistant_ctx.assistant_id = assistant_id
-        context.assistant_ctx.user_id = user_id
 
         # Read all uploaded files
         media_files = []
@@ -186,6 +185,29 @@ async def process_media_json(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
+from fastapi import Request
+import httpx
+
+@app.get("/some-endpoint")
+async def my_endpoint(request: Request):
+    context = GlobalContext()
+    root_url = str(request.base_url) 
+    logger.warning(f"root_url: {root_url}")
+
+    async with httpx.AsyncClient() as client:
+        namespaces = await client.post(f"{root_url}store/namespaces",
+            headers={
+              "Content-Type": "application/json",
+              'x-api-key': f"LANGGRAPH_API_SERVER_KEY",
+            },
+            json={
+              "max_depth": 1,
+              "limit": 100,
+              "offset": 0
+            }
+        )
+        logger.info(f"breakpoing namespaces: {namespaces}")
+    return ({"url": root_url, "namespaces": namespaces.text})
 
 if __name__ == "__main__":
     import uvicorn

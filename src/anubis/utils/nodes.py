@@ -143,9 +143,16 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     
     postgres_db_store = await make_pg_store(configuration)
 
-    user_id = runtime.context.assistant_ctx.get("user_id", "")
-    assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
 
+    if isinstance(runtime.context.user_ctx, dict):
+        user_id = runtime.context.user_ctx.get("user_id", "")
+    else:
+        user_id = getattr(runtime.context.user_ctx, "user_id", "")
+
+    if isinstance(runtime.context.assistant_ctx, dict):
+        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+    else:
+        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
 
     namespace=(user_id, assistant_id)
     async with postgres_db_store as postgres_db_store:
@@ -158,10 +165,16 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
         if ai_context_item is None:
             # store the current context of the ai into the store
             # Try to store the name from the context
-            assistant_context_name = runtime.context.assistant_ctx.get("name", "")
+            logger.info(f"breakpoint")
+            if isinstance(runtime.context.assistant_ctx, dict):
+                assistant_context_name = runtime.context.assistant_ctx.get("name", "")
+            else:
+                assistant_context_name = getattr(runtime.context.assistant_ctx, "name", "")
 
-            assistant_context_description = runtime.context.assistant_ctx.get("description", "")
-
+            if isinstance(runtime.context.assistant_ctx, dict):
+                assistant_context_description = runtime.context.assistant_ctx.get("description", "")
+            else:
+                assistant_context_description = getattr(runtime.context.assistant_ctx, "description", "")
 
             aput_result = await postgres_db_store.aput(namespace, key="identity", value={"identity":{"self": {"name": assistant_context_name, "description": assistant_context_description}}})
 

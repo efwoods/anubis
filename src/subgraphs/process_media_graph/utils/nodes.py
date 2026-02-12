@@ -56,8 +56,16 @@ async def process_uploaded_files_and_label_media_type(
     
     logger.info(f"Process uploaded files NODE")
 
-    user_id = runtime.context.assistant_ctx.user_id
-    assistant_id = runtime.context.assistant_ctx.assistant_id
+    if isinstance(runtime.context.user_ctx, dict):
+        user_id = runtime.context.user_ctx.get("user_id", "")
+    else:
+        user_id = getattr(runtime.context.user_ctx, "user_id", "")
+
+    if isinstance(runtime.context.assistant_ctx, dict):
+        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+    else:
+        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+
 
     media_files = state.get('media_files', [])
     
@@ -805,8 +813,16 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
     
     logger.info(f"Extract_media_from_message NODE")
 
-    user_id = runtime.context.user_ctx.user_id
-    assistant_id = runtime.context.assistant_ctx.assistant_id
+
+    if isinstance(runtime.context.user_ctx, dict):
+        user_id = runtime.context.user_ctx.get("user_id", "")
+    else:
+        user_id = getattr(runtime.context.user_ctx, "user_id", "")
+
+    if isinstance(runtime.context.assistant_ctx, dict):
+        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+    else:
+        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
 
     messages = state.get('messages', [])
 

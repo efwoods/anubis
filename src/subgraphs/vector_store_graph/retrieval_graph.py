@@ -131,9 +131,16 @@ async def retrieve(
 
     configuration = runtime.context.configuration
 
-    user_id = runtime.context.assistant_ctx.get("user_id", "")
-    assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-    
+    if isinstance(runtime.context.user_ctx, dict):
+        user_id = runtime.context.user_ctx.get("user_id", "")
+    else:
+        user_id = getattr(runtime.context.user_ctx, "user_id", "")
+        
+    if isinstance(runtime.context.assistant_ctx, dict):
+        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
+    else:
+        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+
     memory_search = runtime.context.vector_store_memory_search_only
 
     if memory_search == "FALSE":
@@ -149,7 +156,7 @@ async def retrieve(
         }
                 # "type": {"$eq": "memory"}
 
-    logger.info(f"breakpoint")
+    
     vector_store = await make_pg_vector(configuration)
 
     logger.info(f"breakpoint")

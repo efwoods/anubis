@@ -23,29 +23,15 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from sqlalchemy.ext.asyncio import create_async_engine
 import asyncpg
 
+
+
+
 @dataclass
-class UserContext:
-    user_id: str = field(default="test_user_id_1234")
+class IdentityContext:
+    user_id: str = field(default="2feaa9d8-50c0-4550-81fa-9fb79bfe23f0")
     name: str = field(default=None)
     description: str = field(default=None)
     metadata: dict = field(default_factory=dict )
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for prompt injection."""
-        return {
-            "name": self.name,
-            **self.metadata  # Unpack all metadata at top level
-        }
-
-@dataclass
-class AssistantContext:
-    user_id: str = field(default="test_user_id_1234")
-    assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
-    name: str = field(default=None)
-    description: str = field(default=None)
-
-    # Mutable metadata dictionary
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def update_metadata(self, key: str, value: Any):
         """Update a specific metadata field."""
@@ -62,13 +48,18 @@ class AssistantContext:
                 self._deep_merge(base[key], value)
             else:
                 base[key] = value
-    
+
+
     def to_dict(self) -> Dict[str, Any]:
-        """Conve-rt to dictionary for prompt injection."""
+        """Convert to dictionary for prompt injection."""
         return {
             "name": self.name,
             **self.metadata  # Unpack all metadata at top level
         }
+
+@dataclass
+class AssistantContext(IdentityContext):
+    assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
 
 
 @dataclass(kw_only=True)
@@ -104,7 +95,7 @@ class GlobalContext:
     temporary_system_prompt_update: str = ""
 
 
-    user_ctx: UserContext = field(default_factory=UserContext)
+    user_ctx: IdentityContext = field(default_factory=IdentityContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
 

@@ -76,3 +76,4 @@ firebase-admin
 # Image processing
 opencv-python
 mediapipe
+langgraph-api

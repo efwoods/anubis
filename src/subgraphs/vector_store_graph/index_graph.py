@@ -28,7 +28,12 @@ def ensure_docs_have_user_id(
     Returns:
         list[Document]: A new list of Document objects with updated metadata.
     """
-    user_id = runtime.context.user_ctx.user_id
+    
+    if isinstance(runtime.context.user_ctx, dict):
+        user_id = runtime.context.user_ctx.get("user_id", "")
+    else:
+        user_id = getattr(runtime.context.user_ctx, "user_id", "")
+
     return [
         Document(
             page_content=doc.page_content, metadata={**doc.metadata, "user_id": user_id}
@@ -73,17 +78,17 @@ async def index_docs(
     
     if filenames:
         filenames_list = list(filenames)
-        user_ctx = runtime.context.user_ctx
-        if isinstance(user_ctx, dict):
+        
+        if isinstance(runtime.context.user_ctx, dict):
             user_id = runtime.context.user_ctx.get("user_id", "")
         else:
-            user_id = getattr(runtime.context.user_ctx, "user_id")
-        
-        assistant_ctx = runtime.context.assistant_ctx
-        if isinstance(assistant_ctx, dict):
+            user_id = getattr(runtime.context.assistant_ctx, "user_id", "")
+
+        if isinstance(runtime.context.assistant_ctx, dict):
             assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
         else:
-            assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id")
+            assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+
 
         # search for the documents
         from sqlalchemy import text

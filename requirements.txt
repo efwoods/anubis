@@ -79,3 +79,6 @@ firebase-admin
 # Image processing
 opencv-python
 mediapipe
+
+
+python-dateutil

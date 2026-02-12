@@ -188,8 +188,8 @@ async def process_media_json(
 from fastapi import Request
 import httpx
 
-@app.get("/some-endpoint")
-async def my_endpoint(request: Request):
+@app.get("/example-api")
+async def example_call_to_extend_api_for_avatars(request: Request):
     context = GlobalContext()
     root_url = str(request.base_url) 
     logger.warning(f"root_url: {root_url}")
@@ -207,7 +207,7 @@ async def my_endpoint(request: Request):
             }
         )
         logger.info(f"breakpoing namespaces: {namespaces}")
-    return ({"url": root_url, "namespaces": namespaces.text})
+    return ({"namespaces": namespaces.text})
 
 if __name__ == "__main__":
     import uvicorn

@@ -178,14 +178,15 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
             aput_result = await postgres_db_store.aput(namespace, key="identity", value={"identity":{"self": {"name": assistant_context_name, "description": assistant_context_description}}})
 
-            # get the ai_context
+            # get the ai_context after the update
             ai_context_item = await postgres_db_store.aget(namespace, key="identity")
-
         if ai_context_item.value["identity"]["self"].get("name", None) is None:
-            # Try to store the name from the context
-            assistant_context_name = runtime.context.assistant_ctx.get("name", "")
-
+            if isinstance(runtime.context.assistant_ctx, dict):
+                assistant_context_name = runtime.context.assistant_ctx.get("name", "")
+            else:
+                assistant_context_name = getattr(runtime.context.assistant_ctx, "name", "")
             # Update the ai_context_item_value dictionary
+            logger.info(f"name {assistant_context_name}")
             ai_context_item.value["identity"]["self"].update({"name":assistant_context_name})
 
             # overwrite the entire value dictionary with the current value dictionary updated
@@ -193,7 +194,10 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
         if ai_context_item.value["identity"]["self"].get("description", None) is None:
             # Try to store the description from the context
-            assistant_context_description = runtime.context.assistant_ctx.get("description", "")
+            if isinstance(runtime.context.assistant_ctx, dict):
+                assistant_context_description = runtime.context.assistant_ctx.get("description", "")
+            else:
+                assistant_context_description = getattr(runtime.context.assistant_ctx, "description", "")
 
             # Update the ai_context_item_value dictionary
             ai_context_item.value["identity"]["self"].update({"description":assistant_context_description})

@@ -1,10 +1,9 @@
 # src/anubis/utils/model
 
-# from src.anubis.utils.tools import search, health_check, add_to_vectorstore, retrieve_from_vectorstore
+import logging
 
-# tools = [search, health_check, add_to_vectorstore, retrieve_from_vectorstore]
+logger = logging.getLogger(__name__)
 
-from pydantic import BaseModel
 
 from src.anubis.utils.configuration import GlobalConfiguration
 
@@ -18,6 +17,7 @@ def init_model(configuration: GlobalConfiguration,
 
     logger.info(f"dev: {dev}")
     logger.info(f"base_url: {base_url}")
+    logger.info(f"model_name: {model_name}")
 
     # if dev == 'TRUE':
     from langchain_openai import ChatOpenAI
@@ -41,15 +41,3 @@ def init_model(configuration: GlobalConfiguration,
     #     from langchain_together import ChatTogether
     #     model = ChatTogether(model=model_name, temperature=0.1)
     return model
-
-from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
-from src.anubis.utils.helper_functions import format_docs
-from datetime import datetime, timezone
-from src.anubis.utils.state import GlobalState
-from src.anubis.utils.context import GlobalContext
-from langgraph.runtime import Runtime
-from langchain.agents import create_agent
-
-import logging
-
-logger = logging.getLogger(__name__)

@@ -46,6 +46,9 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     # vectorstore = await make_vectorstore(configuration)
 
     logger.info(f"breakpoint invoke agent")
+    
+    logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
+
 
 
     """ CREATE MODEL """
@@ -71,6 +74,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     # relevant documents invoke retrieval and only return documents that do not have the type "memory"
     runtime.context.vector_store_memory_search_only = "FALSE"
+    
+    logger.info(f"{retrieval_message}")
 
     new_state_retrieved_docs = await retrieval_graph.ainvoke(
         retrieval_message, 
@@ -189,8 +194,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     assert(ai_context_item is not None)
     user_context = ai_context_item.value["identity"].get("user", {}) # information stored in a nested dictionary about the user
 
-
-
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
     temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
@@ -215,7 +218,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     messages_input = populated_template.messages + state["messages"]
     
     logger.info(f"messages_input: {messages_input}")
-    
+
     # Call the model
     response = await model.ainvoke(input=messages_input)
 
@@ -251,7 +254,6 @@ async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]) -> Co
     
     # Create a model with structured output
     config = runtime.context.configuration # Loads env vars automatically
-    tools = []
 
     model_router_structured_output = init_model(
         configuration=config,

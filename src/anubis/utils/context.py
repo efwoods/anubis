@@ -83,7 +83,6 @@ class GlobalContext:
 
     temporary_system_prompt_update: str = ""
 
-
     user_ctx: IdentityContext = field(default_factory=IdentityContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)

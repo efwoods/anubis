@@ -1,9 +1,7 @@
 # src/anubis/utils/model
 
 import logging
-
 logger = logging.getLogger(__name__)
-
 
 from src.anubis.utils.configuration import GlobalConfiguration
 

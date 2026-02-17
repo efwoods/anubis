@@ -777,6 +777,8 @@ async def extract_personality_from_image(
         content=image_to_target_textual_description_payload
     )
 
+    logger.info(message)
+
     response = await model.ainvoke([message])
 
     logger.info(f"response: {response}")

@@ -111,12 +111,7 @@ class GlobalConfiguration(IndexConfiguration):
             "description": "Model Name Only"
         },
     )
-    provider_model: str = field(
-        default=None,
-        metadata={
-            "description": "provider/model_name"
-        },
-    )
+    
     response_model: str = field(
         default=None,
         metadata={

@@ -11,17 +11,13 @@ from src.anubis.utils.configuration import GlobalConfiguration
 def init_model(configuration: GlobalConfiguration, 
                tools=[], response_format = None):
     
-    provider_model = configuration.provider_model
+    model_name = configuration.model
     base_url = configuration.llama_api_base_url
     api_key = configuration.llama_api_key
     dev = configuration.dev
 
     logger.info(f"dev: {dev}")
     logger.info(f"base_url: {base_url}")
-    logger.info(f"provider_model: {provider_model}")
-    
-    provider, model_name = provider_model.split("/", maxsplit=1) 
-
 
     # if dev == 'TRUE':
     from langchain_openai import ChatOpenAI

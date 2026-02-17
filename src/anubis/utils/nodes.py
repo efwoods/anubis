@@ -234,7 +234,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     logger.info(f"populated_template: {populated_template}")
 
-    # clear the temporary injected prompt
+    # clear the temporary injected prompt``
     runtime.context.temporary_system_prompt_update = ""
 
     # prepend system message

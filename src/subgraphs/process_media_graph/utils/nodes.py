@@ -773,9 +773,7 @@ async def extract_personality_from_image(
                         },
                     ]
 
-    message = HumanMessage(
-        content=image_to_target_textual_description_payload
-    )
+    
 
     response = await model.ainvoke([message])
 

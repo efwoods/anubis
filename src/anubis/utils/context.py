@@ -66,14 +66,6 @@ class AssistantContext(IdentityContext):
 class GlobalContext:
     """Main context class for the memory graph system."""
 
-    provider_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-        metadata={
-            "description": "The name of the language model to use for the agent. "
-            "Should be in the form: provider/model-name."
-        },
-    )
-
     system_prompt: Annotated[SystemMessage, {"__template_metadata__": {"kind": "system_message"}}] = field(
         default=system_prompts.SYSTEM_PROMPT,
         metadata={

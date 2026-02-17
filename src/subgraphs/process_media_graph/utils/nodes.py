@@ -793,7 +793,7 @@ async def extract_personality_from_image(
         metadata={
             "source": "vision_model", 
             "type": "personality_extraction", 
-            "model": configuration.provider_model
+            "model": configuration.model
         }
     )
 

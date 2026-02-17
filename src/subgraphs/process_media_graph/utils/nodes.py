@@ -26,8 +26,6 @@ from langgraph.store.base import BaseStore
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
-from src.anubis.utils.model import init_model
-
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item_target_for_vectorstore
 
 from src.anubis.utils.state import GlobalState
@@ -393,11 +391,7 @@ async def process_media_item_task(
                 tools = []
 
                 model_with_structured_output = init_model(
-                    configuration.provider_model,
-                    configuration.llama_api_base_url,
-                    configuration.llama_api_key,
-                    tools,
-                    configuration.dev,
+                    configuration=configuration,
                     response_format=TextualSituationalAwareness
                 )
                 from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
@@ -762,14 +756,8 @@ async def extract_personality_from_image(
 
     configuration = GlobalConfiguration()
 
-    tools = []
-    
     model = init_model(
-        configuration.provider_model,
-        configuration.llama_api_base_url,
-        configuration.llama_api_key,
-        tools, 
-        configuration.dev
+        configuration=configuration
     )
 
     image_to_target_textual_description_payload = [

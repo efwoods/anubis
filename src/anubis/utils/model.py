@@ -6,11 +6,26 @@
 
 from pydantic import BaseModel
 
-def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response_format = None):
+from src.anubis.utils.configuration import GlobalConfiguration
+
+def init_model(configuration: GlobalConfiguration, 
+               tools=[], response_format = None):
+    
+    provider_model = configuration.provider_model
+    base_url = configuration.llama_api_base_url
+    api_key = configuration.llama_api_key
+    dev = configuration.dev
+
+    logger.info(f"dev: {dev}")
+    logger.info(f"base_url: {base_url}")
+    logger.info(f"provider_model: {provider_model}")
+    
     provider, model_name = provider_model.split("/", maxsplit=1) 
+
+
     # if dev == 'TRUE':
     from langchain_openai import ChatOpenAI
-    logger.error(f"base_url: {base_url}")
+    
     if response_format is None:
         model = ChatOpenAI(
                     model = model_name,
@@ -42,71 +57,3 @@ from langchain.agents import create_agent
 import logging
 
 logger = logging.getLogger(__name__)
-
-async def invoke_model_core(
-        state: GlobalState, 
-        runtime: Runtime[GlobalContext],
-        tools: list,
-        ):
-    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
-    
-    logger.info(f"invoke model core")
-
-    config = runtime.context.configuration # Loads env vars automatically
-
-    model = init_model(
-        config.provider_model,
-        config.llama_api_base_url,
-        config.llama_api_key,
-        tools,
-        config.dev
-    )
-
-    # build system prompt with injection
-    # search store for current context information
-    # update the context
-    # inject the system prompt with context from user and assistant
-
-    prompt_builder = DynamicPromptBuilder()
-
-    retrieved_docs = format_docs(state.get('retrieved_docs', []))
-
-    ai_context = runtime.context.assistant_ctx.to_dict()
-    user_ctx = runtime.context.user_ctx.to_dict()
-    system_time = datetime.now(tz=timezone.utc).isoformat()
-
-    temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
-
-    prompt_template, prompt_variables = prompt_builder.build_prompt(
-        ai_context=ai_context,
-        user_context=user_ctx, 
-        retrieved_docs=retrieved_docs,
-        system_time = system_time,
-        temporary_message=temporary_system_prompt_update,
-    )
-    
-    runtime.context.temporary_system_prompt_update = ""
-
-    # Inject and create the system prompt and append messages of state
-    injected_prompt = await prompt_template.ainvoke({
-        **prompt_variables, 
-        "messages": state['messages']
-    })
-
-    logger.info(f"INJECTED PROMPT: {injected_prompt}")
-    
-    agent = create_agent(
-        model=model, 
-        tools = tools, 
-        context_schema=GlobalContext, 
-        state_schema=GlobalState,
-    )
-
-    response = await agent.ainvoke(input=injected_prompt)
-
-    logger.info(f"AGENT RESPONSE: {response}")
-    result = {"messages": response['messages'][-1]}
-    return result
-
-
-

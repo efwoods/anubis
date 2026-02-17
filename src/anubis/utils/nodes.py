@@ -21,13 +21,9 @@ from src.anubis.utils.helper_functions import format_docs
 
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 
-from src.anubis.utils.model import invoke_model_core
 
 from src.anubis.utils.tools import (
     health_check, 
-    # add_to_vectorstore_subgraph, 
-    # retrieve_from_vectorstore_subgraph, 
-    # upsert_memory
 )
 
 from langgraph.store.base import BaseStore
@@ -38,24 +34,6 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 # Optional: Add tools=[] if you have them
 tools = []  # Replace with your tools 
-
-async def invoke_model(state: GlobalState, runtime: Runtime[GlobalContext]):
-    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
-    logger.info(f"INVOKE MODEL NODE ")
-    
-    response = await invoke_model_core(
-        state=state,
-        runtime=runtime,
-        tools=tools,
-    )
-
-    logger.info(f"INVOKE MODEL NODE {response['messages']}")
-
-    result = {"messages": [response["messages"]]}
-    logger.info(f"RESULT OF INVOKE MODEL NODE RETURN: {result}")
-
-    return result
-
 
 async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
@@ -75,11 +53,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     config = runtime.context.configuration # Loads env vars automatically
 
     model = init_model(
-        config.provider_model,
-        config.llama_api_base_url,
-        config.llama_api_key,
-        tools,
-        config.dev
+        configuration = config,
     )
 
     """ VECTORSTORE DOCUMENT RETRIEVAL """
@@ -280,11 +254,7 @@ async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]) -> Co
     tools = []
 
     model_router_structured_output = init_model(
-        config.provider_model,
-        config.llama_api_base_url,
-        config.llama_api_key,
-        tools,
-        config.dev,
+        configuration=config,
         response_format=RouteDecision
     )
 

@@ -161,11 +161,7 @@ async def process_text_media_item_target_for_vectorstore(
             tools = []
 
             model_structured_output = init_model(
-                        configuration.provider_model,
-                        configuration.llama_api_base_url,
-                        configuration.llama_api_key,
-                        tools,
-                        configuration.dev,
+                        configuration=configuration,
                         response_format=SemanticChunkIndexList
             )
 

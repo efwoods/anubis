@@ -75,14 +75,8 @@ async def generate_query(
         from src.anubis.utils.model import init_model
         configuration = runtime.context.configuration
 
-        tools = []
-
         model_structured_output = init_model(
-            configuration.provider_model, 
-            configuration.llama_api_base_url,
-            configuration.llama_api_key,
-            tools, 
-            configuration.dev, 
+            configuration = configuration,
             response_format=SearchQuery
         )
 

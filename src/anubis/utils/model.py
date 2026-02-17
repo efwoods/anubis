@@ -10,6 +10,7 @@ def init_model(provider_model, base_url, api_key, tools=[], dev="TRUE", response
     provider, model_name = provider_model.split("/", maxsplit=1) 
     # if dev == 'TRUE':
     from langchain_openai import ChatOpenAI
+    logger.error(f"base_url: {base_url}")
     if response_format is None:
         model = ChatOpenAI(
                     model = model_name,

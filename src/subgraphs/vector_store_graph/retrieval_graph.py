@@ -20,7 +20,7 @@ from src.subgraphs.vector_store_graph.utils import retrieval
 from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
-from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text, load_chat_model
+from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text
 
 import logging
 logger = logging.getLogger(__name__)

@@ -23,9 +23,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from sqlalchemy.ext.asyncio import create_async_engine
 import asyncpg
 
-
-
-
 @dataclass
 class IdentityContext:
     user_id: str = field(default="2feaa9d8-50c0-4550-81fa-9fb79bfe23f0")

@@ -140,8 +140,8 @@ async def make_pg_vector(
 
     logger.info(f"make_pg_vector ENTRYPOINT")
     embedding = await make_text_encoder(configuration.embedding_model)
-    logger.info(f"configuration.postgres_uri: {configuration.postgres_uri}")
-    async_engine = create_async_engine(configuration.postgres_uri)
+    logger.info(f"configuration.vectorstore_postgres_uri: {configuration.vectorstore_postgres_uri}")
+    async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
         
     vector_store = await asyncio.to_thread(
         PGVector.from_existing_index,
@@ -155,7 +155,6 @@ async def make_pg_vector(
     return vector_store
 
 from langgraph.store.postgres import AsyncPostgresStore
-
 
 async def make_pg_store(
     configuration: GlobalConfiguration):

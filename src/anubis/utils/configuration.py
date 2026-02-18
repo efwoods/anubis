@@ -148,7 +148,7 @@ class GlobalConfiguration(IndexConfiguration):
         },
     )
 
-    postgres_uri: str = field(
+    vectorstore_postgres_uri: str = field(
         default=None,
         metadata={"description": "Connection string to postgres db for persistent document storage via vector store"}
     )

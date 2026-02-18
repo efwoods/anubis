@@ -14,7 +14,6 @@ import base64
 from langchain_core.documents import Document
 import tempfile
 
-
 import base64
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -118,7 +117,8 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes),
                         "user_id": user_id,
                         "assistant_id": assistant_id, 
-                        "reference_audio": reference_audio                    }
+                        "reference_audio": reference_audio                    
+                    }
                 })
             
             elif content_type.startswith('video/'):

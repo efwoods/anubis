@@ -49,7 +49,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
 
 
-
     """ CREATE MODEL """
 
     config = runtime.context.configuration # Loads env vars automatically
@@ -120,7 +119,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
    
     
     postgres_db_store = await make_pg_store(configuration)
-
 
     if isinstance(runtime.context.user_ctx, dict):
         user_id = runtime.context.user_ctx.get("user_id", "")

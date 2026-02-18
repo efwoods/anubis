@@ -89,12 +89,15 @@ async def index_docs(
         else:
             assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
 
+        # redundancy to ensure the validity of the data
+        user_id = "".join(user_id.strip())
+        assistant_id = "".join(assistant_id.strip())
 
         # search for the documents
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        async_engine = create_async_engine(configuration.postgres_uri)
+        async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
 
         SQL_QUERY="""SELECT id FROM langchain_pg_embedding WHERE cmetadata->>'user_id' = :user_id
         AND cmetadata->>'assistant_id' = :assistant_id
@@ -129,9 +132,6 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
 
-# if (configuration.dev == "TRUE"):
-    # index_graph = builder.compile(store=across_thread_memory)
-# else: 
 index_graph = builder.compile()
 
 index_graph.name = "IndexGraph"

@@ -83,13 +83,6 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "The system prompt used for generating responses."},
     )
 
-    response_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="Llama-4-Maverick-17B-128E-Instruct-FP8",
-        metadata={
-            "description": "The language model used for generating responses. Should be in the form: provider/model-name."
-        },
-    )
-
     query_system_prompt: str = field(
         default=vector_store_graph_prompts.QUERY_SYSTEM_PROMPT,
         metadata={
@@ -97,46 +90,35 @@ class GlobalConfiguration(IndexConfiguration):
         },
     )
 
-    query_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="Llama-4-Maverick-17B-128E-Instruct-FP8",
-        metadata={
-            "description": "The language model used for processing and refining queries. Should be in the form: provider/model-name."
-        },
-    )
-
     """ Default Environment Variables """
-    model: str = field(
-        default=None,
-        metadata={
-            "description": "Model Name Only"
-        },
+
+    together_api_key: str = field(
+        default=None, 
+        metadata={"description": "inference provider for production use and for adapter training."}
     )
     
-    response_model: str = field(
-        default=None,
-        metadata={
-            "description": "The system prompt used for processing and refining queries during vectorstore retrieval response."
-        },
-    )
-    query_model: str = field(
-        default=None,
-        metadata={
-            "description": "The system prompt used for processing and refining queries during query generation for the vectorstore."
-        },
-    )
+
     llama_api_key: str = field(
         default=None,
         metadata={
             "description": "API key for llama models"
         },
     )
+
     llama_api_base_url: str = field(
         default=None,
         metadata={
             "description": "base url for the llama model"
         }
-        
     )
+
+    model: str = field(
+        default=None,
+        metadata={
+            "description": "Model Name Only"
+        },
+    )
+
     dev: str = field(
         default=None,
         metadata={
@@ -151,19 +133,9 @@ class GlobalConfiguration(IndexConfiguration):
         }
     )
 
-    mongodb_uri: str = field(
-        default=None, 
-        metadata={"description": "connection string to the mongodb for vectorstore retrieval."}
-    )
-
-    together_api_key: str = field(
-        default=None, 
-        metadata={"description": "inference provider for production use and for adapter training."}
-    )
-    
-    postgres_uri: str = field(
+    huggingface_token: str = field(
         default=None,
-        metadata={"description": "Connection string to postgres db for persistent document storage via vector store"}
+        metadata={"description": "Token to use huggingface models"}
     )
 
     embedding_model: Annotated[
@@ -176,14 +148,14 @@ class GlobalConfiguration(IndexConfiguration):
         },
     )
 
+    postgres_uri: str = field(
+        default=None,
+        metadata={"description": "Connection string to postgres db for persistent document storage via vector store"}
+    )
+
     async_postgres_store_uri: str = field(
         default=None,
         metadata={"description": "Connection string to async postgres store for persistent storage of avatar metadata for contextual prompt injection"}
-    )
-
-    huggingface_token: str = field(
-        default=None,
-        metadata={"description": "Token to use huggingface models"}
     )
 
     def __post_init__(self):

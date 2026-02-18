@@ -18,7 +18,7 @@
       "refresh_on_read": false
     }
   },
-  "env": ".env.dev",
+  "env": ".env",
   "http": {
     "app": "src/anubis/webapp.py:app"
   }

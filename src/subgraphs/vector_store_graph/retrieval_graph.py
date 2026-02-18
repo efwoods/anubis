@@ -115,7 +115,17 @@ async def retrieve(
         dict[str, list[Document]]: A dictionary with a single key "retrieved_docs"
         containing a list of retrieved Document objects.
     """
+    from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
+
+    state['human_message'] = state['messages'][-1]
+
+    assert(isinstance(state['human_message'], HumanMessage))
+
+    retrieval_message = {"messages" : [state['human_message']]}
+
+    logger.info(f"{retrieval_message}")
+    
 
     configuration = runtime.context.configuration
 

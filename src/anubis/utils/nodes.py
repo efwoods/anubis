@@ -86,9 +86,12 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
 
     logger.info(f"breakpoint")
+    logger.info(f"state['retrieved_docs']{state['retrieved_docs']}")
 
     # Vectorstore Retrieved Docments
     retrieved_docs = format_docs(state.get('retrieved_docs', []))
+
+    logger.info(f"format_docs(state.get('retrieved_docs', [])): {retrieved_docs}")
 
     """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
     runtime.context.vector_store_memory_search_only = "TRUE"

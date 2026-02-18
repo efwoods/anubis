@@ -94,12 +94,6 @@ async def generate_query(
             "queries": [generated.query],
         }
 
-
-from langgraph.store.postgres import PostgresStore
-from langchain_postgres import PGVector
-
-from langchain_huggingface import HuggingFaceEmbeddings
-
 from src.subgraphs.vector_store_graph.utils.retrieval import (
     make_pg_vector
 )

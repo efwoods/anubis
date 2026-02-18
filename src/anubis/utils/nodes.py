@@ -43,7 +43,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"INVOKE AGENT NODE ")
 
     configuration =  runtime.context.configuration
-    # vectorstore = await make_vectorstore(configuration)
 
     logger.info(f"breakpoint invoke agent")
 

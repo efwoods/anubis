@@ -62,7 +62,7 @@ async def update_column_metadata(
         'filenames': [m['filename'] for m in creation_times_list]
     }
     
-    async_engine = create_async_engine(configuration.postgres_uri)
+    async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
     try:
 
         async with async_engine.connect() as conn:

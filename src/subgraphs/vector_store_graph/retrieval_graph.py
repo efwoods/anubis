@@ -55,6 +55,12 @@ async def generate_query(
     """
     logging.info(f"XXXXX GENERATE QUERY NODE XXXX")
 
+    # update the context from the state
+    runtime.context.assistant_ctx.user_id = state['user_id']
+    runtime.context.user_ctx.user_id = state['user_id']
+    runtime.context.assistant_ctx.assistant_id = state['assistant_id']
+
+
     messages = state['messages']
     if len(messages) == 1:
         # It's the first user question. We will use the input directly to search.

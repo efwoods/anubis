@@ -26,19 +26,6 @@ from langchain_core.runnables import RunnableConfig
 
 configuration = GlobalConfiguration()
 
-# Define the context 
-# def make_context(config: RunnableConfig) -> GlobalContext:
-#     configurable = config.get("configurable", {})
-
-#     user_id = configurable.get("user_id", "test_user_1234")
-#     assistant_id = configurable.get("assistant_id", "Anubis")
-
-#     return GlobalContext(
-#         user_ctx=IdentityContext(user_id=user_id),
-#         assistant_ctx=AssistantContext(assistant_id=assistant_id),
-#         configuration=GlobalConfiguration.from_runnable_config(config)
-#     )
-
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(
     state_schema = GlobalState, 

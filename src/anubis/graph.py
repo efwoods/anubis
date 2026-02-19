@@ -21,6 +21,9 @@ from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 from dotenv import load_dotenv
 load_dotenv()
 
+from src.anubis.utils.context import IdentityContext, AssistantContext
+from langchain_core.runnables import RunnableConfig
+
 configuration = GlobalConfiguration()
 
 # Build minimal graph: START -> agent -> END
@@ -35,11 +38,12 @@ workflow.add_node("retrieve_documents", retrieval_graph)
 workflow.add_node("invoke_agent", invoke_agent)
 
 # Edges
-workflow.add_edge(START, "invoke_agent")
-
+workflow.add_edge(START, 'retrieve_documents')
+workflow.add_edge('retrieve_documents', "invoke_agent")
 workflow.add_edge("invoke_agent", END)
 
 graph = workflow.compile()
+# graph = workflow.compile(context=make_context)
 
 graph.name = "Anubis"
 

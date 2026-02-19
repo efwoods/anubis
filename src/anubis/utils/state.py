@@ -82,9 +82,10 @@ class GlobalState(TypedDict):
     # retrieved_documents: List[Document] = field(default_factory=list)
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
-    
-    extracted_human_message: str = ""
 
+    user_id: str
+    assistant_id: str
+    
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
 
     """ Data Retrieval """

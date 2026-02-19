@@ -73,23 +73,26 @@ async def generate_query(
 
       # Create a model for invocation
         from src.anubis.utils.model import init_model
-        configuration = runtime.context.configuration
 
         model_structured_output = init_model(
             configuration = configuration,
             response_format=SearchQuery
         )
 
+        messages = state['messages']
+        queries = state['queries']
+        system_time = datetime.now(tz=timezone.utc).isoformat(),
+
+
         message_value = await prompt.ainvoke(
             {
-                "messages": state.messages,
-                "queries": "\n- ".join(state.queries),
+                "messages": messages,
+                "queries": "\n- ".join(queries),
                 "system_time": datetime.now(tz=timezone.utc).isoformat(),
             },
-            configuration,
         )
 
-        generated = cast(SearchQuery, await model_structured_output.ainvoke(message_value, configuration))
+        generated = cast(SearchQuery, await model_structured_output.ainvoke(message_value))
         return {
             "queries": [generated.query],
         }
@@ -99,7 +102,7 @@ from src.subgraphs.vector_store_graph.utils.retrieval import (
 )
 
 async def retrieve(
-    state: GlobalState, runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -118,11 +121,11 @@ async def retrieve(
     from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
 
-    state['human_message'] = state['messages'][-1]
+    human_message = state['messages'][-1]
 
-    assert(isinstance(state['human_message'], HumanMessage))
+    assert(isinstance(human_message, HumanMessage))
 
-    retrieval_message = {"messages" : [state['human_message']]}
+    retrieval_message = {"messages" : [human_message]}
 
     logger.info(f"{retrieval_message}")
     

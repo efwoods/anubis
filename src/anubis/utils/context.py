@@ -78,9 +78,6 @@ class GlobalContext:
         },
     )
 
-    llama_api_base_url: str = ""
-    llama_api_key: str = ""
-
     temporary_system_prompt_update: str = ""
 
 

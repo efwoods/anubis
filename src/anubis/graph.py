@@ -21,7 +21,23 @@ from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 from dotenv import load_dotenv
 load_dotenv()
 
+from src.anubis.utils.context import IdentityContext, AssistantContext
+from langchain_core.runnables import RunnableConfig
+
 configuration = GlobalConfiguration()
+
+# Define the context 
+# def make_context(config: RunnableConfig) -> GlobalContext:
+#     configurable = config.get("configurable", {})
+
+#     user_id = configurable.get("user_id", "test_user_1234")
+#     assistant_id = configurable.get("assistant_id", "Anubis")
+
+#     return GlobalContext(
+#         user_ctx=IdentityContext(user_id=user_id),
+#         assistant_ctx=AssistantContext(assistant_id=assistant_id),
+#         configuration=GlobalConfiguration.from_runnable_config(config)
+#     )
 
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(
@@ -35,11 +51,12 @@ workflow.add_node("retrieve_documents", retrieval_graph)
 workflow.add_node("invoke_agent", invoke_agent)
 
 # Edges
-workflow.add_edge(START, "invoke_agent")
-
+workflow.add_edge(START, 'retrieve_documents')
+workflow.add_edge('retrieve_documents', "invoke_agent")
 workflow.add_edge("invoke_agent", END)
 
 graph = workflow.compile()
+# graph = workflow.compile(context=make_context)
 
 graph.name = "Anubis"
 

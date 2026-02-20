@@ -212,7 +212,12 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"messages_input: {messages_input}")
 
     # Call the model
-    response = await model.ainvoke(input=messages_input)
+    token_count = model.get_num_tokens_from_messages(messages_input)
+    if token_count < configuration.model_token_limit:
+        response = await model.ainvoke(input=messages_input)
+    else:
+        # message truncation call logic
+        model.ainvoke(input=messages_input[-3:])
 
     logger.info(f"AGENT RESPONSE: {response}")
     result = {"messages": [response]}

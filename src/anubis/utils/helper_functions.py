@@ -17,8 +17,13 @@ def add_queries(existing: Sequence[str], new:Sequence[str]) -> Sequence[str]:
     Returns:
         Sequence[str]: A new list containing all queries from both input sequences.
     """
-    return list(existing) + list(new)
 
+    query_list = list(existing) + list(new)
+    query_list = list(set(query_list))
+    if len(query_list) > 10:
+        return query_list[-10:]
+    else:
+        return query_list
 
 
 def get_message_text(msg: AnyMessage) -> str:
@@ -60,12 +65,12 @@ def _format_doc(doc: Document) -> str:
     Returns:
         str: The formatted document as an XML string.
     """
-    metadata = doc.metadata or {}
-    meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
-    if meta:
-        meta = f" {meta}"
-
-    return f"<document{meta}>\n{doc.page_content}\n</document>"
+    # metadata = doc.metadata or {}
+    # meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
+    # if meta:
+        # meta = f" {meta}"
+    # f"<document{meta}>\n{doc.page_content}\n</document>"
+    return f"<document>\n{doc.page_content}\n</document>"
 
 
 def format_docs(docs: list[Document] | None) -> str:

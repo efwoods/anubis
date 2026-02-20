@@ -33,7 +33,7 @@ class SearchQuery(BaseModel):
 from langgraph.runtime import Runtime
 
 async def generate_query(
-    state: GlobalState, runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[str]]:
     """Generate a search query based on the current state and configuration.
 
@@ -56,9 +56,21 @@ async def generate_query(
     logging.info(f"XXXXX GENERATE QUERY NODE XXXX")
 
     # update the context from the state
-    runtime.context.assistant_ctx.user_id = state['user_id']
-    runtime.context.user_ctx.user_id = state['user_id']
-    runtime.context.assistant_ctx.assistant_id = state['assistant_id']
+
+    #  update the configuration if used as an argument
+
+    if config:
+        if config.get("metadata", None) != None:
+            logger.warning(f"config: {config}")    
+            user_id = config['metadata'].get("user_id", "")
+            assistant_id = config['metadata'].get("assistant_id", "")
+
+            if (user_id):
+                runtime.context.user_ctx.user_id = user_id
+                runtime.context.assistant_ctx.user_id = user_id
+
+            if (assistant_id):
+                runtime.context.assistant_ctx.assistant_id = assistant_id
 
 
     messages = state['messages']
@@ -126,6 +138,9 @@ async def retrieve(
     """
     from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
+    logger.warning(f"runtime.context.user_ctx.user_id: {runtime.context.user_ctx.user_id}")
+    logger.warning(f"runtime.context.assistant_ctx.assistant_id: {runtime.context.assistant_ctx.assistant_id}")
+   
 
     human_message = state['messages'][-1]
 
@@ -179,6 +194,7 @@ async def retrieve(
 
     logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
     logger.info(f"{retrieved_docs}")
+    state['retrieved_docs'] = []
     return {"retrieved_docs": retrieved_docs}
 
 # Define a new graph

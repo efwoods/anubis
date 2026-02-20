@@ -160,7 +160,7 @@ class GlobalConfiguration(IndexConfiguration):
 
     model_token_limit: int = field(
         default=128000,
-        metadata={"description": "number of acceptable tokens in a request to the current llm."}
+        metadata={"description": "number of acceptable tokens in a request to the current llm in thousands of tokens."}
     )
 
     def __post_init__(self):

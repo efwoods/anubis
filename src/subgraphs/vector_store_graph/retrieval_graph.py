@@ -32,6 +32,8 @@ class SearchQuery(BaseModel):
 
 from langgraph.runtime import Runtime
 
+from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
+
 async def generate_query(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[str]]:
@@ -72,9 +74,23 @@ async def generate_query(
             if (assistant_id):
                 runtime.context.assistant_ctx.assistant_id = assistant_id
 
+    configuration = runtime.context.configuration
 
     messages = state['messages']
-    if len(messages) == 1:
+
+    trimmed_messages = trim_messages(messages=messages, 
+                             max_tokens=configuration.model_token_limit,
+                             token_counter=count_tokens_approximately,
+                             strategy="last", 
+                             include_system=True,
+                             start_on="system",
+                             end_on=("human", "tool"),
+                            )
+
+    logger.info(f"trimmed_messages: {trimmed_messages}")
+
+
+    if len(trimmed_messages) == 1:
         # It's the first user question. We will use the input directly to search.
         human_input = get_message_text(messages[-1])
         return {"queries": [human_input]}
@@ -109,6 +125,76 @@ async def generate_query(
                 "system_time": datetime.now(tz=timezone.utc).isoformat(),
             },
         )
+
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        if isinstance(message_value.messages[0], SystemMessage):
+            max_tokens_minus_system_message_token_length = configuration.model_token_limit - count_tokens_approximately(message_value.messages[0])
+            retained_messages = trim_messages(
+                messages=message_value.messages[1:], 
+                max_tokens=max_tokens_minus_system_message_token_length, 
+                token_counter=count_tokens_approximately, 
+                strategy="last", 
+                end_on=(HumanMessage)
+            )
+            if len(retained_messages) != message_value.messages[1:]:
+                # filter the retained messages and summarize the initial messages
+                if len(retained_messages) > 0:
+                    retained_message_id = retained_messages[0].get("id", "")
+                    if retained_message_id: 
+                        if not isinstance(retained_messages, list):
+                            count_tokens_approximately([retained_messages])
+                        else:
+                            count_tokens_approximately(retained_messages)
+                        message_id_list = [message.id for message in message_value.messages[1:]]
+                        idx = message_id_list.index(retained_message_id) # find the index in the non-system message list
+
+                        summarization_messages = message_value.messages[1:idx+1] # offset the id by 1 to bypass the system message and correctly gather all messages before the retrieval message for summarization.
+
+                        model = init_model(configuration=configuration) 
+                        summary_prompt = ""
+                        while len(summarization_messages > 0):
+                            summary_prompt_token_length = count_tokens_approximately([SystemMessage(content=summary_prompt)])
+                            if summary_prompt_token_length > configuration.model_token_limit*.8:
+                                # summarize the summary prompt
+                                input = [SystemMessage(content="Summarize the following message:"), HumanMessage(content=summary_prompt)]
+                                response = await model.ainvoke(input=input)
+                                summary_prompt = response.content[0]["text"]
+                                summary_prompt_token_length = count_tokens_approximately([SystemMessage(content=summary_prompt)])
+
+                            max_tokens_minus_summary_prompt_length = configuration.model_token_limit - summary_prompt_token_length
+                            retained_summarization_messages = trim_messages(
+                                messages = summarization_messages, max_tokens=max_tokens_minus_summary_prompt_length, token_counter=count_tokens_approximately, strategy="last", end_on=(HumanMessage)
+                            )
+                            if len(retained_summarization_messages) > 0:
+
+                                summarization_messages_ids = [message.get("id") for message in summarization_messages]
+                                
+                                initial_retained_summarization_messages_id = retained_summarization_messages[0].get("id", "")
+    
+
+
+
+
+
+
+                        # Recursively count the remaining token length past the system_prompt:
+                        # split the messages up to the remaining token length
+                        # summazize the messages with the system prompt
+                        # update the summary prompt
+                        # validate the summary prompt is less than the max token length - (the original system_message token length + original non-summarized message token length); else summarize the summary_prompt
+                        # recalculate the remaining tokens
+                        # pass the remaining messages back into the function until there are no more messages to summarize
+                        # 
+                        # while ()
+                        summary_prompt = "Summarize the following messages:"
+                        SystemMessage(content="Summarize the following messages:")
+
+
+
+                [message for message in message_value.messages[1:] if message.id]
+
+
 
         generated = cast(SearchQuery, await model_structured_output.ainvoke(message_value))
         return {

@@ -83,6 +83,7 @@ class GlobalState(TypedDict):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
 
+    conversation_summary: str = ""
    
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
 

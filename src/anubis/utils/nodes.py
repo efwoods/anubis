@@ -25,7 +25,35 @@ from langgraph.store.base import BaseStore
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
+from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
+
+
 # Optional: Add tools=[] if you have them
+
+async def summarize_conversation(state: GlobalState, runtime: Runtime[GlobalContext]):
+    
+    messages = state['messages']
+    configuration = runtime.context.configuration
+
+
+    # Retrieve the current message summary
+    conversation_summary = state.get("conversation_summary", "") 
+    if conversation_summary:
+
+        # Extend the current conversation summary:
+        summary_message = (
+            f"This is the current summary of the conversation to the current message {conversation_summary}\n\n"
+            +f"Extend this conversation summary with the included messages:"
+        )
+    else:
+        summary_message = "Please create a summarization of the conversation using the included messages. Do not include this message as part of the summary"
+    
+    model = init_model(configuration=configuration)
+
+    input_messages = [HumanMessage(context=summary_message)] + state['messages']
+
+    # response = await model.ainvoke(input=HumanMessage(content=summary_message)
+
 
 async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
@@ -42,10 +70,8 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     """ CREATE MODEL """
 
-    config = runtime.context.configuration # Loads env vars automatically
-
     model = init_model(
-        configuration = config,
+        configuration = configuration,
     )
 
     """ VECTORSTORE DOCUMENT RETRIEVAL """
@@ -63,8 +89,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     # relevant documents invoke retrieval and only return documents that do not have the type "memory"
     
-    
-
     # new_state_retrieved_docs = await retrieval_graph.ainvoke(
     #     retrieval_message, 
     #     context=runtime.context
@@ -112,7 +136,6 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"configuration: {runtime.context.configuration}")
     logger.info(f"context: {runtime.context}")
    
-    
     postgres_db_store = await make_pg_store(configuration)
 
     if isinstance(runtime.context.user_ctx, dict):
@@ -203,7 +226,7 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
 
     logger.info(f"populated_template: {populated_template}")
 
-    # clear the temporary injected prompt``
+    # clear the temporary injected prompt
     runtime.context.temporary_system_prompt_update = ""
 
     # prepend system message
@@ -212,12 +235,18 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"messages_input: {messages_input}")
 
     # Call the model
-    token_count = model.get_num_tokens_from_messages(messages_input)
-    if token_count < configuration.model_token_limit:
-        response = await model.ainvoke(input=messages_input)
-    else:
-        # message truncation call logic
-        model.ainvoke(input=messages_input[-3:])
+    trimmed_messages_input = trim_messages(
+        messages = messages_input,
+        strategy="last",
+        token_counter=count_tokens_approximately, 
+        max_tokens=configuration.model_token_limit,
+        start_on="system",
+        end_on=("human", "tool"),
+    )
+
+    logger.info(f"trimmed_messages_input: {trimmed_messages_input}")
+
+    response = await model.ainvoke(input=trimmed_messages_input)
 
     logger.info(f"AGENT RESPONSE: {response}")
     result = {"messages": [response]}

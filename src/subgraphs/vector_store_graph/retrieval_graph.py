@@ -122,7 +122,7 @@ from src.subgraphs.vector_store_graph.utils.retrieval import (
 )
 
 async def retrieve(
-    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext]
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -143,6 +143,21 @@ async def retrieve(
     logger.warning(f"runtime.context.user_ctx.user_id: {runtime.context.user_ctx.user_id}")
     logger.warning(f"runtime.context.assistant_ctx.assistant_id: {runtime.context.assistant_ctx.assistant_id}")
    
+    if config:
+        config_user_id = config.get("configurable").get("user_id", "")
+        config_assistant_id = config.get("configurable").get("assistant_id", "")
+        if config_user_id != "":
+            runtime.context.user_ctx.user_id = config_user_id
+            runtime.context.assistant_ctx.user_id = config_user_id
+        else:
+            user_id = runtime.context.user_ctx.user_id
+        if config_assistant_id != "":
+            runtime.context.assistant_ctx.assistant_id = config_assistant_id
+        else:
+            assistant_id = runtime.context.assistant_ctx.assistant_id
+
+    logger.info(f"user_id: {config_user_id}")
+    logger.info(f"assistant_id: {config_assistant_id}")
 
     human_message = state['messages'][-1]
 
@@ -163,6 +178,9 @@ async def retrieve(
         assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
     else:
         assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+
+    logger.info(f"user_id: {user_id}")
+    logger.info(f"assistant_id: {assistant_id}")
 
     memory_search = runtime.context.vector_store_memory_search_only
 
@@ -186,7 +204,8 @@ async def retrieve(
     if len(state['queries']) > 0:
         query = state['queries'][-1]
     else:
-        query = ""
+        query = getattr(state['messages'][-1], "content", "")
+
     results = await vector_store.asimilarity_search_with_relevance_scores(
         query = query,
         filter=filter_query,

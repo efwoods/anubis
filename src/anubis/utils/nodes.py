@@ -148,6 +148,9 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     else:
         assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
 
+    logger.info(f"user_id: {user_id}")
+    logger.info(f"assistant_id: {assistant_id}")
+
     namespace=(user_id, assistant_id)
     async with postgres_db_store as postgres_db_store:
         ai_context_item = await postgres_db_store.aget(namespace, key="identity")

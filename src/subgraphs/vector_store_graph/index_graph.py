@@ -82,7 +82,7 @@ async def index_docs(
         if isinstance(runtime.context.user_ctx, dict):
             user_id = runtime.context.user_ctx.get("user_id", "")
         else:
-            user_id = getattr(runtime.context.assistant_ctx, "user_id", "")
+            user_id = getattr(runtime.context.user_ctx, "user_id", "")
 
         if isinstance(runtime.context.assistant_ctx, dict):
             assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")

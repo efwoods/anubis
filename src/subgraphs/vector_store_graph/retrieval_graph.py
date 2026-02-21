@@ -25,6 +25,8 @@ from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_me
 import logging
 logger = logging.getLogger(__name__)
 
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
+
 # Define the function that calls the model
 class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
@@ -32,8 +34,15 @@ class SearchQuery(BaseModel):
 
 from langgraph.runtime import Runtime
 
+from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from src.anubis.utils.model import init_model
+
+from src.anubis.utils.helper_functions import summarize_messages
+
 async def generate_query(
-    state: GlobalState, runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[str]]:
     """Generate a search query based on the current state and configuration.
 
@@ -56,59 +65,64 @@ async def generate_query(
     logging.info(f"XXXXX GENERATE QUERY NODE XXXX")
 
     # update the context from the state
-    runtime.context.assistant_ctx.user_id = state['user_id']
-    runtime.context.user_ctx.user_id = state['user_id']
-    runtime.context.assistant_ctx.assistant_id = state['assistant_id']
+
+    #  update the configuration if used as an argument
+
+    # if config:
+    #     if config.get("metadata", None) != None:
+    #         logger.warning(f"config: {config}")    
+    #         user_id = config['metadata'].get("user_id", "")
+    #         assistant_id = config['metadata'].get("assistant_id", "")
+
+    #         if (user_id):
+    #             runtime.context.user_ctx.user_id = user_id
+    #             runtime.context.assistant_ctx.user_id = user_id
+
+    #         if (assistant_id):
+    #             runtime.context.assistant_ctx.assistant_id = assistant_id
+
+    # configuration = runtime.context.configuration
+
+    # messages = state['messages']
+    # query_l = state['queries']
+    # system_message_instruction_single_message =  "<Instruction>Please summarize this message into a query:</Instruction>"
+    
+    # future_updated_system_message = "<Instructions>Using the summary and messages, create a brief single-sentence query that identifies the intent of all the messages and message summary and will retrieve documents that match this intent. Treat the intent of the summary and messages as the question to which the retrieved documents are the answer such that the question will match the content of the retrieved documents.</Instructions>\n<Summary>The following is the summary of the current conversation to date.</Summary>"
+
+    # future_updated_system_message_failsafe = "<Instructions>Using the messages, create a brief single-sentence query that identifies the intent of all the messages and will retrieve documents that match this intent. Treat the intent of the summary and messages as the question to which the retrieved documents are the answer such that the question will match the content of the retrieved documents.</Instructions>"
+
+    # system_message = system_message_instruction_single_message
+    # input = [SystemMessage(content=[{'type': 'text', 'text': system_message}]), HumanMessage(content=[{'type': 'text', 'text': human_input}])]
+    # model = init_model(configuration)
+    # response = await model.ainvoke(input=input)
 
 
-    messages = state['messages']
-    if len(messages) == 1:
-        # It's the first user question. We will use the input directly to search.
-        human_input = get_message_text(messages[-1])
-        return {"queries": [human_input]}
-    else:
-        
-        configuration = runtime.context.configuration
-        # Feel free to customize the prompt, model, and other logic!
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", configuration.query_system_prompt),
-                ("placeholder", "{messages}"),
-            ]
-        )
+    # master_message_list = await summarize_messages(
+    #     messages, 
+    #     configuration, 
+    #     future_updated_system_message, 
+    #     future_updated_system_message_failsafe, 
+    #     system_message_instruction_single_message,
+    #     query_l = query_l, 
+    #     query_generation_mode=True
+    # )
+    # # Create a model for invocation
+    # model_structured_output = init_model(
+    #             configuration = configuration,
+    #             response_format=SearchQuery
+    #         )
+    # generated = cast(SearchQuery, await model_structured_output.ainvoke(master_message_list))
 
-      # Create a model for invocation
-        from src.anubis.utils.model import init_model
+    # return {"queries": [generated.query]}
 
-        model_structured_output = init_model(
-            configuration = configuration,
-            response_format=SearchQuery
-        )
-
-        messages = state['messages']
-        queries = state['queries']
-        system_time = datetime.now(tz=timezone.utc).isoformat(),
-
-
-        message_value = await prompt.ainvoke(
-            {
-                "messages": messages,
-                "queries": "\n- ".join(queries),
-                "system_time": datetime.now(tz=timezone.utc).isoformat(),
-            },
-        )
-
-        generated = cast(SearchQuery, await model_structured_output.ainvoke(message_value))
-        return {
-            "queries": [generated.query],
-        }
+    return {"queries": ["test query"]}
 
 from src.subgraphs.vector_store_graph.utils.retrieval import (
     make_pg_vector
 )
 
 async def retrieve(
-    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext]
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -126,6 +140,24 @@ async def retrieve(
     """
     from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
+    logger.warning(f"runtime.context.user_ctx.user_id: {runtime.context.user_ctx.user_id}")
+    logger.warning(f"runtime.context.assistant_ctx.assistant_id: {runtime.context.assistant_ctx.assistant_id}")
+   
+    if config:
+        config_user_id = config.get("configurable").get("user_id", "")
+        config_assistant_id = config.get("configurable").get("assistant_id", "")
+        if config_user_id != "":
+            runtime.context.user_ctx.user_id = config_user_id
+            runtime.context.assistant_ctx.user_id = config_user_id
+        else:
+            user_id = runtime.context.user_ctx.user_id
+        if config_assistant_id != "":
+            runtime.context.assistant_ctx.assistant_id = config_assistant_id
+        else:
+            assistant_id = runtime.context.assistant_ctx.assistant_id
+
+    logger.info(f"user_id: {config_user_id}")
+    logger.info(f"assistant_id: {config_assistant_id}")
 
     human_message = state['messages'][-1]
 
@@ -135,7 +167,6 @@ async def retrieve(
 
     logger.info(f"{retrieval_message}")
     
-
     configuration = runtime.context.configuration
 
     if isinstance(runtime.context.user_ctx, dict):
@@ -147,6 +178,9 @@ async def retrieve(
         assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
     else:
         assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+
+    logger.info(f"user_id: {user_id}")
+    logger.info(f"assistant_id: {assistant_id}")
 
     memory_search = runtime.context.vector_store_memory_search_only
 
@@ -167,8 +201,13 @@ async def retrieve(
     vector_store = await make_pg_vector(configuration)
 
     logger.info(f"breakpoint")
+    if len(state['queries']) > 0:
+        query = state['queries'][-1]
+    else:
+        query = getattr(state['messages'][-1], "content", "")
+
     results = await vector_store.asimilarity_search_with_relevance_scores(
-        query = state['queries'][-1],
+        query = query,
         filter=filter_query,
     )
         # score_threshold=0.6
@@ -177,17 +216,20 @@ async def retrieve(
 
     logger.info(f"breakpoint")
 
-    logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
+    # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
     logger.info(f"{retrieved_docs}")
+    state['retrieved_docs'] = []
     return {"retrieved_docs": retrieved_docs}
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
-builder.add_node(generate_query)  # type: ignore[arg-type]
+# builder.add_node(generate_query)  # type: ignore[arg-type]
 builder.add_node(retrieve)  # type: ignore[arg-type]
-builder.add_edge("__start__", "generate_query")
-builder.add_edge("generate_query", "retrieve")
+
+# builder.add_edge("__start__", "generate_query")
+# builder.add_edge("generate_query", "retrieve")
+builder.add_edge("__start__", "retrieve")
 
 # This compiles it into a graph you can invoke and deploy.
 retrieval_graph = builder.compile(

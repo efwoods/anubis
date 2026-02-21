@@ -35,6 +35,7 @@ workflow = StateGraph(
 # Add single node (your input/output)
 # workflow.add_node("call_router", call_router)
 workflow.add_node("retrieve_documents", retrieval_graph)
+# workflow.add_node("summarize_conversation", summarize_conversation)
 workflow.add_node("invoke_agent", invoke_agent)
 
 # Edges

@@ -7,6 +7,27 @@ from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage
 
+from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from src.anubis.utils.model import init_model
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from src.anubis.utils.configuration import GlobalConfiguration
+
+import logging
+import re
+
+from datetime import datetime
+from datetime import timezone
+
+logger = logging.getLogger(__name__)
+
+
+from pydantic import BaseModel
+class SearchQuery(BaseModel):
+    """Search the indexed documents for a query."""
+    query: str
+
 def add_queries(existing: Sequence[str], new:Sequence[str]) -> Sequence[str]:
     """Combine existing queries with new queries for the vectorstore.
 
@@ -17,8 +38,13 @@ def add_queries(existing: Sequence[str], new:Sequence[str]) -> Sequence[str]:
     Returns:
         Sequence[str]: A new list containing all queries from both input sequences.
     """
-    return list(existing) + list(new)
 
+    query_list = list(existing) + list(new)
+    query_list = list(set(query_list))
+    if len(query_list) > 10:
+        return query_list[-10:]
+    else:
+        return query_list
 
 
 def get_message_text(msg: AnyMessage) -> str:
@@ -60,12 +86,12 @@ def _format_doc(doc: Document) -> str:
     Returns:
         str: The formatted document as an XML string.
     """
-    metadata = doc.metadata or {}
-    meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
-    if meta:
-        meta = f" {meta}"
-
-    return f"<document{meta}>\n{doc.page_content}\n</document>"
+    # metadata = doc.metadata or {}
+    # meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
+    # if meta:
+        # meta = f" {meta}"
+    # f"<document{meta}>\n{doc.page_content}\n</document>"
+    return f"<document>\n{doc.page_content}\n</document>"
 
 
 def format_docs(docs: list[Document] | None) -> str:
@@ -143,3 +169,367 @@ def reduce_docs(
                 coerced.append(item)
         return coerced
     return existing or []
+
+############################  CHUNK LONG MESSAGES  #############################
+
+async def chunk_long_messages(human_message_list, configuration) -> list:
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size = 1500, chunk_overlap=0)
+    # Chunk Long Messages
+    chunked_message_list = []
+    for message in human_message_list:
+        message_token_len = count_tokens_approximately([message])
+    if message_token_len > configuration.model_token_limit:
+        text_chunks = text_splitter.split_text(getattr(message, "text", ""))
+        message = [HumanMessage(content=[{'type':'text', 'text':chunk}]) for chunk in text_chunks]
+    if isinstance(message, list):
+        chunked_message_list += message
+    else:
+        chunked_message_list += [message]
+    
+    human_message_list = chunked_message_list
+    return human_message_list 
+
+
+############################  Summarize Messages  #############################
+
+from typing import Optional
+
+async def summarize_messages(
+        messages, 
+        configuration, 
+        future_updated_system_message, 
+        future_updated_system_message_failsafe, 
+        system_message_instruction_single_message, 
+        query_l: Optional[list],
+        query_generation_mode: bool=True
+        ) -> list:
+    """
+    This function will accept a list of messages, 
+    retain messages according to the model context window length,
+    and create a summary in the system message prompt of the current conversation
+
+    Args:
+        messages (Sequence[HumanMessage | AIMessage | SystemMessage]): state['messages']
+        configuration (GlobalConfiguration): environment variables
+        future_updated_system_message (str): system message instructions
+        future_updated_system_message_failsafe (str): system message instructions in the case that the system message instructions are too long
+        system_message_instruction_single_message (_type_): system message instructions for the case where there is a single message.
+    
+    Returns: list(SystemMessage, HumanMessage|AIMessage|ToolMessage)
+
+    """
+    logger.info("summarize_messages breakpoin")
+
+    if query_generation_mode:
+
+        if len(messages) == 1:
+            # It's the first user question. We will use the input directly to search.
+            human_input = get_message_text(messages[-1])
+
+            # Verify the human input is not too large for the model
+            if count_tokens_approximately(human_input) > (.8 * configuration.model_token_limit):
+                # chunk the message into a query
+                human_input = await chunk_long_messages(human_input, configuration)
+                # Summarize the long message into a single query
+                system_message = system_message_instruction_single_message
+                input = [SystemMessage(content=[{'type': 'text', 'text': system_message}]), HumanMessage(content=[{'type': 'text', 'text': human_input}])]
+                model = init_model(configuration)
+                response = model.ainvoke(input=input)
+
+
+                # Verify Successful Response
+                if response:
+                    try:
+                        assert(type(response) == AIMessage)
+                        human_input = getattr(response, "content", "")
+                        assert(human_input is not None)
+                        assert(human_input != "")
+                    except Exception as e:
+                        logger.warning(f"Error extracting content from summarization response of large single message in query generation.")    
+                else:
+                    logger.warning(f"No response while summarizing the chunked large single message. Using original chunked input.")
+
+            # system_message = system_message_instruction_single_message
+            # input = [SystemMessage(content=[{'type': 'text', 'text': system_message}]), HumanMessage(content=[{'type': 'text', 'text': human_input}])]
+            # model = init_model(configuration)
+            # response = await model.ainvoke(input=input)
+
+            logger.info(f"BREAKPOINT")
+
+            return {"queries": [human_input]}
+
+        else:
+
+            # Feel free to customize the prompt, model, and other logic!
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", configuration.query_system_prompt),
+                    ("placeholder", "{messages}"),
+                ]
+            )
+
+            message_value = await prompt.ainvoke(
+                {
+                    "messages": messages,
+                    "queries": "\n- ".join(query_l),
+                    "system_time": datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+
+            original_system_message = ""
+
+            future_updated_system_message_instruction_length = count_tokens_approximately([SystemMessage(content=future_updated_system_message)])
+
+            if isinstance(message_value.messages[0], SystemMessage):
+                original_system_message = message_value.messages[0]
+                human_message_list = message_value.messages[1:]
+
+                original_system_message_token_length = count_tokens_approximately(message_value.messages[0])
+
+                max_tokens_minus_system_message_token_length = configuration.model_token_limit - original_system_message_token_length - future_updated_system_message_instruction_length
+            else:
+                human_message_list = message_value.messages
+                max_tokens_minus_system_message_token_length = configuration.model_token_limit - future_updated_system_message_instruction_length
+
+            # Attempt to trim messages to verify that messages need to be summarized
+            retained_messages = trim_messages(
+                messages=human_message_list, 
+                max_tokens=max_tokens_minus_system_message_token_length, 
+                token_counter=count_tokens_approximately, 
+                strategy="last", 
+                end_on=(HumanMessage)
+            )
+            # Identify if the messages need to be summarized
+            if len(retained_messages) == 0:
+                human_message_list = await chunk_long_messages(retained_messages, human_message_list)
+                # re-attempt to trim messages
+                retained_messages = trim_messages(
+                    messages = human_message_list, 
+                    max_tokens = max_tokens_minus_system_message_token_length, 
+                    token_counter=count_tokens_approximately,
+                    strategy="last",
+                    end_on=(HumanMessage)
+                )
+            assert(len(retained_messages != 0)) # messages length will be equal to or less than the length of the original message list because the messages have been chunked below the max token limit of the model;
+
+            if len(retained_messages) == len(human_message_list):
+                # no summary required; use the original message structure
+                # create a generated query
+                return message_value
+
+            else: # Messages need to be summarized
+                assert(len(retained_messages) > 0)
+                assert(len(retained_messages) != len(human_message_list))
+                # filter the retained messages and summarize the initial messages
+                retained_message_id = getattr(retained_messages[0], "id", "")
+                assert(retained_message_id is not None)
+                assert(retained_message_id != "")
+
+                # if not isinstance(retained_messages, list):
+                #     original_retained_messages_token_length = count_tokens_approximately([retained_messages])
+                # else:
+                #     original_retained_messages_token_length = count_tokens_approximately(retained_messages)
+
+                message_id_list = [message.id for message in human_message_list]
+                idx = message_id_list.index(retained_message_id) # find the index in the non-system message list
+
+                summarization_messages = human_message_list[:idx]
+
+                model = init_model(configuration=configuration) 
+
+                # Save the optional system message and the retained messages
+                if original_system_message != "":
+                    if type(retained_messages) == list:
+                        master_message_list = [original_system_message] + retained_messages
+                    else:
+                        master_message_list = [original_system_message] + [retained_messages]
+                else:
+                    if type(retained_messages) == list:
+                        master_message_list = retained_messages
+                    else:
+                        master_message_list = [retained_messages]
+
+                summary_prompt = ""
+                while len(summarization_messages) != len(retained_messages):
+                    # summarize the messages
+                    if summary_prompt == "":
+                        summary_prompt = "<Instructions>Please summarize the following messages:</Instructions>"
+                    else:
+                        summary_prompt = f"<Instructions> This is the current conversation summary to date. Please extend the summary prompt using the included messages. </Instructions>  {summary_prompt}. "
+                    summary_prompt_token_length = count_tokens_approximately([SystemMessage(content=summary_prompt)])
+
+                    if summary_prompt_token_length > configuration.model_token_limit*.8:
+                        # summarize the summary prompt
+                        input = [SystemMessage(content="<Instructions>Summarize the following message:</Instructions>"), HumanMessage(content=summary_prompt)]
+                        response = await model.ainvoke(input=input)
+                        if response:
+                            assert(type(response) is AIMessage)
+                            summary_prompt = getattr(response, "content", "")
+                        else:
+                            logger.warning(f"No response from the model; summarization prompt is greater than 80% of the length of the max token limit for the current model. Continuing with the current summarization prompt")
+                        summary_prompt_token_length = count_tokens_approximately([SystemMessage(content=summary_prompt)])
+
+                    max_token_minus_summary_prompt_length_during_message_summarization = configuration.model_token_limit - summary_prompt_token_length
+
+                    retained_messages = trim_messages(
+                        messages = summarization_messages, 
+                        max_tokens=max_token_minus_summary_prompt_length_during_message_summarization, 
+                        token_counter=count_tokens_approximately, 
+                        strategy="last", 
+                        end_on=(HumanMessage)
+                    )
+
+                    if len(retained_messages) == len(summarization_messages):
+                        # summarize all the remaining messages
+                        if type(retained_messages) == list:
+                            input = [SystemMessage(content=system_message)] + retained_messages
+                        else:
+                            input = [SystemMessage(content=system_message)] + [retained_messages]
+
+                        response = model.ainvoke(input=input)
+                        # Verify Successful Response
+                        if response:
+                            try:
+                                assert(type(response) == AIMessage)
+                                summary_prompt = getattr(response, "content", "")
+                                assert(summary_prompt is not None)
+                                assert(summary_prompt != "")
+
+                            except Exception as e:
+                                logger.warning(f"Error extracting content from summarization response during base case of message summary.")    
+                        else:
+                            logger.warning(f"No response while summarizing the chunked large single message. Continuing without message summary.")
+
+                            # continue; while loop will be broken; 
+                    elif len(retained_messages == 0):
+                        # identify large messages and use a text splitter to chunk the messages
+                        summarization_messages = await chunk_long_messages(summarization_messages, configuration)
+                        # re trim messages
+                        retained_messages = trim_messages(
+                            messages = summarization_messages, 
+                            max_tokens=max_token_minus_summary_prompt_length_during_message_summarization, 
+                            token_counter=count_tokens_approximately, 
+                            strategy="last", 
+                            end_on=(HumanMessage)
+                        )
+                        if len(retained_messages) == len(summarization_messages):
+                            # summarize the messages;  The messages no longer need to be trimmed
+                            if type(retained_messages) == list:
+                                input = [SystemMessage(content=system_message)] + retained_messages
+                            else:
+                                input = [SystemMessage(content=system_message)] + [retained_messages]
+
+                            response = model.ainvoke(input=input)
+
+                            # Verify Successful Response
+                            if response:
+                                try:
+                                    assert(type(response) == AIMessage)
+                                    summary_prompt = getattr(response, "content", "")
+                                    assert(summary_prompt is not None)
+                                    assert(summary_prompt != "")
+
+                                except Exception as e:
+                                    logger.warning(f"Error extracting content from summarization response during base case of message summary.")    
+                            else:
+                                logger.warning(f"No response while summarizing the chunked large single message. Continuing without message summary.")
+
+                            # continue; while loop will be broken; 
+
+                        else:
+                            assert(len(retained_messages) != 0)
+                            assert(len(retained_messages) < len(summarization_messages))
+                            message_id_list = [message.id for message in summarization_messages]
+                            if type(retained_messages, list):
+                                retained_message_id = getattr(retained_messages[0], "id", "")
+                            else:
+                                retained_message_id = getattr(retained_messages, "id", "")
+                            assert(retained_message_id != "")
+
+                            idx = message_id_list.index(retained_message_id) # find the index in the non-system message list
+
+                            # summarize the messages;  The messages no longer need to be trimmed
+                            if type(retained_messages) == list:
+                                input = [SystemMessage(content=system_message)] + retained_messages
+                            else:
+                                input = [SystemMessage(content=system_message)] + [retained_messages]
+
+                            response = model.ainvoke(input=input)
+
+                            # Verify Successful Response
+                            if response:
+                                try:
+                                    assert(type(response) == AIMessage)
+                                    summary_prompt = getattr(response, "content", "")
+                                    assert(summary_prompt is not None)
+                                    assert(summary_prompt != "")
+
+                                except Exception as e:
+                                    logger.warning(f"Error extracting content from summarization response during base case of message summary.")    
+                            else:
+                                logger.warning(f"No response while summarizing the chunked large single message. Continuing without message summary.")
+
+
+                            # update the summarization messages
+                            summarization_messages = summarization_messages[:idx]
+
+                            # update the retained_messages
+                            retained_messages = trim_messages(
+                                messages = summarization_messages, 
+                                max_tokens=max_token_minus_summary_prompt_length_during_message_summarization, 
+                                token_counter=count_tokens_approximately, 
+                                strategy="last", 
+                                end_on=(HumanMessage)
+                            )
+                    else:
+                        logger.warning(f"retained_messasges are non zero and greater than the list of the messages where they initialized. This is a logical error and impossible.")
+
+                # message is summarized
+                if summary_prompt != "":
+                    # update the system message with the summary_prompt
+                    summary_prompt = re.sub(r"<Instructions>.*?</Instructions>", future_updated_system_message, summary_prompt)
+
+                    if type(master_message_list[0]) == SystemMessage:
+                        original_system_message = master_message_list[0].content
+                        new_system_message = original_system_message + " \n " + summary_prompt
+                        master_message_list[0].content = new_system_message
+                    else:
+                        master_message_list.insert(0, SystemMessage(content=summary_prompt))
+                else:
+                    if type(master_message_list[0]) == SystemMessage:
+                        master_message_list[0].content=future_updated_system_message
+                    else:
+                        master_message_list.insert(0, SystemMessage(content=future_updated_system_message))
+
+                final_message_list_token_length = count_tokens_approximately(master_message_list)
+                if final_message_list_token_length > configuration.model_token_limit:
+                    system_message_token_length = count_tokens_approximately(master_message_list[0])
+                    human_message_token_length = final_message_list_token_length - system_message_token_length
+                    if system_message_token_length >= human_message_token_length:
+                        master_message_list[0].content=future_updated_system_message_failsafe
+                    else:
+                        messages_to_be_trimmed = master_message_list[1:]
+                        retained_messages = trim_messages(
+                            messages = messages_to_be_trimmed, 
+                            max_tokens = configuration.model_token_limit,
+                            token_counter=count_tokens_approximately,
+                            strategy="last",
+                            end_on=(HumanMessage, ToolMessage)
+                        )
+                        if len(retained_messages) == 0:
+                            messages_to_be_trimmed = await chunk_long_messages(messages_to_be_trimmed, configuration)
+                            retained_messages = trim_messages(
+                                messages = messages_to_be_trimmed, 
+                                max_tokens = configuration.model_token_limit,
+                                token_counter=count_tokens_approximately,
+                                strategy="last",
+                                end_on=(HumanMessage, ToolMessage)
+                            )
+
+                        system_message = master_message_list[0]
+                        if type(retained_messages) == list:
+                            master_message_list = [system_message] + retained_messages
+                        else:
+                            master_message_list = [system_message] = [retained_messages]
+    
+    return master_message_list

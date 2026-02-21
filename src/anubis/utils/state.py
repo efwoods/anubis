@@ -83,10 +83,10 @@ class GlobalState(TypedDict):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
 
-    user_id: str
-    assistant_id: str
-    
+
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
+    
+    conversation_summary: Optional[str] = ""
 
     """ Data Retrieval """
 

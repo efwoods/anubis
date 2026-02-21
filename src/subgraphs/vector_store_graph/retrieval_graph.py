@@ -183,8 +183,12 @@ async def retrieve(
     vector_store = await make_pg_vector(configuration)
 
     logger.info(f"breakpoint")
+    if len(state['queries']) > 0:
+        query = state['queries'][-1]
+    else:
+        query = ""
     results = await vector_store.asimilarity_search_with_relevance_scores(
-        query = state['queries'][-1],
+        query = query,
         filter=filter_query,
     )
         # score_threshold=0.6
@@ -193,7 +197,7 @@ async def retrieve(
 
     logger.info(f"breakpoint")
 
-    logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
+    # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
     logger.info(f"{retrieved_docs}")
     state['retrieved_docs'] = []
     return {"retrieved_docs": retrieved_docs}

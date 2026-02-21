@@ -234,19 +234,9 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     
     logger.info(f"messages_input: {messages_input}")
 
-    # Call the model
-    trimmed_messages_input = trim_messages(
-        messages = messages_input,
-        strategy="last",
-        token_counter=count_tokens_approximately, 
-        max_tokens=configuration.model_token_limit,
-        start_on="system",
-        end_on=("human", "tool"),
-    )
+    # Summarize messages
 
-    logger.info(f"trimmed_messages_input: {trimmed_messages_input}")
-
-    response = await model.ainvoke(input=trimmed_messages_input)
+    response = await model.ainvoke(input=messages_input)
 
     logger.info(f"AGENT RESPONSE: {response}")
     result = {"messages": [response]}

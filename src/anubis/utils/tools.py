@@ -66,3 +66,27 @@ async def upsert_memory(
 """ Vector Store SubGraph Tools """
 """ Process Media SubGraph Tools """
 
+# src/anubis/utils/store.py
+import contextlib
+from typing import cast
+from langchain.embeddings import init_embeddings, Embeddings
+from langgraph.store.base import IndexConfig
+from langgraph.store.postgres import AsyncPostgresStore
+from src.anubis.utils.configuration import GlobalConfiguration
+from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
+from langchain_huggingface import HuggingFaceEmbeddings
+
+# embeddings = cast(Embeddings, init_embeddings("openai:text-embedding-3-small"))
+
+@contextlib.asynccontextmanager
+async def generate_store():
+    """Yield a BaseStore, open for the duration of the server."""
+    configuration = GlobalConfiguration()
+    embeddings = HuggingFaceEmbeddings(model_name = configuration.embedding_model)
+
+    async with AsyncPostgresStore.from_conn_string(
+        conn_string=configuration.async_postgres_store_uri,
+        index=IndexConfig(dims=384, embed=embeddings, fields=["$"])
+    ) as store:
+        await store.setup()
+        yield store

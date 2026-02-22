@@ -18,7 +18,7 @@ from src.anubis.utils.nodes import (
 
 from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
-from src.anubis.utils.store import generate_store
+from src.anubis.utils.tools import generate_store
 from dotenv import load_dotenv
 load_dotenv()
 

@@ -26,7 +26,7 @@ from src.anubis.utils.configuration import GlobalConfiguration
 from langchain_core.runnables import RunnableConfig
 configuration = GlobalConfiguration()
 
-from src.anubis.utils.store import generate_store
+from src.anubis.utils.tools import generate_store
 
 # Define the Graph & Context
 workflow = StateGraph(

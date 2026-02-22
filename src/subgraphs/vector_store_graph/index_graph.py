@@ -49,6 +49,7 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 from langchain_core.runnables import RunnableConfig
 from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
+import uuid
 
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig
@@ -63,27 +64,21 @@ async def index_docs(
         state (IndexState): The current state containing documents and retriever.
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
-    from src.anubis.utils.configuration import GlobalConfiguration
     logger.info(f"INDEXING DOCUMENTS")
     
-    configuration = GlobalConfiguration()
+
     if config:
         update_current_user_and_assistant_identity(config, runtime)
-
+   
+    docs = state['vectorstore_documents_to_be_indexed']
     
-    v_store = await make_pg_vector(configuration)
-
-    # Delete documents with the same filename in the metadata
-    filenames = {
-        doc.metadata.get("filename") 
-        for doc in 
-        state['vectorstore_documents_to_be_indexed'] 
-        if doc.metadata.get("filename") is not None
-    }
+    filenames = [doc.metadata.get("filename") for doc in docs]
+    try:
+        assert(len(filenames) == len(docs))
+    except AssertionError as e:
+        logger.warning(f"Missing {len(docs) - len(filenames)} filenames on documents")
     
-    if filenames:
-        filenames_list = list(filenames)
-        
+    if len(filenames) > 0:
         if isinstance(runtime.context.user_ctx, dict):
             user_id = runtime.context.user_ctx.get("user_id", "")
         else:
@@ -98,41 +93,20 @@ async def index_docs(
         user_id = "".join(user_id.strip())
         assistant_id = "".join(assistant_id.strip())
 
-asdf
-        # delete documents that already exist:
-        namespace = (user_id, assistant_id, "document", filename)
-        store.abatch()
-        store.adelete()
+        docs = state['vectorstore_documents_to_be_indexed']
+        result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
 
-        # search for the documents
-        from sqlalchemy import text
-        from sqlalchemy.ext.asyncio import create_async_engine
+        try:
+            assert(result['success'] == True)
+        except AssertionError as e:
+            logger.error(f"Error uploading documents: {result["error_batch_documents"]}")
+            
+            # Clear the documents to be indexed on error
+            
+            state['vectorstore_documents_to_be_indexed'] = []
+            
+            raise Exception(f"Error uploading documents: {result["error_batch_documents"]}")
 
-        async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
-
-        SQL_QUERY="""SELECT id FROM langchain_pg_embedding WHERE cmetadata->>'user_id' = :user_id
-        AND cmetadata->>'assistant_id' = :assistant_id
-        AND cmetadata->>'filename' = ANY(:filenames)
-        """
-        params = {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "filenames": filenames_list
-        }
-
-        async with async_engine.connect() as conn:
-            result = await conn.execute(text(SQL_QUERY), params)
-            all_docs = result.fetchall()
-
-        # Extract list of ids from returned tuples of documents to be deleted
-        id_list = [id[0] for id in all_docs] if all_docs else []
-
-        result = await batch_index_documents_vectorstore(
-                id_list=id_list, 
-                configuration=configuration, 
-                vectorstore_documents_to_be_indexed=state['vectorstore_documents_to_be_indexed'], 
-                BATCH_SIZE=5000
-            )
         logger.info(f"breaktpoint after batch_index_documents_vectorstore")
 
         return {"docs": "delete"}

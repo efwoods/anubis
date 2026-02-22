@@ -176,16 +176,54 @@ from langgraph_runtime import Runtime
 from src.anubis.utils.context import GlobalContext
 
 async def update_current_user_and_assistant_identity(config: RunnableConfig, runtime: Runtime[GlobalContext]):
+    """ update the user context and assistant context:
     
-    if config:
-        config_user_id = config.get("configurable").get("user_id", "")
-        config_assistant_id = config.get("configurable").get("assistant_id", "")
+        Example Contexts:
+        @dataclass
+        class IdentityContext:
+            user_id: str = field(default="2feaa9d8-50c0-4550-81fa-9fb79bfe23f0")
+            name: str = field(default=None)
+            description: str = field(default=None)
+            metadata: dict = field(default_factory=dict )
 
-        if config_user_id != "":
-            runtime.context.user_ctx.user_id = config_user_id
-            runtime.context.assistant_ctx.user_id = config_user_id
-        if config_assistant_id != "":
-            runtime.context.assistant_ctx.assistant_id = config_assistant_id
+            def update_metadata(self, key: str, value: Any):
+                # Update a specific metadata field.
+                self.metadata[key] = value
+
+            def merge_metadata(self, new_metadata: Dict[str, Any]):
+                # Merge new metadata into existing.
+                self._deep_merge(self.metadata, new_metadata)
+
+            def _deep_merge(self, base: Dict, update: Dict):
+                #Recursively merge dictionaries.
+                for key, value in update.items():
+                    if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                        self._deep_merge(base[key], value)
+                    else:
+                        base[key] = value
+
+
+            def to_dict(self) -> Dict[str, Any]:
+                # Convert to dictionary for prompt injection.
+                return {
+                    "name": self.name,
+                    **self.metadata  # Unpack all metadata at top level
+                }
+
+        @dataclass
+        class AssistantContext(IdentityContext):
+            assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
+
+    """
+
+    if config:
+        config_user_ctx = config.get("configurable").get("user_ctx", "")
+        config_assistant_ctx = config.get("configurable").get("assistant_ctx", "")
+
+        if config_user_ctx != "":
+            runtime.context.user_ctx = config_user_ctx
+        if config_assistant_ctx != "":
+            runtime.context.assistant_ctx = config_assistant_ctx
 
 
 

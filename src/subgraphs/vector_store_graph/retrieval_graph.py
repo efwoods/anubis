@@ -121,9 +121,11 @@ from src.subgraphs.vector_store_graph.utils.retrieval import (
     make_pg_vector
 )
 
+from langgraph.store.base import BaseStore
+
 from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
 async def retrieve(
-    state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext], store: BaseStore
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -170,44 +172,29 @@ async def retrieve(
     logger.info(f"user_id: {user_id}")
     logger.info(f"assistant_id: {assistant_id}")
 
-    memory_search = runtime.context.vector_store_memory_search_only
-
-    if memory_search == "FALSE":
-        filter_query = {
-                "user_id": {"$eq": user_id},
-                "assistant_id": {"$eq": assistant_id}, 
-        }
-                # "type": {"$ne": "memory"}
-    else:
-        filter_query = {
-                "user_id": {"$eq": user_id},
-                "assistant_id": {"$eq": assistant_id}, 
-        }
-                # "type": {"$eq": "memory"}
-
-    
-    vector_store = await make_pg_vector(configuration)
+    namespace = (user_id, assistant_id, "document")
 
     logger.info(f"breakpoint")
     if len(state['queries']) > 0:
         query = state['queries'][-1]
     else:
         query = getattr(state['messages'][-1], "content", "")
+    
+    item_results = await store.asearch(namespace, query=query)
 
-    results = await vector_store.asimilarity_search_with_relevance_scores(
-        query = query,
-        filter=filter_query,
-    )
-        # score_threshold=0.6
+    # format the items into documents
+    doc_results = [Document(page_content=item.value.get("content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
+    
+    # include the search result score on each document
+    [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]
 
-    retrieved_docs = [doc[0] for doc in results] # extract documents only
 
     logger.info(f"breakpoint")
 
     # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
-    logger.info(f"{retrieved_docs}")
+    logger.info(f"{doc_results}")
     state['retrieved_docs'] = []
-    return {"retrieved_docs": retrieved_docs}
+    return {"retrieved_docs": doc_results}
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

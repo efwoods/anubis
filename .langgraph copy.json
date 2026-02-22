@@ -7,7 +7,12 @@
     "test_graph": "./src/test_graph/graph.py:test_graph"
   },
   "store": {
-    "path": "./src/anubis/utils/store.py:generate_store"
+    "path": "src.subgraphs.vector_store_graph.utils.retrieval.py:make_pg_store"
+  },
+  "index": {
+    "dims": 384,
+    "embed": "huggingface:sentence-transformers/all-MiniLM-L6-v2",
+    "fields": ["document"]
   },
   "env": ".env.dev",
   "http": {

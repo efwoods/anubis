@@ -46,7 +46,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector, make_pg_store
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 
 async def index_docs(
@@ -132,8 +132,11 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
+if configuration.dev == "TRUE":
+    index_graph = builder.compile()
+else:
+    index_graph = builder.compile(store=make_pg_store)
 
-index_graph = builder.compile()
 
 index_graph.name = "IndexGraph"
 

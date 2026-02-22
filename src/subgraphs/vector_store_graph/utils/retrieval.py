@@ -156,9 +156,13 @@ async def make_pg_vector(
 
 from langgraph.store.postgres import AsyncPostgresStore
 
-async def make_pg_store(
-    configuration: GlobalConfiguration):
+from typing import Optional
+from langchain_huggingface import HuggingFaceEmbeddings
+import contextlib
+from langgraph.store.base import IndexConfig
 
+@contextlib.asynccontextmanager
+async def make_pg_store():
     """ EXAMPLE USAGE
     # postgres_db_store = await make_pg_store(configuration)
 
@@ -190,10 +194,20 @@ async def make_pg_store(
     """
     logger.info(f"make_pg_store ENTRYPOINT")
 
-    # returns AsyncContextManager object
-    postgres_db_store = await asyncio.to_thread(
-        AsyncPostgresStore.from_conn_string,
-        conn_string=configuration.async_postgres_store_uri,
-    )
+    configuration = GlobalConfiguration()
+    embeddings = HuggingFaceEmbeddings(model_name = configuration.embedding_model)
 
-    return postgres_db_store
+    async with AsyncPostgresStore.from_conn_string(
+        conn_string=configuration.async_postgres_store_uri,
+        index = IndexConfig(dims=384, embed=embeddings, fields=["documents"])
+        ) as store:
+        await store.setup()
+        yield store
+
+    # returns AsyncContextManager object
+    # async with AsyncPostgresStore.from_conn_string(
+    #     conn_string=configuration.async_postgres_store_uri,
+    #     index = IndexConfig(dims=384, embed=embeddings, fields=["documents"])
+    # ) as store:
+    #     yield store.setup()
+    #     yield store

@@ -5,6 +5,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.configuration import GlobalConfiguration
 
 import logging
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI):
             logger.info(f"  - Model: openai/whisper-large-v3")
             logger.info(f"  - Device: {pipe.device}")
             logger.info(f"  - Ready to process audio requests")
+
         
     except Exception as e:
         logger.error("=" * 60)

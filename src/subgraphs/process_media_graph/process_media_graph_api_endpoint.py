@@ -23,15 +23,15 @@ from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 from src.anubis.utils.configuration import GlobalConfiguration
 
+from langchain_core.runnables import RunnableConfig
 configuration = GlobalConfiguration()
-if configuration.dev == "TRUE":
-    across_thread_memory = InMemoryStore()
+
+from src.anubis.utils.store import generate_store
 
 # Define the Graph & Context
 workflow = StateGraph(
     state_schema=GlobalState, 
-    context_schema=GlobalContext, 
-    store=BaseStore
+    context_schema=GlobalContext
 )
 
 # Add Nodes
@@ -44,7 +44,8 @@ workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
 
-process_media_graph_api_endpoint = workflow.compile()
+process_media_graph_api_endpoint = workflow.compile(
+)
     
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"
 

@@ -45,12 +45,13 @@ def ensure_docs_have_user_id(
 import logging
 logger = logging.getLogger(__name__)
 
-
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector, make_pg_store
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
+from langchain_core.runnables import RunnableConfig
+from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
 
 async def index_docs(
-    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
+    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -66,7 +67,10 @@ async def index_docs(
     logger.info(f"INDEXING DOCUMENTS")
     
     configuration = GlobalConfiguration()
+    if config:
+        update_current_user_and_assistant_identity(config, runtime)
 
+    
     v_store = await make_pg_vector(configuration)
 
     # Delete documents with the same filename in the metadata

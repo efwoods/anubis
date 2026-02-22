@@ -121,6 +121,7 @@ from src.subgraphs.vector_store_graph.utils.retrieval import (
     make_pg_vector
 )
 
+from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
 async def retrieve(
     state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext]
 ) -> dict[str, list[Document]]:
@@ -144,20 +145,7 @@ async def retrieve(
     logger.warning(f"runtime.context.assistant_ctx.assistant_id: {runtime.context.assistant_ctx.assistant_id}")
    
     if config:
-        config_user_id = config.get("configurable").get("user_id", "")
-        config_assistant_id = config.get("configurable").get("assistant_id", "")
-        if config_user_id != "":
-            runtime.context.user_ctx.user_id = config_user_id
-            runtime.context.assistant_ctx.user_id = config_user_id
-        else:
-            user_id = runtime.context.user_ctx.user_id
-        if config_assistant_id != "":
-            runtime.context.assistant_ctx.assistant_id = config_assistant_id
-        else:
-            assistant_id = runtime.context.assistant_ctx.assistant_id
-
-    logger.info(f"user_id: {config_user_id}")
-    logger.info(f"assistant_id: {config_assistant_id}")
+        update_current_user_and_assistant_identity(config, runtime)
 
     human_message = state['messages'][-1]
 

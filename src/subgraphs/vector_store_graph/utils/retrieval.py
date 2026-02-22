@@ -204,10 +204,3 @@ async def make_pg_store():
         await store.setup()
         yield store
 
-    # returns AsyncContextManager object
-    # async with AsyncPostgresStore.from_conn_string(
-    #     conn_string=configuration.async_postgres_store_uri,
-    #     index = IndexConfig(dims=384, embed=embeddings, fields=["documents"])
-    # ) as store:
-    #     yield store.setup()
-    #     yield store

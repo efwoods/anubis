@@ -170,6 +170,25 @@ def reduce_docs(
         return coerced
     return existing or []
 
+
+from langchain_core.runnables import RunnableConfig
+from langgraph_runtime import Runtime
+from src.anubis.utils.context import GlobalContext
+
+async def update_current_user_and_assistant_identity(config: RunnableConfig, runtime: Runtime[GlobalContext]):
+    
+    if config:
+        config_user_id = config.get("configurable").get("user_id", "")
+        config_assistant_id = config.get("configurable").get("assistant_id", "")
+
+        if config_user_id != "":
+            runtime.context.user_ctx.user_id = config_user_id
+            runtime.context.assistant_ctx.user_id = config_user_id
+        if config_assistant_id != "":
+            runtime.context.assistant_ctx.assistant_id = config_assistant_id
+
+
+
 ############################  CHUNK LONG MESSAGES  #############################
 
 async def chunk_long_messages(human_message_list, configuration) -> list:

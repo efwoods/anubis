@@ -7,13 +7,9 @@
     "test_graph": "./src/test_graph/graph.py:test_graph"
   },
   "store": {
-    "index": {
-      "dims": 384,
-      "embed": "huggingface:sentence-transformers/all-MiniLM-L6-v2",
-      "fields": ["document"]
-    }
+    "path": "./src/anubis/utils/store.py:generate_store"
   },
-  "env": ".env",
+  "env": ".env.dev",
   "http": {
     "app": "src/anubis/webapp.py:app"
   }

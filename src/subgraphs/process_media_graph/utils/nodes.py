@@ -41,9 +41,12 @@ from langchain.tools import tool
 
 from src.anubis.utils.configuration import GlobalConfiguration
 
+from langchain_core.runnables import RunnableConfig
+
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
+    config: RunnableConfig,
     store: BaseStore
 ) -> Dict[str, Any]:
     """
@@ -62,6 +65,12 @@ async def process_uploaded_files_and_label_media_type(
         assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
     else:
         assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+
+    # logger.info("STORE ACCESS TESTING")
+    # namespace = ("evan")
+    # await store.aput(namespace=namespace, key="evan", value={"name": "evan"})
+    # get_value = await store.aget("evan", key="name")
+    # logger.info("get_value: {get_value}")
 
 
     media_files = state.get('media_files', [])
@@ -183,7 +192,7 @@ async def process_uploaded_files_and_label_media_type(
         "media_files": []  # Clear after processing
     }
 
-async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext]) -> Dict[str, Any]:
+async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig) -> Dict[str, Any]:
     """ 
     Media type in media list is determined at this point: 
     Convert the media in a list of one or more media to text in parallel.
@@ -220,7 +229,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     # Create tasks for parallel processing
     all_documents = []
     for media_item in media_list:
-        docs = await process_media_item_task(media_item, runtime)
+        docs = await process_media_item_task(media_item, runtime, config, store)
         
         for doc in docs:
             status = doc.metadata.get("status", "")
@@ -255,7 +264,9 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
 async def process_media_item_task(
     media_item: Dict[str, Any], 
-    runtime: Runtime[GlobalContext]
+    runtime: Runtime[GlobalContext], 
+    config: RunnableConfig,
+    store: BaseStore
 ) -> Document:
     """Task: Convert a single media item to a Document"""
     
@@ -275,6 +286,15 @@ async def process_media_item_task(
     logger.info(f"Processing file: {filename}")
 
     configuration = runtime.context.configuration
+
+    logger.info(f"Testing store access")
+
+    namespace = ("testing","document")
+    await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
+    testing_get = await store.aget(namespace=namespace, key="media")
+    testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
+    logger.info(f"testing_get: {testing_get}")
+    logger.info(f"get_value: {testing_search}")
 
     try:
         # Handle base64 images

@@ -98,6 +98,12 @@ async def index_docs(
         user_id = "".join(user_id.strip())
         assistant_id = "".join(assistant_id.strip())
 
+asdf
+        # delete documents that already exist:
+        namespace = (user_id, assistant_id, "document", filename)
+        store.abatch()
+        store.adelete()
+
         # search for the documents
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import create_async_engine

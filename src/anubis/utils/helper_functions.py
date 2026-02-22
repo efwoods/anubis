@@ -172,7 +172,7 @@ def reduce_docs(
 
 
 from langchain_core.runnables import RunnableConfig
-from langgraph_runtime import Runtime
+from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalContext
 
 async def update_current_user_and_assistant_identity(config: RunnableConfig, runtime: Runtime[GlobalContext]):

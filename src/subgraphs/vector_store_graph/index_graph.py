@@ -99,13 +99,11 @@ async def index_docs(
         try:
             assert(result['success'] == True)
         except AssertionError as e:
-            logger.error(f"Error uploading documents: {result["error_batch_documents"]}")
-            
+            logger.error(f"Error uploading documents: {result['error_batch_documents']}")
+
             # Clear the documents to be indexed on error
-            
-            state['vectorstore_documents_to_be_indexed'] = []
-            
-            raise Exception(f"Error uploading documents: {result["error_batch_documents"]}")
+            state['vectorstore_documents_to_be_indexed'] = []            
+            raise Exception(f"Error uploading documents: {result['error_batch_documents']}")
 
         logger.info(f"breaktpoint after batch_index_documents_vectorstore")
 

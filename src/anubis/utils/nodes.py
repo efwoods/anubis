@@ -73,6 +73,8 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     # Asserting Current Identity:
     await update_current_user_and_assistant_identity(config, runtime)
 
+    logger.info(f"BREAKPOINT: UPDATE USER AND ASSISTANT CONTEXT")
+
     # await store.aput("testing", key="testing_key", value={"testing_key":"testing_value"})
     # testing_get = await store.aget("testing", key="testing_key", value={"testing_key":"testing_value"})
     # get_value = await store.aget("evan", key="name")
@@ -87,29 +89,6 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     """ VECTORSTORE DOCUMENT RETRIEVAL """
 
-    # Retrieve documents for the query
-    # from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
-
-    # human_message = state['messages'][-1]
-
-    # assert(isinstance(human_message, HumanMessage))
-    
-    # retrieval_message = {"messages" : [human_message]}
-
-    # Memories are text-only statements with user_id, assistant_id, "type": "memory", "source": "conversation" add to vectorstore and filter results to retrieve only memories through prompt-created generation and retrieval; invoke retrieval and only return documents that have the type "memory" 
-
-    # relevant documents invoke retrieval and only return documents that do not have the type "memory"
-    
-    # new_state_retrieved_docs = await retrieval_graph.ainvoke(
-    #     retrieval_message, 
-    #     context=runtime.context
-    # )
-
-    # state['retrieved_docs'] = []
-
-    # populate the relevant documents with a new state
-    # state['retrieved_docs'] = new_state_retrieved_docs['retrieved_docs']
-
     logger.info(f"breakpoint")
     logger.info(f"state['retrieved_docs']: {state['retrieved_docs']}")
 
@@ -119,21 +98,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     logger.info(f"format_docs(state.get('retrieved_docs', [])): {retrieved_docs}")
 
     """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
-    # runtime.context.vector_store_memory_search_only = "TRUE"
-    # new_state_retrieved_memories = await retrieval_graph.ainvoke(
-    #     retrieval_message
-    # )
-
-    # state['retrieved_memories'] = []
-
-    # # populate the relevant documents with a new state
-    # state['retrieved_memories'] = new_state_retrieved_memories['retrieved_docs']
-
-    # logger.info(f"breakpoint")
-
-    # # Vectorstore Retrieved Docments
-    # retrieved_memories = format_docs(state.get('retrieved_memories', []))
-
+    
     # # TODO: PROMPT INJECT RETRIEVED MEMORIES 
 
     prompt_builder = DynamicPromptBuilder()

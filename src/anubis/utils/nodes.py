@@ -27,9 +27,6 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
 
-
-# Optional: Add tools=[] if you have them
-
 async def summarize_conversation(state: GlobalState, runtime: Runtime[GlobalContext]):
     
     messages = state['messages']
@@ -55,7 +52,9 @@ async def summarize_conversation(state: GlobalState, runtime: Runtime[GlobalCont
     # response = await model.ainvoke(input=HumanMessage(content=summary_message)
 
 
-async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
+from langchain_core.runnables import RunnableConfig
+
+async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     from langchain_huggingface import HuggingFaceEmbeddings
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -67,6 +66,14 @@ async def invoke_agent(state: GlobalState, runtime: Runtime[GlobalContext], stor
     logger.info(f"breakpoint invoke agent")
     
     logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
+
+    logger.info(f"Testing store access")
+
+    await store.aput("testing", key="testing_key", value={"testing_key":"testing_value"})
+    testing_get = await store.aget("testing", key="testing_key", value={"testing_key":"testing_value"})
+    get_value = await store.aget("evan", key="name")
+    logger.info(f"get_value: {get_value}")
+    logger.info(f"testing_get: {testing_get}")
 
     """ CREATE MODEL """
 

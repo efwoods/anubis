@@ -27,6 +27,23 @@ from langchain_core.runnables import RunnableConfig
 
 configuration = GlobalConfiguration()
 
+from langgraph.store.base import BaseStore
+from langgraph.runtime import Runtime
+
+
+import logging
+logger = logging.getLogger(__name__)
+
+async def test_node(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
+    logger.info(f"ENTRYPOINT TEST NODE")
+    test_namespace = ("testing", "documents")
+    await store.aput(namespace=test_namespace, key="testing_key", value={"testing_key":"testing_value", "documents":"This is a test field to embed. UNICORN."})
+    testing_get = await store.aget(("testing", "documents"), key="testing_key")
+    results = await store.asearch(("testing", "documents"), query="UNICORN.")
+    logger.info(f"testing_get: {testing_get}")
+    logger.info(f"results: {results}")
+
+
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(
     state_schema = GlobalState, 
@@ -34,19 +51,15 @@ workflow = StateGraph(
 )
 
 # Add single node (your input/output)
-# workflow.add_node("call_router", call_router)
-workflow.add_node("retrieve_documents", retrieval_graph)
-# workflow.add_node("summarize_conversation", summarize_conversation)
-workflow.add_node("invoke_agent", invoke_agent)
+workflow.add_node("test_node", test_node)
 
 # Edges
-workflow.add_edge(START, 'retrieve_documents')
-workflow.add_edge('retrieve_documents', "invoke_agent")
-workflow.add_edge("invoke_agent", END)
+workflow.add_edge(START, 'test_node')
+workflow.add_edge("test_node", END)
 
-graph = workflow.compile()
+test_graph = workflow.compile()
 # graph = workflow.compile(context=make_context)
 
-graph.name = "Anubis"
+test_graph.name = "test_graph"
 
-__all__ = ["graph"]
+__all__ = ["test_graph"]

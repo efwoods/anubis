@@ -232,10 +232,7 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 builder.add_edge("__start__", "retrieve")
 
 # This compiles it into a graph you can invoke and deploy.
-retrieval_graph = builder.compile(
-    interrupt_before=[],  # if you want to update the state before calling the tools
-    interrupt_after=[],
-)
+retrieval_graph = builder.compile()
 retrieval_graph.name = "RetrievalGraph"
 
 __all__ = ["retrieval_graph"]

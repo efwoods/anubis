@@ -28,14 +28,15 @@ async def lifespan(app: FastAPI):
 
         # Create pipeline for audio transcription
         if context.configuration.dev == "TRUE":
-            from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
-            # Call the function to trigger @lru_cache and load model into memory
-            pipe = get_whisper_pipeline()
+            pass
+            # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
+            # # Call the function to trigger @lru_cache and load model into memory
+            # pipe = get_whisper_pipeline()
         
-            logger.info("✓ Whisper model preloaded and cached successfully")
-            logger.info(f"  - Model: openai/whisper-large-v3")
-            logger.info(f"  - Device: {pipe.device}")
-            logger.info(f"  - Ready to process audio requests")
+            # logger.info("✓ Whisper model preloaded and cached successfully")
+            # logger.info(f"  - Model: openai/whisper-large-v3")
+            # logger.info(f"  - Device: {pipe.device}")
+            # logger.info(f"  - Ready to process audio requests")
 
         
     except Exception as e:
@@ -107,11 +108,18 @@ async def upload_media(
         initial_state = {
             "media_files": media_files,
         }
+
+        config = {
+            "configurable": {
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+            }
+        }
            
         # Invoke the graph
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            context=context,
+            config=config,
             )
         
         # Extract indexed documents info

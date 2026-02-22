@@ -112,6 +112,8 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     logger.info(f"configuration: {runtime.context.configuration}")
     logger.info(f"context: {runtime.context}")
    
+    user_id = config.get("configurable", "").get("user_ctx", "").get("user_id")
+
     if isinstance(runtime.context.user_ctx, dict):
         user_id = runtime.context.user_ctx.get("user_id", "")
     else:

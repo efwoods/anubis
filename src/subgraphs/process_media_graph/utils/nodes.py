@@ -55,16 +55,8 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
-
-    if isinstance(runtime.context.user_ctx, dict):
-        user_id = runtime.context.user_ctx.get("user_id", "")
-    else:
-        user_id = getattr(runtime.context.user_ctx, "user_id", "")
-
-    if isinstance(runtime.context.assistant_ctx, dict):
-        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-    else:
-        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+    user_id = config.get("configurable","").get("user_ctx", "").get("user_id","")
+    assistant_id = config.get("configurable","").get("assistant_ctx", "").get("assistant_id","")
 
     # logger.info("STORE ACCESS TESTING")
     # namespace = ("evan")
@@ -289,12 +281,12 @@ async def process_media_item_task(
 
     logger.info(f"Testing store access")
 
-    namespace = ("testing","document")
-    await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
-    testing_get = await store.aget(namespace=namespace, key="media")
-    testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
-    logger.info(f"testing_get: {testing_get}")
-    logger.info(f"get_value: {testing_search}")
+    # namespace = ("testing","document")
+    # await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
+    # testing_get = await store.aget(namespace=namespace, key="media")
+    # testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
+    # logger.info(f"testing_get: {testing_get}")
+    # logger.info(f"get_value: {testing_search}")
 
     try:
         # Handle base64 images

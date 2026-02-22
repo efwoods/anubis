@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 async def test_node(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
     logger.info(f"ENTRYPOINT TEST NODE")
+    logger.info(f"store type: {type(store)}")
     test_namespace = ("testing", "documents")
     await store.aput(namespace=test_namespace, key="testing_key", value={"testing_key":"testing_value", "documents":"This is a test field to embed. UNICORN."})
     testing_get = await store.aget(("testing", "documents"), key="testing_key")

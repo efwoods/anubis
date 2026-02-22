@@ -18,7 +18,7 @@ from src.anubis.utils.nodes import (
 
 from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
-from src.anubis.utils.tools import generate_store
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -44,8 +44,10 @@ workflow.add_edge(START, 'retrieve_documents')
 workflow.add_edge('retrieve_documents', "invoke_agent")
 workflow.add_edge("invoke_agent", END)
 
-graph = workflow.compile()
-# graph = workflow.compile(context=make_context)
+if configuration.dev == "TRUE":
+    graph = workflow.compile(store=make_pg_store)
+else:
+    graph = workflow.compile()    
 
 graph.name = "Anubis"
 

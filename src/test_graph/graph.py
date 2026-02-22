@@ -18,7 +18,6 @@ from src.anubis.utils.nodes import (
 
 from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
-from src.anubis.utils.tools import generate_store
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -29,7 +28,7 @@ configuration = GlobalConfiguration()
 
 from langgraph.store.base import BaseStore
 from langgraph.runtime import Runtime
-
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 import logging
 logger = logging.getLogger(__name__)
@@ -57,7 +56,10 @@ workflow.add_node("test_node", test_node)
 workflow.add_edge(START, 'test_node')
 workflow.add_edge("test_node", END)
 
-test_graph = workflow.compile()
+if configuration.dev == "TRUE":
+    test_graph = workflow.compile(store=make_pg_store)
+else:
+    test_graph = workflow.compile()
 # graph = workflow.compile(context=make_context)
 
 test_graph.name = "test_graph"

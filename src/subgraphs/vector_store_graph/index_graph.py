@@ -9,7 +9,6 @@ from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 
-
 from langgraph.store.base import BaseStore
 
 from langgraph.store.memory import InMemoryStore
@@ -45,11 +44,12 @@ def ensure_docs_have_user_id(
 import logging
 logger = logging.getLogger(__name__)
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
+from src.anubis.utils.helper_functions import extract_user_id_assistant_id
 import uuid
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+
 
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig
@@ -66,9 +66,7 @@ async def index_docs(
     """
     logger.info(f"INDEXING DOCUMENTS")
     
-
-    if config:
-        update_current_user_and_assistant_identity(config, runtime)
+    user_id, assistant_id = extract_user_id_assistant_id(config)
    
     docs = state['vectorstore_documents_to_be_indexed']
     
@@ -79,21 +77,7 @@ async def index_docs(
         logger.warning(f"Missing {len(docs) - len(filenames)} filenames on documents")
     
     if len(filenames) > 0:
-        if isinstance(runtime.context.user_ctx, dict):
-            user_id = runtime.context.user_ctx.get("user_id", "")
-        else:
-            user_id = getattr(runtime.context.user_ctx, "user_id", "")
 
-        if isinstance(runtime.context.assistant_ctx, dict):
-            assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-        else:
-            assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
-
-        # redundancy to ensure the validity of the data
-        user_id = "".join(user_id.strip())
-        assistant_id = "".join(assistant_id.strip())
-
-        docs = state['vectorstore_documents_to_be_indexed']
         result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
 
         try:
@@ -115,9 +99,9 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
 if configuration.dev == "TRUE":
-    index_graph = builder.compile()
-else:
     index_graph = builder.compile(store=make_pg_store)
+else:
+    index_graph = builder.compile()
 
 
 index_graph.name = "IndexGraph"

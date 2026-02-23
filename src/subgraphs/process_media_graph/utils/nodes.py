@@ -310,16 +310,13 @@ async def process_media_item_task(
 
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
+                    namespace=(user_id, assistant_id, "reference_image")
+                    
                     metadata = doc.metadata
                     page_content = doc.metadata.get("page_content", "")
                     metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": metadata})               
+                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "metadata": metadata})
+                    
                 docs = [doc]
                 return docs
             
@@ -343,16 +340,12 @@ async def process_media_item_task(
 
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
+                    namespace=(user_id, assistant_id, "reference_image")
                     metadata = doc.metadata
                     page_content = doc.metadata.get("page_content", "")
                     metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": metadata})                   
+                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "metadata": metadata})
+                    
                 docs = [doc]
                 return docs
         
@@ -571,17 +564,14 @@ async def process_media_item_task(
                 })
 
                 if reference_audio:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
+                    logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
+                    namespace=(user_id, assistant_id, "reference_audio")
+
                     metadata = doc.metadata
                     page_content = doc.metadata.get("page_content", "")
                     metadata.update({"page_content":page_content})
 
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_audio", 
-                            value={"reference_audio_data": audio_data, "metadata": metadata})                   
+                    await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
 
                 docs = [doc]
                 return docs
@@ -605,20 +595,14 @@ async def process_media_item_task(
                         "filename": filename
                     })
                     if reference_audio:
-                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                        namespace=(user_id, assistant_id)
-                        postgres_db_store = await make_pg_store(configuration)
+                        logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
+                        namespace=(user_id, assistant_id, "reference_audio")
                         metadata = doc.metadata
                         page_content = doc.metadata.get("page_content", "")
                         metadata.update({"page_content":page_content})
 
-                        with postgres_db_store as pg_store:
-                            pg_store.aput(
-                                namespace, key="reference_audio", 
-                                value={
-                                    "reference_audio_data": audio_data, 
-                                    "metadata": metadata
-                                })                   
+                        await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
+
                 docs = [doc]
                 return docs
         
@@ -785,9 +769,10 @@ async def extract_personality_from_image(
                         },
                     ]
 
+    input = {"messages": [{"role": "user", "content": image_to_target_textual_description_payload}]}
     
 
-    response = await model.ainvoke([message])
+    response = await model.ainvoke(input=input)
 
     logger.info(f"response: {response}")
 

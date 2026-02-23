@@ -161,6 +161,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 import contextlib
 from langgraph.store.base import IndexConfig
 
+
 @contextlib.asynccontextmanager
 async def make_pg_store():
     """ EXAMPLE USAGE
@@ -199,7 +200,7 @@ async def make_pg_store():
 
     async with AsyncPostgresStore.from_conn_string(
         conn_string=configuration.async_postgres_store_uri,
-        index = IndexConfig(dims=384, embed=embeddings, fields=["documents"])
+        index = IndexConfig(dims=384, embed=embeddings, fields=["document"])
         ) as store:
         await store.setup()
         yield store

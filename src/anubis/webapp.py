@@ -24,10 +24,10 @@ async def lifespan(app: FastAPI):
 
     try:
         # Initialize context / configuration
-        context = GlobalContext()
+        configuration = GlobalConfiguration()
 
         # Create pipeline for audio transcription
-        if context.configuration.dev == "TRUE":
+        if configuration.dev == "TRUE":
             pass
             # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
             # # Call the function to trigger @lru_cache and load model into memory
@@ -82,9 +82,6 @@ async def upload_media(
     - **assistant_id**: Assistant identifier
     """
     try:
-        # update the context:
-        context.user_ctx.user_id = user_id
-        context.assistant_ctx.assistant_id = assistant_id
 
         # Read all uploaded files
         media_files = []
@@ -111,8 +108,8 @@ async def upload_media(
 
         config = {
             "configurable": {
-                "user_id": user_id,
-                "assistant_id": assistant_id,
+                "user_ctx": {"user_id":user_id},
+                "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
             }
         }
            
@@ -172,18 +169,16 @@ async def process_media_json(
         initial_state = {
             "media_list": media_list,   
         }
+
         
-        # config = {
-        #     "configurable": {
-        #         "user_id": user_id,
-        #         "assistant_id": assistant_id,
-        #     }
-        # }
-        
-        result = await process_media_graph_api_endpoint.ainvoke(initial_state)
-        
+        config = {
+            "configurable": {
+                "user_ctx": {"user_id":user_id},
+                "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
+            }
+        }
+        result = await process_media_graph_api_endpoint.ainvoke(initial_state, config)
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-        
         return {
             "status": "success",
             "media_items_processed": len(media_list),

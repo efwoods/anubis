@@ -119,7 +119,7 @@ async def batch_index_documents_vectorstore(
 
         # Ensure each document has a unique key:
         insert_document_keys = [
-            doc.metadata.update({"key":uuid.uuid4()})
+            doc.metadata.update({"key":str(uuid.uuid4())})
             for doc in 
             vectorstore_documents_to_be_indexed
             if doc.metadata.get("key") is None

@@ -16,7 +16,6 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
-from src.subgraphs.vector_store_graph.utils import retrieval
 from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
@@ -40,6 +39,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.anubis.utils.model import init_model
 
 from src.anubis.utils.helper_functions import summarize_messages
+
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 async def generate_query(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
@@ -117,10 +118,6 @@ async def generate_query(
 
     return {"queries": ["test query"]}
 
-from src.subgraphs.vector_store_graph.utils.retrieval import (
-    make_pg_vector
-)
-
 from langgraph.store.base import BaseStore
 
 from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
@@ -196,6 +193,9 @@ async def retrieve(
     state['retrieved_docs'] = []
     return {"retrieved_docs": doc_results}
 
+
+configuration = GlobalConfiguration()
+
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
@@ -207,7 +207,10 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 builder.add_edge("__start__", "retrieve")
 
 # This compiles it into a graph you can invoke and deploy.
-retrieval_graph = builder.compile()
+if configuration.dev =="TRUE":
+    retrieval_graph = builder.compile(store=make_pg_store)
+else:
+    retrieval_graph = builder.compile()
 retrieval_graph.name = "RetrievalGraph"
 
 __all__ = ["retrieval_graph"]

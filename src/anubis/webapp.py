@@ -14,28 +14,31 @@ logger = logging.getLogger(__name__)
  
 from contextlib import asynccontextmanager
 
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store, make_text_encoder
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
     # Startup: Preload the Whisper model pipeline
     logger.info("Application startup: Preloading Whisper model...")
-    global context 
+    global configuration
     global store 
 
     try:
         # Initialize context / configuration
-        context = GlobalContext()
+        configuration = GlobalConfiguration()
 
         # Create pipeline for audio transcription
-        if context.configuration.dev == "TRUE":
-            from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
-            # Call the function to trigger @lru_cache and load model into memory
-            pipe = get_whisper_pipeline()
+        if configuration.dev == "TRUE":
+            pass
+            # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
+            # # Call the function to trigger @lru_cache and load model into memory
+            # pipe = get_whisper_pipeline()
         
-            logger.info("✓ Whisper model preloaded and cached successfully")
-            logger.info(f"  - Model: openai/whisper-large-v3")
-            logger.info(f"  - Device: {pipe.device}")
-            logger.info(f"  - Ready to process audio requests")
+            # logger.info("✓ Whisper model preloaded and cached successfully")
+            # logger.info(f"  - Model: openai/whisper-large-v3")
+            # logger.info(f"  - Device: {pipe.device}")
+            # logger.info(f"  - Ready to process audio requests")
 
         
     except Exception as e:
@@ -81,9 +84,6 @@ async def upload_media(
     - **assistant_id**: Assistant identifier
     """
     try:
-        # update the context:
-        context.user_ctx.user_id = user_id
-        context.assistant_ctx.assistant_id = assistant_id
 
         # Read all uploaded files
         media_files = []
@@ -107,13 +107,43 @@ async def upload_media(
         initial_state = {
             "media_files": media_files,
         }
+
+        config = {
+            "configurable": {
+                "user_ctx": {"user_id":user_id},
+                "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
+            }
+        }
            
         # Invoke the graph
+        # if configuration.dev == "TRUE":
+            
+        #     from langgraph.store.postgres import AsyncPostgresStore
+
+        #     from typing import Optional
+        #     from langchain_huggingface import HuggingFaceEmbeddings
+        #     import contextlib
+        #     from langgraph.store.base import IndexConfig
+        #     embeddings = await make_text_encoder(model = configuration.embedding_model)
+
+        #     async with AsyncPostgresStore.from_conn_string(
+        #         conn_string=configuration.async_postgres_store_uri,
+        #         index = IndexConfig(dims=384, embed=embeddings, fields=["page_content"])
+        #     ) as store:
+        #         await store.setup()
+
+        #         result = await process_media_graph_api_endpoint.ainvoke(
+        #             initial_state, 
+        #             config=config,
+        #             store=store
+        #             )
+
+        # else:
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            context=context,
+            config=config
             )
-        
+
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
         
@@ -164,18 +194,16 @@ async def process_media_json(
         initial_state = {
             "media_list": media_list,   
         }
+
         
-        # config = {
-        #     "configurable": {
-        #         "user_id": user_id,
-        #         "assistant_id": assistant_id,
-        #     }
-        # }
-        
-        result = await process_media_graph_api_endpoint.ainvoke(initial_state)
-        
+        config = {
+            "configurable": {
+                "user_ctx": {"user_id":user_id},
+                "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
+            }
+        }
+        result = await process_media_graph_api_endpoint.ainvoke(initial_state, config)
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-        
         return {
             "status": "success",
             "media_items_processed": len(media_list),

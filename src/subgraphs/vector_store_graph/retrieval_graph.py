@@ -16,7 +16,6 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
-from src.subgraphs.vector_store_graph.utils import retrieval
 from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
@@ -40,6 +39,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.anubis.utils.model import init_model
 
 from src.anubis.utils.helper_functions import summarize_messages
+
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 async def generate_query(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
@@ -117,12 +118,11 @@ async def generate_query(
 
     return {"queries": ["test query"]}
 
-from src.subgraphs.vector_store_graph.utils.retrieval import (
-    make_pg_vector
-)
+from langgraph.store.base import BaseStore
+from src.anubis.utils.helper_functions import extract_user_id_assistant_id
 
 async def retrieve(
-    state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext]
+    state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext], store: BaseStore
 ) -> dict[str, list[Document]]:
     """Retrieve documents based on the latest query in the state.
 
@@ -140,25 +140,12 @@ async def retrieve(
     """
     from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
-    logger.warning(f"runtime.context.user_ctx.user_id: {runtime.context.user_ctx.user_id}")
-    logger.warning(f"runtime.context.assistant_ctx.assistant_id: {runtime.context.assistant_ctx.assistant_id}")
-   
-    if config:
-        config_user_id = config.get("configurable").get("user_id", "")
-        config_assistant_id = config.get("configurable").get("assistant_id", "")
-        if config_user_id != "":
-            runtime.context.user_ctx.user_id = config_user_id
-            runtime.context.assistant_ctx.user_id = config_user_id
-        else:
-            user_id = runtime.context.user_ctx.user_id
-        if config_assistant_id != "":
-            runtime.context.assistant_ctx.assistant_id = config_assistant_id
-        else:
-            assistant_id = runtime.context.assistant_ctx.assistant_id
 
-    logger.info(f"user_id: {config_user_id}")
-    logger.info(f"assistant_id: {config_assistant_id}")
-
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
+    
+    logger.info(f"user_id: {user_id}")
+    logger.info(f"assistant_id: {assistant_id}")
+    
     human_message = state['messages'][-1]
 
     assert(isinstance(human_message, HumanMessage))
@@ -167,59 +154,36 @@ async def retrieve(
 
     logger.info(f"{retrieval_message}")
     
-    configuration = runtime.context.configuration
-
-    if isinstance(runtime.context.user_ctx, dict):
-        user_id = runtime.context.user_ctx.get("user_id", "")
-    else:
-        user_id = getattr(runtime.context.user_ctx, "user_id", "")
-        
-    if isinstance(runtime.context.assistant_ctx, dict):
-        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-    else:
-        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
-
-    logger.info(f"user_id: {user_id}")
-    logger.info(f"assistant_id: {assistant_id}")
-
-    memory_search = runtime.context.vector_store_memory_search_only
-
-    if memory_search == "FALSE":
-        filter_query = {
-                "user_id": {"$eq": user_id},
-                "assistant_id": {"$eq": assistant_id}, 
-        }
-                # "type": {"$ne": "memory"}
-    else:
-        filter_query = {
-                "user_id": {"$eq": user_id},
-                "assistant_id": {"$eq": assistant_id}, 
-        }
-                # "type": {"$eq": "memory"}
-
-    
-    vector_store = await make_pg_vector(configuration)
+    namespace = (user_id, assistant_id, "document")
 
     logger.info(f"breakpoint")
     if len(state['queries']) > 0:
         query = state['queries'][-1]
     else:
-        query = getattr(state['messages'][-1], "content", "")
+        if isinstance(human_message, HumanMessage):
+            content = getattr(human_message, "content")
+            query = content[0].get('text', "")
+        else:
+            query = ""
 
-    results = await vector_store.asimilarity_search_with_relevance_scores(
-        query = query,
-        filter=filter_query,
-    )
-        # score_threshold=0.6
+    if query != "":    
+        item_results = await store.asearch(namespace, query=query)
 
-    retrieved_docs = [doc[0] for doc in results] # extract documents only
+    # format the items into documents
+    doc_results = [Document(page_content=item.value.get("page_content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
+    
+    # include the search result score on each document
+    [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]
 
     logger.info(f"breakpoint")
 
     # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
-    logger.info(f"{retrieved_docs}")
+    logger.info(f"{doc_results}")
     state['retrieved_docs'] = []
-    return {"retrieved_docs": retrieved_docs}
+    return {"retrieved_docs": doc_results}
+
+
+configuration = GlobalConfiguration()
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
@@ -232,7 +196,10 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 builder.add_edge("__start__", "retrieve")
 
 # This compiles it into a graph you can invoke and deploy.
-retrieval_graph = builder.compile()
+if configuration.dev =="TRUE":
+    retrieval_graph = builder.compile(store=make_pg_store)
+else:
+    retrieval_graph = builder.compile()
 retrieval_graph.name = "RetrievalGraph"
 
 __all__ = ["retrieval_graph"]

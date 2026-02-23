@@ -33,7 +33,7 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 import logging
 logger = logging.getLogger(__name__)
 
-async def test_node(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore):
+async def test_node(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext], store: BaseStore):
     logger.info(f"ENTRYPOINT TEST NODE")
     logger.info(f"store type: {type(store)}")
     test_namespace = ("testing", "documents")

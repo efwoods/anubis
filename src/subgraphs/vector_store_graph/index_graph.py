@@ -9,7 +9,6 @@ from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 
-
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 from src.anubis.utils.configuration import GlobalConfiguration
@@ -44,12 +43,15 @@ def ensure_docs_have_user_id(
 import logging
 logger = logging.getLogger(__name__)
 
-
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector, make_pg_store
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
+from langchain_core.runnables import RunnableConfig
+from src.anubis.utils.helper_functions import extract_user_id_assistant_id
+import uuid
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+
 
 async def index_docs(
-    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore | None = None
+    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -61,70 +63,34 @@ async def index_docs(
         state (IndexState): The current state containing documents and retriever.
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
-    from src.anubis.utils.configuration import GlobalConfiguration
     logger.info(f"INDEXING DOCUMENTS")
     
-    configuration = GlobalConfiguration()
-
-    v_store = await make_pg_vector(configuration)
-
-    # Delete documents with the same filename in the metadata
-    filenames = {
-        doc.metadata.get("filename") 
-        for doc in 
-        state['vectorstore_documents_to_be_indexed'] 
-        if doc.metadata.get("filename") is not None
-    }
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
+   
+    docs = state['vectorstore_documents_to_be_indexed']
     
-    if filenames:
-        filenames_list = list(filenames)
-        
-        if isinstance(runtime.context.user_ctx, dict):
-            user_id = runtime.context.user_ctx.get("user_id", "")
-        else:
-            user_id = getattr(runtime.context.user_ctx, "user_id", "")
+    filenames = [doc.metadata.get("filename") for doc in docs]
+    try:
+        assert(len(filenames) == len(docs))
+    except AssertionError as e:
+        logger.warning(f"Missing {len(docs) - len(filenames)} filenames on documents")
+    
+    if len(filenames) > 0:
 
-        if isinstance(runtime.context.assistant_ctx, dict):
-            assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-        else:
-            assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+        result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
 
-        # redundancy to ensure the validity of the data
-        user_id = "".join(user_id.strip())
-        assistant_id = "".join(assistant_id.strip())
+        try:
+            assert(result['success'] == True)
+        except AssertionError as e:
+            logger.error(f"Error uploading documents: {result['error_batch_documents']}")
 
-        # search for the documents
-        from sqlalchemy import text
-        from sqlalchemy.ext.asyncio import create_async_engine
+            # Clear the documents to be indexed on error
+            state['vectorstore_documents_to_be_indexed'] = []            
+            raise Exception(f"Error uploading documents: {result['error_batch_documents']}")
 
-        async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
-
-        SQL_QUERY="""SELECT id FROM langchain_pg_embedding WHERE cmetadata->>'user_id' = :user_id
-        AND cmetadata->>'assistant_id' = :assistant_id
-        AND cmetadata->>'filename' = ANY(:filenames)
-        """
-        params = {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "filenames": filenames_list
-        }
-
-        async with async_engine.connect() as conn:
-            result = await conn.execute(text(SQL_QUERY), params)
-            all_docs = result.fetchall()
-
-        # Extract list of ids from returned tuples of documents to be deleted
-        id_list = [id[0] for id in all_docs] if all_docs else []
-
-        result = await batch_index_documents_vectorstore(
-                id_list=id_list, 
-                configuration=configuration, 
-                vectorstore_documents_to_be_indexed=state['vectorstore_documents_to_be_indexed'], 
-                BATCH_SIZE=5000
-            )
         logger.info(f"breaktpoint after batch_index_documents_vectorstore")
 
-        return {"docs": "delete"}
+    return {"docs": "delete"}
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)
@@ -132,9 +98,9 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
 if configuration.dev == "TRUE":
-    index_graph = builder.compile()
-else:
     index_graph = builder.compile(store=make_pg_store)
+else:
+    index_graph = builder.compile()
 
 
 index_graph.name = "IndexGraph"

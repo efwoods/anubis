@@ -20,6 +20,26 @@ def parse_datetime(dt_value):
     else:
         raise ValueError(f"Unexpected datetime type: {type(dt_value)}")
     
+# Delete all chunks of a document by filename
+import logging
+logger = logging.getLogger(__name__)
+
+async def delete_docs_filename(store, user_id, assistant_id, filenames):
+    idx = 0
+    for filename in filenames:
+        logger.info(f"Total remaining files to be deleted: {len(filenames) - idx}")
+        
+        namespace = (user_id, assistant_id, "document", filename)
+        search_results = await store.asearch(namespace)
+        del_list = [(res.namespace, res.key) for res in search_results]
+        total_items_to_be_deleted = len(search_results)
+        
+        logger.info(f"deleting {total_items_to_be_deleted} items associated with {filename}")
+        [await store.adelete(namespace=item[0], key=item[1]) for item in (del_list)]
+        
+        logger.info(f"deleted {len(search_results)} items associated with {filename}")
+        idx+=1
+
 
 async def update_column_metadata(
     added_ids: list[str],
@@ -75,131 +95,82 @@ async def update_column_metadata(
     
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
 from src.subgraphs.vector_store_graph.utils.helper_functions import update_column_metadata
+from langchain_core.stores import BaseStore
+import uuid
+from langgraph.store.base import PutOp
 
 async def batch_index_documents_vectorstore(
-        id_list: list[str], 
-        configuration: GlobalConfiguration, 
+        store: BaseStore,
+        user_id: str, 
+        assistant_id: str,
         vectorstore_documents_to_be_indexed: list[any], 
-        BATCH_SIZE: int = 5000
+        BATCH_SIZE: int = 1000
     ):
 
         logger.info(f"BATCH INDEX DOCUMENTS VECTORSTORE BREAKPOINT")
 
-        configuration = GlobalConfiguration()
+         # Delete documents with the same filename in the metadata
+        filenames = {
+            doc.metadata.get("filename") 
+            for doc in 
+            vectorstore_documents_to_be_indexed
+            if doc.metadata.get("filename") is not None
+        }
 
-        v_store = await make_pg_vector(configuration)
-
-        total_documents_to_be_deleted = len(id_list)
-
-        logger.info(f"id_list length: {total_documents_to_be_deleted}")
-
-        # batch delete
-        error_deleting_ids = []
-
-        for i in range(0, total_documents_to_be_deleted, BATCH_SIZE):
-            batch = id_list[i:i + BATCH_SIZE]
-            batch_num  = (i // BATCH_SIZE) + 1
-            total_batches = (total_documents_to_be_deleted + BATCH_SIZE - 1) // BATCH_SIZE
-            try:
-                await v_store.adelete(ids=batch) # there is no return value from a delete
-                progress = min(i + BATCH_SIZE, total_documents_to_be_deleted)
-                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_deleted}")
-            except Exception as e:
-                print(f"Error in batch delete for batch number: {batch_num}: {str(e)}")
-                # Handle the error with a retry
-                logger.warning(f"error in delete: retrying...")
-                try:
-                    await v_store.adelete(ids=batch) # there is no return value from a delete
-                    progress = min(i + BATCH_SIZE, total_documents_to_be_deleted)
-                    logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_deleted}")
-                except Exception as e:
-                    logger.error(f"Continued Error in batch delete for batch number: {batch_num}: {str(e)}; returning error_ids_list.")
-                    error_deleting_ids.extend(batch)
-                    continue
+        # Ensure each document has a unique key:
+        insert_document_keys = [
+            doc.metadata.update({"key":str(uuid.uuid4())})
+            for doc in 
+            vectorstore_documents_to_be_indexed
+            if doc.metadata.get("key") is None
+        ]
+        
+        # Delete files
+        await delete_docs_filename(store, user_id, assistant_id, filenames)
         
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
 
-        all_document_ids = []
-        total_documents_to_be_indexed = len(vectorstore_documents_to_be_indexed)
+        # create upload namespaces
+        namespaces = [(user_id, assistant_id, "document", filename) for filename in filenames]
+        batch_put_ops = [PutOp(namespace=namespace, key=key, value={"page_content":doc.page_content, "metadata":doc.metadata}) for namespace, key, doc in zip(namespaces, insert_document_keys, vectorstore_documents_to_be_indexed)]
+
+        num_successful_batch_uploads = 0
+        total_documents_to_be_indexed = len(batch_put_ops)
         error_batch_documents = []
 
         # batch the document uploads
         for i in range(0, total_documents_to_be_indexed, BATCH_SIZE):
            
-            batch = vectorstore_documents_to_be_indexed[i:i + BATCH_SIZE]
+            batch = batch_put_ops[i:i + BATCH_SIZE]
             batch_num = (i // BATCH_SIZE) + 1
             total_batches = (total_documents_to_be_indexed + BATCH_SIZE - 1) // BATCH_SIZE
             try:
-                batch_ids = await v_store.aadd_documents(batch)
-                all_document_ids.extend(batch_ids)
+                await store.abatch(batch)
 
                 progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
                 
                 logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed}")
+
+                num_successful_batch_uploads += len(batch)
                 
-                # add columns for sorting
-
-                logger.info(f"breakpoint after add to vectorstore")
-                
-                # Create creation_times_list:
-
-                creation_times_list = [
-                {
-                    "created_at": doc.metadata['created_at'], 
-                    "user_id":doc.metadata['user_id'], 
-                    'assistant_id': doc.metadata['assistant_id'],
-                    'filename': doc.metadata['filename']
-                } for doc in batch]
-
-                response = await update_column_metadata(
-                    batch_ids, 
-                    creation_times_list, 
-                    configuration, 
-                    table_name="langchain_pg_embedding"
-                )
-
-                logger.info(f"Update of column metadata: {response['success']}")
             except Exception as e:
                 logger.info(f"Error in batch {batch_num}: {str(e)}. Attempting Retry.")
                 # Handle the error with a retry
                 try:
-                    batch_ids = await v_store.aadd_documents(batch)
-                    all_document_ids.extend(batch_ids)
+                    await store.abatch(batch)
 
                     progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
 
                     logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed}")
 
-                    # add columns for sorting
-
-                    logger.info(f"breakpoint after add to vectorstore")
-
-                    # Create creation_times_list:
-
-                    creation_times_list = [
-                    {
-                        "created_at": doc.metadata['created_at'], 
-                        "user_id":doc.metadata['user_id'], 
-                        'assistant_id': doc.metadata['assistant_id'],
-                        'filename': doc.metadata['filename']
-                    } for doc in batch]
-
-                    response = await update_column_metadata(
-                        batch_ids, 
-                        creation_times_list, 
-                        configuration, 
-                        table_name="langchain_pg_embedding"
-                    )
-
-                    logger.info(f"Update of column metadata: {response['success']}")
                 except Exception as e:
                     logger.info(f"Continued error in batch {batch_num}: {str(e)}. Returning batch documents in error")
                     error_batch_documents.extend(batch)
                     continue
         
-        if len(error_batch_documents) == 0 and len(error_deleting_ids) == 0:
-            return {"success": True}
+        if len(error_batch_documents) == 0:
+            return {"success": True, "documents_uploaded": num_successful_batch_uploads}
         else:
-            return {"success": False, "error_batch_documents": error_batch_documents, "error_deleting_ids": error_deleting_ids}
+            return {"success": False, "error_batch_documents": error_batch_documents}
         

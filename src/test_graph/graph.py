@@ -64,12 +64,7 @@ workflow.add_node("test_node", test_node)
 workflow.add_edge(START, 'test_node')
 workflow.add_edge("test_node", END)
 
-if configuration.dev == "TRUE":
-    test_graph = workflow.compile(store=make_pg_store())
-else:
-    test_graph = workflow.compile()
-# graph = workflow.compile(context=make_context)
-
-test_graph.name = "test_graph"
+test_graph = workflow.compile()
+compile()
 
 __all__ = ["test_graph"]

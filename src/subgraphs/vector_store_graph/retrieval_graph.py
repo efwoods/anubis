@@ -141,7 +141,7 @@ async def retrieve(
     from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
 
-    user_id, assistant_id = extract_user_id_assistant_id(config)
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
     
     logger.info(f"user_id: {user_id}")
     logger.info(f"assistant_id: {assistant_id}")
@@ -160,16 +160,20 @@ async def retrieve(
     if len(state['queries']) > 0:
         query = state['queries'][-1]
     else:
-        query = getattr(state['messages'][-1], "content", "")
-    
-    item_results = await store.asearch(namespace, query=query)
+        if isinstance(human_message, HumanMessage):
+            content = getattr(human_message, "content")
+            query = content[0].get('text', "")
+        else:
+            query = ""
+
+    if query != "":    
+        item_results = await store.asearch(namespace, query=query)
 
     # format the items into documents
     doc_results = [Document(page_content=item.value.get("page_content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
     
     # include the search result score on each document
     [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]
-
 
     logger.info(f"breakpoint")
 

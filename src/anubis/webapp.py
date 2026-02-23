@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
  
 from contextlib import asynccontextmanager
 
+from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store, make_text_encoder
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
     # Startup: Preload the Whisper model pipeline
     logger.info("Application startup: Preloading Whisper model...")
-    global context 
+    global configuration
     global store 
 
     try:
@@ -114,11 +116,34 @@ async def upload_media(
         }
            
         # Invoke the graph
+        # if configuration.dev == "TRUE":
+            
+        #     from langgraph.store.postgres import AsyncPostgresStore
+
+        #     from typing import Optional
+        #     from langchain_huggingface import HuggingFaceEmbeddings
+        #     import contextlib
+        #     from langgraph.store.base import IndexConfig
+        #     embeddings = await make_text_encoder(model = configuration.embedding_model)
+
+        #     async with AsyncPostgresStore.from_conn_string(
+        #         conn_string=configuration.async_postgres_store_uri,
+        #         index = IndexConfig(dims=384, embed=embeddings, fields=["page_content"])
+        #     ) as store:
+        #         await store.setup()
+
+        #         result = await process_media_graph_api_endpoint.ainvoke(
+        #             initial_state, 
+        #             config=config,
+        #             store=store
+        #             )
+
+        # else:
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            config=config,
+            config=config
             )
-        
+
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
         

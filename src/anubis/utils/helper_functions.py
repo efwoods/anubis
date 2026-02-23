@@ -180,22 +180,25 @@ from src.anubis.utils.context import GlobalContext
 
 async def extract_user_id_assistant_id(config: RunnableConfig):
        
-    user_id = config.get("configurable", "").get("user_ctx", "").get("user_id", "")
+    user_id = config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
     if user_id == "":
-        user_id = config.get("configurable","").get("user_id","")
+        user_id = config.get("configurable",{}).get("user_id","")
 
-    assistant_id = config.get("configurable", "").get("assistant_ctx", "").get("assistant_id", "")
+
+    assistant_id = config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
     if assistant_id == "":
-        assistant_id = config.get("configurable","").get("assistant_id","")
+        assistant_id = config.get("configurable",{}).get("assistant_id","")
 
     # Ensure valid user_id and assistant_id
+    if user_id == "" and (config.get("metadata", {}).get("from_studio") is True):
+        user_id = "Anubis_from_studio_" + assistant_id
     user_id = "".join(user_id.strip())    
-    assistant_id = "".join(assistant_id.strip())    
+    assistant_id = "".join(assistant_id.strip())
 
     return user_id, assistant_id
 
 async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
-        user_id, assistant_id = extract_user_id_assistant_id(config)
+        user_id, assistant_id = await extract_user_id_assistant_id(config)
         
         namespace=(user_id, assistant_id, "assistant_ctx")
         ai_context_item = await store.aget(namespace, key=assistant_id)
@@ -206,7 +209,7 @@ async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
 
         # get the current assistant context as a dict
 
-        configurable_assistant_ctx = config.get("configurable", "").get("assistant_ctx", None)
+        configurable_assistant_ctx = config.get("configurable", {}).get("assistant_ctx", None)
 
         if configurable_assistant_ctx is not None:
             if ai_context_item is not None:

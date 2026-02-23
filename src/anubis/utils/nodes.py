@@ -71,7 +71,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     logger.info(f"Testing store access")
 
     # Asserting Current Identity:
-    user_id, assistant_id = extract_user_id_assistant_id(config)
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
     logger.info(f"user_id: {user_id}")
     logger.info(f"assistant_id: {assistant_id}")
 
@@ -111,7 +111,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     logger.info(f"async postgres store connection test breakpoint")
 
-    ai_context_item = configure_assistant_context(config, store)
+    ai_context_item = await configure_assistant_context(config, store)
 
     try:
         assert(ai_context_item is not None)

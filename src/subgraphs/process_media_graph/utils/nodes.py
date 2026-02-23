@@ -42,6 +42,7 @@ from langchain.tools import tool
 from src.anubis.utils.configuration import GlobalConfiguration
 
 from langchain_core.runnables import RunnableConfig
+from src.anubis.utils.helper_functions import extract_user_id_assistant_id
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -55,8 +56,7 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
-    user_id = config.get("configurable","").get("user_ctx", "").get("user_id","")
-    assistant_id = config.get("configurable","").get("assistant_ctx", "").get("assistant_id","")
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
 
     # logger.info("STORE ACCESS TESTING")
     # namespace = ("evan")
@@ -277,7 +277,7 @@ async def process_media_item_task(
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
 
-    configuration = runtime.context.configuration
+    configuration = GlobalConfiguration()
 
     logger.info(f"Testing store access")
 

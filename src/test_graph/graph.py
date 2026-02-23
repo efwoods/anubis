@@ -35,9 +35,16 @@ logger = logging.getLogger(__name__)
 
 async def test_node(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext], store: BaseStore):
     logger.info(f"ENTRYPOINT TEST NODE")
-    logger.info(f"store type: {type(store)}")
+
+    logger.info(f"config: {config.keys()}")
+    logger.info(f"config user_ctx: {config['configurable'].get('user_ctx', None)}")
+    logger.info(f"config assistant_ctx: {config['configurable'].get('assistant_ctx', None)}")
+    logger.info(f"runtime.store: {runtime.store}")
+    logger.info(f"store: {store}")
+    logger.info(f"new test")
+
     test_namespace = ("testing", "documents")
-    await runtime.store.aput(namespace=test_namespace, key="testing_key", value={"testing_key":"testing_value", "documents":"This is a test field to embed. UNICORN."})
+    await store.aput(namespace=test_namespace, key="testing_key", value={"testing_key":"testing_value", "documents":"This is a test field to embed. UNICORN."})
     testing_get = await runtime.store.aget(("testing", "documents"), key="testing_key")
     results = await runtime.store.asearch(("testing", "documents"), query="UNICORN.")
     logger.info(f"testing_get: {testing_get}")
@@ -57,12 +64,6 @@ workflow.add_node("test_node", test_node)
 workflow.add_edge(START, 'test_node')
 workflow.add_edge("test_node", END)
 
-if configuration.dev == "TRUE":
-    test_graph = workflow.compile(store=make_pg_store)
-else:
-    test_graph = workflow.compile()
-# graph = workflow.compile(context=make_context)
-
-test_graph.name = "test_graph"
+test_graph = workflow.compile()
 
 __all__ = ["test_graph"]

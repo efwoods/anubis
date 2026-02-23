@@ -196,7 +196,7 @@ async def make_pg_store():
     logger.info(f"make_pg_store ENTRYPOINT")
 
     configuration = GlobalConfiguration()
-    embeddings = HuggingFaceEmbeddings(model_name = configuration.embedding_model)
+    embeddings = await make_text_encoder(configuration.embedding_model)
 
     async with AsyncPostgresStore.from_conn_string(
         conn_string=configuration.async_postgres_store_uri,

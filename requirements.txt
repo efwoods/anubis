@@ -63,8 +63,8 @@ ffmpeg-python
 transformers
 accelerate
 aiofiles
-
 torchaudio
+
 # torch
 # pyannote-audio
 

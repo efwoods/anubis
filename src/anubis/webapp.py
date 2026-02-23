@@ -81,9 +81,9 @@ async def test_hello_world():
     system_time = datetime.now(tz=timezone.utc).isoformat
     content = [{"type":"text", "text": system_time}]
     input = {"messages": HumanMessage(content=content)}
-    store = make_pg_store()
+    # store = make_pg_store()
 
-    result = await test_graph.ainvoke(input, config=config, store=store)
+    result = await test_graph.ainvoke(input, config=config)
     logger.info(f"HELLO WORLD ENTRY")
     return {"Hello": "World"}
 

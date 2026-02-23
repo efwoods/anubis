@@ -65,6 +65,5 @@ workflow.add_edge(START, 'test_node')
 workflow.add_edge("test_node", END)
 
 test_graph = workflow.compile()
-compile()
 
 __all__ = ["test_graph"]

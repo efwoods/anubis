@@ -37,9 +37,9 @@ async def test_node(state: GlobalState, config: RunnableConfig, runtime: Runtime
     logger.info(f"ENTRYPOINT TEST NODE")
     logger.info(f"store type: {type(store)}")
     test_namespace = ("testing", "documents")
-    await store.aput(namespace=test_namespace, key="testing_key", value={"testing_key":"testing_value", "documents":"This is a test field to embed. UNICORN."})
-    testing_get = await store.aget(("testing", "documents"), key="testing_key")
-    results = await store.asearch(("testing", "documents"), query="UNICORN.")
+    await runtime.store.aput(namespace=test_namespace, key="testing_key", value={"testing_key":"testing_value", "documents":"This is a test field to embed. UNICORN."})
+    testing_get = await runtime.store.aget(("testing", "documents"), key="testing_key")
+    results = await runtime.store.asearch(("testing", "documents"), query="UNICORN.")
     logger.info(f"testing_get: {testing_get}")
     logger.info(f"results: {results}")
 

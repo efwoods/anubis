@@ -69,6 +69,7 @@ async def split_text_into_chunks(
         doc = Document(
             page_content=chunk,
             metadata={
+                "key":str(uuid4),
                 "user_id": user_id,
                 "assistant_id": assistant_id,
                 "created_at": current_timestamp,
@@ -293,6 +294,7 @@ async def process_text_media_item_target_for_vectorstore(
                             doc = Document(
                                 page_content=semantic_text_chunk,
                                 metadata={
+                                    "key": str(uuid4()),
                                     "user_id": user_id,
                                     "assistant_id": assistant_id,
                                     "created_at": current_timestamp,
@@ -404,6 +406,7 @@ async def process_text_media_item_target_for_vectorstore(
                     doc = Document(
                         page_content=text_content,
                         metadata={
+                            "key": str(uuid4()),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "created_at": current_timestamp,

@@ -42,6 +42,7 @@ from langchain.tools import tool
 from src.anubis.utils.configuration import GlobalConfiguration
 
 from langchain_core.runnables import RunnableConfig
+from src.anubis.utils.helper_functions import extract_user_id_assistant_id
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -55,16 +56,7 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
-
-    if isinstance(runtime.context.user_ctx, dict):
-        user_id = runtime.context.user_ctx.get("user_id", "")
-    else:
-        user_id = getattr(runtime.context.user_ctx, "user_id", "")
-
-    if isinstance(runtime.context.assistant_ctx, dict):
-        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-    else:
-        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
 
     # logger.info("STORE ACCESS TESTING")
     # namespace = ("evan")
@@ -285,16 +277,16 @@ async def process_media_item_task(
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
 
-    configuration = runtime.context.configuration
+    configuration = GlobalConfiguration()
 
     logger.info(f"Testing store access")
 
-    namespace = ("testing","document")
-    await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
-    testing_get = await store.aget(namespace=namespace, key="media")
-    testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
-    logger.info(f"testing_get: {testing_get}")
-    logger.info(f"get_value: {testing_search}")
+    # namespace = ("testing","document")
+    # await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
+    # testing_get = await store.aget(namespace=namespace, key="media")
+    # testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
+    # logger.info(f"testing_get: {testing_get}")
+    # logger.info(f"get_value: {testing_search}")
 
     try:
         # Handle base64 images
@@ -318,16 +310,13 @@ async def process_media_item_task(
 
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
+                    namespace=(user_id, assistant_id, "reference_image")
+                    
                     metadata = doc.metadata
                     page_content = doc.metadata.get("page_content", "")
                     metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": metadata})               
+                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "metadata": metadata})
+                    
                 docs = [doc]
                 return docs
             
@@ -351,16 +340,12 @@ async def process_media_item_task(
 
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
+                    namespace=(user_id, assistant_id, "reference_image")
                     metadata = doc.metadata
                     page_content = doc.metadata.get("page_content", "")
                     metadata.update({"page_content":page_content})
-
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_image", 
-                            value={"reference_image_data": image_data, "metadata": metadata})                   
+                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "metadata": metadata})
+                    
                 docs = [doc]
                 return docs
         
@@ -579,17 +564,14 @@ async def process_media_item_task(
                 })
 
                 if reference_audio:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id)
-                    postgres_db_store = await make_pg_store(configuration)
+                    logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
+                    namespace=(user_id, assistant_id, "reference_audio")
+
                     metadata = doc.metadata
                     page_content = doc.metadata.get("page_content", "")
                     metadata.update({"page_content":page_content})
 
-                    with postgres_db_store as pg_store:
-                        pg_store.aput(
-                            namespace, key="reference_audio", 
-                            value={"reference_audio_data": audio_data, "metadata": metadata})                   
+                    await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
 
                 docs = [doc]
                 return docs
@@ -613,20 +595,14 @@ async def process_media_item_task(
                         "filename": filename
                     })
                     if reference_audio:
-                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                        namespace=(user_id, assistant_id)
-                        postgres_db_store = await make_pg_store(configuration)
+                        logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
+                        namespace=(user_id, assistant_id, "reference_audio")
                         metadata = doc.metadata
                         page_content = doc.metadata.get("page_content", "")
                         metadata.update({"page_content":page_content})
 
-                        with postgres_db_store as pg_store:
-                            pg_store.aput(
-                                namespace, key="reference_audio", 
-                                value={
-                                    "reference_audio_data": audio_data, 
-                                    "metadata": metadata
-                                })                   
+                        await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
+
                 docs = [doc]
                 return docs
         
@@ -793,9 +769,10 @@ async def extract_personality_from_image(
                         },
                     ]
 
+    input = {"messages": [{"role": "user", "content": image_to_target_textual_description_payload}]}
     
 
-    response = await model.ainvoke([message])
+    response = await model.ainvoke(input=input)
 
     logger.info(f"response: {response}")
 

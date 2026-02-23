@@ -14,6 +14,8 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AI
 from langchain_core.prompts import ChatPromptTemplate
 from src.anubis.utils.configuration import GlobalConfiguration
 
+from langgraph.store.base import BaseStore
+
 import logging
 import re
 
@@ -169,6 +171,81 @@ def reduce_docs(
                 coerced.append(item)
         return coerced
     return existing or []
+
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.runtime import Runtime
+from src.anubis.utils.context import GlobalContext
+
+
+async def extract_user_id_assistant_id(config: RunnableConfig):
+       
+    user_id = config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
+    if user_id == "":
+        user_id = config.get("configurable",{}).get("user_id","")
+
+
+    assistant_id = config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
+    if assistant_id == "":
+        assistant_id = config.get("configurable",{}).get("assistant_id","")
+
+    # Ensure valid user_id and assistant_id
+    if user_id == "" and (config.get("metadata", {}).get("from_studio") is True):
+        user_id = "Anubis_from_studio_" + assistant_id
+    user_id = "".join(user_id.strip())    
+    assistant_id = "".join(assistant_id.strip())
+
+    return user_id, assistant_id
+
+async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
+        user_id, assistant_id = await extract_user_id_assistant_id(config)
+        
+        namespace=(user_id, assistant_id, "assistant_ctx")
+        ai_context_item = await store.aget(namespace, key=assistant_id)
+        logger.info(f"ai_context_item: {ai_context_item}")
+
+        # Load/UPDATE AI SELF IDENTITY
+        logger.info("item object breakpoint")
+
+        # get the current assistant context as a dict
+
+        configurable_assistant_ctx = config.get("configurable", {}).get("assistant_ctx", None)
+
+        if configurable_assistant_ctx is not None:
+            if ai_context_item is not None:
+                for key, value in configurable_assistant_ctx:
+                    if (value != "" and value != None) and key != "metadata":
+                        ai_context_item.value['assistant_ctx'].update({key: value})
+                if configurable_assistant_ctx.get("metadata", None) is not None:
+                    update_metadata = configurable_assistant_ctx.get("metadata")
+                    ai_context_item.value['assistant_ctx']['metadata'].update(update_metadata)                 
+
+                await store.aput(namespace, key=assistant_id, value={"assistant_ctx":ai_context_item.value["assistant_ctx"]})
+            else:
+                init_assistant_ctx = {
+                    "user_id":user_id,
+                    "assistant_id":assistant_id,
+                    "name":configurable_assistant_ctx.get("name", ""),
+                    "description":configurable_assistant_ctx.get("description", ""),
+                    "metadata": configurable_assistant_ctx.get("metadata", {})
+                }
+                await store.aput(namespace, key=assistant_id, value={"assistant_ctx":init_assistant_ctx})
+        else:
+            if ai_context_item is None:
+                init_assistant_ctx = {
+                    "user_id":user_id,
+                    "assistant_id":assistant_id,
+                    "name": "",
+                    "description": "",
+                    "metadata": {}
+                }
+                await store.aput(namespace, key=assistant_id, value={"assistant_ctx":init_assistant_ctx})
+
+        ai_context_item = await store.aget(namespace, key=assistant_id)
+
+        return ai_context_item
+
+
 
 ############################  CHUNK LONG MESSAGES  #############################
 

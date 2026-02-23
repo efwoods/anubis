@@ -26,6 +26,8 @@ from src.anubis.utils.configuration import GlobalConfiguration
 from langchain_core.runnables import RunnableConfig
 configuration = GlobalConfiguration()
 
+from langgraph.store.postgres import AsyncPostgresStore
+
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 # Define the Graph & Context
@@ -44,10 +46,7 @@ workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
 
-if configuration.dev == "TRUE":
-    process_media_graph_api_endpoint = workflow.compile(store=make_pg_store())
-else:
-    process_media_graph_api_endpoint = workflow.compile()
+process_media_graph_api_endpoint = workflow.compile()
     
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"
 

@@ -116,34 +116,21 @@ async def upload_media(
         }
            
         # Invoke the graph
-        # if configuration.dev == "TRUE":
-            
-        #     from langgraph.store.postgres import AsyncPostgresStore
+        if configuration.dev == "TRUE":
 
-        #     from typing import Optional
-        #     from langchain_huggingface import HuggingFaceEmbeddings
-        #     import contextlib
-        #     from langgraph.store.base import IndexConfig
-        #     embeddings = await make_text_encoder(model = configuration.embedding_model)
-
-        #     async with AsyncPostgresStore.from_conn_string(
-        #         conn_string=configuration.async_postgres_store_uri,
-        #         index = IndexConfig(dims=384, embed=embeddings, fields=["page_content"])
-        #     ) as store:
-        #         await store.setup()
-
-        #         result = await process_media_graph_api_endpoint.ainvoke(
-        #             initial_state, 
-        #             config=config,
-        #             store=store
-        #             )
-
-        # else:
-        result = await process_media_graph_api_endpoint.ainvoke(
-            initial_state, 
-            config=config
-            )
-
+            async with make_pg_store() as store:
+                await store.setup()
+                result = await process_media_graph_api_endpoint.ainvoke(
+                    initial_state, 
+                    config=config,
+                    store=store
+                    )
+        else:
+            result = await process_media_graph_api_endpoint.ainvoke(
+                initial_state, 
+                config=config
+                )
+    
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
         

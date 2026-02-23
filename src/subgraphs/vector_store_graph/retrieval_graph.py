@@ -119,8 +119,8 @@ async def generate_query(
     return {"queries": ["test query"]}
 
 from langgraph.store.base import BaseStore
+from src.anubis.utils.helper_functions import extract_user_id_assistant_id
 
-from src.anubis.utils.helper_functions import update_current_user_and_assistant_identity
 async def retrieve(
     state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext], store: BaseStore
 ) -> dict[str, list[Document]]:
@@ -140,12 +140,12 @@ async def retrieve(
     """
     from langchain_core.messages import HumanMessage
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
-    logger.warning(f"runtime.context.user_ctx.user_id: {runtime.context.user_ctx.user_id}")
-    logger.warning(f"runtime.context.assistant_ctx.assistant_id: {runtime.context.assistant_ctx.assistant_id}")
-   
-    if config:
-        update_current_user_and_assistant_identity(config, runtime)
 
+    user_id, assistant_id = extract_user_id_assistant_id(config)
+    
+    logger.info(f"user_id: {user_id}")
+    logger.info(f"assistant_id: {assistant_id}")
+    
     human_message = state['messages'][-1]
 
     assert(isinstance(human_message, HumanMessage))
@@ -154,21 +154,6 @@ async def retrieve(
 
     logger.info(f"{retrieval_message}")
     
-    configuration = runtime.context.configuration
-
-    if isinstance(runtime.context.user_ctx, dict):
-        user_id = runtime.context.user_ctx.get("user_id", "")
-    else:
-        user_id = getattr(runtime.context.user_ctx, "user_id", "")
-        
-    if isinstance(runtime.context.assistant_ctx, dict):
-        assistant_id = runtime.context.assistant_ctx.get("assistant_id", "")
-    else:
-        assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
-
-    logger.info(f"user_id: {user_id}")
-    logger.info(f"assistant_id: {assistant_id}")
-
     namespace = (user_id, assistant_id, "document")
 
     logger.info(f"breakpoint")
@@ -180,7 +165,7 @@ async def retrieve(
     item_results = await store.asearch(namespace, query=query)
 
     # format the items into documents
-    doc_results = [Document(page_content=item.value.get("content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
+    doc_results = [Document(page_content=item.value.get("page_content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
     
     # include the search result score on each document
     [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]

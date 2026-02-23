@@ -133,7 +133,7 @@ async def batch_index_documents_vectorstore(
 
         # create upload namespaces
         namespaces = [(user_id, assistant_id, "document", filename) for filename in filenames]
-        batch_put_ops = [PutOp(namespace=namespace, key=key, value={"content":doc.page_content, "metadata":doc.metadata}) for namespace, key, doc in zip(namespaces, insert_document_keys, vectorstore_documents_to_be_indexed)]
+        batch_put_ops = [PutOp(namespace=namespace, key=key, value={"page_content":doc.page_content, "metadata":doc.metadata}) for namespace, key, doc in zip(namespaces, insert_document_keys, vectorstore_documents_to_be_indexed)]
 
         num_successful_batch_uploads = 0
         total_documents_to_be_indexed = len(batch_put_ops)

@@ -52,7 +52,7 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 
 async def index_docs(
-    state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig
+    state: GlobalState, runtime: Runtime[GlobalContext], config: RunnableConfig
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 
@@ -78,7 +78,7 @@ async def index_docs(
     
     if len(filenames) > 0:
 
-        result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
+        result = await batch_index_documents_vectorstore(runtime, user_id, assistant_id, docs, BATCH_SIZE=1000)
 
         try:
             assert(result['success'] == True)

@@ -69,6 +69,8 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
 
     logger.info(f"Testing store access")
+    logger.info(f"runtime.store: {runtime.store}")
+    logger.info(f"store: {store}")
 
     # Asserting Current Identity:
     user_id, assistant_id = await extract_user_id_assistant_id(config)

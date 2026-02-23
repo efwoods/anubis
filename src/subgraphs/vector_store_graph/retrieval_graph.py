@@ -162,7 +162,12 @@ async def retrieve(
     else:
         if isinstance(human_message, HumanMessage):
             content = getattr(human_message, "content")
-            query = content[0].get('text', "")
+            if isinstance(content, str):
+                query = content
+            elif isinstance(content, list):
+                query = content[0].get('text', "")
+            else:
+                query = content.get('text', "")
         else:
             query = ""
 
@@ -195,9 +200,15 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 # builder.add_edge("generate_query", "retrieve")
 builder.add_edge("__start__", "retrieve")
 
+async def build_store(store_context_manager):
+    async with store_context_manager as store:
+        yield store
+
 # This compiles it into a graph you can invoke and deploy.
 if configuration.dev =="TRUE":
-    retrieval_graph = builder.compile(store=make_pg_store)
+    store_context_manager = make_pg_store()
+    store = build_store(store_context_manager)
+    retrieval_graph = builder.compile(store=store)
 else:
     retrieval_graph = builder.compile()
 retrieval_graph.name = "RetrievalGraph"

@@ -24,18 +24,21 @@ def parse_datetime(dt_value):
 import logging
 logger = logging.getLogger(__name__)
 
-async def delete_docs_filename(store, user_id, assistant_id, filenames):
+
+
+async def delete_docs_filename(runtime, user_id, assistant_id, filenames):
     idx = 0
     for filename in filenames:
         logger.info(f"Total remaining files to be deleted: {len(filenames) - idx}")
         
         namespace = (user_id, assistant_id, "document", filename)
-        search_results = await store.asearch(namespace)
+        
+        search_results = await runtime.store.asearch(namespace)
         del_list = [(res.namespace, res.key) for res in search_results]
         total_items_to_be_deleted = len(search_results)
         
         logger.info(f"deleting {total_items_to_be_deleted} items associated with {filename}")
-        [await store.adelete(namespace=item[0], key=item[1]) for item in (del_list)]
+        [await runtime.store.adelete(namespace=item[0], key=item[1]) for item in (del_list)]
         
         logger.info(f"deleted {len(search_results)} items associated with {filename}")
         idx+=1
@@ -99,8 +102,10 @@ from langchain_core.stores import BaseStore
 import uuid
 from langgraph.store.base import PutOp
 
+from langgraph.runtime import Runtime
+
 async def batch_index_documents_vectorstore(
-        store: BaseStore,
+        runtime: Runtime,
         user_id: str, 
         assistant_id: str,
         vectorstore_documents_to_be_indexed: list[any], 
@@ -126,7 +131,7 @@ async def batch_index_documents_vectorstore(
         ]
         
         # Delete files
-        await delete_docs_filename(store, user_id, assistant_id, filenames)
+        await delete_docs_filename(runtime, user_id, assistant_id, filenames)
         
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
@@ -146,7 +151,7 @@ async def batch_index_documents_vectorstore(
             batch_num = (i // BATCH_SIZE) + 1
             total_batches = (total_documents_to_be_indexed + BATCH_SIZE - 1) // BATCH_SIZE
             try:
-                await store.abatch(batch)
+                await runtime.store.abatch(batch)
 
                 progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
                 
@@ -158,7 +163,7 @@ async def batch_index_documents_vectorstore(
                 logger.info(f"Error in batch {batch_num}: {str(e)}. Attempting Retry.")
                 # Handle the error with a retry
                 try:
-                    await store.abatch(batch)
+                    await runtime.store.abatch(batch)
 
                     progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
 

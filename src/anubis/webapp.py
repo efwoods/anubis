@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
     # Startup: Preload the Whisper model pipeline
     logger.info("Application startup: Preloading Whisper model...")
     global configuration
-    global store 
+    global store_context_manager 
 
     try:
         # Initialize context / configuration
@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
 
         # Create pipeline for audio transcription
         if configuration.dev == "TRUE":
+            store_context_manager = make_pg_store() 
             pass
             # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
             # # Call the function to trigger @lru_cache and load model into memory
@@ -60,8 +61,29 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+from src.test_graph.graph import test_graph
+from datetime import datetime, timezone
+from langchain_core.messages import HumanMessage
+
 @app.get("/hello")
-def test_hello_world():
+async def test_hello_world():
+    
+    config = {
+            "configurable": {
+                "user_ctx": {"user_id":"Anubs_from_studio_3cf764e9-51c3-5404-9699-e16f5e4034ec"},
+                "assistant_ctx": {
+                    "user_id":"Anubs_from_studio_3cf764e9-51c3-5404-9699-e16f5e4034ec",
+                    "assistant_id":"3cf764e9-51c3-5404-9699-e16f5e4034ec"}
+            }
+        }
+    
+    system_time = datetime.now(tz=timezone.utc).isoformat
+    content = [{"type":"text", "text": system_time}]
+    input = {"messages": HumanMessage(content=content)}
+    store = make_pg_store()
+
+    result = await test_graph.ainvoke(input, config=config, store=store)
     logger.info(f"HELLO WORLD ENTRY")
     return {"Hello": "World"}
 
@@ -116,20 +138,21 @@ async def upload_media(
         }
            
         # Invoke the graph
-        if configuration.dev == "TRUE":
+        # if configuration.dev == "TRUE":
 
-            async with make_pg_store() as store:
-                await store.setup()
-                result = await process_media_graph_api_endpoint.ainvoke(
-                    initial_state, 
-                    config=config,
-                    store=store
-                    )
-        else:
-            result = await process_media_graph_api_endpoint.ainvoke(
-                initial_state, 
-                config=config
-                )
+        #     async with store_context_manager as store:
+        #         await store.setup()
+        #         logger.info(f"breakpoint")
+        #         result = await process_media_graph_api_endpoint.ainvoke(
+        #             initial_state, 
+        #                 config=config,
+        #                 store=store
+        #             )
+        # else:
+        result = await process_media_graph_api_endpoint.ainvoke(
+            initial_state, 
+            config=config
+            )
     
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
@@ -213,7 +236,7 @@ async def example_call_to_extend_api_for_avatars(request: Request):
 
     async with httpx.AsyncClient() as client:
         namespaces = await client.post(f"{root_url}store/namespaces",
-            headers={
+          headers={
               "Content-Type": "application/json",
               'x-api-key': f"LANGGRAPH_API_SERVER_KEY",
             },

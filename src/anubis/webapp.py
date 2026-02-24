@@ -31,9 +31,10 @@ async def lifespan(app: FastAPI):
         configuration = GlobalConfiguration()
         logger.info("Application startup: lifecycle...")
 
-        # engine = create_async_engine(configuration.vectorstore_postgres_uri)
-        # async_session = sessionmaker(engine, class_=AsyncSession)
-        # app.state.db_session = async_session
+        # for direct db connections for efficient processing
+        engine = create_async_engine(configuration.vectorstore_postgres_uri)
+        async_session = sessionmaker(engine, class_=AsyncSession)
+        app.state.db_session = async_session
 
         # store_cm = make_pg_store()
         # store = await store_cm.__aenter__()

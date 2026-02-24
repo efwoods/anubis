@@ -98,10 +98,8 @@ builder = StateGraph(GlobalState, context_schema=GlobalContext)
 
 builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
-if configuration.dev == "TRUE":
-    index_graph = builder.compile(store=make_pg_store)
-else:
-    index_graph = builder.compile()
+
+index_graph = builder.compile(store=make_pg_store)
 
 
 index_graph.name = "IndexGraph"

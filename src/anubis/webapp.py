@@ -47,11 +47,19 @@ async def lifespan(app: FastAPI):
             from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
             app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
 
-            yield
+            yield  # Application runs here
+                
+            # engine.dispose()
+            if getattr(app.state, "store_cm", None):
+                await app.state.store_cm.__aexit__(None, None, None)
+
+
+            # Shutdown: Cleanup if needed
+            logger.info("Shutting down application...")
 
         # Create pipeline for audio transcription
-        if configuration.dev == "TRUE":
-            pass
+        # if configuration.dev == "TRUE":
+            # pass
             # logger.info("Application startup: Preloading Whisper model...")
             # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
             # # Call the function to trigger @lru_cache and load model into memory
@@ -69,15 +77,6 @@ async def lifespan(app: FastAPI):
         logger.error("=" * 60)
         # Decide if you want to fail fast or continue
         raise  # Uncomment to prevent startup if model loading fails
-    
-    yield  # Application runs here
-    # engine.dispose()
-    if getattr(app.state, "store_cm", None):
-        await app.state.store_cm.__aexit__(None, None, None)
-
-    
-    # Shutdown: Cleanup if needed
-    logger.info("Shutting down application...")
 
 app = FastAPI(
     title="Media Processing API",

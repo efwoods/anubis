@@ -103,6 +103,7 @@ import uuid
 from langgraph.store.base import PutOp
 
 from langgraph.runtime import Runtime
+from uuid import uuid4
 
 async def batch_index_documents_vectorstore(
         runtime: Runtime,
@@ -123,12 +124,25 @@ async def batch_index_documents_vectorstore(
         }
 
         # Ensure each document has a unique key:
-        insert_document_keys = [
+        _ = [
             doc.metadata.update({"key":str(uuid.uuid4())})
             for doc in 
             vectorstore_documents_to_be_indexed
-            if doc.metadata.get("key") is None
+            if (doc.metadata.get("key") is None) or (type(doc.metadata.get("key", []) is not str))
         ]
+
+        # acquire keys
+        insert_document_keys = [
+            doc.metadata.get("key", "")
+            for doc in 
+            vectorstore_documents_to_be_indexed
+        ]
+
+        try:
+            assert len(insert_document_keys) == len(vectorstore_documents_to_be_indexed)  == len(filenames)
+        except Exception as e:
+            logger.warning(f"Assertion error: number of document keys, documents, and document filenames are not equal during document batch indexing:\n {e}")
+            
         
         # Delete files
         await delete_docs_filename(runtime, user_id, assistant_id, filenames)
@@ -138,7 +152,7 @@ async def batch_index_documents_vectorstore(
 
         # create upload namespaces
         namespaces = [(user_id, assistant_id, "document", filename) for filename in filenames]
-        batch_put_ops = [PutOp(namespace=namespace, key=key, value={"page_content":doc.page_content, "metadata":doc.metadata}) for namespace, key, doc in zip(namespaces, insert_document_keys, vectorstore_documents_to_be_indexed)]
+        batch_put_ops = [PutOp(namespace=(user_id, assistant_id, "document", doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"page_content":doc.page_content, "metadata":doc.metadata}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
 
         num_successful_batch_uploads = 0
         total_documents_to_be_indexed = len(batch_put_ops)

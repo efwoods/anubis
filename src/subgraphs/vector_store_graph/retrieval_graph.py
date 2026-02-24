@@ -203,17 +203,8 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 # builder.add_edge("generate_query", "retrieve")
 builder.add_edge("__start__", "retrieve")
 
-async def build_store(store_context_manager):
-    async with store_context_manager as store:
-        yield store
-
 # This compiles it into a graph you can invoke and deploy.
-if configuration.dev =="TRUE":
-    store_context_manager = make_pg_store()
-    store = build_store(store_context_manager)
-    retrieval_graph = builder.compile(store=store)
-else:
-    retrieval_graph = builder.compile()
+retrieval_graph = builder.compile(store=make_pg_store)
 retrieval_graph.name = "RetrievalGraph"
 
 __all__ = ["retrieval_graph"]

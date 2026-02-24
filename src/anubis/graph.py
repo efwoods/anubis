@@ -44,10 +44,7 @@ workflow.add_edge(START, 'retrieve_documents')
 workflow.add_edge('retrieve_documents', "invoke_agent")
 workflow.add_edge("invoke_agent", END)
 
-if configuration.dev == "TRUE":
-    graph = workflow.compile(store=make_pg_store)
-else:
-    graph = workflow.compile()    
+graph = workflow.compile(store=make_pg_store)
 
 graph.name = "Anubis"
 

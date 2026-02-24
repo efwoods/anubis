@@ -163,6 +163,11 @@ class GlobalConfiguration(IndexConfiguration):
         metadata={"description": "number of acceptable tokens in a request to the current llm in thousands of tokens."}
     )
 
+    langsmith_api_key: str = field(
+        default = None, 
+        metadata={"description": "api key"}
+    )
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

@@ -249,6 +249,61 @@ async def example_call_to_extend_api_for_avatars(request: Request):
         logger.info(f"breakpoing namespaces: {namespaces}")
     return ({"namespaces": namespaces.text})
 
+
+@app.post("/test-endpoint")
+async def test_endpoint(request: Request):
+    root_url = str(request.base_url)
+    logger.warning(f"root_url: {root_url}")
+
+    import requests
+    import json
+
+    url = f"{root_url}/runs/wait"
+
+    payload = json.dumps({
+      "assistant_id": "3cf764e9-51c3-5404-9699-e16f5e4034ec",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "what do these two images have in common?"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://upload.wikimedia.org/wikipedia/commons/2/2e/Lama_glama_Laguna_Colorada_2.jpg"
+                }
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://upload.wikimedia.org/wikipedia/commons/1/12/Llamas%2C_Laguna_Milluni_y_Nevado_Huayna_Potos%C3%AD_%28La_Paz_-_Bolivia%29.jpg"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "context": {
+        "user_id": "61f439e3-8557-4710-9d81-13124b35ceca",
+        "assistant_id": "9fdfe08b-36ac-47a5-ac1d-5c450c91a59a"
+      }
+    })
+    headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'x-api-key': configuration.langsmith_api_key
+    }
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+
+    print(response.text)
+
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

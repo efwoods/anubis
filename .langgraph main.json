@@ -3,11 +3,14 @@
   "dependencies": ["."],
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
-    "process_media_graph_api_endpoint": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:process_media_graph_api_endpoint",
     "test_graph": "./src/test_graph/graph.py:test_graph"
   },
   "store": {
-    "path": "./src/subgraphs/vector_store_graph/utils/retrieval.py:make_pg_store"
+    "index": {
+      "dims": 384,
+      "embed": "huggingface:sentence-transformers/all-MiniLM-L6-v2",
+      "fields": ["page_content"]
+    }
   },
   "env": ".env.dev"
 }

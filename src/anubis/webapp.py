@@ -47,6 +47,8 @@ async def lifespan(app: FastAPI):
             from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
             app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
 
+            yield
+
         # Create pipeline for audio transcription
         if configuration.dev == "TRUE":
             pass

@@ -12,16 +12,10 @@ from langgraph.graph import StateGraph, START, END
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.configuration import GlobalConfiguration
-from src.anubis.utils.nodes import (
-    invoke_agent
-)
-
-from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.anubis.utils.context import IdentityContext, AssistantContext
 from langchain_core.runnables import RunnableConfig
 
 configuration = GlobalConfiguration()
@@ -63,7 +57,9 @@ workflow.add_node("test_node", test_node)
 # Edges
 workflow.add_edge(START, 'test_node')
 workflow.add_edge("test_node", END)
-
-test_graph = workflow.compile()
+if configuration.dev == "TRUE":
+    test_graph = workflow.compile(store = make_pg_store)
+else:
+    test_graph = workflow.compile()
 
 __all__ = ["test_graph"]

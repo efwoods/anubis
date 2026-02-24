@@ -26,27 +26,49 @@ configuration = GlobalConfiguration()
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
+def create_process_media_graph(store=None):
+    # Define the Graph & Context
+    workflow = StateGraph(
+        state_schema=GlobalState, 
+        context_schema=GlobalContext
+    )
+
+    # Add Nodes
+    workflow.add_node("process_uploaded_files", process_uploaded_files_and_label_media_type)
+    workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_text_document)
+    workflow.add_node("index_docs", index_docs)
+
+    # Define Edges
+    workflow.add_edge(START, "process_uploaded_files")
+    workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
+    workflow.add_edge("convert_media_list_to_text_document", "index_docs")
+
+    if configuration.dev == "TRUE":
+        process_media_graph_api_endpoint = workflow.compile(store=store)
+    else:
+        process_media_graph_api_endpoint = workflow.compile()
+
+    process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"
+    return process_media_graph_api_endpoint
+
+
 # Define the Graph & Context
 workflow = StateGraph(
     state_schema=GlobalState, 
     context_schema=GlobalContext
 )
-
 # Add Nodes
 workflow.add_node("process_uploaded_files", process_uploaded_files_and_label_media_type)
 workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_text_document)
 workflow.add_node("index_docs", index_docs)
-
 # Define Edges
 workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
-
 if configuration.dev == "TRUE":
-    process_media_graph_api_endpoint = workflow.compile(store=make_pg_store)
+    process_media_graph_api_endpoint = workflow.compile()
 else:
     process_media_graph_api_endpoint = workflow.compile()
-    
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"
 
 __all__ = ["process_media_graph_api_endpoint"]

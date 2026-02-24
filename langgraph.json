@@ -9,5 +9,8 @@
   "store": {
     "path": "./src/subgraphs/vector_store_graph/utils/retrieval.py:make_pg_store"
   },
+  "http": {
+    "app": "./src/anubis/webapp.py:app"
+  },
   "env": ".env.dev"
 }

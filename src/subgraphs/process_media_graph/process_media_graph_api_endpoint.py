@@ -19,14 +19,10 @@ from src.subgraphs.process_media_graph.utils.nodes import (
 
 from src.subgraphs.vector_store_graph.index_graph import index_docs
 from src.subgraphs.process_media_graph.utils.nodes import process_uploaded_files_and_label_media_type
-from langgraph.store.base import BaseStore
-from langgraph.store.memory import InMemoryStore
 from src.anubis.utils.configuration import GlobalConfiguration
 
-from langchain_core.runnables import RunnableConfig
 configuration = GlobalConfiguration()
 
-from langgraph.store.postgres import AsyncPostgresStore
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
@@ -46,23 +42,8 @@ workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
 
-from langgraph.store.base import IndexConfig
-from langchain_core.embeddings import Embeddings
-import asyncio
-
-from src.subgraphs.vector_store_graph.utils.retrieval import make_text_encoder
-async def build_store():
-    embeddings = await make_text_encoder()
-    async with AsyncPostgresStore.from_conn_string(
-            conn_string="postgresql://postgres:postgres@127.0.0.1:54322",
-            index = IndexConfig(dims=384, embed=embeddings, fields=["page_content"])
-        ) as store:
-        await store.setup()
-        return store
 if configuration.dev == "TRUE":
-    # store_context_manager = make_pg_store()
-    # store = build_store(store_context_manager)
-    process_media_graph_api_endpoint = workflow.compile(store=make_pg_store())
+    process_media_graph_api_endpoint = workflow.compile(store=make_pg_store)
 else:
     process_media_graph_api_endpoint = workflow.compile()
     

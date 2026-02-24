@@ -1,4 +1,6 @@
-.bak
+
+**/uv.lock
+**/.bak/**
 **.ipynb
 *firebase-key.json
 **store.py**

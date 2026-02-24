@@ -10,22 +10,7 @@ fastapi
 uvicorn
 python-multipart
 
-
-# pydantic-settings
-# python-multipart
-
-# FastAPI and server
-
-# HTTP client
-# aiohttp
-# requests
-
-# Monitoring and logging
-# prometheus-client
-# structlog
-
-# Development and hot-reload support
-# watchfiles
+debugpy
 
 # Langchain
 langsmith
@@ -46,34 +31,3 @@ psycopg2-binary
 huggingface-hub>=0.24.0
 sentence-transformers
 langchain-mongodb
-
-# Document Processing
-pillow
-beautifulsoup4
-requests
-trafilatura
-
-
-# Media Processing
-yt-dlp
-instaloader
-ffmpeg-python
-
-# Audio Processing
-transformers
-accelerate
-aiofiles
-torchaudio
-
-# torch
-# pyannote-audio
-
-# Firebase
-firebase-admin
-
-# Image processing
-opencv-python
-mediapipe
-
-
-python-dateutil

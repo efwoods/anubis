@@ -142,49 +142,52 @@ async def retrieve(
     logging.info(f"XXXXX RETRIEVE NODE XXXX")
 
     user_id, assistant_id = await extract_user_id_assistant_id(config)
-    
-    logger.info(f"user_id: {user_id}")
-    logger.info(f"assistant_id: {assistant_id}")
-    
-    human_message = state['messages'][-1]
 
-    assert(isinstance(human_message, HumanMessage))
+    doc_results = []
+    if user_id != "" and assistant_id != "":
+        logger.info(f"user_id: {user_id}")
+        logger.info(f"assistant_id: {assistant_id}")
 
-    retrieval_message = {"messages" : [human_message]}
+        human_message = state['messages'][-1]
 
-    logger.info(f"{retrieval_message}")
-    
-    namespace = (user_id, assistant_id, "document")
+        assert(isinstance(human_message, HumanMessage))
 
-    logger.info(f"breakpoint")
-    if len(state['queries']) > 0:
-        query = state['queries'][-1]
-    else:
-        if isinstance(human_message, HumanMessage):
-            content = getattr(human_message, "content")
-            if isinstance(content, str):
-                query = content
-            elif isinstance(content, list):
-                query = content[0].get('text', "")
-            else:
-                query = content.get('text', "")
+        retrieval_message = {"messages" : [human_message]}
+
+        logger.info(f"{retrieval_message}")
+
+        namespace = (user_id, assistant_id, "document")
+
+        logger.info(f"breakpoint")
+        if len(state['queries']) > 0:
+            query = state['queries'][-1]
         else:
-            query = ""
+            if isinstance(human_message, HumanMessage):
+                content = getattr(human_message, "content")
+                if isinstance(content, str):
+                    query = content
+                elif isinstance(content, list):
+                    query = content[0].get('text', "")
+                else:
+                    query = content.get('text', "")
+            else:
+                query = ""
 
-    if query != "":    
-        item_results = await store.asearch(namespace, query=query)
+        if query != "":    
+            item_results = await store.asearch(namespace, query=query)
 
-    # format the items into documents
-    doc_results = [Document(page_content=item.value.get("page_content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
-    
-    # include the search result score on each document
-    [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]
+            # format the items into documents
+            doc_results = [Document(page_content=item.value.get("page_content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
 
-    logger.info(f"breakpoint")
+            # include the search result score on each document
+            [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]
 
-    # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
-    logger.info(f"{doc_results}")
-    state['retrieved_docs'] = []
+            logger.info(f"breakpoint")
+
+            # logger.info(f"Query: {state['queries'][-1]} | Docs: {len(retrieved_docs)}")
+            logger.info(f"{doc_results}")
+            state['retrieved_docs'] = []
+
     return {"retrieved_docs": doc_results}
 
 

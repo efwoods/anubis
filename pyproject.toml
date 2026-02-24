@@ -24,7 +24,6 @@ dependencies = [
     "langgraph>=1.0.9",
     "langgraph-checkpoint-postgres>=3.0.4",
     "langgraph-cli[inmem]>=0.4.12",
-    "langgraph-sdk>=0.3.8",
     "langsmith>=0.7.6",
     "llama-api-client>=0.6.0",
     "openai>=2.23.0",

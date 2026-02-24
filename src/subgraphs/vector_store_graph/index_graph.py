@@ -51,7 +51,8 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 
 async def index_docs(
-    state: GlobalState, runtime: Runtime[GlobalContext], config: RunnableConfig
+    state: GlobalState, runtime: Runtime[GlobalContext], config: RunnableConfig,
+    store: BaseStore
 ) -> dict[str, str]:
     """Asynchronously index documents in the given state using the configured retriever.
 

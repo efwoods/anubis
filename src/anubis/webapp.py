@@ -16,22 +16,41 @@ from contextlib import asynccontextmanager
 
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store, make_text_encoder
 
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
     # Startup: Preload the Whisper model pipeline
-    logger.info("Application startup: Preloading Whisper model...")
     global configuration
     global store_context_manager 
 
     try:
         # Initialize context / configuration
         configuration = GlobalConfiguration()
+        logger.info("Application startup: lifecycle...")
+
+        # engine = create_async_engine(configuration.vectorstore_postgres_uri)
+        # async_session = sessionmaker(engine, class_=AsyncSession)
+        # app.state.db_session = async_session
+
+        # store_cm = make_pg_store()
+        # store = await store_cm.__aenter__()
+        # await store.setup()
+        # app.state.store = store
+        # app.state.store_cm = store_cm
+        async with make_pg_store() as store:
+            await store.setup()
+            app.state.store = store
+
+            from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
+            app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
 
         # Create pipeline for audio transcription
         if configuration.dev == "TRUE":
-            store_context_manager = make_pg_store() 
             pass
+            # logger.info("Application startup: Preloading Whisper model...")
             # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
             # # Call the function to trigger @lru_cache and load model into memory
             # pipe = get_whisper_pipeline()
@@ -50,6 +69,10 @@ async def lifespan(app: FastAPI):
         raise  # Uncomment to prevent startup if model loading fails
     
     yield  # Application runs here
+    # engine.dispose()
+    if getattr(app.state, "store_cm", None):
+        await app.state.store_cm.__aexit__(None, None, None)
+
     
     # Shutdown: Cleanup if needed
     logger.info("Shutting down application...")
@@ -149,10 +172,12 @@ async def upload_media(
         #                 store=store
         #             )
         # else:
-        result = await process_media_graph_api_endpoint.ainvoke(
+        logger.info(f"breakpoint before process_media_graph")
+        result = await app.state.process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            config=config
+            config=config,
             )
+            # store = app.state.store
     
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])

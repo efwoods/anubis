@@ -12,5 +12,8 @@
       "fields": ["page_content"]
     }
   },
+  "http": {
+    "app": "./src/anubis/webapp.py:app"
+  },
   "env": ".env.dev"
 }

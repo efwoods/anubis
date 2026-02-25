@@ -12,5 +12,5 @@
     "app": "./src/anubis/webapp.py:app"
   },
   "env": ".env",
-  "image-distro": "wolfi"
+  "image_distro": "wolfi"
 }

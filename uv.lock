@@ -36,6 +36,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-multipart" },
     { name = "sentence-transformers" },
+    { name = "sqlalchemy" },
     { name = "uvicorn" },
 ]
 
@@ -80,6 +81,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.22" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.1" },
     { name = "sentence-transformers", specifier = ">=5.2.3" },
+    { name = "sqlalchemy", specifier = ">=2.0.47" },
     { name = "uvicorn", specifier = ">=0.41.0" },
 ]
 provides-extras = ["dev"]

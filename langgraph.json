@@ -12,5 +12,6 @@
   "http": {
     "app": "./src/anubis/webapp.py:app"
   },
-  "env": ".env.dev"
+  "env": ".env.dev",
+  "image-distro": "wolfi"
 }

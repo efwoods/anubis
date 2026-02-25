@@ -35,40 +35,38 @@ async def lifespan(app: FastAPI):
 
         # for direct db connections for efficient processing
         logger.info("Application startup: pre-create engine...")
-        engine = create_async_engine(configuration.vectorstore_postgres_uri)
+        # engine = create_async_engine(configuration.vectorstore_postgres_uri)
         logger.info("Application startup: post-create engine...")
 
         logger.info("Application startup: pre-create async session...")
-        async_session = sessionmaker(engine, class_=AsyncSession)
+        # async_session = sessionmaker(engine, class_=AsyncSession)
         logger.info("Application startup: post-create async session...")
 
-        app.state.db_session = async_session
+
+        # Langgraph SDK extension 
+        # app.state.db_session = async_session
+        # app.state.langgraph_client = get_client()
         
-        app.state.langgraph_client = get_client()
 
-        # store_cm = make_pg_store()
-        # store = await store_cm.__aenter__()
-        # await store.setup()
-        # app.state.store = store
-        # app.state.store_cm = store_cm
-        async with make_pg_store() as store:
-            await store.setup()
-            app.state.store = store
+        
+        # async with make_pg_store() as store:
+        #     await store.setup()
+        #     app.state.store = store
 
-            from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
+        #     from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
 
-            logger.info("Application startup: pre-create create_process_media_graph during async make_pg_store...")
+        #     logger.info("Application startup: pre-create create_process_media_graph during async make_pg_store...")
 
-            app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
+        #     app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
 
-            logger.info("Application startup: post-create create_process_media_graph during async make_pg_store...")
+        #     logger.info("Application startup: post-create create_process_media_graph during async make_pg_store...")
 
-            yield  # Application runs here
+        #     yield  # Application runs here
                 
-            # Shutdown: Cleanup if needed
-            logger.info("Shutting down application...")
+        #     # Shutdown: Cleanup if needed
+        #     logger.info("Shutting down application...")
 
-        await engine.dispose()
+        # await engine.dispose()
         # Create pipeline for audio transcription
         # if configuration.dev == "TRUE":
             # pass
@@ -82,13 +80,14 @@ async def lifespan(app: FastAPI):
             # logger.info(f"  - Device: {pipe.device}")
             # logger.info(f"  - Ready to process audio requests")
 
+        yield
         
     except Exception as e:
         logger.error("=" * 60)
         logger.error(f"✗ CRITICAL: Failed to preload Whisper model: {e}", exc_info=True)
         logger.error("=" * 60)
 
-        await engine.dispose()
+        # await engine.dispose()
         # Decide if you want to fail fast or continue
         raise  # Uncomment to prevent startup if model loading fails
 
@@ -174,6 +173,8 @@ async def upload_media(
                 "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
             }
         }
+
+        # process_media_graph_api_endpoint = app.state.process_media_graph_api_endpoint
            
         # Invoke the graph
         # if configuration.dev == "TRUE":
@@ -188,7 +189,7 @@ async def upload_media(
         #             )
         # else:
         logger.info(f"breakpoint before process_media_graph")
-        result = await app.state.process_media_graph_api_endpoint.ainvoke(
+        result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
             config=config,
             )

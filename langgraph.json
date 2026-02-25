@@ -2,14 +2,10 @@
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": ["."],
   "graphs": {
-    "Anubis": "./src/anubis/graph.py:graph",
-    "test_graph": "./src/test_graph/graph.py:test_graph"
+    "Anubis": "./src/anubis/graph.py:graph"
   },
   "store": {
     "path": "./src/subgraphs/vector_store_graph/utils/retrieval.py:make_pg_store"
-  },
-  "http": {
-    "app": "./src/anubis/webapp.py:app"
   },
   "env": ".env",
   "image_distro": "wolfi"

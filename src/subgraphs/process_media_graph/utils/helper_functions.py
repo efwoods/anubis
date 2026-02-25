@@ -27,15 +27,8 @@ logger = logging.getLogger(__name__)
 from pydantic.dataclasses import dataclass
 
 from sentence_transformers import SentenceTransformer
+from langchain_core.messages.utils import count_tokens_approximately
 
-# Load once — reuse
-configuration = GlobalConfiguration()
-embedder = SentenceTransformer(configuration.embedding_model)
-embedding_tokenizer = embedder.tokenizer
-
-def token_length(text: str) -> int:
-    # Most accurate: no special tokens, just like sentence-transformers pooling
-    return len(embedding_tokenizer.encode(text, add_special_tokens=False))
 @dataclass
 class SemanticChunkIndexList:
     index: list[int]
@@ -153,8 +146,8 @@ async def process_text_media_item_target_for_vectorstore(
                 " ",     # Spaces
                 ""       # Characters
             ]
-
-        token_text_content_length = token_length(text_content)    
+   
+        token_text_content_length = count_tokens_approximately([text_content])    
         if token_text_content_length > chunk_size and use_semantic_chunks:
         
             # Define meaningful chunks first

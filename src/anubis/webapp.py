@@ -34,11 +34,16 @@ async def lifespan(app: FastAPI):
         logger.info("Application startup: lifecycle...")
 
         # for direct db connections for efficient processing
+        logger.info("Application startup: pre-create engine...")
         engine = create_async_engine(configuration.vectorstore_postgres_uri)
+        logger.info("Application startup: post-create engine...")
+
+        logger.info("Application startup: pre-create async session...")
         async_session = sessionmaker(engine, class_=AsyncSession)
+        logger.info("Application startup: post-create async session...")
 
         app.state.db_session = async_session
-
+        
         app.state.langgraph_client = get_client()
 
         # store_cm = make_pg_store()
@@ -51,7 +56,12 @@ async def lifespan(app: FastAPI):
             app.state.store = store
 
             from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
+
+            logger.info("Application startup: pre-create create_process_media_graph during async make_pg_store...")
+
             app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
+
+            logger.info("Application startup: post-create create_process_media_graph during async make_pg_store...")
 
             yield  # Application runs here
                 

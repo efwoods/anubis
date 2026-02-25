@@ -3,7 +3,6 @@
   "dependencies": ["."],
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
-    "process_media_graph_api_endpoint": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:process_media_graph_api_endpoint",
     "test_graph": "./src/test_graph/graph.py:test_graph"
   },
   "store": {

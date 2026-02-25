@@ -24,8 +24,6 @@ def parse_datetime(dt_value):
 import logging
 logger = logging.getLogger(__name__)
 
-
-
 async def delete_docs_filename(runtime, user_id, assistant_id, filenames):
     idx = 0
     for filename in filenames:

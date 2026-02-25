@@ -37,6 +37,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "python-multipart>=0.0.22",
     "sentence-transformers>=5.2.2",
+    "sqlalchemy>=2.0.47",
     "uvicorn>=0.38.0",
 ]
 

@@ -19,6 +19,8 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store, make
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
+from langgraph_sdk import get_client
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
@@ -34,7 +36,10 @@ async def lifespan(app: FastAPI):
         # for direct db connections for efficient processing
         engine = create_async_engine(configuration.vectorstore_postgres_uri)
         async_session = sessionmaker(engine, class_=AsyncSession)
+
         app.state.db_session = async_session
+
+        app.state.langgraph_client = get_client()
 
         # store_cm = make_pg_store()
         # store = await store_cm.__aenter__()
@@ -50,14 +55,10 @@ async def lifespan(app: FastAPI):
 
             yield  # Application runs here
                 
-            # engine.dispose()
-            if getattr(app.state, "store_cm", None):
-                await app.state.store_cm.__aexit__(None, None, None)
-
-
             # Shutdown: Cleanup if needed
             logger.info("Shutting down application...")
 
+        await engine.dispose()
         # Create pipeline for audio transcription
         # if configuration.dev == "TRUE":
             # pass
@@ -76,6 +77,8 @@ async def lifespan(app: FastAPI):
         logger.error("=" * 60)
         logger.error(f"✗ CRITICAL: Failed to preload Whisper model: {e}", exc_info=True)
         logger.error("=" * 60)
+
+        await engine.dispose()
         # Decide if you want to fail fast or continue
         raise  # Uncomment to prevent startup if model loading fails
 
@@ -275,6 +278,35 @@ async def example_call_to_extend_api_for_avatars(request: Request):
         )
         logger.info(f"breakpoing namespaces: {namespaces}")
     return ({"namespaces": namespaces.text})
+
+from sqlalchemy import text
+
+@app.get("/test_store_endpoint")
+async def test_store_access_production(request: Request):
+    
+    langgraph_client = app.state.langgraph_client
+    test_search_results = await langgraph_client.assistants.search()
+
+    logger.info(f"test_search_results: {test_search_results}")
+
+    agent = test_search_results[0]
+
+    thread = await langgraph_client.threads.create()
+
+    logger.info(f"thread: {thread}")
+
+    test_input = {"messages": [{"role": "human", "content": "what's the weather in la"}]}
+
+    async for chunk in langgraph_client.runs.stream(thread['thread_id'], test_search_results["assistant_id"], input=input):
+        logger.info(f"chunk: {chunk}")
+
+    db_session = app.state.db_session
+    identify = "2feaa9d8-50c0-4550-81fa-9fb79bfe23f0.Anubis"
+    with db_session() as session:
+        result = await session.execute(
+            text("SELECT * FROM store WHERE prefix LIKE :prefix"),
+            {"prefix": f"{identify}%"})
+
 
 if __name__ == "__main__":
     import uvicorn

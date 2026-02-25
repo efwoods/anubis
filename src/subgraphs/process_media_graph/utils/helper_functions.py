@@ -259,7 +259,7 @@ async def process_text_media_item_target_for_vectorstore(
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 separators=separators,
-                length_function=token_length,
+                length_function=count_tokens_approximately,
                 is_separator_regex=False,
             )
 
@@ -278,7 +278,7 @@ async def process_text_media_item_target_for_vectorstore(
 
                     for semantic_text_chunk in chunks:
                         # Determine the length in tokens per semantic text chunk
-                        semantic_text_chunk_token_size = token_length(semantic_text_chunk)
+                        semantic_text_chunk_token_size = count_tokens_approximately([semantic_text_chunk])
 
                         if semantic_text_chunk_token_size < chunk_size:
                             """ create documents of semantic chunks """
@@ -388,7 +388,7 @@ async def process_text_media_item_target_for_vectorstore(
             else:
                 logger.info(f"use_semantic_chunks is False AND token_text_content_length is less than or equal to the chunk_size (256 tokens before truncation)")
                 idx = 0
-                text_chunk_token_size = token_length(text_content)
+                text_chunk_token_size = count_tokens_approximately([text_content])
                 all_documents = []
 
                 # Redundant identification of chunk_size

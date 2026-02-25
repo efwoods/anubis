@@ -43,8 +43,7 @@ workflow.add_node("invoke_agent", invoke_agent)
 workflow.add_edge(START, 'retrieve_documents')
 workflow.add_edge('retrieve_documents', "invoke_agent")
 workflow.add_edge("invoke_agent", END)
-store = make_pg_store
-graph = workflow.compile(store=store)
+graph = workflow.compile(store=make_pg_store)
 
 graph.name = "Anubis"
 

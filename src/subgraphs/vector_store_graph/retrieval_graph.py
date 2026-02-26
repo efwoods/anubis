@@ -156,7 +156,9 @@ async def retrieve(
 
         logger.info(f"{retrieval_message}")
 
-        namespace = (user_id, assistant_id, "document")
+        # namespace = (user_id, assistant_id, "document")
+        # testing: 
+        namespace = ("evan_woods", "shivon_zilis", "document")
 
         logger.info(f"breakpoint")
         if len(state['queries']) > 0:

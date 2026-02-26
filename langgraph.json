@@ -3,7 +3,7 @@
   "dependencies": ["."],
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
-    "test_graph": "./src/test_graph/graph.py:test_graph"
+    "test_graph": "./src/url_loading_graph/graph.py:url_loader"
   },
   "store": {
     "index": {

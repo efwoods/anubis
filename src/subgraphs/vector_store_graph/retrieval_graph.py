@@ -179,7 +179,8 @@ async def retrieve(
             item_results = await store.asearch(namespace, query=query)
 
             # format the items into documents
-            doc_results = [Document(page_content=item.value.get("page_content", ""), metadata=item.value.get("metadata", "")) for item in item_results]
+            doc_results = [Document(
+                page_content=item.value.get("document", {}).get("kwargs", {}).get("page_content", ""), metadata=item.value.get("document", {}).get("kwargs", {}).get("metadata", {})) for item in item_results if item.value.get("document", {}).get("kwargs", {}).get("page_content", "") != ""]
 
             # include the search result score on each document
             [doc.metadata.update({"score":getattr(item, "score", "")}) for doc, item in zip(doc_results, item_results)]

@@ -9,6 +9,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
+    "asyncio>=4.0.0",
     "beautifulsoup4>=4.14.3",
     "chromadb>=1.4.1",
     "debugpy>=1.8.20",
@@ -30,6 +31,7 @@ dependencies = [
     "langgraph-sdk>=0.2.10",
     "langsmith>=0.4.49",
     "llama-api-client>=0.6.0",
+    "nest-asyncio>=1.6.0",
     "openai>=2.16.0",
     "pillow>=12.1.0",
     "psycopg2-binary>=2.9.11",

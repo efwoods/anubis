@@ -9,11 +9,8 @@
     "index": {
       "dims": 384,
       "embed": "huggingface:sentence-transformers/all-MiniLM-l6-v2",
-      "fields": "page_content"
+      "fields": ["page_content"]
     }
-  },
-  "http": {
-    "app": "./src/anubis/webapp.py:app"
   },
   "env": ".env.dev",
   "image_distro": "wolfi"

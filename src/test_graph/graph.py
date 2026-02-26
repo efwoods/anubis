@@ -59,21 +59,21 @@ async def test_node(state: GlobalState, config: RunnableConfig, runtime: Runtime
     logger.info(f"pages[0].page_content: {pages[0].page_content}")
 
 
-    namespace = ("evan_woods", "shivon_zilis", "document", "lifeboat_com_ex_bios_shivon_a_zilis")
+    namespace = ("evan_woods", "shivon_zilis", "test")
 
     aput_result = await runtime.store.aput(
         namespace=namespace, 
-        key="document1", 
-        value={"page_content":pages[0].page_content, "metadata": pages[0].metadata}
+        key="test", 
+        value={"document":pages[0].to_json()}
     )
 
-    aget_result = await runtime.store.aget(namespace, key="document1")
+    aget_result = await runtime.store.aget(namespace, key="test")
     logger.info(f"aget_result: {aget_result}")
 
-    asearch_result = await runtime.store.asearch(("evan_woods", "shivon_zilis", "document"))
+    asearch_result = await runtime.store.asearch(("evan_woods", "shivon_zilis", "test"))
     logger.info("asearch_result: {asearch_result}")
 
-    asearch_result_query = await runtime.store.asearch(("evan_woods", "shivon_zilis", "document"), query="Who is Shivon Zilis")
+    asearch_result_query = await runtime.store.asearch(("evan_woods", "shivon_zilis", "test"), query="Who is Shivon Zilis")
     logger.info(f"asearch_result with query: {asearch_result_query}")
 
     # human_message = state['messages'][-1]
@@ -94,6 +94,6 @@ workflow.add_node("test_node", test_node)
 # Edges
 workflow.add_edge(START, 'test_node')
 workflow.add_edge("test_node", END)
-test_graph = workflow.compile(store = make_pg_store)
+test_graph = workflow.compile()
 
 __all__ = ["test_graph"]

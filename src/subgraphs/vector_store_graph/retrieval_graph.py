@@ -204,7 +204,7 @@ builder.add_node(retrieve)  # type: ignore[arg-type]
 builder.add_edge("__start__", "retrieve")
 
 # This compiles it into a graph you can invoke and deploy.
-retrieval_graph = builder.compile(store=make_pg_store)
+retrieval_graph = builder.compile()
 retrieval_graph.name = "RetrievalGraph"
 
 __all__ = ["retrieval_graph"]

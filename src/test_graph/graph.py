@@ -23,6 +23,13 @@ configuration = GlobalConfiguration()
 from langgraph.store.base import BaseStore
 from langgraph.runtime import Runtime
 from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+from langchain_core.messages import HumanMessage
+from langchain_community.document_loaders import WebBaseLoader
+
+import asyncio
+import nest_asyncio
+
+nest_asyncio.apply()
 
 import logging
 logger = logging.getLogger(__name__)
@@ -43,6 +50,41 @@ async def test_node(state: GlobalState, config: RunnableConfig, runtime: Runtime
     results = await runtime.store.asearch(("testing", "documents"), query="UNICORN.")
     logger.info(f"testing_get: {testing_get}")
     logger.info(f"results: {results}")
+
+    loader = WebBaseLoader("https://lifeboat.com/ex/bios.shivon.a.zilis")
+
+    pages = []
+    async for doc in loader.alazy_load():
+        pages.append(doc)
+    # logger.info(f"pages[0].page_content[:100]: {pages[0].page_content[:100]:}")
+    logger.info(f"pages[0].page_content: {pages[0].page_content}")
+    logger.info(f"pages[0].metadata: {pages[0].metadata}")
+
+    logger.info(f"pages[0].metadata: {pages[0].metadata}")
+    logger.info(f"pages[0].page_content: {pages[0].page_content}")
+
+
+    namespace = ("evan_woods", "shivon_zilis", "document", "lifeboat_com_ex_bios_shivon_a_zilis")
+
+    aput_result = await runtime.store.aput(
+        namespace=namespace, 
+        key="document1", 
+        value={"page_content":pages[0].page_content, "metadata": pages[0].metadata}
+    )
+
+    aget_result = await runtime.store.aget(namespace, key="document1")
+    logger.info(f"aget_result: {aget_result}")
+
+    asearch_result = await runtime.store.asearch(("evan_woods", "shivon_zilis", "document"))
+    logger.info("asearch_result: {asearch_result}")
+
+    asearch_result_query = await runtime.store.asearch(("evan_woods", "shivon_zilis", "document"), query="Who is Shivon Zilis")
+    logger.info(f"asearch_result with query: {asearch_result_query}")
+
+    # human_message = state['messages'][-1]
+
+    # if isinstance(human_message, HumanMessage):
+        
 
 
 # Build minimal graph: START -> agent -> END

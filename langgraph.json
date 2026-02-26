@@ -5,8 +5,12 @@
     "Anubis": "./src/anubis/graph.py:graph"
   },
   "store": {
-    "path": "./src/subgraphs/vector_store_graph/utils/retrieval.py:make_pg_store"
+    "index": {
+      "dims": 384,
+      "embed": "huggingface:sentence-transformers/all-MiniLM-l6-v2",
+      "fields": ["page_content"]
+    }
   },
-  "env": ".env",
-  "image_distro": "wolfi"
+  "env": ".env.dev",
+  "image-distro": "wolfi"
 }

@@ -26,11 +26,6 @@ from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from langchain_core.messages import HumanMessage
 from langchain_community.document_loaders import WebBaseLoader
 
-import asyncio
-import nest_asyncio
-
-nest_asyncio.apply()
-
 import logging
 logger = logging.getLogger(__name__)
 

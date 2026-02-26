@@ -2,7 +2,8 @@
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": ["."],
   "graphs": {
-    "Anubis": "./src/anubis/graph.py:graph"
+    "Anubis": "./src/anubis/graph.py:graph",
+    "test_graph": "./src/anubis/test_graph/graph.py:test_graph"
   },
   "store": {
     "index": {

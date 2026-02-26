@@ -67,7 +67,7 @@ workflow.add_edge("convert_media_list_to_text_document", "index_docs")
 
 
 
-process_media_graph_api_endpoint = workflow.compile(store=make_pg_store)
+process_media_graph_api_endpoint = workflow.compile()
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"
 
 __all__ = ["process_media_graph_api_endpoint"]

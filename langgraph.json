@@ -9,7 +9,7 @@
     "index": {
       "dims": 384,
       "embed": "huggingface:sentence-transformers/all-MiniLM-l6-v2",
-      "fields": ["page_content"]
+      "fields": ["document.kwargs.page_content"]
     }
   },
   "env": ".env.dev",

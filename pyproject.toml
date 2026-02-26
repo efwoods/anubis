@@ -9,16 +9,13 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "asyncio>=4.0.0",
-    "beautifulsoup4>=4.14.3",
-    "chromadb>=1.4.1",
     "debugpy>=1.8.20",
-    "fastapi>=0.133.0",
+    "fastapi>=0.133.1",
     "huggingface-hub>=0.24.0",
     "langchain>=1.2.10",
     "langchain-chroma>=1.1.0",
     "langchain-community>=0.4.1",
-    "langchain-core>=1.2.15",
+    "langchain-core>=1.2.16",
     "langchain-huggingface>=1.2.0",
     "langchain-mongodb>=0.11.0",
     "langchain-openai>=1.1.10",
@@ -27,17 +24,15 @@ dependencies = [
     "langgraph>=1.0.9",
     "langgraph-checkpoint-postgres>=3.0.4",
     "langgraph-cli[inmem]>=0.4.12",
-    "langsmith>=0.7.6",
+    "langgraph-sdk>=0.3.9",
+    "langsmith>=0.7.7",
     "llama-api-client>=0.6.0",
-    "nest-asyncio>=1.6.0",
-    "openai>=2.16.0",
-    "pillow>=12.1.0",
+    "openai>=2.24.0",
     "psycopg2-binary>=2.9.11",
     "pydantic>=2.12.5",
     "python-multipart>=0.0.22",
     "sentence-transformers>=5.2.3",
     "uvicorn>=0.41.0",
-    "sqlalchemy>=2.0.47",
 ]
 
 

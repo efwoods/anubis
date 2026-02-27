@@ -11,8 +11,7 @@ from contextlib import contextmanager, asynccontextmanager
 from typing import Generator, AsyncGenerator
 
 from langchain_core.embeddings import Embeddings
-from langchain_core.runnables import RunnableConfig
-from langchain_core.vectorstores import VectorStoreRetriever, VectorStore
+from langchain_core.vectorstores import VectorStoreRetriever
 from src.anubis.utils.configuration import IndexConfiguration, GlobalConfiguration
 
 import asyncio
@@ -117,63 +116,64 @@ async def make_retriever(
                 f"Got: {configuration.retriever_provider}"
             )
 
-from sqlalchemy.ext.asyncio import create_async_engine
-from langchain_postgres import PGVector
+# from sqlalchemy.ext.asyncio import create_async_engine
+# from langchain_postgres import PGVector
 
-async def make_pg_vector(
-    configuration: GlobalConfiguration):
+# async def make_pg_vector(
+#     configuration: GlobalConfiguration):
 
-    """ EXAMPLE USAGE
+#     """ EXAMPLE USAGE
 
-    vector_store = make_pg_vector(configuration)
-    async with vector_store as vector_store:
-        logger.info(f"breakpoint")
-        results = await vector_store.asimilarity_search_with_relevance_scores(
-        query="kitty", 
-        filter={"id": {"$in": [1,2,5,9]}},
-        score_threshold=0.3
-        )
+#     vector_store = make_pg_vector(configuration)
+#     async with vector_store as vector_store:
+#         logger.info(f"breakpoint")
+#         results = await vector_store.asimilarity_search_with_relevance_scores(
+#         query="kitty", 
+#         filter={"id": {"$in": [1,2,5,9]}},
+#         score_threshold=0.3
+#         )
 
-    retrieved_docs = [doc[0] for doc in results] # extract documents only; a tuple of relevance scores is returned
+#     retrieved_docs = [doc[0] for doc in results] # extract documents only; a tuple of relevance scores is returned
 
-    """
+#     """
 
-    logger.info(f"make_pg_vector ENTRYPOINT")
-    embedding = await make_text_encoder(configuration.embedding_model)
-    logger.info(f"configuration.vectorstore_postgres_uri: {configuration.vectorstore_postgres_uri}")
-    async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
+#     logger.info(f"make_pg_vector ENTRYPOINT")
+#     embedding = await make_text_encoder(configuration.embedding_model)
+#     logger.info(f"configuration.vectorstore_postgres_uri: {configuration.vectorstore_postgres_uri}")
+#     async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
         
-    vector_store = await asyncio.to_thread(
-        PGVector.from_existing_index,
-        embedding=embedding,
-        collection_name = "documents",
-        connection = async_engine,
-        async_mode=True,
-        create_extension=False
-    )
+#     vector_store = await asyncio.to_thread(
+#         PGVector.from_existing_index,
+#         embedding=embedding,
+#         collection_name = "documents",
+#         connection = async_engine,
+#         async_mode=True,
+#         create_extension=False
+#     )
 
-    return vector_store
-
-from langgraph.store.postgres import AsyncPostgresStore
-
-from typing import Optional
-from langchain_huggingface import HuggingFaceEmbeddings
-import contextlib
-from langgraph.store.base import IndexConfig
+#     return vector_store
 
 
-@contextlib.asynccontextmanager
-async def make_pg_store():
+# === USE THIS METHOD WHEN CONNECTING TO A CUSTOM STORE === #
 
-    logger.info(f"make_pg_store ENTRYPOINT")
+# from langgraph.store.postgres import AsyncPostgresStore
 
-    configuration = GlobalConfiguration()
-    embeddings = await make_text_encoder(configuration.embedding_model)
+# import contextlib
+# from langgraph.store.base import IndexConfig
 
-    async with AsyncPostgresStore.from_conn_string(
-        conn_string=configuration.async_postgres_store_uri,
-        index = IndexConfig(dims=384, embed=embeddings, fields=["page_content"])
-        ) as store:
-        await store.setup()
-        yield store
+
+# @contextlib.asynccontextmanager
+# async def make_pg_store():
+
+#     logger.info(f"make_pg_store ENTRYPOINT")
+
+#     configuration = GlobalConfiguration()
+#     embeddings = await make_text_encoder(configuration.embedding_model)
+
+#     async with AsyncPostgresStore.from_conn_string(
+#         conn_string=configuration.async_postgres_store_uri,
+#         index = IndexConfig(dims=384, embed=embeddings, fields=["page_content"])
+#         ) as store:
+#         await store.setup()
+#         yield store
 

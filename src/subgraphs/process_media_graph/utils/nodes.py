@@ -23,8 +23,6 @@ from langgraph.runtime import Runtime
 
 from langgraph.store.base import BaseStore
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
-
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item_target_for_vectorstore
 
 from src.anubis.utils.state import GlobalState
@@ -36,7 +34,6 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from src.anubis.utils.model import init_model
 
-from langgraph.prebuilt import ToolRuntime
 from langchain.tools import tool
 
 from src.anubis.utils.configuration import GlobalConfiguration
@@ -646,24 +643,24 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
 
     # store
 
-    from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
+    # from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
-    pg_store_manager = await make_pg_store(configuration)
+    # pg_store_manager = await make_pg_store(configuration)
 
-    async with pg_store_manager as pg_store:
-        namespace = (user_id, assistant_id)
-        reference_audio  = pg_store.aget(namespace=namespace, key="reference_audio")
-        """
-        {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
-        """
+    # async with pg_store_manager as pg_store:
+    #     namespace = (user_id, assistant_id)
+    #     reference_audio  = pg_store.aget(namespace=namespace, key="reference_audio")
+    """
+    {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
+    """
 
     """ ANALYZE AUDIO """
 
 
-    if reference_audio is not None:
-        logger.info(f"Identify the number of speakers in the audio")
-        logger.info(f"Identify if the target speaker is in the audio")
-        logger.info(f"Diarize the audio (timestamps of who is speaking when)")
+    # if reference_audio is not None:
+    logger.info(f"Identify the number of speakers in the audio")
+    logger.info(f"Identify if the target speaker is in the audio")
+    logger.info(f"Diarize the audio (timestamps of who is speaking when)")
         
 # Otherwise presume the audio is a single speaker of the target if there is no reference audio; mention in metadata
     if configuration.dev == "TRUE":

@@ -4,7 +4,7 @@
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
     "process_media_graph_api_endpoint": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:process_media_graph_api_endpoint",
-    "test_graph": "./src/test_graph/graph.py:test_graph"
+    "url_loading_graph": "./src/url_loading_graph/graph.py:url_loader"
   },
   "store": {
     "path": "./src/subgraphs/vector_store_graph/utils/retrieval.py:make_pg_store",

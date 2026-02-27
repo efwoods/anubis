@@ -18,7 +18,6 @@ from src.anubis.utils.nodes import (
 
 from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 from dotenv import load_dotenv
 load_dotenv()
 

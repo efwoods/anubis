@@ -40,7 +40,6 @@ from src.anubis.utils.model import init_model
 
 from src.anubis.utils.helper_functions import summarize_messages
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
 async def generate_query(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]

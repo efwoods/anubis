@@ -24,8 +24,6 @@ from src.anubis.utils.configuration import GlobalConfiguration
 configuration = GlobalConfiguration()
 
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
-
 def create_process_media_graph(store=None):
     # Define the Graph & Context
     workflow = StateGraph(

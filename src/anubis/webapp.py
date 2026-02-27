@@ -14,13 +14,6 @@ logger = logging.getLogger(__name__)
  
 from contextlib import asynccontextmanager
 
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store, make_text_encoder
-
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-
-from langgraph_sdk import get_client
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""

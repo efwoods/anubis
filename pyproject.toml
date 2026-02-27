@@ -1,39 +1,30 @@
 [project]
 name = "agent"
 version = "0.0.1"
-description = "Starter template for making a new agent LangGraph."
+description = "Anubis graph"
 authors = [
-    { name = "William Fu-Hinthorn", email = "13333726+hinthornw@users.noreply.github.com" },
+    { name = "Evan Woods", email = "22337004+efwoods@users.noreply.github.com" },
 ]
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "beautifulsoup4>=4.14.3",
-    "debugpy>=1.8.20",
-    "fastapi>=0.133.1",
-    "huggingface-hub>=0.24.0",
+    "huggingface-hub>=0.36.2",
     "langchain>=1.2.10",
     "langchain-chroma>=1.1.0",
     "langchain-community>=0.4.1",
     "langchain-core>=1.2.16",
     "langchain-huggingface>=1.2.0",
-    "langchain-mongodb>=0.11.0",
     "langchain-openai>=1.1.10",
-    "langchain-postgres>=0.0.17",
     "langchain-unstructured>=1.0.1",
     "langgraph>=1.0.9",
-    "langgraph-checkpoint-postgres>=3.0.4",
     "langgraph-cli[inmem]>=0.4.12",
-    "langgraph-sdk>=0.3.9",
     "langsmith>=0.7.7",
     "llama-api-client>=0.6.0",
     "openai>=2.24.0",
-    "psycopg2-binary>=2.9.11",
     "pydantic>=2.12.5",
-    "python-multipart>=0.0.22",
     "sentence-transformers>=5.2.3",
-    "uvicorn>=0.41.0",
 ]
 
 
@@ -81,6 +72,7 @@ convention = "google"
 [dependency-groups]
 dev = [
     "anyio>=4.7.0",
+    "debugpy>=1.8.20",
     "langgraph-cli[inmem]>=0.4.7",
     "mypy>=1.13.0",
     "pytest>=8.3.5",

@@ -1,16 +1,8 @@
 langgraph
-langgraph-sdk
 llama-api-client
 langgraph-cli[inmem]
 pydantic
 openai
-
-# fastapi
-fastapi
-uvicorn
-python-multipart
-
-debugpy
 
 # Langchain
 langsmith
@@ -22,13 +14,6 @@ langchain-core
 langchain-chroma
 langchain-openai
 
-# Database
-langgraph-checkpoint-postgres
-langchain-postgres
-psycopg2-binary
-
-
-huggingface-hub>=0.24.0
+huggingface-hub
 sentence-transformers
-langchain-mongodb
 beautifulsoup4

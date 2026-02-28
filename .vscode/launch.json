@@ -17,6 +17,22 @@
         }
       ],
       "justMyCode": true
+    },
+    {
+      "name": "Python: Attach Neural Nexus API",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5687
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}/api",
+          "remoteRoot": "/app"
+        }
+      ],
+      "justMyCode": true
     }
   ]
 }

@@ -4,3 +4,10 @@ fastapi
 langgraph-sdk
 supabase
 python-dotenv
+debugpy
+langchain-core
+langchain-text-splitters
+langchain-openai
+langgraph
+python-multipart
+scalar-fastapi

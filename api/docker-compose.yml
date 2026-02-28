@@ -3,8 +3,9 @@ services:
     build: .
     ports:
       - "8000:8000"
+      - "5687:5687"
     env_file:
       - .env.dev
     volumes:
       - .:/app
-    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    command: python -m debugpy --listen 0.0.0.0:5687 -m uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload

@@ -29,6 +29,8 @@ from pydantic.dataclasses import dataclass
 from sentence_transformers import SentenceTransformer
 from langchain_core.messages.utils import count_tokens_approximately
 
+from uuid import uuid4, uuid5, NAMESPACE_URL
+
 @dataclass
 class SemanticChunkIndexList:
     index: list[int]
@@ -42,6 +44,9 @@ async def split_text_into_chunks(
         assistant_id: str,
         classification_metadata: dict,
         idx: int, 
+        document_id: str,
+        filename: str, 
+        filename_uuid5: str,
     ):
     
     """ TEXT CHUNKING HELPER FUNCTION: process_text_media_item_target_for_vectorstore """
@@ -62,7 +67,6 @@ async def split_text_into_chunks(
         doc = Document(
             page_content=chunk,
             metadata={
-                "key":str(uuid4),
                 "user_id": user_id,
                 "assistant_id": assistant_id,
                 "created_at": current_timestamp,
@@ -71,11 +75,13 @@ async def split_text_into_chunks(
                 "type": "text",
                 "chunk_index": idx,
                 "total_chunks": len(text_chunks),
-                # Include any additional metadata from original media_item
-                **{k: v for k, v in source_metadata.items() if k not in ["source"]}
+                "filename": filename,
+                "filename_uuid5": str(uuid5(filename)),
+                "document_id":str(uuid4()),
             }
         )
         idx += 1
+        doc.metadata.update(source_metadata)
         if classification_metadata is not None:
             doc.metadata.update(classification_metadata)
         documents.append(doc)
@@ -125,6 +131,8 @@ async def process_text_media_item_target_for_vectorstore(
 
         # Extract text content
         text_content = media_item.get("content", "")
+        filename = media_item.get("metadata", {}).get("filename", "")
+        filename_uuid5 = str(uuid5(NAMESPACE_URL, filename))
 
         source_metadata = media_item.get("metadata", {})
         source = source_metadata.get("source", "user_upload")
@@ -287,7 +295,6 @@ async def process_text_media_item_target_for_vectorstore(
                             doc = Document(
                                 page_content=semantic_text_chunk,
                                 metadata={
-                                    "key": str(uuid4()),
                                     "user_id": user_id,
                                     "assistant_id": assistant_id,
                                     "created_at": current_timestamp,
@@ -295,11 +302,13 @@ async def process_text_media_item_target_for_vectorstore(
                                     "source": source,
                                     "type": "text",
                                     "chunk_index": idx,
-                                    # Include any additional metadata from original media_item
-                                    **{k: v for k, v in source_metadata.items() if k not in ["source"]}
+                                    "filename": filename,
+                                    "document_id": str(uuid4()),
+                                    "filename_uuid5":filename_uuid5
                                 }
                             )
                             idx += 1
+                            doc.metadata.update(source_metadata)
                             if classification_metadata is not None:
                                 doc.metadata.update(classification_metadata)
                         else: 
@@ -313,6 +322,9 @@ async def process_text_media_item_target_for_vectorstore(
                                 assistant_id=assistant_id,
                                 classification_metadata=classification_metadata,
                                 idx=idx,
+                                filename=filename,
+                                document_id = str(uuid4()),
+                                filename_uuid5 = filename_uuid5
                             )
                             if not isinstance(documents, list): # Redundant type verification
                                 documents = [documents] 
@@ -331,6 +343,9 @@ async def process_text_media_item_target_for_vectorstore(
                                 assistant_id=assistant_id,
                                 classification_metadata=classification_metadata,
                                 idx=idx,
+                                filename=filename,
+                                document_id = str(uuid4()),
+                                filename_uuid5 = filename_uuid5
                             )
                     if not isinstance(documents, list): # Redundant type verification
                         documents = [documents] 
@@ -349,6 +364,9 @@ async def process_text_media_item_target_for_vectorstore(
                             assistant_id=assistant_id,
                             classification_metadata=classification_metadata,
                             idx=idx,
+                            filename=filename,
+                            document_id = str(uuid4()),
+                            filename_uuid5 = filename_uuid5
                         )
                 if not isinstance(documents, list): # Redundant type verification
                     documents = [documents] 
@@ -380,6 +398,9 @@ async def process_text_media_item_target_for_vectorstore(
                             assistant_id=assistant_id,
                             classification_metadata=classification_metadata,
                             idx=idx,
+                            filename=filename,
+                            document_id = str(uuid4()),
+                            filename_uuid5 = filename_uuid5
                         )
                 if not isinstance(documents, list): # Redundant type verification
                     documents = [documents] 
@@ -399,7 +420,6 @@ async def process_text_media_item_target_for_vectorstore(
                     doc = Document(
                         page_content=text_content,
                         metadata={
-                            "key": str(uuid4()),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "created_at": current_timestamp,
@@ -407,8 +427,9 @@ async def process_text_media_item_target_for_vectorstore(
                             "source": source,
                             "type": "text",
                             "chunk_index": idx,
-                            # Include any additional metadata from original media_item
-                            **{k: v for k, v in source_metadata.items() if k not in ["source"]}
+                            "filename": filename,
+                            "document_id": str(uuid4()),
+                            "filename_uuid5":filename_uuid5
                         }
                     )
                     idx += 1

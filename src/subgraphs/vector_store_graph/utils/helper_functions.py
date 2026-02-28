@@ -114,24 +114,24 @@ async def batch_index_documents_vectorstore(
         logger.info(f"BATCH INDEX DOCUMENTS VECTORSTORE BREAKPOINT")
 
          # Delete documents with the same filename in the metadata
-        filenames = {
+        filenames = [
             doc.metadata.get("filename") 
             for doc in 
             vectorstore_documents_to_be_indexed
             if doc.metadata.get("filename") is not None
-        }
+        ]
 
         # Ensure each document has a unique key:
         _ = [
-            doc.metadata.update({"key":str(uuid.uuid4())})
+            doc.metadata.update({"document_id":str(uuid.uuid4())})
             for doc in 
             vectorstore_documents_to_be_indexed
-            if (doc.metadata.get("key") is None) or (type(doc.metadata.get("key", []) is not str))
+            if (doc.metadata.get("document_id") is None) or (type(doc.metadata.get("document_id", []) is not str))
         ]
 
         # acquire keys
         insert_document_keys = [
-            doc.metadata.get("key", "")
+            doc.metadata.get("document_id", "")
             for doc in 
             vectorstore_documents_to_be_indexed
         ]
@@ -141,10 +141,9 @@ async def batch_index_documents_vectorstore(
         except Exception as e:
             logger.warning(f"Assertion error: number of document keys, documents, and document filenames are not equal during document batch indexing:\n {e}")
             
-        
-        # Delete files
-        await delete_docs_filename(runtime, user_id, assistant_id, filenames)
-        
+
+        # Files do not need to be deleted; deleting writes "None" to value; put will overwrite with new value
+
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
 

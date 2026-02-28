@@ -96,7 +96,7 @@ app = FastAPI(
 )
 
 
-from src.test_graph.graph import test_graph
+from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
 from langchain_core.messages import HumanMessage
 
@@ -117,7 +117,7 @@ async def test_hello_world():
     input = {"messages": HumanMessage(content=content)}
     # store = make_pg_store()
 
-    result = await test_graph.ainvoke(input, config=config)
+    result = await url_loading_graph.ainvoke(input, config=config)
     logger.info(f"HELLO WORLD ENTRY")
     return {"Hello": "World"}
 

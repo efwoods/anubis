@@ -918,7 +918,62 @@ async def _put_with_retry(
                 logger.error(
                     f"put_item permanently failed for key={key} after {max_retries + 1} attempts: {e}"
                 )
-    return {"namespace": namespace, "key": key, "value": value, "error": str(last_exc)}
+                return {"success": False}
+    return {"namespace": namespace, "key": key, "value": value, "error": str(last_exc), "success": True}
+
+async def _delete_with_retry(
+    store,
+    namespace: tuple,
+    key: str,
+    max_retries: int = 2,
+    retry_delay: float = 0.5,
+):
+    """Single delete_item call with retry logic."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            await store.delete_item(list(namespace), key=key)
+            return None  # success
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                logger.warning(
+                    f"delete_item failed for key={key} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(
+                    f"delete_item permanently failed for key={key} after {max_retries + 1} attempts: {e}"
+                )
+                return {"success":False}
+    return {"namespace": namespace, "key": key, "error": str(last_exc), "success":True}
+
+
+async def _search_with_retry(
+    store,
+    namespace: tuple,
+    max_retries: int = 2,
+    retry_delay: float = 0.5,
+):
+    """Single delete_item call with retry logic."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            search_results = await store.search_items(list(namespace))
+            return None  # success
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                logger.warning(
+                    f"search_items failed for namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(
+                    f"search_items permanently failed for namespace={namespace} after {max_retries + 1} attempts: {e}"
+                )
+                return {"error": str(last_exc), "success":False}
+    return {"search_results": search_results, "error": str(last_exc), "success":True}
 
 
 async def batch_index_documents_vectorstore(
@@ -966,8 +1021,12 @@ async def batch_index_documents_vectorstore(
 
 
         num_successful_batch_uploads = 0
+        num_successful_batch_searches = 0
+        num_successful_batch_deletes = 0
         
         error_batch_documents = []
+        error_batch_searches = []
+        error_batch_deletes = []
 
         # batch the document uploads
         if getattr(client.store, "abatch", None) is not None:
@@ -1011,6 +1070,85 @@ async def batch_index_documents_vectorstore(
 
             total_documents_to_be_indexed = len(batch_put_ops)
 
+            # delete previous filename chunks
+            # extract filename chunk keys
+            
+            # extract the unique filenames
+            filenames_uuid5_set = set([doc.metadata.get("filename_uuid5", "") for doc in vectorstore_documents_to_be_indexed])
+            filenames_uuid5_list = list(filenames_uuid5_set)
+
+            batch_search_ops = [((user_id, assistant_id, "document", filename) for filename in filenames_uuid5_list)]
+            num_search_ops = len(batch_search_ops)
+
+
+
+            all_batch_delete_ops = []
+
+            # create all namespace keys for each delete operation through batched searches
+            for i in range (0, num_search_ops, BATCH_SIZE):
+                batch = batch_search_ops[i : i + BATCH_SIZE]
+                batch_num = (i // BATCH_SIZE) + 1
+                total_batches = (num_search_ops + BATCH_SIZE - 1) // BATCH_SIZE
+
+                progress = min(i + BATCH_SIZE, num_search_ops)
+
+                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{num_search_ops}")
+
+                batch_search_errors = []
+
+                # Search for documents
+                search_results = await asyncio.gather(
+                    *[_search_with_retry(client.store, namespace=namespace) for namespace in batch]
+                )
+
+                # extract the keys
+                all_delete_ops = []
+                for search_result, namespace in zip (search_results, batch):
+                    delete_ops_namespace_keys = [(namespace, item.get("key", "")) for item in search_result.get("search_result", {}).get("items", []) if search_result.get("success", False) is not False]
+                    # collect delete operations for the search results
+                    all_delete_ops = all_delete_ops + delete_ops_namespace_keys
+
+                # collect delete operations for the batch
+                all_batch_delete_ops = all_batch_delete_ops + all_delete_ops
+
+                batch_search_errors = [search_result for search_result in search_results if search_result.get("success", True) is not True]
+
+                batch_search_success = len(batch) - len(batch_search_errors)
+
+                num_successful_batch_searches += batch_search_success
+                error_batch_searches.extend(batch_search_errors)
+
+                logger.info(
+                    f"BATCH {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed} processed "
+                    f"({batch_search_success} success, {len(batch_search_errors)} failed)"
+                )                
+
+            num_delete_ops = len(all_batch_delete_ops)
+
+            # Batch delete
+            for i in range (0, num_delete_ops, BATCH_SIZE):
+                batch = all_batch_delete_ops[i : i + BATCH_SIZE]
+                batch_num = (i // BATCH_SIZE) + 1
+                total_batches = (num_delete_ops + BATCH_SIZE - 1) // BATCH_SIZE
+
+                progress = min(i + BATCH_SIZE, num_delete_ops)
+
+                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{num_delete_ops}")
+
+                batch_search_errors = []
+
+                # Search for documents
+                delete_results = await asyncio.gather(
+                    *[_delete_with_retry(client.store, namespace=batch_delete_op[0], key=batch_delete_op[1]) for batch_delete_op in batch]
+                )
+
+                batch_delete_errors = [delete_result for delete_result in delete_results if delete_result.get("success", False) is not False]
+
+                batch_delete_success = len(batch) - len(batch_delete_errors)
+                num_successful_batch_deletes += batch_delete_success
+                error_batch_deletes.extend(batch_delete_errors)
+
+            # Batch Put ops
             for i in range(0, total_documents_to_be_indexed, BATCH_SIZE):
                 batch = batch_put_ops[i : i + BATCH_SIZE]
                 batch_num = (i // BATCH_SIZE) + 1
@@ -1019,43 +1157,14 @@ async def batch_index_documents_vectorstore(
 
                 logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed}")
 
-                namespace = batch[0][0]
-                key = batch[0][1]
-                value = batch[0][2]
-
                 logger.info("breakpoint")
 
-                result = await _put_with_retry(client.store, namespace=namespace, key=key, value=value, max_retries=3, retry_delay=0.5)
-
-
-                logger.info("breakpoint")
                 batch_errors = []
 
-                for namespace, key, value in batch:
-                    logger.info(f"namespace: {namespace}")
-                    logger.info(f"key: {key}")
-                    logger.info(f"value: {value}")
-
-                logger.info(f"breakpoint")
-
-                for namespace, key, value in batch:
-                    logger.info(f"namespace: {namespace}")
-                    logger.info(f"key: {key}")
-                    logger.info(f"value: {value}")
-                    result = await _put_with_retry(client.store, namespace=namespace, key=key, value=value)
-                    if result is not None:
-                        batch_errors.append(result)
+                results = await asyncio.gather(
+                    *[_put_with_retry(client.store, namespace=namespace, key=key, value=value) for namespace, key, value in batch]
+                )
                 
-                result = await client.store.get_item(namespace, key)
-
-                logger.info("breakpoint")
-                logger.info(f"result: {result}")
-
-                # results = await asyncio.gather(
-                #     *[_put_with_retry(client.store, namespace=namespace, key=key, value=value) for namespace, key, value in batch]
-                # )
-                
-
                 # batch_errors = [result for result in results if result is not None]
                 batch_success = len(batch) - len(batch_errors)
 

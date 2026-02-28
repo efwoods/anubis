@@ -65,9 +65,6 @@ configuration = GlobalConfiguration()
 
 """ NODES """
 
-
-
-
 async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext], store: BaseStore):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
     from langchain_huggingface import HuggingFaceEmbeddings

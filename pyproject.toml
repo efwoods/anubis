@@ -1,5 +1,5 @@
 [project]
-name = "agent"
+name = "anubis"
 version = "0.0.1"
 description = "Anubis graph"
 authors = [
@@ -9,22 +9,21 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "beautifulsoup4>=4.14.3",
-    "huggingface-hub>=0.36.2",
-    "langchain>=1.2.10",
-    "langchain-chroma>=1.1.0",
-    "langchain-community>=0.4.1",
-    "langchain-core>=1.2.16",
-    "langchain-huggingface>=1.2.0",
-    "langchain-openai>=1.1.10",
-    "langchain-unstructured>=1.0.1",
-    "langgraph>=1.0.9",
-    "langgraph-cli[inmem]>=0.4.12",
-    "langsmith>=0.7.7",
-    "llama-api-client>=0.6.0",
-    "openai>=2.24.0",
-    "pydantic>=2.12.5",
-    "sentence-transformers>=5.2.3",
+  "beautifulsoup4>=4.14.3",
+  "huggingface-hub>=0.36.2",
+  "langchain>=1.2.10",
+  "langchain-community>=0.4.1",
+  "langchain-core>=1.2.16",
+  "langchain-huggingface>=1.2.0",
+  "langchain-openai>=1.1.10",
+  "langchain-unstructured>=1.0.1",
+  "langgraph>=1.0.10",
+  "langgraph-cli[inmem]>=0.4.12",
+  "langsmith>=0.7.9",
+  "llama-api-client>=0.6.0",
+  "openai>=2.24.0",
+  "pydantic>=2.12.5",
+  "sentence-transformers>=5.2.3",
 ]
 
 

@@ -141,6 +141,8 @@ async def upload_media(
         # Extract indexed documents info for response
         index_result = await index_docs(vectorstore_documents_to_be_indexed, config, client=langgraph_sdk_client)
 
+        logger.info("breakpoint")
+
         # handle documents to be analyzed for context storage and prompt injection of assistantimpor
         # handle documents to be processed for adapter training
 

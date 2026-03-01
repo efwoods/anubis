@@ -906,19 +906,18 @@ async def _put_with_retry(
     for attempt in range(max_retries + 1):
         try:
             await store.put_item(list(namespace), key=key, value=value)
-            return None  # success
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
                 logger.warning(
-                    f"put_item failed for key={key} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
+                    f"put_item failed for key={key}, namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
                 )
                 await asyncio.sleep(retry_delay)
             else:
                 logger.error(
-                    f"put_item permanently failed for key={key} after {max_retries + 1} attempts: {e}"
+                    f"put_item permanently failed for key={key}, namespace={namespace} after {max_retries + 1} attempts: {e}"
                 )
-                return {"success": False}
+                return {"success": False, "namespace":namespace, "key": key, "value":value}
     return {"namespace": namespace, "key": key, "value": value, "error": str(last_exc), "success": True}
 
 async def _delete_with_retry(
@@ -933,19 +932,18 @@ async def _delete_with_retry(
     for attempt in range(max_retries + 1):
         try:
             await store.delete_item(list(namespace), key=key)
-            return None  # success
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
                 logger.warning(
-                    f"delete_item failed for key={key} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
+                    f"delete_item failed for key={key}, namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
                 )
                 await asyncio.sleep(retry_delay)
             else:
                 logger.error(
-                    f"delete_item permanently failed for key={key} after {max_retries + 1} attempts: {e}"
+                    f"delete_item permanently failed for key={key}, namespace={namespace} after {max_retries + 1} attempts: {e}"
                 )
-                return {"success":False}
+                return {"success": False, "namespace":namespace, "key": key}
     return {"namespace": namespace, "key": key, "error": str(last_exc), "success":True}
 
 
@@ -956,11 +954,11 @@ async def _search_with_retry(
     retry_delay: float = 0.5,
 ):
     """Single delete_item call with retry logic."""
+    logger.info(f"search_with_retry: {namespace}")
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
-            search_results = await store.search_items(list(namespace))
-            return None  # success
+            search_results = await store.search_items(list(namespace), limit=1000000)
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
@@ -972,7 +970,7 @@ async def _search_with_retry(
                 logger.error(
                     f"search_items permanently failed for namespace={namespace} after {max_retries + 1} attempts: {e}"
                 )
-                return {"error": str(last_exc), "success":False}
+                return {"error": str(last_exc), "namespace":namespace, "success":False}
     return {"search_results": search_results, "error": str(last_exc), "success":True}
 
 
@@ -1077,7 +1075,7 @@ async def batch_index_documents_vectorstore(
             filenames_uuid5_set = set([doc.metadata.get("filename_uuid5", "") for doc in vectorstore_documents_to_be_indexed])
             filenames_uuid5_list = list(filenames_uuid5_set)
 
-            batch_search_ops = [((user_id, assistant_id, "document", filename) for filename in filenames_uuid5_list)]
+            batch_search_ops = [(user_id, assistant_id, "document", filename) for filename in filenames_uuid5_list]
             num_search_ops = len(batch_search_ops)
 
 
@@ -1092,7 +1090,7 @@ async def batch_index_documents_vectorstore(
 
                 progress = min(i + BATCH_SIZE, num_search_ops)
 
-                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{num_search_ops}")
+                logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{num_search_ops}; sample namespace: {batch[0]}")
 
                 batch_search_errors = []
 
@@ -1104,7 +1102,7 @@ async def batch_index_documents_vectorstore(
                 # extract the keys
                 all_delete_ops = []
                 for search_result, namespace in zip (search_results, batch):
-                    delete_ops_namespace_keys = [(namespace, item.get("key", "")) for item in search_result.get("search_result", {}).get("items", []) if search_result.get("success", False) is not False]
+                    delete_ops_namespace_keys = [(namespace, item.get("key", "")) for item in search_result.get("search_results", {}).get("items", []) if search_result.get("success", False) is not False]
                     # collect delete operations for the search results
                     all_delete_ops = all_delete_ops + delete_ops_namespace_keys
 
@@ -1135,7 +1133,7 @@ async def batch_index_documents_vectorstore(
 
                 logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{num_delete_ops}")
 
-                batch_search_errors = []
+                batch_delete_errors = []
 
                 # Search for documents
                 delete_results = await asyncio.gather(
@@ -1165,6 +1163,7 @@ async def batch_index_documents_vectorstore(
                     *[_put_with_retry(client.store, namespace=namespace, key=key, value=value) for namespace, key, value in batch]
                 )
                 
+                batch_errors = [result for result in results if result.get("success", True) is not True]
                 # batch_errors = [result for result in results if result is not None]
                 batch_success = len(batch) - len(batch_errors)
 

@@ -4,6 +4,8 @@ services:
     ports:
       - "8000:8000"
       - "5687:5687"
+    environment:
+      - PYDEVD_DISABLE_FILE_VALIDATION=1
     env_file:
       - .env.dev
     volumes:

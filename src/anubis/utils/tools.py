@@ -101,6 +101,7 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
 # TODO: IMAGE URL IDENTITY UPDATER
 
 # TODO: TEXT WEBPAGE URL IDENTITY UPDATER
+# TODO: TEST CONFIGURATION & STORE CAPABILITY
 from langchain_openai import ChatOpenAI
 from src.anubis.utils.prompts.system_prompts import FACT_FORMATTING_STRING_PROMPT
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage

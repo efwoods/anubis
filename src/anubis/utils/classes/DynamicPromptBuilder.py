@@ -78,14 +78,14 @@ class DynamicPromptBuilder:
         """
 
         # Render Assistant Name:
-        if assistant_name is None:
+        if assistant_name is None or assistant_name is "":
             assistant_name = "You don't know your name."    
 
         # Render Assistant Identity
-        if assistant_identity is None:
+        if assistant_identity is None or assistant_identity.get("assistant_identity_documents", []) == []:
             assistant_identity_str = "You don't have any information about identity."
         else:
-            assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity])
+            assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity.get("assistant_identity_documents", [])])
 
         # Render AI context
         # assistant_context_str = self.render_identity_context(assistant_context or {})
@@ -93,10 +93,10 @@ class DynamicPromptBuilder:
         if user_name is None:
             user_name = "You don't know the name of the person you are communicating with."
 
-        if user_identity is None:
+        if user_identity is None or user_identity.get("user_identity_documents", []) == []:
             user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
         else:
-            user_identity_str = "\n\n".join([doc.page_content for doc in user_identity])
+            user_identity_str = "\n\n".join([doc.page_content for doc in user_identity.get("user_identity_documents")])
         
 
         # Build user context
@@ -116,7 +116,7 @@ class DynamicPromptBuilder:
 
         # Build system time
         if system_time is None:
-            system_time_str = "Time information unavailable."
+            system_time = "Time information unavailable."
         
         # Create the prompt template
         prompt = ChatPromptTemplate.from_messages([
@@ -132,7 +132,7 @@ class DynamicPromptBuilder:
             "retrieved_memories": retrieved_memories_str,
             "user_name": user_name, 
             "user_identity": user_identity_str,
-            "system_time": system_time_str,
+            "system_time": system_time,
         }
 
         populated_template =  prompt.invoke(prompt_vars)

@@ -168,16 +168,15 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     logger.info(f"populated_template: {populated_identity_template}")
 
     # prepend system message
-    system_identity = SystemMessage(content = populated_identity_template.messages)
-    chat_prompt_template = ChatPromptTemplate(messages = system_identity + state["messages"])
-    input = {"messages": chat_prompt_template.messages}
+    messages = populated_identity_template.messages + state['messages']
+    input = {"messages": messages}
     
     logger.info(f"message input: {input}")
 
     response = await avatar.ainvoke(input=input)
     avatar_response = response.get("messages", [])[-1]
 
-    logger.info(f"Avatar RESPONSE: {getattr(avatar_response.content, "content")}")
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, "content")}")
     result = {"messages": [avatar_response]}
 
     return result

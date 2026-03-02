@@ -10,6 +10,8 @@ from typing_extensions import Annotated
 
 
 from src.anubis.utils.prompts import system_prompts
+from src.anubis.utils.prompts.subgraphs import vector_store_graph_prompts
+
 from src.anubis.utils.configuration import GlobalConfiguration
 
 from langchain_core.messages import SystemMessage
@@ -18,10 +20,8 @@ from typing import Dict, Any
 
 @dataclass
 class IdentityContext:
-    user_id: str = field(default="2feaa9d8-50c0-4550-81fa-9fb79bfe23f0")
     name: str = field(default=None)
     description: str = field(default=None)
-    metadata: dict = field(default_factory=dict )
 
     def update_metadata(self, key: str, value: Any):
         """Update a specific metadata field."""
@@ -49,91 +49,116 @@ class IdentityContext:
 
 @dataclass
 class AssistantContext(IdentityContext):
-    assistant_id: str = field(default="Anubis") # Name of the Graph in langgraph.json
+    pass
 
+@dataclass 
+class UserContext(IdentityContext):
+    pass
 
 @dataclass(kw_only=True)
 class GlobalContext:
     """Main context class for the memory graph system."""
 
-    system_prompt: Annotated[SystemMessage, {"__template_metadata__": {"kind": "system_message"}}] = field(
-        default=system_prompts.SYSTEM_PROMPT,
-        metadata={
-            "description": "The system prompt to use for interations."
-            "Defines the context and behavior of the agent."
-        },
-    )
-
-    max_search_results: int = field(
-        default=10, 
-        metadata={
-            "description":"Maximum number of search results to return for each search query."
-        },
-    )
-
-    temporary_system_prompt_update: str = ""
-
-    user_ctx: IdentityContext = field(default_factory=IdentityContext)
+    user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
     configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
 
-    vector_store_memory_search_only: str = field(default="FALSE")
+    # max_search_results: int = field(
+    #     default=10, 
+    #     metadata={
+    #         "description":"Maximum number of search results to return for each search query."
+    #     },
+    # )
 
-    async def load_identity_from_storage(self, user_id: str):
-        """Load assistant identity from long-term storage."""
-        # Simulate loading from database/vector store
-        # In production, this would query your storage system
+    # response_system_prompt: str = field(
+    #     default=vector_store_graph_prompts.RESPONSE_SYSTEM_PROMPT,
+    #     metadata={"description": "The system prompt used for generating responses."},
+    # )
 
-        stored_identity = {
-            "name": "Elon Musk",
-            "personality": {
-                "traits": ["innovative", "direct", "ambitious"],
-                "communication_style": "casual and technical"
-            },
-            "background": {
-                "expertise": ["technology", "space", "electric vehicles"],
-                "current_role": "CEO of multiple companies",
-                "interests": ["Mars colonization", "AI safety", "sustainable energy"]
-            },
-            "knowledge_base": {
-                "technical_depth": "expert",
-                "fields": ["engineering", "physics", "business"]
-            },
-            "conversation_preferences": {
-                "formality": "low",
-                "humor": "dry and sarcastic",
-                "detail_level": "high for technical topics"
-            }
-        }
+    # query_system_prompt: str = field(
+    #     default=vector_store_graph_prompts.QUERY_SYSTEM_PROMPT,
+    #     metadata={
+    #         "description": "The system prompt used for processing and refining queries."
+    #     },
+    # )
 
-        # Update assistant context
-        self.assistant_ctx.name = stored_identity.get("name", None)
-        self.assistant_ctx.merge_metadata(stored_identity)
+    """ Default Environment Variables """
 
-    async def update_identity(self, new_information: Dict[str, Any]):
-        """Update identity with new information during conversation."""
-        self.assistant_ctx.merge_metadata(new_information)
-        # Optionally persist to storage here
-        await self._persist_to_storage()
+    together_api_key: str = field(
+        default=None, 
+        metadata={"description": "inference provider for production use and for adapter training."}
+    )
     
-    async def _persist_to_storage(self):
-        """Persist updated identity to long-term storage."""
-        # This would save to your database/vector store
-        pass
 
-    async def put_store_items(self, json):
-        """Example put value to the store
-        {
-                  "namespace": [
-                    ""
-                  ],
-                  "key": "",
-                  "value": {}
-                }
+    llama_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "API key for llama models"
+        },
+    )
 
-        Args:
-            json (dict): put payload
-        """
+    llama_api_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "base url for the llama model"
+        }
+    )
+
+    model: str = field(
+        default=None,
+        metadata={
+            "description": "Model Name Only"
+        },
+    )
+
+    dev: str = field(
+        default=None,
+        metadata={
+            "description": "development mode; single user model; 10 requests/minute; no adapters/training"
+        }
+    )
+    
+    debug: str = field(
+        default=None, 
+        metadata={
+            "description": "debugging available"
+        }
+    )
+
+    huggingface_token: str = field(
+        default=None,
+        metadata={"description": "Token to use huggingface models"}
+    )
+
+    embedding_model: Annotated[
+        str,
+        {"__template_metadata__": {"kind": "embeddings"}},
+    ] = field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        metadata={
+            "description": "Name of the embedding model to use. Must be a valid embedding model name."
+        },
+    )
+
+    vectorstore_postgres_uri: str = field(
+        default=None,
+        metadata={"description": "Connection string to postgres db for persistent document storage via vector store"}
+    )
+
+    async_postgres_store_uri: str = field(
+        default=None,
+        metadata={"description": "Connection string to async postgres store for persistent storage of avatar metadata for contextual prompt injection"}
+    )
+
+    model_token_limit: int = field(
+        default=128000,
+        metadata={"description": "number of acceptable tokens in a request to the current llm in thousands of tokens."}
+    )
+
+    langsmith_api_key: str = field(
+        default = None, 
+        metadata={"description": "api key"}
+    )
 
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
@@ -145,3 +170,4 @@ class GlobalContext:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
 
         self.configuration.__post_init__()
+

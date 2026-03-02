@@ -76,6 +76,40 @@ class BaselineIndexState:
     """A list of documents that the agent can store or otherwise process."""
 
 
+@dataclass(kw_only=True)
+class UserIdentityState:
+    """Represents the state for documents stored for textual baseline evaluation of generated content (stored in pg store).
+
+    This class defines the structure of the index state, which includes
+    the documents to be stored. Will be deleted after stored appropriately.
+    """
+
+    user_identity_documents: Annotated[Sequence[Document], reduce_docs]
+    """A list of documents that the agent can store or otherwise process."""
+
+@dataclass(kw_only=True)
+class AssistantIdentityState:
+    """Represents the state for documents stored for textual baseline evaluation of generated content (stored in pg store).
+
+    This class defines the structure of the index state, which includes
+    the documents to be stored. Will be deleted after stored appropriately.
+    """
+
+    assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
+    """A list of documents that the agent can store or otherwise process."""
+
+class AssitantState(TypedDict):
+    assistant_name: str
+    assistant_identity: AssistantIdentityState
+    assistant_id: str
+
+class UserState(TypedDict):
+    user_name: str
+    user_identity: UserIdentityState
+    user_id: str
+
+
+
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
     # Common examples include:
@@ -85,6 +119,9 @@ class GlobalState(TypedDict):
 
 
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
+
+    assistant_state: AssitantState
+    user_state: UserState
     
     conversation_summary: Optional[str] = ""
 

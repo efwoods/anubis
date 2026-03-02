@@ -51,6 +51,8 @@ services:
             start_period: 10s
         env_file:
             - .env
+        volumes:
+            - .:/deps/anubis
         build:
             context: .
             dockerfile: Dockerfile

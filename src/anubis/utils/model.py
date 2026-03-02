@@ -3,15 +3,15 @@
 import logging
 logger = logging.getLogger(__name__)
 
-from src.anubis.utils.configuration import GlobalConfiguration
+from src.anubis.utils.context import GlobalContext
 
-def init_model(configuration: GlobalConfiguration, 
+def init_model(context: GlobalContext, 
                tools=[], response_format = None):
     
-    model_name = configuration.model
-    base_url = configuration.llama_api_base_url
-    api_key = configuration.llama_api_key
-    dev = configuration.dev
+    model_name = context.model
+    base_url = context.llama_api_base_url
+    api_key = context.llama_api_key
+    dev = context.dev
 
     logger.info(f"dev: {dev}")
     logger.info(f"base_url: {base_url}")

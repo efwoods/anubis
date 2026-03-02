@@ -1,7 +1,9 @@
 
-from typing import Optional, Dict, Any
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from typing import Optional, Dict, Any, List
+from langchain_core.prompts import ChatPromptTemplate
 from src.anubis.utils.prompts.system_prompts import IDENTITY_SYSTEM_PROMPT_TEMPLATE
+
+from langchain_core.documents import Document
 
 class DynamicPromptBuilder:
     """Builder for creating prompts with optional components."""
@@ -10,17 +12,17 @@ class DynamicPromptBuilder:
         self.base_prompt = base_prompt
 
     # Base identity rendering function
-    def render_identity_context(self, ai_context: Dict[str, Any]) -> str:
+    def render_identity_context(self, assistant_context: Dict[str, Any]) -> str:
         """
         Recursively render AI context dictionary into natural language.
 
         Args:
-            ai_context: Dictionary containing identity metadata
+            assistant_context: Dictionary containing identity metadata
 
         Returns:
             Formatted string representing the AI's identity
         """
-        if not ai_context:
+        if not assistant_context:
             return "No specific identity information available."
 
         def format_dict(d: Dict[str, Any], indent: int = 0) -> str:
@@ -47,50 +49,74 @@ class DynamicPromptBuilder:
 
             return "\n".join(lines)
 
-        return format_dict(ai_context)
+        return format_dict(assistant_context)
     
     def build_prompt(
         self,
-        ai_context: Optional[Dict[str, Any]] = None,
-        user_context: Optional[Dict[str, Any]] = None,
-        retrieved_docs: Optional[str] = None,
-        retrieved_memories: Optional[str] = None,
+        assistant_name: Optional[str] = None,
+        assistant_identity: Optional[List[Document]] = None,
+        # assistant_context: Optional[Dict[str, Any]] = None,
+        # user_context: Optional[Dict[str, Any]] = None,
+        retrieved_knowledge: Optional[List[Document]] = None,
+        retrieved_memories: Optional[List[Document]] = None,
+        user_name: Optional[str] = None,
+        user_identity: Optional[List[Document]] = None,
         system_time: Optional[str] = None,
-        temporary_message: Optional[str] = None
     ) -> ChatPromptTemplate:
         """
         Build a ChatPromptTemplate with optional components.
         
         Args:
-            ai_context: Dictionary of AI identity metadata
+            assistant_context: Dictionary of AI identity metadata
             user_context: Information about current user
-            retrieved_docs: Retrieved document context
+            retrieved_knowledge: Retrieved document context
             system_time: Current timestamp
             temporary_message: Optional temporary instruction/context
             
         Returns:
             ChatPromptTemplate ready for invocation
         """
+
+        # Render Assistant Name:
+        if assistant_name is None:
+            assistant_name = "You don't know your name."    
+
+        # Render Assistant Identity
+        if assistant_identity is None:
+            assistant_identity_str = "You don't have any information about identity."
+        else:
+            assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity])
+
         # Render AI context
-        ai_context_str = self.render_identity_context(ai_context or {})
+        # assistant_context_str = self.render_identity_context(assistant_context or {})
+
+        if user_name is None:
+            user_name = "You don't know the name of the person you are communicating with."
+
+        if user_identity is None:
+            user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
+        else:
+            user_identity_str = "\n\n".join([doc.page_content for doc in user_identity])
         
+
         # Build user context
-        user_context_str = user_context or "User identity unknown."
+        # user_context_str = user_context or "User identity unknown."
         
-        # Build retrieved docs
-        retrieved_docs_str = retrieved_docs or "No additional documents retrieved."
+        # Build retrieved knowledge
+        if retrieved_knowledge is None:
+            retrieved_knowledge_str = "No additional documents retrieved."
+        else:
+            retrieved_knowledge_str = "\n\n".join([doc.page_content for doc in retrieved_knowledge])
         
         # Build retrieved memories (associated memories given the conversation)
-        retrieved_memories_str = retrieved_memories or "No additional memories retrieved"
-        
-        # Build system time
-        system_time_str = system_time or "Time information unavailable."
-        
-        # Build temporary message (this is the key part - it's optional!)
-        if temporary_message:
-            temp_msg_str = f"\n=== IMMEDIATE CONTEXT ===\n{temporary_message}\n"
+        if retrieved_memories is None:
+            retrieved_memories_str = "No additional memories retrieved"
         else:
-            temp_msg_str = ""  # Empty string if no temporary message
+            retrieved_memories_str = "\n\n".join([doc.page_content for doc in retrieved_memories])
+
+        # Build system time
+        if system_time is None:
+            system_time_str = "Time information unavailable."
         
         # Create the prompt template
         prompt = ChatPromptTemplate.from_messages([
@@ -100,12 +126,13 @@ class DynamicPromptBuilder:
 
         # Mapping of the variables to the values for injection into the system prompt template
         prompt_vars = {
-            "ai_context": ai_context_str,
-            "user_context": user_context_str,
-            "retrieved_docs": retrieved_docs_str,
+            "assistant_name": assistant_name, 
+            "assistant_identity": assistant_identity_str,
+            "retrieved_knowledge": retrieved_knowledge_str,
             "retrieved_memories": retrieved_memories_str,
+            "user_name": user_name, 
+            "user_identity": user_identity_str,
             "system_time": system_time_str,
-            "temporary_message": temp_msg_str
         }
 
         populated_template =  prompt.invoke(prompt_vars)

@@ -52,10 +52,11 @@ from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 
 from langgraph.store.base import BaseStore
 
-
 from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
 
-
+from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
+from langgraph.graph import MessagesState
 """ TOOLS """
 
 """ CONFIGURATION """
@@ -65,51 +66,74 @@ configuration = GlobalConfiguration()
 
 """ NODES """
 
-async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext], store: BaseStore):
+async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
-    from langchain_huggingface import HuggingFaceEmbeddings
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    logger.info(f"INVOKE AGENT NODE ")
-
+    
     configuration =  runtime.context.configuration
 
-    logger.info(f"breakpoint invoke agent")
+    if runtime.context.debug == "TRUE":
+
+        logger.info(f"INVOKE AGENT NODE ")
+
+        logger.info(f"state: {state}")
+        logger.info(f"config: {config}")
+        logger.info(f"runtime: {runtime}")
+        logger.info(f"runtime.store: {runtime.store}")
+        logger.info(f"runtime.context: {runtime.context}")
+
+        logger.info(f"breakpoint invoke agent")
+
+        logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
+
+        logger.info(f"Testing store access")
+        logger.info(f"runtime.store: {runtime.store}")
     
-    logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
+        # Asserting Current Identity:
+        # user_id, assistant_id = await extract_user_id_assistant_id(config)
+        logger.info(f"user_id: {state['user_state'].get("user_id", "")}")
+        logger.info(f"assistant_id: {state['assistant_state'].get("assistant_id", "")}")
 
-    logger.info(f"Testing store access")
-    logger.info(f"runtime.store: {runtime.store}")
-    logger.info(f"store: {store}")
+        # Loaded Identity:
+        logger.info(f"user_identity: {state['user_state'].get("user_identity", [])}")
+        logger.info(f"assistant_identity: {state['assistant_state'].get("assistant_identity", [])}")
 
-    # Asserting Current Identity:
-    user_id, assistant_id = await extract_user_id_assistant_id(config)
-    logger.info(f"user_id: {user_id}")
-    logger.info(f"assistant_id: {assistant_id}")
+        # Loaded Names
+        logger.info(f"user_identity: {state['user_state'].get("user_name", "")}")
+        logger.info(f"assistant_identity: {state['assistant_state'].get("assistant_name", "")}")
 
-    logger.info(f"BREAKPOINT: UPDATE USER AND ASSISTANT CONTEXT")
+        logger.info(f"BREAKPOINT: UPDATE USER AND ASSISTANT CONTEXT")
 
-    # await store.aput("testing", key="testing_key", value={"testing_key":"testing_value"})
-    # testing_get = await store.aget("testing", key="testing_key", value={"testing_key":"testing_value"})
-    # get_value = await store.aget("evan", key="name")
-    # logger.info(f"get_value: {get_value}")
-    # logger.info(f"testing_get: {testing_get}")
+        # await store.aput("testing", key="testing_key", value={"testing_key":"testing_value"})
+        # testing_get = await store.aget("testing", key="testing_key", value={"testing_key":"testing_value"})
+        # get_value = await store.aget("evan", key="name")
+        # logger.info(f"get_value: {get_value}")
+        # logger.info(f"testing_get: {testing_get}")
 
     """ CREATE MODEL """
 
-    model = init_model(
-        configuration = configuration,
+    avatar_model = init_model(
+        context = runtime.context
     )
+
+    # summarization_model = init_model(
+    #     context = runtime.context
+    # )
+
+    avatar = create_agent(
+        model=avatar_model, 
+        tools=[], 
+    ) 
+    # middleware=SummarizationMiddleware(model=summarization_model, )
 
     """ VECTORSTORE DOCUMENT RETRIEVAL """
 
-    logger.info(f"breakpoint")
-    logger.info(f"state['retrieved_docs']: {state['retrieved_docs']}")
+    # logger.info(f"breakpoint")
+    # logger.info(f"state['retrieved_docs']: {state['retrieved_docs']}")
 
     # Vectorstore Retrieved Docments
-    retrieved_docs = format_docs(state.get('retrieved_docs', []))
+    # retrieved_docs = format_docs(state.get('retrieved_docs', []))
 
-    logger.info(f"format_docs(state.get('retrieved_docs', [])): {retrieved_docs}")
+    # logger.info(f"format_docs(state.get('retrieved_docs', [])): {retrieved_docs}")
 
     """ RETRIEVE MEMORIES FROM NATURAL LANGUAGE GENERATED QUERY IN VECTORSTORE """
     
@@ -123,46 +147,39 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     logger.info(f"async postgres store connection test breakpoint")
 
-    ai_context_item = await configure_assistant_context(config, store)
-
-    try:
-        assert(ai_context_item is not None)
-    except AssertionError as e:
-        logger.warning(f"ai_context_item is not None: {e}")
-        raise e
+    # ai_context_item = await configure_assistant_context(config, store)
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
-    temporary_system_prompt_update = runtime.context.temporary_system_prompt_update
+    assistant_identity = state['assistant_state'].get("assistant_identity", [])
+    assistant_name = state['assistant_state'].get("assistant_name", "")
 
-    ai_context = ai_context_item.value['assistant_ctx'].get('metadata', {})
-    user_context = ai_context_item.value['assistant_ctx'].get('metadata', {}).get("user", {})
+    user_identity = state['user_state'].get('user_identity', [])
+    user_name = state['user_state'].get("user_name", "")
 
-    populated_template = prompt_builder.build_prompt(
-        ai_context=ai_context,
-        user_context=user_context, 
-        retrieved_docs=retrieved_docs,
-        retrieved_memories="",
+    populated_identity_template = prompt_builder.build_prompt(
+        assistant_name = assistant_name,
+        assistant_identity= assistant_identity,
+        user_name = user_name,
+        user_identity=user_identity, 
         system_time = system_time,
-        temporary_message=temporary_system_prompt_update,
     )
 
-    logger.info(f"populated_template: {populated_template}")
-
-    # clear the temporary injected prompt
-    runtime.context.temporary_system_prompt_update = ""
+    logger.info(f"populated_template: {populated_identity_template}")
 
     # prepend system message
-    messages_input = populated_template.messages + state["messages"]
+    system_identity = SystemMessage(content = populated_identity_template.messages)
+    chat_prompt_template = ChatPromptTemplate(messages = system_identity + state["messages"])
+    input = {"messages": chat_prompt_template.messages}
     
-    logger.info(f"messages_input: {messages_input}")
+    logger.info(f"message input: {input}")
 
-    # TODO: Summarize messages
+    response = await avatar.ainvoke(input=input)
+    avatar_response = response.get("messages", [])[-1]
 
-    response = await model.ainvoke(input=messages_input)
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response.content, "content")}")
+    result = {"messages": [avatar_response]}
 
-    logger.info(f"AGENT RESPONSE: {response}")
-    result = {"messages": [response]}
     return result
 
 
@@ -189,7 +206,6 @@ async def summarize_conversation(state: GlobalState, runtime: Runtime[GlobalCont
     input_messages = [HumanMessage(context=summary_message)] + state['messages']
 
     # response = await model.ainvoke(input=HumanMessage(content=summary_message)
-
 
 async def call_router(state: GlobalState, runtime: Runtime[GlobalContext]) -> Command[Literal["chat"]]:
     """Decides whether to upload new personal information or to respond based upon the chat
@@ -237,25 +253,116 @@ async def route_node_from_decision(state: GlobalState, runtime: GlobalContext) -
         logger.info(f"NON CHAT")
         return "invoke_agent"
 
+async def message_interface(state:MessagesState, config: RunnableConfig, runtime: Runtime) -> GlobalState:
+    logger.info(f"state:{state}")
+    logger.info(f"config:{config}")
+    logger.info(f"runtime:{runtime}")
+    logger.info(f"runtime.store:{runtime.store}")
+    logger.info(f"runtime.context: {runtime.context}")
+
+    logger.info(f"assistant_id:{config['configurable']['assistant_id']}")
+    logger.info(f"configurable:{config['configurable']['langgraph_auth_user_id']}")
+    logger.info(f"configurable:{config['configurable']}")
+    logger.info(f"THIS IS AN UPDATE")
+    logger.info(f"THIS IS ANOTHER UPDATE")
+
+    assistant_state = {}
+    user_state = {}
+
+    # Assert the user is loggedin and the assistant has an id from the config:
+    # Otherwise use an anonymouse user id
+
+    user_id = config.get("configurable",{}).get("langgraph_api_user_id", '')
+
+    if user_id != '':
+        user_state.update("user_id", user_id)
+    else:
+        """anonymous_user_id is 'str(uuid5(NAMESPACE_URL, 'anonymous_user_id"""
+        user_state.update({"user_id":'9977df19-9ceb-5f87-a130-55f6a6282069'})
+        
+    
+    assistant_id = config.get("configurable", {}).get("assistant_id", "")
+
+    if assistant_id != "":
+        assistant_state.update({"assistant_id":assistant_id})
+    else:
+        raise Exception("Assistant does not have an id from the configuration. Provide an assistant_id in config['configurable']['assistant_id'].")
+
+    # Update Name and Description of User and Assistant if provided in the context
+
+    assistant_name = getattr(runtime.context.assistant_ctx, "name", None)
+    assistant_description = getattr(runtime.context.assistant_ctx, "description", None)
+
+    user_name = getattr(runtime.context.user_ctx, "name", None)
+    user_description = getattr(runtime.context.user_ctx, "description", None)
+    
+    if assistant_name is not None:
+        assistant_state.update({"assistant_name": assistant_name})        
+    else:
+        runtime.store.asearch("")
+
+    if assistant_description is not None:
+        assistant_state.update({"assistant_description": assistant_description})        
+
+    if user_name is not None:
+        user_state.update({"user_name": user_name})        
+
+    if user_description is not None:
+        user_state.update({"user_description": user_description})        
+
+
+    # Load the assistant identity from store:
+    # Identity of the assistant
+    assistant_identity_namespace = ("user_id", "assistant_id", "identity")
+
+    # Identity of the user according to the assistant
+    user_identity_namespace = (assistant_id, user_id, "identity")
+
+    user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
+    # user_identity_document_items = user_identity_document_items_response.get("items", {})
+
+    assistant_identity_document_items = await runtime.store.asearch(assistant_identity_namespace)
+
+    # assistant_identity_document_items = assistant_identity_document_items_response.get("items", [])
+
+    user_state.update({"user_identity": {"user_identity_documents": user_identity_document_items}})
+
+    assistant_state.update({"assistant_identity": {"assistant_identity_documents": assistant_identity_document_items}})
+
+    logger.info("breakpoint")
+
+    return {"messages": state['messages'], "assistant_state": assistant_state, "user_state": user_state}
+
 
 """ GRAPH """
 
 # Build minimal graph: START -> agent -> END
 workflow = StateGraph(
-    state_schema = GlobalState, 
+    state_schema = GlobalState,
+    input_schema = MessagesState,
+    output_schema= MessagesState,
     context_schema = GlobalContext
 )
+# workflow.add_edge("message_interface", END)
 
 # Add single node (your input/output)
 # workflow.add_node("summarize_conversation", summarize_conversation)
 # workflow.add_node("call_router", call_router)
-workflow.add_node("retrieve_documents", retrieval_graph)
-workflow.add_node("invoke_agent", invoke_agent)
+
+# workflow.add_node("message_interface_graph", message_interface_graph)
+workflow.add_node("chat", message_interface)
+workflow.add_node("avatar", invoke_agent)
+
+workflow.add_edge(START, "chat")
+# workflow.add_node("retrieve_documents", retrieval_graph)
 
 # Edges
-workflow.add_edge(START, 'retrieve_documents')
-workflow.add_edge('retrieve_documents', "invoke_agent")
-workflow.add_edge("invoke_agent", END)
+
+# workflow.add_edge(START, 'retrieve_documents')
+# workflow.add_edge('retrieve_documents', "invoke_agent")
+workflow.add_edge('chat', "avatar")
+workflow.add_edge("avatar", END)
+
 graph = workflow.compile()
 
 graph.name = "Anubis"

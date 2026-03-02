@@ -22,9 +22,6 @@ class IndexConfiguration:
     retriever provider choice, and search parameters.
     """
 
-    user_id: str = field(default="test_user_1234", metadata={"description": "Unique identifier for the user."})
-    # assistant_id: str = field(metadata={"description": "Unique identifier for the assistant."})
-
     embedding_model: Annotated[
         str,
         {"__template_metadata__": {"kind": "embeddings"}},

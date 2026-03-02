@@ -106,3 +106,54 @@ Rules for classifying the situation of the text as Other:
 - Try not to classify any situation of the text as Other.
 </Rules>
 """
+
+
+FACT_FORMATTING_STRING_PROMPT="""
+<Instructions>
+Extract and write the following as a list of facts only. 
+Do not change any content. 
+Include ALL facts about the target {assistant_name}.
+</Instructions>
+<Rules>
+Keep text only unless there are numbers within the document. 
+Do not include bullets or numbers in a list.  
+Do not include reference indicators. 
+Do not use the text from the example in the output.  
+Keep all text fact the same.
+Do not change ANY facts in the text.
+Numbers and dates within the articles are acceptable. Numbers as reference indicators are not exceptable.
+</Rules>
+<Example>
+Do not do the following:
+Zilis commenced her professional career at IBM in , 
+
+ Shivon Zilis was born on February ,  in Markham, Ontario,    
+Canada. 
+
+- Shivon Zilis
+
+This is a fact about Shivon Zilis. [30]
+
+DO THE FOLLOWING:
+Shivon Zilis was born on February 8th, 1986 in Markham, Ontario, Canada.
+Shivon Zilis is a Leafs fan for life.
+Shivon Zilis cofounded Bloomberg Beta.
+Shivon Zilis is a mother of four children.
+</Example>
+<Instructions>
+Extract and write the following as a list of facts only. 
+Do not change any content. 
+Include ALL facts about the target {assistant_name}.
+</Instructions>
+"""
+
+TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT = """
+<Instructions>
+    Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
+    Return only the description of the person using the FIRST PERSON PERSPECTIVE.
+    Do not mention that this is an image. 
+    Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE.
+    Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
+    Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
+</Instructions>
+"""

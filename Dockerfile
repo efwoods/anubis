@@ -10,6 +10,7 @@ ADD . /deps/anubis
 RUN for dep in /deps/*; do             echo "Installing $dep";             if [ -d "$dep" ]; then                 echo "Installing $dep";                 (cd "$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e .);             fi;         done
 # -- End of local dependencies install --
 ENV LANGGRAPH_STORE='{"index": {"dims": 384, "embed": "huggingface:sentence-transformers/all-MiniLM-l6-v2", "fields": ["document.kwargs.page_content"]}}'
+ENV LANGGRAPH_HTTP='{"app": "/deps/anubis/src/api/webapp.py:app"}'
 ENV LANGSERVE_GRAPHS='{"Anubis": "/deps/anubis/src/anubis/graph.py:graph"}'
 
 

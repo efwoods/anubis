@@ -106,16 +106,16 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     
         # Asserting Current Identity:
         # user_id, assistant_id = await extract_user_id_assistant_id(config)
-        logger.info(f"user_id: {state['user_state'].get("user_id", "")}")
-        logger.info(f"assistant_id: {state['assistant_state'].get("assistant_id", "")}")
+        logger.info(f"user_id: {state['user_state'].get('user_id', '')}")
+        logger.info(f"assistant_id: {state['assistant_state'].get('assistant_id', '')}")
 
         # Loaded Identity:
-        logger.info(f"user_identity: {state['user_state'].get("user_identity", [])}")
-        logger.info(f"assistant_identity: {state['assistant_state'].get("assistant_identity", [])}")
+        logger.info(f"user_identity: {state['user_state'].get('user_identity', [])}")
+        logger.info(f"assistant_identity: {state['assistant_state'].get('assistant_identity', [])}")
 
         # Loaded Names
-        logger.info(f"user_identity: {state['user_state'].get("user_name", "")}")
-        logger.info(f"assistant_identity: {state['assistant_state'].get("assistant_name", "")}")
+        logger.info(f"user_identity: {state['user_state'].get('user_name','')}")
+        logger.info(f"assistant_identity: {state['assistant_state'].get('assistant_name','')}")
 
         logger.info(f"BREAKPOINT: UPDATE USER AND ASSISTANT CONTEXT")
 
@@ -171,11 +171,11 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
-    assistant_identity = state['assistant_state'].get("assistant_identity", [])
-    assistant_name = state['assistant_state'].get("assistant_name", "")
+    assistant_identity = state['assistant_state'].get('assistant_identity', [])
+    assistant_name = state['assistant_state'].get('assistant_name','')
 
     user_identity = state['user_state'].get('user_identity', [])
-    user_name = state['user_state'].get("user_name", "")
+    user_name = state['user_state'].get('user_name','')
 
     populated_identity_template = prompt_builder.build_prompt(
         assistant_name = assistant_name,
@@ -196,7 +196,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     response = await avatar.ainvoke(input=input)
     avatar_response = response.get("messages", [])[-1]
 
-    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, "content")}")
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
     result = {"messages": [avatar_response]}
 
     return result
@@ -209,7 +209,7 @@ async def summarize_conversation(state: GlobalState, runtime: Runtime[GlobalCont
 
 
     # Retrieve the current message summary
-    conversation_summary = state.get("conversation_summary", "") 
+    conversation_summary = state.get("conversation_summary",'') 
     if conversation_summary:
 
         # Extend the current conversation summary:
@@ -309,19 +309,19 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
     user_description = runtime.context.user_ctx.get("description", None)
     
     if assistant_name is not None:
-        assistant_state.update({"assistant_name": assistant_name})        
+        assistant_state.update({'assistant_name': assistant_name})        
     else:
         possible_name = await runtime.store.asearch((user_id, assistant_id, "identity"), query="name")
-        assistant_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact", "")     
+        assistant_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact",'')     
         
     if assistant_description is not None:
         assistant_state.update({"assistant_description": assistant_description})        
 
     if user_name is not None:
-        user_state.update({"user_name": user_name})        
+        user_state.update({'user_name': user_name})        
     else:
         possible_name = await runtime.store.asearch((assistant_id, user_id, "identity"), query="name")
-        user_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact", "")
+        user_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact",'')
 
     if user_description is not None:
         user_state.update({"user_description": user_description})        
@@ -344,9 +344,9 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
     # Coerce into document objects from Search Items
     assistant_identity_document_items = reduce_docs([], assistant_identity_document_items)
 
-    user_state.update({"user_identity": {"user_identity_documents": user_identity_document_items}})
+    user_state.update({'user_identity': {"user_identity_documents": user_identity_document_items}})
 
-    assistant_state.update({"assistant_identity": {"assistant_identity_documents": assistant_identity_document_items}})
+    assistant_state.update({'assistant_identity': {"assistant_identity_documents": assistant_identity_document_items}})
 
     logger.info("breakpoint")
 

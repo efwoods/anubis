@@ -50,7 +50,7 @@ services:
             start_interval: 1s
             start_period: 10s
         env_file:
-            - .env.dev
+            - .env
         volumes:
             - .:/deps/anubis
         build:

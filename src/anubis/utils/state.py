@@ -39,8 +39,6 @@ class VectorstoreIndexState:
     vectorstore_documents_to_be_indexed: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can index."""
 
-
-
 @dataclass(kw_only=True)
 class AnalysisIndexState:
     """Represents the state for document indexing and retrieval.
@@ -98,21 +96,24 @@ class AssistantIdentityState:
     assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can store or otherwise process."""
 
+@dataclass(kw_only=True)
+class RememberedMemories:
+    """Represents the state of the memories that have been remembered and retrieved from the store.
+
+    This class defines the structure of the remembered memories.
+    """
+    remembered_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+
 class AssistantState(TypedDict):
     assistant_name: str
     assistant_identity: AssistantIdentityState
     assistant_id: str
+    remembered_memories: RememberedMemories
 
 class UserState(TypedDict):
     user_name: str
     user_identity: UserIdentityState
     user_id: str
-
-class IdentityUpdateState(TypedDict):
-    user_state: UserState
-    assistant_state: AssistantState
-    content: str
-
 
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
@@ -126,8 +127,6 @@ class GlobalState(TypedDict):
 
     assistant_state: AssistantState
     user_state: UserState
-    
-    conversation_summary: Optional[str] = ""
 
     """ Data Retrieval """
 
@@ -145,17 +144,7 @@ class GlobalState(TypedDict):
         }
     )
 
-    retrieved_memories: Annotated[list[Document], operator.add] = field(
-        default_factory=list, 
-        metadata={
-            "description":"""
-            This is a list of memories for reference during chat created as 
-            Document objects for search by user_id and assistant_id or with 
-            relevance scores in vectorstore 
-            (Document type is the standard for the vector store).
-            """
-        }
-    )
+    remembered_memory_documents: Annotated[Sequence[Document], reduce_docs] 
 
     """ Data Uploading and Processing """
 

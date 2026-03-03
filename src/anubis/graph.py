@@ -58,7 +58,16 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.graph import MessagesState
 
-from src.anubis.utils.tools import learn_information_about_the_user
+from src.anubis.utils.tools import (
+    learn_information_about_the_user, 
+    learn_information_about_yourself_through_text_from_the_user_as_a_memory,
+    # learn_information_about_yourself_through_images,
+    # learn_information_about_yourself_through_tweets,
+    # learn_information_about_yourself_through_youtube_videos,
+    remember_memories,
+    # learn_new_facts,
+    # retrieve_knowledge,
+)
 
 from src.anubis.utils.utility import (
     reduce_docs, 
@@ -128,7 +137,11 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     avatar = create_agent(
         model=avatar_model, 
-        tools=[learn_information_about_the_user], 
+        tools=[
+            # learn_information_about_the_user, 
+            learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+            remember_memories
+        ], 
     ) 
     # middleware=SummarizationMiddleware(model=summarization_model, )
 

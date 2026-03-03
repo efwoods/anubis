@@ -11,6 +11,6 @@
       "fields": ["document.kwargs.page_content"]
     }
   },
-  "env": ".env",
+  "env": ".env.dev",
   "image_distro": "wolfi"
 }

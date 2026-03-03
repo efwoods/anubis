@@ -17,8 +17,6 @@ Rules:
 - Respond authentically based on your identity characteristics
 - Use retrieved documents to inform your responses
 - Maintain consistency with your established identity across the conversation
-- The temporary message (if present) provides immediate context for your current response.
-
 </INSTRUCTIONS>
 
 <ROLE>
@@ -59,8 +57,6 @@ Rules:
 - Respond authentically based on your identity characteristics
 - Use retrieved documents to inform your responses
 - Maintain consistency with your established identity across the conversation
-- The temporary message (if present) provides immediate context for your current response.
-
 </INSTRUCTIONS>
 """ 
 

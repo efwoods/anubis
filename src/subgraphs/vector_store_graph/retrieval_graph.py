@@ -38,7 +38,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.anubis.utils.model import init_model
 
-from src.anubis.utils.helper_functions import summarize_messages
+from src.anubis.utils.utility import summarize_messages
 
 
 async def generate_query(
@@ -118,7 +118,7 @@ async def generate_query(
     return {"queries": ["test query"]}
 
 from langgraph.store.base import BaseStore
-from src.anubis.utils.helper_functions import extract_user_id_assistant_id
+from src.anubis.utils.utility import extract_user_id_assistant_id
 
 async def retrieve(
     state: GlobalState, config: RunnableConfig,  runtime: Runtime[GlobalContext], store: BaseStore

@@ -39,7 +39,7 @@ from langchain.tools import tool
 from src.anubis.utils.configuration import GlobalConfiguration
 
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.helper_functions import extract_user_id_assistant_id
+from src.anubis.utils.utility import extract_user_id_assistant_id
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 

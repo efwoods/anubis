@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.helper_functions import extract_user_id_assistant_id
+from src.anubis.utils.utility import extract_user_id_assistant_id
 
 
 async def index_docs(

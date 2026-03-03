@@ -22,7 +22,7 @@ from src.anubis.utils.context import IdentityContext, AssistantContext
 from langchain_core.runnables import RunnableConfig
 
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.helper_functions import extract_user_id_assistant_id, configure_assistant_context
+from src.anubis.utils.utility import extract_user_id_assistant_id, configure_assistant_context
 
 from src.anubis.utils.schema import RouteDecision
 
@@ -46,7 +46,7 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.state import GlobalState
 
-from src.anubis.utils.helper_functions import format_docs
+from src.anubis.utils.utility import format_docs
 
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 
@@ -57,6 +57,13 @@ from langchain_core.messages.utils import (trim_messages, count_tokens_approxima
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.graph import MessagesState
+
+from src.anubis.utils.tools import learn_information_about_the_user
+
+from src.anubis.utils.utility import (
+    reduce_docs, 
+)
+
 """ TOOLS """
 
 """ CONFIGURATION """
@@ -121,7 +128,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     avatar = create_agent(
         model=avatar_model, 
-        tools=[], 
+        tools=[learn_information_about_the_user], 
     ) 
     # middleware=SummarizationMiddleware(model=summarization_model, )
 
@@ -271,40 +278,37 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
     # Assert the user is loggedin and the assistant has an id from the config:
     # Otherwise use an anonymouse user id
 
-    user_id = config.get("configurable",{}).get("langgraph_api_user_id", '')
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(config, runtime)
 
-    if user_id != '':
-        user_state.update("user_id", user_id)
-    else:
-        """anonymous_user_id is 'str(uuid5(NAMESPACE_URL, 'anonymous_user_id"""
-        user_state.update({"user_id":'9977df19-9ceb-5f87-a130-55f6a6282069'})
-        
-    
-    assistant_id = config.get("configurable", {}).get("assistant_id", "")
+    user_state.update(updated_user_state)
+    assistant_state.update(updated_assistant_state)
 
-    if assistant_id != "":
-        assistant_state.update({"assistant_id":assistant_id})
-    else:
-        raise Exception("Assistant does not have an id from the configuration. Provide an assistant_id in config['configurable']['assistant_id'].")
+    user_id = user_state.get("user_id")
+    assistant_id = assistant_state.get("assistant_id")
 
     # Update Name and Description of User and Assistant if provided in the context
 
-    assistant_name = getattr(runtime.context.assistant_ctx, "name", None)
-    assistant_description = getattr(runtime.context.assistant_ctx, "description", None)
+    # name and description are accessible as dictionaries
+    assistant_name = runtime.context.assistant_ctx.get("name", None)
+    assistant_description = runtime.context.assistant_ctx.get("description", None)
 
-    user_name = getattr(runtime.context.user_ctx, "name", None)
-    user_description = getattr(runtime.context.user_ctx, "description", None)
+    user_name = runtime.context.user_ctx.get("name", None)
+    user_description = runtime.context.user_ctx.get("description", None)
     
     if assistant_name is not None:
         assistant_state.update({"assistant_name": assistant_name})        
     else:
-        runtime.store.asearch("")
-
+        possible_name = await runtime.store.asearch((user_id, assistant_id, "identity"), query="name")
+        assistant_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact", "")     
+        
     if assistant_description is not None:
         assistant_state.update({"assistant_description": assistant_description})        
 
     if user_name is not None:
         user_state.update({"user_name": user_name})        
+    else:
+        possible_name = await runtime.store.asearch((assistant_id, user_id, "identity"), query="name")
+        user_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact", "")
 
     if user_description is not None:
         user_state.update({"user_description": user_description})        
@@ -318,11 +322,14 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
     user_identity_namespace = (assistant_id, user_id, "identity")
 
     user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
-    # user_identity_document_items = user_identity_document_items_response.get("items", {})
+
+    # Coerce into document objects from Search Items
+    user_identity_document_items = reduce_docs([], user_identity_document_items)
 
     assistant_identity_document_items = await runtime.store.asearch(assistant_identity_namespace)
 
-    # assistant_identity_document_items = assistant_identity_document_items_response.get("items", [])
+    # Coerce into document objects from Search Items
+    assistant_identity_document_items = reduce_docs([], assistant_identity_document_items)
 
     user_state.update({"user_identity": {"user_identity_documents": user_identity_document_items}})
 

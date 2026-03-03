@@ -133,7 +133,7 @@ def format_docs(docs: list[Document] | None) -> str:
 import uuid
 from typing import Union, Any, Literal
 
-from langgraph_sdk.schema import Item
+from langgraph.store.base import SearchItem
 
 def reduce_docs(
     existing: Sequence[Document] | None,
@@ -141,6 +141,7 @@ def reduce_docs(
         Sequence[Document],
         Sequence[dict[str, Any]],
         Sequence[str],
+        Sequence[SearchItem],
         str,
         Literal["delete"],
     ],
@@ -169,9 +170,10 @@ def reduce_docs(
                 )
             elif isinstance(item, dict):
                 coerced.append(Document(**item))
-            elif isinstance(item, Item):
-                document = Document(page_content = item['value'].get("document", {}).get("kwargs", {}).get("page_content", ""))
-                document.metadata.update({"metadata": item['value'].get("document", {}).get("kwargs", {}).get("metadata", {})})
+            elif isinstance(item, SearchItem):
+                logger.info("breakpoint")
+                document = Document(page_content = getattr(item,'value', {}).get("document", {}).get("kwargs", {}).get("page_content", ""))
+                document.metadata.update({"metadata": getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})})
                 coerced.append(document)
             else:
                 coerced.append(item)
@@ -184,24 +186,26 @@ from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalContext
 
 
-async def extract_user_id_assistant_id(config: RunnableConfig):
-       
-    user_id = config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
-    if user_id == "":
-        user_id = config.get("configurable",{}).get("user_id","")
+async def extract_user_id_assistant_id(config: RunnableConfig, runtime: Runtime):
+    user_state = {}
+    assistant_state = {}
 
+    user_id = config.get("configurable",{}).get("langgraph_api_user_id", '')
 
-    assistant_id = config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
-    if assistant_id == "":
-        assistant_id = config.get("configurable",{}).get("assistant_id","")
+    if user_id != '':
+        user_state.update({"user_id": user_id})
+    else:
+        """anonymous_user_id is 'str(uuid5(NAMESPACE_URL, 'anonymous_user_id"""
+        user_state.update({"user_id":'9977df19-9ceb-5f87-a130-55f6a6282069'})
+        
+    assistant_id = config.get("configurable", {}).get("assistant_id", "")
 
-    # Ensure valid user_id and assistant_id
-    if user_id == "" and (config.get("metadata", {}).get("from_studio") is True):
-        user_id = "Anubis_from_studio_" + assistant_id
-    user_id = "".join(user_id.strip())    
-    assistant_id = "".join(assistant_id.strip())
+    if assistant_id != "":
+        assistant_state.update({"assistant_id":assistant_id})
+    else:
+        raise Exception("Assistant does not have an id from the configuration. Provide an assistant_id in config['configurable']['assistant_id'].")
 
-    return user_id, assistant_id
+    return user_state, assistant_state
 
 async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
         user_id, assistant_id = await extract_user_id_assistant_id(config)
@@ -250,8 +254,6 @@ async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
         ai_context_item = await store.aget(namespace, key=assistant_id)
 
         return ai_context_item
-
-
 
 ############################  CHUNK LONG MESSAGES  #############################
 

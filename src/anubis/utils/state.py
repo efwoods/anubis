@@ -20,7 +20,7 @@ from langgraph.graph.message import add_messages # Built-in reducer
 from langchain_core.documents import Document 
 
 
-from src.anubis.utils.helper_functions import (
+from src.anubis.utils.utility import (
     add_queries, 
     reduce_docs, 
 )
@@ -98,7 +98,7 @@ class AssistantIdentityState:
     assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can store or otherwise process."""
 
-class AssitantState(TypedDict):
+class AssistantState(TypedDict):
     assistant_name: str
     assistant_identity: AssistantIdentityState
     assistant_id: str
@@ -108,6 +108,10 @@ class UserState(TypedDict):
     user_identity: UserIdentityState
     user_id: str
 
+class IdentityUpdateState(TypedDict):
+    user_state: UserState
+    assistant_state: AssistantState
+    content: str
 
 
 class GlobalState(TypedDict):
@@ -120,7 +124,7 @@ class GlobalState(TypedDict):
 
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
 
-    assistant_state: AssitantState
+    assistant_state: AssistantState
     user_state: UserState
     
     conversation_summary: Optional[str] = ""

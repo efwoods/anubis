@@ -97,23 +97,23 @@ class AssistantIdentityState:
     """A list of documents that the agent can store or otherwise process."""
 
 @dataclass(kw_only=True)
-class RememberedMemories:
+class RecalledMemories:
     """Represents the state of the memories that have been remembered and retrieved from the store.
 
-    This class defines the structure of the remembered memories.
+    This class defines the structure of the recalled memories.
     """
-    remembered_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
 
 class AssistantState(TypedDict):
+    assistant_id: str
     assistant_name: str
     assistant_identity: AssistantIdentityState
-    assistant_id: str
-    remembered_memories: RememberedMemories
+    recalled_memories: RecalledMemories
 
 class UserState(TypedDict):
+    user_id: str
     user_name: str
     user_identity: UserIdentityState
-    user_id: str
 
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
@@ -144,7 +144,7 @@ class GlobalState(TypedDict):
         }
     )
 
-    remembered_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
 
     """ Data Uploading and Processing """
 

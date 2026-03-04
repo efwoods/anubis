@@ -61,9 +61,10 @@ from typing import Dict
 #     )
 #     return f"Stored memory {mem_id}"
 
-
+from langgraph.types import Command
+from langchain_core.messages import ToolMessage
 @tool()
-async def remember_memories(runtime: ToolRuntime) -> GlobalState:
+async def remember_memories(runtime: ToolRuntime):
     """This is used to retrieve memories or 'REMEMBER MEMORIES' from the store.
      These memories have been shared from the user and contain information about the assistant's identity.
      These memories have been shared from the user and contain information that was important that assistant decided the assistant needed to remember.
@@ -83,7 +84,6 @@ async def remember_memories(runtime: ToolRuntime) -> GlobalState:
             relevance scores in vectorstore 
             (Document type is the standard for the vector store).'
     """
-
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
@@ -124,7 +124,11 @@ async def remember_memories(runtime: ToolRuntime) -> GlobalState:
 
     system_message = SystemMessage(content=MEMORY_EVOCATION_INSTRUCTIONS)
 
-    chat_prompt_model = system_message + runtime.state['messages']
+    
+    messages = [message for message in runtime.state['messages'] if type(message) is not SystemMessage]
+    
+    tool_call_id = messages[-1].tool_calls[0]['id']
+    chat_prompt_model = system_message + messages
 
     response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
     
@@ -134,8 +138,11 @@ async def remember_memories(runtime: ToolRuntime) -> GlobalState:
         assistant_memory_namespace,
         query=evoked_memory_query
     )
-
-    return {"remembered_memory_documents": evoked_memories_response}
+    update = {"recalled_memory_documents": evoked_memories_response, 
+              "messages":[ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.", tool_call_id=tool_call_id)]}
+    goto = "load_consciousness"
+    tool_call_id = runtime.tool_call_id
+    return Command(update=update, goto=goto)
 
 @tool()
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory(

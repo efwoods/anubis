@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 from langgraph.graph import StateGraph, START, END
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.configuration import GlobalConfiguration
 
 from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
 
@@ -43,7 +42,6 @@ from langgraph.runtime import Runtime
 
 from src.anubis.utils.model import init_model
 from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.state import GlobalState
 
 from src.anubis.utils.utility import format_docs
@@ -77,12 +75,7 @@ from src.anubis.utils.utility import (
     reduce_docs, 
 )
 
-""" TOOLS """
-
-""" CONFIGURATION """
-
-configuration = GlobalConfiguration()
-
+from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 
 """ NODES """
 
@@ -125,6 +118,7 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     <ROLE>
     You are an expert judge of identifying violations of the terms of service and privacy policy from human messages.
     </ROLE>
+    
     <INSTRUCTIONS>
     Determine if the user MESSAGE is a violation of the included TERMS_OF_SERVICE or the PRIVACY_POLICY. 
     Include a reason the user MESSAGE has violated the terms of service or the privacy policy or both. 
@@ -134,12 +128,15 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     Return a FALSE violation if the MESSAGE has NOT violated the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
     MUST include EVERY exact line in the TERMS_OF_SERVICE or the PRIVACY_POLICY that give reason that the MESSAGE is a violation of either the TERMS_OF_SERVICE or the PRIVACY_POLICY whenever there is a violation in the MESSAGE of either or the TERMS_OF_SERVICE or the PRIVACY_POLICY or both.
     </INSTRUCTIONS>
+
     <TERMS_OF_SERVICE>
     {terms_of_service}
     </TERMS_OF_SERVICE>
+    
     <PRIVACY_POLICY>
     {privacy_policy}
     </PRIVACY_POLICY>
+    
     <INSTRUCTIONS>
     Determine if the user MESSAGE is a violation of the included TERMS_OF_SERVICE or the PRIVACY_POLICY. 
     Include a reason the user MESSAGE has violated the terms of service or the privacy policy or both. 
@@ -149,12 +146,13 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     Return a FALSE violation if the MESSAGE has NOT violated the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
     MUST include EVERY exact line in the TERMS_OF_SERVICE or the PRIVACY_POLICY that give reason that the MESSAGE is a violation of either the TERMS_OF_SERVICE or the PRIVACY_POLICY whenever there is a violation in the MESSAGE of either or the TERMS_OF_SERVICE or the PRIVACY_POLICY or both.
     </INSTRUCTIONS>
+    
     <ROLE>
     You are an expert judge of identifying violations of the terms of service and privacy policy from human messages.
     </ROLE>
 """
 
-    system_message = SystemMessage(content = TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT)
+    system_message = SystemMessage(content = TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT.format(terms_of_service=TERMS_OF_SERVICE, privacy_policy = PRIVACY_POLICY))
     model_with_structured_output = init_model(context=GlobalContext, response_format=TermsAndServicesContentModeration)
 
     chat_prompt_template = [system_message] + [message]
@@ -172,14 +170,24 @@ async def update_identity_tool_classification(state:GlobalState, config: Runnabl
     Identify and handle identity tool calls.
     """
     
-    model_with_identity_tools = init_model(context=GlobalContext, tools=[learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory])
+    model_with_identity_tools = init_model(
+        context=runtime.context, 
+        tools=[
+            learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory
+        ])
     identity_tools_message = model_with_identity_tools.ainvoke(state['messages'])
+    return {'messages':identity_tools_message}
 
-# async def update_identity_tool_condition()
+async def update_identity_tool_condition(state: GlobalState) -> Literal["update_identity_tools", "load_consciousness"]:
+    recent_message = state['messages'][-1]
+    if recent_message.tool_calls:
+        return "update_identity_tools" 
+    else:
+        return "load_consciousness"    
+
+
 
 async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
-
-
     user_id = state["user_state"]['user_id']
     assistant_id = state['assistant_state']['assistant_id']
 
@@ -250,7 +258,8 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     logger.info("breakpoint")
 
-    retrieved_memories = state['remembered_memory_documents']
+    # retrieved_memories = state['assistant_state'].get("recalled_memories", {}).get("recalled_memory_documents", [])
+    retrieved_memories = state['recalled_memory_documents']
     
     if len(retrieved_memories) == 0:
         retrieved_memories = None
@@ -277,6 +286,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     logger.info(f"populated_template: {populated_identity_template}")
 
     # prepend system message
+    messages = [message for message in state['messages'] if type(message) is not SystemMessage]
     messages = populated_identity_template.messages + state['messages']
     input = {"messages": messages}
     
@@ -285,73 +295,43 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
 async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
-    
-    configuration =  runtime.context.configuration
-
-    if runtime.context.debug == "TRUE":
-
-        logger.info(f"INVOKE AGENT NODE ")
-
-        logger.info(f"state: {state}")
-        logger.info(f"config: {config}")
-        logger.info(f"runtime: {runtime}")
-        logger.info(f"runtime.store: {runtime.store}")
-        logger.info(f"runtime.context: {runtime.context}")
-
-        logger.info(f"breakpoint invoke agent")
-
-        logger.warning(f"THERE SHOULD BE ENVIRONMENT VARIABLES; configuration: {configuration}")
-
-        logger.info(f"Testing store access")
-        logger.info(f"runtime.store: {runtime.store}")
-    
-        # Asserting Current Identity:
-        # user_id, assistant_id = await extract_user_id_assistant_id(config)
-        logger.info(f"user_id: {state['user_state'].get('user_id', '')}")
-        logger.info(f"assistant_id: {state['assistant_state'].get('assistant_id', '')}")
-
-        # Loaded Identity:
-        logger.info(f"user_identity: {state['user_state'].get('user_identity', [])}")
-        logger.info(f"assistant_identity: {state['assistant_state'].get('assistant_identity', [])}")
-
-        # Loaded Names
-        logger.info(f"user_identity: {state['user_state'].get('user_name','')}")
-        logger.info(f"assistant_identity: {state['assistant_state'].get('assistant_name','')}")
-
-        logger.info(f"BREAKPOINT: UPDATE USER AND ASSISTANT CONTEXT")
-
-        # await store.aput("testing", key="testing_key", value={"testing_key":"testing_value"})
-        # testing_get = await store.aget("testing", key="testing_key", value={"testing_key":"testing_value"})
-        # get_value = await store.aget("evan", key="name")
-        # logger.info(f"get_value: {get_value}")
-        # logger.info(f"testing_get: {testing_get}")
 
     """ CREATE MODEL """
 
+
+    # model invocation
     avatar_model_with_tools = init_model(
         context = runtime.context,
         tools = [
-            learn_information_about_the_user, 
-            learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
             remember_memories
         ]
     )
 
-    # model invocation
     response = await avatar_model_with_tools.ainvoke(input=state['messages'])
     avatar_response_content = getattr(response, 'content')
     logger.info(f"Avatar Model Response: {avatar_response_content}")
     return {"messages":[response]}
 
     # agent invocation
-    # response = await avatar.ainvoke(input=input)
+    # avatar_model = init_model(
+    #     context = runtime.context,
+    # )
+
+    # avatar = create_agent(model=avatar_model, tools=[remember_memories])
+
+    # response = await avatar.ainvoke(input={"messages": state['messages']})
     # avatar_response = response.get("messages", [])[-1]
 
     # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
     # result = {"messages": [avatar_response]}
     # return result
  
-# async def avatar_tools_condition()
+async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tools", '__end__']:
+    recent_message = state['messages'][-1]
+    if recent_message.tool_calls:
+        return "avatar_tools"
+    else:
+        return "__end__"
     
 # async def evaluate_response_quality()
     
@@ -375,18 +355,18 @@ avatar_tools = ToolNode([remember_memories])
 
 # TOOL WORKFLOW 
 
-# """ TOOL WORKFLOW NODES """
+""" TOOL WORKFLOW NODES """
 
 # workflow.add_node("chat", message_interface)
 
 # workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
 
-# workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
-# workflow.add_node("update_identity_tools", update_identity_tools)
+workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
+workflow.add_node("update_identity_tools", update_identity_tools)
 
 # workflow.add_node("load_consciousness", load_consciousness)
 # workflow.add_node("respond", invoke_agent)
-# workflow.add_node("avatar_tools", avatar_tools)
+workflow.add_node("avatar_tools", avatar_tools)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
 
@@ -396,18 +376,26 @@ avatar_tools = ToolNode([remember_memories])
 
 # workflow.add_edge(START, "chat")
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
-# workflow.add_edge("chat", "update_identity_tool_classification")
 
-# workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", END:"load_consciousness"})
+# workflow.add_edge("chat", "update_identity_tool_classification")
+workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "__end__":"load_consciousness"})
+# workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
 
 # workflow.add_edge("load_consciousness", "respond")
-# workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', END:"evaluate_response_quality"})
-# workflow.add_edge("avatar_tools", "load_consciousness")
 
+# COERCION
+# workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', END:"evaluate_response_quality"})
 # workflow.add_edge("evaluate_response_quality", "update_response_metadata")
 # workflow.add_edge("terms_and_services_content_moderation", "update_response_metadata")
-
 # workflow.add_edge("update_response_metadata", END)
+
+
+# TOOL TESTING
+workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', "__end__":"__end__"})
+workflow.add_edge("avatar_tools", "load_consciousness")
+
+# workflow.add_edge("terms_and_services_content_moderation", END)
+
 
 # BASIC CHAT WORKFLOW
 
@@ -422,8 +410,7 @@ workflow.add_node("respond", invoke_agent)
 workflow.add_edge(START, "chat")
 workflow.add_edge("chat", "load_consciousness")
 workflow.add_edge("load_consciousness", "respond")
-workflow.add_edge("respond", END)
-
+# workflow.add_edge("respond", END)
 
 graph = workflow.compile()
 

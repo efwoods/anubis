@@ -61,7 +61,6 @@ class GlobalContext:
 
     user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
-    configuration: GlobalConfiguration = field(default_factory=GlobalConfiguration)
 
     # max_search_results: int = field(
     #     default=10, 
@@ -168,6 +167,3 @@ class GlobalContext:
 
             if getattr(self, f.name) == f.default:
                 setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
-
-        self.configuration.__post_init__()
-

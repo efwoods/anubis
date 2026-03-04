@@ -94,6 +94,7 @@ class AssistantIdentityState:
     """
 
     assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
+    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
     """A list of documents that the agent can store or otherwise process."""
 
 @dataclass(kw_only=True)
@@ -107,13 +108,12 @@ class RecalledMemories:
 class AssistantState(TypedDict):
     assistant_id: str
     assistant_name: str
-    assistant_identity: AssistantIdentityState
-    recalled_memories: RecalledMemories
+    assistant_description: str
 
 class UserState(TypedDict):
     user_id: str
     user_name: str
-    user_identity: UserIdentityState
+    user_description: str
 
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
@@ -122,11 +122,15 @@ class GlobalState(TypedDict):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
 
+    system_message: str = ""
 
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
 
     assistant_state: AssistantState
     user_state: UserState
+
+    assistant_identity_state: AssistantIdentityState
+    user_identity_state: UserIdentityState
 
     """ Data Retrieval """
 

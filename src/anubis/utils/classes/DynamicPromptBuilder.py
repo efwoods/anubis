@@ -54,13 +54,17 @@ class DynamicPromptBuilder:
     def build_prompt(
         self,
         assistant_name: Optional[str] = None,
+        assistant_description: Optional[str] = None,
         assistant_identity: Optional[List[Document]] = None,
+        assistant_emotions: Optional[List[Document]] = None,
         # assistant_context: Optional[Dict[str, Any]] = None,
         # user_context: Optional[Dict[str, Any]] = None,
         retrieved_knowledge: Optional[List[Document]] = None,
         retrieved_memories: Optional[List[Document]] = None,
         user_name: Optional[str] = None,
+        user_description: Optional[str] = None,
         user_identity: Optional[List[Document]] = None,
+        user_emotions: Optional[List[Document]] = None,
         system_time: Optional[str] = None,
     ) -> ChatPromptTemplate:
         """
@@ -82,10 +86,15 @@ class DynamicPromptBuilder:
             assistant_name = "You don't know your name."    
 
         # Render Assistant Identity
-        if assistant_identity is None or assistant_identity.get("assistant_identity_documents", []) == []:
-            assistant_identity_str = "You don't have any information about identity."
+        if assistant_identity is None or len(assistant_identity) == 0:
+            if assistant_description is None:
+                assistant_identity_str = "You don't have any information about identity."
+            else:
+                assistant_identity_str = assistant_description
         else:
-            assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity.get("assistant_identity_documents", [])])
+            assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity])
+            if assistant_description is not None:
+                assistant_identity_str = assistant_description + "\n\n" + assistant_identity_str
 
         # Render AI context
         # assistant_context_str = self.render_identity_context(assistant_context or {})
@@ -93,12 +102,16 @@ class DynamicPromptBuilder:
         if user_name is None:
             user_name = "You don't know the name of the person you are communicating with."
 
-        if user_identity is None or user_identity.get("user_identity_documents", []) == []:
-            user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
+        if user_identity is None or len(user_identity) == 0:
+            if user_description is None:
+                user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
+            else:
+                user_identity_str = user_description
         else:
-            user_identity_str = "\n\n".join([doc.page_content for doc in user_identity.get("user_identity_documents")])
+            user_identity_str = "\n\n".join([doc.page_content for doc in user_identity])
+            if user_description is not None:
+                user_identity_str = user_description + "\n\n" + user_identity_str
         
-
         # Build user context
         # user_context_str = user_context or "User identity unknown."
         
@@ -110,9 +123,15 @@ class DynamicPromptBuilder:
         
         # Build retrieved memories (associated memories given the conversation)
         if retrieved_memories is None:
-            retrieved_memories_str = "No additional memories retrieved"
+            retrieved_memories_str = "No additional memories retrieved."
         else:
             retrieved_memories_str = "\n\n".join([doc.page_content for doc in retrieved_memories])
+
+        if assistant_emotions is None:
+            assistant_emotions_str = "Unaware of current emotions of self."
+
+        if user_emotions is None:
+            user_emotions_str = "Unaware of the current emotions of the person or people you are addressing."
 
         # Build system time
         if system_time is None:
@@ -128,10 +147,12 @@ class DynamicPromptBuilder:
         prompt_vars = {
             "assistant_name": assistant_name, 
             "assistant_identity": assistant_identity_str,
+            "assistant_emotions": assistant_emotions_str,
             "retrieved_knowledge": retrieved_knowledge_str,
             "retrieved_memories": retrieved_memories_str,
             "user_name": user_name, 
             "user_identity": user_identity_str,
+            "user_emotions": user_emotions_str,
             "system_time": system_time,
         }
 

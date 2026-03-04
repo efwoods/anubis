@@ -158,6 +158,10 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     addressed as YOU or or YOUR or YOURS or the direct given name of the assistant.
     An example memory is the user telling the assistant what the assistant's name is or facts about the assistant.
     THERE MAY BE MORE THAN ONE FACT. IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+
+    RULE:
+    DO NOT CALL THIS TOOL MULTIPLE TIMES WITH THE SAME FACT.
+
     Example:
     Hi, my name is Evan.
     This is a description of me.
@@ -284,8 +288,14 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         key=identity_id,
         value={"document": assistant_identity_memory_document_json},
     )
-    return {"assistant_state":{"remembered_memories": {"remembered_memory_documents": assistant_identity_memory_document}}}
 
+    tool_call_id = runtime.state['messages'][-1]['tool_calls'][0]['id']
+
+    update =  {"assistant_identity_state": {"recalled_memory_documents": assistant_identity_memory_document},
+               "messages":[ToolMessage(content="{assistant_fact}", tool_call_id = tool_call_id)]}
+
+    goto="update_identity_tool_classification"
+    return Command(update=update, goto=goto)
 
 @tool()
 async def learn_information_about_the_user(
@@ -426,7 +436,16 @@ async def learn_information_about_the_user(
         key=identity_id,
         value={"document": user_identity_document_json},
     )
-    return {"user_state": {"user_identity": {"user_identity_documents": user_identity_document}}}
+
+    recent_message = runtime.state['messages'][-1]
+    tool_call_id = recent_message.tool_calls[0].get('id')
+
+    update = {"user_identity_state": 
+               {"user_identity_documents": user_identity_document},
+               "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
+    goto = "update_identity_tool_classification"
+
+    return Command(update=update, goto=goto)
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

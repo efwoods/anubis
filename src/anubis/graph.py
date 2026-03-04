@@ -103,6 +103,7 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
     user_state.update(updated_user_state)
     assistant_state.update(updated_assistant_state)
 
+
     return {"messages": state['messages'], "assistant_state": assistant_state, "user_state": user_state}
 
 
@@ -169,23 +170,27 @@ async def update_identity_tool_classification(state:GlobalState, config: Runnabl
     """
     Identify and handle identity tool calls.
     """
-    
+    logger.info("breakpoint")
     model_with_identity_tools = init_model(
         context=runtime.context, 
         tools=[
             learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory
         ])
-    identity_tools_message = model_with_identity_tools.ainvoke(state['messages'])
+    messages = state['messages']
+    identity_tools_message = await model_with_identity_tools.ainvoke(messages)
     return {'messages':identity_tools_message}
 
 async def update_identity_tool_condition(state: GlobalState) -> Literal["update_identity_tools", "load_consciousness"]:
+    logger.info("breakpoint")
     recent_message = state['messages'][-1]
     if recent_message.tool_calls:
-        return "update_identity_tools" 
-    else:
-        return "load_consciousness"    
-
-
+        for tool_call in recent_message.tool_calls:
+            if tool_call.get("name", "") in update_identity_accessible_tools_list:
+                return "update_identity_tools" 
+            else:
+                return "load_consciousness"
+    
+    return "load_consciousness"    
 
 async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     user_id = state["user_state"]['user_id']
@@ -245,16 +250,13 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
 
     # Coerce into document objects from Search Items
-    user_identity_document_items = reduce_docs([], user_identity_document_items)
+    user_identity = reduce_docs([], user_identity_document_items)
 
     assistant_identity_document_items = await runtime.store.asearch(assistant_identity_namespace)
 
     # Coerce into document objects from Search Items
-    assistant_identity_document_items = reduce_docs([], assistant_identity_document_items)
+    assistant_identity = reduce_docs([], assistant_identity_document_items)
 
-    state['user_state'].update({'user_identity': {"user_identity_documents": user_identity_document_items}})
-
-    state['assistant_state'].update({'assistant_identity': {"assistant_identity_documents": assistant_identity_document_items}})
 
     logger.info("breakpoint")
 
@@ -268,17 +270,19 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     system_time = datetime.now(tz=timezone.utc).isoformat()
 
-    assistant_identity = state['assistant_state'].get('assistant_identity', [])
+    # assistant_identity = state['assistant_state'].get('assistant_identity', [])
     assistant_name = state['assistant_state'].get('assistant_name','')
 
-    user_identity = state['user_state'].get('user_identity', [])
+    # user_identity = state['user_state'].get('user_identity', [])
     user_name = state['user_state'].get('user_name','')
 
     populated_identity_template = prompt_builder.build_prompt(
         assistant_name = assistant_name,
+        assistant_description = assistant_description,
         assistant_identity= assistant_identity,
         retrieved_memories=retrieved_memories,
         user_name = user_name,
+        user_description = user_description,
         user_identity=user_identity, 
         system_time = system_time,
     )
@@ -286,12 +290,18 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     logger.info(f"populated_template: {populated_identity_template}")
 
     # prepend system message
-    messages = [message for message in state['messages'] if type(message) is not SystemMessage]
-    messages = populated_identity_template.messages + state['messages']
-    input = {"messages": messages}
+    logger.info(f"state['messages']: {state['messages']}")
+
+    system_message_str = populated_identity_template.messages[0].content
+
+    input_update = { 
+                    "user_identity_state": user_identity, 
+                    "assistant_identity_state": assistant_identity, 
+                    "system_message": system_message_str
+                    }
     
-    logger.info(f"message input: {input}")
-    return input
+
+    return Command(update = input_update, goto="respond")
 
 async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
@@ -304,10 +314,19 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
         context = runtime.context,
         tools = [
             remember_memories
-        ]
+        ], 
+
     )
 
-    response = await avatar_model_with_tools.ainvoke(input=state['messages'])
+    logger.info(f"breakpoint")
+    messages = state['messages']
+    
+    if type(messages[0]) is not SystemMessage:
+        messages.insert(0, SystemMessage(content=state['system_message']))
+    else:
+        messages[0].content = state['system_message']
+
+    response = await avatar_model_with_tools.ainvoke(input=messages)
     avatar_response_content = getattr(response, 'content')
     logger.info(f"Avatar Model Response: {avatar_response_content}")
     return {"messages":[response]}
@@ -326,10 +345,14 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     # result = {"messages": [avatar_response]}
     # return result
  
-async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tools", '__end__']:
+async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tools", "respond", '__end__']:
     recent_message = state['messages'][-1]
     if recent_message.tool_calls:
-        return "avatar_tools"
+        for tool_call in recent_message.tool_calls:
+            if tool_call.get("name", "") in avatar_accessible_tools_list:
+                return "avatar_tools"
+            else:
+                return "__end__"
     else:
         return "__end__"
     
@@ -347,25 +370,33 @@ workflow = StateGraph(
     context_schema = GlobalContext
 )
 
+update_identity_accessible_tools = [
+    learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory
+    ]
 
-update_identity_tools = ToolNode([learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory])
+update_identity_accessible_tools_list = [
+    "learn_information_about_the_user", "learn_information_about_yourself_through_text_from_the_user_as_a_memory"
+    ]
 
-avatar_tools = ToolNode([remember_memories])
+update_identity_tools = ToolNode(update_identity_accessible_tools, handle_tool_errors=True)
 
+avatar_accessible_tools = [remember_memories]
+avatar_accessible_tools_list = ["remember_memories"]
+avatar_tools = ToolNode(avatar_accessible_tools, handle_tool_errors=True)
 
 # TOOL WORKFLOW 
 
 """ TOOL WORKFLOW NODES """
 
-# workflow.add_node("chat", message_interface)
+workflow.add_node("chat", message_interface)
 
 # workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
 
 workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
 workflow.add_node("update_identity_tools", update_identity_tools)
 
-# workflow.add_node("load_consciousness", load_consciousness)
-# workflow.add_node("respond", invoke_agent)
+workflow.add_node("load_consciousness", load_consciousness)
+workflow.add_node("respond", invoke_agent)
 workflow.add_node("avatar_tools", avatar_tools)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
@@ -374,14 +405,14 @@ workflow.add_node("avatar_tools", avatar_tools)
 
 # """ TOOL WORKFLOW EDGES """
 
-# workflow.add_edge(START, "chat")
+workflow.add_edge(START, "chat")
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
 
-# workflow.add_edge("chat", "update_identity_tool_classification")
-workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "__end__":"load_consciousness"})
-# workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
+workflow.add_edge("chat", "update_identity_tool_classification")
+workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "load_consciousness":"load_consciousness"})
+workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
 
-# workflow.add_edge("load_consciousness", "respond")
+workflow.add_edge("load_consciousness", "respond")
 
 # COERCION
 # workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', END:"evaluate_response_quality"})
@@ -399,17 +430,17 @@ workflow.add_edge("avatar_tools", "load_consciousness")
 
 # BASIC CHAT WORKFLOW
 
-""" BASIC CHAT WORKFLOW NODES """
+# """ BASIC CHAT WORKFLOW NODES """
 
-workflow.add_node("chat", message_interface)
-workflow.add_node("load_consciousness", load_consciousness)
-workflow.add_node("respond", invoke_agent)
+# workflow.add_node("chat", message_interface)
+# workflow.add_node("load_consciousness", load_consciousness)
+# workflow.add_node("respond", invoke_agent)
 
-""" BASIC CHAT WORKFLOW EDGES """
+# """ BASIC CHAT WORKFLOW EDGES """
 
-workflow.add_edge(START, "chat")
-workflow.add_edge("chat", "load_consciousness")
-workflow.add_edge("load_consciousness", "respond")
+# workflow.add_edge(START, "chat")
+# workflow.add_edge("chat", "load_consciousness")
+# workflow.add_edge("load_consciousness", "respond")
 # workflow.add_edge("respond", END)
 
 graph = workflow.compile()

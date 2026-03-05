@@ -34,7 +34,7 @@ services:
             start_interval: 1s
 
     langgraph-api:
-        image: anubis-langgraph-api:latest
+        image: evdev3/anubis-langgraph-api:latest
         ports:
             - "8123:8000"
         depends_on:

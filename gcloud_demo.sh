@@ -1,0 +1,1 @@
+gcloud compute ssh anubis-demo --zone=us-centra1-a

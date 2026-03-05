@@ -15,4 +15,5 @@ langchain-openai
 
 huggingface-hub
 sentence-transformers
+langchain-mongodb
 beautifulsoup4

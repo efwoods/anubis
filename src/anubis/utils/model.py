@@ -26,7 +26,7 @@ def init_model(context: GlobalContext,
                     base_url = base_url,
                     temperature=0.1,
                     api_key = api_key,
-                ).bind_tools(tools=tools, tool_choice={})
+                ).bind_tools(tools=tools, tool_choice="auto") # zero or more tools
     else: 
         model = ChatOpenAI(
             model = model_name,

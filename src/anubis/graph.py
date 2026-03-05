@@ -29,7 +29,6 @@ from pydantic import BaseModel, Field
 from typing import Literal
 from langgraph.types import Command
 
-
 import logging
 from datetime import datetime, timezone
 
@@ -60,15 +59,18 @@ from langgraph.prebuilt import ToolNode
 
 from pydantic import Field
 
-from src.anubis.utils.tools import (
+from src.anubis.utils.tools.identity.identity_tools import (
     learn_information_about_the_user, 
     learn_information_about_yourself_through_text_from_the_user_as_a_memory,
     # learn_information_about_yourself_through_images,
     # learn_information_about_yourself_through_tweets,
     # learn_information_about_yourself_through_youtube_videos,
-    remember_memories,
     # learn_new_facts,
     # retrieve_knowledge,
+)
+
+from src.anubis.utils.tools.avatar.avatar_tools import (
+    recall_memories,    
 )
 
 from src.anubis.utils.utility import (
@@ -165,32 +167,55 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     }
     return {"moderation_response": moderation_response}
 
+identity_tools_list = {"learn_information_about_yourself_through_text_from_the_user_as_a_memory": learn_information_about_yourself_through_text_from_the_user_as_a_memory, "learn_information_about_the_user":learn_information_about_the_user}
 
-async def update_identity_tool_classification(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
-    """
-    Identify and handle identity tool calls.
-    """
-    logger.info("breakpoint")
-    model_with_identity_tools = init_model(
-        context=runtime.context, 
-        tools=[
-            learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory
-        ])
-    messages = state['messages']
-    identity_tools_message = await model_with_identity_tools.ainvoke(messages)
-    return {'messages':identity_tools_message}
+identity_tools = [learn_information_about_yourself_through_text_from_the_user_as_a_memory, learn_information_about_the_user]
 
-async def update_identity_tool_condition(state: GlobalState) -> Literal["update_identity_tools", "load_consciousness"]:
-    logger.info("breakpoint")
-    recent_message = state['messages'][-1]
-    if recent_message.tool_calls:
-        for tool_call in recent_message.tool_calls:
-            if tool_call.get("name", "") in update_identity_accessible_tools_list:
-                return "update_identity_tools" 
-            else:
-                return "load_consciousness"
+# async def update_identity_tool_classification(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
+#     """
+#     Identify and handle identity tool calls.
+#     """
+#     logger.info("breakpoint")
+#     model_with_identity_tools = init_model(
+#         context=runtime.context, 
+#         tools=identity_tools,
+#         tool_choice = {
+#             "type":"function", "function":
+#             {"name": "learn_information_about_yourself_through_text_from_the_user_as_a_memory"},
+#             "type":"function", "function":
+#             {"name": "learn_information_about_the_user"}, 
+#         }
+#     )
+
+
+#     messages = state['messages']
+#     try:
+#         identity_tools_message = await model_with_identity_tools.ainvoke(messages)
+#     except openai.BadRequestError as e:
+#         if "function name not found" in str(e):
+#             return 
+
+#     tool_results = []
+
+#     if identity_tools_message.tool_calls:
+#         for tool_call in identity_tools_message.tool_calls:
+#             if tool_call['name'] in identity_tools_list.keys():
+#                 tool_result = await identity_tools_list[tool_call['name']].invoke(messages)
+#                 tool_results.append(tool_result)
+
+#     return Command(goto="load_consciousness")
+
+# async def update_identity_tool_condition(state: GlobalState) -> Literal["update_identity_tools", "load_consciousness"]:
+#     logger.info("breakpoint")
+#     recent_message = state['messages'][-1]
+#     if recent_message.tool_calls:
+#         for tool_call in recent_message.tool_calls:
+#             if tool_call.get("name", "") in update_identity_accessible_tools_list:
+#                 return "update_identity_tools" 
+#             else:
+#                 return "load_consciousness"
     
-    return "load_consciousness"    
+#     return "load_consciousness"    
 
 async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     user_id = state["user_state"]['user_id']
@@ -218,9 +243,9 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     if assistant_name is not None:
         state['assistant_state'].update({'assistant_name': assistant_name})        
     else:
-        possible_name = await runtime.store.asearch((user_id, assistant_id, "identity"), query="name")
-        if len(possible_name) > 0:
-            assistant_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact",'')     
+        assistant_possible_name = await runtime.store.asearch((user_id, assistant_id, "identity"), query="name")
+        if len(assistant_possible_name) > 0:
+            assistant_name = getattr(assistant_possible_name[0], "value").get("document", {}).get("kwargs", {}).get("metadata", {}).get("fact",'')     
         else:
             assistant_name = ""
         
@@ -230,9 +255,9 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     if user_name is not None:
         state['user_state'].update({'user_name': user_name})        
     else:
-        possible_name = await runtime.store.asearch((assistant_id, user_id, "identity"), query="name")
-        if len(possible_name) > 0:
-            user_name = getattr(possible_name[0], "value").get("document", {}).get("metadata", {}).get("fact",'')
+        user_possible_name = await runtime.store.asearch((assistant_id, user_id, "identity"), query="name")
+        if len(user_possible_name) > 0:
+            user_name = getattr(user_possible_name[0], "value").get("document", {}).get("kwargs", {}).get("metadata", {}).get("fact",'')
         else:
             user_name = ""
 
@@ -240,22 +265,26 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
         state['user_state'].update({"user_description": user_description})        
 
 
-    # Load the assistant identity from store:
-    # Identity of the assistant
-    assistant_identity_namespace = ("user_id", "assistant_id", "identity")
+    if state['user_identity_documents'] is None or len(state['user_identity_documents']) == 0:
+        user_identity_namespace = (assistant_id, user_id, "identity")
+        
+        user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
 
-    # Identity of the user according to the assistant
-    user_identity_namespace = (assistant_id, user_id, "identity")
+        # Coerce into document objects from Search Items
+        user_identity = reduce_docs([], user_identity_document_items)
+    else:
+        user_identity = state['user_identity_documents']
 
-    user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
 
-    # Coerce into document objects from Search Items
-    user_identity = reduce_docs([], user_identity_document_items)
+    if state['assistant_identity_documents'] is None or len(state['assistant_identity_documents']) == 0:
+        assistant_identity_namespace = (user_id, assistant_id, "identity")
+        
+        assistant_identity_document_items = await runtime.store.asearch(assistant_identity_namespace)
 
-    assistant_identity_document_items = await runtime.store.asearch(assistant_identity_namespace)
-
-    # Coerce into document objects from Search Items
-    assistant_identity = reduce_docs([], assistant_identity_document_items)
+        # Coerce into document objects from Search Items
+        assistant_identity = reduce_docs([], assistant_identity_document_items)
+    else:
+        assistant_identity = state['assistant_identity_documents']
 
 
     logger.info("breakpoint")
@@ -265,6 +294,116 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     
     if len(retrieved_memories) == 0:
         retrieved_memories = None
+
+    # Search your feelings
+    # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt 
+
+    # if state['current_assistant_emotions'] is None or state['current_assistant_emotions'] == "":
+    #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt
+    #     class EmotionSummarization(BaseModel):
+    #         """ Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning. """
+    #         emotional_summary: str
+    #         emotional_summary_reasoning: str    
+    #         serenity: float
+    #         joy: float
+    #         ecstacy: float
+    #         love: float
+    #         acceptance: float
+    #         trust : float
+    #         admiration: float
+    #         submission: float
+    #         apprehension: float
+    #         fear: float
+    #         terror: float
+    #         awe: float
+    #         distraction: float
+    #         surprise: float
+    #         amazement: float
+    #         disappointment: float
+    #         pensiveness: float
+    #         sadness: float
+    #         grief: float
+    #         remorse: float
+    #         boredom: float
+    #         disgust: float
+    #         loathing: float
+    #         contempt: float
+    #         annoyance: float
+    #         anger: float
+    #         rage: float
+    #         aggressiveness: float
+    #         interest: float
+    #         anticipation: float
+    #         vigilance: float
+    #         optimism: float 
+    #     emotional_model = init_model(context=runtime.context, response_format=EmotionSummarization)
+    #     historical_assistant_emotion_items = await runtime.store.asearch(assistant_identity_namespace, query=["I am feeling", "feeling"])
+    #     historical_assistant_emotion_documents = reduce_docs(historical_assistant_emotion_items)
+    #     historical_feelings_str = "\n\n".join([document.metadata.get("fact") for document in historical_user_feelings_documents if document.metadata.get("fact", "") != ""])    
+    #     emotion_summarization = await emotional_model.ainvoke(input = [SystemMessage(content = EMOTIONAL_ANALYSIS_PROMPT), HumanMessage(content=historical_feelings_str)])  
+    #     current_assistant_emotions = emotion_summarization.emotional_summary
+
+    # # Search user feelings
+    # if state['current_user_feelings'] is None or state['current_user_feelings'] == "":
+    #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt
+    #     class EmotionSummarization(BaseModel):
+    #         """ Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning. """
+    #         emotional_summary: str
+    #         emotional_summary_reasoning: str
+
+    #         serenity: float
+    #         joy: float
+    #         ecstacy: float
+    #         love: float
+    #         acceptance: float
+    #         trust : float
+    #         admiration: float
+    #         submission: float
+    #         apprehension: float
+    #         fear: float
+    #         terror: float
+    #         awe: float
+    #         distraction: float
+    #         surprise: float
+    #         amazement: float
+    #         disappointment: float
+    #         pensiveness: float
+    #         sadness: float
+    #         grief: float
+    #         remorse: float
+    #         boredom: float
+    #         disgust: float
+    #         loathing: float
+    #         contempt: float
+    #         annoyance: float
+    #         anger: float
+    #         rage: float
+    #         aggressiveness: float
+    #         interest: float
+    #         anticipation: float
+    #         vigilance: float
+    #         optimism: float
+
+
+
+    #     emotional_model = init_model(context=runtime.context, response_format=EmotionSummarization)
+        
+    #     historical_user_feelings_items = await runtime.store.asearch(user_identity_namespace, query=["I am feeling", "feeling"])
+    #     historical_user_feelings_documents = reduce_docs(historical_user_feelings_items)
+    #     historical_feelings_str = "\n\n".join([document.metadata.get("fact") for document in historical_user_feelings_documents if document.metadata.get("fact", "") != ""])
+
+    #     historical_user_feelings_items = await runtime.store.asearch(user_id, assistant_id, "memory", query=["I am feeling", "feeling"])
+    #     historical_user_feelings_documents = reduce_docs(historical_user_feelings_items)
+    #     historical_feelings_str = historical_feelings_str + "\n\n".join([document.metadata.get("fact") for document in historical_user_feelings_documents if document.metadata.get("fact", "") != ""])
+
+    #     emotion_summarization = await emotional_model.ainvoke(input = [SystemMessage(content = EMOTIONAL_ANALYSIS_PROMPT), HumanMessage(content=historical_feelings_str)])
+
+    #     current_user_emotions = emotion_summarization.emotional_summary
+
+
+
+
+
 
     prompt_builder = DynamicPromptBuilder()
 
@@ -295,13 +434,13 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     system_message_str = populated_identity_template.messages[0].content
 
     input_update = { 
-                    "user_identity_state": user_identity, 
-                    "assistant_identity_state": assistant_identity, 
+                    "user_identity_documents": user_identity, 
+                    "assistant_identity_documents": assistant_identity, 
                     "system_message": system_message_str
                     }
     
 
-    return Command(update = input_update, goto="respond")
+    return  input_update
 
 async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
@@ -313,10 +452,10 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     avatar_model_with_tools = init_model(
         context = runtime.context,
         tools = [
-            remember_memories
-        ], 
-
-    )
+            learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+                 recall_memories
+            ], 
+        )
 
     logger.info(f"breakpoint")
     messages = state['messages']
@@ -336,7 +475,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     #     context = runtime.context,
     # )
 
-    # avatar = create_agent(model=avatar_model, tools=[remember_memories])
+    # avatar = create_agent(model=avatar_model, tools=[recall_memories])
 
     # response = await avatar.ainvoke(input={"messages": state['messages']})
     # avatar_response = response.get("messages", [])[-1]
@@ -349,10 +488,7 @@ async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runt
     recent_message = state['messages'][-1]
     if recent_message.tool_calls:
         for tool_call in recent_message.tool_calls:
-            if tool_call.get("name", "") in avatar_accessible_tools_list:
-                return "avatar_tools"
-            else:
-                return "__end__"
+            return "avatar_tools"
     else:
         return "__end__"
     
@@ -370,18 +506,9 @@ workflow = StateGraph(
     context_schema = GlobalContext
 )
 
-update_identity_accessible_tools = [
-    learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory
-    ]
 
-update_identity_accessible_tools_list = [
-    "learn_information_about_the_user", "learn_information_about_yourself_through_text_from_the_user_as_a_memory"
-    ]
-
-update_identity_tools = ToolNode(update_identity_accessible_tools, handle_tool_errors=True)
-
-avatar_accessible_tools = [remember_memories]
-avatar_accessible_tools_list = ["remember_memories"]
+avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+                 recall_memories]
 avatar_tools = ToolNode(avatar_accessible_tools, handle_tool_errors=True)
 
 # TOOL WORKFLOW 
@@ -392,8 +519,8 @@ workflow.add_node("chat", message_interface)
 
 # workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
 
-workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
-workflow.add_node("update_identity_tools", update_identity_tools)
+# workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
+# workflow.add_node("update_identity_tools", update_identity_tools)
 
 workflow.add_node("load_consciousness", load_consciousness)
 workflow.add_node("respond", invoke_agent)
@@ -408,10 +535,9 @@ workflow.add_node("avatar_tools", avatar_tools)
 workflow.add_edge(START, "chat")
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
 
-workflow.add_edge("chat", "update_identity_tool_classification")
-workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "load_consciousness":"load_consciousness"})
-workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
-
+workflow.add_edge("chat", "load_consciousness")
+# workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "load_consciousness":"load_consciousness"})
+# workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
 workflow.add_edge("load_consciousness", "respond")
 
 # COERCION
@@ -441,7 +567,7 @@ workflow.add_edge("avatar_tools", "load_consciousness")
 # workflow.add_edge(START, "chat")
 # workflow.add_edge("chat", "load_consciousness")
 # workflow.add_edge("load_consciousness", "respond")
-# workflow.add_edge("respond", END)
+# workflow.add_edge("respond", END)K
 
 graph = workflow.compile()
 

@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 from src.anubis.utils.context import GlobalContext
 
 def init_model(context: GlobalContext, 
-               tools=[], response_format = None):
+               tools=[], tool_choice={}, response_format = None):
     
     model_name = context.model
     base_url = context.llama_api_base_url
@@ -26,7 +26,7 @@ def init_model(context: GlobalContext,
                     base_url = base_url,
                     temperature=0.1,
                     api_key = api_key,
-                ).bind_tools(tools=tools)
+                ).bind_tools(tools=tools, tool_choice={})
     else: 
         model = ChatOpenAI(
             model = model_name,

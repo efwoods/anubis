@@ -115,6 +115,11 @@ class UserState(TypedDict):
     user_name: str
     user_description: str
 
+class PlutchikEmotionalState:
+    """
+    
+    """
+
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
     # Common examples include:
@@ -126,11 +131,6 @@ class GlobalState(TypedDict):
 
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
 
-    assistant_state: AssistantState
-    user_state: UserState
-
-    assistant_identity_state: AssistantIdentityState
-    user_identity_state: UserIdentityState
 
     """ Data Retrieval """
 
@@ -148,7 +148,37 @@ class GlobalState(TypedDict):
         }
     )
 
+
+    """ User Identity"""
+    user_state: UserState
+    
+    current_user_emotions: str
+    # current_user_beliefs: str
+    # current_user_desires: str
+    # current_user_fears: str
+    # current_user_hopes: str
+    
+    # current_user_action: str
+
+    # current_user_objective: str
+
+    user_identity_documents: Annotated[Sequence[Document], reduce_docs]
+
+    """ Assistant Identity """
+    assistant_state: AssistantState
+    
+    current_assistant_emotions: str
+    # current_assistant_beliefs: str
+    # current_assistant_desires: str
+    # current_assistant_fears: str
+    # current_assistant_hopes: str
+
+    # current_assistant_action: str
+
+    # current_user_objective: str
+
     recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+    assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
 
     """ Data Uploading and Processing """
 

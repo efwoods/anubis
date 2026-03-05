@@ -172,8 +172,9 @@ def reduce_docs(
                 coerced.append(Document(**item))
             elif isinstance(item, SearchItem):
                 logger.info("breakpoint")
-                document = Document(page_content = getattr(item,'value', {}).get("document", {}).get("kwargs", {}).get("page_content", ""))
-                document.metadata.update({"metadata": getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})})
+                page_content = getattr(item,'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
+                document_metadata = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})
+                document = Document(page_content=page_content, metadata=document_metadata)
                 coerced.append(document)
             else:
                 coerced.append(item)

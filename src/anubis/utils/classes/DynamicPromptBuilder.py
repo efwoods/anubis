@@ -99,8 +99,9 @@ class DynamicPromptBuilder:
         # Render AI context
         # assistant_context_str = self.render_identity_context(assistant_context or {})
 
-        if user_name is None:
+        if user_name is None or user_name is '':
             user_name = "You don't know the name of the person you are communicating with."
+        
 
         if user_identity is None or len(user_identity) == 0:
             if user_description is None:

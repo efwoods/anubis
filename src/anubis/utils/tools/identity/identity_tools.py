@@ -8,16 +8,11 @@ from langchain_core.documents import Document
 from langchain_core.tools import InjectedToolArg
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from langgraph.store.base import BaseStore
 
-from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 
 logger = logging.getLogger(__name__)
 
-from src.anubis.utils.state import UserState, AssistantState, UserIdentityState, AssistantIdentityState
-
-from datetime import datetime, timezone
 
 
 from langchain_core.messages import AnyMessage
@@ -28,40 +23,6 @@ from src.anubis.utils.model import init_model
 from src.anubis.utils.utility import extract_user_id_assistant_id
 from typing import Dict
 from langgraph.types import Command
-
-# @tool()
-# async def create_memory(
-#     content: str, 
-#     # Hide these arguments from the model.
-#     assistant_state: Annotated[AssistantState, InjectedToolArg],
-#     user_state: Annotated[UserState, InjectedToolArg],
-#     runtime: ToolRuntime
-# ):
-#     """Create a new memory.
-
-#     Create a new memory between a user and an assistant. 
-#     This tool is used to create memories that the user has told the assistant.
-#     An example memory is the user telling the assistant the assistant's name.
-
-     
-
-#     Args:
-#         content: The main content of the memory. For example:
-#             "User expressed interest in learning about French."
-#         context: Additional context for the memory. For example:
-#             "This was mentioned while discussing career options in Europe."
-#         memory_id: ONLY PROVIDE IF UPDATING AN EXISTING MEMORY.
-#         The memory to overwrite.
-#     """
-
-#     mem_id = uuid.uuid4()
-#     await runtime.store.aput(
-#         (user_state.user_id, assistant_state.assistant_id, "memories"),
-#         key=str(mem_id),
-#         value={"content": content, "context": context},
-#     )
-#     return f"Stored memory {mem_id}"
-
 
 @tool()
 async def create_a_memory(
@@ -98,45 +59,6 @@ async def create_a_memory(
         """
         significant_fact: str =  Field(description = "This is the fact about the assistant that was shared by the user.")
         fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
-        
-    # class NewUserFactJudgeLLM(BaseModel):
-    #     non_new_fact: bool = Field(description = "This value is TRUE when there is a matching fact. " \
-    #     "This value is FALSE when there is not a matching fact in the list of known facts." \
-    #     "This information is already exists in the learned facts")
-    #     key_id: str = Field(description = "This is the id as a string of uuid of the fact that is exactly the same as the fact that is trying to be learned." \
-    #     "The key is located in the same dictionary as the matching_fact in the known_facts list under 'document.kwargs.metadata.id'" \
-    #     "the key may be None if the user fact is a new fact.")
-    #     known_facts: List[Dict[str, any]] = Field(description = "These are facts that are already known about the user. " \
-    #     "The fact is in a dictionary located under 'document.kwargs.metadata.fact' and the key is located in the same dictionary under 'document.kwargs.metadata.id'" )
-    #     matching_fact: str = Field("This is the fact that is the same as the user_fact that is trying to be learned. " \
-    #     "This may not exist if the user fact is a new fact that is not already in the list of known facts." \
-    #     "The fact is in a dictionary located under 'document.kwargs.metadata.fact' in the list of known facts")
-    #     reasoning: str = Field("This is the reasoning why the user fact is a new fact or is not a new fact. " \
-    #     "This is a clear reason. " \
-    #     "The user_fact may be a matching fact or the user_fact may be a new fact if the user_fact is not in the list of known facts. ")
-
-    # NEW_USER_FACT_LLM_AS_A_JUDGE_INSTRUCTIONS = """
-    # <INSTRUCTIONS>
-    # Identify if there is already an exact fact as the included fact in the list of known facts.
-    # Given the list of known facts, identify if there is a matching fact.
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # <RULES>
-    # Do not change the information of the fact.
-    # Do not change any of the keys.
-    # Do not change any information at all ever.
-    # </RULES>
-    # <FACT>
-    # {content}
-    # </FACT>
-    # <INSTRUCTIONS>
-    # Identify the fact that the user shared about themselves. 
-    # Do not change the information of the fact.
-    # Identify the CONTEXT behind the fact given the list of messages.
-    # The context behind the fact must be succinct. 
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # """
 
     model_with_structured_output = init_model(context = runtime.context, response_format=SignificantFactAndContext)
 
@@ -200,12 +122,12 @@ async def create_a_memory(
         value={"document": assistant_identity_memory_document_json},
     )
 
-    tool_call_id = runtime.state['messages'][-1]['tool_calls'][0]['id']
+    recent_message = runtime.state['messages'][-1]
+    tool_call_id = recent_message.tool_calls[0].get('id')
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
               "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
     return Command(update=update, goto="load_consciousness")
-
 
 @tool()
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory(
@@ -250,45 +172,6 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         """
         assistant_fact: str =  Field(description = "This is the fact about the assistant that was shared by the user.")
         fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
-        
-    # class NewUserFactJudgeLLM(BaseModel):
-    #     non_new_fact: bool = Field(description = "This value is TRUE when there is a matching fact. " \
-    #     "This value is FALSE when there is not a matching fact in the list of known facts." \
-    #     "This information is already exists in the learned facts")
-    #     key_id: str = Field(description = "This is the id as a string of uuid of the fact that is exactly the same as the fact that is trying to be learned." \
-    #     "The key is located in the same dictionary as the matching_fact in the known_facts list under 'document.kwargs.metadata.id'" \
-    #     "the key may be None if the user fact is a new fact.")
-    #     known_facts: List[Dict[str, any]] = Field(description = "These are facts that are already known about the user. " \
-    #     "The fact is in a dictionary located under 'document.kwargs.metadata.fact' and the key is located in the same dictionary under 'document.kwargs.metadata.id'" )
-    #     matching_fact: str = Field("This is the fact that is the same as the user_fact that is trying to be learned. " \
-    #     "This may not exist if the user fact is a new fact that is not already in the list of known facts." \
-    #     "The fact is in a dictionary located under 'document.kwargs.metadata.fact' in the list of known facts")
-    #     reasoning: str = Field("This is the reasoning why the user fact is a new fact or is not a new fact. " \
-    #     "This is a clear reason. " \
-    #     "The user_fact may be a matching fact or the user_fact may be a new fact if the user_fact is not in the list of known facts. ")
-
-    # NEW_USER_FACT_LLM_AS_A_JUDGE_INSTRUCTIONS = """
-    # <INSTRUCTIONS>
-    # Identify if there is already an exact fact as the included fact in the list of known facts.
-    # Given the list of known facts, identify if there is a matching fact.
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # <RULES>
-    # Do not change the information of the fact.
-    # Do not change any of the keys.
-    # Do not change any information at all ever.
-    # </RULES>
-    # <FACT>
-    # {content}
-    # </FACT>
-    # <INSTRUCTIONS>
-    # Identify the fact that the user shared about themselves. 
-    # Do not change the information of the fact.
-    # Identify the CONTEXT behind the fact given the list of messages.
-    # The context behind the fact must be succinct. 
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # """
     
     
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
@@ -299,16 +182,17 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     assistant_memory_namespace = (user_id, assistant_id, 'memory')
 
     # VERIFY FACT DOES NOT ALREADY EXIST
-    assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['assistant_identity_documents']]
-    assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=content)
-    assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
-    if content in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
-        # Fact already exists:
-        recent_message = runtime.state['messages'][-1]
-        tool_call_id = recent_message.tool_calls[0].get('id')
+    if runtime.state.get('assistant_identity_documents', None) is not None:
+        assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['assistant_identity_documents']]
+        assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=content)
+        assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
+        if content in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
+            # Fact already exists:
+            recent_message = runtime.state['messages'][-1]
+            tool_call_id = recent_message.tool_calls[0].get('id')
 
-        update = {"messages": [ToolMessage(content=f"Fact: {content} previously learned", tool_call_id=tool_call_id)]}
-        return Command(update=update, goto="load_consciousness")
+            update = {"messages": [ToolMessage(content=f"Fact: {content} previously learned", tool_call_id=tool_call_id)]}
+            return Command(update=update, goto="load_consciousness")
 
     model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
 
@@ -366,7 +250,9 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         value={"document": assistant_identity_memory_document_json},
     )
 
-    tool_call_id = runtime.state['messages'][-1]['tool_calls'][0]['id']
+    recent_message = runtime.state['messages'][-1]
+    tool_call_id = recent_message.tool_calls[0].get('id')
+    logger.warning(f"tool_call_id: {tool_call_id}")
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
               "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
@@ -410,45 +296,10 @@ async def learn_information_about_the_user(
         """
         user_fact: str =  Field(description = "This is the fact about the user that was shared by the user.")
         fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
-        
-    # class NewUserFactJudgeLLM(BaseModel):
-    #     non_new_fact: bool = Field(description = "This value is TRUE when there is a matching fact. " \
-    #     "This value is FALSE when there is not a matching fact in the list of known facts." \
-    #     "This information is already exists in the learned facts")
-    #     key_id: str = Field(description = "This is the id as a string of uuid of the fact that is exactly the same as the fact that is trying to be learned." \
-    #     "The key is located in the same dictionary as the matching_fact in the known_facts list under 'document.kwargs.metadata.id'" \
-    #     "the key may be None if the user fact is a new fact.")
-    #     known_facts: List[Dict[str, any]] = Field(description = "These are facts that are already known about the user. " \
-    #     "The fact is in a dictionary located under 'document.kwargs.metadata.fact' and the key is located in the same dictionary under 'document.kwargs.metadata.id'" )
-    #     matching_fact: str = Field("This is the fact that is the same as the user_fact that is trying to be learned. " \
-    #     "This may not exist if the user fact is a new fact that is not already in the list of known facts." \
-    #     "The fact is in a dictionary located under 'document.kwargs.metadata.fact' in the list of known facts")
-    #     reasoning: str = Field("This is the reasoning why the user fact is a new fact or is not a new fact. " \
-    #     "This is a clear reason. " \
-    #     "The user_fact may be a matching fact or the user_fact may be a new fact if the user_fact is not in the list of known facts. ")
 
-    # NEW_USER_FACT_LLM_AS_A_JUDGE_INSTRUCTIONS = """
-    # <INSTRUCTIONS>
-    # Identify if there is already an exact fact as the included fact in the list of known facts.
-    # Given the list of known facts, identify if there is a matching fact.
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # <RULES>
-    # Do not change the information of the fact.
-    # Do not change any of the keys.
-    # Do not change any information at all ever.
-    # </RULES>
-    # <FACT>
-    # {content}
-    # </FACT>
-    # <INSTRUCTIONS>
-    # Identify the fact that the user shared about themselves. 
-    # Do not change the information of the fact.
-    # Identify the CONTEXT behind the fact given the list of messages.
-    # The context behind the fact must be succinct. 
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # """
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    user_id = updated_user_state.get("user_id")
+    assistant_id = updated_assistant_state.get("assistant_id")
 
     # Identity of the user from the assistant's perspective
     user_identity_namespace = (assistant_id, user_id, 'identity')
@@ -489,12 +340,6 @@ async def learn_information_about_the_user(
     </INSTRUCTIONS>
     """
 
-
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
-    user_id = updated_user_state.get("user_id")
-    assistant_id = updated_assistant_state.get("assistant_id")
-
-
     identity_id = str(uuid.uuid4())
 
     system_message = SystemMessage(content=DECISION_INSTRUCTIONS.format(content=content))
@@ -529,9 +374,40 @@ async def learn_information_about_the_user(
     tool_call_id = recent_message.tool_calls[0].get('id')
 
     update = {"user_identity_documents": [user_identity_document],
-               "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
+               "messages": [ToolMessage(content=f"Learned: {user_fact}")]}
 
     return Command(update=update, goto="load_consciousness")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

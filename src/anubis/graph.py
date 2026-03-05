@@ -484,11 +484,24 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     # result = {"messages": [avatar_response]}
     # return result
  
-async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tools", "respond", '__end__']:
+avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+                 recall_memories]
+
+avatar_accessible_tools_dict = [{"learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+                 "recall_memories":recall_memories}]
+
+from langchain_core.messages import ToolMessage
+
+async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tools", '__end__']:
     recent_message = state['messages'][-1]
     if recent_message.tool_calls:
         for tool_call in recent_message.tool_calls:
-            return "avatar_tools"
+            current_tool_call = tool_call
+            logger.warning(f'current_tool_call: {current_tool_call}')
+            try:                
+                return "avatar_tools"
+            except Exception as e:
+                return Command(update={"messages":[ToolMessage(content=f"Error handling tool: {current_tool_call}: {e}")]}, goto="load_consciousness")
     else:
         return "__end__"
     
@@ -509,7 +522,7 @@ workflow = StateGraph(
 
 avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
                  recall_memories]
-avatar_tools = ToolNode(avatar_accessible_tools, handle_tool_errors=True)
+avatar_tools = ToolNode(avatar_accessible_tools,  )
 
 # TOOL WORKFLOW 
 

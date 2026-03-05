@@ -34,6 +34,7 @@ services:
             start_interval: 1s
 
     langgraph-api:
+        image: anubis-langgraph-api:latest
         ports:
             - "8123:8000"
         depends_on:
@@ -51,9 +52,3 @@ services:
             start_period: 10s
         env_file:
             - .env
-        volumes:
-            - .:/deps/anubis
-        build:
-            context: .
-            dockerfile: Dockerfile
-

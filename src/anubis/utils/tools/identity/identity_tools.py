@@ -124,10 +124,11 @@ async def create_a_memory(
 
     recent_message = runtime.state['messages'][-1]
     tool_call_id = recent_message.tool_calls[0].get('id')
-    update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+    update = {"state_update_data": {"recalled_memory_documents": [assistant_identity_memory_document]},
+              "tool_message": f"Learned: {document_metadata['fact']}"}
 
-    return Command(update=update, goto="load_consciousness")
+    return update
+
 
 @tool()
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory(
@@ -190,9 +191,8 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
             # Fact already exists:
             recent_message = runtime.state['messages'][-1]
             tool_call_id = recent_message.tool_calls[0].get('id')
-
-            update = {"messages": [ToolMessage(content=f"Fact: {content} previously learned", tool_call_id=tool_call_id)]}
-            return Command(update=update, goto="load_consciousness")
+            update = {"state_update_data": {}, "tool_message": f"Fact: {content} previously learned"}
+            return update
 
     model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
 
@@ -253,10 +253,10 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     recent_message = runtime.state['messages'][-1]
     tool_call_id = recent_message.tool_calls[0].get('id')
     logger.warning(f"tool_call_id: {tool_call_id}")
-    update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+    update = {"state_update_data": {"recalled_memory_documents": [assistant_identity_memory_document]},
+              "tool_message": f"Learned: {document_metadata['fact']}"}
 
-    return Command(update=update, goto="load_consciousness")
+    return update
 
 @tool()
 async def learn_information_about_the_user(
@@ -313,8 +313,8 @@ async def learn_information_about_the_user(
         recent_message = runtime.state['messages'][-1]
         tool_call_id = recent_message.tool_calls[0].get('id')
 
-        update = {"messages": [ToolMessage(content=f"Fact: {content} previously learned", tool_call_id=tool_call_id)]}
-        return Command(update=update, goto="load_consciousness")
+        update = {"state_update_data": {}, "tool_message": f"Fact: {content} previously learned"}
+        return update
     
     model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
 
@@ -370,13 +370,10 @@ async def learn_information_about_the_user(
         value={"document": user_identity_document_json},
     )
 
-    recent_message = runtime.state['messages'][-1]
-    tool_call_id = recent_message.tool_calls[0].get('id')
+    update = {"state_update_data": {"user_identity_documents": [user_identity_document]},
+               "tool_message": f"Learned: {user_fact}"}
 
-    update = {"user_identity_documents": [user_identity_document],
-               "messages": [ToolMessage(content=f"Learned: {user_fact}")]}
-
-    return Command(update=update, goto="load_consciousness")
+    return update
 
 
 

@@ -115,10 +115,46 @@ class UserState(TypedDict):
     user_name: str
     user_description: str
 
-class PlutchikEmotionalState:
-    """
-    
-    """
+from pydantic import BaseModel
+
+class EmotionSummarization(BaseModel):
+    """ Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning. """
+    emotional_summary: str
+    emotional_summary_reasoning: str
+
+    serenity: float
+    joy: float
+    ecstacy: float
+    love: float
+    acceptance: float
+    trust : float
+    admiration: float
+    submission: float
+    apprehension: float
+    fear: float
+    terror: float
+    awe: float
+    distraction: float
+    surprise: float
+    amazement: float
+    disappointment: float
+    pensiveness: float
+    sadness: float
+    grief: float
+    remorse: float
+    boredom: float
+    disgust: float
+    loathing: float
+    contempt: float
+    annoyance: float
+    anger: float
+    rage: float
+    aggressiveness: float
+    interest: float
+    anticipation: float
+    vigilance: float
+    optimism: float
+
 
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.

@@ -84,7 +84,7 @@ async def recall_memories(runtime: ToolRuntime):
         assistant_memory_namespace,
         query=evoked_memory_query
     )
-    update = {"recalled_memory_documents": evoked_memories_response,
-              "messages":[ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.", tool_call_id=tool_call_id), ]}
+    update = {"state_update_data": {"recalled_memory_documents": evoked_memories_response},
+              "tool_message":f"Evoked {len(evoked_memories_response)} memories."}
 
-    return Command(update=update, goto="load_consciousness")
+    return update

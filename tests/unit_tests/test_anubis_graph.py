@@ -225,5 +225,3 @@ class TestWorkflowLoopPrevention:
         state2 = {"messages": [mock_message_without_tools]}
         result2 = await avatar_tools_condition(state2, MagicMock(), MagicMock())
         assert result2 == "__end__"
-
-

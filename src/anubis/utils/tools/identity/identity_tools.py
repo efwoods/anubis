@@ -129,7 +129,6 @@ async def create_a_memory(
 
     return update
 
-
 @tool()
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory(
     content: str, 

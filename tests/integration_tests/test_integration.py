@@ -39,7 +39,7 @@ class TestGraphIntegration:
         config = {
             "configurable": {
                 "assistant_id": "test_assistant",
-                "langgraph_auth_user_id": "test_user",
+                "langgraph_auth_user_id": "test_user",  
             }
         }
 

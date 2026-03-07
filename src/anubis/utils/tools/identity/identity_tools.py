@@ -375,37 +375,6 @@ async def learn_information_about_the_user(
 
     return update
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM
 # from src.anubis.utils.helper_functions import download_transcript, parse_vtt

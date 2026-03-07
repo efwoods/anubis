@@ -69,11 +69,9 @@ async def recall_memories(runtime: ToolRuntime):
     """
 
     system_message = SystemMessage(content=MEMORY_EVOCATION_INSTRUCTIONS)
-
     
     messages = [message for message in runtime.state['messages'] if type(message) is not SystemMessage]
     
-    tool_call_id = messages[-1].tool_calls[0]['id']
     chat_prompt_model = system_message + messages
 
     response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)

@@ -416,17 +416,24 @@ async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runt
     else:
         return "__end__"
     
+from langchain.tools import ToolRuntime
+
 async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
-    avatar_accessible_tools_dict = {"learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-                 "recall_memories":recall_memories}
+    avatar_accessible_tools_dict = {
+        "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+        }
+        # "recall_memories":recall_memories
     
     avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
     message = state['messages'][-1]
+    
     for tool_call in message.tool_calls:
         if tool_call['name'] in avatar_accessible_tool_names:
             tool = avatar_accessible_tools_dict[tool_call['name']]
             logger.warning(f"tool_call: {tool_call}")
-            tool_response = await tool.ainvoke(tool_call['args'])
+
+            
+            tool_response = await tool.ainvoke(tool_call['args'].update({"runtime":ToolRuntime(state=state, config=config, tool_call_id=tool_call['id'])}))
             """
             EXPECTED STRUCTURE
             tool_response = {"state_update_data": {}, "tool_message":{}}
@@ -442,13 +449,7 @@ async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:R
             else:
                 update.update({"messages": tool_message})
             
-            return Command(update=update, goto="load_consciousness")
-
-
-
-
-
-
+            return update
     
 # async def evaluate_response_quality()
     

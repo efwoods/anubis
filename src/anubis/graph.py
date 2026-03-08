@@ -400,11 +400,6 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     #     current_user_emotions = emotion_summarization.emotional_summary
 
-
-
-
-
-
     prompt_builder = DynamicPromptBuilder()
 
     system_time = datetime.now(tz=timezone.utc).isoformat()

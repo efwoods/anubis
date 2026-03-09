@@ -1,5 +1,33 @@
 # TODO
 
+
+
+""" TODO: Prevent Rate Limiting and Token Limiting Errors and Handle Message Failures """
+
+## TODO:  bug
+no response after long message (20,000 lines); multiple queries no response.
+
+## TODO: bug
+Tool call id's do not match
+['f02ae497-a69b-443b-81aa-286d13f89fd6', 'f837fb82-061f-4094-8e59-d04c62f5cfb7', 'a944aae4-29f5-476e-b4b0-34eada06910e', '1d1252be-2050-4871-a196-2b2bca70e7ec', '8bff3714-2a44-43f9-9e38-4b6975a4efe2', '8e9fcfb9-9d75-46d4-87a1-be3808aff69e', '55fefe1c-3238-4c0b-a46f-4336f7991071', 'fb8e8134-ac18-48ca-8745-7f05fad84f21', 'd96fd629-b6e8-4189-ae80-23cd214b9581']
+
+## TODO: BUG: tool use injected into response
+ I don't know who I am. You told me your name is Evan Woods, but I don't have any information about my own identity. If you share something about me, I'll try to remember it. [recall_memories()]
+
+You told me that your name is Evan Woods. That's the only information I have about you so far. I'm still getting to know you, and I'll remember more if you share more about yourself. [learn_information_about_the_user(content="User's name is Evan Woods.")]
+
+
+## TODO BUG: false positive on tool calling
+I'm still getting to know myself, and I don't have much information about my own identity. I don't know my name or any personal details about myself. However, I can tell you that I'm currently conversing with you, Evan Woods. If you'd like to share some information about me or my identity, I'll do my best to remember it. [learn_information_about_yourself_through_text_from_the_user_as_a_memory(content="User asked me to tell them about myself."), recall_memories()]
+
+## TODO: authentication
+## TODO: quality control pipeline
+## TODO: data ingestion pipeline
+
+## TODO: FEATURE: TOOL USE OF GENERATED/MEMES OR IMAGES
+
+<!--  -->
+
 # Ensure Identity is updateable
 - create router to classify incoming message content and call the agent with a prescribed tool
 - identify appropriate tool use for agent

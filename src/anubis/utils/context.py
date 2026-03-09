@@ -159,6 +159,12 @@ class GlobalContext:
         metadata={"description": "api key"}
     )
 
+    image_model: str = field(
+        default = None, 
+        metadata={"description": "Name of the model with image capabilities. Assumes base url, and api key matches the 'model' variable (text model)."}
+    )
+
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

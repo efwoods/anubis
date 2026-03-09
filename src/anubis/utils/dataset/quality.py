@@ -8,7 +8,11 @@ from src.anubis.utils.prompts.system_prompts import (
     CONSISTENCY_SCORE_CRITERIA,
     CONSISTENCY_SCORE_STEPS,
     FLUENCY_SCORE_CRITERIA,
-    FLUENCY_SCORE_STEPS
+    FLUENCY_SCORE_STEPS,
+    TONE_SCORE_CRITERIA, 
+    TONE_SCORE_STEPS,
+    STYLE_SCORE_CRITERIA, 
+    STYLE_SCORE_STEPS,
 )
 
 from src.anubis.utils.model import init_model
@@ -34,60 +38,84 @@ async def get_llm_eval_scores(
         normalization_scale_max is None and 
         normalization_scale_min is None
     ):
-        relevancy_system_prompt = SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
+        relevancy_system_prompt = [SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
               criteria=RELEVANCY_SCORE_CRITERIA,
               steps=RELEVANCY_SCORE_STEPS,
               source_text=source_text,
               generated_response=generated_response,
               metric_name="Relevancy"
-        ))
+        ))]
 
-        coherence_system_prompt = SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
+        coherence_system_prompt = [SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
               criteria=COHERENCE_SCORE_CRITERIA,
               steps=COHERENCE_SCORE_STEPS,
               source_text=source_text,
               generated_response=generated_response,
               metric_name="Coherence"
-        ))
+        ))]
 
-        consistency_system_prompt = SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
+        consistency_system_prompt = [SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
               criteria=CONSISTENCY_SCORE_CRITERIA,
               steps=CONSISTENCY_SCORE_STEPS,
               source_text=source_text,
               generated_response=generated_response,
               metric_name="Consistency"
-        ))
+        ))]
 
-        fluency_system_prompt = SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
+        fluency_system_prompt = [SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
               criteria=FLUENCY_SCORE_CRITERIA,
               steps=FLUENCY_SCORE_STEPS,
               source_text=source_text,
               generated_response=generated_response,
               metric_name="Fluency"
-        ))
+        ))]
+
+        tone_system_prompt = [SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
+              criteria=TONE_SCORE_CRITERIA,
+              steps=TONE_SCORE_STEPS,
+              source_text=source_text,
+              generated_response=generated_response,
+              metric_name="Tone"
+        ))]
+
+        style_system_prompt = [SystemMessage(content = EVALUATION_PROMPT_TEMPLATE.format(
+              criteria=STYLE_SCORE_CRITERIA,
+              steps=STYLE_SCORE_STEPS,
+              source_text=source_text,
+              generated_response=generated_response,
+              metric_name="Style"
+        ))]
 
         system_prompt_list = [
             relevancy_system_prompt, 
             coherence_system_prompt, 
             consistency_system_prompt, 
-            fluency_system_prompt
+            fluency_system_prompt,
+            tone_system_prompt,
+            style_system_prompt
         ]
 
-        eval_name_list = ["Relevancy", "Coherence", "Consistency", "Fluency"]
+        eval_name_list = ["Relevancy", "Coherence", "Consistency", "Fluency", "Tone", "Style"]
 
-        model = init_model()
+        class CriteriaResponseModel(BaseModel):
+            quality: int
+            reason: str
+
+        model = init_model(response_format = CriteriaResponseModel)
 
         results = []
         for index in range(0, len(system_prompt_list)):
             response = await model.ainvoke(system_prompt_list[index])
-            results.append(response.content)
-        evaluation_results = {eval_name: int(result) for eval_name, result in zip(eval_name_list, results)}
-        
+            results.append(response)
+        evaluation_results = {eval_name: {"score": result.quality, "reason": result.reason} for eval_name, result in zip(eval_name_list, results)}
+    
         # Normalize 0 - 1
-        evaluation_results['Relevancy'] = (evaluation_results['Relevancy'] - 1) / 4
-        evaluation_results['Coherence'] = (evaluation_results['Coherence'] - 1) / 4
-        evaluation_results['Consistency'] = (evaluation_results['Consistency'] - 1) / 4
-        evaluation_results['Fluency'] = (evaluation_results['Fluency'] - 1) / 2
+        evaluation_results['Relevancy']['score'] = (evaluation_results['Relevancy']['score'] - 1) / 4
+        evaluation_results['Coherence']['score'] = (evaluation_results['Coherence']['score'] - 1) / 4
+        evaluation_results['Consistency']['score'] = (evaluation_results['Consistency']['score'] - 1) / 4
+        evaluation_results['Fluency']['score'] = (evaluation_results['Fluency']['score'] - 1) / 2
+        evaluation_results['Tone']['score'] = (evaluation_results['Tone']['score'] - 1) / 4
+        evaluation_results['Style']['score'] = (evaluation_results['Style']['score'] - 1) / 4
 
         return evaluation_results
 
@@ -110,13 +138,11 @@ async def get_llm_eval_scores(
 
         return {metric_name: norm_results}
 
-
 async def get_rouge_score(source_text: str, 
                            generated_response: str):
 
     rouge = Rouge()
-    return rouge(source_text, generated_response)
-
+    return rouge.get_scores(source_text, generated_response)
 
 async def get_bert_score(source_text: str, 
                           generated_response: str):
@@ -124,7 +150,7 @@ async def get_bert_score(source_text: str,
     scorer = BERTScorer(lang="en")
 
     precision, recall, f_score = scorer.score([source_text], [generated_response])
-    return f_score
+    return float(f_score[0])
     
 async def evaluate(source_text: str, generated_response: str):
     """
@@ -142,9 +168,9 @@ async def evaluate(source_text: str, generated_response: str):
     """
 
     evaluation_results = {}
-    semantic_similarity_bert_f_score = get_bert_score(source_text, generated_response)
-    sentence_structure_rouge_f_score = get_rouge_score(source_text, generated_response)
-    llm_eval_scores = get_llm_eval_scores(source_text, generated_response)
+    semantic_similarity_bert_f_score = await get_bert_score(source_text, generated_response)
+    sentence_structure_rouge_f_score = await get_rouge_score(source_text, generated_response)
+    llm_eval_scores = await get_llm_eval_scores(source_text, generated_response)
 
     eval_list = [
         {"semantic_similarity_bert_f_score": semantic_similarity_bert_f_score}, 

@@ -56,8 +56,4 @@ services:
             - .:/deps/anubis
         build:
             context: .
-<<<<<<< HEAD
             dockerfile: Dockerfile
-=======
-            dockerfile: Dockerfile
->>>>>>> test_bak

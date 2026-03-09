@@ -250,7 +250,7 @@ Example:
 
 Source Text:
 
-{text}
+{source_text}
 
 Generated Response:
 
@@ -258,7 +258,7 @@ Generated Response:
 
 Evaluation Form (scores ONLY):
 
-- {metric_name}
+{metric_name}
 """
 
 # Metric 1: Relevance
@@ -281,12 +281,12 @@ RELEVANCY_SCORE_STEPS = """
 COHERENCE_SCORE_CRITERIA = """
 Coherence(1-5) - the collective quality of all sentences. 
 We align this dimension with the Document Understanding Conference question of structure and coherence whereby "the generated response should be well-structured and well-organized. 
-The generated response should not just be a heap of related information, but should build from sentence to a coherent body of information about a topic." 
+The generated response should not just be a heap of related information, but should build from sentence to a coherent body of information about a topic in the same manner as the source document." 
 """
 
 COHERENCE_SCORE_STEPS = """
-1. Read the source document carefully and identiyf the main topic and key points. 
-2. Read the generated response and compare the generated response to the source document. Check if the generated response covers the main topic and key points of the source document, and if the generated response presents the main topic and key points in a clear and logical order. 
+1. Read the source document carefully and identiy the main topic and key points. 
+2. Read the generated response and compare the generated response to the source document. Check if the generated response matches the main topic and key points of the source document, and if the generated response presents the main topic and key points in a clear and logical order. 
 3. Assign a score for coherence on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """
 
@@ -300,7 +300,7 @@ Annotators were also asked to penalize source documents that contained hallucina
 
 CONSISTENCY_SCORE_STEPS = """
 1. Read the source document carefully and identify the main facts and details the source document presents.
-2. Read the generated response and compare the generated response to the article. Check if the generated response contains and factual errors that were not supported by the source document. 
+2. Read the generated response and compare the generated response to the source document. Check if the generated response contains and factual errors that were not included in the source document. 
 3. Assign a score for consistency based on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """
 
@@ -315,4 +315,26 @@ Fluency(1-3): The quality of the generated response in terms of grammar, spellin
 
 FLUENCY_SCORE_STEPS = """
 Read the generated response and evaluate the generated response's fluency on a scale from 1 to 3, where 1 is the lowest and 3 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 5: Tone
+
+TONE_SCORE_CRITERIA = """
+Tone(1-5): The tone or emotional quality of the generated response compared to the tone of the source document.
+A matching tone matches the personality, emotions, and intensions of the both the generated response and the source document.
+"""
+
+TONE_SCORE_STEPS = """
+Read the generated response and evaluate the generated response's tone on a scale from 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 6: Style
+STYLE_SCORE_CRITERIA = """
+Style(1-5): The style of writing of the generated response's style of writing compared to the style of writing of the source document.
+Matching style of writing matches in terms of phrasing, figurative language, sentence structure, vocabulary, idioms, slang, rhythm and pacing. 
+This criteria has an emphasis of attention on the structure and flow of writing.
+"""
+
+STYLE_SCORE_STEPS = """
+Read the generated response and evaluate the generated response's style of writing on a scale from 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """

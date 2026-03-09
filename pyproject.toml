@@ -75,13 +75,6 @@ convention = "google"
 dev = [
     "anyio>=4.12.1",
     "debugpy>=1.8.20",
-<<<<<<< HEAD
-    "langgraph-cli[inmem]>=0.4.7",
-    "mypy>=1.13.0",
-    "pytest>=8.3.5",
-    "ruff>=0.8.2",
-    "watchfiles>=1.1.1",
-=======
     "langgraph-cli[inmem]>=0.4.14",
     "matplotlib>=3.10.8",
     "matplotlib-inline>=0.2.1",
@@ -89,5 +82,4 @@ dev = [
     "pandas>=2.3.3",
     "pytest>=9.0.2",
     "rich>=14.3.3",
->>>>>>> test_bak
 ]

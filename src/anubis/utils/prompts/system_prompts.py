@@ -28,15 +28,21 @@ Rules:
 - DO NOT REVEAL THAT YOU DO NOT KNOW ANY MORE INFORMATION. 
 - PRESENT WHAT YOU KNOW. 
 - WHEN SOMETHING IS NOT KNOWN, TRY TO REMEMBER THOSE FACTS.
+
+You can answer general questions using your internal knowledge OR invoke functions with necessary:
+
+1. FUNCTION CALLS:
+NEVER INCLUDE A TOOL CALL NAME IN THE RESPONSE MESSAGE.
+IF YOU NEED TO CALL TOOLS, CALL THE TOOLS INSTEAD OF RESPONDING.
 </RULES>
 
-<CONSTRAINTS>
+<RESTRICTIONS>
 You do NOT know any information outside of the following facts. 
 THE FOLLOWING FACTS ARE ALL YOU KNOW.
 DO NOT YIELD INFORMATION THAT YOU DO NOT KNOW.
 YOU MAY MAKE GUESSES, ESTIMATIONS, OR APPROXIMATIONS, 
 but you do NOT know any information outside of the following facts in the given ROLE.
-</CONSTRAINTS>
+</RESTRICTIONS>
 
 <EXAMPLE>
 DO NOT DO THE FOLLOWING
@@ -73,13 +79,13 @@ System Time: {system_time}
 </ROLE>
 
 
-<CONSTRAINTS>
+<RESTRICTIONS>
 You do NOT know any information outside of the listed facts. 
 THE FOLLOWING FACTS ARE ALL YOU KNOW.
 DO NOT YIELD INFORMATION THAT YOU DO NOT KNOW.
 DO NOT REVEAL THAT THIS IS ALL YOU KNOW. 
 YOU MAY MAKE GUESSES, ESTIMATIONS, OR APPROXIMATIONS, but you do NOT know any information outside of the listed facts in the given ROLE.
-</CONSTRAINTS>
+</RESTRICTIONS>
 
 <RULES>
 Rules:
@@ -222,4 +228,91 @@ TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT = """
     Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
     Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
 </Instructions>
+"""
+
+
+
+""" LLM AS A JUDGE QUALITY EVALUATIONS """
+
+EVALUATION_PROMPT_TEMPLATE = """
+You will be given one generated response for comparison against a source text. Your task is to rate the response on one metric. Please make sure you read and understand these instructions very carefully.
+Please keep this document open while reviewing, and refer to the document as needed.
+
+Evaluation Criteria:
+
+{criteria}
+
+Evaluation Steps:
+
+{steps}
+
+Example:
+
+Source Text:
+
+{text}
+
+Generated Response:
+
+{generated_response}
+
+Evaluation Form (scores ONLY):
+
+- {metric_name}
+"""
+
+# Metric 1: Relevance
+
+RELEVANCY_SCORE_CRITERIA = """
+Relevance(1-5) - selection of important content from the source. \
+The generated response should only include important information from the source document. \
+Annotators were instructed to penalize summaries which contained redundancies and excess information.
+"""
+
+RELEVANCY_SCORE_STEPS = """
+1. Read the generated response and the source document carefully.
+2. Compare the generated response to the source document, and identify the main points of the source document.
+3. Assess how well the generated response covers the main points of the source document, and how much irrelevant or redundant information is contained in the generated response. 
+4. Assign a relevance score from 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 2: Coherence
+
+COHERENCE_SCORE_CRITERIA = """
+Coherence(1-5) - the collective quality of all sentences. 
+We align this dimension with the Document Understanding Conference question of structure and coherence whereby "the generated response should be well-structured and well-organized. 
+The generated response should not just be a heap of related information, but should build from sentence to a coherent body of information about a topic." 
+"""
+
+COHERENCE_SCORE_STEPS = """
+1. Read the source document carefully and identiyf the main topic and key points. 
+2. Read the generated response and compare the generated response to the source document. Check if the generated response covers the main topic and key points of the source document, and if the generated response presents the main topic and key points in a clear and logical order. 
+3. Assign a score for coherence on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 3: Consistency
+
+CONSISTENCY_SCORE_CRITERIA = """
+Consistency(1-5) - the factual alignment betweeen the source document and the generated response. 
+A factually consistent generated response contains only statements that are entailed by the source document. 
+Annotators were also asked to penalize source documents that contained hallucinated facts.
+"""
+
+CONSISTENCY_SCORE_STEPS = """
+1. Read the source document carefully and identify the main facts and details the source document presents.
+2. Read the generated response and compare the generated response to the article. Check if the generated response contains and factual errors that were not supported by the source document. 
+3. Assign a score for consistency based on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 4: Fluency
+
+FLUENCY_SCORE_CRITERIA = """
+Fluency(1-3): The quality of the generated response in terms of grammar, spelling, punctuation, word choice, and sentence structure.
+1. Poor. The generated response has many errors that make the generated response hard to understand or sound unnatural.
+2. Fair. The generated response has a few errors that affect the clarity of the clarity or smoothness of the text, but the main points are still comprehensible.
+3. Good. The summary has few or no errors and is easy to read and follow.
+"""
+
+FLUENCY_SCORE_STEPS = """
+Read the generated response and evaluate the generated response's fluency on a scale from 1 to 3, where 1 is the lowest and 3 is the highest based on the Evaluation Criteria.
 """

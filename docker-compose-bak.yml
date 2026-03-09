@@ -36,7 +36,6 @@ services:
     langgraph-api:
         ports:
             - "8123:8000"
-        command: uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload 
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -56,8 +55,5 @@ services:
             - .:/deps/anubis
         build:
             context: .
-<<<<<<< HEAD
             dockerfile: Dockerfile
-=======
-            dockerfile: Dockerfile
->>>>>>> test_bak
+

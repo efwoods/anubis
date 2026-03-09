@@ -152,7 +152,7 @@ async def get_bert_score(source_text: str,
     precision, recall, f_score = scorer.score([source_text], [generated_response])
     return float(f_score[0])
     
-async def evaluate(source_text: str, generated_response: str):
+async def evaluate(source_text: str, generated_response: str, use_llm_as_a_judge: bool = False):
     """
     Evaluate the llm generated response against the source text with respect to the following criteria:
     - RELEVANCY
@@ -170,13 +170,19 @@ async def evaluate(source_text: str, generated_response: str):
     evaluation_results = {}
     semantic_similarity_bert_f_score = await get_bert_score(source_text, generated_response)
     sentence_structure_rouge_f_score = await get_rouge_score(source_text, generated_response)
-    llm_eval_scores = await get_llm_eval_scores(source_text, generated_response)
+    if use_llm_as_a_judge:
+        llm_eval_scores = await get_llm_eval_scores(source_text, generated_response)
 
-    eval_list = [
-        {"semantic_similarity_bert_f_score": semantic_similarity_bert_f_score}, 
-        {"sentence_structure_rouge_f_score": sentence_structure_rouge_f_score}, 
-        llm_eval_scores
-    ]
+        eval_list = [
+            {"semantic_similarity_bert_f_score": semantic_similarity_bert_f_score}, 
+            {"sentence_structure_rouge_f_score": sentence_structure_rouge_f_score}, 
+            llm_eval_scores
+        ]
+    else: 
+        eval_list = [
+                    {"semantic_similarity_bert_f_score": semantic_similarity_bert_f_score}, 
+                    {"sentence_structure_rouge_f_score": sentence_structure_rouge_f_score},
+                ]
 
     for eval in eval_list:
         evaluation_results.update(eval)

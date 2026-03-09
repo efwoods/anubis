@@ -99,7 +99,7 @@ async def test_hello_world():
 
     # result = await url_loading_graph.ainvoke(input, config=config)
     logger.info(f"HELLO WORLD ENTRY")
-    return {"Hello": "World"}
+    return {"Hello": "okay"}
 
 # @app.post("/upload-media")
 # async def upload_media(

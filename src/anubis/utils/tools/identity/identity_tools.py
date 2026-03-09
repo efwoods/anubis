@@ -30,22 +30,38 @@ async def create_a_memory(
     # Hide these arguments from the model.
     runtime: ToolRuntime
 ) -> GlobalState:
-    """Create a memory whenever a significant event occurs or when prompted to remember. 
+    """
+    <INSTRUCTIONS>
+    Create a memory whenever a significant event occurs or when prompted to remember. 
     This is not used when the user is telling the assistant about the assistant's identity.
 
-    This tool is used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
+    This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
+    
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
-    THERE MAY BE MORE THAN ONE FACT. IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    
+    THERE MAY BE MORE THAN ONE FACT and IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    
+    ALWAYS use this tool when a significant EVENT OCCURS that is SALIENT to the assistant or user's goals, beliefs, values, or perspective or is otherwise IMPORTANT, SURPRISING, EVENTFUL, UNUSUAL or EXTRAORDINARY.
+    
+    ALWAYS use this tool when a CHOICE has been made or there is otherwise an event that has reached a point of no return.
+    </INSTRUCTIONS>
 
-    RULE:
-    DO NOT CALL THIS TOOL MULTIPLE TIMES WITH THE SAME FACT.
-
+    <RESTRICTIONS>
+    NEVER CALL THIS TOOL MULTIPLE TIMES WITH THE SAME FACT.
+    NEVER call this tool when the user is telling the assistant about the assistant's identity.
+    NEVER call this tool when updating information about IDENTITY.
+    </RESTRICTIONS>
+    
+    <EXAMPLE>
+    An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
+    
     Example:
     WOW! THIS JUST HAPPENED!
     I never tell anyone this, but here is a secret.
     I want you to remember that.
     This is important.
     This is important to me.
+    </EXAMPLE> 
 
     Args:
         content: The main content of the significant fact, event, or occurance. For example:
@@ -124,10 +140,10 @@ async def create_a_memory(
 
     recent_message = runtime.state['messages'][-1]
     tool_call_id = recent_message.tool_calls[0].get('id')
-    update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+    update = {"state_update_data": {"recalled_memory_documents": [assistant_identity_memory_document]},
+              "tool_message": f"Learned: {document_metadata['fact']}"}
 
-    return Command(update=update, goto="load_consciousness")
+    return update
 
 @tool()
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory(
@@ -135,7 +151,9 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     # Hide these arguments from the model.
     runtime: ToolRuntime
 ) -> GlobalState:
-    """Learn Facts about yourself from the User through text
+    """
+    <INSTRUCTIONS>
+    Learn Facts about yourself from the User through text
 
     Update the known information about yourself.
     This tool is used to create memories that the user has told the assistant that are 
@@ -143,10 +161,13 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     addressed as YOU or or YOUR or YOURS or the direct given name of the assistant.
     An example memory is the user telling the assistant what the assistant's name is or facts about the assistant.
     THERE MAY BE MORE THAN ONE FACT. IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    </INSTRUCTIONS>
+    
+    <RESTRICTIONS>
+    NEVER call this tool multiple times with the same fact.
+    </RESTRICTIONS>
 
-    RULE:
-    DO NOT CALL THIS TOOL MULTIPLE TIMES WITH THE SAME FACT.
-
+    <EXAMPLE>
     Example:
     Hi, my name is Evan.
     This is a description of me.
@@ -159,6 +180,7 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     Becomes multiple tool calls (multiple facts follow):
     My name is Shivon Zilis.
     I have twins.
+    </EXAMPLE>
 
     Args:
         content: The main content of the assistant's identity. For example:
@@ -190,9 +212,8 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
             # Fact already exists:
             recent_message = runtime.state['messages'][-1]
             tool_call_id = recent_message.tool_calls[0].get('id')
-
-            update = {"messages": [ToolMessage(content=f"Fact: {content} previously learned", tool_call_id=tool_call_id)]}
-            return Command(update=update, goto="load_consciousness")
+            update = {"state_update_data": {}, "tool_message": f"Fact: {content} previously learned"}
+            return update
 
     model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
 
@@ -253,10 +274,10 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     recent_message = runtime.state['messages'][-1]
     tool_call_id = recent_message.tool_calls[0].get('id')
     logger.warning(f"tool_call_id: {tool_call_id}")
-    update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+    update = {"state_update_data": {"recalled_memory_documents": [assistant_identity_memory_document]},
+              "tool_message": f"Learned: {document_metadata['fact']}"}
 
-    return Command(update=update, goto="load_consciousness")
+    return update
 
 @tool()
 async def learn_information_about_the_user(
@@ -264,13 +285,23 @@ async def learn_information_about_the_user(
     # Hide these arguments from the model.
     runtime: ToolRuntime
 ) -> GlobalState:
-    """Learn Facts about the User
+    """
+    <INSTRUCTIONS>
+    Learn Facts about the User
 
     Update the known information about the user.
     The user is a primary source of information about the user, therefore the identity namespace is updated when the user shares information about themself.
     This tool is used to create documents of identity that the user has told the assistant that are SPECIFICALLY ABOUT THE USER.
     An example document identity is the user telling the assistant what the user's name is or facts about the user.
     THERE MAY BE MORE THAN ONE FACT. IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    </INSTRUCTIONS>
+    
+    <RESTRICTIONS>
+    Only use this when learning information that are FACTS about the IDENTITY of the user.
+    NEVER use this to save information about events or occurances that are not about the IDENTITY of the user.
+    </RESTRICTIONS>
+
+    <EXAMPLE>
     Example:
     Hi, my name is Evan.
     This is a description of me.
@@ -283,7 +314,8 @@ async def learn_information_about_the_user(
     Becomes multiple tool calls (multiple facts follow):
     Hi, my name is Evan.
     I love you.
-
+    </EXAMPLE>
+    
     Args:
         content: The main content of the user's identity. For example:
             "User expressed interest in learning about French."
@@ -313,8 +345,8 @@ async def learn_information_about_the_user(
         recent_message = runtime.state['messages'][-1]
         tool_call_id = recent_message.tool_calls[0].get('id')
 
-        update = {"messages": [ToolMessage(content=f"Fact: {content} previously learned", tool_call_id=tool_call_id)]}
-        return Command(update=update, goto="load_consciousness")
+        update = {"state_update_data": {}, "tool_message": f"Fact: {content} previously learned"}
+        return update
     
     model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
 
@@ -370,44 +402,10 @@ async def learn_information_about_the_user(
         value={"document": user_identity_document_json},
     )
 
-    recent_message = runtime.state['messages'][-1]
-    tool_call_id = recent_message.tool_calls[0].get('id')
+    update = {"state_update_data": {"user_identity_documents": [user_identity_document]},
+               "tool_message": f"Learned: {user_fact}"}
 
-    update = {"user_identity_documents": [user_identity_document],
-               "messages": [ToolMessage(content=f"Learned: {user_fact}")]}
-
-    return Command(update=update, goto="load_consciousness")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    return update
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

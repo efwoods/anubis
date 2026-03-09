@@ -69,11 +69,9 @@ async def recall_memories(runtime: ToolRuntime):
     """
 
     system_message = SystemMessage(content=MEMORY_EVOCATION_INSTRUCTIONS)
-
     
     messages = [message for message in runtime.state['messages'] if type(message) is not SystemMessage]
     
-    tool_call_id = messages[-1].tool_calls[0]['id']
     chat_prompt_model = system_message + messages
 
     response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
@@ -84,7 +82,7 @@ async def recall_memories(runtime: ToolRuntime):
         assistant_memory_namespace,
         query=evoked_memory_query
     )
-    update = {"recalled_memory_documents": evoked_memories_response,
-              "messages":[ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.", tool_call_id=tool_call_id), ]}
+    update = {"state_update_data": {"recalled_memory_documents": evoked_memories_response},
+              "tool_message":f"Evoked {len(evoked_memories_response)} memories."}
 
-    return Command(update=update, goto="load_consciousness")
+    return update

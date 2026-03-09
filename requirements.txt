@@ -1,10 +1,5 @@
-langgraph
-llama-api-client
-langgraph-cli[inmem]
-pydantic
-openai
-
 # Langchain
+langgraph
 langsmith
 langchain
 langchain-community
@@ -13,6 +8,16 @@ langchain-huggingface
 langchain-core
 langchain-openai
 
+llama-api-client
+pydantic
+openai
+
 huggingface-hub
 sentence-transformers
 beautifulsoup4
+
+fastapi
+python-multipart
+
+bert_score
+rouge

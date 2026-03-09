@@ -297,45 +297,10 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     # Search your feelings
     # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt 
+    from src.anubis.utils.state import EmotionSummarization
 
     # if state['current_assistant_emotions'] is None or state['current_assistant_emotions'] == "":
     #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt
-    #     class EmotionSummarization(BaseModel):
-    #         """ Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning. """
-    #         emotional_summary: str
-    #         emotional_summary_reasoning: str    
-    #         serenity: float
-    #         joy: float
-    #         ecstacy: float
-    #         love: float
-    #         acceptance: float
-    #         trust : float
-    #         admiration: float
-    #         submission: float
-    #         apprehension: float
-    #         fear: float
-    #         terror: float
-    #         awe: float
-    #         distraction: float
-    #         surprise: float
-    #         amazement: float
-    #         disappointment: float
-    #         pensiveness: float
-    #         sadness: float
-    #         grief: float
-    #         remorse: float
-    #         boredom: float
-    #         disgust: float
-    #         loathing: float
-    #         contempt: float
-    #         annoyance: float
-    #         anger: float
-    #         rage: float
-    #         aggressiveness: float
-    #         interest: float
-    #         anticipation: float
-    #         vigilance: float
-    #         optimism: float 
     #     emotional_model = init_model(context=runtime.context, response_format=EmotionSummarization)
     #     historical_assistant_emotion_items = await runtime.store.asearch(assistant_identity_namespace, query=["I am feeling", "feeling"])
     #     historical_assistant_emotion_documents = reduce_docs(historical_assistant_emotion_items)
@@ -346,46 +311,6 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     # # Search user feelings
     # if state['current_user_feelings'] is None or state['current_user_feelings'] == "":
     #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt
-    #     class EmotionSummarization(BaseModel):
-    #         """ Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning. """
-    #         emotional_summary: str
-    #         emotional_summary_reasoning: str
-
-    #         serenity: float
-    #         joy: float
-    #         ecstacy: float
-    #         love: float
-    #         acceptance: float
-    #         trust : float
-    #         admiration: float
-    #         submission: float
-    #         apprehension: float
-    #         fear: float
-    #         terror: float
-    #         awe: float
-    #         distraction: float
-    #         surprise: float
-    #         amazement: float
-    #         disappointment: float
-    #         pensiveness: float
-    #         sadness: float
-    #         grief: float
-    #         remorse: float
-    #         boredom: float
-    #         disgust: float
-    #         loathing: float
-    #         contempt: float
-    #         annoyance: float
-    #         anger: float
-    #         rage: float
-    #         aggressiveness: float
-    #         interest: float
-    #         anticipation: float
-    #         vigilance: float
-    #         optimism: float
-
-
-
     #     emotional_model = init_model(context=runtime.context, response_format=EmotionSummarization)
         
     #     historical_user_feelings_items = await runtime.store.asearch(user_identity_namespace, query=["I am feeling", "feeling"])
@@ -399,11 +324,6 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     #     emotion_summarization = await emotional_model.ainvoke(input = [SystemMessage(content = EMOTIONAL_ANALYSIS_PROMPT), HumanMessage(content=historical_feelings_str)])
 
     #     current_user_emotions = emotion_summarization.emotional_summary
-
-
-
-
-
 
     prompt_builder = DynamicPromptBuilder()
 
@@ -447,7 +367,6 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 
     """ CREATE MODEL """
 
-
     # model invocation
     avatar_model_with_tools = init_model(
         context = runtime.context,
@@ -487,23 +406,50 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
 avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
                  recall_memories]
 
-avatar_accessible_tools_dict = [{"learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-                 "recall_memories":recall_memories}]
-
 from langchain_core.messages import ToolMessage
 
-async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tools", '__end__']:
+async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tool_node", '__end__']:
     recent_message = state['messages'][-1]
     if recent_message.tool_calls:
         for tool_call in recent_message.tool_calls:
-            current_tool_call = tool_call
-            logger.warning(f'current_tool_call: {current_tool_call}')
-            try:                
-                return "avatar_tools"
-            except Exception as e:
-                return Command(update={"messages":[ToolMessage(content=f"Error handling tool: {current_tool_call}: {e}")]}, goto="load_consciousness")
+            return "avatar_tool_node"
     else:
         return "__end__"
+    
+from langchain.tools import ToolRuntime
+
+async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
+    avatar_accessible_tools_dict = {
+        "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+        }
+        # "recall_memories":recall_memories
+    
+    avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
+    message = state['messages'][-1]
+    
+    for tool_call in message.tool_calls:
+        if tool_call['name'] in avatar_accessible_tool_names:
+            tool = avatar_accessible_tools_dict[tool_call['name']]
+            logger.warning(f"tool_call: {tool_call}")
+
+            
+            tool_response = await tool.ainvoke(tool_call['args'].update({"runtime":ToolRuntime(state=state, config=config, tool_call_id=tool_call['id'])}))
+            """
+            EXPECTED STRUCTURE
+            tool_response = {"state_update_data": {}, "tool_message":{}}
+            """
+
+            tool_message = [ToolMessage(content=tool_response.get("tool_message"), tool_call_id = tool_call['id'])]
+            update = tool_response.get("state_update_data")
+
+            if update.get("messages"):
+                messages = update.get("messages", [])
+                messages = messages + tool_message
+                update.set({"messages": messages})
+            else:
+                update.update({"messages": tool_message})
+            
+            return update
     
 # async def evaluate_response_quality()
     
@@ -512,46 +458,42 @@ async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runt
 """ GRAPH """
 
 # Build minimal graph: START -> agent -> END
-workflow = StateGraph(
+anubis_workflow = StateGraph(
     state_schema = GlobalState,
-    input_schema = MessagesState,
-    output_schema= MessagesState,
+    input_schema = GlobalState,
+    output_schema = MessagesState,
     context_schema = GlobalContext
 )
 
-
-avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-                 recall_memories]
-avatar_tools = ToolNode(avatar_accessible_tools,  )
-
-# TOOL WORKFLOW 
-
-""" TOOL WORKFLOW NODES """
-
-workflow.add_node("chat", message_interface)
+""" ANUBIS WORKFLOW NODES """
 
 # workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
 
 # workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
 # workflow.add_node("update_identity_tools", update_identity_tools)
 
-workflow.add_node("load_consciousness", load_consciousness)
-workflow.add_node("respond", invoke_agent)
-workflow.add_node("avatar_tools", avatar_tools)
+anubis_workflow.add_node("load_consciousness", load_consciousness)
+anubis_workflow.add_node("respond", invoke_agent)
+anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
 
 # workflow.add_node("update_response_metadata", update_response_metadata)
 
-# """ TOOL WORKFLOW EDGES """
+""" ANUBIS WORKFLOW EDGES """
 
-workflow.add_edge(START, "chat")
+anubis_workflow.add_edge(START, "load_consciousness")
+anubis_workflow.add_edge("load_consciousness", "respond")
+
+anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
+anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
+anubis_workflow.add_edge("respond", END)
+
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
 
-workflow.add_edge("chat", "load_consciousness")
 # workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "load_consciousness":"load_consciousness"})
 # workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
-workflow.add_edge("load_consciousness", "respond")
+
 
 # COERCION
 # workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', END:"evaluate_response_quality"})
@@ -560,11 +502,22 @@ workflow.add_edge("load_consciousness", "respond")
 # workflow.add_edge("update_response_metadata", END)
 
 
-# TOOL TESTING
-workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', "__end__":"__end__"})
-workflow.add_edge("avatar_tools", "load_consciousness")
+anubis = anubis_workflow.compile()
+
+message_workflow = StateGraph(
+    state_schema = GlobalState,
+    input_schema = MessagesState,
+    output_schema = MessagesState,
+    context_schema = GlobalContext
+)
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
+message_workflow.add_node("chat", message_interface)
+message_workflow.add_node("anubis", anubis)
+
+message_workflow.add_edge(START, "chat")
+message_workflow.add_edge("chat", "anubis")
+message_workflow.add_edge("anubis", END)
 
 
 # BASIC CHAT WORKFLOW
@@ -582,7 +535,7 @@ workflow.add_edge("avatar_tools", "load_consciousness")
 # workflow.add_edge("load_consciousness", "respond")
 # workflow.add_edge("respond", END)K
 
-graph = workflow.compile()
+graph = message_workflow.compile()
 
 graph.name = "Anubis"
 

@@ -1,7 +1,5 @@
 # TODO
 
-
-
 """ TODO: Prevent Rate Limiting and Token Limiting Errors and Handle Message Failures """
 
 ## TODO:  bug
@@ -25,6 +23,11 @@ I'm still getting to know myself, and I don't have much information about my own
 ## TODO: data ingestion pipeline
 
 ## TODO: FEATURE: TOOL USE OF GENERATED/MEMES OR IMAGES
+
+# Next actions:
+- Fix bugs
+- Q&A dataset of chatgpt conversations
+- Create Adapter dataset & Attach and test adapter
 
 <!--  -->
 

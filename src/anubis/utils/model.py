@@ -31,9 +31,6 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                     temperature=0.1,
                     top_p=0.1,
                     api_key = api_key,
-<<<<<<< HEAD
-                ).bind_tools(tools=tools, tool_choice="auto") # zero or more tools
-=======
                 ).bind_tools(
                     method='json_schema', 
                     tools=tools, 
@@ -41,7 +38,6 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                     strict=True, 
                     include_raw=True
                 )
->>>>>>> test_bak
     else: 
         model = ChatOpenAI(
             model = model_name,

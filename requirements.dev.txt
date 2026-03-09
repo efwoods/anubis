@@ -1,1 +1,5 @@
 debugpy
+langgraph-cli[inmem]
+pandas
+anyio
+pytest

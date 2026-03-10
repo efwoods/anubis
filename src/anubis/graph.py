@@ -165,56 +165,6 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     }
     return {"moderation_response": moderation_response}
 
-# identity_tools_list = {"learn_information_about_yourself_through_text_from_the_user_as_a_memory": learn_information_about_yourself_through_text_from_the_user_as_a_memory, "learn_information_about_the_user":learn_information_about_the_user}
-
-# identity_tools = [learn_information_about_yourself_through_text_from_the_user_as_a_memory, learn_information_about_the_user]
-
-# async def update_identity_tool_classification(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
-#     """
-#     Identify and handle identity tool calls.
-#     """
-#     logger.info("breakpoint")
-#     model_with_identity_tools = init_model(
-#         context=runtime.context, 
-#         tools=identity_tools,
-#         tool_choice = {
-#             "type":"function", "function":
-#             {"name": "learn_information_about_yourself_through_text_from_the_user_as_a_memory"},
-#             "type":"function", "function":
-#             {"name": "learn_information_about_the_user"}, 
-#         }
-#     )
-
-
-#     messages = state['messages']
-#     try:
-#         identity_tools_message = await model_with_identity_tools.ainvoke(messages)
-#     except openai.BadRequestError as e:
-#         if "function name not found" in str(e):
-#             return 
-
-#     tool_results = []
-
-#     if identity_tools_message.tool_calls:
-#         for tool_call in identity_tools_message.tool_calls:
-#             if tool_call['name'] in identity_tools_list.keys():
-#                 tool_result = await identity_tools_list[tool_call['name']].invoke(messages)
-#                 tool_results.append(tool_result)
-
-#     return Command(goto="load_consciousness")
-
-# async def update_identity_tool_condition(state: GlobalState) -> Literal["update_identity_tools", "load_consciousness"]:
-#     logger.info("breakpoint")
-#     recent_message = state['messages'][-1]
-#     if recent_message.tool_calls:
-#         for tool_call in recent_message.tool_calls:
-#             if tool_call.get("name", "") in update_identity_accessible_tools_list:
-#                 return "update_identity_tools" 
-#             else:
-#                 return "load_consciousness"
-    
-#     return "load_consciousness"    
-
 async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     user_id = state["user_state"]['user_id']
     assistant_id = state['assistant_state']['assistant_id']
@@ -287,11 +237,36 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     logger.info("breakpoint")
 
-    # retrieved_memories = state['assistant_state'].get("recalled_memories", {}).get("recalled_memory_documents", [])
-    retrieved_memories = state['recalled_memory_documents']
     
-    if len(retrieved_memories) == 0:
-        retrieved_memories = None
+    # retrieved_memories = state['recalled_memory_documents']
+    
+    # if len(retrieved_memories) == 0:
+    #     retrieved_memories = None
+
+
+    query = state['messages'][-1].content
+    
+    retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
+
+
+    # Coerce into document objects from Search Items
+    retrieved_memories = reduce_docs([], retrieved_memories_items)
+
+
+    # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
+    #     assistant_identity_namespace = (user_id, assistant_id, "memory")
+    #     query = state['messages'][-1].content
+        
+    #     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
+
+
+    #     # Coerce into document objects from Search Items
+    #     retrieved_memories = reduce_docs([], retrieved_memories_items)
+    # else:
+    #     retrieved_memories = state['recalled_memory_documents']
+
+    logger.info("breakpoint")
+
 
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
@@ -386,10 +361,10 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     avatar_model_with_tools = init_model(
         context = runtime.context,
         tools = [
-            learn_information_about_the_user, 
-            learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-            recall_memories, 
-            create_episodic_memory,
+            # learn_information_about_the_user, 
+            # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+            # recall_memories, 
+            # create_episodic_memory,
             ], 
         )
 
@@ -447,9 +422,10 @@ async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runt
 from langgraph.types import StreamWriter
 async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
     avatar_accessible_tools_dict = {
-        "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-        "recall_memories":recall_memories,
-        "create_episodic_memory": create_episodic_memory
+        # "learn_information_about_the_user": learn_information_about_the_user,
+        # "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+        # "recall_memories":recall_memories,
+        # "create_episodic_memory": create_episodic_memory
         }
     
     # avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()

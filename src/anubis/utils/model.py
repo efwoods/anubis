@@ -14,7 +14,7 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                tools=[], 
                tool_choice: str = "auto", 
                response_format = None, 
-               image_to_text_model: bool = False):
+               image_to_text_model: bool = True):
     
     context = GlobalContext()
     model_name = context.model

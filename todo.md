@@ -9,6 +9,10 @@ no response after long message (20,000 lines); multiple queries no response.
 Tool call id's do not match
 ['f02ae497-a69b-443b-81aa-286d13f89fd6', 'f837fb82-061f-4094-8e59-d04c62f5cfb7', 'a944aae4-29f5-476e-b4b0-34eada06910e', '1d1252be-2050-4871-a196-2b2bca70e7ec', '8bff3714-2a44-43f9-9e38-4b6975a4efe2', '8e9fcfb9-9d75-46d4-87a1-be3808aff69e', '55fefe1c-3238-4c0b-a46f-4336f7991071', 'fb8e8134-ac18-48ca-8745-7f05fad84f21', 'd96fd629-b6e8-4189-ae80-23cd214b9581']
 
+## TODO: BUG: CancelledError()
+humanThis is a new event and I need you to create a memory about this. This is the first time I said I love you, because I do.
+CancelledError()
+
 ## TODO: BUG: tool use injected into response
  I don't know who I am. You told me your name is Evan Woods, but I don't have any information about my own identity. If you share something about me, I'll try to remember it. [recall_memories()]
 

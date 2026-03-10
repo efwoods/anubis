@@ -67,10 +67,8 @@ from src.anubis.utils.tools.identity.identity_tools import (
     # learn_information_about_yourself_through_youtube_videos,
     # learn_new_facts,
     # retrieve_knowledge,
-)
-
-from src.anubis.utils.tools.avatar.avatar_tools import (
     recall_memories,    
+    create_episodic_memory
 )
 
 from src.anubis.utils.utility import (
@@ -167,9 +165,9 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     }
     return {"moderation_response": moderation_response}
 
-identity_tools_list = {"learn_information_about_yourself_through_text_from_the_user_as_a_memory": learn_information_about_yourself_through_text_from_the_user_as_a_memory, "learn_information_about_the_user":learn_information_about_the_user}
+# identity_tools_list = {"learn_information_about_yourself_through_text_from_the_user_as_a_memory": learn_information_about_yourself_through_text_from_the_user_as_a_memory, "learn_information_about_the_user":learn_information_about_the_user}
 
-identity_tools = [learn_information_about_yourself_through_text_from_the_user_as_a_memory, learn_information_about_the_user]
+# identity_tools = [learn_information_about_yourself_through_text_from_the_user_as_a_memory, learn_information_about_the_user]
 
 # async def update_identity_tool_classification(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
 #     """
@@ -222,6 +220,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     assistant_id = state['assistant_state']['assistant_id']
 
     # Update Name and Description of User and Assistant if provided in the context
+    logger.info(f"conscioussness breakpoint")
 
     if (isinstance(runtime.context.assistant_ctx, AssistantContext)):
         assistant_name = getattr(runtime.context.assistant_ctx, "name", None)
@@ -286,7 +285,6 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     else:
         assistant_identity = state['assistant_identity_documents']
 
-
     logger.info("breakpoint")
 
     # retrieved_memories = state['assistant_state'].get("recalled_memories", {}).get("recalled_memory_documents", [])
@@ -294,6 +292,19 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     
     if len(retrieved_memories) == 0:
         retrieved_memories = None
+
+    # Few Shot Example of Quotes and Writing style directly from the real-world assistant
+    # The QUOTE namespace holds direct quotes from the real-world assistant
+    query = state['messages'][-1].content
+    direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
+    logger.info(f"direct_quote_items: {direct_quote_items}")
+
+    direct_quotes = reduce_docs([], direct_quote_items)
+
+    # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
+    retrieved_knowledge_items = await runtime.store.asearch((user_id, assistant_id, 'document'), query=query)
+    logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
+    retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
     # Search your feelings
     # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt 
@@ -340,6 +351,8 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
         assistant_description = assistant_description,
         assistant_identity= assistant_identity,
         retrieved_memories=retrieved_memories,
+        retrieved_knowledge=retrieved_knowledge,
+        direct_quotes = direct_quotes,
         user_name = user_name,
         user_description = user_description,
         user_identity=user_identity, 
@@ -362,46 +375,59 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     return  input_update
 
+from src.anubis.utils.dataset.quality import evaluate
+
 async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
 
     """ CREATE MODEL """
 
     # model invocation
-    avatar_model_with_tools = init_model(
-        context = runtime.context,
-        tools = [
-            learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-                 recall_memories
-            ], 
-        )
+    # avatar_model_with_tools = init_model(
+    #     context = runtime.context,
+    #     tools = [
+    #         learn_information_about_the_user, 
+    #         learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+    #         recall_memories, 
+    #         create_episodic_memory,
+    #         ], 
+    #     )
 
     logger.info(f"breakpoint")
-    messages = state['messages']
+    # messages = state['messages']
     
-    if type(messages[0]) is not SystemMessage:
-        messages.insert(0, SystemMessage(content=state['system_message']))
-    else:
-        messages[0].content = state['system_message']
+    # system_message = [SystemMessage(content = state['system_message'])]
+    # messages = state['messages'][1:]
+    # messages = system_message + messages
 
-    response = await avatar_model_with_tools.ainvoke(input=messages)
-    avatar_response_content = getattr(response, 'content')
-    logger.info(f"Avatar Model Response: {avatar_response_content}")
-    return {"messages":[response]}
+
+    # response = await avatar_model_with_tools.ainvoke(input=messages)
+    # avatar_response_content = getattr(response, 'content')
+    # logger.info(f"Avatar Model Response: {avatar_response_content}")
+    # return {"messages":[response]}
 
     # agent invocation
-    # avatar_model = init_model(
-    #     context = runtime.context,
-    # )
+    avatar_model = init_model(
+        context = runtime.context,
+    )
 
-    # avatar = create_agent(model=avatar_model, tools=[recall_memories])
+    avatar = create_agent(model=avatar_model, system_prompt=state['system_message'], tools=[
+            learn_information_about_the_user, 
+            learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+            recall_memories, 
+            create_episodic_memory
+            ],
+            state_schema=GlobalState,
+            )
 
-    # response = await avatar.ainvoke(input={"messages": state['messages']})
-    # avatar_response = response.get("messages", [])[-1]
+    messages = state['messages']
+    response = await avatar.ainvoke(input={"messages": messages})
+    avatar_response = response.get("messages", [])[-1]
 
-    # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
-    # result = {"messages": [avatar_response]}
-    # return result
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+    result = {"messages": [avatar_response]}
+    if len(avatar_response.tool_calls) == 0:
+        return Command(update = result, goto="__end__")
  
 avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
                  recall_memories]
@@ -485,8 +511,9 @@ anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
 anubis_workflow.add_edge(START, "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "respond")
 
-anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
-anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
+# anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
+
+# anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
 anubis_workflow.add_edge("respond", END)
 
 # workflow.add_edge("chat", "terms_and_services_content_moderation")

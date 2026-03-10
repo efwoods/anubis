@@ -59,8 +59,8 @@ class UserContext(IdentityContext):
 class GlobalContext:
     """Main context class for the memory graph system."""
 
-    user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
+    user_ctx: UserContext = field(default_factory=UserContext)
 
     # max_search_results: int = field(
     #     default=10, 

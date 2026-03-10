@@ -62,8 +62,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     significant_fact: str, 
     fact_context:str,
     # Hide these arguments from the model.
-    state: Annotated[GlobalState, InjectedState],
-    runtime: ToolRuntime
+    runtime: Annotated[ToolRuntime, InjectedToolArg]
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -86,7 +85,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     The context behind the fact must be succinct. 
     The fact must be clear and complete.
     
-    
+    USE THIS FUNCTION SPARINGLY FOR SIGNIFICANT and EXTRAODINARY EVENTS ONLY.
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
@@ -151,12 +150,36 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     return Command(update=update, goto="load_conscioussness")
 
 
-@tool("recall_memories", return_direct = False)
-async def recall_memories(state: Annotated[GlobalState, InjectedState], runtime: ToolRuntime): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
+class ConversationSummaryToProvokeMemories(BaseModel):
+    """
+    Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
+    These document memories have been shared from the user and contain information about the assistant's identity.
+    These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
+    """
+    evoked_memory_query: str =  Field(description = """
+                                      This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.""")
+
+
+@tool("recall_memories", return_direct = False, args_schema=ConversationSummaryToProvokeMemories)
+async def recall_memories(
+    evoked_memory_query: Annotated[str, Field(description="This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.")],
+
+    # Hide these arguments
+    runtime: Annotated[ToolRuntime, InjectedToolArg]): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
     """This is used to retrieve memories or 'REMEMBER MEMORIES' from the store.
      These memories have been shared from the user and contain information about the assistant's identity.
      These memories have been shared from the user and contain information that was important that assistant decided the assistant needed to remember.
      This is used when the assistant needs to RECALL or REMEMBER important information that the assistant chose to MEMORIZE or REMEMBER. 
+
+
+    <INSTRUCTIONS>
+        Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
+        These document memories have been shared from the user and contain information about the assistant's identity.
+        These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
+        It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
+        The summary must be at most one sentence. 
+        The summary can be a single word or phrase that identifies the topic of conversation. 
+    </INSTRUCTIONS>
 
     Args:
         runtime (ToolRuntime): contains the store that holds the memories.
@@ -176,6 +199,40 @@ async def recall_memories(state: Annotated[GlobalState, InjectedState], runtime:
     logger.info(f'breakpoint')
 
 
+
+    # model_with_structured_output = init_model(context = runtime.context, response_format=ConversationSummaryToProvokeMemories)
+
+    # MEMORY_EVOCATION_INSTRUCTIONS = """
+    # <INSTRUCTIONS>
+    #     Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
+    #     These document memories have been shared from the user and contain information about the assistant's identity.
+    #     These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
+    #     It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
+    #     The summary must be at most one sentence. 
+    #     The summary can be a single word or phrase that identifies the topic of conversation. 
+    # </INSTRUCTIONS>
+
+    # <INSTRUCTIONS>
+    #     Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
+    #     These document memories have been shared from the user and contain information about the assistant's identity.
+    #     These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
+    #     It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
+    #     The summary must be at most one sentence. 
+    #     The summary can be a single word or phrase that identifies the topic of conversation.
+    # </INSTRUCTIONS>
+    # # """
+
+    # system_message = SystemMessage(content=MEMORY_EVOCATION_INSTRUCTIONS)
+    
+    # messages = [message for message in runtime.state['messages'] if type(message) is not SystemMessage]
+    
+    # chat_prompt_model = system_message + messages
+
+    # response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
+    
+    # evoked_memory_query = getattr(response, "evoked_memory_query", "")
+
+
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
@@ -183,56 +240,16 @@ async def recall_memories(state: Annotated[GlobalState, InjectedState], runtime:
     # Memory of the Identity of the assistant presented as text from the user.
     assistant_memory_namespace = (user_id, assistant_id, 'memory')
 
-    class ConversationSummaryToProvokeMemories(BaseModel):
-        """
-        Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
-        These document memories have been shared from the user and contain information about the assistant's identity.
-        These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
-        """
-        evoked_memory_query: str =  Field(description = """
-                                          This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.""")
-
-    model_with_structured_output = init_model(context = runtime.context, response_format=ConversationSummaryToProvokeMemories)
-
-    MEMORY_EVOCATION_INSTRUCTIONS = """
-    <INSTRUCTIONS>
-        Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
-        These document memories have been shared from the user and contain information about the assistant's identity.
-        These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
-        It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
-        The summary must be at most one sentence. 
-        The summary can be a single word or phrase that identifies the topic of conversation. 
-    </INSTRUCTIONS>
-
-    <INSTRUCTIONS>
-        Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
-        These document memories have been shared from the user and contain information about the assistant's identity.
-        These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
-        It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
-        The summary must be at most one sentence. 
-        The summary can be a single word or phrase that identifies the topic of conversation.
-    </INSTRUCTIONS>
-    """
-
-    system_message = SystemMessage(content=MEMORY_EVOCATION_INSTRUCTIONS)
-    
-    messages = [message for message in runtime.state['messages'] if type(message) is not SystemMessage]
-    
-    chat_prompt_model = system_message + messages
-
-    response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
-    
-    evoked_memory_query = getattr(response, "evoked_memory_query", "")
-
     evoked_memories_response = await runtime.store.asearch(
         assistant_memory_namespace,
         query=evoked_memory_query
     )
-    recent_message = runtime.state['messages'][-1]
-    tool_call_id = recent_message.tool_calls[0].get("id")
+    # recent_message = runtime.state['messages'][-1]
+    # tool_call_id = recent_message.tool_calls[0].get("id")
+    # runtime.tool_call_id
 
     update = {"recalled_memory_documents": evoked_memories_response, 
-              "messages": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=tool_call_id)]}
+              "messages": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=runtime.tool_call_id)]}
 
     return Command(update = update, goto="load_consciousness")
 
@@ -240,9 +257,8 @@ async def recall_memories(state: Annotated[GlobalState, InjectedState], runtime:
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
     content: str, 
     context: str,
-    runtime: ToolRuntime,
     # Hide these arguments from the model.
-    state: Annotated[GlobalState, InjectedState],
+    runtime: ToolRuntime,
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -372,9 +388,6 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
 
     return Command(update=update, goto="load_conscioussness")
 
-from langgraph.prebuilt import InjectedState
-
-
 class UserFactAndContext(BaseModel):
     """
     Extract Facts about the USER and the context of that fact given the history of messages.
@@ -387,7 +400,6 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     user_fact: Annotated[str, Field(description = "This is the fact about the user that was shared by the user.")],
     fact_context: Annotated[str, Field(description = "This is the context of the messages from which this fact was made.")],
     # Hide these arguments from the model.
-    state: Annotated[GlobalState, InjectedState],
     runtime: ToolRuntime,
 ) -> GlobalState:
     """

@@ -383,104 +383,108 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     """ CREATE MODEL """
 
     # model invocation
-    # avatar_model_with_tools = init_model(
-    #     context = runtime.context,
-    #     tools = [
-    #         learn_information_about_the_user, 
-    #         learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-    #         recall_memories, 
-    #         create_episodic_memory,
-    #         ], 
-    #     )
-
-    logger.info(f"breakpoint")
-    # messages = state['messages']
-    
-    # system_message = [SystemMessage(content = state['system_message'])]
-    # messages = state['messages'][1:]
-    # messages = system_message + messages
-
-
-    # response = await avatar_model_with_tools.ainvoke(input=messages)
-    # avatar_response_content = getattr(response, 'content')
-    # logger.info(f"Avatar Model Response: {avatar_response_content}")
-    # return {"messages":[response]}
-
-    # agent invocation
-    avatar_model = init_model(
+    avatar_model_with_tools = init_model(
         context = runtime.context,
-    )
-
-    avatar = create_agent(model=avatar_model, system_prompt=state['system_message'], tools=[
+        tools = [
             learn_information_about_the_user, 
             learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
             recall_memories, 
-            create_episodic_memory
-            ],
-            state_schema=GlobalState,
-            )
+            create_episodic_memory,
+            ], 
+        )
 
+    logger.info(f"breakpoint")
     messages = state['messages']
-    response = await avatar.ainvoke(input={"messages": messages})
-    avatar_response = response.get("messages", [])[-1]
+    
+    if isinstance(messages[0], SystemMessage):
+        messages[0].content = state['system_message']
+    else:
+        messages = [SystemMessage(content = state['system_message'])] + messages
 
-    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+    response = await avatar_model_with_tools.ainvoke(input=messages)
+    avatar_response_content = getattr(response, 'content')
+    logger.info(f"Avatar Model Response: {avatar_response_content}")
+    return {"messages":[response]}
+
+    # agent invocation
+    # avatar_model = init_model(
+    #     context = runtime.context,
+    # )
+
+    # avatar = create_agent(model=avatar_model, system_prompt=state['system_message'], tools=[
+    #         learn_information_about_the_user, 
+    #         learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+    #         recall_memories, 
+    #         create_episodic_memory
+    #         ],
+    #         state_schema=GlobalState,
+    #         )
+
+    # messages = state['messages']
+    # response = await avatar.ainvoke(input={"messages": messages})
+    # avatar_response = response.get("messages", [])[-1]
+
+    # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
     # recall_memories()<|python_end|>
-    result = {"messages": [avatar_response]}
-    if len(avatar_response.tool_calls) == 0:
-        return Command(update = result, goto="__end__")
+    # result = {"messages": [avatar_response]}
+    # if len(avatar_response.tool_calls) == 0:
+    #     return Command(update = result, goto="__end__")
  
 avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
                  recall_memories]
 
 from langchain_core.messages import ToolMessage
-
-# async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tool_node", '__end__']:
-#     recent_message = state['messages'][-1]
-#     if recent_message.tool_calls:
-#         for tool_call in recent_message.tool_calls:
-#             return "avatar_tool_node"
-#     else:
-#         return "__end__"
-    
 from langchain.tools import ToolRuntime
 
-# async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
-#     avatar_accessible_tools_dict = {
-#         "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-#         }
-#         # "recall_memories":recall_memories
+async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tool_node", '__end__']:
+    recent_message = state['messages'][-1]
+    if recent_message.tool_calls:
+        for tool_call in recent_message.tool_calls:
+            return "avatar_tool_node"
+    else:
+        return "__end__"
     
-#     avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
-#     message = state['messages'][-1]
+from langgraph.types import StreamWriter
+async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
+    avatar_accessible_tools_dict = {
+        "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+        "recall_memories":recall_memories,
+        "create_episodic_memory": create_episodic_memory
+        }
     
-#     for tool_call in message.tool_calls:
-#         if tool_call['name'] in avatar_accessible_tool_names:
-#             tool = avatar_accessible_tools_dict[tool_call['name']]
-#             logger.warning(f"tool_call: {tool_call}")
+    # avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
+    
+    message = state['messages'][-1]
+    logger.info(f"breakpoint")    
+    for tool_call in message.tool_calls:
+            if tool_call['name'] in avatar_accessible_tools_dict:
+                tool = avatar_accessible_tools_dict[tool_call['name']]
+                tool_runtime = ToolRuntime(
+                    state=state, 
+                    config=config, 
+                    context=runtime.context, 
+                    store=runtime.store,
+                    tool_call_id = tool_call['id'],
+                    stream_writer=runtime.stream_writer
+                    )
+                logger.warning(f"tool_call: {tool_call}")
+                tool_call["args"].update({"runtime":tool_runtime})
 
-            
-#             tool_response = await tool.ainvoke(tool_call['args'].update({"runtime":ToolRuntime(state=state, config=config, tool_call_id=tool_call['id'])}))
-#             """
-#             EXPECTED STRUCTURE
-#             tool_response = {"state_update_data": {}, "tool_message":{}}
-#             """
+                await tool.ainvoke(tool_call['args'], runtime=tool_runtime)
 
-#             tool_message = [ToolMessage(content=tool_response.get("tool_message"), tool_call_id = tool_call['id'])]
-#             update = tool_response.get("state_update_data")
-
-#             if update.get("messages"):
-#                 messages = update.get("messages", [])
-#                 messages = messages + tool_message
-#                 update.set({"messages": messages})
-#             else:
-#                 update.update({"messages": tool_message})
-            
-#             return update
     
 # async def evaluate_response_quality()
     
 # async def update_response_metadata()
+
+from langgraph.prebuilt import ToolNode
+
+# avatar_tool_node = ToolNode([
+#     learn_information_about_the_user, 
+#     learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+#     create_episodic_memory, 
+#     recall_memories
+# ], handle_tool_errors=True)
     
 """ GRAPH """
 
@@ -501,7 +505,7 @@ anubis_workflow = StateGraph(
 
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("respond", invoke_agent)
-# anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
+anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
 
@@ -512,10 +516,10 @@ anubis_workflow.add_node("respond", invoke_agent)
 anubis_workflow.add_edge(START, "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "respond")
 
-# anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
+anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
 
-# anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
-anubis_workflow.add_edge("respond", END)
+anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
+# anubis_workflow.add_edge("respond", END)
 
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
 
@@ -546,22 +550,6 @@ message_workflow.add_node("anubis", anubis)
 message_workflow.add_edge(START, "chat")
 message_workflow.add_edge("chat", "anubis")
 message_workflow.add_edge("anubis", END)
-
-
-# BASIC CHAT WORKFLOW
-
-# """ BASIC CHAT WORKFLOW NODES """
-
-# workflow.add_node("chat", message_interface)
-# workflow.add_node("load_consciousness", load_consciousness)
-# workflow.add_node("respond", invoke_agent)
-
-# """ BASIC CHAT WORKFLOW EDGES """
-
-# workflow.add_edge(START, "chat")
-# workflow.add_edge("chat", "load_consciousness")
-# workflow.add_edge("load_consciousness", "respond")
-# workflow.add_edge("respond", END)K
 
 graph = message_workflow.compile()
 

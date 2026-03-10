@@ -2,6 +2,12 @@
 
 """ TODO: Prevent Rate Limiting and Token Limiting Errors and Handle Message Failures """
 
+## TODO: multiple tool calls
+
+## TODO: False positive create memory vs recall_memories
+
+# RECURSION LIMIT REACHED
+
 ## TODO:  bug
 no response after long message (20,000 lines); multiple queries no response.
 
@@ -19,7 +25,7 @@ CancelledError()
  recall_memories()<|python_end|>
 
 You told me that your name is Evan Woods. That's the only information I have about you so far. I'm still getting to know you, and I'll remember more if you share more about yourself. [learn_information_about_the_user(content="User's name is Evan Woods.")]
-
+        
 
 ## TODO BUG: false positive on tool calling
 I'm still getting to know myself, and I don't have much information about my own identity. I don't know my name or any personal details about myself. However, I can tell you that I'm currently conversing with you, Evan Woods. If you'd like to share some information about me or my identity, I'll do my best to remember it. [learn_information_about_yourself_through_text_from_the_user_as_a_memory(content="User asked me to tell them about myself."), recall_memories()]

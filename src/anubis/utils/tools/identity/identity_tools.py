@@ -239,6 +239,7 @@ async def recall_memories(state: Annotated[GlobalState, InjectedState], runtime:
 @tool("learn_information_about_yourself_through_text_from_the_user_as_a_memory", return_direct=False)
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
     content: str, 
+    context: str,
     runtime: ToolRuntime,
     # Hide these arguments from the model.
     state: Annotated[GlobalState, InjectedState],

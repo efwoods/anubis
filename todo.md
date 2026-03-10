@@ -16,6 +16,8 @@ CancelledError()
 ## TODO: BUG: tool use injected into response
  I don't know who I am. You told me your name is Evan Woods, but I don't have any information about my own identity. If you share something about me, I'll try to remember it. [recall_memories()]
 
+ recall_memories()<|python_end|>
+
 You told me that your name is Evan Woods. That's the only information I have about you so far. I'm still getting to know you, and I'll remember more if you share more about yourself. [learn_information_about_the_user(content="User's name is Evan Woods.")]
 
 

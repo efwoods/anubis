@@ -425,6 +425,7 @@ async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runt
     avatar_response = response.get("messages", [])[-1]
 
     logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+    # recall_memories()<|python_end|>
     result = {"messages": [avatar_response]}
     if len(avatar_response.tool_calls) == 0:
         return Command(update = result, goto="__end__")
@@ -434,48 +435,48 @@ avatar_accessible_tools = [learn_information_about_the_user, learn_information_a
 
 from langchain_core.messages import ToolMessage
 
-async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tool_node", '__end__']:
-    recent_message = state['messages'][-1]
-    if recent_message.tool_calls:
-        for tool_call in recent_message.tool_calls:
-            return "avatar_tool_node"
-    else:
-        return "__end__"
+# async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tool_node", '__end__']:
+#     recent_message = state['messages'][-1]
+#     if recent_message.tool_calls:
+#         for tool_call in recent_message.tool_calls:
+#             return "avatar_tool_node"
+#     else:
+#         return "__end__"
     
 from langchain.tools import ToolRuntime
 
-async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
-    avatar_accessible_tools_dict = {
-        "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-        }
-        # "recall_memories":recall_memories
+# async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
+#     avatar_accessible_tools_dict = {
+#         "learn_information_about_the_user": learn_information_about_the_user, "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+#         }
+#         # "recall_memories":recall_memories
     
-    avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
-    message = state['messages'][-1]
+#     avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
+#     message = state['messages'][-1]
     
-    for tool_call in message.tool_calls:
-        if tool_call['name'] in avatar_accessible_tool_names:
-            tool = avatar_accessible_tools_dict[tool_call['name']]
-            logger.warning(f"tool_call: {tool_call}")
+#     for tool_call in message.tool_calls:
+#         if tool_call['name'] in avatar_accessible_tool_names:
+#             tool = avatar_accessible_tools_dict[tool_call['name']]
+#             logger.warning(f"tool_call: {tool_call}")
 
             
-            tool_response = await tool.ainvoke(tool_call['args'].update({"runtime":ToolRuntime(state=state, config=config, tool_call_id=tool_call['id'])}))
-            """
-            EXPECTED STRUCTURE
-            tool_response = {"state_update_data": {}, "tool_message":{}}
-            """
+#             tool_response = await tool.ainvoke(tool_call['args'].update({"runtime":ToolRuntime(state=state, config=config, tool_call_id=tool_call['id'])}))
+#             """
+#             EXPECTED STRUCTURE
+#             tool_response = {"state_update_data": {}, "tool_message":{}}
+#             """
 
-            tool_message = [ToolMessage(content=tool_response.get("tool_message"), tool_call_id = tool_call['id'])]
-            update = tool_response.get("state_update_data")
+#             tool_message = [ToolMessage(content=tool_response.get("tool_message"), tool_call_id = tool_call['id'])]
+#             update = tool_response.get("state_update_data")
 
-            if update.get("messages"):
-                messages = update.get("messages", [])
-                messages = messages + tool_message
-                update.set({"messages": messages})
-            else:
-                update.update({"messages": tool_message})
+#             if update.get("messages"):
+#                 messages = update.get("messages", [])
+#                 messages = messages + tool_message
+#                 update.set({"messages": messages})
+#             else:
+#                 update.update({"messages": tool_message})
             
-            return update
+#             return update
     
 # async def evaluate_response_quality()
     
@@ -500,7 +501,7 @@ anubis_workflow = StateGraph(
 
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("respond", invoke_agent)
-anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
+# anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
 

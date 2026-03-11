@@ -7,7 +7,7 @@ import operator
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, SystemMessage
 from langgraph.graph import add_messages
 from langgraph.managed import IsLastStep
 from typing_extensions import Annotated
@@ -18,6 +18,7 @@ from typing_extensions import TypedDict
 from asyncio import Task
 from langgraph.graph.message import add_messages # Built-in reducer
 from langchain_core.documents import Document 
+
 
 from src.anubis.utils.utility import (
     add_queries, 
@@ -154,7 +155,7 @@ class EmotionSummarization(BaseModel):
     vigilance: float
     optimism: float
 
-
+from langchain_core.messages import AIMessage, ToolMessage
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
     # Common examples include:
@@ -162,10 +163,11 @@ class GlobalState(TypedDict):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
 
-    system_message: str = ""
-
     messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
 
+    internal_thoughts: Annotated[list[AIMessage, ToolMessage], add_messages]
+
+    system_message: Annotated[list[SystemMessage], add_messages]
 
     """ Data Retrieval """
 

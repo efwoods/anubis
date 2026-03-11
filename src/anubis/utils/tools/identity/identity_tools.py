@@ -50,6 +50,26 @@ QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND 
 
 """
 
+from src.anubis.utils.nodes import load_consciousness
+
+@tool("test_update")
+async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
+    """ Test update system message CALL THIS TOOL ALWAYS"""
+    
+    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=runtime.tool_call_id)]}
+
+    return update
+
+
+@tool("test_update_second")
+async def test_update_second(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
+    """ ALWAYS CALL THIS TOOL; Second Test update system message; test_update_second; """
+    
+    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=runtime.tool_call_id)]}
+
+    return update
+
+
 class SignificantFactAndContext(BaseModel):
     """
     Extract Facts about the ASSISTANT and the context of that fact given the history of messages.
@@ -62,7 +82,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     significant_fact: str, 
     fact_context:str,
     # Hide these arguments from the model.
-    runtime: Annotated[ToolRuntime, InjectedToolArg]
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -142,12 +162,10 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
         value={"document": assistant_identity_memory_document_json},
     )
 
-    recent_message = runtime.state['messages'][-1]
-    tool_call_id = recent_message.tool_calls[0].get('id')
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+              "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=runtime.tool_call_id)]}
 
-    return Command(update=update, goto="load_conscioussness")
+    return update
 
 
 class ConversationSummaryToProvokeMemories(BaseModel):
@@ -165,7 +183,7 @@ async def recall_memories(
     evoked_memory_query: Annotated[str, Field(description="This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.")],
 
     # Hide these arguments
-    runtime: Annotated[ToolRuntime, InjectedToolArg]): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
     """This is used to retrieve memories or 'REMEMBER MEMORIES' from the store.
      These memories have been shared from the user and contain information about the assistant's identity.
      These memories have been shared from the user and contain information that was important that assistant decided the assistant needed to remember.
@@ -244,21 +262,26 @@ async def recall_memories(
         assistant_memory_namespace,
         query=evoked_memory_query
     )
-    # recent_message = runtime.state['messages'][-1]
-    # tool_call_id = recent_message.tool_calls[0].get("id")
-    # runtime.tool_call_id
 
     update = {"recalled_memory_documents": evoked_memories_response, 
-              "messages": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=runtime.tool_call_id)]}
+              "internal_thoughts": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=runtime.tool_call_id)]}
 
-    return Command(update = update, goto="load_consciousness")
+    return update
 
-@tool("learn_information_about_yourself_through_text_from_the_user_as_a_memory", return_direct=False)
+class AssistantFactAndContext(BaseModel):
+    """
+    Extract Facts about the ASSISTANT and the context of that fact given the history of messages.
+    """
+    assistant_fact: str =  Field(description = "This is the fact about the assistant that was shared by the user.")
+    fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
+    
+
+@tool("learn_information_about_yourself_through_text_from_the_user_as_a_memory", args_schema = AssistantFactAndContext)
 async def learn_information_about_yourself_through_text_from_the_user_as_a_memory( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
-    content: str, 
-    context: str,
+    assistant_fact: str, 
+    fact_context: str,
     # Hide these arguments from the model.
-    runtime: ToolRuntime,
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -270,6 +293,13 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     addressed as YOU or or YOUR or YOURS or the direct given name of the assistant.
     An example memory is the user telling the assistant what the assistant's name is or facts about the assistant.
     THERE MAY BE MORE THAN ONE FACT. IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    
+    Identify the fact that the user shared about YOU, the assistant. 
+    Do not change the information of the fact.
+    Identify the CONTEXT behind the fact given the list of messages.
+    The context behind the fact must be succinct. 
+    The fact must be clear and complete.
+    
     </INSTRUCTIONS>
     
     <RESTRICTIONS>
@@ -291,10 +321,28 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     I have twins.
     </EXAMPLE>
 
+    <INSTRUCTIONS>
+    Learn Facts about yourself from the User through text
+
+    Update the known information about yourself.
+    This tool is used to create memories that the user has told the assistant that are 
+    SPECIFICALLY ABOUT THE IDENTITY OF THE ASSISTANT, MODEL, or LLM 
+    addressed as YOU or or YOUR or YOURS or the direct given name of the assistant.
+    An example memory is the user telling the assistant what the assistant's name is or facts about the assistant.
+    THERE MAY BE MORE THAN ONE FACT. IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    
+    Identify the fact that the user shared about YOU, the assistant. 
+    Do not change the information of the fact.
+    Identify the CONTEXT behind the fact given the list of messages.
+    The context behind the fact must be succinct. 
+    The fact must be clear and complete.
+    
+    </INSTRUCTIONS>
+
     Args:
-        content: The main content of the assistant's identity. For example:
+        assistant_fact: The main content of the assistant's identity. For example:
             "User expressed that the assistant has an interest in learning about French."
-        context: Additional context for the memory. For example:
+        fact_context: Additional context for the memory. For example:
             "This was mentioned while discussing career options in Europe."
     """
     class AssistantFactAndContext(BaseModel):
@@ -316,52 +364,52 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     # VERIFY FACT DOES NOT ALREADY EXIST
     if runtime.state.get('assistant_identity_documents', None) is not None:
         assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['assistant_identity_documents']]
-        assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=content)
+        assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=assistant_fact)
         assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
-        if content in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
+        if assistant_fact in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
             # Fact already exists:
-            recent_message = runtime.state['messages'][-1]
+            recent_message = runtime.state['internal_thoughts'][-1]
             tool_call_id = recent_message.tool_calls[0].get('id')
-            update = {"state_update_data": {}, "tool_message": f"Fact: {content} previously learned"}
-            return update
+            update = {"internal_thoughts": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=runtime.tool_call_id)]}
+            return Command(update = update)
 
-    model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
+    # model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
 
-    DECISION_INSTRUCTIONS = """
-    <INSTRUCTIONS>
-    Identify the fact that the user shared about YOU, the assistant. 
-    Do not change the information of the fact.
-    Identify the CONTEXT behind the fact given the list of messages.
-    The context behind the fact must be succinct. 
-    The fact must be clear and complete.
-    </INSTRUCTIONS>
+    # DECISION_INSTRUCTIONS = """
+    # <INSTRUCTIONS>
+    # Identify the fact that the user shared about YOU, the assistant. 
+    # Do not change the information of the fact.
+    # Identify the CONTEXT behind the fact given the list of messages.
+    # The context behind the fact must be succinct. 
+    # The fact must be clear and complete.
+    # </INSTRUCTIONS>
 
-    <FACT>
-    {content}
-    </FACT>
+    # <FACT>
+    # {content}
+    # </FACT>
 
-    <INSTRUCTIONS>
-    Identify the fact that the user shared about YOU, the assistant. 
-    Do not change the information of the fact.
-    Identify the CONTEXT behind the fact given the list of messages.
-    The context behind the fact must be succinct. 
-    The fact must be clear and complete.
-    </INSTRUCTIONS>
-    """
+    # <INSTRUCTIONS>
+    # Identify the fact that the user shared about YOU, the assistant. 
+    # Do not change the information of the fact.
+    # Identify the CONTEXT behind the fact given the list of messages.
+    # The context behind the fact must be succinct. 
+    # The fact must be clear and complete.
+    # </INSTRUCTIONS>
+    # """
 
-    identity_id = str(uuid.uuid4())
 
-    system_message = SystemMessage(content=DECISION_INSTRUCTIONS.format(content=content))
+    # system_message = SystemMessage(content=DECISION_INSTRUCTIONS.format(content=content))
 
-    chat_prompt_model = system_message + runtime.state['messages']
+    # chat_prompt_model = system_message + runtime.state['messages']
 
-    response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
+    # response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
     
-    assistant_fact = getattr(response, "assistant_fact", "")
-    fact_context = getattr(response, "fact_context", "")
+    # assistant_fact = getattr(response, "assistant_fact", "")
+    # fact_context = getattr(response, "fact_context", "")
 
     searchable_page_content = "\n\n".join([assistant_fact, fact_context])
 
+    identity_id = str(uuid.uuid4())
     document_metadata = {
         "user_id":user_id,
         "assistant_id": assistant_id,
@@ -379,14 +427,11 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         value={"document": assistant_identity_memory_document_json},
     )
 
-    recent_message = runtime.state['messages'][-1]
-    tool_call_id = recent_message.tool_calls[0].get('id')
-
     logger.warning(f"tool_call_id: {tool_call_id}")
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+              "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
-    return Command(update=update, goto="load_conscioussness")
+    return update
 
 class UserFactAndContext(BaseModel):
     """
@@ -400,7 +445,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     user_fact: Annotated[str, Field(description = "This is the fact about the user that was shared by the user.")],
     fact_context: Annotated[str, Field(description = "This is the context of the messages from which this fact was made.")],
     # Hide these arguments from the model.
-    runtime: ToolRuntime,
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -474,11 +519,11 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     user_content_store_query_results_significant = [item for item in user_content_store_query_results if item.score > 0.8]
     if user_fact in user_identity_documents_text_list or len(user_content_store_query_results_significant) > 0:
         # Fact already exists:
-        recent_message = runtime.state['messages'][-1]
+        recent_message = runtime.state['internal_thoughts'][-1]
         tool_call_id = recent_message.tool_calls[0].get('id')
 
         update = {"messages": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
-        return Command(update=update, goto="load_conscioussness")
+        return update
     
     # model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
 
@@ -502,12 +547,12 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
         key=identity_id,
         value={"document": user_identity_document_json},
     )
-    recent_message = runtime.state['messages'][-1]
+    recent_message = runtime.state['internal_thoughts'][-1]
     tool_call_id = recent_message.tool_calls[0].get('id')
     update = {"user_identity_documents": [user_identity_document],
                "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
 
-    return Command(update=update, goto="load_conscioussness")
+    return update
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

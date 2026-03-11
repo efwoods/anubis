@@ -59,8 +59,8 @@ class UserContext(IdentityContext):
 class GlobalContext:
     """Main context class for the memory graph system."""
 
-    user_ctx: UserContext = field(default_factory=UserContext)
     assistant_ctx: AssistantContext = field(default_factory=AssistantContext)
+    user_ctx: UserContext = field(default_factory=UserContext)
 
     # max_search_results: int = field(
     #     default=10, 
@@ -158,6 +158,17 @@ class GlobalContext:
         default = None, 
         metadata={"description": "api key"}
     )
+
+    image_model: str = field(
+        default = None, 
+        metadata={"description": "Name of the model with image capabilities. Assumes base url, and api key matches the 'model' variable (text model)."}
+    )
+
+    deployment: str = field(
+        default= None,
+        metadata={"description": "True for langsmith deployments to use autoconfiguration of store; disables functionality of api yet allows the graph to run for deployments."}
+    )
+
 
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""

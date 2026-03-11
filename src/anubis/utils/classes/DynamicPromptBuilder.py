@@ -61,6 +61,7 @@ class DynamicPromptBuilder:
         # user_context: Optional[Dict[str, Any]] = None,
         retrieved_knowledge: Optional[List[Document]] = None,
         retrieved_memories: Optional[List[Document]] = None,
+        direct_quotes: Optional[List[Document]] = None,
         user_name: Optional[str] = None,
         user_description: Optional[str] = None,
         user_identity: Optional[List[Document]] = None,
@@ -83,29 +84,37 @@ class DynamicPromptBuilder:
 
         # Render Assistant Name:
         if assistant_name is None or assistant_name is "":
-            assistant_name = "You don't know your name."    
+            # assistant_name = "You don't know your name."    
+            assistant_name = ""
 
         # Render Assistant Identity
         if assistant_identity is None or len(assistant_identity) == 0:
             if assistant_description is None:
-                assistant_identity_str = "You don't have any information about identity."
+                # assistant_identity_str = "You don't have any information about identity."
+                assistant_identity_str = ""
             else:
                 assistant_identity_str = assistant_description
         else:
             assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity])
             if assistant_description is not None:
                 assistant_identity_str = assistant_description + "\n\n" + assistant_identity_str
+        
+        if direct_quotes is not None and len(direct_quotes) != 0:
+            direct_quotes_str = "\n\n".join([doc.page_content for doc in direct_quotes])
+        else:
+            direct_quotes_str = ""
 
         # Render AI context
         # assistant_context_str = self.render_identity_context(assistant_context or {})
 
-        if user_name is None or user_name is '':
+        if user_name is None or user_name == '':
             user_name = "You don't know the name of the person you are communicating with."
         
 
         if user_identity is None or len(user_identity) == 0:
             if user_description is None:
-                user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
+                # user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
+                user_identity_str = ""
             else:
                 user_identity_str = user_description
         else:
@@ -117,22 +126,26 @@ class DynamicPromptBuilder:
         # user_context_str = user_context or "User identity unknown."
         
         # Build retrieved knowledge
-        if retrieved_knowledge is None:
-            retrieved_knowledge_str = "No additional documents retrieved."
-        else:
+        if retrieved_knowledge is not None and len(retrieved_knowledge) != 0:
             retrieved_knowledge_str = "\n\n".join([doc.page_content for doc in retrieved_knowledge])
+        else:
+            # retrieved_knowledge_str = "No additional documents retrieved."
+            retrieved_knowledge_str = ""
         
         # Build retrieved memories (associated memories given the conversation)
         if retrieved_memories is None:
-            retrieved_memories_str = "No additional memories retrieved."
+            # retrieved_memories_str = "No additional memories retrieved."
+            retrieved_memories_str = ""
         else:
             retrieved_memories_str = "\n\n".join([doc.page_content for doc in retrieved_memories])
 
         if assistant_emotions is None:
-            assistant_emotions_str = "Unaware of current emotions of self."
+            # assistant_emotions_str = "Unaware of current emotions of self."
+            assistant_emotions_str = ""
 
         if user_emotions is None:
-            user_emotions_str = "Unaware of the current emotions of the person or people you are addressing."
+            # user_emotions_str = "Unaware of the current emotions of the person or people you are addressing."
+            user_emotions_str = ""
 
         # Build system time
         if system_time is None:
@@ -151,6 +164,7 @@ class DynamicPromptBuilder:
             "assistant_emotions": assistant_emotions_str,
             "retrieved_knowledge": retrieved_knowledge_str,
             "retrieved_memories": retrieved_memories_str,
+            "direct_quotes": direct_quotes_str,
             "user_name": user_name, 
             "user_identity": user_identity_str,
             "user_emotions": user_emotions_str,

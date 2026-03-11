@@ -1,9 +1,6 @@
 debugpy
-<<<<<<< HEAD
-watchfiles
-=======
 langgraph-cli[inmem]
 pandas
 anyio
 pytest
->>>>>>> test_bak
+pytest-asyncio

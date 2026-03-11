@@ -6,10 +6,15 @@ logger = logging.getLogger(__name__)
 from src.anubis.utils.context import GlobalContext
 from typing import Optional
 
+from pydantic import BaseModel
+
 """ TODO: Prevent Rate Limiting and Token Limiting Errors and Handle Message Failures """
 
 def init_model(context: Optional[GlobalContext] = GlobalContext(), 
-               tools=[], tool_choice={}, response_format = None):
+               tools=[], 
+               tool_choice: str = "auto", 
+               response_format = None, 
+               image_to_text_model: bool = True):
     
     context = GlobalContext()
     model_name = context.model
@@ -24,6 +29,9 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
     # if dev == 'TRUE':
     from langchain_openai import ChatOpenAI
     
+    if image_to_text_model:
+        model_name = context.image_model
+
     if response_format is None:
         model = ChatOpenAI(
                     model = model_name,
@@ -32,11 +40,11 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                     top_p=0.1,
                     api_key = api_key,
                 ).bind_tools(
-                    method='json_schema', 
+                    # method='json_schema', 
                     tools=tools, 
-                    tool_choice="auto", # auto: zero or more tools
-                    strict=True, 
-                    include_raw=True
+                    tool_choice=tool_choice, # auto: zero or more tools
+                    # strict=True, # model output will be guaranteed to match the schema
+                    # include_raw=True # model response (JSON e.g.) and the parsed response (Pydantic e.g.) will be returned
                 )
     else: 
         model = ChatOpenAI(
@@ -46,9 +54,9 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             top_p=0.1,
             api_key = api_key,
         )
-
-        model = model.with_structured_output(schema=response_format, include_raw=False, strict=True)
+        model = model.with_structured_output(schema=response_format)
     # else: 
     #     from langchain_together import ChatTogether
     #     model = ChatTogether(model=model_name, temperature=0.1)
     return model
+

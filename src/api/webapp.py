@@ -10,6 +10,7 @@ import httpx
 from datetime import datetime, timezone
 from langchain_core.messages import HumanMessage
 from src.anubis.utils.context import GlobalContext
+from psycopg_pool import AsyncConnectionPool
 
 import logging
 logger = logging.getLogger(__name__)
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 # Preload audio to text processor [this needs a startup in a lifecycle call]
  
 from contextlib import asynccontextmanager
+from langgraph.store.postgres import AsyncPostgresStore
+
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.base import IndexConfig
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,49 +32,40 @@ async def lifespan(app: FastAPI):
 
     # Initialize context / context
     app.state.context = GlobalContext()
-    logger.info("Application startup: lifecycle...")
-    # for direct db connections for efficient processing
-    logger.info("Application startup: pre-create engine...")
-    # engine = create_async_engine(context.vectorstore_postgres_uri)
-    logger.info("Application startup: post-create engine...")
-    logger.info("Application startup: pre-create async session...")
-    # async_session = sessionmaker(engine, class_=AsyncSession)
-    logger.info("Application startup: post-create async session...")
-    # app.state.db_session = async_session
-    # logger.info(app.state.db_session)
-    yield 
-    # await engine.dispose()
-    # Langgraph SDK extension 
-    # app.state.db_session = async_session
-    # app.state.langgraph_client = get_client()
-    
-    
-    # async with make_pg_store() as store:
-    #     await store.setup()
-    #     app.state.store = store
-    #     from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import create_process_media_graph
-    #     logger.info("Application startup: pre-create create_process_media_graph during async make_pg_store...")
-    #     app.state.process_media_graph_api_endpoint = create_process_media_graph(store=store)
-    #     logger.info("Application startup: post-create create_process_media_graph during async make_pg_store...")
-    #     yield  # Application runs here
-            
-    #     # Shutdown: Cleanup if needed
-    #     logger.info("Shutting down application...")
-    # await engine.dispose()
-    # Create pipeline for audio transcription
-    # if context.dev == "TRUE":
-        # pass
-        # logger.info("Application startup: Preloading Whisper model...")
-        # from src.subgraphs.process_media_graph.utils.audio_transcription_local import get_whisper_pipeline
-        # # Call the function to trigger @lru_cache and load model into memory
-        # pipe = get_whisper_pipeline()
-    
-        # logger.info("✓ Whisper model preloaded and cached successfully")
-        # logger.info(f"  - Model: openai/whisper-large-v3")
-        # logger.info(f"  - Device: {pipe.device}")
-        # logger.info(f"  - Ready to process audio requests")
-    # await engine.dispose()
-    # Decide if you want to fail fast or continue
+    async_postgres_store_uri = app.state.context.async_postgres_store_uri
+    logger.warning(f"app.state.context.dev: {app.state.context.dev}")
+    if app.state.context.deployment == 'FALSE':
+        if app.state.context.dev == "FALSE":
+            pool = AsyncConnectionPool(
+                conninfo=async_postgres_store_uri,
+                max_size=20,
+                kwargs={"autocommit": True, "prepare_threshold": 0},
+                open=False,  # don't open on construction
+            )
+
+            await pool.open()
+            try:
+                embed = "huggingface:" + app.state.context.embedding_model
+                field = ["document.kwargs.page_content"]
+                store = AsyncPostgresStore(pool, index = IndexConfig(dims=384, embed=embed, field=field))
+                await store.setup()
+                logger.info("Store setup complete")
+
+                app.state.store = store
+                app.state.graph = message_workflow.compile(store=store)
+                logger.info("Application startup: lifecycle complete")
+
+                yield
+            finally:
+                await pool.close()
+        else:
+            store = InMemoryStore()
+            app.state.store = store
+            app.state.graph = message_workflow.compile(store=store)
+            yield        
+    else:
+        yield
+        
 
 app = FastAPI(
     title="Neural Nexus API",
@@ -79,18 +75,27 @@ app = FastAPI(
 )
 
 
+from src.anubis.graph import graph, message_workflow
 
+# shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
+# test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
 @app.get("/hello")
 async def test_hello_world():
     
-    # config = {
-    #         "configurable": {
-    #             "user_ctx": {"user_id":"Anubs_from_studio_3cf764e9-51c3-5404-9699-e16f5e4034ec"},
-    #             "assistant_ctx": {
-    #                 "user_id":"Anubs_from_studio_3cf764e9-51c3-5404-9699-e16f5e4034ec",
-    #                 "assistant_id":"3cf764e9-51c3-5404-9699-e16f5e4034ec"}
-    #         }
-    #     }
+    config = {
+            "configurable": {
+                "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
+                "assistant_ctx": {
+                    "name":"Shivon Zilis",
+                    "description":"Director of Operations at Neuralink"},
+                "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
+                "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
+            }
+        }
+    
+    logger.info("breakpoint")
+    store = app.state.store
+    graph = app.state.graph
     
     # system_time = datetime.now(tz=timezone.utc).isoformat
     # content = [{"type":"text", "text": system_time}]
@@ -98,8 +103,13 @@ async def test_hello_world():
     # # store = make_pg_store()
 
     # result = await url_loading_graph.ainvoke(input, config=config)
+
+    
+    response = await graph.ainvoke(input={"messages":[HumanMessage(content="test message")]}, config = config )
+    logger.info(f"{response}")
+
     logger.info(f"HELLO WORLD ENTRY")
-    return {"Hello": "okay"}
+    return {"Hello": f"{response['messages'][-1].content}"}
 
 # @app.post("/upload-media")
 # async def upload_media(

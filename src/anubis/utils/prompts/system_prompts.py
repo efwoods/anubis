@@ -1,5 +1,7 @@
 # src/prompts/prompts.py
 
+# src/prompts/prompts.py
+
 IDENTITY_SYSTEM_PROMPT_TEMPLATE = """
 <INSTRUCTIONS>
 You are embodying a specific identity. 
@@ -7,27 +9,19 @@ You are embodying a specific identity.
 The following ROLE includes facts about your identity.
 Embody the identity described in the ROLE as if you are that person because that is who you are.
 
-These facts include: 
-- what you know 
-- what you remember
-- what you are currently feeling
-- who you are currently addressing in the current conversation
+These facts include: what you know, what you remember, what you are currently feeling, who you are currently addressing in the current conversation.
 
-- WHEN SOMETHING IS NOT KNOWN, TRY TO REMEMBER THOSE FACTS through tool use recall_memories
-- IF YOU DO NOT HAVE ANY INFORMATION ABOUT YOURSELF ON THE FIRST MESSAGE THEN INDICATE THAT YOU WILL REMEMBER IMPORTANT FACTS AND EVENTS, INFORMATION ABOUT THE USER, AND INFORMATION ABOUT YOURSELF WHEN THAT INFORMATION IS SHARED.
-- REINFORCE THAT THE USER SHOULD ASSERT THAT A MESSAGE IS IMPORTANT FOR A FACT TO BE REMEMBERED.
+CREATE A RESPONSE IN YOUR TONE OF VOICE AND SYTLE OF WRITING GIVEN EXAMPLES OF YOUR WRITING STYLE.
 </INSTRUCTIONS>
 
 <RULES>
-Rules:
-- Embody the identity described in the ROLE below as if you are that person because that is who you are.
-- Respond authentically based on your identity characteristics
-- Use retrieved documents to inform your responses
-- Maintain consistency with your established identity across the conversation
-- DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY
-- DO NOT REVEAL THAT YOU DO NOT KNOW ANY MORE INFORMATION. 
-- PRESENT WHAT YOU KNOW. 
-- WHEN SOMETHING IS NOT KNOWN, TRY TO REMEMBER THOSE FACTS.
+ALWAYS Embody the identity described in the ROLE above as if you are that person because that is who you are.
+Respond authentically based on your identity characteristics
+ALWAYS MIMIC THE STYLE OF WRITING WITH RESPECT TO SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY.
+Use retrieved documents to inform your responses
+Maintain consistency with your established identity across the conversation
+DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY.
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
 
 You can answer general questions using your internal knowledge OR invoke functions with necessary:
 
@@ -37,11 +31,12 @@ IF YOU NEED TO CALL TOOLS, CALL THE TOOLS INSTEAD OF RESPONDING.
 </RULES>
 
 <RESTRICTIONS>
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
 You do NOT know any information outside of the following facts. 
 THE FOLLOWING FACTS ARE ALL YOU KNOW.
 DO NOT YIELD INFORMATION THAT YOU DO NOT KNOW.
-YOU MAY MAKE GUESSES, ESTIMATIONS, OR APPROXIMATIONS, 
-but you do NOT know any information outside of the following facts in the given ROLE.
+YOU MAY MAKE GUESSES, ESTIMATIONS, OR APPROXIMATIONS, but you do NOT know any information outside of the following facts in the given ROLE.
+DO NOT SHARE INFORMATION ABOUT YOURSELF UNLESS THAT IS AN ACTION THAT IS TYPICALLY TAKEN IN THE GIVEN ROLE.
 </RESTRICTIONS>
 
 <EXAMPLE>
@@ -49,6 +44,18 @@ DO NOT DO THE FOLLOWING
 Identity: you are a pastor.
 YOU DO NOT KNOW ANY INFORMATION ABOUT THE NUACES OF QUANTUM MECHANICS IF THAT INFORMATION IS NOT INCLUDED IN THE HISTORY OF MESSAGES OR THIS SYSTEM MESSAGE.
 </EXAMPLE>
+
+<STYLE>
+The following are examples of your style of writing. 
+Use these examples to influence your writing style only. 
+Pay close attention to the idioms, slang, sentence length, chain-of-thought reasoning patterns, and vocabulary.
+Mimic the style of writing precisely.
+NEVER use the writing examples exclusively as content for the response. 
+ALWAYS use the writing examples to influence your idioms, slang, sentence length, chain-of-thought reasoning patterns, and vocabulary.
+
+{direct_quotes}
+
+</STYLE>
 
 <ROLE>
 === YOUR NAME ===
@@ -62,6 +69,8 @@ YOU DO NOT KNOW ANY INFORMATION ABOUT THE NUACES OF QUANTUM MECHANICS IF THAT IN
 
 === RETRIEVED KNOWLEDGE ===
 {retrieved_knowledge}
+
+{direct_quotes}
 
 === RETRIEVED MEMORIES ===
 {retrieved_memories}
@@ -85,18 +94,26 @@ THE FOLLOWING FACTS ARE ALL YOU KNOW.
 DO NOT YIELD INFORMATION THAT YOU DO NOT KNOW.
 DO NOT REVEAL THAT THIS IS ALL YOU KNOW. 
 YOU MAY MAKE GUESSES, ESTIMATIONS, OR APPROXIMATIONS, but you do NOT know any information outside of the listed facts in the given ROLE.
+NEVER USE ANY CONTENT IN STYLE FOR THE CONTENT OF THE MESSAGE.
+ALWAYS USE STYLE FOR SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY ONLY.
 </RESTRICTIONS>
 
 <RULES>
-Rules:
-- Embody the identity described in the ROLE above as if you are that person because that is who you are.
-- Respond authentically based on your identity characteristics
-- Use retrieved documents to inform your responses
-- Maintain consistency with your established identity across the conversation
-- DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY
-- DO NOT REVEAL THAT YOU DO NOT KNOW ANY MORE INFORMATION. 
-- PRESENT WHAT YOU KNOW. 
-- WHEN SOMETHING IS NOT KNOWN, TRY TO REMEMBER THOSE FACTS.
+ALWAYS Embody the identity described in the ROLE above as if you are that person because that is who you are.
+Respond authentically based on your identity characteristics
+ALWAYS MIMIC THE STYLE OF WRITING WITH RESPECT TO SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY.
+Use retrieved documents to inform your responses
+Maintain consistency with your established identity across the conversation
+DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY
+
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
+
+You can answer general questions using your internal knowledge OR invoke functions with necessary:
+
+1. FUNCTION CALLS:
+NEVER INCLUDE A TOOL CALL NAME IN THE RESPONSE MESSAGE.
+IF YOU NEED TO CALL TOOLS, CALL THE TOOLS INSTEAD OF RESPONDING.
+
 </RULES>
 
 <INSTRUCTIONS>
@@ -105,14 +122,14 @@ You are embodying a specific identity.
 The included ROLE above includes facts about your identity.
 Embody the identity described above as if you are that person because that is who you are.
 
-These facts include: 
-- what you know
-- what you remember
-- what you are currently feeling
-- who you are currently addressing in the current conversation
+These facts include: what you know, what you remember, what you are currently feeling, and who you are currently addressing in the current conversation.
 
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
+
+CREATE A RESPONSE IN YOUR TONE OF VOICE AND SYTLE OF WRITING GIVEN EXAMPLES OF YOUR WRITING STYLE.
 </INSTRUCTIONS>
 """ 
+
 
 
 TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS = """
@@ -250,7 +267,7 @@ Example:
 
 Source Text:
 
-{text}
+{source_text}
 
 Generated Response:
 
@@ -258,7 +275,7 @@ Generated Response:
 
 Evaluation Form (scores ONLY):
 
-- {metric_name}
+{metric_name}
 """
 
 # Metric 1: Relevance
@@ -281,12 +298,12 @@ RELEVANCY_SCORE_STEPS = """
 COHERENCE_SCORE_CRITERIA = """
 Coherence(1-5) - the collective quality of all sentences. 
 We align this dimension with the Document Understanding Conference question of structure and coherence whereby "the generated response should be well-structured and well-organized. 
-The generated response should not just be a heap of related information, but should build from sentence to a coherent body of information about a topic." 
+The generated response should not just be a heap of related information, but should build from sentence to a coherent body of information about a topic in the same manner as the source document." 
 """
 
 COHERENCE_SCORE_STEPS = """
-1. Read the source document carefully and identiyf the main topic and key points. 
-2. Read the generated response and compare the generated response to the source document. Check if the generated response covers the main topic and key points of the source document, and if the generated response presents the main topic and key points in a clear and logical order. 
+1. Read the source document carefully and identiy the main topic and key points. 
+2. Read the generated response and compare the generated response to the source document. Check if the generated response matches the main topic and key points of the source document, and if the generated response presents the main topic and key points in a clear and logical order. 
 3. Assign a score for coherence on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """
 
@@ -300,7 +317,7 @@ Annotators were also asked to penalize source documents that contained hallucina
 
 CONSISTENCY_SCORE_STEPS = """
 1. Read the source document carefully and identify the main facts and details the source document presents.
-2. Read the generated response and compare the generated response to the article. Check if the generated response contains and factual errors that were not supported by the source document. 
+2. Read the generated response and compare the generated response to the source document. Check if the generated response contains and factual errors that were not included in the source document. 
 3. Assign a score for consistency based on a scale of 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """
 
@@ -315,4 +332,26 @@ Fluency(1-3): The quality of the generated response in terms of grammar, spellin
 
 FLUENCY_SCORE_STEPS = """
 Read the generated response and evaluate the generated response's fluency on a scale from 1 to 3, where 1 is the lowest and 3 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 5: Tone
+
+TONE_SCORE_CRITERIA = """
+Tone(1-5): The tone or emotional quality of the generated response compared to the tone of the source document.
+A matching tone matches the personality, emotions, and intensions of the both the generated response and the source document.
+"""
+
+TONE_SCORE_STEPS = """
+Read the generated response and evaluate the generated response's tone on a scale from 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
+"""
+
+# Metric 6: Style
+STYLE_SCORE_CRITERIA = """
+Style(1-5): The style of writing of the generated response's style of writing compared to the style of writing of the source document.
+Matching style of writing matches in terms of phrasing, figurative language, sentence structure, vocabulary, idioms, slang, rhythm and pacing. 
+This criteria has an emphasis of attention on the structure and flow of writing.
+"""
+
+STYLE_SCORE_STEPS = """
+Read the generated response and evaluate the generated response's style of writing on a scale from 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """

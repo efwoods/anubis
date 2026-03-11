@@ -1,4 +1,4 @@
-
+.env.test
 uv.lock
 **/.bak/**
 **.ipynb

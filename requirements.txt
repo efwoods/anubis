@@ -1,5 +1,6 @@
 # Langchain
 langgraph
+langgraph-checkpoing-postgres
 langsmith
 langchain
 langchain-community

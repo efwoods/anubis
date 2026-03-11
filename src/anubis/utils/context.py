@@ -164,6 +164,11 @@ class GlobalContext:
         metadata={"description": "Name of the model with image capabilities. Assumes base url, and api key matches the 'model' variable (text model)."}
     )
 
+    deployment: str = field(
+        default= None,
+        metadata={"description": "True for langsmith deployments to use autoconfiguration of store; disables functionality of api yet allows the graph to run for deployments."}
+    )
+
 
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""

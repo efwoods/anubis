@@ -61,6 +61,15 @@ async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg]):
     return Command(update=update)
 
 
+@tool("test_update_second")
+async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg]):
+    """ Test update system message """
+    
+    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=runtime.tool_call_id)]}
+
+    return Command(update=update)
+
+
 class SignificantFactAndContext(BaseModel):
     """
     Extract Facts about the ASSISTANT and the context of that fact given the history of messages.

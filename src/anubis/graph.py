@@ -236,14 +236,13 @@ async def process_thoughts(state: GlobalState, config: RunnableConfig, runtime:R
                 logger.warning(f"tool_call: {tool_call}")
                 tool_call["args"].update({"runtime":tool_runtime})
 
-                thought = await tool.ainvoke(tool_call['args'], runtime=tool_runtime)
-                thoughts.append(thought)
                 logger.info("process_thoughts breakpoint")
-
-    return "load_consciousness"
-
-
-
+                thought = await tool.ainvoke(tool_call['args'], runtime=tool_runtime)
+                return thought
+                # thoughts.append(thought)
+    if len(message.tool_calls) == 0:
+        return Command(goto="load_consciousness")
+    # return thoughts
 
 async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""

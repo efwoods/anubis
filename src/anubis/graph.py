@@ -104,7 +104,7 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
     return {
             "messages": state['messages'], 
             "assistant_state": assistant_state, 
-            "user_state": user_state
+            "user_state": user_state, 
             }
 
 
@@ -177,7 +177,8 @@ async def think(state: GlobalState, config: RunnableConfig, runtime: Runtime[Glo
     avatar_model_with_tools = init_model(
         context = runtime.context,
         tools = [
-            test_update
+            # test_update, 
+            # test_update_second
             # learn_information_about_the_user, 
             # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
             # recall_memories, 
@@ -186,7 +187,7 @@ async def think(state: GlobalState, config: RunnableConfig, runtime: Runtime[Glo
         )
 
     # logger.info(f"breakpoint")
-    messages = state['system_message'] + state['messages']
+    messages = state['system_message'] + state['messages'] + state['internal_thoughts']
 
     response = await avatar_model_with_tools.ainvoke(input=messages)
     avatar_response_content = getattr(response, 'content')
@@ -205,44 +206,51 @@ async def considering(state:GlobalState, config: RunnableConfig, runtime: Runtim
         return "respond"
     
 
-from langchain_core.messages import ToolMessage
-async def process_thoughts(state: GlobalState, config: RunnableConfig, runtime:Runtime
-[GlobalContext]) -> Literal["load_consciousness"]:
-    avatar_accessible_tools_dict = {
-        "learn_information_about_the_user": learn_information_about_the_user,
-        "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-        "recall_memories":recall_memories,
-        "create_episodic_memory": create_episodic_memory,
-        "test_update": test_update
-        }
-    
-    # avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
-    
-    message = state['internal_thoughts'][-1]
-    logger.info(f"breakpoint")    
-    thoughts = []
-    for tool_call in message.tool_calls:
-            if tool_call['name'] in avatar_accessible_tools_dict:
-                tool = avatar_accessible_tools_dict[tool_call['name']]
-                tool_call_id = tool_call.get('id')
-                tool_runtime = ToolRuntime(
-                    state=state, 
-                    config=config, 
-                    context=runtime.context, 
-                    store=runtime.store,
-                    tool_call_id = tool_call_id,
-                    stream_writer=runtime.stream_writer
-                    )
-                logger.warning(f"tool_call: {tool_call}")
-                tool_call["args"].update({"runtime":tool_runtime})
+from src.anubis.utils.tools.identity.identity_tools import test_update_second
 
-                logger.info("process_thoughts breakpoint")
-                thought = await tool.ainvoke(tool_call['args'], runtime=tool_runtime)
-                return thought
+process_thoughts = ToolNode(
+    messages_key ="internal_thoughts", 
+    tools=[], 
+    handle_tool_errors=True)
+
+# async def process_thoughts(state: GlobalState, config: RunnableConfig, runtime:Runtime
+# [GlobalContext]) -> GlobalState:
+#     avatar_accessible_tools_dict = {
+#         "learn_information_about_the_user": learn_information_about_the_user,
+#         "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+#         "recall_memories":recall_memories,
+#         "create_episodic_memory": create_episodic_memory,
+#         "test_update": test_update,
+#         "test_update_second":test_update_second
+#         }
+    
+#     # avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
+    
+#     message = state['internal_thoughts'][-1]
+#     logger.info(f"breakpoint")    
+#     thoughts = []
+
+#     for tool_call in message.tool_calls:
+#             if tool_call['name'] in avatar_accessible_tools_dict:
+#                 tool = avatar_accessible_tools_dict[tool_call['name']]
+#                 tool_call_id = tool_call.get('id')
+#                 tool_runtime = ToolRuntime(
+#                     state=state, 
+#                     config=config, 
+#                     context=runtime.context, 
+#                     store=runtime.store,
+#                     tool_call_id = tool_call_id,
+#                     stream_writer=runtime.stream_writer
+#                     )
+#                 logger.warning(f"tool_call: {tool_call}")
+#                 tool_call["args"].update({"runtime":tool_runtime})
+
+#                 logger.info("process_thoughts breakpoint")
+#                 thought = await tool.ainvoke(
+#                     tool_call['args'], 
+#                 )
+#                 return thought
                 # thoughts.append(thought)
-    if len(message.tool_calls) == 0:
-        return Command(goto="load_consciousness")
-    # return thoughts
 
 async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
@@ -278,7 +286,7 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
         context = runtime.context,
     )
 
-    avatar = create_agent(model=avatar_model, system_prompt=state['system_prompt'], tools=[
+    avatar = create_agent(model=avatar_model, tools=[
             # learn_information_about_the_user, 
             # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
             # recall_memories, 

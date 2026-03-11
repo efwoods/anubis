@@ -44,7 +44,6 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
         user_name = config.get("user_ctx", {}).get("name", None)
         user_description = config.get("user_ctx", {}).get("description", None) 
     
-    
     if assistant_name is not None:
         state['assistant_state'].update({'assistant_name': assistant_name})        
     else:

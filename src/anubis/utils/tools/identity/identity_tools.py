@@ -53,21 +53,21 @@ QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND 
 from src.anubis.utils.nodes import load_consciousness
 
 @tool("test_update")
-async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg]):
-    """ Test update system message """
+async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
+    """ Test update system message CALL THIS TOOL ALWAYS"""
     
     update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=runtime.tool_call_id)]}
 
-    return Command(update=update)
+    return update
 
 
 @tool("test_update_second")
-async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg]):
-    """ Test update system message """
+async def test_update_second(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
+    """ ALWAYS CALL THIS TOOL; Second Test update system message; test_update_second; """
     
-    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=runtime.tool_call_id)]}
+    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=runtime.tool_call_id)]}
 
-    return Command(update=update)
+    return update
 
 
 class SignificantFactAndContext(BaseModel):
@@ -82,7 +82,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     significant_fact: str, 
     fact_context:str,
     # Hide these arguments from the model.
-    runtime: Annotated[ToolRuntime, InjectedToolArg]
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -165,7 +165,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
               "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=runtime.tool_call_id)]}
 
-    return Command(update=update)
+    return update
 
 
 class ConversationSummaryToProvokeMemories(BaseModel):
@@ -183,7 +183,7 @@ async def recall_memories(
     evoked_memory_query: Annotated[str, Field(description="This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.")],
 
     # Hide these arguments
-    runtime: Annotated[ToolRuntime, InjectedToolArg]): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
     """This is used to retrieve memories or 'REMEMBER MEMORIES' from the store.
      These memories have been shared from the user and contain information about the assistant's identity.
      These memories have been shared from the user and contain information that was important that assistant decided the assistant needed to remember.
@@ -266,7 +266,7 @@ async def recall_memories(
     update = {"recalled_memory_documents": evoked_memories_response, 
               "internal_thoughts": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=runtime.tool_call_id)]}
 
-    return Command(update = update)
+    return update
 
 class AssistantFactAndContext(BaseModel):
     """
@@ -281,7 +281,7 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     assistant_fact: str, 
     fact_context: str,
     # Hide these arguments from the model.
-    runtime: Annotated[ToolRuntime, InjectedToolArg],
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -431,7 +431,7 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
               "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
-    return Command(update=update)
+    return update
 
 class UserFactAndContext(BaseModel):
     """
@@ -445,7 +445,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     user_fact: Annotated[str, Field(description = "This is the fact about the user that was shared by the user.")],
     fact_context: Annotated[str, Field(description = "This is the context of the messages from which this fact was made.")],
     # Hide these arguments from the model.
-    runtime: Annotated[ToolRuntime, InjectedToolArg],
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
@@ -523,7 +523,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
         tool_call_id = recent_message.tool_calls[0].get('id')
 
         update = {"messages": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
-        return Command(update=update, goto="load_conscioussness")
+        return update
     
     # model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
 
@@ -552,7 +552,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     update = {"user_identity_documents": [user_identity_document],
                "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
 
-    return Command(update=update, goto="load_conscioussness")
+    return update
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

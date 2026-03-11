@@ -106,7 +106,9 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     if isinstance(query, list):
         query = query[0]['text']
     
-    retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
+
+    assistant_memory_namespace = (user_id, assistant_id, "memory")
+    retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query)
 
 
     # Coerce into document objects from Search Items

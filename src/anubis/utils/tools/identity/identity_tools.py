@@ -55,19 +55,19 @@ from src.anubis.utils.nodes import load_consciousness
 @tool("test_update")
 async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
     """ Test update system message CALL THIS TOOL ALWAYS"""
-    
-    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=runtime.tool_call_id)]}
+    tool_call_id = runtime.tool_call_id
+    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=tool_call_id)]}
 
-    return update
+    return Command(update=update)
 
 
 @tool("test_update_second")
 async def test_update_second(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
     """ ALWAYS CALL THIS TOOL; Second Test update system message; test_update_second; """
-    
-    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=runtime.tool_call_id)]}
+    tool_call_id = runtime.tool_call_id
+    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=tool_call_id)]}
 
-    return update
+    return Command(update=update)
 
 
 class SignificantFactAndContext(BaseModel):
@@ -161,11 +161,11 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
         key=identity_id,
         value={"document": assistant_identity_memory_document_json},
     )
-
+    tool_call_id = runtime.tool_call_id
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=runtime.tool_call_id)]}
+              "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
-    return update
+    return Command(update = update)
 
 
 class ConversationSummaryToProvokeMemories(BaseModel):
@@ -263,10 +263,11 @@ async def recall_memories(
         query=evoked_memory_query
     )
 
+    tool_call_id = runtime.tool_call_id
     update = {"recalled_memory_documents": evoked_memories_response, 
-              "internal_thoughts": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=runtime.tool_call_id)]}
+              "internal_thoughts": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=tool_call_id)]}
 
-    return update
+    return Command(update=update)
 
 class AssistantFactAndContext(BaseModel):
     """
@@ -353,7 +354,7 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
     
     logger.info(f"learn_information about user breakpoint")
-
+ 
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
@@ -361,17 +362,19 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     # Memory of the Identity of the assistant presented as text from the user.
     assistant_memory_namespace = (user_id, assistant_id, 'memory')
 
-    # VERIFY FACT DOES NOT ALREADY EXIST
-    if runtime.state.get('assistant_identity_documents', None) is not None:
-        assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['assistant_identity_documents']]
+    # VERIFY FACT DOES NOT ALREADY EXIST in memories
+    if runtime.state.get('recalled_memory_documents', None) is not None:
+        assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['recalled_memory_documents']]
         assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=assistant_fact)
         assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
         if assistant_fact in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
             # Fact already exists:
-            recent_message = runtime.state['internal_thoughts'][-1]
-            tool_call_id = recent_message.tool_calls[0].get('id')
-            update = {"internal_thoughts": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=runtime.tool_call_id)]}
+            tool_call_id = runtime.tool_call_id
+        
+            update = {"internal_thoughts": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=tool_call_id)]}
             return Command(update = update)
+
+    # if runtime.state.get('assistant_identity_documents', None) is not None:
 
     # model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
 
@@ -427,11 +430,11 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         value={"document": assistant_identity_memory_document_json},
     )
 
-    logger.warning(f"tool_call_id: {tool_call_id}")
+    tool_call_id = runtime.tool_call_id
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
               "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
-    return update
+    return Command(update=update)
 
 class UserFactAndContext(BaseModel):
     """
@@ -519,11 +522,11 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     user_content_store_query_results_significant = [item for item in user_content_store_query_results if item.score > 0.8]
     if user_fact in user_identity_documents_text_list or len(user_content_store_query_results_significant) > 0:
         # Fact already exists:
-        recent_message = runtime.state['internal_thoughts'][-1]
-        tool_call_id = recent_message.tool_calls[0].get('id')
 
-        update = {"messages": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
-        return update
+        tool_call_id = runtime.tool_call_id
+
+        update = {"internal_thoughts": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
+        return Command(update=update)
     
     # model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
 
@@ -547,12 +550,11 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
         key=identity_id,
         value={"document": user_identity_document_json},
     )
-    recent_message = runtime.state['internal_thoughts'][-1]
-    tool_call_id = recent_message.tool_calls[0].get('id')
+    tool_call_id = runtime.tool_call_id
     update = {"user_identity_documents": [user_identity_document],
-               "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
+               "internal_thoughts": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
 
-    return update
+    return Command(update=update)
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

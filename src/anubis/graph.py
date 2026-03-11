@@ -55,6 +55,11 @@ from pydantic import Field
 
 from src.anubis.utils.nodes import load_consciousness
 
+
+from src.anubis.utils.utility import (
+    reduce_docs, 
+)
+
 from src.anubis.utils.tools.identity.identity_tools import (
     learn_information_about_the_user, 
     learn_information_about_yourself_through_text_from_the_user_as_a_memory,
@@ -67,9 +72,17 @@ from src.anubis.utils.tools.identity.identity_tools import (
     create_episodic_memory
 )
 
-from src.anubis.utils.utility import (
-    reduce_docs, 
-)
+identity_tools = [
+    learn_information_about_the_user, 
+    learn_information_about_yourself_through_text_from_the_user_as_a_memory,
+    # learn_information_about_yourself_through_images,
+    # learn_information_about_yourself_through_tweets,
+    # learn_information_about_yourself_through_youtube_videos,
+    # learn_new_facts,
+    # retrieve_knowledge,
+    recall_memories,    
+    create_episodic_memory
+]
 
 from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 
@@ -176,14 +189,7 @@ async def think(state: GlobalState, config: RunnableConfig, runtime: Runtime[Glo
     # model invocation
     avatar_model_with_tools = init_model(
         context = runtime.context,
-        tools = [
-            # test_update, 
-            # test_update_second
-            # learn_information_about_the_user, 
-            # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-            # recall_memories, 
-            # create_episodic_memory,
-            ], 
+        tools = identity_tools, 
         )
 
     # logger.info(f"breakpoint")
@@ -193,6 +199,12 @@ async def think(state: GlobalState, config: RunnableConfig, runtime: Runtime[Glo
     avatar_response_content = getattr(response, 'content')
     logger.info(f"Avatar Model Response: {avatar_response_content}")
     return {"internal_thoughts":[response]}
+
+process_thoughts = ToolNode(
+    messages_key ="internal_thoughts", 
+    tools=identity_tools, 
+    handle_tool_errors=True)
+
 
 
 from langchain.tools import ToolRuntime
@@ -206,12 +218,6 @@ async def considering(state:GlobalState, config: RunnableConfig, runtime: Runtim
         return "respond"
     
 
-from src.anubis.utils.tools.identity.identity_tools import test_update_second
-
-process_thoughts = ToolNode(
-    messages_key ="internal_thoughts", 
-    tools=[], 
-    handle_tool_errors=True)
 
 # async def process_thoughts(state: GlobalState, config: RunnableConfig, runtime:Runtime
 # [GlobalContext]) -> GlobalState:
@@ -257,31 +263,6 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
 
     """ CREATE MODEL """
 
-    # model invocation
-    # avatar_model_with_tools = init_model(
-    #     context = runtime.context,
-    #     tools = [
-    #         # learn_information_about_the_user, 
-    #         # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-    #         # recall_memories, 
-    #         # create_episodic_memory,
-    #         ], 
-    #     )
-
-    # logger.info(f"breakpoint")
-    # messages = state['messages']
-    
-    # if isinstance(messages[0], SystemMessage):
-    #     messages[0].content = state['system_message']
-    # else:
-    #     messages = [SystemMessage(content = state['system_message'])] + messages
-
-    # response = await avatar_model_with_tools.ainvoke(input=messages)
-    # avatar_response_content = getattr(response, 'content')
-    # logger.info(f"Avatar Model Response: {avatar_response_content}")
-    # return {"messages":[response]}
-
-    # agent invocation
     avatar_model = init_model(
         context = runtime.context,
     )
@@ -303,8 +284,7 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
     result = {"messages": [avatar_response]}
 
     return result
-    # if len(avatar_response.tool_calls) == 0:
-    #     return Command(update = result, goto="__end__")
+
 # async def evaluate_response_quality()
     
 # async def update_response_metadata()
@@ -332,9 +312,6 @@ anubis_workflow = StateGraph(
 
 # workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
 
-# workflow.add_node("update_identity_tool_classification", update_identity_tool_classification)
-# workflow.add_node("update_identity_tools", update_identity_tools)
-
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("think", think)
 anubis_workflow.add_node("process_thoughts", process_thoughts)
@@ -355,9 +332,6 @@ anubis_workflow.add_edge("process_thoughts", "load_consciousness")
 anubis_workflow.add_edge("respond", END)
 
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
-
-# workflow.add_conditional_edges("update_identity_tool_classification", update_identity_tool_condition, {"update_identity_tools": "update_identity_tools", "load_consciousness":"load_consciousness"})
-# workflow.add_edge("update_identity_tools", "update_identity_tool_classification")
 
 
 # COERCION

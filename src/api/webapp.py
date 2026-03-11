@@ -10,6 +10,7 @@ import httpx
 from datetime import datetime, timezone
 from langchain_core.messages import HumanMessage
 from src.anubis.utils.context import GlobalContext
+from psycopg_pool import AsyncConnectionPool
 
 import logging
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Preload audio to text processor [this needs a startup in a lifecycle call]
  
 from contextlib import asynccontextmanager
+from langgraph.store.postgres import AsyncPostgresStore
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,6 +29,27 @@ async def lifespan(app: FastAPI):
 
     # Initialize context / context
     app.state.context = GlobalContext()
+    async_postgres_store_uri = app.state.context.async_postgres_store_uri
+    pool = AsyncConnectionPool(
+        conninfo=async_postgres_store_uri,
+        max_size=20,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+        open=False,  # don't open on construction
+    )
+
+    await pool.open()
+    try:
+        store = AsyncPostgresStore(pool)
+        await store.setup()
+        logger.info("Store setup complete")
+
+        app.state.store = store
+        app.state.graph = message_workflow.compile(store=store)
+        logger.info("Application startup: lifecycle complete")
+
+        yield
+    finally:
+        await pool.close()
     logger.info("Application startup: lifecycle...")
     # for direct db connections for efficient processing
     logger.info("Application startup: pre-create engine...")
@@ -37,7 +60,6 @@ async def lifespan(app: FastAPI):
     logger.info("Application startup: post-create async session...")
     # app.state.db_session = async_session
     # logger.info(app.state.db_session)
-    yield 
     # await engine.dispose()
     # Langgraph SDK extension 
     # app.state.db_session = async_session
@@ -79,18 +101,27 @@ app = FastAPI(
 )
 
 
+from src.anubis.graph import graph, message_workflow
 
+# shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
+# test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
 @app.get("/hello")
 async def test_hello_world():
     
-    # config = {
-    #         "configurable": {
-    #             "user_ctx": {"user_id":"Anubs_from_studio_3cf764e9-51c3-5404-9699-e16f5e4034ec"},
-    #             "assistant_ctx": {
-    #                 "user_id":"Anubs_from_studio_3cf764e9-51c3-5404-9699-e16f5e4034ec",
-    #                 "assistant_id":"3cf764e9-51c3-5404-9699-e16f5e4034ec"}
-    #         }
-    #     }
+    config = {
+            "configurable": {
+                "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
+                "assistant_ctx": {
+                    "name":"Shivon Zilis",
+                    "description":"Director of Operations at Neuralink"},
+                "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
+                "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
+            }
+        }
+    
+    logger.info("breakpoint")
+    store = app.state.store
+    graph = app.state.graph
     
     # system_time = datetime.now(tz=timezone.utc).isoformat
     # content = [{"type":"text", "text": system_time}]
@@ -98,6 +129,11 @@ async def test_hello_world():
     # # store = make_pg_store()
 
     # result = await url_loading_graph.ainvoke(input, config=config)
+
+    
+    response = await graph.ainvoke(input={"messages":[HumanMessage(content="test message")]}, config = config )
+    logger.info(f"{response}")
+
     logger.info(f"HELLO WORLD ENTRY")
     return {"Hello": "okay"}
 

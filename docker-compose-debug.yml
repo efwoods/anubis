@@ -36,8 +36,8 @@ services:
     langgraph-api:
         ports:
             - "8123:8000"
-            - "5687:5687"
-        command: uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload 
+            - "5678:5678"
+        command: uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload
         depends_on:
             langgraph-redis:
                 condition: service_healthy

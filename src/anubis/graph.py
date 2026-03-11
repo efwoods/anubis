@@ -80,17 +80,17 @@ from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 """ NODES """
 
 async def message_interface(state:MessagesState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> GlobalState:
-    logger.info(f"state:{state}")
-    logger.info(f"config:{config}")
-    logger.info(f"runtime:{runtime}")
-    logger.info(f"runtime.store:{runtime.store}")
-    logger.info(f"runtime.context: {runtime.context}")
+    # logger.info(f"state:{state}")
+    # logger.info(f"config:{config}")
+    # logger.info(f"runtime:{runtime}")
+    # logger.info(f"runtime.store:{runtime.store}")
+    # logger.info(f"runtime.context: {runtime.context}")
 
-    logger.info(f"assistant_id:{config['configurable']['assistant_id']}")
-    logger.info(f"configurable:{config['configurable']['langgraph_auth_user_id']}")
-    logger.info(f"configurable:{config['configurable']}")
-    logger.info(f"THIS IS AN UPDATE")
-    logger.info(f"THIS IS ANOTHER UPDATE")
+    # logger.info(f"assistant_id:{config['configurable']['assistant_id']}")
+    # logger.info(f"configurable:{config['configurable']['langgraph_auth_user_id']}")
+    # logger.info(f"configurable:{config['configurable']}")
+    # logger.info(f"THIS IS AN UPDATE")
+    # logger.info(f"THIS IS ANOTHER UPDATE")
 
     assistant_state = {}
     user_state = {}
@@ -171,22 +171,30 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     # Update Name and Description of User and Assistant if provided in the context
     logger.info(f"conscioussness breakpoint")
+    if getattr(runtime, "context"):
+        if (isinstance(runtime.context.assistant_ctx, AssistantContext)):
+            assistant_name = getattr(runtime.context.assistant_ctx, "name", None)
+            assistant_description = getattr(runtime.context.assistant_ctx, "description", None)
+        else:
+            assert(type(runtime.context.assistant_ctx) is dict)
+            assistant_name = runtime.context.assistant_ctx.get("name", None)
+            assistant_description = runtime.context.assistant_ctx.get("description", None)
 
-    if (isinstance(runtime.context.assistant_ctx, AssistantContext)):
-        assistant_name = getattr(runtime.context.assistant_ctx, "name", None)
-        assistant_description = getattr(runtime.context.assistant_ctx, "description", None)
+        if (isinstance(runtime.context.user_ctx, UserContext)):
+            user_name = getattr(runtime.context.user_ctx, "name", None)
+            user_description = getattr(runtime.context.user_ctx, "description", None)
+        else:
+            assert(type(runtime.context.user_ctx) is dict)
+            user_name = runtime.context.user_ctx.get("name", None)
+            user_description = runtime.context.user_ctx.get("description", None) 
     else:
-        assert(type(runtime.context.assistant_ctx) is dict)
-        assistant_name = runtime.context.assistant_ctx.get("name", None)
-        assistant_description = runtime.context.assistant_ctx.get("description", None)
-
-    if (isinstance(runtime.context.user_ctx, UserContext)):
-        user_name = getattr(runtime.context.user_ctx, "name", None)
-        user_description = getattr(runtime.context.user_ctx, "description", None)
-    else:
-        assert(type(runtime.context.user_ctx) is dict)
-        user_name = runtime.context.user_ctx.get("name", None)
-        user_description = runtime.context.user_ctx.get("description", None)  
+        assert(type(config.get("assistant_ctx", {}) is dict))
+        assistant_name = config.get("assistant_ctx", {}).get("name", None)
+        assistant_description = config.get("assistant_ctx", {}).get("description", None)
+        
+        assert(type(config.get("user_ctx", {}) is dict))
+        user_name = config.get("user_ctx", {}).get("name", None)
+        user_description = config.get("user_ctx", {}).get("description", None) 
     
     
     if assistant_name is not None:
@@ -213,6 +221,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     if user_description is not None:
         state['user_state'].update({"user_description": user_description})        
 
+    """ Load User Identity documents """
 
     if state['user_identity_documents'] is None or len(state['user_identity_documents']) == 0:
         user_identity_namespace = (assistant_id, user_id, "identity")
@@ -224,6 +233,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     else:
         user_identity = state['user_identity_documents']
 
+    """ Load Assistant Identity documents """
 
     if state['assistant_identity_documents'] is None or len(state['assistant_identity_documents']) == 0:
         assistant_identity_namespace = (user_id, assistant_id, "identity")
@@ -243,8 +253,11 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     # if len(retrieved_memories) == 0:
     #     retrieved_memories = None
 
+    """ Retrieve memories """
 
     query = state['messages'][-1].content
+    if isinstance(query, list):
+        query = query[0]['text']
     
     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
 
@@ -267,21 +280,25 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     logger.info("breakpoint")
 
+    """ Retrieve Direct Quotes """
 
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
-    query = state['messages'][-1].content
+
     direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
     logger.info(f"direct_quote_items: {direct_quote_items}")
 
     direct_quotes = reduce_docs([], direct_quote_items)
+
+    """ Retrieve Documents """
 
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
     retrieved_knowledge_items = await runtime.store.asearch((user_id, assistant_id, 'document'), query=query)
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
-    # Search your feelings
+    """ Retrieve Emotions """
+
     # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt 
     from src.anubis.utils.state import EmotionSummarization
 
@@ -321,6 +338,8 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     # user_identity = state['user_state'].get('user_identity', [])
     user_name = state['user_state'].get('user_name','')
 
+    """ Create System Prompt """
+
     populated_identity_template = prompt_builder.build_prompt(
         assistant_name = assistant_name,
         assistant_description = assistant_description,
@@ -350,65 +369,60 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     return  input_update
 
-from src.anubis.utils.dataset.quality import evaluate
-
 async def invoke_agent(state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]):
     """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
 
     """ CREATE MODEL """
 
     # model invocation
-    avatar_model_with_tools = init_model(
-        context = runtime.context,
-        tools = [
-            # learn_information_about_the_user, 
-            # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-            # recall_memories, 
-            # create_episodic_memory,
-            ], 
-        )
+    # avatar_model_with_tools = init_model(
+    #     context = runtime.context,
+    #     tools = [
+    #         # learn_information_about_the_user, 
+    #         # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+    #         # recall_memories, 
+    #         # create_episodic_memory,
+    #         ], 
+    #     )
 
-    logger.info(f"breakpoint")
-    messages = state['messages']
+    # logger.info(f"breakpoint")
+    # messages = state['messages']
     
-    if isinstance(messages[0], SystemMessage):
-        messages[0].content = state['system_message']
-    else:
-        messages = [SystemMessage(content = state['system_message'])] + messages
+    # if isinstance(messages[0], SystemMessage):
+    #     messages[0].content = state['system_message']
+    # else:
+    #     messages = [SystemMessage(content = state['system_message'])] + messages
 
-    response = await avatar_model_with_tools.ainvoke(input=messages)
-    avatar_response_content = getattr(response, 'content')
-    logger.info(f"Avatar Model Response: {avatar_response_content}")
-    return {"messages":[response]}
+    # response = await avatar_model_with_tools.ainvoke(input=messages)
+    # avatar_response_content = getattr(response, 'content')
+    # logger.info(f"Avatar Model Response: {avatar_response_content}")
+    # return {"messages":[response]}
 
     # agent invocation
-    # avatar_model = init_model(
-    #     context = runtime.context,
-    # )
+    avatar_model = init_model(
+        context = runtime.context,
+    )
 
-    # avatar = create_agent(model=avatar_model, system_prompt=state['system_message'], tools=[
-    #         learn_information_about_the_user, 
-    #         learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-    #         recall_memories, 
-    #         create_episodic_memory
-    #         ],
-    #         state_schema=GlobalState,
-    #         )
+    avatar = create_agent(model=avatar_model, system_prompt=state['system_message'], tools=[
+            learn_information_about_the_user, 
+            learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+            recall_memories, 
+            create_episodic_memory
+            ],
+            state_schema=GlobalState,
+            )
 
-    # messages = state['messages']
-    # response = await avatar.ainvoke(input={"messages": messages})
-    # avatar_response = response.get("messages", [])[-1]
+    messages = state['messages']
+    response = await avatar.ainvoke(input={"messages": messages})
+    avatar_response = response.get("messages", [])[-1]
 
-    # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
-    # recall_memories()<|python_end|>
-    # result = {"messages": [avatar_response]}
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+    result = {"messages": [avatar_response]}
+
+    return result
     # if len(avatar_response.tool_calls) == 0:
     #     return Command(update = result, goto="__end__")
- 
-avatar_accessible_tools = [learn_information_about_the_user, learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-                 recall_memories]
 
-from langchain_core.messages import ToolMessage
 from langchain.tools import ToolRuntime
 
 async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["avatar_tool_node", '__end__']:
@@ -422,10 +436,10 @@ async def avatar_tools_condition(state:GlobalState, config: RunnableConfig, runt
 from langgraph.types import StreamWriter
 async def avatar_tool_node(state: GlobalState, config: RunnableConfig, runtime:Runtime[GlobalContext]) -> Literal["load_consciousness"]:
     avatar_accessible_tools_dict = {
-        # "learn_information_about_the_user": learn_information_about_the_user,
-        # "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-        # "recall_memories":recall_memories,
-        # "create_episodic_memory": create_episodic_memory
+        "learn_information_about_the_user": learn_information_about_the_user,
+        "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+        "recall_memories":recall_memories,
+        "create_episodic_memory": create_episodic_memory
         }
     
     # avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
@@ -481,7 +495,7 @@ anubis_workflow = StateGraph(
 
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("respond", invoke_agent)
-anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
+# anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
 
@@ -492,10 +506,10 @@ anubis_workflow.add_node("avatar_tool_node", avatar_tool_node)
 anubis_workflow.add_edge(START, "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "respond")
 
-anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
+# anubis_workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tool_node':'avatar_tool_node', "__end__":"__end__"})
 
-anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
-# anubis_workflow.add_edge("respond", END)
+# anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
+anubis_workflow.add_edge("respond", END)
 
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
 

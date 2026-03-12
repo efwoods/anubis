@@ -558,39 +558,39 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM
-# from src.anubis.utils.helper_functions import download_transcript, parse_vtt
+from src.anubis.utils.utility import download_transcript, parse_vtt
 
-# @tool
-# def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
-#     """
-#     Use this tool when a user suggests there is a youtube link 
-#     or the link included in the message contains the word 'youtube'. 
-#     Use this to download the text from the link.
+@tool
+def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
+    """
+    Use this tool when a user suggests there is a youtube link 
+    or the link included in the message contains the word 'youtube'. 
+    Use this to download the text from the link.
 
 
-#     Args:
-#         url: YouTube video URL
-#         lang: Subtitle language code
-#         save_txt: If True, saves plain text transcript to disk
+    Args:
+        url: YouTube video URL
+        lang: Subtitle language code
+        save_txt: If True, saves plain text transcript to disk
 
-#     Returns:
-#         Transcript as a plain text string
-#     """
-#     print(f"Downloading subtitles for: {url}")
-#     vtt_path = download_transcript(url, lang=lang)
+    Returns:
+        Transcript as a plain text string
+    """
+    print(f"Downloading subtitles for: {url}")
+    vtt_path = download_transcript(url, lang=lang)
 
-#     print(f"Parsing: {vtt_path}")
-#     transcript = parse_vtt(vtt_path)
+    print(f"Parsing: {vtt_path}")
+    transcript = parse_vtt(vtt_path)
 
-#     if save_txt:
-#         txt_path = vtt_path.rsplit(".", 2)[0] + ".txt"
-#         with open(txt_path, "w", encoding="utf-8") as f:
-#             f.write(transcript)
-#         print(f"Transcript saved to: {txt_path}")
+    if save_txt:
+        txt_path = vtt_path.rsplit(".", 2)[0] + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(transcript)
+        print(f"Transcript saved to: {txt_path}")
 
-#     print(f"TRANSCRIPT: {transcript}")
+    print(f"TRANSCRIPT: {transcript}")
 
-#     return transcript
+    return transcript
 
 # TODO: IMAGE URL IDENTITY UPDATER
 

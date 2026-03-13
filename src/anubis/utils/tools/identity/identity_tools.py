@@ -603,45 +603,88 @@ from uuid import uuid4, uuid5, NAMESPACE_URL
 from langchain_unstructured import UnstructuredLoader
 from langchain_core.documents import Document
 
-# @tool
-# async def update_identity_via_text_content_url(url: str, runtime: ToolRuntime):
+@tool
+async def update_identity_via_text_content_url(
+    url: str, 
+    runtime: Annotated[ToolRuntime, InjectedToolArg]
+):
+    """This function is used to extract facts about a target individual from a website url. The website url contains only textual facts about this user.
+    <RESTRICTIONS>
+    NEVER use this tool when the url contains youtube.com or the type in the human message content is image_url.
+    </RESTRICTIONS>
+
+    <EXAMPLE>
+    https://www.lexfridman.com/
+    https://www.hubermanlab.com/about
+    </EXAMPLE>
+
+    <EXAMPLE>
+    This is information about you:    
+    https://www.lexfridman.com/
+    </EXAMPLE>
+
+    <EXAMPLE>
+    https://www.shivonzilis.com/
+    </EXAMPLE>
+
+    <INSTRUCTIONS>
+    This function is used to extract facts about a target individual from a website url. The website url contains only textual facts about this user.
+    </INSTRUCTIONS>
+
+    Args:
+        url (str): This is a url to a website.
+    """
+    # Extract 
+    user_id = runtime.config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
+    assistant_id = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
+    assistant_name = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_name", "")
+
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    user_id = updated_user_state.get("user_id")
+    assistant_id = updated_assistant_state.get("assistant_id")
+
+    model = init_model()
     
-#     # Extract 
-#     user_id = runtime.config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
-#     assistant_id = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
-#     assistant_name = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_name", "")
+    system_message = SystemMessage(content = FACT_FORMATTING_STRING_PROMPT.format(assistant_name=assistant_name))
+
+    filename = url
+    filename_uuid5 = uuid5(NAMESPACE_URL, url)
+ 
+    namespace = (user_id, assistant_id, "identity", filename_uuid5)
     
-#     model = ChatOpenAI(
-#         model_name = "Llama-4-Maverick-17B-128E-Instruct-FP8",
-#         base_url = "https://api.llama.com/compat/v1/",
-#         api_key = "LLM|2160921497745669|2M_zeRPt10hKzWlJw39C_P-UIHM",
-#         temperature = 0.1
-#     )
-#     system_message = SystemMessage(content = FACT_FORMATTING_STRING_PROMPT.format(assistant_name=assistant_name))
-
-#     filename = url
-#     filename_uuid5 = uuid5(NAMESPACE_URL, url)
-
-#     namespace = (user_id, assistant_id, "identity", filename_uuid5)
-    
-#     loader = UnstructuredLoader(web_url=url)
-#     docs = loader.load()
-
-#     total_number_of_documents = len(docs)
-#     number_of_documents_to_format = 5
-#     for index in range(0, total_number_of_documents, number_of_documents_to_format):
-#         retrieved_data = "\n\n".join([doc.page_content for doc in docs[index:index + number_of_documents_to_format]])
-#         human_message = HumanMessage(content=retrieved_data)
-#         messages = [system_message, human_message]
-#         extracted_response = await model.ainvoke(input=messages)
-#         extracted_response_document = Document(page_content=extracted_response)
-#         key = str(uuid4())
-#         extracted_response_document.metadata.update({"filename":filename, "user_id":user_id, "assistant_id": assistant_id, "filename_uuid5":filename_uuid5, "key":key})
-#         document_data_json = extracted_response_document.to_json()
-
-#         # Upload the document to the store
-#         await runtime.store.aput(namespace, key=key, value={"document":document_data_json})
-
-# TODO: IN-MESSAGE IDENTITY UPDATER (TEXT)
+    loader = UnstructuredLoader(web_url=url)
+    docs = loader.load()
+ 
+    total_number_of_documents = len(docs)
+    number_of_documents_to_format = 5
+    for index in range(0, total_number_of_documents, number_of_documents_to_format):
+        retrieved_data = "\n\n".join([doc.page_content for doc in docs[index:index + number_of_documents_to_format]])
+        human_message = HumanMessage(content=retrieved_data)
+        messages = [system_message, human_message]
+        extracted_response = await model.ainvoke(input=messages)
+        extracted_response_document = Document(page_content=extracted_response)
+        key = str(uuid4())
+        extracted_response_document.metadata.update({"filename":filename, "user_id":user_id, "assistant_id": assistant_id, "filename_uuid5":filename_uuid5, "id":key})
+        document_data_json = extracted_response_document.to_json()
+        # Upload the document to the store
+        await runtime.store.aput(namespace, key=key, value={"document":document_data_json})
 
 
+from src.anubis.utils.utility import image_to_text
+@tool
+async def update_identity_via_reference_image(message: HumanMessage, runtime: Annotated[ToolRuntime, InjectedToolArg]):
+    """ This tool is used when there is a single image in a message and the image is only of a single person. This will describe the image, store the image in base64 encoded format in the store, store the description in the identity namespace as a document, and return the document of the updated identity to update the list of assistant_identity_documents. The text description is moderated for content. """
+
+    content = getattr(message, "content")
+    for message in content:
+        if message.get("image_url", "") is not "":
+            image_url = message.get("image_url")
+    description = image_to_text(target_image_url=image_url)
+
+
+
+
+
+
+@tool
+async def update_identity_via_text_content_url(

@@ -256,6 +256,52 @@ async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
 
         return ai_context_item
 
+from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT
+from typing import Optional
+async def image_to_text(target_image_url: str, 
+                        reference_image_url: Optional[str] = None, 
+                        ):
+    """
+    Convert an image of a target to text.
+    Describe the target individual to the best of your ability. 
+    args:
+        target_image_url: base64 encoded string or a url to an image to describe.
+        reference_image_url (Optional[str]): base64 encoded string or a url to an image. 
+            Expected to only have a single individual. Used to identify the target to describe in the target image.
+    
+    Returns: 
+        description (str): This is the description of the target with respect to the individual. The description is of the target from the FIRST PERSON PERSPECTIVE.
+    """
+
+    if reference_image_url is not None:
+        if "." in reference_image_url:
+            # url
+            reference_message = {"type": "image_url", "image_url":{"url":reference_image_url}}
+        else:
+            # base 64 encoding
+            reference_message = {"type": "image_url", "image_url":{"url":f"data:image/jpeg;base64,{reference_image_url}"}}
+
+    if "." in target_image_url:
+        target_message = {"type": "image_url", "image_url": {"url":target_image_url}}
+    else:
+        target_message = {"type": "image_url", "image_url": {"url":f"data:image/jpeg;base64,{target_image_url}"}}
+
+    # Compile the message
+    content = [reference_message, target_message] if reference_image_url is not None else [target_message]
+    system_message = [SystemMessage(content=TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT)]
+    human_message = [{"role": "user", "content": content}]
+
+    messages = system_message + human_message
+
+    model = init_model()
+
+    response = await model.ainvoke(input=messages)
+
+    description  = response.content
+
+    return description 
+
+
 ############################  CHUNK LONG MESSAGES  #############################
 
 async def chunk_long_messages(human_message_list, configuration) -> list:

@@ -1,7 +1,5 @@
 # src/prompts/prompts.py
 
-# src/prompts/prompts.py
-
 IDENTITY_SYSTEM_PROMPT_TEMPLATE = """
 <INSTRUCTIONS>
 You are embodying a specific identity. 
@@ -133,8 +131,6 @@ CREATE A RESPONSE IN YOUR TONE OF VOICE AND SYTLE OF WRITING GIVEN EXAMPLES OF Y
 </INSTRUCTIONS>
 """ 
 
-
-
 TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS = """
 <Role>
 Your role is to analyze and classify text with respect to the situation of the content within the text.
@@ -240,6 +236,15 @@ Include ALL facts about the target {assistant_name}.
 """
 
 TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT = """
+<Instructions>
+    Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
+    Return only the description of the person using the FIRST PERSON PERSPECTIVE.
+    Do not mention that this is an image. 
+    Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE.
+    Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
+    Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
+</Instructions>
+
 <Instructions>
     Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
     Return only the description of the person using the FIRST PERSON PERSPECTIVE.

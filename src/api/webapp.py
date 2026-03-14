@@ -32,9 +32,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize context / context
     app.state.context = GlobalContext()
-    async_postgres_store_uri = app.state.context.async_postgres_store_uri
-    logger.warning(f"app.state.context.dev: {app.state.context.dev}")
     if app.state.context.deployment == 'FALSE':
+        async_postgres_store_uri = app.state.context.async_postgres_store_uri
+        logger.warning(f"app.state.context.dev: {app.state.context.dev}")
         if app.state.context.dev == "FALSE":
             pool = AsyncConnectionPool(
                 conninfo=async_postgres_store_uri,

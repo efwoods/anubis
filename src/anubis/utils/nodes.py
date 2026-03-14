@@ -102,17 +102,18 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     """ Retrieve memories """
 
-    query = state['messages'][-1].content
-    if isinstance(query, list):
-        query = query[0]['text']
+    if len(state['messages']) > 0:
+        query = state['messages'][-1].content
+        if isinstance(query, list):
+            query = query[0]['text']
     
 
-    assistant_memory_namespace = (user_id, assistant_id, "memory")
-    retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query)
+        assistant_memory_namespace = (user_id, assistant_id, "memory")
+        retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query)
 
 
-    # Coerce into document objects from Search Items
-    retrieved_memories = reduce_docs([], retrieved_memories_items)
+        # Coerce into document objects from Search Items
+        retrieved_memories = reduce_docs([], retrieved_memories_items)
 
 
     # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
@@ -133,18 +134,18 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
+    if len(state['messages']) > 0:
+        direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
+        logger.info(f"direct_quote_items: {direct_quote_items}")
 
-    direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
-    logger.info(f"direct_quote_items: {direct_quote_items}")
+        direct_quotes = reduce_docs([], direct_quote_items)
 
-    direct_quotes = reduce_docs([], direct_quote_items)
+        """ Retrieve Documents """
 
-    """ Retrieve Documents """
-
-    # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
-    retrieved_knowledge_items = await runtime.store.asearch((user_id, assistant_id, 'document'), query=query)
-    logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
-    retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
+        # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
+        retrieved_knowledge_items = await runtime.store.asearch((user_id, assistant_id, 'document'), query=query)
+        logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
+        retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
     """ Retrieve Emotions """
 

@@ -37,7 +37,7 @@ def init_model(configuration: GlobalConfiguration,
 
     model_name = configuration.model
     base_url = configuration.llama_api_base_url
-    api_key = configuration.llama_api_key
+    api_id = configuration.llama_api_id
     dev = configuration.dev
 
     logger.info(f"dev: {dev}")
@@ -52,14 +52,14 @@ def init_model(configuration: GlobalConfiguration,
                     model = model_name,
                     base_url = base_url,
                     temperature=0.1,
-                    api_key = api_key,
+                    api_id = api_id,
                 ).bind_tools(tools=tools)
     else: 
         model = ChatOpenAI(
             model = model_name,
             base_url = base_url,
             temperature=0.1,
-            api_key = api_key,
+            api_id = api_id,
         ).bind_tools(tools=tools)
         model = model.with_structured_output(response_format)
     # else: 
@@ -101,8 +101,8 @@ async def process_uploaded_files_and_label_media_type(
 
     # logger.info("STORE ACCESS TESTING")
     # namespace = ("evan")
-    # await store.aput(namespace=namespace, key="evan", value={"name": "evan"})
-    # get_value = await store.aget("evan", key="name")
+    # await store.aput(namespace=namespace, id="evan", value={"name": "evan"})
+    # get_value = await store.aget("evan", id="name")
     # logger.info("get_value: {get_value}")
 
     
@@ -324,8 +324,8 @@ async def process_media_item_task(
     logger.info(f"Testing store access")
 
     # namespace = ("testing","document")
-    # await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
-    # testing_get = await store.aget(namespace=namespace, key="media")
+    # await store.aput(namespace=namespace, id="media", value={"media":media_item, "document":media_item['content']})
+    # testing_get = await store.aget(namespace=namespace, id="media")
     # testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
     # logger.info(f"testing_get: {testing_get}")
     # logger.info(f"get_value: {testing_search}")
@@ -355,7 +355,7 @@ async def process_media_item_task(
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                     namespace=(user_id, assistant_id, "reference_image")
                     document_json = document.to_json()
-                    await client.store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "document": document_json})
+                    await client.store.aput(namespace, id=assistant_id, value={"reference_image_data": image_data, "document": document_json})
                     
                 docs = [doc]
                 return docs
@@ -384,7 +384,7 @@ async def process_media_item_task(
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                     namespace=(user_id, assistant_id, "reference_image")
                     document_json = document.to_json()
-                    await client.store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "document": document_json})
+                    await client.store.aput(namespace, id=assistant_id, value={"reference_image_data": image_data, "document": document_json})
                     
                 docs = [doc]
                 return docs
@@ -486,13 +486,13 @@ async def process_media_item_task(
                     # BASELINE CODE BELOW
                     # make_pg_store 
                     # namespace = (user_id, assistant_id)
-                    # baseline_evaluation_quote_data = aget(namespace, key="baseline_evaluation_quote_data")
+                    # baseline_evaluation_quote_data = aget(namespace, id="baseline_evaluation_quote_data")
                     # metadata = baseline_evaluation_quote_data.metadata
                     # metadata_update = {"baseline_evaluation_quote_data": {"uuid4()":{"data": "unchunked direct_quote from media_item['content']", "metadata":{"created_at":"", "filename":"", "user_id":"", "assistant_id":""}}}} # also the structure of original metadata
                     # metadata.update(metadata_update)
                     # 
                     # update the metadata object with an overwrite
-                    # aput(namespace, key="baseline_evaluation_quote_data", value=metadata) # this extends the metadata dictionary
+                    # aput(namespace, id="baseline_evaluation_quote_data", value=metadata) # this extends the metadata dictionary
                     
                     # iterate through the uuid4's to pull the "data" and have all the orginal quote content for evaluation of AI responses.
 
@@ -606,7 +606,7 @@ async def process_media_item_task(
                 if reference_audio:
                     logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
                     namespace=(user_id, assistant_id, "reference_audio")
-                    await client.store.aput(namespace, key=assistant_id, value={"reference_audio_data": audio_data, "document": document.to_json()})                   
+                    await client.store.aput(namespace, id=assistant_id, value={"reference_audio_data": audio_data, "document": document.to_json()})                   
 
                 docs = [doc]
                 return docs
@@ -636,7 +636,7 @@ async def process_media_item_task(
                         page_content = doc.metadata.get("page_content", "")
                         metadata.update({"page_content":page_content})
 
-                        await client.store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
+                        await client.store.aput(namespace, id=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
 
                 docs = [doc]
                 return docs
@@ -686,7 +686,7 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
 
     # async with pg_store_manager as pg_store:
     #     namespace = (user_id, assistant_id)
-    #     reference_audio  = pg_store.aget(namespace=namespace, key="reference_audio")
+    #     reference_audio  = pg_store.aget(namespace=namespace, id="reference_audio")
     """
     {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
     """
@@ -896,7 +896,7 @@ import asyncio
 async def _put_with_retry(
     store,
     namespace: tuple,
-    key: str,
+    id: str,
     value: dict,
     max_retries: int = 2,
     retry_delay: float = 0.5,
@@ -905,25 +905,25 @@ async def _put_with_retry(
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
-            await store.put_item(list(namespace), key=key, value=value)
+            await store.put_item(list(namespace), id=id, value=value)
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
                 logger.warning(
-                    f"put_item failed for key={key}, namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
+                    f"put_item failed for id={id}, namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
                 )
                 await asyncio.sleep(retry_delay)
             else:
                 logger.error(
-                    f"put_item permanently failed for key={key}, namespace={namespace} after {max_retries + 1} attempts: {e}"
+                    f"put_item permanently failed for id={id}, namespace={namespace} after {max_retries + 1} attempts: {e}"
                 )
-                return {"success": False, "namespace":namespace, "key": key, "value":value}
-    return {"namespace": namespace, "key": key, "value": value, "error": str(last_exc), "success": True}
+                return {"success": False, "namespace":namespace, "id": id, "value":value}
+    return {"namespace": namespace, "id": id, "value": value, "error": str(last_exc), "success": True}
 
 async def _delete_with_retry(
     store,
     namespace: tuple,
-    key: str,
+    id: str,
     max_retries: int = 2,
     retry_delay: float = 0.5,
 ):
@@ -931,20 +931,20 @@ async def _delete_with_retry(
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
-            await store.delete_item(list(namespace), key=key)
+            await store.delete_item(list(namespace), id=id)
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
                 logger.warning(
-                    f"delete_item failed for key={key}, namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
+                    f"delete_item failed for id={id}, namespace={namespace} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {retry_delay}s..."
                 )
                 await asyncio.sleep(retry_delay)
             else:
                 logger.error(
-                    f"delete_item permanently failed for key={key}, namespace={namespace} after {max_retries + 1} attempts: {e}"
+                    f"delete_item permanently failed for id={id}, namespace={namespace} after {max_retries + 1} attempts: {e}"
                 )
-                return {"success": False, "namespace":namespace, "key": key}
-    return {"namespace": namespace, "key": key, "error": str(last_exc), "success":True}
+                return {"success": False, "namespace":namespace, "id": id}
+    return {"namespace": namespace, "id": id, "error": str(last_exc), "success":True}
 
 
 async def _search_with_retry(
@@ -993,7 +993,7 @@ async def batch_index_documents_vectorstore(
             if doc.metadata.get("filename") is not None
         ]
 
-        # Ensure each document has a unique key:
+        # Ensure each document has a unique id:
         _ = [
             doc.metadata.update({"document_id":str(uuid.uuid4())})
             for doc in 
@@ -1001,17 +1001,17 @@ async def batch_index_documents_vectorstore(
             if (doc.metadata.get("document_id") is None) or (type(doc.metadata.get("document_id", []) is not str))
         ]
 
-        # acquire keys
-        insert_document_keys = [
+        # acquire ids
+        insert_document_ids = [
             doc.metadata.get("document_id", "")
             for doc in 
             vectorstore_documents_to_be_indexed
         ]
 
         try:
-            assert len(insert_document_keys) == len(vectorstore_documents_to_be_indexed)  == len(filenames)
+            assert len(insert_document_ids) == len(vectorstore_documents_to_be_indexed)  == len(filenames)
         except Exception as e:
-            logger.warning(f"Assertion error: number of document keys, documents, and document filenames are not equal during document batch indexing:\n {e}")
+            logger.warning(f"Assertion error: number of document ids, documents, and document filenames are not equal during document batch indexing:\n {e}")
             
         
         # Upload the new documents into the vector store
@@ -1029,7 +1029,7 @@ async def batch_index_documents_vectorstore(
         # batch the document uploads
         if getattr(client.store, "abatch", None) is not None:
             # create upload batch
-            batch_put_ops = [PutOp(namespace=(user_id, assistant_id, "document", doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"page_content":doc.page_content, "metadata":doc.metadata}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
+            batch_put_ops = [PutOp(namespace=(user_id, assistant_id, "document", doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), id=id, value={"page_content":doc.page_content, "metadata":doc.metadata}) for id, doc in zip(insert_document_ids, vectorstore_documents_to_be_indexed)]
 
             total_documents_to_be_indexed = len(batch_put_ops)
 
@@ -1064,12 +1064,12 @@ async def batch_index_documents_vectorstore(
         else:
             # asyncio with put_item
             # create upload batch
-            batch_put_ops = [((user_id, assistant_id, "document", doc.metadata.get("filename_uuid5", f"{user_id}'_'{assistant_id}'_{str(uuid4())}_document_unknown_filename'")), key, {"page_content":doc.page_content, "metadata":doc.metadata}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
+            batch_put_ops = [((user_id, assistant_id, "document", doc.metadata.get("filename_uuid5", f"{user_id}'_'{assistant_id}'_{str(uuid4())}_document_unknown_filename'")), id, {"page_content":doc.page_content, "metadata":doc.metadata}) for id, doc in zip(insert_document_ids, vectorstore_documents_to_be_indexed)]
 
             total_documents_to_be_indexed = len(batch_put_ops)
 
             # delete previous filename chunks
-            # extract filename chunk keys
+            # extract filename chunk ids
             
             # extract the unique filenames
             filenames_uuid5_set = set([doc.metadata.get("filename_uuid5", "") for doc in vectorstore_documents_to_be_indexed])
@@ -1082,7 +1082,7 @@ async def batch_index_documents_vectorstore(
 
             all_batch_delete_ops = []
 
-            # create all namespace keys for each delete operation through batched searches
+            # create all namespace ids for each delete operation through batched searches
             for i in range (0, num_search_ops, BATCH_SIZE):
                 batch = batch_search_ops[i : i + BATCH_SIZE]
                 batch_num = (i // BATCH_SIZE) + 1
@@ -1099,12 +1099,12 @@ async def batch_index_documents_vectorstore(
                     *[_search_with_retry(client.store, namespace=namespace) for namespace in batch]
                 )
 
-                # extract the keys
+                # extract the ids
                 all_delete_ops = []
                 for search_result, namespace in zip (search_results, batch):
-                    delete_ops_namespace_keys = [(namespace, item.get("key", "")) for item in search_result.get("search_results", {}).get("items", []) if search_result.get("success", False) is not False]
+                    delete_ops_namespace_ids = [(namespace, item.get("id", "")) for item in search_result.get("search_results", {}).get("items", []) if search_result.get("success", False) is not False]
                     # collect delete operations for the search results
-                    all_delete_ops = all_delete_ops + delete_ops_namespace_keys
+                    all_delete_ops = all_delete_ops + delete_ops_namespace_ids
 
                 # collect delete operations for the batch
                 all_batch_delete_ops = all_batch_delete_ops + all_delete_ops
@@ -1137,7 +1137,7 @@ async def batch_index_documents_vectorstore(
 
                 # Search for documents
                 delete_results = await asyncio.gather(
-                    *[_delete_with_retry(client.store, namespace=batch_delete_op[0], key=batch_delete_op[1]) for batch_delete_op in batch]
+                    *[_delete_with_retry(client.store, namespace=batch_delete_op[0], id=batch_delete_op[1]) for batch_delete_op in batch]
                 )
 
                 batch_delete_errors = [delete_result for delete_result in delete_results if delete_result.get("success", False) is not False]
@@ -1160,7 +1160,7 @@ async def batch_index_documents_vectorstore(
                 batch_errors = []
 
                 results = await asyncio.gather(
-                    *[_put_with_retry(client.store, namespace=namespace, key=key, value=value) for namespace, key, value in batch]
+                    *[_put_with_retry(client.store, namespace=namespace, id=id, value=value) for namespace, id, value in batch]
                 )
                 
                 batch_errors = [result for result in results if result.get("success", True) is not True]
@@ -1276,7 +1276,7 @@ async def process_text_media_item_target_for_vectorstore(
     3. Creating Document objects with proper metadata for each chunk
     
     Args:
-        media_item: Dictionary containing text data with 'text' key
+        media_item: Dictionary containing text data with 'text' id
         user_id: User identifier for metadata
         assistant_id: Assistant identifier for metadata
         chunk_size: Maximum size of each text chunk (default: 500)

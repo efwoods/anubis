@@ -257,7 +257,7 @@ async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
         return ai_context_item
 
 from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT
-
+from typing import Optional
 async def image_to_text(target_image_url: str, 
                         reference_image_url: Optional[str] = None, 
                         ):

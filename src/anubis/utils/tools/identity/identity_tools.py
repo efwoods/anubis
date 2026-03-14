@@ -686,5 +686,5 @@ async def update_identity_via_reference_image(message: HumanMessage, runtime: An
 
 
 
-@tool
-async def update_identity_via_text_content_url(
+# @tool
+# async def update_identity_via_text_content_url(

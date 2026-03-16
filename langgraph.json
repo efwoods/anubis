@@ -11,7 +11,7 @@
       "fields": ["document.kwargs.page_content"]
     }
   },
-  "env": ".env.dev",
+  "env": ".env.test",
   "image_distro": "wolfi",
   "http": {
     "app": "./src/api/webapp.py:app"

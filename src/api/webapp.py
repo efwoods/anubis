@@ -94,22 +94,25 @@ async def test_hello_world():
         }
     
     logger.info("breakpoint")
-    store = app.state.store
-    graph = app.state.graph
-    
-    # system_time = datetime.now(tz=timezone.utc).isoformat
-    # content = [{"type":"text", "text": system_time}]
-    # input = {"messages": HumanMessage(content=content)}
-    # # store = make_pg_store()
+    if app.state.context.deployment == 'FALSE':
+        store = app.state.store
+        graph = app.state.graph
 
-    # result = await url_loading_graph.ainvoke(input, config=config)
+        # system_time = datetime.now(tz=timezone.utc).isoformat
+        # content = [{"type":"text", "text": system_time}]
+        # input = {"messages": HumanMessage(content=content)}
+        # # store = make_pg_store()
 
-    
-    response = await graph.ainvoke(input={"messages":[HumanMessage(content="test message")]}, config = config )
-    logger.info(f"{response}")
+        # result = await url_loading_graph.ainvoke(input, config=config)
 
-    logger.info(f"HELLO WORLD ENTRY")
-    return {"Hello": f"{response['messages'][-1].content}"}
+
+        response = await graph.ainvoke(input={"messages":[HumanMessage(content="test message")]}, config = config )
+        logger.info(f"{response}")
+
+        logger.info(f"HELLO WORLD ENTRY")
+        return {"Hello": f"{response['messages'][-1].content}"}
+    else:
+        return {"Hello": f"World"}
 
 # @app.post("/upload-media")
 # async def upload_media(

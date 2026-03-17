@@ -6,23 +6,17 @@
 [yt_video_to_audio_to_text dataset creation](https://github.com/efwoods/yt_summarizer)
 [llm_audio_transcription_pipeline](https://github.com/efwoods/voice-llm-transcription-pipeline-demo)
 [llm_adapter_testing](https://github.com/efwoods/adapter-testing)
+[TogetherAI]()
 
 # """ Quality """
-
 ## [Statistical Significance between input and output](https://claude.ai/chat/73b928d8-4c15-468d-a83d-2e4c472e9680)
-
 ## [Measuring Quality of Generated Response against the ground truth dataset](https://chatgpt.com/c/69aebfc6-1eb0-8327-814b-206d51b519be)
-
 ## [Evaluations](https://academy.langchain.com/courses/take/building-reliable-agents/multimedia/73116761-intro-the-agent-engineering-lifecycle)
 
-
 # """ Authentication """
-
 ## [Authentication](https://docs.langchain.com/langsmith/set-up-custom-auth#set-up-custom-authentication)
 
-
 # """ Features """ 
-
 ## [Live Voice](https://docs.langchain.com/oss/javascript/langchain/voice-agent#what-are-voice-agents)
 ## [API Extension](https://docs.langchain.com/langsmith/custom-routes#how-to-add-custom-routes)
 

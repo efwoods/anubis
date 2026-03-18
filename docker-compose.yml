@@ -34,6 +34,7 @@ services:
             start_interval: 1s
 
     langgraph-api:
+        image: evdev3/anubis:latest
         ports:
             - "8123:8000"
             - "5687:5687"
@@ -55,6 +56,6 @@ services:
             - .env
         volumes:
             - .:/deps/anubis
-        build:
-            context: .
-            dockerfile: Dockerfile
+        # build:
+            # context: .
+            # dockerfile: Dockerfile

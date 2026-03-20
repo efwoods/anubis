@@ -1,6 +1,6 @@
 # Langchain
 langgraph
-langgraph-checkpoing-postgres
+langgraph-checkpoint-postgres
 langsmith
 langchain
 langchain-community
@@ -19,6 +19,8 @@ beautifulsoup4
 
 fastapi
 python-multipart
+
+yt_dlp
 
 bert_score
 rouge

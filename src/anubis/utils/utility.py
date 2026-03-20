@@ -668,125 +668,125 @@ async def summarize_messages(
 
 
 """ YOUTUBE HELPER FUNCTIONS """
-# import yt_dlp
-# import os
-# import re
+import yt_dlp
+import os
+import re
 
 
-# def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: str = ".") -> str:
-#     """
-#     Download transcript/subtitles from a YouTube video.
+def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: str = ".") -> str:
+    """
+    Download transcript/subtitles from a YouTube video.
 
-#     Args:
-#         url: YouTube video URL
-#         lang: Language code (e.g., 'en', 'es', 'fr')
-#         auto_subs: Fall back to auto-generated subtitles if manual not found
-#         output_dir: Directory to save files
+    Args:
+        url: YouTube video URL
+        lang: Language code (e.g., 'en', 'es', 'fr')
+        auto_subs: Fall back to auto-generated subtitles if manual not found
+        output_dir: Directory to save files
 
-#     Returns:
-#         Path to the downloaded subtitle file
-#     """
-#     ydl_opts = {
-#         "skip_download": True,
-#         "writesubtitles": True,
-#         "writeautomaticsub": auto_subs,
-#         "subtitleslangs": [lang],
-#         "subtitlesformat": "vtt",
-#         "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
-#         "quiet": True,
-#         "no_warnings": False,
-#     }
+    Returns:
+        Path to the downloaded subtitle file
+    """
+    ydl_opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": auto_subs,
+        "subtitleslangs": [lang],
+        "subtitlesformat": "vtt",
+        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": False,
+    }
 
-#     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-#         info = ydl.extract_info(url, download=True)
-#         title = info.get("title", "video")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        title = info.get("title", "video")
 
-#     # Find the downloaded .vtt file
-#     for f in os.listdir(output_dir):
-#         if f.endswith(".vtt"):
-#             return os.path.join(output_dir, f)
+    # Find the downloaded .vtt file
+    for f in os.listdir(output_dir):
+        if f.endswith(".vtt"):
+            return os.path.join(output_dir, f)
 
-#     raise FileNotFoundError(f"No subtitle file found for '{title}'. "
-#                             "Try listing available languages first.")
-
-
-# def parse_vtt(vtt_path: str) -> str:
-#     """
-#     Parse a .vtt subtitle file into clean plain text.
-#     Removes timestamps, cue settings, and duplicate lines.
-#     """
-#     with open(vtt_path, "r", encoding="utf-8") as f:
-#         content = f.read()
-
-#     # Remove WEBVTT header and NOTE blocks
-#     content = re.sub(r"WEBVTT.*?\n\n", "", content, flags=re.DOTALL)
-#     content = re.sub(r"NOTE.*?\n\n", "", content, flags=re.DOTALL)
-
-#     lines = content.splitlines()
-#     clean_lines = []
-#     seen = set()
-
-#     for line in lines:
-#         line = line.strip()
-#         # Skip timestamps, cue IDs, and empty lines
-#         if not line or "-->" in line or re.match(r"^\d+$", line):
-#             continue
-#         # Remove inline tags like <00:00:01.000>, <c>, </c>
-#         line = re.sub(r"<[^>]+>", "", line)
-#         line = line.strip()
-#         # Deduplicate consecutive repeated lines (common in auto-subs)
-#         if line and line not in seen:
-#             clean_lines.append(line)
-#             seen.add(line)
-#         elif line in seen:
-#             seen = {line}  # reset window to allow repeated words in new context
-
-#     return " ".join(clean_lines)
+    raise FileNotFoundError(f"No subtitle file found for '{title}'. "
+                            "Try listing available languages first.")
 
 
-# def list_available_subtitles(url: str) -> dict:
-#     """List all available subtitle languages for a video."""
-#     ydl_opts = {"quiet": True, "skip_download": True}
+def parse_vtt(vtt_path: str) -> str:
+    """
+    Parse a .vtt subtitle file into clean plain text.
+    Removes timestamps, cue settings, and duplicate lines.
+    """
+    with open(vtt_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
-#     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-#         info = ydl.extract_info(url, download=False)
+    # Remove WEBVTT header and NOTE blocks
+    content = re.sub(r"WEBVTT.*?\n\n", "", content, flags=re.DOTALL)
+    content = re.sub(r"NOTE.*?\n\n", "", content, flags=re.DOTALL)
 
-#     manual = info.get("subtitles", {})
-#     auto = info.get("automatic_captions", {})
+    lines = content.splitlines()
+    clean_lines = []
+    seen = set()
 
-#     print(f"\nVideo: {info.get('title')}")
-#     print(f"Manual subtitles:    {list(manual.keys()) or 'None'}")
-#     print(f"Auto-generated subs: {list(auto.keys()) or 'None'}")
+    for line in lines:
+        line = line.strip()
+        # Skip timestamps, cue IDs, and empty lines
+        if not line or "-->" in line or re.match(r"^\d+$", line):
+            continue
+        # Remove inline tags like <00:00:01.000>, <c>, </c>
+        line = re.sub(r"<[^>]+>", "", line)
+        line = line.strip()
+        # Deduplicate consecutive repeated lines (common in auto-subs)
+        if line and line not in seen:
+            clean_lines.append(line)
+            seen.add(line)
+        elif line in seen:
+            seen = {line}  # reset window to allow repeated words in new context
 
-#     return {"manual": manual, "automatic": auto}
+    return " ".join(clean_lines)
 
 
-# # This needs to be in-memory rather than using file storage
-# def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
-#     """
-#     High-level function: download + parse transcript, return plain text.
+def list_available_subtitles(url: str) -> dict:
+    """List all available subtitle languages for a video."""
+    ydl_opts = {"quiet": True, "skip_download": True}
 
-#     Args:
-#         url: YouTube video URL
-#         lang: Subtitle language code
-#         save_txt: If True, saves plain text transcript to disk
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-#     Returns:
-#         Transcript as a plain text string
-#     """
-#     print(f"Downloading subtitles for: {url}")
-#     vtt_path = download_transcript(url, lang=lang)
+    manual = info.get("subtitles", {})
+    auto = info.get("automatic_captions", {})
 
-#     print(f"Parsing: {vtt_path}")
-#     transcript = parse_vtt(vtt_path)
+    print(f"\nVideo: {info.get('title')}")
+    print(f"Manual subtitles:    {list(manual.keys()) or 'None'}")
+    print(f"Auto-generated subs: {list(auto.keys()) or 'None'}")
 
-#     if save_txt:
-#         txt_path = vtt_path.rsplit(".", 2)[0] + ".txt"
-#         with open(txt_path, "w", encoding="utf-8") as f:
-#             f.write(transcript)
-#         print(f"Transcript saved to: {txt_path}")
+    return {"manual": manual, "automatic": auto}
 
-#     return transcript
+
+# This needs to be in-memory rather than using file storage
+def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
+    """
+    High-level function: download + parse transcript, return plain text.
+
+    Args:
+        url: YouTube video URL
+        lang: Subtitle language code
+        save_txt: If True, saves plain text transcript to disk
+
+    Returns:
+        Transcript as a plain text string
+    """
+    print(f"Downloading subtitles for: {url}")
+    vtt_path = download_transcript(url, lang=lang)
+
+    print(f"Parsing: {vtt_path}")
+    transcript = parse_vtt(vtt_path)
+
+    if save_txt:
+        txt_path = vtt_path.rsplit(".", 2)[0] + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(transcript)
+        print(f"Transcript saved to: {txt_path}")
+
+    return transcript
 
 
 # --- Example usage ---

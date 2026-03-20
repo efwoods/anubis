@@ -64,3 +64,11 @@ I'm still getting to know myself, and I don't have much information about my own
 - use cosine similarity of the evaluation index to identity the mean score of the generated response for each response
 - use the evaluation dataset with llm as a judge to evaluate the generated responses for the dataset
 - (future) self-avatar, each message can be used (stored as a message in a message run) for evaluation as above
+
+
+# Todo
+production redis & production pg db connection 
+vanity url
+upload bible 
+user accounts
+scalable api (kubernetes)

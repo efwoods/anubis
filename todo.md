@@ -67,8 +67,10 @@ I'm still getting to know myself, and I don't have much information about my own
 
 
 # Todo
-production redis & production pg db connection 
-vanity url
-upload bible 
+<!-- production redis & production pg db connection  -->
+upload bible
 user accounts
 scalable api (kubernetes)
+change redis and postgres (exposed credentials and expensive)
+vanity url
+ci-cd build and push to azure

@@ -1,11 +1,11 @@
 volumes:
     langgraph-data:
         driver: local
-
 services:
     langgraph-api:
+        image: evdev3/anubis-langgraph-api:latest
         ports:
-            - "8123:8000"
+            - "80:8000"
             - "5687:5687"
         environment:
             REDIS_URI: "rediss://:jgElK7rhZT34S56sGHh6XLF9XbEhw2ozNAzCaDYvhWA=@anubis-redis.redis.cache.windows.net:6380"
@@ -17,5 +17,3 @@ services:
             start_period: 10s
         env_file:
             - .env
-        volumes: 
-            - .:./deps/anubis

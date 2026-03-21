@@ -4,12 +4,12 @@ volumes:
 services:
     langgraph-api:
         image: evdev3/anubis-langgraph-api:latest
+        dns:
+            - 168.83.129.16
+            - 8.8.8.8
         ports:
-            - "80:8000"
+            - "8123:8000"
             - "5687:5687"
-        environment:
-            REDIS_URI: "rediss://:jgElK7rhZT34S56sGHh6XLF9XbEhw2ozNAzCaDYvhWA=@anubis-redis.redis.cache.windows.net:6380"
-            POSTGRES_URI: "postgres://pgadmin:datagatE33@anubis-pg.postgres.database.azure.com:5432/postgres?sslmode=require"
         healthcheck:
             test: python /api/healthcheck.py
             interval: 60s

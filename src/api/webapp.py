@@ -74,7 +74,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-
 from src.anubis.graph import graph, message_workflow
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
@@ -93,7 +92,7 @@ async def test_hello_world():
             }
         }
     
-    logger.info("breakpoint")
+    logger.warning("breakpoint")
     if app.state.context.deployment == 'FALSE':
         store = app.state.store
         graph = app.state.graph

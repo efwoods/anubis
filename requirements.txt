@@ -20,6 +20,8 @@ beautifulsoup4
 fastapi
 python-multipart
 
+yt_dlp
+
 bert_score
 rouge
 yt_dlp

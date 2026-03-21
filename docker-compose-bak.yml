@@ -14,7 +14,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "5432:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -34,8 +34,11 @@ services:
             start_interval: 1s
 
     langgraph-api:
+        image: evdev3/anubis:latest
         ports:
             - "8123:8000"
+            - "5687:5687"
+        command: uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload 
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -53,7 +56,6 @@ services:
             - .env
         volumes:
             - .:/deps/anubis
-        build:
-            context: .
-            dockerfile: Dockerfile
-
+        # build:
+            # context: .
+            # dockerfile: Dockerfile

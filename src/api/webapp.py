@@ -184,18 +184,6 @@ async def select_avatar(assistant_id: Optional[str] = None, assistant_name: Opti
 @app.get("/list_avatars")
 async def list_avatars():
 
-#     {
-#   "metadata": {},
-#   "graph_id": "Anubis",
-#   "name": "",
-#   "limit": 10,
-#   "offset": 0,
-#   "sort_by": "assistant_id",
-#   "sort_order": "asc",
-#   "select": [
-#     "assistant_id"
-#   ]
-# }
     try: 
         client = get_client()
         response = await client.assistants.search()
@@ -207,7 +195,6 @@ async def list_avatars():
     except Exception as e:
         error = f"Error in listing avatars: {e}"
         return JSONResponse(error, status_code=500)
-
 
 # @app.post("/upload-media")
 # async def upload_media(

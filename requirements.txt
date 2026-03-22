@@ -24,3 +24,6 @@ yt_dlp
 
 bert_score
 rouge
+
+# auth
+# supabase

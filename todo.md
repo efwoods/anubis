@@ -76,3 +76,17 @@ scalable api (kubernetes)
 change redis and postgres (exposed credentials and expensive)
 vanity url
 ci-cd build and push to azure
+
+
+lve docker.io/langchain/langgraph-api:3.11-wolfi@sha256:9885da9da5aa6967a97c17cc9251333dacae34da7c1  0.0s
+ => => sha256:dae55952d1776bb7624227c315cf992eaf8932ba0f5506893122463495fdb2ea 5.25kB / 5.25kB                  0.0s
+ => => sha256:4edde2f518634a751d38dfa5fed3c60e890ba96dae69a172f653ff5012a6808d 9.02kB / 9.02kB                  0.0s
+ => => sha256:9885da9da5aa6967a97c17cc9251333dacae34da7c17a392fa3d4a57ee4f2670 1.61kB / 1.61kB                  0.0s
+ => [ 2/10] ADD . /deps/anubis                                                                                 16.3s
+ => [ 3/10] RUN for dep in /deps/*; do             echo "Installing $dep";             if [ -d "$dep" ]; then  60.9s
+ => => #  Downloaded transformers                                                                                   
+ => => #  Downloaded pandas                                                                                         
+ => => #  Downloaded cuda-bindings                                                                                  
+ => => #  Downloaded numpy                                                                                          
+ => => #  Downloaded scipy                                                                                          
+ => => #  Downloaded nvidia-nvjitlink-cu12                                                                          

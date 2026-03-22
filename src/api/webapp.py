@@ -27,6 +27,8 @@ from typing import Optional
 
 from langgraph_sdk import get_client
 
+import supabase
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""

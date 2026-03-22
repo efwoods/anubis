@@ -26,4 +26,4 @@ bert_score
 rouge
 
 # auth
-# supabase
+supabase

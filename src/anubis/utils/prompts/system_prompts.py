@@ -362,3 +362,22 @@ This criteria has an emphasis of attention on the structure and flow of writing.
 STYLE_SCORE_STEPS = """
 Read the generated response and evaluate the generated response's style of writing on a scale from 1 to 5, where 1 is the lowest and 5 is the highest based on the Evaluation Criteria.
 """
+
+
+VIDEO_TO_TEXT_WITH_LEADING_REFERENCE_IMAGE_OF_TARGET = """
+
+<INSTRUCTIONS>
+The attached images are sequential frames in a movie.  
+Describe each frame in full detail as if from a script in a movie. Use narrative text in braces []. The first image is a reference image. Use the first image of only a single person to identify the target in the frame of the movie. Do not describe the first image. Only use the reference image to target the individual in the frame. If the individual exists in the frame.
+</INSTRUCTIONS>
+
+<RESTRICTIONS>
+Do not describe the first image. Only use the reference image to target the individual in the frame. If the individual exists in the frame.
+</RESTRICTIONS>
+
+<INSTRUCTIONS>
+The attached images are sequential frames in a movie.  
+Describe each frame in full detail as if from a script in a movie. Use narrative text in braces []. The first image is a reference image. Use the first image of only a single person to identify the target in the frame of the movie. Do not describe the first image. Only use the reference image to target the individual in the frame. If the individual exists in the frame.
+</INSTRUCTIONS>
+
+"""

@@ -23,6 +23,8 @@ from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import IndexConfig
 
+from typing import Optional
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
@@ -78,19 +80,23 @@ from src.anubis.graph import graph, message_workflow
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
-@app.get("/hello")
-async def test_hello_world():
-    
-    config = {
-            "configurable": {
-                "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
-                "assistant_ctx": {
-                    "name":"Shivon Zilis",
-                    "description":"Director of Operations at Neuralink"},
-                "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
-                "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
+@app.get("/message")
+async def message(message: Optional[str] = None):
+
+
+    if getattr(app.state, "config", None) is None:
+        config = {
+                "configurable": {
+                    "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
+                    "assistant_ctx": {
+                        "name":"Shivon Zilis",
+                        "description":"Director of Operations at Neuralink"},
+                    "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
+                    "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
+                }
             }
-        }
+    else:
+        config = app.state.config
     
     logger.warning("breakpoint")
     if app.state.context.deployment == 'FALSE':
@@ -104,14 +110,53 @@ async def test_hello_world():
 
         # result = await url_loading_graph.ainvoke(input, config=config)
 
+        if message is None:
+            message = "Hello"
 
-        response = await graph.ainvoke(input={"messages":[HumanMessage(content="test message")]}, config = config )
+        logger.info(f"config: {config}")
+        
+        response = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
+
         logger.info(f"{response}")
 
-        logger.info(f"HELLO WORLD ENTRY")
-        return {"Hello": f"{response['messages'][-1].content}"}
+        return JSONResponse(response['messages'][-1].content, status_code=200)
+
+@app.get("/select_avatar")
+async def select_avatar(assistant_id: str):
+
+    config = {
+        "configurable": {
+            "assistant_id": assistant_id
+        }
+    }
+
+    configurable = getattr(app.state, "config", {}).get("configurable", {}) 
+
+    if configurable:
+        if getattr(app.state, "config", None) is not None:
+            app.state.config['configurable'].update(config['configurable'])
+        else:
+            app.state.config = config
     else:
-        return {"Hello": f"World"}
+        if getattr(app.state, "config", None) is not None:
+            app.state.config.update(config) 
+        else:
+            app.state.config = config
+
+    return JSONResponse(app.state.config, status_code=200)
+    
+    # config = {
+    #         "configurable": {
+    #             "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
+    #             "assistant_ctx": {
+    #                 "name":"Shivon Zilis",
+    #                 "description":"Director of Operations at Neuralink"},
+    #             "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
+    #             "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
+    #         }
+    #     }
+    
+
 
 # @app.post("/upload-media")
 # async def upload_media(

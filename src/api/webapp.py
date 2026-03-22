@@ -25,6 +25,8 @@ from langgraph.store.base import IndexConfig
 
 from typing import Optional
 
+from langgraph_sdk import get_client
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
@@ -122,13 +124,36 @@ async def message(message: Optional[str] = None):
         return JSONResponse(response['messages'][-1].content, status_code=200)
 
 @app.get("/select_avatar")
-async def select_avatar(assistant_id: str):
+async def select_avatar(assistant_id: Optional[str] = None, assistant_name: Optional[str] = None, ):
 
-    config = {
-        "configurable": {
-            "assistant_id": assistant_id
+    if assistant_id:
+        config = {
+            "configurable": {
+                "assistant_id": assistant_id
+            }
         }
-    }
+    elif assistant_name:
+        try:
+            client = get_client()
+            response = await client.assistants.search(name=assistant_name)
+            if type(response) is list:
+                assistant_id = response[0]["assistant_id"]
+                config = {
+                    "configurable": {
+                        "assistant_ctx": {
+                            "name": response[0].get('name', ''),
+                            'description': response[0].get('description', '')
+                        },
+                        "assistant_id": assistant_id
+                    }
+                }
+            else:
+                raise AssertionError("response is not a list during search for assistant via name.")
+        except Exception as e:
+            error_str = "{error}".format(error = e)
+            return JSONResponse(content = error_str, status_code=500)
+    else: 
+        return JSONResponse(content = "Error: either assistant_id or assistant_name is required.", status_code=500)
 
     configurable = getattr(app.state, "config", {}).get("configurable", {}) 
 
@@ -156,6 +181,32 @@ async def select_avatar(assistant_id: str):
     #         }
     #     }
     
+@app.get("/list_avatars")
+async def list_avatars():
+
+#     {
+#   "metadata": {},
+#   "graph_id": "Anubis",
+#   "name": "",
+#   "limit": 10,
+#   "offset": 0,
+#   "sort_by": "assistant_id",
+#   "sort_order": "asc",
+#   "select": [
+#     "assistant_id"
+#   ]
+# }
+    try: 
+        client = get_client()
+        response = await client.assistants.search()
+        if type(response) is list:
+            avatar_list = response[0]
+        else:
+            raise AssertionError("response is not a list")
+        return JSONResponse(avatar_list, status_code=200)
+    except Exception as e:
+        error = f"Error in listing avatars: {e}"
+        return JSONResponse(error, status_code=500)
 
 
 # @app.post("/upload-media")

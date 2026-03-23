@@ -1,17 +1,14 @@
 from urllib.parse import quote
 from langgraph_sdk import Auth
 from supabase import create_async_client
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 
 from pydantic import BaseModel
 
 from typing import Optional
-
-from src.api.dependencies import (
-    get_context, 
-    get_request_object, 
-)
 
 import os
 
@@ -26,6 +23,8 @@ load_dotenv()
 auth = Auth()
 
 security_route = APIRouter()
+
+security = HTTPBearer()
 
 ALGORITHMS = ["RS256"]
 
@@ -57,6 +56,8 @@ def _mgmt_headers() -> dict:
 
 
 # utility functions
+
+
 
 def signup_user(email: str, password: str, name: Optional[str] = None) -> dict:
 
@@ -110,6 +111,24 @@ def delete_user(user_id: str) -> None:
 
     return response.json()
 
+
+def update_user_login_status(user_id: str, is_logged_in: bool):
+    """Updates Auth0 user_metadata with login status."""
+    payload = {
+        "user_metadata": {
+            "logged_in": is_logged_in
+        }
+    }
+
+    logger.warning('update login status breakpoint')
+    # Note: user_id must be URL encoded (e.g., auth0|123 -> auth0%7C123)
+    encoded_id = quote(user_id, safe="")
+    httpx.patch(
+        f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
+        json=payload,
+        headers=_mgmt_headers(),
+    )
+
 def get_user(user_id: str) -> dict:
     response = httpx.get(
         f"{BASE_AUTH_URL}/api/v2/users/{user_id}",
@@ -121,7 +140,6 @@ def get_user(user_id: str) -> dict:
 
 
 def send_verification_email(user_id: str) -> dict:
-    from urllib.parse import quote
     response = httpx.post(
         f"{BASE_AUTH_URL}/api/v2/jobs/verification-email",
         json={"user_id": user_id},
@@ -170,6 +188,7 @@ def verify_token(token: str) -> dict:
         issuer=f"https://{DOMAIN}/",
     )
 
+
 # ── Schemas ────────────────────────────────────────────────────────────────
 class SignupRequest(BaseModel):
     email: str
@@ -184,23 +203,38 @@ class LogoutRequest(BaseModel):
     refresh_token: str
 
 # ── Dependency: require valid token ────────────────────────────────────────
-def get_current_user(authorization: str = Header(...)) -> dict:
-    token = authorization.removeprefix("Bearer ")
+
+async def get_current_user(request: Request, res: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
+    """
+    This dependency validates the JWT and returns the payload.
+    The 'sub' field in the payload is the Auth0 user_id.
+    """
+    if not res:
+        return None
+    
     try:
-        return verify_token(token)
+        token = res.credentials
+        payload = verify_token(token)
+        return payload  # This contains 'sub', 'email', etc.
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(
+            status_code=401, 
+            detail=f"Invalid or expired token: {str(e)}"
+        )
 
 # ── Routes ─────────────────────────────────────────────────────────────────
-
-
-
 
 @security_route.post("/resend-verification")
 def resend_verification(current_user: dict = Depends(get_current_user)):
     return send_verification_email(current_user["sub"])
 
-
+@security_route.get("/get_user_profile")
+def get_user_profile(current_user: dict = Depends(get_current_user)):
+    # You don't need to pass user_id in the URL or body; 
+    # it is extracted from the token you're wearing!
+    user_id = current_user["sub"]
+    response = get_user(user_id=user_id)
+    return {"user_id": user_id, "full_payload": response}
 
 @security_route.post("/signup")
 def signup(body: SignupRequest):
@@ -212,23 +246,36 @@ def signup(body: SignupRequest):
     except Exception as e:
         raise HTTPException(status_code=response.status_code, detail=response.json())
     
-
+import logging
+logger = logging.getLogger(__name__)
 @security_route.post("/login")
 def login(body: LoginRequest):
     try:
         # returns: access_token, refresh_token, id_token, expires_in
         response = login_user(body.email, body.password)
         response.raise_for_status()
-        return response.json()
+        logger.warning(f"response.status_code: {response.status_code}")
+        if response.status_code == 200:
+            data = response.json()
+            logger.warning(f"DATA: {data}")
+            user_info = jwt.get_unverified_claims(data.get('id_token'))
+            logger.warning(f"DATA: {user_info}")
+            update_user_login_status(user_info['sub'], True)
+            return data
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.json())
     except Exception as e:
         raise HTTPException(status_code=response.status_code, detail=response.json())
 
 @security_route.post("/logout")
-def logout(body: LogoutRequest):
+def logout(body: LogoutRequest, current_user: dict = Depends(get_current_user)):
 
     response = logout_user(body.refresh_token)
     try:
+
         response.raise_for_status()
+        if response.status_code == 200:
+            update_user_login_status(current_user['sub'], False)
         return {"message": "Logged out successfully"}
     except Exception as e:
         raise HTTPException(detail = response.json(), status_code=response.status_code)
@@ -242,49 +289,6 @@ def delete(user_id: str, current_user: dict = Depends(get_current_user)):
     response = delete_user(encoded_id)
     return response
 
-# ###
-
-# @security_route.post("/sign_up")
-# async def sign_up(email: str, password: str, context=Depends(get_context)):
-
-#     try:
-#         supabase_client = create_async_client(supabase_url=context.supabase_url, supabase_key=context.supabase_key)
-#         response = await supabase_client.auth.signup(
-#             {"email": email, 
-#              "password": password}
-#         )
-
-#         return JSONResponse(response, static_code = 200)
-#     except Exception as e:
-#         return HTTPException(status_code=500, detail=f"Error: {e}")
-
-# @security_route.post("/login")
-# async def login(email: str, password: str, context=Depends(get_context, get_request_object)):
-#     try:
-#         supabase_client = create_async_client(supabase_url=context.supabase_url, supabase_key=context.supabase_key)
-#         response = await supabase_client.auth.sign_in_with_password(
-#             {
-#                 "email": email, 
-#                 "password": password
-#             }
-#         )
-#         return JSONResponse(response, status_code=200)
-#     except Exception as e:
-#         return HTTPException(status_code=500, detail=f"Error: {e}")
-
-
-
-
-# @security_route.get("get_current_user")
-# @auth.authenticate
-# async def get_current_user(authorization: str | None) -> Auth.types.MinimalUserDict:
-#     """ Identify if the user's token is valid. """
-#     assert authorization
-#     scheme, token = authorization.split()
-#     assert scheme.lower() == "bearer"
-
-#     # Check if token is valid:
-#     if token
 
 @auth.authenticate
 async def authenticate(authorization: str | None) -> Auth.types.MinimalUserDict:
@@ -306,5 +310,5 @@ async def authenticate(authorization: str | None) -> Auth.types.MinimalUserDict:
         "identity": payload["sub"],          # Auth0 user ID e.g. "auth0|abc123"
         "email":    payload.get("email"),
         "permissions": payload.get("permissions", []),
+        "metadata": {"user_id": payload["sub"]}
     }
-

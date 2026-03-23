@@ -70,6 +70,11 @@ one message is 58 bytes (input and response) in redis cache
 
 # Todo
 <!-- production redis & production pg db connection  -->
+
+
+
+
+
 upload bible
 user accounts
 scalable api (kubernetes)

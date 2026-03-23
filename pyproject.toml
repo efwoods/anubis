@@ -9,9 +9,11 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
+    "auth0-fastapi-api>=1.0.0b6",
     "beautifulsoup4>=4.14.3",
     "bert-score>=0.3.13",
     "fastapi>=0.135.1",
+    "firebase-admin>=7.3.0",
     "huggingface-hub>=0.36.2",
     "langchain>=1.2.10",
     "langchain-community>=0.4.1",

@@ -164,7 +164,15 @@ class GlobalContext:
         metadata={"description": "True for langsmith deployments to use autoconfiguration of store; disables functionality of api yet allows the graph to run for deployments."}
     )
 
+    supabase_url: str = field(
+        default=None, 
+        metadata={"description": "url for user authentication"}
+    )
 
+    supabase_key: str = field(
+        default=None, 
+        metadata={"description": "api key for user authentication"}
+    )
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

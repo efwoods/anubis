@@ -27,3 +27,4 @@ rouge
 
 # auth
 supabase
+auth0-fastapi-api

@@ -24,10 +24,10 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import IndexConfig
 
 from typing import Optional
-
 from langgraph_sdk import get_client
 
-import supabase
+from src.anubis.graph import graph, message_workflow
+from src.security.auth import security_route, auth
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     # Startup: Preload the Whisper model pipeline
     global context
     global store_context_manager 
-
+        
     # Initialize context / context
     app.state.context = GlobalContext()
     if app.state.context.deployment == 'FALSE':
@@ -80,7 +80,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-from src.anubis.graph import graph, message_workflow
+app.include_router(router=security_route)
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
@@ -128,10 +128,13 @@ async def message(message: Optional[str] = None):
 @app.get("/select_avatar")
 async def select_avatar(assistant_id: Optional[str] = None, assistant_name: Optional[str] = None, ):
 
+    langgraph_auth_user = getattr(app.state, "config", {}).get("langgraph_auth_user", "")
+
     if assistant_id:
         config = {
             "configurable": {
-                "assistant_id": assistant_id
+                "assistant_id": assistant_id,
+                "user_id": langgraph_auth_user
             }
         }
     elif assistant_name:
@@ -172,6 +175,7 @@ async def select_avatar(assistant_id: Optional[str] = None, assistant_name: Opti
 
     return JSONResponse(app.state.config, status_code=200)
     
+    
     # config = {
     #         "configurable": {
     #             "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
@@ -197,6 +201,28 @@ async def list_avatars():
     except Exception as e:
         error = f"Error in listing avatars: {e}"
         return JSONResponse(error, status_code=500)
+
+
+@app.post("create_avatar")
+async def create_avatar(
+    name: str, 
+    description: Optional[str] = None):
+
+    # config = getattr(app.state, "config")
+    # if config.get('configurable', {}).get("user_id", None)
+
+    try:
+        client = get_client()
+        response = client.assistants.create(graph_id = "Anubis", description=description, name=name)
+        return JSONResponse(response, status_code=200)
+    except Exception as e:
+        error = "Error: {e}".format(error = e)
+        return JSONResponse(error, status_code=500)
+    
+
+
+# @app.post()
+
 
 # @app.post("/upload-media")
 # async def upload_media(

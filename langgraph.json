@@ -17,6 +17,6 @@
     "app": "./src/api/webapp.py:app"
   },
   "auth": {
-    "path": "./src/security/auth.py:get_current_user"
+    "path": "./src/security/auth.py:auth"
   }
 }

@@ -118,6 +118,23 @@ def get_user(user_id: str) -> dict:
     response.raise_for_status()
     return response.json()
 
+
+
+def send_verification_email(user_id: str) -> dict:
+    from urllib.parse import quote
+    response = httpx.post(
+        f"{BASE_AUTH_URL}/api/v2/jobs/verification-email",
+        json={"user_id": user_id},
+        headers=_mgmt_headers(),
+    )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.json()
+        )
+    return response.json()  # returns a job object
+
+
 # Token Verification
 
 @lru_cache(maxsize=1)
@@ -175,6 +192,13 @@ def get_current_user(authorization: str = Header(...)) -> dict:
         raise HTTPException(status_code=401, detail=str(e))
 
 # ── Routes ─────────────────────────────────────────────────────────────────
+
+
+
+
+@security_route.post("/resend-verification")
+def resend_verification(current_user: dict = Depends(get_current_user)):
+    return send_verification_email(current_user["sub"])
 
 
 

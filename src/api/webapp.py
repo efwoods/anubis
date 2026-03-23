@@ -156,86 +156,86 @@ async def get_public_avatars(assistant_id: Optional[str] = None):
 from src.security.auth import security
 from fastapi.security import HTTPAuthorizationCredentials
 
-# @app.post("/select_avatar")
-# async def select_avatar(
-#     response: Response,
-#     current_user: dict = Depends(get_current_user),
-#     assistant_id: Optional[str] = None, 
-#     assistant_name: Optional[str] = None,
-#     auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
-#     ):
+@app.post("/select_avatar")
+async def select_avatar(
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    assistant_id: Optional[str] = None, 
+    assistant_name: Optional[str] = None,
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
 
-#     if not current_user and not assistant_id:
-#         return HTTPException(status_code=400, detail="Unauthenticated users must log in to use the select avatars via name feature. Please log in or use an assistant_id for selection.")
+    if not current_user and not assistant_id:
+        return HTTPException(status_code=400, detail="Unauthenticated users must log in to use the select avatars via name feature. Please log in or use an assistant_id for selection.")
     
-#     if not current_user:
-#         result = get_public_avatars(assistant_id=assistant_id)
+    if not current_user:
+        result = get_public_avatars(assistant_id=assistant_id)
 
-#         assistant_config = {"configurable": {
-#             "assistant_id": assistant_id
-#         }}
+        assistant_config = {"configurable": {
+            "assistant_id": assistant_id
+        }}
 
-#         if len(result) > 0:
-#             assistant_config['configurable'].update({
-#                 "assistant_ctx": {
-#                     "name": result[0].get("name", None),
-#                     "description": result[0].get("description", None)
-#                 }
-#             })
-#         response.set_cookie(
-#             key="assistant_config",
-#             value = assistant_config,
-#             httponly=True,
-#             samesite="lax"
-#         )
+        if len(result) > 0:
+            assistant_config['configurable'].update({
+                "assistant_ctx": {
+                    "name": result[0].get("name", None),
+                    "description": result[0].get("description", None)
+                }
+            })
+        response.set_cookie(
+            key="assistant_config",
+            value = assistant_config,
+            httponly=True,
+            samesite="lax"
+        )
 
-#     else:
-#          get the current authorization token; needs to auto configure to the running instance
-#          client = get_client(headers={"Authorization": "Bearer
-#         if assistant_id:
-#             assistant_config = {
-#                 "configurable": {
-#                     "assistant_id": assistant_id,
-#                 }
-#             }
-#         elif assistant_name:
-#             client = get_client()
-#             try:
-#                 client = get_client()
-#                 result = await client.assistants.search(name=assistant_name)
-#                 if type(response) is list:
-#                     assistant_id = response[0]["assistant_id"]
-#                     config = {
-#                         "configurable": {
-#                             "assistant_ctx": {
-#                                 "name": response[0].get('name', ''),
-#                                 'description': response[0].get('description', '')
-#                             },
-#                             "assistant_id": assistant_id
-#                         }
-#                     }
-#                 else:
-#                     raise AssertionError("response is not a list during search for assistant via name.")
-#             except Exception as e:
-#                 error_str = "{error}".format(error = e)
-#                 return JSONResponse(content = error_str, status_code=500)
-#         else: 
-#             return JSONResponse(content = "Error: either assistant_id or assistant_name is required.", status_code=500)
+    else:
+        #  get the current authorization token; needs to auto configure to the running instance
+        #  client = get_client(headers={"Authorization": "Bearer
+        if assistant_id:
+            assistant_config = {
+                "configurable": {
+                    "assistant_id": assistant_id,
+                }
+            }
+        elif assistant_name:
+            client = get_client()
+            try:
+                client = get_client()
+                result = await client.assistants.search(name=assistant_name)
+                if type(response) is list:
+                    assistant_id = response[0]["assistant_id"]
+                    config = {
+                        "configurable": {
+                            "assistant_ctx": {
+                                "name": response[0].get('name', ''),
+                                'description': response[0].get('description', '')
+                            },
+                            "assistant_id": assistant_id
+                        }
+                    }
+                else:
+                    raise AssertionError("response is not a list during search for assistant via name.")
+            except Exception as e:
+                error_str = "{error}".format(error = e)
+                return JSONResponse(content = error_str, status_code=500)
+        else: 
+            return JSONResponse(content = "Error: either assistant_id or assistant_name is required.", status_code=500)
 
-#     configurable = getattr(app.state, "config", {}).get("configurable", {}) 
+    configurable = getattr(app.state, "config", {}).get("configurable", {}) 
 
-#     if configurable:
-#         if getattr(app.state, "config", None) is not None:
-#             app.state.config['configurable'].update(config['configurable'])
-#         else:
-#             app.state.config = config
-#     else:
-#         if getattr(app.state, "config", None) is not None:
-#             app.state.config.update(config) 
-#         else:
-#             app.state.config = config
+    if configurable:
+        if getattr(app.state, "config", None) is not None:
+            app.state.config['configurable'].update(config['configurable'])
+        else:
+            app.state.config = config
+    else:
+        if getattr(app.state, "config", None) is not None:
+            app.state.config.update(config) 
+        else:
+            app.state.config = config
 
-#     return JSONResponse(app.state.config, status_code=200)
+    return JSONResponse(app.state.config, status_code=200)
     
     
     # config = {
@@ -248,12 +248,22 @@ from fastapi.security import HTTPAuthorizationCredentials
     #             "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
     #         }
     #     }
-    
-@app.get("/list_avatars")
-async def list_avatars():
 
-    langgraph_auth_user = getattr(app.state, "config", {}).get("langgraph_auth_user", "")
-    logger.warning(f"langgraph_auth_user: {langgraph_auth_user}")
+from fastapi.responses import RedirectResponse
+
+@app.get("/")
+async def docs_redirect():
+    return RedirectResponse(url="/docs")
+
+@app.get("/list_avatars")
+async def list_avatars(
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
+    if not current_user:
+        result = await get_public_avatars()
+        return result
+
 
     try: 
         client = get_client()

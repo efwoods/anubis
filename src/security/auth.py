@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-
 from pydantic import BaseModel
 
 from typing import Optional
@@ -17,6 +16,9 @@ from dotenv import load_dotenv
 import httpx
 from functools import lru_cache
 from jose import jwt, JWTError
+
+import logging
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -209,6 +211,7 @@ async def get_current_user(request: Request, res: Optional[HTTPAuthorizationCred
     This dependency validates the JWT and returns the payload.
     The 'sub' field in the payload is the Auth0 user_id.
     """
+    logger.info("breakpoint")
     if not res:
         return None
     
@@ -223,17 +226,6 @@ async def get_current_user(request: Request, res: Optional[HTTPAuthorizationCred
         )
 
 # ── Routes ─────────────────────────────────────────────────────────────────
-@security_route.post("/resend-verification")
-def resend_verification(current_user: dict = Depends(get_current_user)):
-    return send_verification_email(current_user["sub"])
-
-@security_route.get("/get_user_profile")
-def get_user_profile(current_user: dict = Depends(get_current_user)):
-    # You don't need to pass user_id in the URL or body; 
-    # it is extracted from the token you're wearing!
-    user_id = current_user["sub"]
-    response = get_user(user_id=user_id)
-    return {"user_id": user_id, "full_payload": response}
 
 @security_route.post("/signup")
 def signup(body: SignupRequest):
@@ -245,8 +237,20 @@ def signup(body: SignupRequest):
     except Exception as e:
         raise HTTPException(status_code=response.status_code, detail=response.json())
     
-import logging
-logger = logging.getLogger(__name__)
+@security_route.post("/resend-verification")
+def resend_verification(current_user: dict = Depends(get_current_user)):
+    return send_verification_email(current_user["sub"])
+
+@security_route.delete("/users/{user_id}")
+def delete(user_id: str, current_user: dict = Depends(get_current_user)):
+    # Optional: ensure users can only delete themselves unless admin
+    encoded_id = quote(user_id, safe="")
+    if current_user["sub"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    response = delete_user(encoded_id)
+    return response
+
+
 @security_route.post("/login")
 def login(body: LoginRequest):
     try:
@@ -266,6 +270,14 @@ def login(body: LoginRequest):
     except Exception as e:
         raise HTTPException(status_code=response.status_code, detail=response.json())
 
+@security_route.get("/get_user_profile")
+def get_user_profile(current_user: dict = Depends(get_current_user)):
+    # You don't need to pass user_id in the URL or body; 
+    # it is extracted from the token you're wearing!
+    user_id = current_user["sub"]
+    response = get_user(user_id=user_id)
+    return {"user_id": user_id, "full_payload": response}
+
 @security_route.post("/logout")
 def logout(body: LogoutRequest, current_user: dict = Depends(get_current_user)):
 
@@ -279,14 +291,6 @@ def logout(body: LogoutRequest, current_user: dict = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(detail = response.json(), status_code=response.status_code)
 
-@security_route.delete("/users/{user_id}")
-def delete(user_id: str, current_user: dict = Depends(get_current_user)):
-    # Optional: ensure users can only delete themselves unless admin
-    encoded_id = quote(user_id, safe="")
-    if current_user["sub"] != user_id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    response = delete_user(encoded_id)
-    return response
 
 
 @auth.authenticate

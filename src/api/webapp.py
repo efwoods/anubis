@@ -23,15 +23,72 @@ from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import IndexConfig
 
+from typing import Optional
+from langgraph_sdk import get_client
+
+from src.anubis.graph import graph, message_workflow
+from src.security.auth import security_route, auth
+
+from langgraph_sdk.auth import Auth
+
+from src.security.auth import get_current_user
+from fastapi import Response, Depends
+
+from src.security.auth import security
+from fastapi.security import HTTPAuthorizationCredentials
+import json
+
+from fastapi.responses import RedirectResponse
+
+from uuid import uuid4, uuid5, NAMESPACE_URL
+
+import httpx
+
+async def get_public_avatars(assistant_id: Optional[str] = None, 
+                             user_id: Optional[str] = None):
+    pool = app.state.pool
+
+    if assistant_id:
+        # Retrieve the public avatar matching the assistant_id
+        search_query = """
+        SELECT * FROM assistant 
+        WHERE metadata @> '{"is_public": true}'"
+        AND assistant_id IS %s
+        """
+    elif user_id:
+        # Retrieve all public avatars not owned by the current user.
+        search_query = """
+        SELECT * FROM assistant
+        WHERE metadata @> '{"is_public": true}'"
+        AND metadata->user_id IS %s
+        """
+    else:
+        # Retrieve all public avatars
+        search_query = """
+        SELECT * FROM assistant 
+        WHERE metadata @> '{"is_public": true}'"
+        """
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            if assistant_id:
+                await cur.execute(search_query, (assistant_id, ))
+            elif user_id:
+                await cur.execute(search_query, (user_id, ))
+            else:
+                await cur.execute(search_query)
+            return await cur.fetchall()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
     # Startup: Preload the Whisper model pipeline
     global context
     global store_context_manager 
-
+        
     # Initialize context / context
     app.state.context = GlobalContext()
+    app.state.httpx_client = httpx.AsyncClient()
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
         logger.warning(f"app.state.context.dev: {app.state.context.dev}")
@@ -74,27 +131,292 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-from src.anubis.graph import graph, message_workflow
+@app.get("/")
+async def documentation():
+    return RedirectResponse(url="/docs")
+
+app.include_router(router=security_route)
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
-@app.get("/hello")
-async def test_hello_world():
+
+@app.post("/create_avatar")
+async def create_avatar(
+    name: str, 
+    description: Optional[str] = None,
+    is_public: Optional[bool] = False,
+    # is_self_avatar: Optional[bool] = False,
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
+
+    # If the avatar is of the individual, then the avatar is allowed to be made public. 
+    # Reference image, audio, and third-party authenticated account is required to create a shareable avatar. Limited to one shareable avatar of themselves.
+    # Include reference image, reference audio
+
+    logger.info(f"breakpoint")
+
+    if not current_user:
+        return JSONResponse(
+            content="User must be logged in to create avatars.", 
+            status_code=400
+        )
     
+    try:
+        context = app.state.context
+        token = auth_cred.credentials
+        client = get_client(headers={"Authorization": f"Bearer {token}"})
+        assistant_id = str(uuid4())
+        metadata = {
+                "user_id": current_user['sub'], 
+                "assistant_id":assistant_id,
+                "is_public": False
+            }
+        
+        if current_user.get('sub', None) is context.admin_user_id:
+            metadata['is_public'] = is_public
+        
+        response = await client.assistants.create(
+            graph_id = "Anubis", 
+            description=description, 
+            name=name, 
+            assistant_id=assistant_id, 
+            metadata=metadata)
+        
+        return JSONResponse(response, status_code=200)
+    except Exception as e:
+        return HTTPException(detail = e, status_code=500)
+
+@app.delete("/delete_avatar")
+async def delete_avatar(
+    assistant_id: Optional[str] = None,
+    assistant_name: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+
+    logger.info("breakpoint")
+
+    if not assistant_id and not assistant_name:
+        raise HTTPException(
+            detail = "Either supply assistant_id or assistant name.",
+            status_code=400
+        )
+
+    if not current_user:
+        raise HTTPException(
+            content="User must be logged in to delete avatars.", 
+            status_code=400
+        )
+    
+    try:
+        context = app.state.context
+        token = auth_cred.credentials
+        client = get_client(headers={"Authorization": f"Bearer {token}"})
+        
+        metadata = {'user_id':current_user.get('sub', "")}
+        if assistant_id:
+            metadata.update({"assistant_id": assistant_id})
+            await client.assistants.delete(
+                graph_id = "Anubis", 
+                assistant_id=assistant_id, 
+                metadata=metadata)
+        elif assistant_name:
+            result = await client.assistants.search(graph_id="Anubis", name=assistant_name, metadata=metadata)
+            assert type(result) is list
+            assert len(result) > 0
+            await client.assistants.delete(
+                graph_id = "Anubis", 
+                assistant_id=result[0].get("assistant_id"))
+        else:
+            raise HTTPException(
+            detail = "Either supply assistant_id or assistant name.",
+            status_code=400
+        )
+        return JSONResponse("Deleted Avatar", status_code=200)
+    except Exception as e:
+        return HTTPException(detail = e, status_code=500)
+
+@app.post("/share_avatar")
+async def share_avatar(
+    assistant_id: str,
+    is_public: bool = True,
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    user_id = current_user.get('sub', None)
+    if ((user_id is context.admin_user_id)
+        or (assistant_id is user_id)):
+            metadata = {"is_public": True}
+
+    # Only admins may share avatars; 
+    # Users will authenticate and share avatars in the near future.
+    if user_id is context.admin_user_id:
+        try:
+            token = auth_cred.credentials
+            client = get_client(headers={"Authorization": f"Bearer {token}"})
+            result = await client.assistants.update(
+                assistant_id=assistant_id, 
+                metadata=metadata)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
+
+@app.get("/list_avatars")
+async def list_avatars(
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
+    logger.info("breakpoint")
+    public_avatars_result = await get_public_avatars()
+    if not current_user:
+        return public_avatars_result
+    try: 
+        token = auth_cred.credentials
+        client = get_client(headers = {"Authentication": f"Bearer {token}"})
+        response = await client.assistants.search(metadata={"user_id": current_user})
+        if type(response) is list:
+            avatar_list = response[0]
+        else:
+            raise AssertionError("response is not a list")
+        logger.info(f"breakpoint")
+        return_list = [avatar_list, public_avatars_result] # public and private avatars
+        return JSONResponse(return_list, status_code=200)
+    except Exception as e:
+        error = f"Error in listing avatars: {e}"
+        return JSONResponse(error, status_code=500)
+
+
+@app.post("/select_avatar")
+async def select_avatar(
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    assistant_id: Optional[str] = None, 
+    assistant_name: Optional[str] = None,
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
+
+    if not current_user and not assistant_id:
+        return HTTPException(status_code=400, detail="Unauthenticated users must log in to use the select avatars via name feature. Please log in or use an assistant_id for selection.")
+    
+    if not current_user:
+        result = get_public_avatars(assistant_id=assistant_id)
+
+        assistant_config = {"configurable": {
+            "assistant_id": assistant_id
+        }}
+
+        if len(result) > 0:
+            assistant_config['configurable'].update({
+                "assistant_ctx": {
+                    "name": result[0].get("name", None),
+                    "description": result[0].get("description", None)
+                }
+            })
+        response.set_cookie(
+            key="assistant_config",
+            value = json.dumps(assistant_config),
+            httponly=True,
+            samesite="lax"
+        )
+
+    else:
+        
+        token = auth_cred.credentials
+        client = get_client(headers={f"Authorization": "Bearer {token}"})
+
+        if assistant_id:
+            try:
+                result =  await client.assistants.search(
+                    metadata={
+                        "user_id": current_user['sub'], 
+                        "assistant_id":assistant_id
+                        })
+                assistant_config = {
+                    "configurable": {
+                        "assistant_id": assistant_id,
+                        "assistant_ctx": {
+                            "name":result[0].get("name", ""),
+                            "description":result[0].get("description", ""),
+                        }
+                    }
+                }
+                response.set_cookie(
+                    key="assistant_config", 
+                    value = json.dumps(assistant_config), 
+                    httponly=True,
+                    samesite="lax"
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error using assistant_id for logged in user {e}")
+            
+        elif assistant_name:
+            try:
+                result = await client.assistants.search(name=assistant_name)
+                try:
+                    assert type(result) is list
+                    assert len(result) > 0
+                    assistant_id = result[0].get("assistant_id", None)
+                    assert assistant_id is not None
+                    assistant_config = {
+                        "configurable": {
+                            "assistant_ctx": {
+                                "name": result[0].get('name', ''),
+                                'description': result[0].get('description', '')
+                            },
+                            "assistant_id": assistant_id
+                        }
+                    }
+                    response.set_cookie(
+                        key="assistant_config", 
+                        value = json.dumps(assistant_config), 
+                        httponly=True,
+                        samesite="lax"
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail = f"Error during avatar selection via assistant_name: {e}")
+            except Exception as e:
+                error_str = "{error}".format(error = e)
+                return HTTPException(detail = error_str, status_code=500)
+        else: 
+            return HTTPException(detail = "Error: either assistant_id or assistant_name is required.", status_code=400)
+
+    return JSONResponse(assistant_config, status_code=200)
+
+@app.get("/message")
+async def message(
+    response: Response,
+    message: Optional[str] = "Hello!",
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    ):
+
+    assistant_config_str = response.get("assistant_config", None)
+    if assistant_config_str:
+        assistant_config = json.loads(assistant_config_str)
+    else:
+        raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
+
+    if not current_user:
+        user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
+        user_name = None,
+        user_description = None
+    else:
+        user_id = current_user['sub']
+        user_name = current_user.get('name')
+        user_description = current_user.get('description')
+
     config = {
             "configurable": {
-                "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
-                "assistant_ctx": {
-                    "name":"Shivon Zilis",
-                    "description":"Director of Operations at Neuralink"},
-                "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
-                "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
+                "user_ctx": {"name":user_name, "description": user_description},
+                "user_id":user_id
             }
         }
     
-    logger.warning("breakpoint")
+    # update with assistant information
+    config['configurable'].update(assistant_config['configurable'])
+
     if app.state.context.deployment == 'FALSE':
-        store = app.state.store
+        # store = app.state.store
         graph = app.state.graph
 
         # system_time = datetime.now(tz=timezone.utc).isoformat
@@ -104,14 +426,14 @@ async def test_hello_world():
 
         # result = await url_loading_graph.ainvoke(input, config=config)
 
+        # logger.info(f"config: {config}")
+        
+        result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
 
-        response = await graph.ainvoke(input={"messages":[HumanMessage(content="test message")]}, config = config )
-        logger.info(f"{response}")
+        logger.info(f"{result}")
 
-        logger.info(f"HELLO WORLD ENTRY")
-        return {"Hello": f"{response['messages'][-1].content}"}
-    else:
-        return {"Hello": f"World"}
+        return JSONResponse(result['messages'][-1].content, status_code=200)
+
 
 # @app.post("/upload-media")
 # async def upload_media(

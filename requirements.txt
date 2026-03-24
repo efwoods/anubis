@@ -24,4 +24,13 @@ yt_dlp
 
 bert_score
 rouge
+
 yt_dlp
+
+# End of base image
+
+# auth
+supabase
+auth0-fastapi-api
+python-jose[cryptography]
+httpx

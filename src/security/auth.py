@@ -223,7 +223,6 @@ async def get_current_user(request: Request, res: Optional[HTTPAuthorizationCred
         )
 
 # ── Routes ─────────────────────────────────────────────────────────────────
-
 @security_route.post("/resend-verification")
 def resend_verification(current_user: dict = Depends(get_current_user)):
     return send_verification_email(current_user["sub"])

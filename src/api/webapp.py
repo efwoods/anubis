@@ -29,6 +29,54 @@ from langgraph_sdk import get_client
 from src.anubis.graph import graph, message_workflow
 from src.security.auth import security_route, auth
 
+from langgraph_sdk.auth import Auth
+
+from src.security.auth import get_current_user
+from fastapi import Response, Depends
+
+from src.security.auth import security
+from fastapi.security import HTTPAuthorizationCredentials
+import json
+
+from fastapi.responses import RedirectResponse
+
+from uuid import uuid4, uuid5, NAMESPACE_URL
+
+async def get_public_avatars(assistant_id: Optional[str] = None, 
+                             user_id: Optional[str] = None):
+    pool = app.state.pool
+
+    if assistant_id:
+        # Retrieve the public avatar matching the assistant_id
+        search_query = """
+        SELECT * FROM assistant 
+        WHERE metadata @> '{"is_public": true}'"
+        AND assistant_id IS %s
+        """
+    elif user_id:
+        # Retrieve all public avatars not owned by the current user.
+        search_query = """
+        SELECT * FROM assistant
+        WHERE metadata @> '{"is_public": true}'"
+        AND metadata->user_id IS %s
+        """
+    else:
+        # Retrieve all public avatars
+        search_query = """
+        SELECT * FROM assistant 
+        WHERE metadata @> '{"is_public": true}'"
+        """
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            if assistant_id:
+                await cur.execute(search_query, (assistant_id, ))
+            elif user_id:
+                await cur.execute(search_query, (user_id, ))
+            else:
+                await cur.execute(search_query)
+            return await cur.fetchall()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
@@ -80,81 +128,107 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.get("/")
+async def documentation():
+    return RedirectResponse(url="/docs")
+
 app.include_router(router=security_route)
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
-@app.get("/message")
-async def message(message: Optional[str] = None):
 
+@app.post("create_avatar")
+async def create_avatar(
+    name: str, 
+    description: Optional[str] = None,
+    is_public: Optional[bool] = False,
+    # is_self_avatar: Optional[bool] = False,
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
 
-    if getattr(app.state, "config", None) is None:
-        config = {
-                "configurable": {
-                    "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
-                    "assistant_ctx": {
-                        "name":"Shivon Zilis",
-                        "description":"Director of Operations at Neuralink"},
-                    "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
-                    "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
-                }
-            }
-    else:
-        config = app.state.config
+    # If the avatar is of the individual, then the avatar is allowed to be made public. 
+    # Reference image, audio, and third-party authenticated account is required to create a shareable avatar. Limited to one shareable avatar of themselves.
+    # Include reference image, reference audio
+
+    if not current_user:
+        return JSONResponse(
+            content="User must be logged in to create avatars.", 
+            status_code=400
+        )
     
-    logger.warning("breakpoint")
-    if app.state.context.deployment == 'FALSE':
-        store = app.state.store
-        graph = app.state.graph
-
-        # system_time = datetime.now(tz=timezone.utc).isoformat
-        # content = [{"type":"text", "text": system_time}]
-        # input = {"messages": HumanMessage(content=content)}
-        # # store = make_pg_store()
-
-        # result = await url_loading_graph.ainvoke(input, config=config)
-
-        if message is None:
-            message = "Hello"
-
-        logger.info(f"config: {config}")
+    try:
+        context = app.state.context
+        token = auth_cred.credentials
+        client = get_client(headers={"Authorization": f"Bearer {token}"})
+        assistant_id = str(uuid4())
+        metadata = {
+                "user_id": current_user['sub'], 
+                "assistant_id":assistant_id,
+                "is_public": False
+            }
+        if current_user.get('sub', None) is context.admin_user_id:
+            metadata['is_public'] = is_public
         
-        response = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
+        response = client.assistants.create(
+            graph_id = "Anubis", 
+            description=description, 
+            name=name, 
+            assistant_id=assistant_id, 
+            metadata=metadata)
+        
+        return JSONResponse(response.json(), status_code=200)
+    except Exception as e:
+        error = "Error: {e}".format(error = e)
+        return JSONResponse(error, status_code=500)
+    
+@app.post("/share_avatar")
+async def share_avatar(
+    assistant_id: str,
+    is_public: bool = True,
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    user_id = current_user.get('sub', None)
+    if ((user_id is context.admin_user_id)
+        or (assistant_id is user_id)):
+            metadata = {"is_public": True}
 
-        logger.info(f"{response}")
+    # Only admins may share avatars; 
+    # Users will authenticate and share avatars in the near future.
+    if user_id is context.admin_user_id:
+        try:
+            token = auth_cred.credentials
+            client = get_client(headers={"Authorization": f"Bearer {token}"})
+            result = await client.assistants.update(
+                assistant_id=assistant_id, 
+                metadata=metadata)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
 
-        return JSONResponse(response['messages'][-1].content, status_code=200)
+@app.get("/list_avatars")
+async def list_avatars(
+    current_user: dict = Depends(get_current_user),
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    ):
+    public_avatars_result = await get_public_avatars()
+    if not current_user:
+        return public_avatars_result
+    try: 
+        token = auth_cred.credentials
+        client = get_client(headers = {"Authentication": f"Bearer {token}"})
+        response = await client.assistants.search(metadata={"user_id": current_user})
+        if type(response) is list:
+            avatar_list = response[0]
+        else:
+            raise AssertionError("response is not a list")
+        logger.info(f"breakpoint")
+        return_list = [avatar_list, public_avatars_result] # public and private avatars
+        return JSONResponse(return_list, status_code=200)
+    except Exception as e:
+        error = f"Error in listing avatars: {e}"
+        return JSONResponse(error, status_code=500)
 
-from langgraph_sdk.auth import Auth
-
-from src.security.auth import get_current_user
-from fastapi import Response, Depends
-
-async def get_public_avatars(assistant_id: Optional[str] = None):
-    pool = app.state.pool
-
-    if assistant_id:
-        search_query = """
-        SELECT * FROM assistant 
-        WHERE metadata @> '{"is_public": true}'"
-        AND assistant_id = %s
-        """
-    else:
-        search_query = """
-        SELECT * FROM assistant 
-        WHERE metadata @> '{"is_public": true}'"
-        """
-
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            if assistant_id:
-                await cur.execute(search_query, (assistant_id, ))
-            else:
-                await cur.execute(search_query)
-            return await cur.fetchall()
-
-from src.security.auth import security
-from fastapi.security import HTTPAuthorizationCredentials
 
 @app.post("/select_avatar")
 async def select_avatar(
@@ -184,117 +258,126 @@ async def select_avatar(
             })
         response.set_cookie(
             key="assistant_config",
-            value = assistant_config,
+            value = json.dumps(assistant_config),
             httponly=True,
             samesite="lax"
         )
 
     else:
-        #  get the current authorization token; needs to auto configure to the running instance
-        #  client = get_client(headers={"Authorization": "Bearer
+        
+        token = auth_cred.credentials
+        client = get_client(headers={f"Authorization": "Bearer {token}"})
+
         if assistant_id:
-            assistant_config = {
-                "configurable": {
-                    "assistant_id": assistant_id,
-                }
-            }
-        elif assistant_name:
-            client = get_client()
             try:
-                client = get_client()
+                result =  await client.assistants.search(
+                    metadata={
+                        "user_id": current_user['sub'], 
+                        "assistant_id":assistant_id
+                        })
+                assistant_config = {
+                    "configurable": {
+                        "assistant_id": assistant_id,
+                        "assistant_ctx": {
+                            "name":result[0].get("name", ""),
+                            "description":result[0].get("description", ""),
+                        }
+                    }
+                }
+                response.set_cookie(
+                    key="assistant_config", 
+                    value = json.dumps(assistant_config), 
+                    httponly=True,
+                    samesite="lax"
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error using assistant_id for logged in user {e}")
+            
+        elif assistant_name:
+            try:
                 result = await client.assistants.search(name=assistant_name)
-                if type(response) is list:
-                    assistant_id = response[0]["assistant_id"]
-                    config = {
+                try:
+                    assert type(result) is list
+                    assert len(result) > 0
+                    assistant_id = result[0].get("assistant_id", None)
+                    assert assistant_id is not None
+                    assistant_config = {
                         "configurable": {
                             "assistant_ctx": {
-                                "name": response[0].get('name', ''),
-                                'description': response[0].get('description', '')
+                                "name": result[0].get('name', ''),
+                                'description': result[0].get('description', '')
                             },
                             "assistant_id": assistant_id
                         }
                     }
-                else:
-                    raise AssertionError("response is not a list during search for assistant via name.")
+                    response.set_cookie(
+                        key="assistant_config", 
+                        value = json.dumps(assistant_config), 
+                        httponly=True,
+                        samesite="lax"
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail = f"Error during avatar selection via assistant_name: {e}")
             except Exception as e:
                 error_str = "{error}".format(error = e)
-                return JSONResponse(content = error_str, status_code=500)
+                return HTTPException(detail = error_str, status_code=500)
         else: 
-            return JSONResponse(content = "Error: either assistant_id or assistant_name is required.", status_code=500)
+            return HTTPException(detail = "Error: either assistant_id or assistant_name is required.", status_code=400)
 
-    configurable = getattr(app.state, "config", {}).get("configurable", {}) 
+    return JSONResponse(assistant_config, status_code=200)
 
-    if configurable:
-        if getattr(app.state, "config", None) is not None:
-            app.state.config['configurable'].update(config['configurable'])
-        else:
-            app.state.config = config
-    else:
-        if getattr(app.state, "config", None) is not None:
-            app.state.config.update(config) 
-        else:
-            app.state.config = config
-
-    return JSONResponse(app.state.config, status_code=200)
-    
-    
-    # config = {
-    #         "configurable": {
-    #             "user_ctx": {"name":"Evan Woods", "description": "Software developer"},
-    #             "assistant_ctx": {
-    #                 "name":"Shivon Zilis",
-    #                 "description":"Director of Operations at Neuralink"},
-    #             "assistant_id":"59b682f8-9a9c-4f01-bc86-29d487131e5e", 
-    #             "user_id":"61f439e3-8557-4710-9d81-13124b35ceca"
-    #         }
-    #     }
-
-from fastapi.responses import RedirectResponse
-
-@app.get("/")
-async def docs_redirect():
-    return RedirectResponse(url="/docs")
-
-@app.get("/list_avatars")
-async def list_avatars(
+@app.get("/message")
+async def message(
+    response: Response,
+    message: Optional[str] = "Hello!",
     current_user: dict = Depends(get_current_user),
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security),
     ):
+
+    assistant_config_str = response.get("assistant_config", None)
+    if assistant_config_str:
+        assistant_config = json.loads(assistant_config_str)
+    else:
+        raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
+
     if not current_user:
-        result = await get_public_avatars()
-        return result
+        user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
+        user_name = None,
+        user_description = None
+    else:
+        user_id = current_user['sub']
+        user_name = current_user.get('name')
+        user_description = current_user.get('description')
 
-
-    try: 
-        client = get_client()
-        response = await client.assistants.search()
-        if type(response) is list:
-            avatar_list = response[0]
-        else:
-            raise AssertionError("response is not a list")
-        return JSONResponse(avatar_list, status_code=200)
-    except Exception as e:
-        error = f"Error in listing avatars: {e}"
-        return JSONResponse(error, status_code=500)
-
-
-@app.post("create_avatar")
-async def create_avatar(
-    name: str, 
-    description: Optional[str] = None):
-
-    # config = getattr(app.state, "config")
-    # if config.get('configurable', {}).get("user_id", None)
-
-    try:
-        client = get_client()
-        response = client.assistants.create(graph_id = "Anubis", description=description, name=name)
-        return JSONResponse(response, status_code=200)
-    except Exception as e:
-        error = "Error: {e}".format(error = e)
-        return JSONResponse(error, status_code=500)
+    config = {
+            "configurable": {
+                "user_ctx": {"name":user_name, "description": user_description},
+                "user_id":user_id
+            }
+        }
     
-     
+    # update with assistant information
+    config['configurable'].update(assistant_config['configurable'])
+
+    if app.state.context.deployment == 'FALSE':
+        # store = app.state.store
+        graph = app.state.graph
+
+        # system_time = datetime.now(tz=timezone.utc).isoformat
+        # content = [{"type":"text", "text": system_time}]
+        # input = {"messages": HumanMessage(content=content)}
+        # # store = make_pg_store()
+
+        # result = await url_loading_graph.ainvoke(input, config=config)
+
+        # logger.info(f"config: {config}")
+        
+        result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
+
+        logger.info(f"{result}")
+
+        return JSONResponse(result['messages'][-1].content, status_code=200)
+
 
 # @app.post("/upload-media")
 # async def upload_media(

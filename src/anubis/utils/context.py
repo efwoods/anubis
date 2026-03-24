@@ -173,6 +173,12 @@ class GlobalContext:
         default=None, 
         metadata={"description": "api key for user authentication"}
     )
+
+    admin_user_id: str = field(
+        default=None,
+        metadata={"description": "user_id to allow the creation of public avatars. Reserved for CEO."}
+    )
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

@@ -7,9 +7,6 @@ services:
         ports:
             - "80:8000"
             - "5687:5687"
-        environment:
-            REDIS_URI: "rediss://:jgElK7rhZT34S56sGHh6XLF9XbEhw2ozNAzCaDYvhWA=@anubis-redis.redis.cache.windows.net:6380"
-            POSTGRES_URI: "postgres://pgadmin:datagatE33@anubis-pg.postgres.database.azure.com:5432/postgres?sslmode=require"
         healthcheck:
             test: python /api/healthcheck.py
             interval: 60s

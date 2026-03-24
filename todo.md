@@ -65,12 +65,17 @@ I'm still getting to know myself, and I don't have much information about my own
 - use the evaluation dataset with llm as a judge to evaluate the generated responses for the dataset
 - (future) self-avatar, each message can be used (stored as a message in a message run) for evaluation as above
 
+##
+one message is 58 bytes (input and response) in redis cache
 
 # Todo
 <!-- production redis & production pg db connection  -->
+
+send images in messages for id in the app (good to see you!)
 upload bible
-user accounts
 scalable api (kubernetes)
-change redis and postgres (exposed credentials and expensive)
-vanity url
+ssl on vanity url
 ci-cd build and push to azure
+
+                                                         
+https://claude.ai/chat/7ea64dfd-00b7-4743-88c0-6ee4c21ab1c3

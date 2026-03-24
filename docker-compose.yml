@@ -3,7 +3,7 @@ volumes:
         driver: local
 services:
     langgraph-api:
-        image: evdev3/anubis-langgraph-api:0.0.2
+        image: evdev3/anubis-langgraph-api:latest
         dns:
             - 168.83.129.16
             - 8.8.8.8

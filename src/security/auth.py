@@ -131,8 +131,8 @@ def update_user_login_status(user_id: str, is_logged_in: bool):
         headers=_mgmt_headers(),
     )
 
-def get_user(user_id: str) -> dict:
-    response = httpx.get(
+async def get_user(user_id: str, request: Request) -> dict:
+    response = await request.app.state.httpx_client.get(
         f"{BASE_AUTH_URL}/api/v2/users/{user_id}",
         headers = _mgmt_headers()
     )
@@ -158,14 +158,14 @@ def send_verification_email(user_id: str) -> dict:
 # Token Verification
 
 @lru_cache(maxsize=1)
-def _get_jwks() -> dict:
-    resp = httpx.get(f"https://{DOMAIN}/.well-known/jwks.json")
+async def _get_jwks(request: Request) -> dict:
+    resp = await request.app.state.httpx_client.get(f"https://{DOMAIN}/.well-known/jwks.json")
     resp.raise_for_status()
     return resp.json()
 
-def verify_token(token: str) -> dict:
+async def verify_token(token: str, request:Request) -> dict:
     """Decodes and validates an Auth0 JWT. Returns the payload."""
-    jwks = _get_jwks()
+    jwks = await _get_jwks(request)
     unverified_header = jwt.get_unverified_header(token)
     
     rsa_key = next(
@@ -217,7 +217,7 @@ async def get_current_user(request: Request, res: Optional[HTTPAuthorizationCred
     
     try:
         token = res.credentials
-        payload = verify_token(token)
+        payload = await verify_token(token, request=request)
         return payload  # This contains 'sub', 'email', etc.
     except Exception as e:
         raise HTTPException(
@@ -271,11 +271,11 @@ def login(body: LoginRequest):
         raise HTTPException(status_code=response.status_code, detail=response.json())
 
 @security_route.get("/get_user_profile")
-def get_user_profile(current_user: dict = Depends(get_current_user)):
+async def get_user_profile(request: Request, current_user: dict = Depends(get_current_user)):
     # You don't need to pass user_id in the URL or body; 
     # it is extracted from the token you're wearing!
     user_id = current_user["sub"]
-    response = get_user(user_id=user_id)
+    response = await get_user(request=request, user_id=user_id)
     return {"user_id": user_id, "full_payload": response}
 
 @security_route.post("/logout")
@@ -304,7 +304,7 @@ async def authenticate(authorization: str | None) -> Auth.types.MinimalUserDict:
         raise Auth.exceptions.HTTPException(status_code=401, detail="Invalid auth scheme")
 
     try:
-        payload = verify_token(token)
+        payload = await verify_token(token)
     except Exception as e:
         raise Auth.exceptions.HTTPException(status_code=401, detail=str(e))
 

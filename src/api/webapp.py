@@ -42,6 +42,8 @@ from fastapi.responses import RedirectResponse
 
 from uuid import uuid4, uuid5, NAMESPACE_URL
 
+import httpx
+
 async def get_public_avatars(assistant_id: Optional[str] = None, 
                              user_id: Optional[str] = None):
     pool = app.state.pool
@@ -86,6 +88,7 @@ async def lifespan(app: FastAPI):
         
     # Initialize context / context
     app.state.context = GlobalContext()
+    app.state.httpx_client = httpx.AsyncClient()
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
         logger.warning(f"app.state.context.dev: {app.state.context.dev}")

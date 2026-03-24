@@ -5,7 +5,7 @@ services:
     langgraph-api:
         image: evdev3/anubis-langgraph-api:latest
         ports:
-            - "80:8000"
+            - "8123:8000"
         command: uvicorn webapp:app --host 0.0.0.0 --port 8000
         healthcheck:
             test: python /api/healthcheck.py

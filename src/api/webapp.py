@@ -137,6 +137,13 @@ async def documentation():
 
 app.include_router(router=security_route)
 
+from langgraph_sdk.auth.types import AuthContext
+
+@auth.on
+@app.get("/test_auth")
+async def test_auth(ctx, value):
+    return {"Hello": "World"}
+
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
 

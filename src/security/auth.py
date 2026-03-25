@@ -43,7 +43,7 @@ BASE_AUTH_URL = f"https://{DOMAIN}"
 @lru_cache(maxsize=1)
 async def _get_mgmt_token(request: Request) -> str:
     """Get a Management API token using client credentials."""
-    resp = request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/token", json={
+    resp = await request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/token", json={
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -69,10 +69,10 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
         "name": name
     }
 
-    headers = await _mgmt_headers()
+    headers = await _mgmt_headers(request)
 
 
-    response = request.app.state.httpx_client.post(
+    response = await request.app.state.httpx_client.post(
         f"{BASE_AUTH_URL}/api/v2/users",
         json=payload,
         headers=headers,
@@ -81,7 +81,7 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
     return response
 
 async def logout_user(refresh_token: str, request: Request) -> None:
-    response = request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/revoke", json={
+    response = await request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/revoke", json={
         "client_id":CLIENT_ID,
         "client_secret": CLIENT_SECRET, 
         "token": refresh_token, 
@@ -93,7 +93,7 @@ async def login_user(email: str, password: str, request: Request) -> dict:
     Authenticates a user and returns access/id/refresh tokens.
     Requires Resource Owner Password Grant to be enabled.
     """
-    response = request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/token", json={
+    response = await request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/token", json={
         "grant_type": "password",
         "username": email,
         "password": password,
@@ -106,7 +106,7 @@ async def login_user(email: str, password: str, request: Request) -> dict:
 
 async def delete_user(user_id: str, request: Request) -> None:
     headers = await _mgmt_headers(request)
-    response = request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{user_id}", 
+    response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{user_id}", 
                             headers = headers)
     
     if response.status_code == 204:
@@ -114,28 +114,11 @@ async def delete_user(user_id: str, request: Request) -> None:
     
     raise HTTPException(status_code=response.status_code, detail=response.json())
 
-async def update_user_login_status(user_id: str, is_logged_in: bool, request: Request):
-    """Updates Auth0 user_metadata with login status."""
-    payload = {
-        "user_metadata": {
-            "logged_in": is_logged_in
-        }
-    }
-
-    logger.warning('update login status breakpoint')
-    # Note: user_id must be URL encoded (e.g., auth0|123 -> auth0%7C123)
-    encoded_id = quote(user_id, safe="")
-    headers = await _mgmt_headers(request)
-    request.app.state.httpx_client.patch(
-        f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
-        json=payload,
-        headers=headers,
-    )
 
 async def get_user(user_id: str, request: Request) -> dict:
     response = await request.app.state.httpx_client.get(
         f"{BASE_AUTH_URL}/api/v2/users/{user_id}",
-        headers = await _mgmt_headers()
+        headers = await _mgmt_headers(request=request)
     )
     response.raise_for_status()
     return response.json()
@@ -143,10 +126,10 @@ async def get_user(user_id: str, request: Request) -> dict:
 
 
 async def send_verification_email(user_id: str, request: Request) -> dict:
-    response = request.app.state.httpx_client.post(
+    response = await request.app.state.httpx_client.post(
         f"{BASE_AUTH_URL}/api/v2/jobs/verification-email",
         json={"user_id": user_id},
-        headers=await _mgmt_headers(),
+        headers=await _mgmt_headers(request=request),
     )
     if response.status_code >= 400:
         raise HTTPException(
@@ -191,7 +174,6 @@ async def verify_token(token: str, request:Request) -> dict:
         issuer=f"https://{DOMAIN}/",
     )
 
-
 # ── Schemas ────────────────────────────────────────────────────────────────
 class SignupRequest(BaseModel):
     email: str
@@ -227,7 +209,6 @@ async def get_current_user(request: Request, res: Optional[HTTPAuthorizationCred
         )
 
 # ── Routes ─────────────────────────────────────────────────────────────────
-
 @security_route.post("/signup")
 async def signup(body: SignupRequest, request:Request):
     response = await signup_user(body.email, body.password, name=body.name, request=request)
@@ -250,13 +231,12 @@ def delete(user_id: str, current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Forbidden")
     response = delete_user(encoded_id)
     return response
-
-
+   
 @security_route.post("/login")
-def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
     try:
         # returns: access_token, refresh_token, id_token, expires_in
-        response = login_user(body.email, body.password)
+        response = await login_user(body.email, body.password, request=request)
         response.raise_for_status()
         logger.warning(f"response.status_code: {response.status_code}")
         if response.status_code == 200:
@@ -264,7 +244,22 @@ def login(body: LoginRequest):
             logger.warning(f"DATA: {data}")
             user_info = jwt.get_unverified_claims(data.get('id_token'))
             logger.warning(f"DATA: {user_info}")
-            update_user_login_status(user_info['sub'], True)
+            logger.warning("XXXXXXXXXXXXXXXXXXXXX UPDATE USER LOGIN")
+            payload = {
+                "user_metadata": {
+                    "logged_in": True
+                }
+            }
+        
+            logger.warning('update login status breakpoint')
+            # Note: user_id must be URL encoded (e.g., auth0|123 -> auth0%7C123)
+            encoded_id = quote(user_info['sub'], safe="")
+            headers = await _mgmt_headers(request)
+            await request.app.state.httpx_client.patch(
+                f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
+                json=payload,
+                headers=headers,
+            )
             return data
         else:
             raise HTTPException(status_code=response.status_code, detail=response.json())
@@ -280,18 +275,32 @@ async def get_user_profile(request: Request, current_user: dict = Depends(get_cu
     return {"user_id": user_id, "full_payload": response}
 
 @security_route.post("/logout")
-def logout(body: LogoutRequest, current_user: dict = Depends(get_current_user)):
+async def logout(body: LogoutRequest, request:Request, current_user: dict = Depends(get_current_user)):
 
-    response = logout_user(body.refresh_token)
+    response = await logout_user(body.refresh_token, request=request)
     try:
 
         response.raise_for_status()
         if response.status_code == 200:
-            update_user_login_status(current_user['sub'], False)
+            logger.warning("XXXXXXXXXXXXXXXXXXXXX UPDATE USER LOGIN")
+            payload = {
+                "user_metadata": {
+                    "logged_in": False
+                }
+            }
+        
+            logger.warning('update login status breakpoint')
+            # Note: user_id must be URL encoded (e.g., auth0|123 -> auth0%7C123)
+            encoded_id = quote(current_user['sub'], safe="")
+            headers = await _mgmt_headers(request)
+            await request.app.state.httpx_client.patch(
+                f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
+                json=payload,
+                headers=headers,
+            )
         return {"message": "Logged out successfully"}
     except Exception as e:
         raise HTTPException(detail = response.json(), status_code=response.status_code)
-
 
 
 @auth.authenticate

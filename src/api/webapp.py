@@ -140,52 +140,51 @@ app.include_router(router=security_route)
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
 
-@app.post("/create_avatar")
-async def create_avatar(
-    name: str, 
-    description: Optional[str] = None,
-    is_public: Optional[bool] = False,
-    # is_self_avatar: Optional[bool] = False,
-    current_user: dict = Depends(get_current_user),
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
-    ):
+# @app.post("/create_avatar")
+# async def create_avatar(
+#     name: str, 
+#     description: Optional[str] = None,
+#     is_public: Optional[bool] = False,
+#     # is_self_avatar: Optional[bool] = False,
+#     current_user: dict = Depends(get_current_user),
+#     ):
 
-    # If the avatar is of the individual, then the avatar is allowed to be made public. 
-    # Reference image, audio, and third-party authenticated account is required to create a shareable avatar. Limited to one shareable avatar of themselves.
-    # Include reference image, reference audio
+#     # If the avatar is of the individual, then the avatar is allowed to be made public. 
+#     # Reference image, audio, and third-party authenticated account is required to create a shareable avatar. Limited to one shareable avatar of themselves.
+#     # Include reference image, reference audio
 
-    logger.info(f"breakpoint")
+#     logger.info(f"breakpoint")
 
-    if not current_user:
-        return JSONResponse(
-            content="User must be logged in to create avatars.", 
-            status_code=400
-        )
+#     if not current_user:
+#         return JSONResponse(
+#             content="User must be logged in to create avatars.", 
+#             status_code=400
+#         )
     
-    try:
-        context = app.state.context
-        token = auth_cred.credentials
-        client = get_client(headers={"Authorization": f"Bearer {token}"})
-        assistant_id = str(uuid4())
-        metadata = {
-                "user_id": current_user['sub'], 
-                "assistant_id":assistant_id,
-                "is_public": False
-            }
+#     try:
+#         context = app.state.context
+#         # token = auth_cred.credentials
+#         # client = get_client(headers={"Authorization": f"Bearer {token}"})
+#         assistant_id = str(uuid4())
+#         metadata = {
+#                 "user_id": current_user['sub'], 
+#                 "assistant_id":assistant_id,
+#                 "is_public": False
+#             }
         
-        if current_user.get('sub', None) is context.admin_user_id:
-            metadata['is_public'] = is_public
+#         if current_user.get('sub', None) is context.admin_user_id:
+#             metadata['is_public'] = is_public
         
-        response = await client.assistants.create(
-            graph_id = "Anubis", 
-            description=description, 
-            name=name, 
-            assistant_id=assistant_id, 
-            metadata=metadata)
+#         response = await client.assistants.create(
+#             graph_id = "Anubis", 
+#             description=description, 
+#             name=name, 
+#             assistant_id=assistant_id, 
+#             metadata=metadata)
         
-        return JSONResponse(response, status_code=200)
-    except Exception as e:
-        return HTTPException(detail = e, status_code=500)
+#         return JSONResponse(response, status_code=200)
+#     except Exception as e:
+#         return HTTPException(detail = e, status_code=500)
 
 @app.delete("/delete_avatar")
 async def delete_avatar(
@@ -387,9 +386,9 @@ async def message(
     response: Response,
     message: Optional[str] = "Hello!",
     current_user: dict = Depends(get_current_user),
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security),
     ):
 
+    logger.info("breakpoint")
     assistant_config_str = response.get("assistant_config", None)
     if assistant_config_str:
         assistant_config = json.loads(assistant_config_str)

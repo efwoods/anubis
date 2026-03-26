@@ -76,6 +76,5 @@ upload bible
 scalable api (kubernetes)
 ssl on vanity url
 ci-cd build and push to azure
-
                                                          
 https://claude.ai/chat/7ea64dfd-00b7-4743-88c0-6ee4c21ab1c3

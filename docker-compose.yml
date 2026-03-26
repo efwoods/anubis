@@ -9,7 +9,7 @@ services:
             - 8.8.8.8
         ports:
             - "8123:8000"
-            - "5687:5687"
+            - "5678:5678"
         healthcheck:
             test: python /api/healthcheck.py
             interval: 60s

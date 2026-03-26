@@ -44,6 +44,11 @@ from uuid import uuid4, uuid5, NAMESPACE_URL
 
 import httpx
 
+import debugpy
+if os.getenv("DEBUG", 'false').lower() == 'true':
+        debugpy.listen(('0.0.0.0', 5678))
+
+
 async def get_public_avatars(assistant_id: Optional[str] = None, 
                              user_id: Optional[str] = None):
     pool = app.state.pool
@@ -52,23 +57,23 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         # Retrieve the public avatar matching the assistant_id
         search_query = """
         SELECT * FROM assistant 
-        WHERE metadata @> '{"is_public": true}'"
+        WHERE metadata @> '{"is_public": true}
         AND assistant_id IS %s
         """
     elif user_id:
         # Retrieve all public avatars not owned by the current user.
         search_query = """
         SELECT * FROM assistant
-        WHERE metadata @> '{"is_public": true}'"
+        WHERE metadata @> '{"is_public": true}
         AND metadata->user_id IS %s
         """
     else:
         # Retrieve all public avatars
         search_query = """
-        SELECT * FROM assistant 
-        WHERE metadata @> '{"is_public": true}'"
+        SELECT * FROM assistant
+        WHERE (metadata->'is_public')::boolean = TRUE
         """
-
+# WHERE metadata->>'is_public'::boolean IS TRUE
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             if assistant_id:
@@ -89,6 +94,7 @@ async def lifespan(app: FastAPI):
     # Initialize context / context
     app.state.context = GlobalContext()
     app.state.httpx_client = httpx.AsyncClient()
+    
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
         logger.warning(f"app.state.context.dev: {app.state.context.dev}")
@@ -100,11 +106,13 @@ async def lifespan(app: FastAPI):
                 open=False,  # don't open on construction
             )
 
-            await pool.open()
+            app.state.pool = pool
+
+            await app.state.pool.open()
             try:
                 embed = "huggingface:" + app.state.context.embedding_model
                 field = ["document.kwargs.page_content"]
-                store = AsyncPostgresStore(pool, index = IndexConfig(dims=384, embed=embed, field=field))
+                store = AsyncPostgresStore(app.state.pool, index = IndexConfig(dims=384, embed=embed, field=field))
                 await store.setup()
                 logger.info("Store setup complete")
 
@@ -186,6 +194,58 @@ app.include_router(router=security_route)
 #     except Exception as e:
 #         return HTTPException(detail = e, status_code=500)
 
+
+@app.get("/test")
+async def test(current_user: dict = Depends(get_current_user)):
+    return {"current_user": current_user}
+
+@app.get("/list_public_avatars")
+async def list_public_avatars(assistant_id: Optional[str] = None):
+    logger.info("breakpoint")
+    public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
+    return public_avatars_result
+    # if not current_user:
+        # return public_avatars_result
+    # try: 
+    #     token = current_user['app_metadata']['api_key']
+    #     client = get_client(headers = {"Authentication": f"{token}"})
+    #     response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
+    #     if type(response) is list:
+    #         avatar_list = response[0]
+    #     else:
+    #         raise AssertionError("response is not a list")
+    #     logger.info(f"breakpoint")
+    #     return_list = [avatar_list, public_avatars_result] # public and private avatars
+    #     return JSONResponse(return_list, status_code=200)
+    # except Exception as e:
+    #     error = f"Error in listing avatars: {e}"
+    #     return JSONResponse(error, status_code=500)
+
+
+@app.get("/list_user_avatars")
+async def list_user_avatars(
+    current_user: dict = Depends(get_current_user),
+    ):
+    logger.info("breakpoint")
+    public_avatars_result = await get_public_avatars()
+    if not current_user:
+        return public_avatars_result
+    try: 
+        token = current_user['app_metadata']['api_key']
+        client = get_client(headers = {"Authentication": f"{token}"})
+        response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
+        if type(response) is list:
+            avatar_list = response[0]
+        else:
+            raise AssertionError("response is not a list")
+        logger.info(f"breakpoint")
+        return_list = [avatar_list, public_avatars_result] # public and private avatars
+        return JSONResponse(return_list, status_code=200)
+    except Exception as e:
+        error = f"Error in listing avatars: {e}"
+        return JSONResponse(error, status_code=500)
+
+
 @app.delete("/delete_avatar")
 async def delete_avatar(
     assistant_id: Optional[str] = None,
@@ -260,38 +320,14 @@ async def share_avatar(
         except Exception as e:
             raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
 
-@app.get("/list_avatars")
-async def list_avatars(
-    current_user: dict = Depends(get_current_user),
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
-    ):
-    logger.info("breakpoint")
-    public_avatars_result = await get_public_avatars()
-    if not current_user:
-        return public_avatars_result
-    try: 
-        token = auth_cred.credentials
-        client = get_client(headers = {"Authentication": f"Bearer {token}"})
-        response = await client.assistants.search(metadata={"user_id": current_user})
-        if type(response) is list:
-            avatar_list = response[0]
-        else:
-            raise AssertionError("response is not a list")
-        logger.info(f"breakpoint")
-        return_list = [avatar_list, public_avatars_result] # public and private avatars
-        return JSONResponse(return_list, status_code=200)
-    except Exception as e:
-        error = f"Error in listing avatars: {e}"
-        return JSONResponse(error, status_code=500)
-
-
+    
+from src.security.auth import update_assistant_config
 @app.post("/select_avatar")
 async def select_avatar(
-    response: Response,
+    request: Request,
     current_user: dict = Depends(get_current_user),
     assistant_id: Optional[str] = None, 
     assistant_name: Optional[str] = None,
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
     ):
 
     if not current_user and not assistant_id:
@@ -311,23 +347,40 @@ async def select_avatar(
                     "description": result[0].get("description", None)
                 }
             })
-        response.set_cookie(
-            key="assistant_config",
-            value = json.dumps(assistant_config),
-            httponly=True,
-            samesite="lax"
-        )
+        result = await update_assistant_config(assistant_config = assistant_config, request=request)
+        return assistant_config
 
     else:
         
-        token = auth_cred.credentials
-        client = get_client(headers={f"Authorization": "Bearer {token}"})
+        token = current_user['API_KEY']
+        client = get_client(headers={"Authorization": f"{token}"})
+        user_id = current_user['sub'].split("|")[1]
+        #         api_key_hash = _hash_key(api_key)
+        # payload = {
+        #     "email": email, 
+        #     "password": password, 
+        #     "connection": CONNECTION,
+        #     "name": name,
+        #     "app_metadata":{
+        #         "api_key": api_key_hash
+        #     }
+        # }
+
+        # headers = await _mgmt_headers(request)
+
+        # response = await request.app.state.httpx_client.post(
+        #     f"{BASE_AUTH_URL}/api/v2/users",
+        #     json=payload,
+        #     headers=headers,
+        # ) 
+
+        # response.raise_for_status()
 
         if assistant_id:
             try:
                 result =  await client.assistants.search(
                     metadata={
-                        "user_id": current_user['sub'], 
+                        "user_id": user_id, 
                         "assistant_id":assistant_id
                         })
                 assistant_config = {
@@ -339,12 +392,7 @@ async def select_avatar(
                         }
                     }
                 }
-                response.set_cookie(
-                    key="assistant_config", 
-                    value = json.dumps(assistant_config), 
-                    httponly=True,
-                    samesite="lax"
-                )
+                result = await update_assistant_config(assistant_config = assistant_config, request=request)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error using assistant_id for logged in user {e}")
             
@@ -365,12 +413,7 @@ async def select_avatar(
                             "assistant_id": assistant_id
                         }
                     }
-                    response.set_cookie(
-                        key="assistant_config", 
-                        value = json.dumps(assistant_config), 
-                        httponly=True,
-                        samesite="lax"
-                    )
+                    result = await update_assistant_config(assistant_config = assistant_config, request=request)
                 except Exception as e:
                     raise HTTPException(status_code=500, detail = f"Error during avatar selection via assistant_name: {e}")
             except Exception as e:
@@ -389,10 +432,8 @@ async def message(
     ):
 
     logger.info("breakpoint")
-    assistant_config_str = response.get("assistant_config", None)
-    if assistant_config_str:
-        assistant_config = json.loads(assistant_config_str)
-    else:
+    assistant_config = current_user.get("app_metadata", {}).get("assitant_config", {})
+    if not assistant_config:
         raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
 
     if not current_user:

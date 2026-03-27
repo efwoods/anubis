@@ -301,6 +301,7 @@ async def get_current_user(request: Request, api_key: str | None = Depends(api_k
     #         detail=f"Invalid or expired token: {str(e)}"
     #     )
 
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 @security_route.post("/signup")
 async def signup(body: SignupRequest, request:Request):

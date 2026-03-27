@@ -44,10 +44,32 @@ from uuid import uuid4, uuid5, NAMESPACE_URL
 
 import httpx
 
+from pydantic import BaseModel
+from typing import Any
+from uuid import UUID
+
+from langgraph_sdk.schema import Assistant
+from psycopg.rows import class_row
+
+
+class ASSISTANT_QUERY(BaseModel):
+    assistant_id: UUID
+    graph_id: str
+    created_at: datetime
+    updated_at: datetime
+    config: dict[str, Any]
+    metadata: dict[str, Any]
+    version: int
+    name: str
+    description: str | None
+    context: dict[str, Any]
+
+    def to_assistant(self) -> Assistant:
+        return self.model_dump(mode='json')
+
 import debugpy
 if os.getenv("DEBUG", 'false').lower() == 'true':
         debugpy.listen(('0.0.0.0', 5678))
-
 
 async def get_public_avatars(assistant_id: Optional[str] = None, 
                              user_id: Optional[str] = None):
@@ -57,15 +79,15 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         # Retrieve the public avatar matching the assistant_id
         search_query = """
         SELECT * FROM assistant 
-        WHERE metadata @> '{"is_public": true}
-        AND assistant_id IS %s
+        WHERE metadata @> '{"is_public": true}'
+        AND assistant_id = %s
         """
     elif user_id:
         # Retrieve all public avatars not owned by the current user.
         search_query = """
         SELECT * FROM assistant
-        WHERE metadata @> '{"is_public": true}
-        AND metadata->user_id IS %s
+        WHERE metadata @> '{"is_public": true}'
+        AND metadata->user_id = %s
         """
     else:
         # Retrieve all public avatars
@@ -75,14 +97,16 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         """
 # WHERE metadata->>'is_public'::boolean IS TRUE
     async with pool.connection() as conn:
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=class_row(ASSISTANT_QUERY)) as cur:
             if assistant_id:
                 await cur.execute(search_query, (assistant_id, ))
             elif user_id:
                 await cur.execute(search_query, (user_id, ))
             else:
                 await cur.execute(search_query)
-            return await cur.fetchall()
+            data = await cur.fetchall()
+
+            return [assistant_query.to_assistant() for assistant_query in data]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -231,19 +255,16 @@ async def list_user_avatars(
     if not current_user:
         return public_avatars_result
     try: 
-        token = current_user['app_metadata']['api_key']
+        token = current_user['API_KEY']
         client = get_client(headers = {"Authentication": f"{token}"})
         response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
-        if type(response) is list:
+        if len(response) > 0:
             avatar_list = response[0]
-        else:
-            raise AssertionError("response is not a list")
-        logger.info(f"breakpoint")
-        return_list = [avatar_list, public_avatars_result] # public and private avatars
-        return JSONResponse(return_list, status_code=200)
+            public_avatars_result.append(avatar_list) # public and private avatars
+        return JSONResponse(public_avatars_result, status_code=200)
     except Exception as e:
         error = f"Error in listing avatars: {e}"
-        return JSONResponse(error, status_code=500)
+        return HTTPException(detail=error, status_code=500)
 
 
 @app.delete("/delete_avatar")
@@ -354,7 +375,7 @@ async def select_avatar(
         
         token = current_user['API_KEY']
         client = get_client(headers={"Authorization": f"{token}"})
-        user_id = current_user['sub'].split("|")[1]
+        user_id = current_user['identities'][0]['user_id']
         #         api_key_hash = _hash_key(api_key)
         # payload = {
         #     "email": email, 
@@ -370,25 +391,30 @@ async def select_avatar(
 
         # response = await request.app.state.httpx_client.post(
         #     f"{BASE_AUTH_URL}/api/v2/users",
-        #     json=payload,
+        #     json=payload,            
         #     headers=headers,
         # ) 
 
         # response.raise_for_status()
+                        # "user_id": user_id, 
 
         if assistant_id:
             try:
                 result =  await client.assistants.search(
                     metadata={
-                        "user_id": user_id, 
                         "assistant_id":assistant_id
                         })
+                if len(result)==0:
+                    assistant = {"name": None, "description": None}
+                else:
+                    assistant = result[0]
+                logger.info(f"result:{result}")
                 assistant_config = {
                     "configurable": {
                         "assistant_id": assistant_id,
                         "assistant_ctx": {
-                            "name":result[0].get("name", ""),
-                            "description":result[0].get("description", ""),
+                            "name":assistant.get("name", ""),
+                            "description":assistant.get("description", ""),
                         }
                     }
                 }
@@ -401,14 +427,17 @@ async def select_avatar(
                 result = await client.assistants.search(name=assistant_name)
                 try:
                     assert type(result) is list
-                    assert len(result) > 0
+                    if len(result) != 0:
+                        assistant = result[0]
+                    else:
+                        assistant = {"name": None, "description": None}
                     assistant_id = result[0].get("assistant_id", None)
                     assert assistant_id is not None
                     assistant_config = {
                         "configurable": {
                             "assistant_ctx": {
-                                "name": result[0].get('name', ''),
-                                'description': result[0].get('description', '')
+                                "name": assistant.get('name', ''),
+                                'description': assistant.get('description', '')
                             },
                             "assistant_id": assistant_id
                         }
@@ -428,6 +457,8 @@ async def select_avatar(
 async def message(
     response: Response,
     message: Optional[str] = "Hello!",
+    name: Optional[str] = None,
+    description: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     ):
 
@@ -441,9 +472,9 @@ async def message(
         user_name = None,
         user_description = None
     else:
-        user_id = current_user['sub']
-        user_name = current_user.get('name')
-        user_description = current_user.get('description')
+        user_id = current_user['identities']['user_id']
+        user_name = name
+        user_description = description
 
     config = {
             "configurable": {
@@ -475,96 +506,84 @@ async def message(
         return JSONResponse(result['messages'][-1].content, status_code=200)
 
 
-# @app.post("/upload-media")
-# async def upload_media(
-#     files: List[UploadFile] = File(...),
-#     user_id: str = Form(default="test_user_1234"),
-#     assistant_id: str = Form(default="project_gutenberg_assistant_uuid_1234"),
-#     reference_audio: bool = False,
-#     reference_image: bool = False, 
-#     proprietary_content: bool = False, 
-# ):
-#     # Context user_id, assistant_id
-#     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
-#     """
-#     Upload one or more media files for processing and indexing.
+
+@app.post("/upload-media")
+async def upload_media(
+    files: List[UploadFile] = File(...),
+    user_id: str = Form(default="test_user_1234"),
+    assistant_id: str = Form(default="project_gutenberg_assistant_uuid_1234"),
+    reference_audio: bool = False,
+    reference_image: bool = False, 
+    proprietary_content: bool = False, 
+    current_user: dict = Depends(get_current_user)
+):
+    # Context user_id, assistant_id
+    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
+    """
+    Upload one or more media files for processing and indexing.
     
-#     - **files**: One or more files to process
-#     - **user_id**: User identifier
-#     - **assistant_id**: Assistant identifier
-#     """
-#     try:
+    - **files**: One or more files to process
+    - **user_id**: User identifier
+    - **assistant_id**: Assistant identifier
+    """
+    try:
 
-#         # Read all uploaded files
-#         media_files = []
-#         for file in files:
-#             content = await file.read()
-#             media_files.append({
-#                 "filename": file.filename,
-#                 "content_type": file.content_type,
-#                 "content": content,
-#                 "user_id": user_id,
-#                 "assistant_id": assistant_id,
-#                 "reference_audio": reference_audio,
-#                 "reference_image": reference_image, 
-#                 "proprietary_content": proprietary_content
-#             })
+        # Read all uploaded files
+        media_files = []
+        for file in files:
+            content = await file.read()
+            media_files.append({
+                "filename": file.filename,
+                "content_type": file.content_type,
+                "content": content,
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "reference_audio": reference_audio,
+                "reference_image": reference_image, 
+                "proprietary_content": proprietary_content
+            })
         
-#         # Import graph here to avoid circular imports
-#         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
+        # Import graph here to avoid circular imports
+        # from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
         
-#         # Prepare input state
-#         initial_state = {
-#             "media_files": media_files,
-#         }
+        # Prepare input state
+        initial_state = {
+            "media_files": media_files,
+        }
 
-#         config = {
-#             "configurable": {
-#                 "user_ctx": {"user_id":user_id},
-#                 "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
-#             }
-#         }
+        config = {
+            "configurable": {
+                "user_ctx": {"user_id":user_id},
+                "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
+            }
+        }
 
-#         # process_media_graph_api_endpoint = app.state.process_media_graph_api_endpoint
-           
-#         # Invoke the graph
-#         # if context.dev == "TRUE":
-
-#         #     async with store_context_manager as store:
-#         #         await store.setup()
-#         #         logger.info(f"breakpoint")
-#         #         result = await process_media_graph_api_endpoint.ainvoke(
-#         #             initial_state, 
-#         #                 config=config,
-#         #                 store=store
-#         #             )
-#         # else:
-#         logger.info(f"breakpoint before process_media_graph")
-#         result = await process_media_graph_api_endpoint.ainvoke(
-#             initial_state, 
-#             config=config,
-#             )
-#             # store = app.state.store
     
-#         # Extract indexed documents info
-#         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-        
-#         return JSONResponse(
-#             status_code=200,
-#             content={
-#                 "status": "success",
-#                 "files_processed": len(files),
-#                 "documents_indexed": len(indexed_docs),
-#                 "filenames": [f.filename for f in files],
-#                 "message": "Media processed and indexed successfully"
-#             }
-#         )
+        logger.info(f"breakpoint before process_media_graph")
+        # result = await process_media_graph_api_endpoint.ainvoke(
+        #     initial_state, 
+        #     config=config,
+        #     )
     
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Error processing media: {str(e)}"
-#         )
+        # Extract indexed documents info
+        # indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "files_processed": len(files),
+                # "documents_indexed": len(indexed_docs),
+                "filenames": [f.filename for f in files],
+                "message": "Media processed and indexed successfully"
+            }
+        )
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing media: {str(e)}"
+        )
 
 # @app.post("/process-media-json")
 # async def process_media_json(
@@ -618,58 +637,6 @@ async def message(
 #             detail=f"Error processing media: {str(e)}"
 #         )
 
-
-# @app.get("/example-api")
-# async def example_call_to_extend_api_for_avatars(request: Request):
-#     context = GlobalContext()
-#     root_url = str(request.base_url) 
-#     logger.warning(f"root_url: {root_url}")
-
-#     async with httpx.AsyncClient() as client:
-#         namespaces = await client.post(f"{root_url}store/namespaces",
-#           headers={
-#               "Content-Type": "application/json",
-#               'x-api-key': f"LANGGRAPH_API_SERVER_KEY",
-#             },
-#             json={
-#               "max_depth": 1,
-#               "limit": 100,
-#               "offset": 0
-#             }
-#         )
-#         logger.info(f"breakpoing namespaces: {namespaces}")
-#     return ({"namespaces": namespaces.text})
-
-# from sqlalchemy import text
-
-# @app.get("/test_store_endpoint")
-# async def test_store_access_production(request: Request):
-    
-    # langgraph_client = app.state.langgraph_client
-    # test_search_results = await langgraph_client.assistants.search()
-
-    # logger.info(f"test_search_results: {test_search_results}")
-
-    # agent = test_search_results[0]
-
-    # thread = await langgraph_client.threads.create()
-
-    # logger.info(f"thread: {thread}")
-
-    # test_input = {"messages": [{"role": "human", "content": "what's the weather in la"}]}
-
-    # async for chunk in langgraph_client.runs.stream(thread['thread_id'], test_search_results["assistant_id"], input=input):
-    #     logger.info(f"chunk: {chunk}")
-
-    # db_session = app.state.db_session
-    # identify = "2feaa9d8-50c0-4550-81fa-9fb79bfe23f0.Anubis"
-    # logger.info(db_session)
-
-    
-    # with db_session() as session:
-    #     result = await session.execute(
-    #         text("SELECT * FROM store WHERE prefix LIKE :prefix"),
-    #         {"prefix": f"{identify}%"})
 
 
 if __name__ == "__main__":

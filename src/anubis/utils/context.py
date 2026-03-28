@@ -49,7 +49,10 @@ class IdentityContext:
 
 @dataclass
 class AssistantContext(IdentityContext):
-    pass
+    metadata: dict = field(
+        default=None, 
+        metadata={"description": "This is metadata that includes the user_id of the creator."}
+    )
 
 @dataclass 
 class UserContext(IdentityContext):

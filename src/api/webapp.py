@@ -406,6 +406,7 @@ async def select_avatar(
                             "assistant_ctx": {
                                 "name":assistant.get("name", ""),
                                 "description":assistant.get("description", ""),
+                                "metadata": assistant.get("metadata", {})
                             }
                         }
                     }
@@ -413,7 +414,8 @@ async def select_avatar(
                     assistant_config['configurable'].update({
                         "assistant_ctx": {
                             "name": public_avatar_result[0].get("name", None),
-                            "description": public_avatar_result[0].get("description", None)
+                            "description": public_avatar_result[0].get("description", None),
+                            "metadata": public_avatar_result[0].get("metadata", {})
                         }
                     })
                 provider_encoded_user_id = quote(current_user['user_id'], safe="")
@@ -552,8 +554,6 @@ async def message(
     logger.info(f"{result}")
 
     return JSONResponse(result['messages'][-1].content, status_code=200)
-
-
 
 @app.post("/upload-media")
 async def upload_media(

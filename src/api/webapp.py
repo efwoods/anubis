@@ -83,14 +83,14 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         search_query = """
         SELECT * FROM assistant 
         WHERE (metadata->>'is_public')::boolean = TRUE
-        AND assistant_id = %s
+        AND 'assistant_id' = %s
         """
     elif user_id:
         # Retrieve all public avatars not owned by the current user.
         search_query = """
         SELECT * FROM assistant
         WHERE (metadata->'is_public')::boolean = TRUE
-        AND metadata->user_id = %s
+        AND (metadata->>'user_id') != %s
         """
     else:
         # Retrieve all public avatars
@@ -251,8 +251,8 @@ async def list_user_avatars(
         client = get_client(headers = {"Authentication": f"{token}"})
         response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
         if len(response) > 0:
-            avatar_list = response[0]
-            public_avatars_result.append(avatar_list) # public and private avatars
+            avatar_list = response
+            public_avatars_result.extend(avatar_list) # public and private avatars
         return JSONResponse(public_avatars_result, status_code=200)
     except Exception as e:
         error = f"Error in listing avatars: {e}"
@@ -561,8 +561,6 @@ async def message(
 @app.post("/upload-media")
 async def upload_media(
     files: List[UploadFile] = File(...),
-    user_id: str = Form(default="test_user_1234"),
-    assistant_id: str = Form(default="project_gutenberg_assistant_uuid_1234"),
     reference_audio: bool = False,
     reference_image: bool = False, 
     proprietary_content: bool = False, 
@@ -578,6 +576,17 @@ async def upload_media(
     - **assistant_id**: Assistant identifier
     """
     try:
+
+        user_id = current_user['identities'][0]['user_id']
+        assitant_config = current_user['app_metadata']['assistant_config']
+        assistant_id = assitant_config['configurable']['assistant_id']
+        config = {
+            "configurable": {
+                "user_ctx": {"user_id":user_id},
+            }
+        }
+
+        config['configurable'].update(assitant_config['configurable'])
 
         # Read all uploaded files
         media_files = []
@@ -602,12 +611,7 @@ async def upload_media(
             "media_files": media_files,
         }
 
-        config = {
-            "configurable": {
-                "user_ctx": {"user_id":user_id},
-                "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
-            }
-        }
+
 
     
         logger.info(f"breakpoint before process_media_graph")

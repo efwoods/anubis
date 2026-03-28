@@ -727,8 +727,6 @@ async def extract_personality_from_image(
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
     logger.info(f"Extract_media_from_message NODE")
-
-
     if isinstance(runtime.context.user_ctx, dict):
         user_id = runtime.context.user_ctx.get("user_id", "")
     else:

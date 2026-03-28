@@ -61,7 +61,6 @@ async def process_uploaded_files_and_label_media_type(
     # get_value = await store.aget("evan", key="name")
     # logger.info("get_value: {get_value}")
 
-
     media_files = state.get('media_files', [])
     
     if not media_files:

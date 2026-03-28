@@ -50,7 +50,6 @@ from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.graph import MessagesState
 from langgraph.prebuilt import ToolNode
 
-
 from pydantic import Field
 
 from src.anubis.utils.nodes import load_consciousness
@@ -285,17 +284,7 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
     
 # async def update_response_metadata()
 
-from langgraph.prebuilt import ToolNode
-
-# avatar_tool_node = ToolNode([
-#     learn_information_about_the_user, 
-#     learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-#     create_episodic_memory, 
-#     recall_memories
-# ], handle_tool_errors=True)
-    
 """ GRAPH """
-
 # Build minimal graph: START -> agent -> END
 anubis_workflow = StateGraph(
     state_schema = GlobalState,

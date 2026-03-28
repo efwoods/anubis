@@ -34,3 +34,5 @@ supabase
 auth0-fastapi-api
 python-jose[cryptography]
 httpx
+
+debugpy

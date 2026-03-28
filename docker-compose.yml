@@ -1,15 +1,17 @@
 volumes:
     langgraph-data:
         driver: local
+        
 services:
     langgraph-api:
         image: evdev3/anubis-langgraph-api:latest
+        pull_policy: never
         dns:
             - 168.83.129.16
             - 8.8.8.8
         ports:
             - "8123:8000"
-            - "5687:5687"
+            - "5678:5678"
         healthcheck:
             test: python /api/healthcheck.py
             interval: 60s
@@ -19,3 +21,4 @@ services:
             - .env
         volumes:
             - .:/deps/anubis
+            - ~/.cache/huggingface:/root/.cache/huggingface

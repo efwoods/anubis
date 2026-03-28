@@ -56,6 +56,29 @@ def generate_api_key() -> str:
 def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
+
+async def update_assistant_config(hashed_api_key: str, provider_encoded_user_id: str, assistant_config: dict, request: Request):
+    try:
+        payload = {
+            "app_metadata": {
+                "assistant_config": assistant_config
+            }
+        }
+
+        headers = await _mgmt_headers(request)        
+        response = await request.app.state.httpx_client.patch(
+            f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}",
+            json=payload,
+            headers=headers
+        )
+
+        response.raise_for_status()
+        async with _cache_lock:
+            del _api_key_cache[hashed_api_key]
+        return response
+    except Exception as e:
+        raise HTTPException(detail="Error updating assistant configuration: {e}", status_code=response.status_code)
+
 # ── Management API token (cached) ──────────────────────────────────────────
 _mgmt_token_cache: dict = {"token": None, "expires": 0}
 import time
@@ -76,11 +99,9 @@ async def _get_mgmt_token(request: Request) -> str:
     _mgmt_token_cache['expires'] = now + data['expires_in'] - 60
     return _mgmt_token_cache['token']
 
-
 async def _mgmt_headers(request: Request) -> dict:
     access_token = await _get_mgmt_token(request)
     return {"Authorization": f"Bearer {access_token}"}
-
 
 # utility functions
 async def signup_user(email: str, password: str, request:Request, name: Optional[str] = None) -> dict:
@@ -141,17 +162,6 @@ async def login_user(email: str, password: str, request: Request) -> dict:
         return response  # access_token, id_token, refresh_token, expires_in
     except Exception as e:
         raise HTTPException(detail="Error logging in user: {e}", status_code=response.status_code)
-
-async def delete_user(user_id: str, request: Request) -> None:
-    headers = await _mgmt_headers(request=request)
-    response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{user_id}", 
-                            headers = headers)
-    
-    if response.status_code == 204:
-        return {"message":"User deleted"}
-    
-    raise HTTPException(status_code=response.status_code, detail=response.json())
-
 
 async def get_user(user_id: str, request: Request) -> dict:
     response = await request.app.state.httpx_client.get(
@@ -225,6 +235,14 @@ class LoginRequest(BaseModel):
 class LogoutRequest(BaseModel):
     refresh_token: str
 
+class UserDataCache(BaseModel):
+    pass
+    # pass asdf    
+
+class UserDataReturn(UserDataCache):
+    pass
+    # api_key: 
+
 # ── Dependency: require valid token ────────────────────────────────────────
 
 async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
@@ -254,8 +272,9 @@ async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
 
     async with _cache_lock:
         _api_key_cache[cache_key] = user
-    return user
 
+    user.update({"API_KEY":api_key})
+    return user
 
 async def get_current_user(request: Request, api_key: str | None = Depends(api_key_scheme)) -> dict:
     """
@@ -284,6 +303,7 @@ async def get_current_user(request: Request, api_key: str | None = Depends(api_k
     #         detail=f"Invalid or expired token: {str(e)}"
     #     )
 
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 @security_route.post("/signup")
 async def signup(body: SignupRequest, request:Request):
@@ -293,6 +313,7 @@ async def signup(body: SignupRequest, request:Request):
 @security_route.get("/resend_verification_email")
 async def resend_verification_email(request:Request, current_user: dict = Depends(get_current_user)):
     # TODO: RATE LIMIT API CALL
+    logger.info("breakpoint")
     return await send_verification_email(current_user["sub"], request=Request)
 
 @security_route.post("/rotate_api_key")
@@ -309,18 +330,20 @@ async def rotate_api_key(request: Request, email: str, password: str):
     new_key_hash = _hash_key(new_key)
 
     headers = await _mgmt_headers(request)
-    encoded_id = quote(current_user['sub'], safe="")
+    user_id = current_user['sub'].split("|")[1]
+    encoded_user_id = quote(current_user['sub'], safe="")
     try:
         response = await request.app.state.httpx_client.patch(
-            f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
+            f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}",
             json={"app_metadata": {"api_key":new_key_hash}},
             headers=headers
         )
+        response.raise_for_status()
     except Exception as e:
         raise HTTPException(detail=f"Error patching the new api_key: {e}", status_code=response.status_code)
 
     async with _cache_lock:
-        stale = [k for k, v in _api_key_cache.items() if v['user_id'] == current_user['sub']]
+        stale = [k for k, v in _api_key_cache.items() if v['identities'][0]['user_id'] == user_id]
         for k in stale:
             del _api_key_cache[k]
 
@@ -329,36 +352,43 @@ async def rotate_api_key(request: Request, email: str, password: str):
 
 @security_route.post("/forgot_password")
 async def forgot_password(email: str, request: Request, current_user = Depends(get_current_user)):
-    headers = await _mgmt_headers(request=request)
-    result = await request.app.state.httpx_client.post(
-        f"{BASE_AUTH_URL}/dbconnections/change_password",
-        json={
-            "client_id":  CLIENT_ID,
-            "email":      email,
-            "connection": CONNECTION,  # e.g. "Username-Password-Authentication"
-        },
-        headers=headers
-    )
+    try:
+        headers = await _mgmt_headers(request=request)
+        result = await request.app.state.httpx_client.post(
+            f"{BASE_AUTH_URL}/dbconnections/change_password",
+            json={
+                "client_id":  CLIENT_ID,
+                "email":      email,
+                "connection": CONNECTION,  # e.g. "Username-Password-Authentication"
+            },
+            headers=headers
+        )
 
-    if result.status_code != 200:
-        raise HTTPException(status_code=result.status_code, detail=result.json())
+        result.raise_for_status()
+        if result.status_code != 200:
+            raise HTTPException(status_code=result.status_code, detail="Error: {e}")
 
-    # Always return the same message — don't reveal if email exists
-    return {"message": "If that email exists, a password reset link has been sent."}
+        # Always return the same message — don't reveal if email exists
+        return {"message": "If that email exists, a password reset link has been sent."}
+    except Exception as e:
+        raise HTTPException(status_code=result.status_code, detail="Error: {e}")
 
 @security_route.delete("/delete_user")
 async def delete_user(request: Request, current_user: dict = Depends(get_current_user)):
     # Optional: ensure users can only delete themselves unless admin
-    api_key_hash = current_user['app_metadata']['api_key']
-    encoded_id = quote(current_user['user_id'], safe="")
-    headers = await _mgmt_headers(request)
-    response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}", 
-                            headers = headers)
-    if response.status_code == 204:
-        del _api_key_cache[api_key_hash]
-        return {"message":"User deleted"}
-    
-    raise HTTPException(status_code=response.status_code, detail=response.json())
+    try:
+        api_key_hash = current_user['app_metadata']['api_key']
+        encoded_user_id = quote(current_user['user_id'], safe="")
+        headers = await _mgmt_headers(request)
+        response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
+        response.raise_for_status()
+        if response.status_code == 204:
+            del _api_key_cache[api_key_hash]
+            return {"message":"User deleted"}
+        else:
+            raise HTTPException(status_code=response.status_code, detail=f"Error deleting user: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=response.status_code, detail=f"Error deleting user: {e}")
 
 # @security_route.post("/login")
 # async def login(body: LoginRequest, request: Request):
@@ -443,7 +473,7 @@ async def authenticate(request: Request, authorization: str ) -> dict:
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API key")
     
-    return {"identity": user["user_id"], "metadata": {"user_id": user["user_id"]}}
+    return {"identity": user["identities"][0]['user_id'], "metadata": {"user_id": user['identities'][0]["user_id"]}}
 
 
 # Token Authentication

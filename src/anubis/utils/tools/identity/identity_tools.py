@@ -634,6 +634,9 @@ async def update_identity_via_text_content_url(
     Args:
         url (str): This is a url to a website.
     """
+    
+    logger.info(f"breakpoint")
+
     # Extract 
     user_id = runtime.config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
     assistant_id = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")

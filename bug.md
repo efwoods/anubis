@@ -60,3 +60,8 @@ You told me that your name is Evan Woods. That's the only information I have abo
 
 ## BUG: false positive on tool calling
 I'm still getting to know myself, and I don't have much information about my own identity. I don't know my name or any personal details about myself. However, I can tell you that I'm currently conversing with you, Evan Woods. If you'd like to share some information about me or my identity, I'll do my best to remember it. [learn_information_about_yourself_through_text_from_the_user_as_a_memory(content="User asked me to tell them about myself."), recall_memories()]
+
+## BUG: anyone will adopt information to the ai without verification if there is not a tool call. 
+require tuning on the system prompt for learning information about yourself to be called and guard rails to prevent the update of the identity from non-creators during chat.
+
+calling learn information about yourself while not the creator will prevent message response. messages continue in normal conversation. 

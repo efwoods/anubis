@@ -688,7 +688,7 @@ async def update_identity_via_reference_image(message: HumanMessage, runtime: An
 
     content = getattr(message, "content")
     for message in content:
-        if message.get("image_url", "") is not "":
+        if message.get("image_url", "") != "":
             image_url = message.get("image_url")
     description = image_to_text(target_image_url=image_url)
 

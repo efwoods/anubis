@@ -3,12 +3,28 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Attach to LangGraph Server",
+      "name": "Attach to Docker LangGraph Server",
       "type": "debugpy",
       "request": "attach",
       "connect": {
         "host": "localhost",
         "port": 5678
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/deps/anubis"
+        }
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "Attach to Memory LangGraph Server",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5687
       },
       "pathMappings": [
         {

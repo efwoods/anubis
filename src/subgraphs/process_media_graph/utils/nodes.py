@@ -17,7 +17,6 @@ import tempfile
 import base64
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
-from langgraph.runtime import Runtime
 
 # from langgraph.config import get_store
 
@@ -60,7 +59,6 @@ async def process_uploaded_files_and_label_media_type(
     # await store.aput(namespace=namespace, key="evan", value={"name": "evan"})
     # get_value = await store.aget("evan", key="name")
     # logger.info("get_value: {get_value}")
-
 
     media_files = state.get('media_files', [])
     
@@ -728,8 +726,6 @@ async def extract_personality_from_image(
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
     logger.info(f"Extract_media_from_message NODE")
-
-
     if isinstance(runtime.context.user_ctx, dict):
         user_id = runtime.context.user_ctx.get("user_id", "")
     else:

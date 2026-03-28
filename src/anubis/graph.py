@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import RunnableConfig, Runnable
 from src.anubis.utils.utility import extract_user_id_assistant_id, configure_assistant_context
 
 from src.anubis.utils.schema import RouteDecision

@@ -187,7 +187,7 @@ from langgraph.runtime import Runtime
 from src.anubis.utils.context import GlobalContext
 
 
-async def extract_user_id_assistant_id(config: RunnableConfig, runtime: Runtime):
+async def extract_user_id_assistant_id(config: RunnableConfig):
     user_state = {}
     assistant_state = {}
 

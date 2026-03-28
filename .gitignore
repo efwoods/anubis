@@ -11,7 +11,8 @@ uv.lock
 **/models/**
 test.ipynb
 .env.dev
-data
+data/**
+data/elon-musk-dataset
 .langgraph_api
 
 # Byte-compiled / optimized / DLL files

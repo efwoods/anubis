@@ -94,7 +94,7 @@ async def update_column_metadata(
         logger.error("Error updating column metadata during 'update_column_metadata': {e}")
         return {"success": False}
     
-from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
+# from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_vector
 from src.subgraphs.vector_store_graph.utils.helper_functions import update_column_metadata
 from langchain_core.stores import BaseStore
 import uuid

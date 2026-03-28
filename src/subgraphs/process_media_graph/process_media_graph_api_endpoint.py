@@ -19,9 +19,6 @@ from src.subgraphs.process_media_graph.utils.nodes import (
 
 from src.subgraphs.vector_store_graph.index_graph import index_docs
 from src.subgraphs.process_media_graph.utils.nodes import process_uploaded_files_and_label_media_type
-from src.anubis.utils.configuration import GlobalConfiguration
-
-configuration = GlobalConfiguration()
 
 
 def create_process_media_graph(store=None):

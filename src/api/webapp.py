@@ -397,11 +397,11 @@ async def select_avatar(
             try:
                 if len(public_avatar_result) == 0: # the avatar was not public
                     result = await client.assistants.get(assistant_id=assistant_id) # attempt to get user-specific avatar with api key
-                    if len(result)==0:
+                    if not result:
                         raise HTTPException(detail="Assistant not found: {assistant_id}", status_code=500)
                         # assistant = {"name": None, "description": None}
                     else:
-                        assistant = result[0]
+                        assistant = result
                     logger.info(f"result:{result}")
                     assistant_config = {
                         "configurable": {
@@ -513,6 +513,7 @@ async def message(
     message: Optional[str] = "Hello!",
     name: Optional[str] = None,
     description: Optional[str] = None,
+    files: Optional[List[UploadFile]] = File(...),
     current_user: dict = Depends(get_current_user),
     ):
 
@@ -582,7 +583,8 @@ async def upload_media(
         assistant_id = assitant_config['configurable']['assistant_id']
         config = {
             "configurable": {
-                "user_ctx": {"user_id":user_id},
+                "user_id": user_id,
+                "user_ctx": {"name":None, "description": None},
             }
         }
 
@@ -599,36 +601,41 @@ async def upload_media(
                 "user_id": user_id,
                 "assistant_id": assistant_id,
                 "reference_audio": reference_audio,
-                "reference_image": reference_image, 
+                "reference_image": reference_image,               
                 "proprietary_content": proprietary_content
             })
+
+        context=app.state.context
+        store = app.state.store
+        runtime = Runtime(context=context, store=store)
         
         # Import graph here to avoid circular imports
-        # from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
+        from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import workflow
+        # process_media_graph_api_endpoint
+
+        process_media_graph_api_endpoint = workflow.compile(store=store)
         
         # Prepare input state
         initial_state = {
             "media_files": media_files,
         }
-
-
-
     
         logger.info(f"breakpoint before process_media_graph")
-        # result = await process_media_graph_api_endpoint.ainvoke(
-        #     initial_state, 
-        #     config=config,
-        #     )
+        result = await process_media_graph_api_endpoint.ainvoke(
+            initial_state, 
+            config=config,
+            runtime=runtime        
+            )
     
         # Extract indexed documents info
-        # indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
+        indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
         
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
                 "files_processed": len(files),
-                # "documents_indexed": len(indexed_docs),
+                "documents_indexed": len(indexed_docs),
                 "filenames": [f.filename for f in files],
                 "message": "Media processed and indexed successfully"
             }

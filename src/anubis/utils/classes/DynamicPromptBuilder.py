@@ -83,7 +83,7 @@ class DynamicPromptBuilder:
         """
 
         # Render Assistant Name:
-        if assistant_name is None or assistant_name is "":
+        if assistant_name is None or assistant_name == "":
             # assistant_name = "You don't know your name."    
             assistant_name = ""
 

@@ -134,7 +134,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
 
     logger.info(f'breakpoint')
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
@@ -251,7 +251,7 @@ async def recall_memories(
     # evoked_memory_query = getattr(response, "evoked_memory_query", "")
 
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
@@ -363,7 +363,7 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         update = {"internal_thoughts": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
         return Command(update=update)
  
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
@@ -517,7 +517,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     """
     logger.info(f"breakpoint")
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
@@ -650,7 +650,7 @@ async def update_identity_via_text_content_url(
     assistant_id = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
     assistant_name = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_name", "")
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 

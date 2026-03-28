@@ -108,7 +108,7 @@ async def message_interface(state:MessagesState, config: RunnableConfig, runtime
 
     logger.info("breakpoint")
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(config, runtime)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(config)
 
     user_state.update(updated_user_state)
     assistant_state.update(updated_assistant_state)

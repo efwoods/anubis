@@ -205,8 +205,6 @@ process_thoughts = ToolNode(
     tools=identity_tools, 
     handle_tool_errors=True)
 
-
-
 from langchain.tools import ToolRuntime
 
 async def considering(state:GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> Literal["process_thoughts", 'respond']:
@@ -216,8 +214,6 @@ async def considering(state:GlobalState, config: RunnableConfig, runtime: Runtim
             return "process_thoughts"
     else:
         return "respond"
-    
-
 
 # async def process_thoughts(state: GlobalState, config: RunnableConfig, runtime:Runtime
 # [GlobalContext]) -> GlobalState:

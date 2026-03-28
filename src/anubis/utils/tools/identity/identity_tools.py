@@ -354,6 +354,14 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
         fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
     
     logger.info(f"learn_information about user breakpoint")
+
+    # Verify the current user is the creator and responsible for the identity of the avatar
+    creator_id = runtime.config['configurable']['assistant_ctx']['metadata']['user_id']
+    user_id = runtime.config['configurable']['user_id']
+    if creator_id != user_id:
+        tool_call_id = runtime.tool_call_id
+        update = {"internal_thoughts": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
+        return Command(update=update)
  
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config, runtime)
     user_id = updated_user_state.get("user_id")

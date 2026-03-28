@@ -21,3 +21,4 @@ services:
             - .env
         volumes:
             - .:/deps/anubis
+            - ~/.cache/huggingface:/root/.cache/huggingface

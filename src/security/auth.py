@@ -57,19 +57,24 @@ def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-async def update_assistant_config(assistant_config: dict, request: Request):
+async def update_assistant_config(hashed_api_key: str, provider_encoded_user_id: str, assistant_config: dict, request: Request):
     try:
         payload = {
-            "assistant_config": assistant_config
+            "app_metadata": {
+                "assistant_config": assistant_config
+            }
         }
 
-        headers = await _mgmt_headers(request)
-        response = await request.app.state.httpx_client.post(
-            f"{BASE_AUTH_URL}/api/v2/users",
+        headers = await _mgmt_headers(request)        
+        response = await request.app.state.httpx_client.patch(
+            f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}",
             json=payload,
-            headers=headers,
-        ) 
+            headers=headers
+        )
+
         response.raise_for_status()
+        async with _cache_lock:
+            del _api_key_cache[hashed_api_key]
         return response
     except Exception as e:
         raise HTTPException(detail="Error updating assistant configuration: {e}", status_code=response.status_code)
@@ -94,11 +99,9 @@ async def _get_mgmt_token(request: Request) -> str:
     _mgmt_token_cache['expires'] = now + data['expires_in'] - 60
     return _mgmt_token_cache['token']
 
-
 async def _mgmt_headers(request: Request) -> dict:
     access_token = await _get_mgmt_token(request)
     return {"Authorization": f"Bearer {access_token}"}
-
 
 # utility functions
 async def signup_user(email: str, password: str, request:Request, name: Optional[str] = None) -> dict:
@@ -272,7 +275,6 @@ async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
 
     user.update({"API_KEY":api_key})
     return user
-
 
 async def get_current_user(request: Request, api_key: str | None = Depends(api_key_scheme)) -> dict:
     """

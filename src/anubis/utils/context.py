@@ -179,6 +179,11 @@ class GlobalContext:
         metadata={"description": "user_id to allow the creation of public avatars. Reserved for CEO."}
     )
 
+    anonymous_user_id: str = field(
+        default=None,
+        metadata={"description": "user_id to allow the creation of public avatars. Reserved for anonymous users to store the creation of avatars in a cookie."}
+    )
+
     anonymous_api_key: str = field(
         default=None,
         metadata={"description": "api key for anonymous user data analytics to monitor content."}

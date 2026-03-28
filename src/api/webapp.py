@@ -51,6 +51,9 @@ from uuid import UUID
 from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
 
+from urllib.parse import quote
+    
+from src.security.auth import update_assistant_config
 
 class ASSISTANT_QUERY(BaseModel):
     assistant_id: UUID
@@ -79,14 +82,14 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         # Retrieve the public avatar matching the assistant_id
         search_query = """
         SELECT * FROM assistant 
-        WHERE metadata @> '{"is_public": true}'
+        WHERE (metadata->>'is_public')::boolean = TRUE
         AND assistant_id = %s
         """
     elif user_id:
         # Retrieve all public avatars not owned by the current user.
         search_query = """
         SELECT * FROM assistant
-        WHERE metadata @> '{"is_public": true}'
+        WHERE (metadata->'is_public')::boolean = TRUE
         AND metadata->user_id = %s
         """
     else:
@@ -172,79 +175,67 @@ app.include_router(router=security_route)
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
 
-# @app.post("/create_avatar")
-# async def create_avatar(
-#     name: str, 
-#     description: Optional[str] = None,
-#     is_public: Optional[bool] = False,
-#     # is_self_avatar: Optional[bool] = False,
-#     current_user: dict = Depends(get_current_user),
-#     ):
+@app.post("/create_avatar")
+async def create_avatar(
+    name: str, 
+    description: Optional[str] = None,
+    is_public: Optional[bool] = False,
+    # is_self_avatar: Optional[bool] = False,
+    current_user: dict = Depends(get_current_user),
+    ):
 
-#     # If the avatar is of the individual, then the avatar is allowed to be made public. 
-#     # Reference image, audio, and third-party authenticated account is required to create a shareable avatar. Limited to one shareable avatar of themselves.
-#     # Include reference image, reference audio
+    # If the avatar is of the individual, then the avatar is allowed to be made public. 
+    # Reference image, audio, and third-party authenticated account is required to create a shareable avatar. Limited to one shareable avatar of themselves.
+    # Include reference image, reference audio
 
-#     logger.info(f"breakpoint")
+    logger.info(f"breakpoint")
 
-#     if not current_user:
-#         return JSONResponse(
-#             content="User must be logged in to create avatars.", 
-#             status_code=400
-#         )
+    context = app.state.context
+
+    if current_user['identities'][0]['user_id'] == context.anonymous_user_id:
+        return JSONResponse(
+            content="User must be logged in to create avatars.", 
+            status_code=400
+        )
     
-#     try:
-#         context = app.state.context
-#         # token = auth_cred.credentials
-#         # client = get_client(headers={"Authorization": f"Bearer {token}"})
-#         assistant_id = str(uuid4())
-#         metadata = {
-#                 "user_id": current_user['sub'], 
-#                 "assistant_id":assistant_id,
-#                 "is_public": False
-#             }
+    try:
+        # token = auth_cred.credentials
+        # client = get_client(headers={"Authorization": f"Bearer {token}"})
+        assistant_id = str(uuid4())
+        user_id = current_user['identities'][0]['user_id']
+        metadata = {
+                "user_id": user_id,
+                "is_public": False
+            }
         
-#         if current_user.get('sub', None) is context.admin_user_id:
-#             metadata['is_public'] = is_public
+        if user_id == context.admin_user_id:
+            metadata['is_public'] = is_public
+
+        token = current_user['API_KEY']
+        headers = {"Authorization": f"Bearer {token}"}
+        client = get_client(headers=headers)
         
-#         response = await client.assistants.create(
-#             graph_id = "Anubis", 
-#             description=description, 
-#             name=name, 
-#             assistant_id=assistant_id, 
-#             metadata=metadata)
+        create_avatar_response = await client.assistants.create(
+            graph_id = "Anubis", 
+            description=description, 
+            name=name, 
+            assistant_id=assistant_id, 
+            metadata=metadata)
         
-#         return JSONResponse(response, status_code=200)
-#     except Exception as e:
-#         return HTTPException(detail = e, status_code=500)
+        return JSONResponse(content=create_avatar_response, status_code=200)
+    except Exception as e:
+        return HTTPException(detail = "Error creating avatar {name}: {e}", status_code=500)
 
 
-@app.get("/test")
-async def test(current_user: dict = Depends(get_current_user)):
-    return {"current_user": current_user}
+# @app.get("/test")
+# async def test(current_user: dict = Depends(get_current_user)):
+#     return {"current_user": current_user}
 
 @app.get("/list_public_avatars")
 async def list_public_avatars(assistant_id: Optional[str] = None):
     logger.info("breakpoint")
     public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
     return public_avatars_result
-    # if not current_user:
-        # return public_avatars_result
-    # try: 
-    #     token = current_user['app_metadata']['api_key']
-    #     client = get_client(headers = {"Authentication": f"{token}"})
-    #     response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
-    #     if type(response) is list:
-    #         avatar_list = response[0]
-    #     else:
-    #         raise AssertionError("response is not a list")
-    #     logger.info(f"breakpoint")
-    #     return_list = [avatar_list, public_avatars_result] # public and private avatars
-    #     return JSONResponse(return_list, status_code=200)
-    # except Exception as e:
-    #     error = f"Error in listing avatars: {e}"
-    #     return JSONResponse(error, status_code=500)
-
 
 @app.get("/list_user_avatars")
 async def list_user_avatars(
@@ -266,74 +257,98 @@ async def list_user_avatars(
         error = f"Error in listing avatars: {e}"
         return HTTPException(detail=error, status_code=500)
 
-
 @app.delete("/delete_avatar")
 async def delete_avatar(
-    assistant_id: Optional[str] = None,
-    assistant_name: Optional[str] = None,
-    current_user: dict = Depends(get_current_user),
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user)
 ):
-
+    # TODO: Delete avatar in database
     logger.info("breakpoint")
 
-    if not assistant_id and not assistant_name:
+    token = current_user["API_KEY"]
+    user_id = current_user['identities'][0]['user_id']
+    client = get_client(headers={"Authorization": f"Bearer {token}"})
+    
+    metadata = {'user_id':user_id}
+    metadata.update({"assistant_id": assistant_id})
+    try:
+        await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
+    except Exception as e:
+        raise HTTPException(detail = e, status_code=500)
+    
+    return JSONResponse("Deleted Avatar Successfully", status_code=200)
+
+
+@app.patch("/modify_avatar")
+async def modify_avatar(
+    assistant_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    new_avatar_name: Optional[str] = None,
+    new_avatar_description: Optional[str] = None,
+):
+    # Avatar name changes also need to be applied to the db for consistent identities
+    logger.info("breakpoint")
+
+    if not assistant_id:
         raise HTTPException(
-            detail = "Either supply assistant_id or assistant name.",
+            detail = "Supply assistant_id for the assistant to modify.",
+            status_code=400
+        )
+    if not new_avatar_name and not new_avatar_description:
+        raise HTTPException(
+            detail = "Either supply the new avatar name or the new avatar description.",
             status_code=400
         )
 
     if not current_user:
         raise HTTPException(
-            content="User must be logged in to delete avatars.", 
-            status_code=400
+            content="User must be logged in to modify avatar avatars.", 
+            status_code=401
         )
     
-    try:
-        context = app.state.context
-        token = auth_cred.credentials
-        client = get_client(headers={"Authorization": f"Bearer {token}"})
-        
-        metadata = {'user_id':current_user.get('sub', "")}
-        if assistant_id:
-            metadata.update({"assistant_id": assistant_id})
-            await client.assistants.delete(
-                graph_id = "Anubis", 
+    token = current_user["API_KEY"]
+    client = get_client(headers={"Authorization": f"Bearer {token}"})
+    if assistant_id:
+        if new_avatar_name and new_avatar_description:
+            result = await client.assistants.update(
+                graph_id="Anubis", 
                 assistant_id=assistant_id, 
-                metadata=metadata)
-        elif assistant_name:
-            result = await client.assistants.search(graph_id="Anubis", name=assistant_name, metadata=metadata)
-            assert type(result) is list
-            assert len(result) > 0
-            await client.assistants.delete(
-                graph_id = "Anubis", 
-                assistant_id=result[0].get("assistant_id"))
+                name=new_avatar_name, 
+                description=new_avatar_description)
+        elif new_avatar_description:
+            result = await client.assistants.update(
+                graph_id="Anubis", 
+                assistant_id=assistant_id, 
+                description=new_avatar_description)
         else:
-            raise HTTPException(
-            detail = "Either supply assistant_id or assistant name.",
-            status_code=400
-        )
-        return JSONResponse("Deleted Avatar", status_code=200)
-    except Exception as e:
-        return HTTPException(detail = e, status_code=500)
+            result = await client.assistants.update(
+                graph_id="Anubis", 
+                assistant_id=assistant_id, 
+                name=new_avatar_name)
+        try:
+            assert(type(result) == dict)
+            return JSONResponse(content=result, status_code=200)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error updating assistant: {assistant_id}")
+
 
 @app.post("/share_avatar")
 async def share_avatar(
     assistant_id: str,
     is_public: bool = True,
-    current_user: dict = Depends(get_current_user),
-    auth_cred: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    current_user: dict = Depends(get_current_user)
 ):
-    user_id = current_user.get('sub', None)
-    if ((user_id is context.admin_user_id)
-        or (assistant_id is user_id)):
-            metadata = {"is_public": True}
+    context = app.state.context
+    user_id = current_user['identities'][0]['user_id']
+    if ((user_id is context.admin_user_id)):
+            """ verify users are creating avatars of their own likeness in the future"""
+            metadata = {"is_public": is_public}
 
     # Only admins may share avatars; 
     # Users will authenticate and share avatars in the near future.
     if user_id is context.admin_user_id:
         try:
-            token = auth_cred.credentials
+            token = current_user['API_KEY']
             client = get_client(headers={"Authorization": f"Bearer {token}"})
             result = await client.assistants.update(
                 assistant_id=assistant_id, 
@@ -341,108 +356,100 @@ async def share_avatar(
         except Exception as e:
             raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
 
-    
-from src.security.auth import update_assistant_config
 @app.post("/select_avatar")
 async def select_avatar(
     request: Request,
+    response: Response, 
     current_user: dict = Depends(get_current_user),
     assistant_id: Optional[str] = None, 
     assistant_name: Optional[str] = None,
     ):
-
+    logger.info("breakpoint")
     if not current_user and not assistant_id:
         return HTTPException(status_code=400, detail="Unauthenticated users must log in to use the select avatars via name feature. Please log in or use an assistant_id for selection.")
     
+    assistant_config = {"configurable": {
+        "assistant_id": assistant_id
+    }}
+
+    public_avatar_result = await get_public_avatars(assistant_id=assistant_id)
+    
+    # if not current_user['identities'][0]['user_id'] is request.app.state.context['anonymous_user_id']: # anonymous user case
     if not current_user:
-        result = get_public_avatars(assistant_id=assistant_id)
-
-        assistant_config = {"configurable": {
-            "assistant_id": assistant_id
-        }}
-
-        if len(result) > 0:
+        if len(public_avatar_result) > 0:
             assistant_config['configurable'].update({
                 "assistant_ctx": {
-                    "name": result[0].get("name", None),
-                    "description": result[0].get("description", None)
+                    "name": public_avatar_result[0].get("name", None),
+                    "description": public_avatar_result[0].get("description", None)
                 }
             })
-        result = await update_assistant_config(assistant_config = assistant_config, request=request)
-        return assistant_config
-
-    else:
         
+        public_avatar_result = await update_assistant_config(assistant_config = assistant_config, request=request)
+        return assistant_config
+    else:
         token = current_user['API_KEY']
         client = get_client(headers={"Authorization": f"{token}"})
         user_id = current_user['identities'][0]['user_id']
-        #         api_key_hash = _hash_key(api_key)
-        # payload = {
-        #     "email": email, 
-        #     "password": password, 
-        #     "connection": CONNECTION,
-        #     "name": name,
-        #     "app_metadata":{
-        #         "api_key": api_key_hash
-        #     }
-        # }
-
-        # headers = await _mgmt_headers(request)
-
-        # response = await request.app.state.httpx_client.post(
-        #     f"{BASE_AUTH_URL}/api/v2/users",
-        #     json=payload,            
-        #     headers=headers,
-        # ) 
-
-        # response.raise_for_status()
-                        # "user_id": user_id, 
-
         if assistant_id:
             try:
-                result =  await client.assistants.search(
-                    metadata={
-                        "assistant_id":assistant_id
-                        })
-                if len(result)==0:
-                    assistant = {"name": None, "description": None}
-                else:
-                    assistant = result[0]
-                logger.info(f"result:{result}")
-                assistant_config = {
-                    "configurable": {
-                        "assistant_id": assistant_id,
-                        "assistant_ctx": {
-                            "name":assistant.get("name", ""),
-                            "description":assistant.get("description", ""),
+                if len(public_avatar_result) == 0: # the avatar was not public
+                    result = await client.assistants.get(assistant_id=assistant_id) # attempt to get user-specific avatar with api key
+                    if len(result)==0:
+                        raise HTTPException(detail="Assistant not found: {assistant_id}", status_code=500)
+                        # assistant = {"name": None, "description": None}
+                    else:
+                        assistant = result[0]
+                    logger.info(f"result:{result}")
+                    assistant_config = {
+                        "configurable": {
+                            "assistant_id": assistant_id,
+                            "assistant_ctx": {
+                                "name":assistant.get("name", ""),
+                                "description":assistant.get("description", ""),
+                            }
                         }
                     }
-                }
-                result = await update_assistant_config(assistant_config = assistant_config, request=request)
+                else:
+                    assistant_config['configurable'].update({
+                        "assistant_ctx": {
+                            "name": public_avatar_result[0].get("name", None),
+                            "description": public_avatar_result[0].get("description", None)
+                        }
+                    })
+                provider_encoded_user_id = quote(current_user['user_id'], safe="")
+
+                hashed_api_key = current_user['app_metadata']['api_key']
+                update_assistant_result = await update_assistant_config(
+                    hashed_api_key = hashed_api_key,
+                    provider_encoded_user_id=provider_encoded_user_id, 
+                    assistant_config = assistant_config, 
+                    request=request)
+                return assistant_config
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error using assistant_id for logged in user {e}")
-            
         elif assistant_name:
             try:
                 result = await client.assistants.search(name=assistant_name)
                 try:
-                    assert type(result) is list
-                    if len(result) != 0:
-                        assistant = result[0]
+                    if (len(result) == 0):
+                        raise HTTPException(detail="Assistant not found.", status_code=400)
+                    assistant = result[0]
+                    is_public = assistant.get("metadata", {}).get("is_public", False)
+                    if not is_public and (current_user['identities'][0]['user_id'] != assistant.get('metadata', {}).get('user_id', None)):
+                        raise HTTPException(detail="Non-public avatar id.", status_code=401)
                     else:
-                        assistant = {"name": None, "description": None}
-                    assistant_id = result[0].get("assistant_id", None)
-                    assert assistant_id is not None
-                    assistant_config = {
-                        "configurable": {
-                            "assistant_ctx": {
-                                "name": assistant.get('name', ''),
-                                'description': assistant.get('description', '')
-                            },
-                            "assistant_id": assistant_id
+                        assistant_config = {
+                            "configurable": {
+                                "assistant_ctx": {
+                                    "name": assistant.get('name', None),
+                                    'description': assistant.get('description', None)
+                                },
+                                "assistant_id": assistant.get("assistant_id", None)
+                            }
                         }
-                    }
-                    result = await update_assistant_config(assistant_config = assistant_config, request=request)
+                    provider_encoded_user_id = quote(current_user['user_id'], safe="")
+                    result = await update_assistant_config(provider_encoded_user_id=provider_encoded_user_id, assistant_config = assistant_config, request=request)
+                    return JSONResponse(content=assistant_config, status_code=200)
                 except Exception as e:
                     raise HTTPException(status_code=500, detail = f"Error during avatar selection via assistant_name: {e}")
             except Exception as e:
@@ -451,7 +458,49 @@ async def select_avatar(
         else: 
             return HTTPException(detail = "Error: either assistant_id or assistant_name is required.", status_code=400)
 
-    return JSONResponse(assistant_config, status_code=200)
+from src.anubis.utils.tools.identity.identity_tools import learn_information_about_yourself_through_text_from_the_user_as_a_memory
+
+from langgraph.runtime import Runtime
+from langchain_core.runnables import RunnableConfig
+
+# from langgraph.types import StreamWriter
+
+# from langgraph.prebuilt import ToolRuntime
+# ToolRuntime(state=[], store=app.state.store, context = app.state.context, config=config, streamWriter = StreamWriter())
+
+
+# @app.post("/update_avatar_identity")
+# async def update_avatar_identity(
+
+#     assistant_fact: str,
+#     current_user: dict = Depends(get_current_user), 
+#     ):
+
+#     assistant_config = current_user.get('app_metadata', {}).get('assistant_config', {})
+#     user_id = current_user.get("identities", {}).get("user_id", None)
+
+
+
+
+        # context=app.state.context
+        # store = app.state.store
+        # runtime = Runtime(context=context, store=store)
+        # config = {
+        #     "configurable": {
+        #         "user_id": None,
+        #         "assistant_id": None,
+        #         "user_ctx": {
+        #             "name": None, "description": None
+        #         },
+        #         "assistant_ctx": {
+        #             "name": None, 
+        #             "description": None
+        #         }
+        #     }
+        # }
+
+#     learn_information_about_yourself_through_text_from_the_user_as_a_memory(
+#         assistant_fact: str, fact_context: str, )
 
 @app.get("/message")
 async def message(
@@ -463,7 +512,7 @@ async def message(
     ):
 
     logger.info("breakpoint")
-    assistant_config = current_user.get("app_metadata", {}).get("assitant_config", {})
+    assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not assistant_config:
         raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
 
@@ -472,7 +521,7 @@ async def message(
         user_name = None,
         user_description = None
     else:
-        user_id = current_user['identities']['user_id']
+        user_id = current_user['identities'][0]['user_id']
         user_name = name
         user_description = description
 
@@ -486,9 +535,8 @@ async def message(
     # update with assistant information
     config['configurable'].update(assistant_config['configurable'])
 
-    if app.state.context.deployment == 'FALSE':
         # store = app.state.store
-        graph = app.state.graph
+    graph = app.state.graph
 
         # system_time = datetime.now(tz=timezone.utc).isoformat
         # content = [{"type":"text", "text": system_time}]
@@ -499,11 +547,11 @@ async def message(
 
         # logger.info(f"config: {config}")
         
-        result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
 
-        logger.info(f"{result}")
+    logger.info(f"{result}")
 
-        return JSONResponse(result['messages'][-1].content, status_code=200)
+    return JSONResponse(result['messages'][-1].content, status_code=200)
 
 
 
@@ -641,4 +689,4 @@ async def upload_media(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

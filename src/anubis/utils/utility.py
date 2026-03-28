@@ -191,7 +191,7 @@ async def extract_user_id_assistant_id(config: RunnableConfig, runtime: Runtime)
     user_state = {}
     assistant_state = {}
 
-    user_id = config.get("configurable",{}).get("langgraph_api_user_id", '')
+    user_id = config.get("configurable",{}).get("user_id", '')
 
     if user_id != '':
         user_state.update({"user_id": user_id})

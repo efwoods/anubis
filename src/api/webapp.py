@@ -242,10 +242,11 @@ async def list_user_avatars(
     current_user: dict = Depends(get_current_user),
     ):
     logger.info("breakpoint")
-    public_avatars_result = await get_public_avatars()
     if not current_user:
+        public_avatars_result = await get_public_avatars()
         return public_avatars_result
-    try: 
+    try:
+        public_avatars_result = await get_public_avatars(user_id=current_user['identities'][0]['user_id']) 
         token = current_user['API_KEY']
         client = get_client(headers = {"Authentication": f"{token}"})
         response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
@@ -353,8 +354,10 @@ async def share_avatar(
             result = await client.assistants.update(
                 assistant_id=assistant_id, 
                 metadata=metadata)
+            return JSONResponse(result, status_code=200)
         except Exception as e:
             raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
+    raise HTTPException(status_code=401, detail="Users may only share avatars of themselves.")
 
 @app.post("/select_avatar")
 async def select_avatar(

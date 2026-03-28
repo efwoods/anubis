@@ -64,3 +64,4 @@ I'm still getting to know myself, and I don't have much information about my own
 ## BUG: anyone will adopt information to the ai without verification if there is not a tool call. 
 require tuning on the system prompt for learning information about yourself to be called and guard rails to prevent the update of the identity from non-creators during chat.
 
+calling learn information about yourself while not the creator will prevent message response. messages continue in normal conversation. 

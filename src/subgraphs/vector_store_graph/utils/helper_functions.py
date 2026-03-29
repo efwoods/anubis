@@ -104,7 +104,7 @@ from langgraph.runtime import Runtime
 from uuid import uuid4
 
 async def batch_index_documents_vectorstore(
-        runtime: Runtime,
+        store: BaseStore,
         user_id: str, 
         assistant_id: str,
         vectorstore_documents_to_be_indexed: list[any], 
@@ -149,7 +149,7 @@ async def batch_index_documents_vectorstore(
 
         # create upload namespaces
         namespaces = [(user_id, assistant_id, "document", filename) for filename in filenames]
-        batch_put_ops = [PutOp(namespace=(user_id, assistant_id, "document", doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"page_content":doc.page_content, "metadata":doc.metadata}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
+        batch_put_ops = [PutOp(namespace=(user_id, assistant_id, "document", doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"document":doc.to_json()}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
 
         num_successful_batch_uploads = 0
         total_documents_to_be_indexed = len(batch_put_ops)
@@ -162,7 +162,7 @@ async def batch_index_documents_vectorstore(
             batch_num = (i // BATCH_SIZE) + 1
             total_batches = (total_documents_to_be_indexed + BATCH_SIZE - 1) // BATCH_SIZE
             try:
-                await runtime.store.abatch(batch)
+                await store.abatch(batch)
 
                 progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
                 
@@ -174,7 +174,7 @@ async def batch_index_documents_vectorstore(
                 logger.info(f"Error in batch {batch_num}: {str(e)}. Attempting Retry.")
                 # Handle the error with a retry
                 try:
-                    await runtime.store.abatch(batch)
+                    await store.abatch(batch)
 
                     progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
 

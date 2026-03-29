@@ -49,7 +49,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         }
         
         documents = await process_text_media_item_target_for_vectorstore(
-            media_item, 
+            media_item=media_item, 
             user_id=user_id, 
             assistant_id=assistant_id,
             classification_metadata=classification_metadata,
@@ -125,7 +125,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             # format for vectorstore: chunk and upload to vectorstore
                 logger.info(f"proccess_text_media_item_target_for_vectorstore BREAKPOINT in Process media item task: type = text")
                 documents = await process_text_media_item_target_for_vectorstore(
-                    media_item, 
+                    media_item=media_item, 
                     user_id=user_id, 
                     assistant_id=assistant_id,
                     classification_metadata=classification_metadata,
@@ -164,7 +164,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
         
             documents = await process_text_media_item_target_for_vectorstore(
-                media_item, 
+                media_item=media_item, 
                 user_id=user_id, 
                 assistant_id=assistant_id,
                 classification_metadata=classification_metadata,

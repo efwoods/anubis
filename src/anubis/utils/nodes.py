@@ -89,12 +89,21 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
         # Coerce into document objects from Search Items
         assistant_identity = reduce_docs([], assistant_identity_document_items)
+
+        """ search for reference image description and append if existent """
+        assistent_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
+        key=assistant_id
+        reference_image_items = await runtime.store.aget(assistent_reference_image_identity_namespace, key)
+
+        reference_image_doc = reduce_docs([], reference_image_items)
+
+        assistant_identity.extend(reference_image_doc)
+        
     else:
         assistant_identity = state['assistant_identity_documents']
 
     logger.info("breakpoint")
 
-    
     # retrieved_memories = state['recalled_memory_documents']
     
     # if len(retrieved_memories) == 0:

@@ -16,6 +16,15 @@ from src.anubis.utils.configuration import GlobalConfiguration
 across_thread_memory = InMemoryStore()
 configuration = GlobalConfiguration()
 
+
+import logging
+logger = logging.getLogger(__name__)
+
+from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
+from langchain_core.runnables import RunnableConfig
+from src.anubis.utils.utility import extract_user_id_assistant_id
+
+
 def ensure_docs_have_user_id(
     vectorstore_documents_to_be_indexed: Sequence[Document], runtime: GlobalContext
 ) -> list[Document]:
@@ -39,13 +48,6 @@ def ensure_docs_have_user_id(
         )
         for doc in vectorstore_documents_to_be_indexed
     ]
-
-import logging
-logger = logging.getLogger(__name__)
-
-from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
-from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.utility import extract_user_id_assistant_id
 
 
 async def index_docs(
@@ -100,7 +102,6 @@ builder.add_node(index_docs)
 builder.add_edge("__start__", "index_docs")
 
 index_graph = builder.compile()
-
 
 index_graph.name = "IndexGraph"
 

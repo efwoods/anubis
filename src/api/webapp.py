@@ -227,57 +227,31 @@ async def create_avatar(
         return HTTPException(detail = "Error creating avatar {name}: {e}", status_code=500)
 
 
-# @app.get("/test")
-# async def test(current_user: dict = Depends(get_current_user)):
-#     return {"current_user": current_user}
-
-@app.get("/list_public_avatars")
-async def list_public_avatars(assistant_id: Optional[str] = None):
-    logger.info("breakpoint")
-    public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
-    return public_avatars_result
-
-@app.get("/list_user_avatars")
-async def list_user_avatars(
-    current_user: dict = Depends(get_current_user),
-    ):
-    logger.info("breakpoint")
-    if not current_user:
-        public_avatars_result = await get_public_avatars()
-        return public_avatars_result
-    try:
-        public_avatars_result = await get_public_avatars(user_id=current_user['identities'][0]['user_id']) 
-        token = current_user['API_KEY']
-        client = get_client(headers = {"Authentication": f"{token}"})
-        response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
-        if len(response) > 0:
-            avatar_list = response
-            public_avatars_result.extend(avatar_list) # public and private avatars
-        return JSONResponse(public_avatars_result, status_code=200)
-    except Exception as e:
-        error = f"Error in listing avatars: {e}"
-        return HTTPException(detail=error, status_code=500)
-
-@app.delete("/delete_avatar")
-async def delete_avatar(
+@app.post("/share_avatar")
+async def share_avatar(
     assistant_id: str,
+    is_public: bool = True,
     current_user: dict = Depends(get_current_user)
 ):
-    # TODO: Delete avatar in database
-    logger.info("breakpoint")
-
-    token = current_user["API_KEY"]
+    context = app.state.context
     user_id = current_user['identities'][0]['user_id']
-    client = get_client(headers={"Authorization": f"Bearer {token}"})
-    
-    metadata = {'user_id':user_id}
-    metadata.update({"assistant_id": assistant_id})
-    try:
-        await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
-    except Exception as e:
-        raise HTTPException(detail = e, status_code=500)
-    
-    return JSONResponse("Deleted Avatar Successfully", status_code=200)
+    if ((user_id is context.admin_user_id)):
+            """ verify users are creating avatars of their own likeness in the future"""
+            metadata = {"is_public": is_public}
+
+    # Only admins may share avatars; 
+    # Users will authenticate and share avatars in the near future.
+    if user_id is context.admin_user_id:
+        try:
+            token = current_user['API_KEY']
+            client = get_client(headers={"Authorization": f"Bearer {token}"})
+            result = await client.assistants.update(
+                assistant_id=assistant_id, 
+                metadata=metadata)
+            return JSONResponse(result, status_code=200)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
+    raise HTTPException(status_code=401, detail="Users may only share avatars of themselves.")
 
 
 @app.patch("/modify_avatar")
@@ -333,31 +307,60 @@ async def modify_avatar(
             raise HTTPException(status_code=500, detail=f"Error updating assistant: {assistant_id}")
 
 
-@app.post("/share_avatar")
-async def share_avatar(
+@app.delete("/delete_avatar")
+async def delete_avatar(
     assistant_id: str,
-    is_public: bool = True,
     current_user: dict = Depends(get_current_user)
 ):
-    context = app.state.context
-    user_id = current_user['identities'][0]['user_id']
-    if ((user_id is context.admin_user_id)):
-            """ verify users are creating avatars of their own likeness in the future"""
-            metadata = {"is_public": is_public}
+    # TODO: Delete avatar in database
+    logger.info("breakpoint")
 
-    # Only admins may share avatars; 
-    # Users will authenticate and share avatars in the near future.
-    if user_id is context.admin_user_id:
-        try:
-            token = current_user['API_KEY']
-            client = get_client(headers={"Authorization": f"Bearer {token}"})
-            result = await client.assistants.update(
-                assistant_id=assistant_id, 
-                metadata=metadata)
-            return JSONResponse(result, status_code=200)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
-    raise HTTPException(status_code=401, detail="Users may only share avatars of themselves.")
+    token = current_user["API_KEY"]
+    user_id = current_user['identities'][0]['user_id']
+    client = get_client(headers={"Authorization": f"Bearer {token}"})
+    
+    metadata = {'user_id':user_id}
+    metadata.update({"assistant_id": assistant_id})
+    try:
+        await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
+    except Exception as e:
+        raise HTTPException(detail = e, status_code=500)
+    
+    return JSONResponse("Deleted Avatar Successfully", status_code=200)
+
+
+# @app.get("/test")
+# async def test(current_user: dict = Depends(get_current_user)):
+#     return {"current_user": current_user}
+
+@app.get("/list_public_avatars")
+async def list_public_avatars(assistant_id: Optional[str] = None):
+    logger.info("breakpoint")
+    public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
+    return public_avatars_result
+
+@app.get("/list_user_avatars")
+async def list_user_avatars(
+    current_user: dict = Depends(get_current_user),
+    ):
+    logger.info("breakpoint")
+    if not current_user:
+        public_avatars_result = await get_public_avatars()
+        return public_avatars_result
+    try:
+        public_avatars_result = await get_public_avatars(user_id=current_user['identities'][0]['user_id']) 
+        token = current_user['API_KEY']
+        client = get_client(headers = {"Authentication": f"{token}"})
+        response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
+        if len(response) > 0:
+            avatar_list = response
+            public_avatars_result.extend(avatar_list) # public and private avatars
+        return JSONResponse(public_avatars_result, status_code=200)
+    except Exception as e:
+        error = f"Error in listing avatars: {e}"
+        return HTTPException(detail=error, status_code=500)
+
+
 
 @app.post("/select_avatar")
 async def select_avatar(
@@ -559,8 +562,8 @@ async def message(
 
     return JSONResponse(result['messages'][-1].content, status_code=200)
 
-@app.post("/upload-media")
-async def upload_media(
+@app.post("/update_avatar_identity_with_media")
+async def update_avatar_identity_with_media(
     files: List[UploadFile] = File(...),
     reference_audio: bool = False,
     reference_image: bool = False, 
@@ -607,9 +610,9 @@ async def upload_media(
 
         context=app.state.context
         store = app.state.store
-        runtime = Runtime(context=context, store=store)
         
         # Import graph here to avoid circular imports
+
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import workflow
         # process_media_graph_api_endpoint
 
@@ -703,8 +706,6 @@ async def upload_media(
 #             status_code=500,
 #             detail=f"Error processing media: {str(e)}"
 #         )
-
-
 
 if __name__ == "__main__":
     import uvicorn

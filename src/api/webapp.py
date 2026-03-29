@@ -628,17 +628,23 @@ async def upload_media(
     
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "files_processed": len(files),
-                "documents_indexed": len(indexed_docs),
-                "filenames": [f.filename for f in files],
-                "message": "Media processed and indexed successfully"
-            }
-        )
+        if len(indexed_docs) == 0:
+            return HTTPException(status_code=500, content={
+                    "files_processed": len(files),
+                    "documents_indexed": len(indexed_docs),
+                    "filenames": [f.filename for f in files],
+                    "message": "Error processing and indexing media"
+                })
+        else:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "files_processed": len(files),
+                    "documents_indexed": len(indexed_docs),
+                    "filenames": [f.filename for f in files],
+                    "message": "Media processed and indexed successfully"
+                }
+            )
     
     except Exception as e:
         raise HTTPException(

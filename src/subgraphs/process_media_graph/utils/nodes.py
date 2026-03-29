@@ -229,18 +229,18 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
-    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "vectorstore"]
+    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["vectorstore_acceptable"] == True]
 
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
 
-    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "target_analysis"]
+    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["analysis_acceptable"] == True]
 
     # # Adapter list (needs a node)
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
-    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "adapter"]
+    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["adapter_acceptable"] == True]
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
@@ -310,9 +310,7 @@ async def process_media_item_task(
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                     namespace=(user_id, assistant_id, "reference_image")
                     doc_json = doc.to_json()
-                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "document": doc_json})
-
-                    
+                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "document": doc_json})                    
                 docs = [doc]
                 return docs
             

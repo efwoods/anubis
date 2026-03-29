@@ -105,7 +105,6 @@ async def process_uploaded_files_and_label_media_type(
     # get_value = await store.aget("evan", id="name")
     # logger.info("get_value: {get_value}")
 
-    
     if not media_files:
         logger.info("No media files to process")
         return {"media_list": []}
@@ -338,7 +337,7 @@ async def process_media_item_task(
                 # Base64 image
                 image_data = media_item["data"]                
                 
-                doc =  await extract_personality_from_image(image_data)
+                doc = await extract_personality_from_image(image_data)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
                     "user_id": user_id,
@@ -805,7 +804,6 @@ async def extract_personality_from_image(
 
     input = {"messages": [{"role": "user", "content": image_to_target_textual_description_payload}]}
     
-
     response = await model.ainvoke(input=input)
 
     logger.info(f"response: {response}")
@@ -862,8 +860,6 @@ async def index_docs(
                 status_code=500,
                 detail=f"Error processing media: {str(e)}"
             )
-
-
         logger.info(f"breaktpoint after batch_index_documents_vectorstore")
 
     return {"success": True, "number_of_documents_uploaded":result.get("documents_uploaded")}
@@ -1017,7 +1013,6 @@ async def batch_index_documents_vectorstore(
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
 
-
         num_successful_batch_uploads = 0
         num_successful_batch_searches = 0
         num_successful_batch_deletes = 0
@@ -1077,8 +1072,6 @@ async def batch_index_documents_vectorstore(
 
             batch_search_ops = [(user_id, assistant_id, "document", filename) for filename in filenames_uuid5_list]
             num_search_ops = len(batch_search_ops)
-
-
 
             all_batch_delete_ops = []
 

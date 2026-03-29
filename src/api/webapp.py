@@ -507,13 +507,13 @@ from langchain_core.runnables import RunnableConfig
 #     learn_information_about_yourself_through_text_from_the_user_as_a_memory(
 #         assistant_fact: str, fact_context: str, )
 
-@app.get("/message")
+@app.post("/message")
 async def message(
     response: Response,
     message: Optional[str] = "Hello!",
+    files: Optional[List[UploadFile]] = File(default=None),
     name: Optional[str] = None,
     description: Optional[str] = None,
-    files: Optional[List[UploadFile]] = File(...),
     current_user: dict = Depends(get_current_user),
     ):
 
@@ -623,8 +623,7 @@ async def upload_media(
         logger.info(f"breakpoint before process_media_graph")
         result = await process_media_graph_api_endpoint.ainvoke(
             initial_state, 
-            config=config,
-            runtime=runtime        
+            config=config,   
             )
     
         # Extract indexed documents info

@@ -64,8 +64,11 @@ async def index_docs(
     """
     logger.info(f"INDEXING DOCUMENTS")
     
-    user_id, assistant_id = await extract_user_id_assistant_id(config)
-   
+    updated_user_id, updated_assistant_id = await extract_user_id_assistant_id(config)
+    
+    user_id = updated_user_id['user_id']
+    assistant_id = updated_assistant_id['assistant_id']
+
     docs = state['vectorstore_documents_to_be_indexed']
     
     filenames = [doc.metadata.get("filename") for doc in docs]
@@ -75,8 +78,7 @@ async def index_docs(
         logger.warning(f"Missing {len(docs) - len(filenames)} filenames on documents")
     
     if len(filenames) > 0:
-
-        result = await batch_index_documents_vectorstore(runtime, user_id, assistant_id, docs, BATCH_SIZE=1000)
+        result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
 
         try:
             assert(result['success'] == True)
@@ -87,7 +89,7 @@ async def index_docs(
             state['vectorstore_documents_to_be_indexed'] = []            
             raise Exception(f"Error uploading documents: {result['error_batch_documents']}")
 
-        logger.info(f"breaktpoint after batch_index_documents_vectorstore")
+        logger.info(f"breakpoint after batch_index_documents_vectorstore")
 
     return {"docs": "delete"}
 

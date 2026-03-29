@@ -229,18 +229,18 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
-    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "vectorstore"]
+    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["vectorstore_acceptable"] == True]
 
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
 
-    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "target_analysis"]
+    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["analysis_acceptable"] == True]
 
     # # Adapter list (needs a node)
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
-    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["formatted_type"] == "adapter"]
+    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["adapter_acceptable"] == True]
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
@@ -300,18 +300,17 @@ async def process_media_item_task(
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
                     "reference_image": reference_image,
-                    "filename": filename
+                    "filename": filename,
+                    "vectorstore_acceptable": True,
+                    "adapter_acceptable": False,
+                    "analysis_acceptable": True
                 }) 
 
                 if reference_image:
                     logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
                     namespace=(user_id, assistant_id, "reference_image")
-                    
-                    metadata = doc.metadata
-                    page_content = doc.metadata.get("page_content", "")
-                    metadata.update({"page_content":page_content})
-                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "metadata": metadata})
-                    
+                    doc_json = doc.to_json()
+                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "document": doc_json})                    
                 docs = [doc]
                 return docs
             
@@ -391,7 +390,6 @@ async def process_media_item_task(
                 tools = []
 
                 model_with_structured_output = init_model(
-                    configuration=configuration,
                     response_format=TextualSituationalAwareness
                 )
                 from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
@@ -643,11 +641,7 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
 
     # from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
 
-    # pg_store_manager = await make_pg_store(configuration)
-
-    # async with pg_store_manager as pg_store:
-    #     namespace = (user_id, assistant_id)
-    #     reference_audio  = pg_store.aget(namespace=namespace, key="reference_audio")
+    # Identify reference audio existence and extract reference audio 
     """
     {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
     """
@@ -662,7 +656,6 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
         
 async def extract_personality_from_image(
     image_data: str) -> Document:
-    from src.anubis.utils.configuration import GlobalConfiguration
     """Extract personality description from image using vision LLM."""
     logger.info(f"needs reference image from storage for target identification (possibly object bounding box of the target)")
     # base64_image = self._image_to_base64(image_source)
@@ -681,11 +674,7 @@ async def extract_personality_from_image(
 
     # these requests need to use the model in the graph rather than the requests because of 400 errors
 
-    configuration = GlobalConfiguration()
-
-    model = init_model(
-        configuration=configuration
-    )
+    model = init_model()
 
     image_to_target_textual_description_payload = [
                         {
@@ -703,7 +692,7 @@ async def extract_personality_from_image(
     input = {"messages": [{"role": "user", "content": image_to_target_textual_description_payload}]}
     
 
-    response = await model.ainvoke(input=input)
+    response = await model.ainvoke(input=input['messages'])
 
     logger.info(f"response: {response}")
 
@@ -718,8 +707,7 @@ async def extract_personality_from_image(
         page_content=contextual_description,
         metadata={
             "source": "vision_model", 
-            "type": "personality_extraction", 
-            "model": configuration.model
+            "type": "personality_extraction"
         }
     )
 

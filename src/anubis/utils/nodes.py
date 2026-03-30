@@ -130,52 +130,37 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
         retrieved_memories = reduce_docs([], retrieved_memories_items)
 
     
-    # retrieved_memories.extend(retrieved_identity_memories)
+        # retrieved_memories.extend(retrieved_identity_memories)
 
-    # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
-    #     assistant_identity_namespace = (user_id, assistant_id, "memory")
-    #     query = state['messages'][-1].content
-        
-    #     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
+        # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
+        #     assistant_identity_namespace = (user_id, assistant_id, "memory")
+        #     query = state['messages'][-1].content
+
+        #     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
 
 
-    #     # Coerce into document objects from Search Items
-    #     retrieved_memories = reduce_docs([], retrieved_memories_items)
-    # else:
-    #     retrieved_memories = state['recalled_memory_documents']
+        #     # Coerce into document objects from Search Items
+        #     retrieved_memories = reduce_docs([], retrieved_memories_items)
+        # else:
+        #     retrieved_memories = state['recalled_memory_documents']
 
-    logger.info("breakpoint")
+        logger.info("breakpoint")
 
-    """ Retrieve Direct Quotes """
+        """ Retrieve Direct Quotes """
 
-    # Few Shot Example of Quotes and Writing style directly from the real-world assistant
-    # The QUOTE namespace holds direct quotes from the real-world assistant
-    if len(state['messages']) > 0:
+        # Few Shot Example of Quotes and Writing style directly from the real-world assistant
+        # The QUOTE namespace holds direct quotes from the real-world assistant
         direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
         logger.info(f"direct_quote_items: {direct_quote_items}")
 
-<<<<<<< HEAD
         direct_quotes = reduce_docs([], direct_quote_items)
-=======
-    direct_quote_items = await runtime.store.asearch((creator_id, assistant_id, 'quote'), query=query)
-    logger.info(f"direct_quote_items: {direct_quote_items}")
->>>>>>> dev
 
         """ Retrieve Documents """
 
-<<<<<<< HEAD
         # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
-        retrieved_knowledge_items = await runtime.store.asearch((user_id, assistant_id, 'document'), query=query)
+        retrieved_knowledge_items = await runtime.store.asearch((creator_id, assistant_id, 'document'), query=query)
         logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
         retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
-=======
-    """ Retrieve Documents """
-
-    # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
-    retrieved_knowledge_items = await runtime.store.asearch((creator_id, assistant_id, 'document'), query=query)
-    logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
-    retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
->>>>>>> dev
 
     """ Retrieve Emotions """
 

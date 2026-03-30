@@ -70,7 +70,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     """ Load User Identity documents """
 
-    if state['user_identity_documents'] is None or len(state['user_identity_documents']) == 0:
+    if len(state['user_identity_documents']) == 0:
         user_identity_namespace = (assistant_id, user_id, "identity")
         
         user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
@@ -81,9 +81,10 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
         user_identity = state['user_identity_documents']
 
     """ Load Assistant Identity documents """
+    creator_id = config['configurable']['assistant_ctx']['metadata']['user_id']
 
-    if state['assistant_identity_documents'] is None or len(state['assistant_identity_documents']) == 0:
-        assistant_identity_namespace = (user_id, assistant_id, "identity")
+    if len(state['assistant_identity_documents']) == 0:
+        assistant_identity_namespace = (creator_id, assistant_id, "identity")
         
         assistant_identity_document_items = await runtime.store.asearch(assistant_identity_namespace)
 
@@ -91,13 +92,18 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
         assistant_identity = reduce_docs([], assistant_identity_document_items)
 
         """ search for reference image description and append if existent """
-        assistent_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
+        assistent_reference_image_identity_namespace = (creator_id, assistant_id, "reference_image")
         key=assistant_id
         reference_image_items = await runtime.store.aget(assistent_reference_image_identity_namespace, key)
 
         reference_image_doc = reduce_docs([], reference_image_items)
 
         assistant_identity.extend(reference_image_doc)
+
+        assistant_identity_memory_namespace = (creator_id, assistant_id, "identity_memory")
+        retrieved_identity_memories_items = await runtime.store.asearch(assistant_identity_memory_namespace, limit=1000)
+        retrieved_identity_memories = reduce_docs([], retrieved_identity_memories_items)
+        assistant_identity.extend(retrieved_identity_memories)
         
     else:
         assistant_identity = state['assistant_identity_documents']
@@ -117,12 +123,13 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     
 
     assistant_memory_namespace = (user_id, assistant_id, "memory")
-    retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query)
-
+    retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query, limit=1000)
 
     # Coerce into document objects from Search Items
     retrieved_memories = reduce_docs([], retrieved_memories_items)
 
+    
+    # retrieved_memories.extend(retrieved_identity_memories)
 
     # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
     #     assistant_identity_namespace = (user_id, assistant_id, "memory")
@@ -143,7 +150,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
-    direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
+    direct_quote_items = await runtime.store.asearch((creator_id, assistant_id, 'quote'), query=query)
     logger.info(f"direct_quote_items: {direct_quote_items}")
 
     direct_quotes = reduce_docs([], direct_quote_items)
@@ -151,7 +158,7 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
     """ Retrieve Documents """
 
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
-    retrieved_knowledge_items = await runtime.store.asearch((user_id, assistant_id, 'document'), query=query)
+    retrieved_knowledge_items = await runtime.store.asearch((creator_id, assistant_id, 'document'), query=query)
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 

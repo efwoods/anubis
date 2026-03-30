@@ -79,6 +79,75 @@ async def update_assistant_config(hashed_api_key: str, provider_encoded_user_id:
     except Exception as e:
         raise HTTPException(detail="Error updating assistant configuration: {e}", status_code=response.status_code)
 
+from typing import Dict, Any
+
+async def retry_async_httpx_request(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: float = 30.0,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+) -> httpx.Response:
+    """
+    Async retry wrapper for httpx requests.
+    """
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json,
+                    data=data,
+                )
+
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    raise httpx.HTTPStatusError(
+                        f"Retryable HTTP error: {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+
+                response.raise_for_status()
+                return response
+
+            except (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.HTTPStatusError,
+            ) as e:
+                is_last_attempt = attempt == max_retries - 1
+
+                if isinstance(e, httpx.HTTPStatusError):
+                    status_code = e.response.status_code
+                    if status_code not in {429, 500, 502, 503, 504}:
+                        logger.exception("Non-retryable HTTP error")
+                        raise
+
+                if is_last_attempt:
+                    logger.exception("Max retries exceeded")
+                    raise
+
+                delay = base_delay * (2 ** attempt)
+
+                logger.warning(
+                    f"Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                    f"Retrying in {delay:.2f}s"
+                )
+
+                await asyncio.sleep(delay)
+
+    raise RuntimeError("Unexpected retry failure")
+
 # ── Management API token (cached) ──────────────────────────────────────────
 _mgmt_token_cache: dict = {"token": None, "expires": 0}
 import time
@@ -87,12 +156,14 @@ async def _get_mgmt_token(request: Request) -> str:
     now = time.monotonic()
     if _mgmt_token_cache['token'] and now < _mgmt_token_cache['expires']:
         return _mgmt_token_cache['token']
-    result = await request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/token", json={
+    json={
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "audience": f"{BASE_AUTH_URL}/api/v2/",
-    })
+    }
+
+    result = await retry_async_httpx_request("POST", url=f"{BASE_AUTH_URL}/oauth/token", json = json)
     result.raise_for_status()
     data = result.json()
     _mgmt_token_cache['token'] = data['access_token']

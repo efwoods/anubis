@@ -560,7 +560,11 @@ async def message(
 
     logger.info(f"{result}")
 
-    return JSONResponse(result['messages'][-1].content, status_code=200)
+    response = {}
+    response["content"] = result['messages'][-1].content
+    response["response_metadata"] = result['messages'][-1].response_metadata
+
+    return JSONResponse(response, status_code=200)
 
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
@@ -632,7 +636,7 @@ async def update_avatar_identity_with_media(
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
         if len(indexed_docs) == 0:
-            return HTTPException(status_code=500, content={
+            return HTTPException(status_code=500, detail={
                     "files_processed": len(files),
                     "documents_indexed": len(indexed_docs),
                     "filenames": [f.filename for f in files],

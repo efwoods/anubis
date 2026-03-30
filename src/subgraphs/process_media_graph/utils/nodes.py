@@ -227,18 +227,18 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
-    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["vectorstore_acceptable"] == True]
+    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("vectorstore_acceptable", False) == True]
 
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
 
-    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["analysis_acceptable"] == True]
+    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("analysis_acceptable", False) == True]
 
     # # Adapter list (needs a node)
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
-    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["adapter_acceptable"] == True]
+    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("adapter_acceptable", False) == True]
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,

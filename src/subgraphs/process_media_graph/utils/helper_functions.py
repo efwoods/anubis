@@ -57,7 +57,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         )
         
         for document in documents: 
-                    document.metadata.update({"formatted_type": "vectorstore"})
+                    document.metadata.update({"vectorstore_acceptable": True})
         return documents
     
     else:
@@ -230,7 +230,7 @@ async def split_text_into_chunks(
                 "chunk_index": idx,
                 "total_chunks": len(text_chunks),
                 "filename": filename,
-                "filename_uuid5": str(uuid5(filename)),
+                "filename_uuid5": str(uuid5(NAMESPACE_URL, filename)),
                 "document_id":str(uuid4()),
             }
         )
@@ -246,7 +246,6 @@ async def process_text_media_item_target_for_vectorstore(
     media_item: Dict[str, Any],
     user_id: str,
     assistant_id: str,
-    configuration: GlobalConfiguration,
     chunk_size: int = 256,
     chunk_overlap: int = 25,
     separators: Optional[List[str]] = None,
@@ -313,8 +312,6 @@ async def process_text_media_item_target_for_vectorstore(
         if token_text_content_length > chunk_size and use_semantic_chunks:
         
             # Define meaningful chunks first
-
-            tools = []
 
             model_structured_output = init_model(
                         response_format=SemanticChunkIndexList
@@ -598,5 +595,5 @@ async def process_text_media_item_target_for_vectorstore(
         return all_documents
 
     except Exception as e:
-        logger.error("Error in text chunking during process media item target for vector store: {e}")
-        raise e
+        logger.exception(f"Error in text chunking during process media item target for vector store: {e}")
+        raise 

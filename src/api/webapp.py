@@ -121,6 +121,8 @@ async def lifespan(app: FastAPI):
     # Initialize context / context
     app.state.context = GlobalContext()
     app.state.httpx_client = httpx.AsyncClient()
+    app.state.stripe = stripe
+    app.state.stripe.api_key = app.state.context.stripe_publishable_key
     
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
@@ -659,6 +661,45 @@ async def update_avatar_identity_with_media(
             detail=f"Error processing media: {str(e)}"
         )
 
+import stripe
+from fastapi.responses import RedirectResponse 
+@app.get("/subscribe")
+async def subscribe(current_user: dict = Depends(get_current_user)):
+    """
+    Create a monthly subscription.
+    """
+
+    verified_email = current_user.get("verified_email", None)
+    if not verified_email:
+        raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
+    
+    return RedirectResponse(url=app.state.context.stripe_payment_url, code=303)
+
+    # try: 
+    #     checkout_session = stripe.checkout.Session.create(
+    #         line_items=[
+    #             {
+    #                 # Provide the exact Price ID 
+    #                 'price': app.state.context.stripe_product_id
+    #             }
+    #         ], 
+    #         mode='subscription',
+    #         success_url="api.neuralnexus.site" + '?success=true',
+    #         automatic_tax={'enabled': True},
+    #     )
+    # except Exception as e:
+    #         return str(e)
+    # return RedirectResponse(url=checkout_session.url, code=303)
+
+
+
+@app.post("/unsubscribe")
+async def unsubscribe():
+    """
+    Cancel a monthly subscription.
+    """
+
+
 # @app.post("/process-media-json")
 # async def process_media_json(
 #     media_list: List[dict],
@@ -713,4 +754,4 @@ async def update_avatar_identity_with_media(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True, ssl_keyfile='./origin_cert.pem', ssl_certfile='./cloudflare_private.key')

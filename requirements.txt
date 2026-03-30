@@ -34,3 +34,4 @@ python-jose[cryptography]
 httpx
 
 debugpy
+stripe

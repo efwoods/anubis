@@ -22,6 +22,9 @@ import re
 from datetime import datetime
 from datetime import timezone
 
+from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
+from typing import Optional
+
 logger = logging.getLogger(__name__)
 
 
@@ -256,8 +259,7 @@ async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
 
         return ai_context_item
 
-from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT
-from typing import Optional
+
 async def image_to_text(target_image_url: str, 
                         reference_image_url: Optional[str] = None, 
                         ):
@@ -288,7 +290,7 @@ async def image_to_text(target_image_url: str,
 
     # Compile the message
     content = [reference_message, target_message] if reference_image_url is not None else [target_message]
-    system_message = [SystemMessage(content=TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT)]
+    system_message = [SystemMessage(content=TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION)]
     human_message = [{"role": "user", "content": content}]
 
     messages = system_message + human_message

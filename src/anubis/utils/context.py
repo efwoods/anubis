@@ -192,6 +192,26 @@ class GlobalContext:
         metadata={"description": "api key for anonymous user data analytics to monitor content."}
     )
 
+    stripe_publishable_key: str = field(
+        default=None, 
+        metadata={"description": "API key for interacting with the stripe API."}
+    )
+
+    # stripe_secret_key: str = field(
+    #     default=None, 
+    #     metadata={"description": "API key for interacting with the stripe API."}
+    # )
+
+    stripe_product_id: str = field(
+        default=None, 
+        metadata={"description": "Neural Nexus API monthly subscription product id."}
+    )
+
+    stripe_payment_url: str = field(
+        default=None, 
+        metadata={"description": "Payment URL for subscriptions"}
+    )
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

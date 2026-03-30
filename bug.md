@@ -65,3 +65,9 @@ I'm still getting to know myself, and I don't have much information about my own
 require tuning on the system prompt for learning information about yourself to be called and guard rails to prevent the update of the identity from non-creators during chat.
 
 calling learn information about yourself while not the creator will prevent message response. messages continue in normal conversation. 
+
+# BUG: multiple tool calls using memories for the same memory
+learn_information_about_yourself_through_text_from_the_user_as_a_memory
+
+<!-- # VERIFY FACT DOES NOT ALREADY EXIST in memories -->
+if runtime.state.get('recalled_memory_documents', None) is not None:

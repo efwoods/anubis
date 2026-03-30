@@ -22,6 +22,7 @@ from cachetools import TTLCache
 import asyncio
 
 import logging
+import stripe
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -79,6 +80,75 @@ async def update_assistant_config(hashed_api_key: str, provider_encoded_user_id:
     except Exception as e:
         raise HTTPException(detail="Error updating assistant configuration: {e}", status_code=response.status_code)
 
+from typing import Dict, Any
+
+async def retry_async_httpx_request(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: float = 30.0,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+) -> httpx.Response:
+    """
+    Async retry wrapper for httpx requests.
+    """
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json,
+                    data=data,
+                )
+
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    raise httpx.HTTPStatusError(
+                        f"Retryable HTTP error: {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+
+                response.raise_for_status()
+                return response
+
+            except (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.HTTPStatusError,
+            ) as e:
+                is_last_attempt = attempt == max_retries - 1
+
+                if isinstance(e, httpx.HTTPStatusError):
+                    status_code = e.response.status_code
+                    if status_code not in {429, 500, 502, 503, 504}:
+                        logger.exception("Non-retryable HTTP error")
+                        raise
+
+                if is_last_attempt:
+                    logger.exception("Max retries exceeded")
+                    raise
+
+                delay = base_delay * (2 ** attempt)
+
+                logger.warning(
+                    f"Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                    f"Retrying in {delay:.2f}s"
+                )
+
+                await asyncio.sleep(delay)
+
+    raise RuntimeError("Unexpected retry failure")
+
 # ── Management API token (cached) ──────────────────────────────────────────
 _mgmt_token_cache: dict = {"token": None, "expires": 0}
 import time
@@ -87,12 +157,14 @@ async def _get_mgmt_token(request: Request) -> str:
     now = time.monotonic()
     if _mgmt_token_cache['token'] and now < _mgmt_token_cache['expires']:
         return _mgmt_token_cache['token']
-    result = await request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/token", json={
+    json={
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "audience": f"{BASE_AUTH_URL}/api/v2/",
-    })
+    }
+
+    result = await retry_async_httpx_request("POST", url=f"{BASE_AUTH_URL}/oauth/token", json = json)
     result.raise_for_status()
     data = result.json()
     _mgmt_token_cache['token'] = data['access_token']
@@ -108,23 +180,66 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
     try:
         api_key = generate_api_key()
         api_key_hash = _hash_key(api_key)
+
+        # stripe = request.app.state.stripe
+
+        try:
+            customer = stripe.Customer.create(
+                name=name, 
+                email=email
+            )
+        except stripe.error.CardError as e:
+          # A declined card error
+          print('Status: %s' % e.http_status)
+          print('Code: %s' % e.code)
+          if e.param:
+            print('Param: %s' % e.param)
+          print('Message: %s' % e.user_message)
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.RateLimitError as e:
+          # Too many requests made to the API too quickly
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.InvalidRequestError as e:
+          # Invalid parameters were supplied to Stripe's API
+          print('Message: %s' % e.user_message)
+          if e.param:
+            print('Param: %s' % e.param)
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.AuthenticationError as e:
+          # Authentication with Stripe's API failed
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.APIConnectionError as e:
+          # Network communication with Stripe failed
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.StripeError as e:
+          # All other Stripe errors
+          print('Status: %s' % e.http_status)
+          print('Code: %s' % e.code)
+          print('Message: %s' % e.user_message)
+          print('Request ID: %s' % e.request_id)
+        except Exception as e:
+          raise HTTPException(detail="Error creating customer account.", status_code=500)
+
         payload = {
             "email": email, 
             "password": password, 
             "connection": CONNECTION,
             "name": name,
             "app_metadata":{
-                "api_key": api_key_hash
+                "api_key": api_key_hash,
+                "customer": customer
             }
         }
 
         headers = await _mgmt_headers(request)
 
-        response = await request.app.state.httpx_client.post(
-            f"{BASE_AUTH_URL}/api/v2/users",
-            json=payload,
-            headers=headers,
-        ) 
+        response = await retry_async_httpx_request(method="POST", url=f"{BASE_AUTH_URL}/api/v2/users", json=payload, headers=headers)
+
+        # response = await request.app.state.httpx_client.post(
+        #     f"{BASE_AUTH_URL}/api/v2/users",
+        #     json=payload,
+        #     headers=headers,
+        # ) 
 
         response.raise_for_status()
         result = {
@@ -380,7 +495,47 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         api_key_hash = current_user['app_metadata']['api_key']
         encoded_user_id = quote(current_user['user_id'], safe="")
         headers = await _mgmt_headers(request)
-        response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
+
+        customer_id = current_user['app_metadata']['customer']['id']
+
+        stripe = request.app.state.stripe
+        try:
+            deleted = stripe.Customer.delete(customer_id)
+            if deleted.get("deleted", False) is not True:
+                raise HTTPException(detail="Error deleting customer account.", status_code=500)      
+        except stripe.error.CardError as e:
+          # A declined card error
+          print('Status: %s' % e.http_status)
+          print('Code: %s' % e.code)
+          if e.param:
+            print('Param: %s' % e.param)
+          print('Message: %s' % e.user_message)
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.RateLimitError as e:
+          # Too many requests made to the API too quickly
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.InvalidRequestError as e:
+          # Invalid parameters were supplied to Stripe's API
+          print('Message: %s' % e.user_message)
+          if e.param:
+            print('Param: %s' % e.param)
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.AuthenticationError as e:
+          # Authentication with Stripe's API failed
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.APIConnectionError as e:
+          # Network communication with Stripe failed
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.StripeError as e:
+          # All other Stripe errors
+          print('Status: %s' % e.http_status)
+          print('Code: %s' % e.code)
+          print('Message: %s' % e.user_message)
+          print('Request ID: %s' % e.request_id)
+        except Exception as e:
+          raise HTTPException(detail="Error deleting customer account.", status_code=500)
+        response = await retry_async_httpx_request(method="DELETE", url=f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
+        # response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
         response.raise_for_status()
         if response.status_code == 204:
             del _api_key_cache[api_key_hash]

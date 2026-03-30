@@ -121,6 +121,8 @@ async def lifespan(app: FastAPI):
     # Initialize context / context
     app.state.context = GlobalContext()
     app.state.httpx_client = httpx.AsyncClient()
+    app.state.stripe = stripe
+    app.state.stripe.api_key = app.state.context.stripe_publishable_key
     
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
@@ -227,57 +229,31 @@ async def create_avatar(
         return HTTPException(detail = "Error creating avatar {name}: {e}", status_code=500)
 
 
-# @app.get("/test")
-# async def test(current_user: dict = Depends(get_current_user)):
-#     return {"current_user": current_user}
-
-@app.get("/list_public_avatars")
-async def list_public_avatars(assistant_id: Optional[str] = None):
-    logger.info("breakpoint")
-    public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
-    return public_avatars_result
-
-@app.get("/list_user_avatars")
-async def list_user_avatars(
-    current_user: dict = Depends(get_current_user),
-    ):
-    logger.info("breakpoint")
-    if not current_user:
-        public_avatars_result = await get_public_avatars()
-        return public_avatars_result
-    try:
-        public_avatars_result = await get_public_avatars(user_id=current_user['identities'][0]['user_id']) 
-        token = current_user['API_KEY']
-        client = get_client(headers = {"Authentication": f"{token}"})
-        response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
-        if len(response) > 0:
-            avatar_list = response
-            public_avatars_result.extend(avatar_list) # public and private avatars
-        return JSONResponse(public_avatars_result, status_code=200)
-    except Exception as e:
-        error = f"Error in listing avatars: {e}"
-        return HTTPException(detail=error, status_code=500)
-
-@app.delete("/delete_avatar")
-async def delete_avatar(
+@app.post("/share_avatar")
+async def share_avatar(
     assistant_id: str,
+    is_public: bool = True,
     current_user: dict = Depends(get_current_user)
 ):
-    # TODO: Delete avatar in database
-    logger.info("breakpoint")
-
-    token = current_user["API_KEY"]
+    context = app.state.context
     user_id = current_user['identities'][0]['user_id']
-    client = get_client(headers={"Authorization": f"Bearer {token}"})
-    
-    metadata = {'user_id':user_id}
-    metadata.update({"assistant_id": assistant_id})
-    try:
-        await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
-    except Exception as e:
-        raise HTTPException(detail = e, status_code=500)
-    
-    return JSONResponse("Deleted Avatar Successfully", status_code=200)
+    if ((user_id is context.admin_user_id)):
+            """ verify users are creating avatars of their own likeness in the future"""
+            metadata = {"is_public": is_public}
+
+    # Only admins may share avatars; 
+    # Users will authenticate and share avatars in the near future.
+    if user_id is context.admin_user_id:
+        try:
+            token = current_user['API_KEY']
+            client = get_client(headers={"Authorization": f"Bearer {token}"})
+            result = await client.assistants.update(
+                assistant_id=assistant_id, 
+                metadata=metadata)
+            return JSONResponse(result, status_code=200)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
+    raise HTTPException(status_code=401, detail="Users may only share avatars of themselves.")
 
 
 @app.patch("/modify_avatar")
@@ -333,31 +309,60 @@ async def modify_avatar(
             raise HTTPException(status_code=500, detail=f"Error updating assistant: {assistant_id}")
 
 
-@app.post("/share_avatar")
-async def share_avatar(
+@app.delete("/delete_avatar")
+async def delete_avatar(
     assistant_id: str,
-    is_public: bool = True,
     current_user: dict = Depends(get_current_user)
 ):
-    context = app.state.context
-    user_id = current_user['identities'][0]['user_id']
-    if ((user_id is context.admin_user_id)):
-            """ verify users are creating avatars of their own likeness in the future"""
-            metadata = {"is_public": is_public}
+    # TODO: Delete avatar in database
+    logger.info("breakpoint")
 
-    # Only admins may share avatars; 
-    # Users will authenticate and share avatars in the near future.
-    if user_id is context.admin_user_id:
-        try:
-            token = current_user['API_KEY']
-            client = get_client(headers={"Authorization": f"Bearer {token}"})
-            result = await client.assistants.update(
-                assistant_id=assistant_id, 
-                metadata=metadata)
-            return JSONResponse(result, status_code=200)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail = f"Error during update of sharing avatar: {e}")
-    raise HTTPException(status_code=401, detail="Users may only share avatars of themselves.")
+    token = current_user["API_KEY"]
+    user_id = current_user['identities'][0]['user_id']
+    client = get_client(headers={"Authorization": f"Bearer {token}"})
+    
+    metadata = {'user_id':user_id}
+    metadata.update({"assistant_id": assistant_id})
+    try:
+        await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
+    except Exception as e:
+        raise HTTPException(detail = e, status_code=500)
+    
+    return JSONResponse("Deleted Avatar Successfully", status_code=200)
+
+
+# @app.get("/test")
+# async def test(current_user: dict = Depends(get_current_user)):
+#     return {"current_user": current_user}
+
+@app.get("/list_public_avatars")
+async def list_public_avatars(assistant_id: Optional[str] = None):
+    logger.info("breakpoint")
+    public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
+    return public_avatars_result
+
+@app.get("/list_user_avatars")
+async def list_user_avatars(
+    current_user: dict = Depends(get_current_user),
+    ):
+    logger.info("breakpoint")
+    if not current_user:
+        public_avatars_result = await get_public_avatars()
+        return public_avatars_result
+    try:
+        public_avatars_result = await get_public_avatars(user_id=current_user['identities'][0]['user_id']) 
+        token = current_user['API_KEY']
+        client = get_client(headers = {"Authentication": f"{token}"})
+        response = await client.assistants.search(metadata={"user_id": current_user['identities'][0]['user_id']})
+        if len(response) > 0:
+            avatar_list = response
+            public_avatars_result.extend(avatar_list) # public and private avatars
+        return JSONResponse(public_avatars_result, status_code=200)
+    except Exception as e:
+        error = f"Error in listing avatars: {e}"
+        return HTTPException(detail=error, status_code=500)
+
+
 
 @app.post("/select_avatar")
 async def select_avatar(
@@ -557,10 +562,14 @@ async def message(
 
     logger.info(f"{result}")
 
-    return JSONResponse(result['messages'][-1].content, status_code=200)
+    response = {}
+    response["content"] = result['messages'][-1].content
+    response["response_metadata"] = result['messages'][-1].response_metadata
 
-@app.post("/upload-media")
-async def upload_media(
+    return JSONResponse(response, status_code=200)
+
+@app.post("/update_avatar_identity_with_media")
+async def update_avatar_identity_with_media(
     files: List[UploadFile] = File(...),
     reference_audio: bool = False,
     reference_image: bool = False, 
@@ -607,9 +616,9 @@ async def upload_media(
 
         context=app.state.context
         store = app.state.store
-        runtime = Runtime(context=context, store=store)
         
         # Import graph here to avoid circular imports
+
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import workflow
         # process_media_graph_api_endpoint
 
@@ -628,23 +637,68 @@ async def upload_media(
     
         # Extract indexed documents info
         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "files_processed": len(files),
-                "documents_indexed": len(indexed_docs),
-                "filenames": [f.filename for f in files],
-                "message": "Media processed and indexed successfully"
-            }
-        )
+        if len(indexed_docs) == 0:
+            return HTTPException(status_code=500, detail={
+                    "files_processed": len(files),
+                    "documents_indexed": len(indexed_docs),
+                    "filenames": [f.filename for f in files],
+                    "message": "Error processing and indexing media"
+                })
+        else:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "files_processed": len(files),
+                    "documents_indexed": len(indexed_docs),
+                    "filenames": [f.filename for f in files],
+                    "message": "Media processed and indexed successfully"
+                }
+            )
     
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
+
+import stripe
+from fastapi.responses import RedirectResponse 
+@app.get("/subscribe")
+async def subscribe(current_user: dict = Depends(get_current_user)):
+    """
+    Create a monthly subscription.
+    """
+
+    verified_email = current_user.get("verified_email", None)
+    if not verified_email:
+        raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
+    
+    return RedirectResponse(url=app.state.context.stripe_payment_url, code=303)
+
+    # try: 
+    #     checkout_session = stripe.checkout.Session.create(
+    #         line_items=[
+    #             {
+    #                 # Provide the exact Price ID 
+    #                 'price': app.state.context.stripe_product_id
+    #             }
+    #         ], 
+    #         mode='subscription',
+    #         success_url="api.neuralnexus.site" + '?success=true',
+    #         automatic_tax={'enabled': True},
+    #     )
+    # except Exception as e:
+    #         return str(e)
+    # return RedirectResponse(url=checkout_session.url, code=303)
+
+
+
+@app.post("/unsubscribe")
+async def unsubscribe():
+    """
+    Cancel a monthly subscription.
+    """
+
 
 # @app.post("/process-media-json")
 # async def process_media_json(
@@ -698,8 +752,6 @@ async def upload_media(
 #             detail=f"Error processing media: {str(e)}"
 #         )
 
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True, ssl_keyfile='./origin_cert.pem', ssl_certfile='./cloudflare_private.key')

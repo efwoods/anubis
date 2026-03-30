@@ -3,19 +3,12 @@ from typing import Any
 import logging
 logger = logging.getLogger(__name__)
 
-
-# TEXT TO VECTORSTORE
-
-"""
-Text chunking module for processing large text files into Documents
-for LangGraph-MongoDB vectorstore with all-MiniLM-L6-v2 embeddings (384 dimensions)
-"""
-
+from langchain_core.documents import Document
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from uuid import uuid4
 import logging
-from langchain_core.documents import Document
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.anubis.utils.configuration import GlobalConfiguration
@@ -30,6 +23,167 @@ from sentence_transformers import SentenceTransformer
 from langchain_core.messages.utils import count_tokens_approximately
 
 from uuid import uuid4, uuid5, NAMESPACE_URL
+
+from pydantic import BaseModel
+from pydantic.dataclasses import dataclass
+from typing import Literal
+from pydantic import Field
+
+# Process TEXT TO DOCUMENT
+async def process_text_to_document(metadata, user_id, assistant_id, media_item) -> list[Document]:
+    """ Process text to document; 
+    document chunking necessity, 
+    situation determination, 
+    and future use of the data (vectorstore, analysis, adapter) are handled here   
+    """
+    logger.info(f"Handling text in process media")
+    
+    proprietary_content = metadata.get("proprietary_content", False)
+    
+    if proprietary_content:
+        logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
+        
+        classification_metadata = {
+            "classified_situation": "proprietary content",
+            "classification_reasoning": "user_selected_classification_of_proprietary_content"
+        }
+        
+        documents = await process_text_media_item_target_for_vectorstore(
+            media_item=media_item, 
+            user_id=user_id, 
+            assistant_id=assistant_id,
+            classification_metadata=classification_metadata,
+            use_semantic_chunks=False
+        )
+        
+        for document in documents: 
+                    document.metadata.update({"vectorstore_acceptable": True})
+        return documents
+    
+    else:
+        logger.info(f"There is a target and the content of the text needs to be analyzed (is this a monologue or multi-speaker or strictly Q & A; how many speakers, etc.)")
+        
+        # Analyze text situation
+
+        @dataclass
+        class TextualSituationalAwareness:
+            classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
+            reasoning: str = Field(
+                description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
+            )
+        model_with_structured_output = init_model(
+            response_format=TextualSituationalAwareness
+        )
+        from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
+        system_prompt = TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
+        text_content = media_item.get("content", "")
+        
+        classification = await model_with_structured_output.ainvoke(input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text_content}
+        ])
+        logger.info(f"Situation classification: {classification['classified_situation']}")
+        logger.info(f"Reason for classification : {classification['reasoning']}")
+        
+        classification_metadata = {
+            "classified_situation": classification['classified_situation'], "classification_reasoning": classification['reasoning']
+        }
+        if classification['classified_situation'] == "single_speaker":
+            # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 
+            
+            # is this content written in first person or is this content about the individual?
+            # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
+            # @dataclass
+            # class DetermineTextFirstPersonToneOfVoice:
+            #
+            #   classification: Literal("first_person_directly_speaking", "content_about_target_NOT_the_target_directly_speaking")
+            #   reason: str = Field()
+            # model_with_structured_output_classify_text_perspective = init_model()
+            # input = [{"role": "system", "content": DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
+            # response = model_with_structured_output_classify_text_perspective.ainvoke(input=input)
+            # 
+            # if response['classification'] == "first_person_directly_speaking":
+            # Direct quote content of only the target speaker speaking in the entire media item.  
+            # """ IF THE DETERMINATION ABOVE IS TRUE """
+            # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
+            # TODO: GENERATE A PROMPTING QUESTION AND CREATE A TRAINING DOCUMENT WITH BOTH GENERATED QUESTION AND THIS RESPONSE
+            #  """""""""
+            # TODO: format for Baseline ground truth using only text from first-person perspective of the target speaker (ultimately combine with analysis for evaluation; is this generated text something the target speaker would say/know; is this how they behave, their internal decision tree chain-of-thought, are their emotions and emotional sentiment in alignment given ground truth primary resource experiences? (include vader sentiment of baseline ground truth))
+            # BASELINE CODE BELOW
+            # make_pg_store 
+            # namespace = (user_id, assistant_id)
+            # baseline_evaluation_quote_data = aget(namespace, key="baseline_evaluation_quote_data")
+            # metadata = baseline_evaluation_quote_data.metadata
+            # metadata_update = {"baseline_evaluation_quote_data": {"uuid4()":{"data": "unchunked direct_quote from media_item['content']", "metadata":{"created_at":"", "filename":"", "user_id":"", "assistant_id":""}}}} # also the structure of original metadata
+            # metadata.update(metadata_update)
+            # 
+            # update the metadata object with an overwrite
+            # aput(namespace, key="baseline_evaluation_quote_data", value=metadata) # this extends the metadata dictionary
+            
+            # iterate through the uuid4's to pull the "data" and have all the orginal quote content for evaluation of AI responses.
+            # """ REGARDLESS OF DETERMINATION (accept both facts and direct quotes) """
+            # format for vectorstore: chunk and upload to vectorstore
+                logger.info(f"proccess_text_media_item_target_for_vectorstore BREAKPOINT in Process media item task: type = text")
+                documents = await process_text_media_item_target_for_vectorstore(
+                    media_item=media_item, 
+                    user_id=user_id, 
+                    assistant_id=assistant_id,
+                    classification_metadata=classification_metadata,
+                    use_semantic_chunks=True
+                )
+                for document in documents: 
+                    document.metadata.update({"formatted_type": "vectorstore"})
+            # TODO: format for analysis: analyze for content about the target
+            # USE THE DETERMINATION TO AUGMENT ANALYSIS AND NOTE THAT THE CONTENT IS EITHER ABOUT THE TARGET OR IS FROM THE TARGET SPEAKING DIRECTLY
+        elif classification['classified_situation'] == "q_and_a_dialogue":
+            logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")
+            logger.warning(f"""
+            # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER
+                # documents = process_text_media_item_target_for_vectorstore(
+                #     media_item, 
+                #     user_id=user_id, 
+                #     assistant_id=assistant_id, 
+                #     classification_metadata=classification_metadata
+                # )
+                # for document in documents: 
+                #     document.metadata.update({"formatted_type": "vectorstore"})
+                    
+            # TODO: format for analysis: extract target speaker only and analyze with llm
+            # TODO: format for Adapter: Q & A format document
+            """)
+        elif classification['classified_situation'] == "multi_speaker":
+            logger.warning(f"MULTI-SPEAKER CLASSIFICAITON DETECTED")
+            logger.warning(f"""
+            # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER; CONTENT IS NOT DIALOGUE; SPEAKER NEEDS TO BE IDENTIFIED IN THE TEXT
+            # TODO: format for analysis: TARGET MUST BE IDENTIFIED, LLM IS USED TO ANALYZE CONTENT ABOUT THE TARGET ONLY
+            # TODO: format for Adapter: ALL OTHER NON-TARGET SPEAKERS ARE CLASSIFIED AS USER AND THE TARGET SPEAKER IS CLASSIFIED AS AI FOR THE FORMAT.
+            """)
+        elif classification['classified_situation'] == "other":
+            logger.warning(f"OTHER text situation classification detected. Inspect and handle the situation appropriately. Currently handled in the same procedure as proprietary content.")
+            
+            logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
+        
+            documents = await process_text_media_item_target_for_vectorstore(
+                media_item=media_item, 
+                user_id=user_id, 
+                assistant_id=assistant_id,
+                classification_metadata=classification_metadata,
+                use_semantic_chunks=True
+            )
+            for document in documents: 
+                    document.metadata.update({"formatted_type": "vectorstore"})
+        else:
+            logger.warning(f"Error: situation classification is not of type other, multi_speaker, q_and_a_dialogue, or single_speaker")
+        return documents
+
+
+
+# TEXT TO VECTORSTORE
+
+"""
+Text chunking module for processing large text files into Documents
+for LangGraph-MongoDB vectorstore with all-MiniLM-L6-v2 embeddings (384 dimensions)
+"""
 
 @dataclass
 class SemanticChunkIndexList:
@@ -76,7 +230,7 @@ async def split_text_into_chunks(
                 "chunk_index": idx,
                 "total_chunks": len(text_chunks),
                 "filename": filename,
-                "filename_uuid5": str(uuid5(filename)),
+                "filename_uuid5": str(uuid5(NAMESPACE_URL, filename)),
                 "document_id":str(uuid4()),
             }
         )
@@ -92,7 +246,6 @@ async def process_text_media_item_target_for_vectorstore(
     media_item: Dict[str, Any],
     user_id: str,
     assistant_id: str,
-    configuration: GlobalConfiguration,
     chunk_size: int = 256,
     chunk_overlap: int = 25,
     separators: Optional[List[str]] = None,
@@ -160,10 +313,7 @@ async def process_text_media_item_target_for_vectorstore(
         
             # Define meaningful chunks first
 
-            tools = []
-
             model_structured_output = init_model(
-                        configuration=configuration,
                         response_format=SemanticChunkIndexList
             )
 
@@ -445,5 +595,5 @@ async def process_text_media_item_target_for_vectorstore(
         return all_documents
 
     except Exception as e:
-        logger.error("Error in text chunking during process media item target for vector store: {e}")
-        raise e
+        logger.exception(f"Error in text chunking during process media item target for vector store: {e}")
+        raise 

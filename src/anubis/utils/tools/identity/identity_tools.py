@@ -87,6 +87,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     """
     <INSTRUCTIONS>
     Create a memory whenever a significant event occurs or when prompted to remember. 
+    USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
     This is not used when the user is telling the assistant about the assistant's identity.
 
     This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
@@ -105,7 +106,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     The context behind the fact must be succinct. 
     The fact must be clear and complete.
     
-    USE THIS FUNCTION SPARINGLY FOR SIGNIFICANT and EXTRAODINARY EVENTS ONLY.
+    USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
@@ -124,6 +125,41 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     This is important.
     This is important to me.
     </EXAMPLE> 
+
+    <EXAMPLE>
+    Please, don't call me child.
+    I would prefer if you would use my middle name.
+    Can you please stop doing that.
+    Stop that.
+    I want you to do <ACTION OR EVENT/>.
+    I like when you <ACTION OR EVENT/>.
+    I dislike when you <ACTION OR EVENT/>.
+    </EXAMPLE>
+
+    <INSTRUCTIONS>
+    Create a memory whenever a significant event occurs or when prompted to remember. 
+    USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
+    This is not used when the user is telling the assistant about the assistant's identity.
+
+    This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
+    
+    An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
+    
+    THERE MAY BE MORE THAN ONE FACT and IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    
+    ALWAYS use this tool when a significant EVENT OCCURS that is SALIENT to the assistant or user's goals, beliefs, values, or perspective or is otherwise IMPORTANT, SURPRISING, EVENTFUL, UNUSUAL or EXTRAORDINARY.
+    
+    ALWAYS use this tool when a CHOICE has been made or there is otherwise an event that has reached a point of no return.
+
+    Identify the fact, occurance, or event that was asserted was important, found significant, or was a choice or a point of no return. 
+    Do not change the information of the fact.
+    Identify the CONTEXT behind the fact given the list of messages.
+    The context behind the fact must be succinct. 
+    The fact must be clear and complete.
+    
+    USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
+    </INSTRUCTIONS>
+
 
     Args:
         significant_fact: The main content of the significant fact, event, or occurance. For example:
@@ -322,6 +358,10 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     I have twins.
     </EXAMPLE>
 
+    <RESTRICTIONS>
+    NEVER call this tool multiple times with the same fact.
+    </RESTRICTIONS>
+
     <INSTRUCTIONS>
     Learn Facts about yourself from the User through text
 
@@ -368,10 +408,11 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # Memory of the Identity of the assistant presented as text from the user.
-    assistant_memory_namespace = (user_id, assistant_id, 'memory')
+    assistant_memory_namespace = (creator_id, assistant_id, 'identity_memory')
 
     # VERIFY FACT DOES NOT ALREADY EXIST in memories
-    if runtime.state.get('recalled_memory_documents', None) is not None:
+    
+    if len(runtime.state.get('recalled_memory_documents', [])) != 0:
         assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['recalled_memory_documents']]
         assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=assistant_fact)
         assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
@@ -439,7 +480,7 @@ async def learn_information_about_yourself_through_text_from_the_user_as_a_memor
     )
 
     tool_call_id = runtime.tool_call_id
-    update = {"recalled_memory_documents": [assistant_identity_memory_document],
+    update = {"assistant_identity_documents": [assistant_identity_memory_document],
               "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
     return Command(update=update)

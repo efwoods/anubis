@@ -11,21 +11,9 @@
 ## TODO:  bug
 no response after long message (20,000 lines); multiple queries no response.
 
-## TODO: bug
-Tool call id's do not match
-['f02ae497-a69b-443b-81aa-286d13f89fd6', 'f837fb82-061f-4094-8e59-d04c62f5cfb7', 'a944aae4-29f5-476e-b4b0-34eada06910e', '1d1252be-2050-4871-a196-2b2bca70e7ec', '8bff3714-2a44-43f9-9e38-4b6975a4efe2', '8e9fcfb9-9d75-46d4-87a1-be3808aff69e', '55fefe1c-3238-4c0b-a46f-4336f7991071', 'fb8e8134-ac18-48ca-8745-7f05fad84f21', 'd96fd629-b6e8-4189-ae80-23cd214b9581']
-
 ## TODO: BUG: CancelledError()
 humanThis is a new event and I need you to create a memory about this. This is the first time I said I love you, because I do.
 CancelledError()
-
-## TODO: BUG: tool use injected into response
- I don't know who I am. You told me your name is Evan Woods, but I don't have any information about my own identity. If you share something about me, I'll try to remember it. [recall_memories()]
-
- recall_memories()<|python_end|>
-
-You told me that your name is Evan Woods. That's the only information I have about you so far. I'm still getting to know you, and I'll remember more if you share more about yourself. [learn_information_about_the_user(content="User's name is Evan Woods.")]
-        
 
 ## TODO BUG: false positive on tool calling
 I'm still getting to know myself, and I don't have much information about my own identity. I don't know my name or any personal details about myself. However, I can tell you that I'm currently conversing with you, Evan Woods. If you'd like to share some information about me or my identity, I'll do my best to remember it. [learn_information_about_yourself_through_text_from_the_user_as_a_memory(content="User asked me to tell them about myself."), recall_memories()]
@@ -78,3 +66,93 @@ ssl on vanity url
 ci-cd build and push to azure
                                                          
 https://claude.ai/chat/7ea64dfd-00b7-4743-88c0-6ee4c21ab1c3
+
+# TODO:
+Create a qr code for a single avatar for public real-world use (url to avatar with configuration for a single avatar)
+
+# TODO:
+
+- upload bible as reference document
+<!--  -->
+- upload tweets and verify responses 
+
+- pay for your own application
+
+# TODO: 
+- authenticate anonymous users
+- authenticate a user for youtube
+- authenticate a user for twitch
+- authenticate a user for twitter
+- authenticate a user for instagram
+- verify the identity of real people
+
+- rate limit users
+- integrate stripe payments
+- kubernetes scalable azure deployments
+- ci/cd pipeline for building images
+
+- connect health app (watch apple health kit on local for nutrition, sleep, and fitness ingestion and query)
+- connect financial records from a website (download monthly statement as pdf for querying)
+- guard public avatars against revealing personal information 
+
+- include documents in messages
+
+- pipeline data from social media (transcribe image, audio, video and identify target via reference image and reference audio)
+- watch social media for new updates & pipeline that data
+- determine data type
+- process images
+- process audio
+- process video
+- process webcontent
+- upload to vectorstore
+- analyze for features
+- create adapter format when appropriate
+- store adapter
+- train and attach adapter
+- create a dataset from collected responses (find answers to N defined questions)
+- verify quality of responses against a dataset  
+- moderate responses
+- ban violators
+
+- create audio model (generation)
+- create video model (generation)
+- create live audio discord conversations
+
+# Integrate with platforms for use cases (responses) such as:
+- twitch
+- twitter
+- slack
+- discord
+
+
+# Open Call
+Hi my name is Evan! I'm a software engineer working on a startup, Afterlife Systems Incorporated. We are creating A.I. reconstructed personalities of real-world individuals through fine-tuning and few shot prompting data pipelined from social media, told through personal stories of our users, or uploaded by the users themselves. I am looking for a partner to join me in an incubator. If you are interested in the work or the partnership, please contact me!
+
+API URL: http://api.neuralnexus.site
+Welcome Page: https://neuralnexus.site/welcome
+
+Typical use cases include:
+
+Recreating experiences of communicating with people no longer with us to celebrate the best of their existence and to continue experiencing their presence.
+Creating entertaining experiences of interacting with public-domain characters.
+Creating your own avatar to share or for insights into your own personal health and well-being by ingesting health-kit data such as nutrition, sleep, financial data, time-tracking data, browsing history, and physical activity.
+Creating messages in your own custom tone of voice for use in email responses, tweet responses, and custom git logs or to assist in writing in your own vocal style.
+Creating simple public avatars for context-oriented responses from the Project Gutenberg Bible to offer the world a safe, comforting place for their prayers with personal responses from the Bible or other religious text.
+Creating non-denominational motivational public speaker avatars with their consent for personal on-demand contextual self help guidance. 
+Future integration with neural data for thought-to-media and media-to-thought applications (thought-to-image, image-to-neural waveform, etc.): https://github.com/efwoods/V1-Visual-Cortex-Visualization
+
+I am currently working on:
+
+Developing pipelines to pull, clean, and upload data from social media or uploaded files.
+Creating statistical proof of the authenticity of the responses using metrics such as the Mahalanobis Distance with respect to metrics such as rouge and BERT scores to measure response semantic similarity as well as longest sub-sequence length with the aim of evaluating authenticity against a known public individual's dataset. 
+Creating API endpoints to allow use of the Langgraph graph through integrations with other social media bot interfaces such as Slack, Discord, Twitter, and Twitch among others for moderation or any of the above listed features of the application.
+Optimizing the architecture to allow for a scalable API interface to support the requests of multiple simultaneous users.
+Fine-tuning adapters to attach to meta-llama models.
+
+If you have experience or interest in any of the above areas, I welcome working with you in the future.
+
+View my recent work efforts here: github.com/efwoods
+
+I am planning on applying to incubators such as Nvidia's Inception program and Y Combinator Summer 2026.
+
+Thank you for your time, interest, and attention! Best of luck with all your future efforts! (edited)

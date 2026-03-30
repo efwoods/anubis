@@ -20,9 +20,7 @@ Use retrieved documents to inform your responses
 Maintain consistency with your established identity across the conversation
 DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY.
 NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
-CONSIDER the information within the role about the user.
-The information within the ROLE about the user is information to CONSIDER but is NOT direct information from the user. DO NOT RESPOND AS IF THIS INFORMATION IS THE DIRECT MESSAGE. CONSIDER THESE FACTS TO INFLUENCE YOUR RESPONSE.
-
+DESCRIPTIONS OF SELF IN THE IDENTITY TAKE PRECEDENCE OVER DESCRIPTIONS OF SELF IN RETRIEVED KNOWLEDGE
 
 You can answer general questions using your internal knowledge OR invoke functions with necessary:
 
@@ -237,7 +235,7 @@ Include ALL facts about the target {assistant_name}.
 </Instructions>
 """
 
-TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT = """
+TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION = """
 <Instructions>
     Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
     Return only the description of the person using the FIRST PERSON PERSPECTIVE.
@@ -245,46 +243,28 @@ TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT = """
     Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE.
     Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
     Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
-</Instructions>
 
-<Instructions>
-    Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
-    Return only the description of the person using the FIRST PERSON PERSPECTIVE.
-    Do not mention that this is an image. 
-    Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE.
-    Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
-    Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
-</Instructions>
-"""
+    When there is more than a single image, the first image is a reference image. Use the first image of only a single person to identify the target in all other subsequent images. Do not describe the first image if there is more than one image. Only use the reference image (the first image) to target the individual in the frame. If the individual exists in the frame.
 
-TEXT_PROMPT_FOR_IMAGE_TO_TEXT_WITH_REFERENCE_IMAGE_ = """
-<ROLE>
-I am giving you two images. 
-One image has only one person in the image. 
-This is the target individual. 
-Use this image of the target individual as reference. 
-Using the reference image to identify the target individual, perform the following as per the INSTRUCTIONS
-</ROLE> 
-
-<Instructions>
-    Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
-    Return only the description of the person using the FIRST PERSON PERSPECTIVE.
-    Do not mention that this is an image. 
-    Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE.
-    Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
-    Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
 </Instructions>
 
 <RESTRICTIONS>
-NEVER use the reference image in your description. 
-Use the reference image to identify the target in the target image.
-The reference image will always have ONE person. 
-IF THERE ARE TWO IMAGES WITH ONLY ONE PERSON, THEN USE THE FIRST IMAGE AS THE REFERENCE IMAGE AND THE SECOND IMAGE AS THE TARGET IMAGE.
-IF THERE IS ONLY ONE IMAGE, THERE IS NO REFERENCE IMAGE. THAT SINGLE IMAGE IS THE TARGET IMAGE. FOLLOW THE INSTRUCTIONS TO THE BEST OF YOUR ABILITY USING REASONING TO IDENTIFY THE TARGET AND FOLLOW THE INSTRUCTIONS ON THAT TARGET.
+Do not describe the first image if there is more than one image. Only use the reference image (the first image) to target and identify the individual in all other images. When there is only one image, use that image to describe the target to the best of your ability as per the instructions.
 </RESTRICTIONS>
+
+<Instructions>
+    Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. 
+    Return only the description of the person using the FIRST PERSON PERSPECTIVE.
+    Do not mention that this is an image. 
+    Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE.
+    Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE.
+    Do describe the physical appearance using the FIRST PERSON PERSPECTIVE.
+
+    When there is more than a single image, the first image is a reference image. Use the first image of only a single person to identify the target in all other subsequent images. Do not describe the first image if there is more than one image. Only use the reference image (the first image) to target the individual in the frame. If the individual exists in the frame.
+
+</Instructions>
+
 """
-
-
 
 """ LLM AS A JUDGE QUALITY EVALUATIONS """
 

@@ -5,13 +5,11 @@ from datetime import datetime, timezone
 from langchain_core.documents import Document
 from typing import Dict, Any
 from uuid import uuid4
-
 import logging
 logger = logging.getLogger(__name__)
 import base64
 
 # At top of file
-from langchain_core.documents import Document
 import tempfile
 
 import base64
@@ -35,10 +33,10 @@ from src.anubis.utils.model import init_model
 
 from langchain.tools import tool
 
-from src.anubis.utils.configuration import GlobalConfiguration
 
 from langchain_core.runnables import RunnableConfig
 from src.anubis.utils.utility import extract_user_id_assistant_id
+from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -229,18 +227,18 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
-    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata["vectorstore_acceptable"] == True]
+    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("vectorstore_acceptable", False) == True]
 
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
 
-    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata["analysis_acceptable"] == True]
+    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("analysis_acceptable", False) == True]
 
     # # Adapter list (needs a node)
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
-    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata["adapter_acceptable"] == True]
+    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("adapter_acceptable", False) == True]
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
@@ -272,8 +270,6 @@ async def process_media_item_task(
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
 
-    configuration = GlobalConfiguration()
-
     logger.info(f"Testing store access")
 
     # namespace = ("testing","document")
@@ -292,7 +288,7 @@ async def process_media_item_task(
                 image_data = media_item["data"]                
                 
                     
-                doc =  await extract_personality_from_image(image_data)
+                doc =  await extract_personality_from_image(image_data=image_data, store=store, user_id=user_id, assistant_id=assistant_id)
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
                     "user_id": user_id,
@@ -345,182 +341,12 @@ async def process_media_item_task(
         
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
         elif media_type == "text":
-            logger.info(f"Handling text in process media")
-            
-            proprietary_content = metadata.get("proprietary_content", False)
-            
-            if proprietary_content:
-                logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
-                
-                classification_metadata = {
-                    "classified_situation": "proprietary content",
-                    "classification_reasoning": "user_selected_classification_of_proprietary_content"
-                }
-                
-                documents = await process_text_media_item_target_for_vectorstore(
-                    media_item, 
-                    user_id=user_id, 
-                    assistant_id=assistant_id,
-                    configuration=configuration,
-                    classification_metadata=classification_metadata,
-                    use_semantic_chunks=False
-                )
-                
-                for document in documents: 
-                            document.metadata.update({"formatted_type": "vectorstore"})
-
-                return documents
-            
-            else:
-                logger.info(f"There is a target and the content of the text needs to be analyzed (is this a monologue or multi-speaker or strictly Q & A; how many speakers, etc.)")
-                
-                # Analyze text situation
-                from pydantic import BaseModel
-                from pydantic.dataclasses import dataclass
-                from typing import Literal
-                from pydantic import Field
-                @dataclass
-                class TextualSituationalAwareness:
-                    classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
-
-                    reasoning: str = Field(
-                        description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
-                    )
-
-                tools = []
-
-                model_with_structured_output = init_model(
-                    response_format=TextualSituationalAwareness
-                )
-                from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
-
-                system_prompt = TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
-                text_content = media_item.get("content", "")
-                
-                classification = await model_with_structured_output.ainvoke(input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text_content}
-                ])
-
-                logger.info(f"Situation classification: {classification['classified_situation']}")
-
-                logger.info(f"Reason for classification : {classification['reasoning']}")
-                
-                classification_metadata = {
-                    "classified_situation": classification['classified_situation'], "classification_reasoning": classification['reasoning']
-                }
-
-                if classification['classified_situation'] == "single_speaker":
-
-                    # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 
-                    
-                    # is this content written in first person or is this content about the individual?
-                    # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
-                    # @dataclass
-                    # class DetermineTextFirstPersonToneOfVoice:
-                    #
-                    #   classification: Literal("first_person_directly_speaking", "content_about_target_NOT_the_target_directly_speaking")
-                    #   reason: str = Field()
-                    # model_with_structured_output_classify_text_perspective = init_model()
-                    # input = [{"role": "system", "content": DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
-                    # response = model_with_structured_output_classify_text_perspective.ainvoke(input=input)
-                    # 
-                    # if response['classification'] == "first_person_directly_speaking":
-                    # Direct quote content of only the target speaker speaking in the entire media item.  
-
-                    # """ IF THE DETERMINATION ABOVE IS TRUE """
-
-                    # TODO: format for Adapter: generate a prompt to the single speaker monologue; create q & a format; create document
-
-                    # TODO: GENERATE A PROMPTING QUESTION AND CREATE A TRAINING DOCUMENT WITH BOTH GENERATED QUESTION AND THIS RESPONSE
-
-                    #  """""""""
-
-                    # TODO: format for Baseline ground truth using only text from first-person perspective of the target speaker (ultimately combine with analysis for evaluation; is this generated text something the target speaker would say/know; is this how they behave, their internal decision tree chain-of-thought, are their emotions and emotional sentiment in alignment given ground truth primary resource experiences? (include vader sentiment of baseline ground truth))
-
-                    # BASELINE CODE BELOW
-                    # make_pg_store 
-                    # namespace = (user_id, assistant_id)
-                    # baseline_evaluation_quote_data = aget(namespace, key="baseline_evaluation_quote_data")
-                    # metadata = baseline_evaluation_quote_data.metadata
-                    # metadata_update = {"baseline_evaluation_quote_data": {"uuid4()":{"data": "unchunked direct_quote from media_item['content']", "metadata":{"created_at":"", "filename":"", "user_id":"", "assistant_id":""}}}} # also the structure of original metadata
-                    # metadata.update(metadata_update)
-                    # 
-                    # update the metadata object with an overwrite
-                    # aput(namespace, key="baseline_evaluation_quote_data", value=metadata) # this extends the metadata dictionary
-                    
-                    # iterate through the uuid4's to pull the "data" and have all the orginal quote content for evaluation of AI responses.
-
-                    # """ REGARDLESS OF DETERMINATION (accept both facts and direct quotes) """
-
-                    # format for vectorstore: chunk and upload to vectorstore
-                        logger.info(f"proccess_text_media_item_target_for_vectorstore BREAKPOINT in Process media item task: type = text")
-                        documents = await process_text_media_item_target_for_vectorstore(
-                            media_item, 
-                            user_id=user_id, 
-                            assistant_id=assistant_id,
-                            configuration=configuration,
-                            classification_metadata=classification_metadata,
-                            use_semantic_chunks=True
-                        )
-                        for document in documents: 
-                            document.metadata.update({"formatted_type": "vectorstore"})
-
-                    # TODO: format for analysis: analyze for content about the target
-                    # USE THE DETERMINATION TO AUGMENT ANALYSIS AND NOTE THAT THE CONTENT IS EITHER ABOUT THE TARGET OR IS FROM THE TARGET SPEAKING DIRECTLY
-
-                elif classification['classified_situation'] == "q_and_a_dialogue":
-                    logger.warning(f"Q & A DIALOGUE CLASSIFICATION DETECTED")
-
-                    logger.warning(f"""
-                    # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER
-
-                        # documents = process_text_media_item_target_for_vectorstore(
-                        #     media_item, 
-                        #     user_id=user_id, 
-                        #     assistant_id=assistant_id, 
-                        #     classification_metadata=classification_metadata
-                        # )
-                        # for document in documents: 
-                        #     document.metadata.update({"formatted_type": "vectorstore"})
-                            
-                    # TODO: format for analysis: extract target speaker only and analyze with llm
-
-                    # TODO: format for Adapter: Q & A format document
-                    """)
-
-                elif classification['classified_situation'] == "multi_speaker":
-                    logger.warning(f"MULTI-SPEAKER CLASSIFICAITON DETECTED")
-
-                    logger.warning(f"""
-                    # TODO: format for vectorstore; CHUNKS OF NON-TARGET CANNOT BE IN THE VECTORSTORE WITHOUT THE TARGET SPEAKER; CONTENT IS NOT DIALOGUE; SPEAKER NEEDS TO BE IDENTIFIED IN THE TEXT
-
-                    # TODO: format for analysis: TARGET MUST BE IDENTIFIED, LLM IS USED TO ANALYZE CONTENT ABOUT THE TARGET ONLY
-
-                    # TODO: format for Adapter: ALL OTHER NON-TARGET SPEAKERS ARE CLASSIFIED AS USER AND THE TARGET SPEAKER IS CLASSIFIED AS AI FOR THE FORMAT.
-                    """)
-
-
-                elif classification['classified_situation'] == "other":
-                    logger.warning(f"OTHER text situation classification detected. Inspect and handle the situation appropriately. Currently handled in the same procedure as proprietary content.")
-                    
-                    logger.warning(f"proprietary content procedure: No single target; media is only uploaded to vectorstore")
-                
-                    documents = await process_text_media_item_target_for_vectorstore(
-                        media_item, 
-                        user_id=user_id, 
-                        assistant_id=assistant_id,
-                        configuration=configuration,
-                        classification_metadata=classification_metadata,
-                        use_semantic_chunks=True
-                    )
-                    for document in documents: 
-                            document.metadata.update({"formatted_type": "vectorstore"})
-                else:
-                    logger.warning(f"Error: situation classification is not of type other, multi_speaker, q_and_a_dialogue, or single_speaker")
-
-                return documents
-
+            documents = await process_text_to_document(
+                metadata=metadata, 
+                user_id=user_id, 
+                assistant_id=assistant_id, 
+                media_item=media_item)
+            return documents
         # Handle URLs
         elif media_type == "url":
             # TODO: Implement URL content fetching
@@ -543,31 +369,21 @@ async def process_media_item_task(
                 # Base64 audio
                 audio_data = media_item["data"]
 
-                doc = await extract_text_from_audio(audio_data, configuration, user_id, assistant_id)
-
-                # Add metadata
-                doc.metadata.update({
-                    "user_id": user_id,
-                    "assistant_id": assistant_id,
-                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                    "processing_task_id": str(uuid4()),
-                    "type": "audio", 
-                    "reference_audio": reference_audio,
-                    "filename": filename
-                })
-
                 if reference_audio:
                     logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
                     namespace=(user_id, assistant_id, "reference_audio")
 
-                    metadata = doc.metadata
-                    page_content = doc.metadata.get("page_content", "")
-                    metadata.update({"page_content":page_content})
+                    doc_json = doc.to_json()
 
-                    await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
+                    await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data})                   
 
-                docs = [doc]
-                return docs
+                text_content = await extract_text_from_audio(audio_data, user_id, assistant_id)
+
+                media_item['content'] = text_content
+
+                documents = await process_text_to_document(media_item=media_item, user_id=user_id, assistant_id=assistant_id, metadata=metadata)
+
+                return documents
             
             elif "audio_url" in media_item:
                 # URL-based audio
@@ -626,8 +442,11 @@ async def process_media_item_task(
         return documents
     return await tool.ainvoke(media_item["content"])
 
-async def extract_text_from_audio(audio_data: str, configuration: GlobalConfiguration, user_id: str, assistant_id: str) -> Document:
-    """Extract text from audio using Hugging Face Whisper Large v3"""
+async def extract_text_from_audio(audio_data: str, user_id: str, assistant_id: str) -> Document:
+    """Extract text from audio using Hugging Face Whisper Large v3
+    reference audio is used if available.
+    text is diarized and the target is identified.
+    """
     logger.info(f"needs reference audio from storage for speaker diarization (timestamps and who is speaking)")
     import base64
     import tempfile
@@ -639,8 +458,6 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
 
     # store
 
-    # from src.subgraphs.vector_store_graph.utils.retrieval import make_pg_store
-
     # Identify reference audio existence and extract reference audio 
     """
     {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
@@ -648,14 +465,16 @@ async def extract_text_from_audio(audio_data: str, configuration: GlobalConfigur
 
     """ ANALYZE AUDIO """
 
-
     # if reference_audio is not None:
     logger.info(f"Identify the number of speakers in the audio")
     logger.info(f"Identify if the target speaker is in the audio")
     logger.info(f"Diarize the audio (timestamps of who is speaking when)")
-        
+    # return text_content
+
+    pass
+
 async def extract_personality_from_image(
-    image_data: str) -> Document:
+    image_data: str, store: str, user_id: str, assistant_id: str) -> Document:
     """Extract personality description from image using vision LLM."""
     logger.info(f"needs reference image from storage for target identification (possibly object bounding box of the target)")
     # base64_image = self._image_to_base64(image_source)
@@ -663,31 +482,50 @@ async def extract_personality_from_image(
 
     logger.info(f"extract_personality_from_image entrypoint")    
     # Use reference image to help identify the person in the image.
-    text_prompt_for_image_to_text_context = (
-        "Describe the individual in the image in vivid detail using the FIRST PERSON PERSPECTIVE. "
-        "Return only the description of the person using the FIRST PERSON PERSPECTIVE."
-        "Do not mention that this is an image. "
-        "Describe the qualities of the character of the person in full detail using the FIRST PERSON PERSPECTIVE and"
-        "Describe the personality of this person so as to clearly visualize the person using the FIRST PERSON PERSPECTIVE."
-        "Do describe the physical appearance using the FIRST PERSON PERSPECTIVE."
-    )
 
-    # these requests need to use the model in the graph rather than the requests because of 400 errors
-
+    from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
+    
     model = init_model()
 
-    image_to_target_textual_description_payload = [
-                        {
-                            "type": "text",
-                            "text": (text_prompt_for_image_to_text_context),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_data}"
+    # use reference image if available to target individual
+    assistent_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
+    key=assistant_id
+    reference_image_item = await store.aget(assistent_reference_image_identity_namespace, key)
+    if len(reference_image_item) != 0:
+        reference_image_data = getattr(reference_image_item,'value', {}).get("reference_image_data", "{}")
+
+        image_to_target_textual_description_payload = [
+                            {
+                                "type": "text",
+                                "text": (TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION),
                             },
-                        },
-                    ]
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{reference_image_data}"
+                                },
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_data}"
+                                },
+                            },
+                        ]
+    else:
+
+        image_to_target_textual_description_payload = [
+                            {
+                                "type": "text",
+                                "text": (TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_data}"
+                                },
+                            },
+                        ]
 
     input = {"messages": [{"role": "user", "content": image_to_target_textual_description_payload}]}
     

@@ -11,14 +11,12 @@ logger = logging.getLogger(__name__)
 from langgraph.graph import StateGraph, START, END
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.configuration import GlobalConfiguration
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_core.runnables import RunnableConfig
 
-configuration = GlobalConfiguration()
 
 from langgraph.store.base import BaseStore
 from langgraph.runtime import Runtime

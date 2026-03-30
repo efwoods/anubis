@@ -2,7 +2,7 @@ from sqlalchemy.ext.asyncio.engine import create_async_engine
 
 from sqlalchemy import text
 
-from src.anubis.utils.configuration import GlobalConfiguration
+from src.anubis.utils.context import GlobalContext
 
 import logging
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ async def delete_docs_filename(runtime, user_id, assistant_id, filenames):
 async def update_column_metadata(
     added_ids: list[str],
     creation_times_list: list[dict],
-    configuration: GlobalConfiguration,
+    context: GlobalContext,
     table_name: str = "langchain_pg_embedding"
 ):
     
@@ -83,7 +83,7 @@ async def update_column_metadata(
         'filenames': [m['filename'] for m in creation_times_list]
     }
     
-    async_engine = create_async_engine(configuration.vectorstore_postgres_uri)
+    async_engine = create_async_engine(context.vectorstore_postgres_uri)
     try:
 
         async with async_engine.connect() as conn:

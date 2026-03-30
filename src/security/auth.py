@@ -496,8 +496,9 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         encoded_user_id = quote(current_user['user_id'], safe="")
         headers = await _mgmt_headers(request)
 
-        customer_id = current_user['app_metadata']['customer']['id']
+        customer_id = current_user['app_metadata'].get('customer', {}).get('id', "")
 
+        # delete customer information
         stripe = request.app.state.stripe
         try:
             deleted = stripe.Customer.delete(customer_id)
@@ -534,8 +535,41 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
           print('Request ID: %s' % e.request_id)
         except Exception as e:
           raise HTTPException(detail="Error deleting customer account.", status_code=500)
+
+        # retrieve all avatar ids created by the user:
+        from langgraph_sdk import get_client
+        token = current_user['API_KEY']
+        headers = {"Authorization": f"Bearer {token}"}
+        langgraph_sdk_client = get_client(headers=headers)
+        
+        metadata={"user_id": current_user['identities'][0]['user_id']}
+
+        avatars = langgraph_sdk_client.assistants.search(graph_id="Anubis", metadata=metadata)
+
+        for avatar in avatars:
+            assistant_id = avatar.get("assistant_id", "")
+            try:
+                delete_result = await langgraph_sdk_client.assistants.delete(assistant_id=assistant_id, delete_threads=True, headers=headers)
+            except Exception as e:
+                raise HTTPException(detail = "Error deleting avatar for user.", status_code=500) 
+
+        # Delete all entries in the store and store vectors for the created avatars
+        pool = request.app.state.pool
+        user_id = current_user.get("identities", {}).get("user_id")
+        SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
+        SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
+
+        try:
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    cur.execute(SQL_STORE_DELETE_QUERY, (user_id, ))
+                    cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, (user_id, ))
+        except Exception as e:
+            raise HTTPException(detail="Error deleting items from store and store vectors during delete user.")
+
+        # Delete the login information of the user
         response = await retry_async_httpx_request(method="DELETE", url=f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
-        # response = await request.app.state.httpx_client.delete(f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
+
         response.raise_for_status()
         if response.status_code == 204:
             del _api_key_cache[api_key_hash]

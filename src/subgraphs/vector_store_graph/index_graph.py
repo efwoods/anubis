@@ -11,10 +11,8 @@ from src.anubis.utils.state import GlobalState
 
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
-from src.anubis.utils.configuration import GlobalConfiguration
 
 across_thread_memory = InMemoryStore()
-configuration = GlobalConfiguration()
 
 
 import logging

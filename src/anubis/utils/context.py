@@ -12,8 +12,6 @@ from typing_extensions import Annotated
 from src.anubis.utils.prompts import system_prompts
 from src.anubis.utils.prompts.subgraphs import vector_store_graph_prompts
 
-from src.anubis.utils.configuration import GlobalConfiguration
-
 from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
@@ -92,14 +90,14 @@ class GlobalContext:
     )
     
 
-    llama_api_key: str = field(
+    llm_provider_api_key: str = field(
         default=None,
         metadata={
             "description": "API key for llama models"
         },
     )
 
-    llama_api_base_url: str = field(
+    llm_provider_base_url: str = field(
         default=None,
         metadata={
             "description": "base url for the llama model"

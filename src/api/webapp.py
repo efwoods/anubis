@@ -165,18 +165,19 @@ app = FastAPI(
     title="Neural Nexus API",
     description="LangGraph-based API",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-@app.get("/")
+
+@app.get("/*", include_in_schema=False)
 async def documentation():
     return RedirectResponse(url="/docs")
 
-app.include_router(router=security_route)
 
+app.include_router(router=security_route)
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 import stripe
-from fastapi.responses import RedirectResponse 
 @app.get("/subscribe")
 async def subscribe(current_user: dict = Depends(get_current_user)):
     """

@@ -1,0 +1,1 @@
+https://www.reddit.com/r/ChatGPTPromptGenius/comments/1hz3od7/how_to_use_my_prompts/

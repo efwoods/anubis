@@ -122,7 +122,7 @@ async def lifespan(app: FastAPI):
     app.state.context = GlobalContext()
     app.state.httpx_client = httpx.AsyncClient()
     app.state.stripe = stripe
-    app.state.stripe.api_key = app.state.context.stripe_publishable_key
+    app.state.stripe.api_key = app.state.context.stripe_secret_key
     
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
@@ -173,6 +173,47 @@ async def documentation():
     return RedirectResponse(url="/docs")
 
 app.include_router(router=security_route)
+
+
+import stripe
+from fastapi.responses import RedirectResponse 
+@app.get("/subscribe")
+async def subscribe(current_user: dict = Depends(get_current_user)):
+    """
+    Create a monthly subscription.
+    """
+
+    verified_email = current_user.get("email_verified", None)
+    if not verified_email:
+        raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
+    
+    return RedirectResponse(url=app.state.context.stripe_payment_url)
+
+    # try: 
+    #     checkout_session = stripe.checkout.Session.create(
+    #         line_items=[
+    #             {
+    #                 # Provide the exact Price ID 
+    #                 'price': app.state.context.stripe_product_id
+    #             }
+    #         ], 
+    #         mode='subscription',
+    #         success_url="api.neuralnexus.site" + '?success=true',
+    #         automatic_tax={'enabled': True},
+    #     )
+    # except Exception as e:
+    #         return str(e)
+    # return RedirectResponse(url=checkout_session.url, code=303)
+
+
+
+@app.post("/unsubscribe")
+async def unsubscribe():
+    """
+    Cancel a monthly subscription.
+    """
+
+
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
@@ -660,44 +701,6 @@ async def update_avatar_identity_with_media(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
-
-import stripe
-from fastapi.responses import RedirectResponse 
-@app.get("/subscribe")
-async def subscribe(current_user: dict = Depends(get_current_user)):
-    """
-    Create a monthly subscription.
-    """
-
-    verified_email = current_user.get("verified_email", None)
-    if not verified_email:
-        raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
-    
-    return RedirectResponse(url=app.state.context.stripe_payment_url, code=303)
-
-    # try: 
-    #     checkout_session = stripe.checkout.Session.create(
-    #         line_items=[
-    #             {
-    #                 # Provide the exact Price ID 
-    #                 'price': app.state.context.stripe_product_id
-    #             }
-    #         ], 
-    #         mode='subscription',
-    #         success_url="api.neuralnexus.site" + '?success=true',
-    #         automatic_tax={'enabled': True},
-    #     )
-    # except Exception as e:
-    #         return str(e)
-    # return RedirectResponse(url=checkout_session.url, code=303)
-
-
-
-@app.post("/unsubscribe")
-async def unsubscribe():
-    """
-    Cancel a monthly subscription.
-    """
 
 
 # @app.post("/process-media-json")

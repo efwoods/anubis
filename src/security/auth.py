@@ -181,7 +181,7 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
         api_key = generate_api_key()
         api_key_hash = _hash_key(api_key)
 
-        # stripe = request.app.state.stripe
+        stripe = request.app.state.stripe
 
         try:
             customer = stripe.Customer.create(
@@ -220,6 +220,8 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
         except Exception as e:
           raise HTTPException(detail="Error creating customer account.", status_code=500)
 
+        customer_dict = customer.to_dict()
+
         payload = {
             "email": email, 
             "password": password, 
@@ -227,7 +229,7 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
             "name": name,
             "app_metadata":{
                 "api_key": api_key_hash,
-                "customer": customer
+                "customer": customer_dict
             }
         }
 

@@ -1,0 +1,1 @@
+I am attempting to create an LLM as a judge to work as an adversarial llm to determine if a generated text message was artificially created or was created by the real user. I need to evaluate the features of the real text in order to evaluate the generated text with respect to the same features. Please list the features and the python packages associated with this practice

@@ -156,3 +156,15 @@ View my recent work efforts here: github.com/efwoods
 I am planning on applying to incubators such as Nvidia's Inception program and Y Combinator Summer 2026.
 
 Thank you for your time, interest, and attention! Best of luck with all your future efforts! (edited)
+
+
+# SUBSCRIPTION REDIRECT URL
+# UNSUBSCRIBE NEEDS TO BE CREATED
+# METERED ENDPOINT
+# RATE LIMITING MESSAGES
+
+# QUALITY METRICS IN PYTHON NOTEBOOK USING SAMPLE DATASET (QUALITY.IPYNB; NOTEBOOKS/QUALITY.IPYNB)
+https://docs.langchain.com/langsmith/prompt-engineering-concepts
+
+
+# UPLOAD BIBILE TO UPDATE IDENTITY ENDPOINT

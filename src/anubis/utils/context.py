@@ -190,15 +190,15 @@ class GlobalContext:
         metadata={"description": "api key for anonymous user data analytics to monitor content."}
     )
 
-    stripe_publishable_key: str = field(
-        default=None, 
-        metadata={"description": "API key for interacting with the stripe API."}
-    )
-
-    # stripe_secret_key: str = field(
+    # stripe_publishable_key: str = field(
     #     default=None, 
     #     metadata={"description": "API key for interacting with the stripe API."}
     # )
+
+    stripe_secret_key: str = field(
+        default=None, 
+        metadata={"description": "API key for interacting with the stripe API."}
+    )
 
     stripe_product_id: str = field(
         default=None, 

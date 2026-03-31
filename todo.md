@@ -170,3 +170,43 @@ https://docs.langchain.com/langsmith/prompt-engineering-concepts
 
 
 # UPLOAD BIBILE TO UPDATE IDENTITY ENDPOINT
+# Nice to have: upload data progress bar
+# streaming messages 
+# calculated cost for token usage
+
+# timeout errors:
+
+<!-- A timeout occurred Error code 524
+Visit cloudflare.com for more information.
+2026-03-31 04:26:03 UTC
+You
+Browser
+Working
+Atlanta
+Cloudflare
+Working
+api.neuralnexus.site
+Host
+Error
+What happened?
+
+The origin web server timed out responding to this request.
+
+The likely cause is an overloaded background task, database or application, stressing the resources on the host web server.
+What can I do?
+If you're a visitor of this website:
+
+Please try again in a few minutes.
+If you're the owner of this website:
+
+Please refer to the Error 524 article:
+
+    Contact your hosting provider; check for long-running processes or an overloaded web server.
+    Use status polling of large HTTP processes to avoid this error.
+    Run the long-running scripts on a grey-clouded subdomain.
+    Enterprise customers can increase the timeout setting globally or for specific requests using Cache Rules.
+
+Cloudflare Ray ID: 9e4c94e1ab381c72 • Your IP: 2600:1702:3560:9810:c209:837e:9a44:6952 • Performance & security by Cloudflare  -->
+
+# meta llama api key failure
+# langgraph api key failure

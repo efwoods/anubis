@@ -163,6 +163,8 @@ Thank you for your time, interest, and attention! Best of luck with all your fut
 # METERED ENDPOINT
 # RATE LIMITING MESSAGES
 
+# Context length messages must be handled: langgraph-api-1  | 2026-03-31T04:02:33.597927Z [error    ] Error processing media item: Error code: 400 - {'id': 'odDTv3K-28Eivz-9e4c75784abae641', 'error': {'message': "The input (1160343 tokens) is longer than the model's context length (1048576 tokens).", 'type': 'invalid_request_error', 'param': None, 'code': None}} [src.subgraphs.process_media_graph.utils.nodes] api_revision=f2b7154 api_variant=licensed langgraph_api_version=0.7.89 langgraph_node=convert_media_list_to_text_document thread_name=MainThread
+
 # QUALITY METRICS IN PYTHON NOTEBOOK USING SAMPLE DATASET (QUALITY.IPYNB; NOTEBOOKS/QUALITY.IPYNB)
 https://docs.langchain.com/langsmith/prompt-engineering-concepts
 

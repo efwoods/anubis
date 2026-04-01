@@ -210,3 +210,6 @@ Cloudflare Ray ID: 9e4c94e1ab381c72 • Your IP: 2600:1702:3560:9810:c209:837e:9
 
 # meta llama api key failure
 # langgraph api key failure 
+
+# Improvements
+Chatgpt conversation individual messages are being chunked and the messages include parts of code segments that are retrieved and injected as retrieved documents; these messages if not chunked need to be inserted as direct quotes being that they are full length messages; it would be possible to identify if the messages are text or code then filter for text only.

@@ -354,6 +354,7 @@ async def modify_avatar(
 @app.delete("/delete_avatar")
 async def delete_avatar(
     assistant_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     # TODO: Delete avatar in database
@@ -365,6 +366,18 @@ async def delete_avatar(
     
     metadata = {'user_id':user_id}
     metadata.update({"assistant_id": assistant_id})
+        # Delete all entries in the store and store vectors for the created avatars
+    pool = request.app.state.pool
+    SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
+    SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                cur.execute(SQL_STORE_DELETE_QUERY, (assistant_id, ))
+                cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, (assistant_id, ))
+    except Exception as e:
+        raise HTTPException(detail="Error deleting items from store and store vectors during delete avatar.")
+
     try:
         await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
     except Exception as e:
@@ -558,7 +571,6 @@ from langchain_core.runnables import RunnableConfig
 async def message(
     response: Response,
     message: Optional[str] = "Hello!",
-    files: Optional[List[UploadFile]] = File(default=None),
     name: Optional[str] = None,
     description: Optional[str] = None,
     current_user: dict = Depends(get_current_user),

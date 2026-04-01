@@ -8,6 +8,7 @@ from uuid import uuid4
 import logging
 logger = logging.getLogger(__name__)
 import base64
+from pathlib import Path
 
 # At top of file
 import tempfile
@@ -72,6 +73,7 @@ async def process_uploaded_files_and_label_media_type(
         try:
             # Extract file info
             filename = file_data.get('filename', 'unknown')
+            suffix = Path(filename).suffix
             content_type = file_data.get('content_type', '')
             file_bytes = file_data.get('content')  # Raw bytes
             user_id = file_data.get("user_id")
@@ -130,10 +132,10 @@ async def process_uploaded_files_and_label_media_type(
                     }
                 })
             
-            elif content_type in ['text/plain', 'application/json', 'text/markdown']:
+            elif content_type in ['text/plain', 'application/json', 'text/markdown', 'application/octet-stream']:
                 # Handle text files
-                from pathlib import Path
-                suffix = Path(filename)
+                
+                
                 if suffix is '.txt':
                     text_content = file_bytes.decode('utf-8')
                     media_list.append({
@@ -148,9 +150,9 @@ async def process_uploaded_files_and_label_media_type(
                             "proprietary_content": proprietary_content
                         }
                     })
-                elif suffix is '.json':
+                elif suffix is '.json' or '.jsonl':
                     import json
-                    text_content = json.loads(file_bytes)
+                    text_content = json.loads(file_bytes.decode('utf-8'))
                     media_list.append({
                         "type": "json",
                         "content": text_content,

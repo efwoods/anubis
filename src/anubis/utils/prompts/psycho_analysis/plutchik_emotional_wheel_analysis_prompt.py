@@ -1,3 +1,6 @@
+class PLUTCHIK_EMOTIONAL_WHEEL_ANALYSIS:
+    pass 
+
 PLUTCHIK_EMOTIONAL_WHEEL_ANALYSIS_PROMPT="""
 <SYSTEM>
 You are an expert emotional analyst and affective systems architect specializing in Plutchik’s Wheel of Emotions. 

@@ -170,6 +170,3 @@ Use deliberate System 2 thinking to balance fidelity, uncertainty, and ethical r
 Optimize for truthfulness over theatrical realism.
 </Reasoning>
 
-<User_Input>
-Reply with: "Please provide the personal data or media to model the digital persona," then wait for the user input.
-</User_Input>

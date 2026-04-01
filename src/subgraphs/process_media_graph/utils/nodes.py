@@ -8,6 +8,7 @@ from uuid import uuid4
 import logging
 logger = logging.getLogger(__name__)
 import base64
+from pathlib import Path
 
 # At top of file
 import tempfile
@@ -72,6 +73,7 @@ async def process_uploaded_files_and_label_media_type(
         try:
             # Extract file info
             filename = file_data.get('filename', 'unknown')
+            suffix = Path(filename).suffix
             content_type = file_data.get('content_type', '')
             file_bytes = file_data.get('content')  # Raw bytes
             user_id = file_data.get("user_id")
@@ -130,21 +132,53 @@ async def process_uploaded_files_and_label_media_type(
                     }
                 })
             
-            elif content_type in ['text/plain', 'application/json', 'text/markdown']:
+            elif content_type in ['text/plain', 'application/json', 'text/markdown', 'application/octet-stream']:
                 # Handle text files
-                text_content = file_bytes.decode('utf-8')
-                media_list.append({
-                    "type": "text",
-                    "content": text_content,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size": len(file_bytes),
-                        "user_id": user_id,
-                        "assistant_id": assistant_id, 
-                        "proprietary_content": proprietary_content
-                    }
-                })
+                
+                
+                if suffix == '.txt':
+                    text_content = file_bytes.decode('utf-8')
+                    media_list.append({
+                        "type": "text",
+                        "content": text_content,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id, 
+                            "proprietary_content": proprietary_content
+                        }
+                    })
+                elif suffix == '.json' or suffix == '.jsonl':
+                    import json
+                    text_content = json.loads(file_bytes.decode('utf-8'))
+                    media_list.append({
+                        "type": "json",
+                        "content": text_content,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id, 
+                            "proprietary_content": proprietary_content
+                        }
+                    })
+                else: # handle markdown
+                    text_content = file_bytes
+                    media_list.append({
+                        "type": "text",
+                        "content": text_content,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id, 
+                            "proprietary_content": proprietary_content
+                        }
+                    })
             
             elif content_type == 'application/pdf':
                 # Handle PDFs
@@ -347,6 +381,28 @@ async def process_media_item_task(
                 assistant_id=assistant_id, 
                 media_item=media_item)
             return documents
+        elif media_type == "json":
+            classification_metadata = {
+                "classified_situation": "conversation_facts",
+                "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
+            }
+            messages = media_item['content']['messages']
+            final_documents = []
+            for message in messages:
+                media_item['content'] = message['content']
+                documents = await process_text_media_item_target_for_vectorstore(
+                    media_item=media_item, 
+                    user_id=user_id, 
+                    assistant_id=assistant_id,
+                    classification_metadata=classification_metadata,
+                    use_semantic_chunks=False
+                )
+
+                for document in documents: 
+                            document.metadata.update({"vectorstore_acceptable": True})
+                            final_documents.append(document)
+                
+            return final_documents
         # Handle URLs
         elif media_type == "url":
             # TODO: Implement URL content fetching

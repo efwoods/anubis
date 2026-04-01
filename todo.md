@@ -156,3 +156,60 @@ View my recent work efforts here: github.com/efwoods
 I am planning on applying to incubators such as Nvidia's Inception program and Y Combinator Summer 2026.
 
 Thank you for your time, interest, and attention! Best of luck with all your future efforts! (edited)
+
+
+# SUBSCRIPTION REDIRECT URL
+# UNSUBSCRIBE NEEDS TO BE CREATED
+# METERED ENDPOINT
+# RATE LIMITING MESSAGES
+
+# Context length messages must be handled: langgraph-api-1  | 2026-03-31T04:02:33.597927Z [error    ] Error processing media item: Error code: 400 - {'id': 'odDTv3K-28Eivz-9e4c75784abae641', 'error': {'message': "The input (1160343 tokens) is longer than the model's context length (1048576 tokens).", 'type': 'invalid_request_error', 'param': None, 'code': None}} [src.subgraphs.process_media_graph.utils.nodes] api_revision=f2b7154 api_variant=licensed langgraph_api_version=0.7.89 langgraph_node=convert_media_list_to_text_document thread_name=MainThread
+
+# QUALITY METRICS IN PYTHON NOTEBOOK USING SAMPLE DATASET (QUALITY.IPYNB; NOTEBOOKS/QUALITY.IPYNB)
+https://docs.langchain.com/langsmith/prompt-engineering-concepts
+
+
+# UPLOAD BIBILE TO UPDATE IDENTITY ENDPOINT
+# Nice to have: upload data progress bar
+# streaming messages 
+# calculated cost for token usage
+
+# timeout errors:
+
+<!-- A timeout occurred Error code 524
+Visit cloudflare.com for more information.
+2026-03-31 04:26:03 UTC
+You
+Browser
+Working
+Atlanta
+Cloudflare
+Working
+api.neuralnexus.site
+Host
+Error
+What happened?
+
+The origin web server timed out responding to this request.
+
+The likely cause is an overloaded background task, database or application, stressing the resources on the host web server.
+What can I do?
+If you're a visitor of this website:
+
+Please try again in a few minutes.
+If you're the owner of this website:
+
+Please refer to the Error 524 article:
+
+    Contact your hosting provider; check for long-running processes or an overloaded web server.
+    Use status polling of large HTTP processes to avoid this error.
+    Run the long-running scripts on a grey-clouded subdomain.
+    Enterprise customers can increase the timeout setting globally or for specific requests using Cache Rules.
+
+Cloudflare Ray ID: 9e4c94e1ab381c72 • Your IP: 2600:1702:3560:9810:c209:837e:9a44:6952 • Performance & security by Cloudflare  -->
+
+# meta llama api key failure
+# langgraph api key failure 
+
+# Improvements
+Chatgpt conversation individual messages are being chunked and the messages include parts of code segments that are retrieved and injected as retrieved documents; these messages if not chunked need to be inserted as direct quotes being that they are full length messages; it would be possible to identify if the messages are text or code then filter for text only.

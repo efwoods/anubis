@@ -16,7 +16,6 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
-from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.subgraphs.vector_store_graph.utils.utilities import format_docs, get_message_text
@@ -52,7 +51,7 @@ async def generate_query(
 
     Args:
         state (State): The current state containing messages and other information.
-        config (RunnableConfig | None, optional): GlobalConfiguration for the query generation process.
+        config (RunnableConfig | None, optional): environment variables for the query generation process.
 
     Returns:
         dict[str, list[str]]: A dictionary with a 'queries' key containing a list of generated queries.
@@ -131,7 +130,7 @@ async def retrieve(
 
     Args:
         state (State): The current state containing queries and the retriever.
-        config (RunnableConfig | None, optional): GlobalConfiguration for the retrieval process.
+        config (RunnableConfig | None, optional): environment variables for the retrieval process.
 
     Returns:
         dict[str, list[Document]]: A dictionary with a single key "retrieved_docs"
@@ -193,7 +192,6 @@ async def retrieve(
     return {"retrieved_docs": doc_results}
 
 
-configuration = GlobalConfiguration()
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

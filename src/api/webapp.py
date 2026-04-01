@@ -83,20 +83,20 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         search_query = """
         SELECT * FROM assistant 
         WHERE (metadata->>'is_public')::boolean = TRUE
-        AND 'assistant_id' = %s
+        AND assistant_id = %s
         """
     elif user_id:
         # Retrieve all public avatars not owned by the current user.
         search_query = """
         SELECT * FROM assistant
-        WHERE (metadata->'is_public')::boolean = TRUE
+        WHERE (metadata->>'is_public')::boolean = TRUE
         AND (metadata->>'user_id') != %s
         """
     else:
         # Retrieve all public avatars
         search_query = """
         SELECT * FROM assistant
-        WHERE (metadata->'is_public')::boolean = TRUE
+        WHERE (metadata->>'is_public')::boolean = TRUE
         """
 # WHERE metadata->>'is_public'::boolean IS TRUE
     async with pool.connection() as conn:
@@ -122,7 +122,7 @@ async def lifespan(app: FastAPI):
     app.state.context = GlobalContext()
     app.state.httpx_client = httpx.AsyncClient()
     app.state.stripe = stripe
-    app.state.stripe.api_key = app.state.context.stripe_publishable_key
+    app.state.stripe.api_key = app.state.context.stripe_secret_key
     
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
@@ -165,14 +165,56 @@ app = FastAPI(
     title="Neural Nexus API",
     description="LangGraph-based API",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-@app.get("/")
+
+@app.get("/*", include_in_schema=False)
 async def documentation():
     return RedirectResponse(url="/docs")
 
+
 app.include_router(router=security_route)
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import stripe
+@app.get("/subscribe")
+async def subscribe(current_user: dict = Depends(get_current_user)):
+    """
+    Create a monthly subscription.
+    """
+
+    verified_email = current_user.get("email_verified", None)
+    if not verified_email:
+        raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
+    
+    return RedirectResponse(url=app.state.context.stripe_payment_url)
+
+    # try: 
+    #     checkout_session = stripe.checkout.Session.create(
+    #         line_items=[
+    #             {
+    #                 # Provide the exact Price ID 
+    #                 'price': app.state.context.stripe_product_id
+    #             }
+    #         ], 
+    #         mode='subscription',
+    #         success_url="api.neuralnexus.site" + '?success=true',
+    #         automatic_tax={'enabled': True},
+    #     )
+    # except Exception as e:
+    #         return str(e)
+    # return RedirectResponse(url=checkout_session.url, code=303)
+
+
+
+@app.post("/unsubscribe")
+async def unsubscribe():
+    """
+    Cancel a monthly subscription.
+    """
+
+
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
@@ -304,14 +346,34 @@ async def modify_avatar(
                 name=new_avatar_name)
         try:
             assert(type(result) == dict)
+
+            # Update the selected avatar if the avatar was selected
+            # selected_assistant_id = current_user.get('app_metadata', {}).get("assistant_config", {}).get("configurable", {}).get("assistant_id", None)
+
+            # selected_assistant_config = current_user.get('app_metadata', {}).get("assistant_config", {})
+
+            # if selected_assistant_id:
+            #     if selected_assistant_id == assistant_id:
+            #         if selected_assistant_config.get("configurable", {}).get("assistant_ctx", None):
+            #             if new_avatar_description:
+            #                 selected_assistant_config['configurable']['assistant_ctx']['description'] = new_avatar_description
+
+            #             if new_avatar_name: 
+            #                 selected_assistant_config['configurable']['assistant_ctx']['name'] = new_avatar_description
+
+            #             provider_encoded_user_id = quote(current_user['user_id'], safe="")
+
+            #             hashed_api_key = current_user['app_metadata']['api_key']
+            #             update_assistant_config(hashed_api_key, provider_encoded_user_id, assistant_config=selected_assistant_config)
+
             return JSONResponse(content=result, status_code=200)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error updating assistant: {assistant_id}")
-
+            raise HTTPException(status_code=500, detail=f"Error updating assistant.")
 
 @app.delete("/delete_avatar")
 async def delete_avatar(
     assistant_id: str,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     # TODO: Delete avatar in database
@@ -323,10 +385,28 @@ async def delete_avatar(
     
     metadata = {'user_id':user_id}
     metadata.update({"assistant_id": assistant_id})
+        # Delete all entries in the store and store vectors for the created avatars
+    pool = request.app.state.pool
+    SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
+    SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;""" 
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                params = (
+                    assistant_id, 
+                    f"{assistant_id}.%",
+                    f"%.{assistant_id}.%",
+                    f"%.{assistant_id}",
+                )
+                await cur.execute(SQL_STORE_DELETE_QUERY, params)
+                await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
+    except Exception as e:
+        raise HTTPException(detail="Error deleting items from store and store vectors during delete avatar.", status_code=500)
+
     try:
         await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
     except Exception as e:
-        raise HTTPException(detail = e, status_code=500)
+        raise HTTPException(detail = "Error Deleting Assistant", status_code=500)
     
     return JSONResponse("Deleted Avatar Successfully", status_code=200)
 
@@ -457,8 +537,14 @@ async def select_avatar(
                                 "assistant_id": assistant.get("assistant_id", None)
                             }
                         }
+                    hashed_api_key = current_user['app_metadata']['api_key']
                     provider_encoded_user_id = quote(current_user['user_id'], safe="")
-                    result = await update_assistant_config(provider_encoded_user_id=provider_encoded_user_id, assistant_config = assistant_config, request=request)
+                    result = await update_assistant_config(
+                        hashed_api_key=hashed_api_key,
+                        provider_encoded_user_id=provider_encoded_user_id, 
+                        assistant_config = assistant_config, 
+                        request=request)
+                    
                     return JSONResponse(content=assistant_config, status_code=200)
                 except Exception as e:
                     raise HTTPException(status_code=500, detail = f"Error during avatar selection via assistant_name: {e}")
@@ -516,7 +602,6 @@ from langchain_core.runnables import RunnableConfig
 async def message(
     response: Response,
     message: Optional[str] = "Hello!",
-    files: Optional[List[UploadFile]] = File(default=None),
     name: Optional[str] = None,
     description: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
@@ -661,44 +746,6 @@ async def update_avatar_identity_with_media(
             detail=f"Error processing media: {str(e)}"
         )
 
-import stripe
-from fastapi.responses import RedirectResponse 
-@app.get("/subscribe")
-async def subscribe(current_user: dict = Depends(get_current_user)):
-    """
-    Create a monthly subscription.
-    """
-
-    verified_email = current_user.get("verified_email", None)
-    if not verified_email:
-        raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
-    
-    return RedirectResponse(url=app.state.context.stripe_payment_url, code=303)
-
-    # try: 
-    #     checkout_session = stripe.checkout.Session.create(
-    #         line_items=[
-    #             {
-    #                 # Provide the exact Price ID 
-    #                 'price': app.state.context.stripe_product_id
-    #             }
-    #         ], 
-    #         mode='subscription',
-    #         success_url="api.neuralnexus.site" + '?success=true',
-    #         automatic_tax={'enabled': True},
-    #     )
-    # except Exception as e:
-    #         return str(e)
-    # return RedirectResponse(url=checkout_session.url, code=303)
-
-
-
-@app.post("/unsubscribe")
-async def unsubscribe():
-    """
-    Cancel a monthly subscription.
-    """
-
 
 # @app.post("/process-media-json")
 # async def process_media_json(
@@ -754,4 +801,4 @@ async def unsubscribe():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True, ssl_keyfile='./origin_cert.pem', ssl_certfile='./cloudflare_private.key')
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

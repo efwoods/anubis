@@ -249,7 +249,3 @@ Apply first-principles human psychology and deliberate System 2 reasoning.
 Prioritize evidence-based inference, uncertainty calibration, and individual specificity.
 </Reasoning>
 
-<User_Input>
-Please provide the text for values, morality, and attachment analysis and I will begin.
-</User_Input>
-

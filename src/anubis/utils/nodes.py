@@ -117,50 +117,36 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
 
     """ Retrieve memories """
 
-    if len(state['messages']) > 0:
-        query = state['messages'][-1].content
-        if isinstance(query, list):
-            query = query[0]['text']
-    
+    query = state['messages'][-1].content
+    if isinstance(query, list):
+        query = query[0]['text']
 
-        assistant_memory_namespace = (user_id, assistant_id, "memory")
-        retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query, limit=1000)
+    assistant_memory_namespace = (user_id, assistant_id, "memory")
+    retrieved_memories_items = await runtime.store.asearch(assistant_memory_namespace, query=query, limit=1000)
+    # Coerce into document objects from Search Items
+    retrieved_memories = reduce_docs([], retrieved_memories_items)
 
-        # Coerce into document objects from Search Items
-        retrieved_memories = reduce_docs([], retrieved_memories_items)
-
-    
-        # retrieved_memories.extend(retrieved_identity_memories)
-
-        # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
-        #     assistant_identity_namespace = (user_id, assistant_id, "memory")
-        #     query = state['messages'][-1].content
-
-        #     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
-
-
-        #     # Coerce into document objects from Search Items
-        #     retrieved_memories = reduce_docs([], retrieved_memories_items)
-        # else:
-        #     retrieved_memories = state['recalled_memory_documents']
-
-        logger.info("breakpoint")
-
-        """ Retrieve Direct Quotes """
-
-        # Few Shot Example of Quotes and Writing style directly from the real-world assistant
-        # The QUOTE namespace holds direct quotes from the real-world assistant
-        direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
-        logger.info(f"direct_quote_items: {direct_quote_items}")
-
-        direct_quotes = reduce_docs([], direct_quote_items)
-
-        """ Retrieve Documents """
-
-        # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
-        retrieved_knowledge_items = await runtime.store.asearch((creator_id, assistant_id, 'document'), query=query)
-        logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
-        retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
+    # retrieved_memories.extend(retrieved_identity_memories)
+    # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
+    #     assistant_identity_namespace = (user_id, assistant_id, "memory")
+    #     query = state['messages'][-1].content
+    #     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
+    #     # Coerce into document objects from Search Items
+    #     retrieved_memories = reduce_docs([], retrieved_memories_items)
+    # else:
+    #     retrieved_memories = state['recalled_memory_documents']
+    logger.info("breakpoint")
+    """ Retrieve Direct Quotes """
+    # Few Shot Example of Quotes and Writing style directly from the real-world assistant
+    # The QUOTE namespace holds direct quotes from the real-world assistant
+    direct_quote_items = await runtime.store.asearch((user_id, assistant_id, 'quote'), query=query)
+    logger.info(f"direct_quote_items: {direct_quote_items}")
+    direct_quotes = reduce_docs([], direct_quote_items)
+    """ Retrieve Documents """
+    # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
+    retrieved_knowledge_items = await runtime.store.asearch((creator_id, assistant_id, 'document'), query=query)
+    logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
+    retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
     """ Retrieve Emotions """
 

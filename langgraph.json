@@ -1,5 +1,5 @@
 {
-  "$schema": "https://langgra.ph/schema.json",
+  "$schema": "https://raw.githubusercontent.com/langchain-ai/langgraph/main/libs/cli/langgraph/schemas/config.schema.json",
   "dependencies": ["."],
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph"

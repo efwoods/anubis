@@ -16,7 +16,7 @@
           "remoteRoot": "/deps/anubis"
         }
       ],
-      "justMyCode": true
+      "justMyCode": false
     },
     {
       "name": "Attach to Memory LangGraph Server",
@@ -32,7 +32,7 @@
           "remoteRoot": "/deps/anubis"
         }
       ],
-      "justMyCode": true
+      "justMyCode": false
     }
   ]
 }

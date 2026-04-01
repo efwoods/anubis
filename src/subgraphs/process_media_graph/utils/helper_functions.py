@@ -11,7 +11,6 @@ import logging
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from src.anubis.utils.configuration import GlobalConfiguration
 from src.anubis.utils.model import init_model
 
 logger = logging.getLogger(__name__)

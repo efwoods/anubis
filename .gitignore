@@ -1,3 +1,6 @@
+response.md
+notebooks/
+error.md
 certificate
 **/cloudflare_private.key
 **/origin_cert.pem

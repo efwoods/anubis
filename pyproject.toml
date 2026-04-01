@@ -23,6 +23,7 @@ dependencies = [
     "langchain-core>=1.2.16",
     "langchain-huggingface>=1.2.0",
     "langchain-openai>=1.1.10",
+    "langchain-together>=0.4.0",
     "langchain-unstructured>=1.0.1",
     "langgraph>=1.0.10",
     "langgraph-checkpoint-postgres>=3.0.4",

@@ -173,6 +173,9 @@ app = FastAPI(
 async def documentation():
     return RedirectResponse(url="/docs")
 
+@app.get("/", include_in_schema=False)
+async def documentation():
+    return RedirectResponse(url="/docs")
 
 app.include_router(router=security_route)
 from fastapi.responses import HTMLResponse, RedirectResponse

@@ -282,6 +282,7 @@ async def process_text_media_item_target_for_vectorstore(
     try:
 
         # Extract text content
+        media_type = media_item.get("item", "")
         text_content = media_item.get("content", "")
         filename = media_item.get("metadata", {}).get("filename", "")
         filename_uuid5 = str(uuid5(NAMESPACE_URL, filename))
@@ -522,7 +523,7 @@ async def process_text_media_item_target_for_vectorstore(
                 all_documents.extend(documents)
 
         else:
-            if token_text_content_length > chunk_size:
+            if token_text_content_length > chunk_size and media_type != "json":
                 logger.info(f"length of text context is greater than the chunk size therefore use semantic chunks was set to FALSE; CHUNKING TEXT NON-SEMANTICALLY")
 
 

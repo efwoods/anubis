@@ -136,7 +136,7 @@ async def process_uploaded_files_and_label_media_type(
                 # Handle text files
                 
                 
-                if suffix is '.txt':
+                if suffix == '.txt':
                     text_content = file_bytes.decode('utf-8')
                     media_list.append({
                         "type": "text",
@@ -150,7 +150,7 @@ async def process_uploaded_files_and_label_media_type(
                             "proprietary_content": proprietary_content
                         }
                     })
-                elif suffix is '.json' or '.jsonl':
+                elif suffix == '.json' or suffix == '.jsonl':
                     import json
                     text_content = json.loads(file_bytes.decode('utf-8'))
                     media_list.append({

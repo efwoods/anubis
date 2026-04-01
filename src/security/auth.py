@@ -58,7 +58,11 @@ def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-async def update_assistant_config(hashed_api_key: str, provider_encoded_user_id: str, assistant_config: dict, request: Request):
+async def update_assistant_config(hashed_api_key: str, 
+                                  provider_encoded_user_id: str, 
+                                  assistant_config: dict, 
+                                  request: Request
+                                ):
     try:
         payload = {
             "app_metadata": {
@@ -181,56 +185,70 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
         api_key = generate_api_key()
         api_key_hash = _hash_key(api_key)
 
-        # stripe = request.app.state.stripe
+        stripe = request.app.state.stripe
 
-        # try:
-        #     customer = stripe.Customer.create(
-        #         name=name, 
-        #         email=email
-        #     )
-        # except stripe.error.CardError as e:
-        #   # A declined card error
-        #   print('Status: %s' % e.http_status)
-        #   print('Code: %s' % e.code)
-        #   if e.param:
-        #     print('Param: %s' % e.param)
-        #   print('Message: %s' % e.user_message)
-        #   print('Request ID: %s' % e.request_id)
-        # except stripe.error.RateLimitError as e:
-        #   # Too many requests made to the API too quickly
-        #   print('Request ID: %s' % e.request_id)
-        # except stripe.error.InvalidRequestError as e:
-        #   # Invalid parameters were supplied to Stripe's API
-        #   print('Message: %s' % e.user_message)
-        #   if e.param:
-        #     print('Param: %s' % e.param)
-        #   print('Request ID: %s' % e.request_id)
-        # except stripe.error.AuthenticationError as e:
-        #   # Authentication with Stripe's API failed
-        #   print('Request ID: %s' % e.request_id)
-        # except stripe.error.APIConnectionError as e:
-        #   # Network communication with Stripe failed
-        #   print('Request ID: %s' % e.request_id)
-        # except stripe.error.StripeError as e:
-        #   # All other Stripe errors
-        #   print('Status: %s' % e.http_status)
-        #   print('Code: %s' % e.code)
-        #   print('Message: %s' % e.user_message)
-        #   print('Request ID: %s' % e.request_id)
-        # except Exception as e:
-        #   raise HTTPException(detail="Error creating customer account.", status_code=500)
+        try:
+            customer = stripe.Customer.create(
+                name=name, 
+                email=email
+            )
+        except stripe.error.CardError as e:
+          # A declined card error
+          print('Status: %s' % e.http_status)
+          print('Code: %s' % e.code)
+          if e.param:
+            print('Param: %s' % e.param)
+          print('Message: %s' % e.user_message)
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.RateLimitError as e:
+          # Too many requests made to the API too quickly
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.InvalidRequestError as e:
+          # Invalid parameters were supplied to Stripe's API
+          print('Message: %s' % e.user_message)
+          if e.param:
+            print('Param: %s' % e.param)
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.AuthenticationError as e:
+          # Authentication with Stripe's API failed
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.APIConnectionError as e:
+          # Network communication with Stripe failed
+          print('Request ID: %s' % e.request_id)
+        except stripe.error.StripeError as e:
+          # All other Stripe errors
+          print('Status: %s' % e.http_status)
+          print('Code: %s' % e.code)
+          print('Message: %s' % e.user_message)
+          print('Request ID: %s' % e.request_id)
+        except Exception as e:
+          raise HTTPException(detail="Error creating customer account.", status_code=500)
 
-        # customer_dict = customer.to_dict()
+        customer_dict = customer.to_dict()
+
+        # if name:
 
         payload = {
             "email": email, 
             "password": password, 
             "connection": CONNECTION,
-            "name": name,
             "app_metadata":{
                 "api_key": api_key_hash,
             }
         }
+
+        if name is not '':
+            payload['name'] = name
+
+        # else:
+        #         payload = {
+        #             "email": email, 
+        #             "password": password, 
+        #             "connection": CONNECTION,
+        #             "app_metadata":{
+        #                 "api_key": api_key_hash,
+        #             }
+        #         }
                 # "customer": customer_dict
 
         headers = await _mgmt_headers(request)
@@ -558,14 +576,19 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         # Delete all entries in the store and store vectors for the created avatars
         pool = request.app.state.pool
         user_id = current_user.get("identities", {}).get("user_id")
-        SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
-        SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
-
+        SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
+        SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;""" 
+        params = (
+            user_id, 
+            f"{user_id}.%",
+            f"%.{user_id}.%",
+            f"%.{user_id}",
+        )
         try:
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
-                    cur.execute(SQL_STORE_DELETE_QUERY, (user_id, ))
-                    cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, (user_id, ))
+                    await cur.execute(SQL_STORE_DELETE_QUERY, (user_id, ))
+                    await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, (user_id, ))
         except Exception as e:
             raise HTTPException(detail="Error deleting items from store and store vectors during delete user.")
 

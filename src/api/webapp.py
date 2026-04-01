@@ -83,20 +83,20 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         search_query = """
         SELECT * FROM assistant 
         WHERE (metadata->>'is_public')::boolean = TRUE
-        AND 'assistant_id' = %s
+        AND assistant_id = %s
         """
     elif user_id:
         # Retrieve all public avatars not owned by the current user.
         search_query = """
         SELECT * FROM assistant
-        WHERE (metadata->'is_public')::boolean = TRUE
+        WHERE (metadata->>'is_public')::boolean = TRUE
         AND (metadata->>'user_id') != %s
         """
     else:
         # Retrieve all public avatars
         search_query = """
         SELECT * FROM assistant
-        WHERE (metadata->'is_public')::boolean = TRUE
+        WHERE (metadata->>'is_public')::boolean = TRUE
         """
 # WHERE metadata->>'is_public'::boolean IS TRUE
     async with pool.connection() as conn:
@@ -346,10 +346,29 @@ async def modify_avatar(
                 name=new_avatar_name)
         try:
             assert(type(result) == dict)
+
+            # Update the selected avatar if the avatar was selected
+            # selected_assistant_id = current_user.get('app_metadata', {}).get("assistant_config", {}).get("configurable", {}).get("assistant_id", None)
+
+            # selected_assistant_config = current_user.get('app_metadata', {}).get("assistant_config", {})
+
+            # if selected_assistant_id:
+            #     if selected_assistant_id == assistant_id:
+            #         if selected_assistant_config.get("configurable", {}).get("assistant_ctx", None):
+            #             if new_avatar_description:
+            #                 selected_assistant_config['configurable']['assistant_ctx']['description'] = new_avatar_description
+
+            #             if new_avatar_name: 
+            #                 selected_assistant_config['configurable']['assistant_ctx']['name'] = new_avatar_description
+
+            #             provider_encoded_user_id = quote(current_user['user_id'], safe="")
+
+            #             hashed_api_key = current_user['app_metadata']['api_key']
+            #             update_assistant_config(hashed_api_key, provider_encoded_user_id, assistant_config=selected_assistant_config)
+
             return JSONResponse(content=result, status_code=200)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error updating assistant: {assistant_id}")
-
+            raise HTTPException(status_code=500, detail=f"Error updating assistant.")
 
 @app.delete("/delete_avatar")
 async def delete_avatar(
@@ -368,20 +387,26 @@ async def delete_avatar(
     metadata.update({"assistant_id": assistant_id})
         # Delete all entries in the store and store vectors for the created avatars
     pool = request.app.state.pool
-    SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
-    SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = '%s' OR prefix LIKE '%s.%' or prefix LIKE '%.%s.%' or prefix LIKE '%.%s';"""
+    SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
+    SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;""" 
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                cur.execute(SQL_STORE_DELETE_QUERY, (assistant_id, ))
-                cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, (assistant_id, ))
+                params = (
+                    assistant_id, 
+                    f"{assistant_id}.%",
+                    f"%.{assistant_id}.%",
+                    f"%.{assistant_id}",
+                )
+                await cur.execute(SQL_STORE_DELETE_QUERY, params)
+                await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
     except Exception as e:
-        raise HTTPException(detail="Error deleting items from store and store vectors during delete avatar.")
+        raise HTTPException(detail="Error deleting items from store and store vectors during delete avatar.", status_code=500)
 
     try:
         await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
     except Exception as e:
-        raise HTTPException(detail = e, status_code=500)
+        raise HTTPException(detail = "Error Deleting Assistant", status_code=500)
     
     return JSONResponse("Deleted Avatar Successfully", status_code=200)
 
@@ -512,8 +537,14 @@ async def select_avatar(
                                 "assistant_id": assistant.get("assistant_id", None)
                             }
                         }
+                    hashed_api_key = current_user['app_metadata']['api_key']
                     provider_encoded_user_id = quote(current_user['user_id'], safe="")
-                    result = await update_assistant_config(provider_encoded_user_id=provider_encoded_user_id, assistant_config = assistant_config, request=request)
+                    result = await update_assistant_config(
+                        hashed_api_key=hashed_api_key,
+                        provider_encoded_user_id=provider_encoded_user_id, 
+                        assistant_config = assistant_config, 
+                        request=request)
+                    
                     return JSONResponse(content=assistant_config, status_code=200)
                 except Exception as e:
                     raise HTTPException(status_code=500, detail = f"Error during avatar selection via assistant_name: {e}")

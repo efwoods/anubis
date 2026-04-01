@@ -181,46 +181,46 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
         api_key = generate_api_key()
         api_key_hash = _hash_key(api_key)
 
-        stripe = request.app.state.stripe
+        # stripe = request.app.state.stripe
 
-        try:
-            customer = stripe.Customer.create(
-                name=name, 
-                email=email
-            )
-        except stripe.error.CardError as e:
-          # A declined card error
-          print('Status: %s' % e.http_status)
-          print('Code: %s' % e.code)
-          if e.param:
-            print('Param: %s' % e.param)
-          print('Message: %s' % e.user_message)
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.RateLimitError as e:
-          # Too many requests made to the API too quickly
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.InvalidRequestError as e:
-          # Invalid parameters were supplied to Stripe's API
-          print('Message: %s' % e.user_message)
-          if e.param:
-            print('Param: %s' % e.param)
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.AuthenticationError as e:
-          # Authentication with Stripe's API failed
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.APIConnectionError as e:
-          # Network communication with Stripe failed
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.StripeError as e:
-          # All other Stripe errors
-          print('Status: %s' % e.http_status)
-          print('Code: %s' % e.code)
-          print('Message: %s' % e.user_message)
-          print('Request ID: %s' % e.request_id)
-        except Exception as e:
-          raise HTTPException(detail="Error creating customer account.", status_code=500)
+        # try:
+        #     customer = stripe.Customer.create(
+        #         name=name, 
+        #         email=email
+        #     )
+        # except stripe.error.CardError as e:
+        #   # A declined card error
+        #   print('Status: %s' % e.http_status)
+        #   print('Code: %s' % e.code)
+        #   if e.param:
+        #     print('Param: %s' % e.param)
+        #   print('Message: %s' % e.user_message)
+        #   print('Request ID: %s' % e.request_id)
+        # except stripe.error.RateLimitError as e:
+        #   # Too many requests made to the API too quickly
+        #   print('Request ID: %s' % e.request_id)
+        # except stripe.error.InvalidRequestError as e:
+        #   # Invalid parameters were supplied to Stripe's API
+        #   print('Message: %s' % e.user_message)
+        #   if e.param:
+        #     print('Param: %s' % e.param)
+        #   print('Request ID: %s' % e.request_id)
+        # except stripe.error.AuthenticationError as e:
+        #   # Authentication with Stripe's API failed
+        #   print('Request ID: %s' % e.request_id)
+        # except stripe.error.APIConnectionError as e:
+        #   # Network communication with Stripe failed
+        #   print('Request ID: %s' % e.request_id)
+        # except stripe.error.StripeError as e:
+        #   # All other Stripe errors
+        #   print('Status: %s' % e.http_status)
+        #   print('Code: %s' % e.code)
+        #   print('Message: %s' % e.user_message)
+        #   print('Request ID: %s' % e.request_id)
+        # except Exception as e:
+        #   raise HTTPException(detail="Error creating customer account.", status_code=500)
 
-        customer_dict = customer.to_dict()
+        # customer_dict = customer.to_dict()
 
         payload = {
             "email": email, 
@@ -229,19 +229,19 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
             "name": name,
             "app_metadata":{
                 "api_key": api_key_hash,
-                "customer": customer_dict
             }
         }
+                # "customer": customer_dict
 
         headers = await _mgmt_headers(request)
 
-        response = await retry_async_httpx_request(method="POST", url=f"{BASE_AUTH_URL}/api/v2/users", json=payload, headers=headers)
+        # response = await retry_async_httpx_request(method="POST", url=f"{BASE_AUTH_URL}/api/v2/users", json=payload, headers=headers)
 
-        # response = await request.app.state.httpx_client.post(
-        #     f"{BASE_AUTH_URL}/api/v2/users",
-        #     json=payload,
-        #     headers=headers,
-        # ) 
+        response = await request.app.state.httpx_client.post(
+            f"{BASE_AUTH_URL}/api/v2/users",
+            json=payload,
+            headers=headers,
+        ) 
 
         response.raise_for_status()
         result = {

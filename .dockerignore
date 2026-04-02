@@ -1,3 +1,22 @@
+notebooks/
+response.md
+error.md
+certificate
+**/cloudflare_private.key
+**/origin_cert.pem
+neuralnexus-467517-firebase-adminsdk-fbsvc-e796deb01f.json
+.taxes.txt
+**q_and_a_testing
+**/.bak/**
+**.ipynb
+*firebase-key.json
+**store.py**
+**init.ipynb**
+**/models/**
+test.ipynb
+data/**
+data/elon-musk-dataset
+
 # Ignore node_modules and other dependency directories
 node_modules
 bower_components

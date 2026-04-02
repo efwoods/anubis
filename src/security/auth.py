@@ -237,19 +237,8 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
             }
         }
 
-        if name is not '':
+        if name != '':
             payload['name'] = name
-
-        # else:
-        #         payload = {
-        #             "email": email, 
-        #             "password": password, 
-        #             "connection": CONNECTION,
-        #             "app_metadata":{
-        #                 "api_key": api_key_hash,
-        #             }
-        #         }
-                # "customer": customer_dict
 
         headers = await _mgmt_headers(request)
 
@@ -268,8 +257,12 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
             }
 
         return result
+    # except asdf
     except Exception as e:
-        raise HTTPException(detail=f"Error signing up user: {e}", status_code=response.status_code)
+        if e.response.status_code == 400:
+            raise HTTPException(detail=f"Invalid Password. Password Requires a lower case and upper case character as well as at least 8 characters and a special character: {response.json().get('mesage', response.json())}", status_code=response.status_code)
+        else:
+            raise HTTPException(detail=f"Error signing up user: {response.json()}", status_code=response.status_code)
 
 async def logout_user(refresh_token: str, request: Request) -> None:
     response = await request.app.state.httpx_client.post(f"{BASE_AUTH_URL}/oauth/revoke", json={

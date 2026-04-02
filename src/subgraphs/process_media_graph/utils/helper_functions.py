@@ -82,10 +82,11 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             {"role": "user", "content": text_content}
         ])
         logger.info(f"Situation classification: {classification['classified_situation']}")
-        logger.info(f"Reason for classification : {classification['reasoning']}")
+
+        logger.info(f"Reason for classification : {classification.get('reasoning', '')}")
         
         classification_metadata = {
-            "classified_situation": classification['classified_situation'], "classification_reasoning": classification['reasoning']
+            "classified_situation": classification.get("classified_situation",""), "classification_reasoning": classification.get("reasoning", "")
         }
         if classification['classified_situation'] == "single_speaker":
             # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 

@@ -36,3 +36,4 @@ httpx
 
 debugpy
 stripe
+langchain-nvidia-ai-endpoints

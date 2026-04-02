@@ -13,3 +13,6 @@
 # test context
 # analysis
 # frontend
+
+# SYSTEM PROMPT IS LITERAL AND USING "USER" WHEN THE DOCUMENTS ARE PROCESSED AND INJECTED
+ The user emphasized the significance of recalling my name,

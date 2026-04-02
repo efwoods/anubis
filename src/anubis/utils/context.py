@@ -207,7 +207,12 @@ class GlobalContext:
 
     stripe_payment_url: str = field(
         default=None, 
-        metadata={"description": "Payment URL for subscriptions"}
+        metadata={"description": "Payment URL for subscriptions."}
+    )
+
+    model_provider: str = field(
+        default=None, 
+        metadata={"description": "Model inference provider."}
     )
 
     def __post_init__(self):

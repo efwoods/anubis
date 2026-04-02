@@ -1,0 +1,34 @@
+client = OpenAI(
+  api_key='LLM|2160921497745669|2M_zeRPt10hKzWlJw39C_P-UIHM',
+  base_url="https://api.llama.com/compat/v1/",
+)
+
+response = client.chat.completions.create(
+  messages=[
+
+    ],
+  model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+  
+  temperature=0.6,
+  max_completion_tokens=2048,
+  top_p=0.9,
+  frequency_penalty=1
+)
+
+api_key = 'LLM|2160921497745669|2M_zeRPt10hKzWlJw39C_P-UIHM'
+
+print(response)
+
+        model = ChatTogether(
+                    model = model_name,
+                    base_url = base_url,
+                    temperature=0.1,
+                    top_p=0.1,
+                    api_key = api_key,
+                ).bind_tools(
+                    # method='json_schema', 
+                    tools=tools, 
+                    tool_choice=tool_choice, # auto: zero or more tools
+                    # strict=True, # model output will be guaranteed to match the schema
+                    # include_raw=True # model response (JSON e.g.) and the parsed response (Pydantic e.g.) will be returned
+                )

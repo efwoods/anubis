@@ -22,6 +22,7 @@ dependencies = [
     "langchain-community>=0.4.1",
     "langchain-core>=1.2.16",
     "langchain-huggingface>=1.2.0",
+    "langchain-nvidia-ai-endpoints>=1.2.1",
     "langchain-openai>=1.1.10",
     "langchain-together>=0.4.0",
     "langchain-unstructured>=1.0.1",

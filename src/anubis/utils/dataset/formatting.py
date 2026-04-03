@@ -1,7 +1,7 @@
 from typing import List
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from openai import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from src.anubis.utils.model import init_model
 
 

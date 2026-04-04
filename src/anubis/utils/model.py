@@ -9,6 +9,7 @@ from typing import Optional
 from pydantic import BaseModel
 from langchain_together import ChatTogether
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_openai import ChatOpenAI
 
 """ TODO: Prevent Rate Limiting and Token Limiting Errors and Handle Message Failures """
 
@@ -78,7 +79,32 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                 api_key = api_key,
             )
             model = model.with_structured_output(schema=response_format)
+    elif model_provider == "META":
+        if response_format is None:
+            model = ChatOpenAI(
+                            model = model_name,
+                            base_url = base_url,
+                            temperature=0.1,
+                            top_p=0.1,
+                            api_key = api_key,
+                        ).bind_tools(
+                            # method='json_schema', 
+                            tools=tools, 
+                            tool_choice=tool_choice, # auto: zero or more tools
+                            # strict=True, # model output will be guaranteed to match the schema
+                            # include_raw=True # model response (JSON e.g.) and the parsed response (Pydantic e.g.) will be returned
+                        )
+        else: 
+            model = ChatOpenAI(
+                model = model_name,
+                base_url = base_url,
+                temperature=0.1,
+                top_p=0.1,
+                api_key = api_key,
+            )
+            model = model.with_structured_output(schema=response_format)
     
+
     return model
 
 # from together import Together

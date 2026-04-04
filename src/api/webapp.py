@@ -601,12 +601,16 @@ from langchain_core.runnables import RunnableConfig
 #     learn_information_about_yourself_through_text_from_the_user_as_a_memory(
 #         assistant_fact: str, fact_context: str, )
 
+
+class MessagePayload(BaseModel):
+    message: Optional[str] = "Hello!"
+    name: Optional[str] = None
+    description: Optional[str] = None
+
 @app.post("/message")
 async def message(
+    body: MessagePayload,
     response: Response,
-    message: Optional[str] = "Hello!",
-    name: Optional[str] = None,
-    description: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     ):
 
@@ -621,8 +625,8 @@ async def message(
         user_description = None
     else:
         user_id = current_user['identities'][0]['user_id']
-        user_name = name
-        user_description = description
+        user_name = body.name
+        user_description = body.description
 
     config = {
             "configurable": {
@@ -646,7 +650,7 @@ async def message(
 
         # logger.info(f"config: {config}")
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
 
     logger.info(f"{result}")
 

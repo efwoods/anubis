@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 import base64
 from pathlib import Path
 
+from langchain_community.document_loaders import PyPDFLoader
+import tempfile, os
+
+
 # At top of file
 import tempfile
 
@@ -186,6 +190,7 @@ async def process_uploaded_files_and_label_media_type(
                 media_list.append({
                     "type": "pdf",
                     "data": base64_data,
+                    "bytes":file_bytes,
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
@@ -373,7 +378,8 @@ async def process_media_item_task(
                 docs = [doc]
                 return docs
         
-        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
+        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5 
+        # Handle large continuous text string if proprietary content; classify non-proprietary text content
         elif media_type == "text":
             documents = await process_text_to_document(
                 metadata=metadata, 
@@ -381,7 +387,7 @@ async def process_media_item_task(
                 assistant_id=assistant_id, 
                 media_item=media_item)
             return documents
-        elif media_type == "json":
+        elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             classification_metadata = {
                 "classified_situation": "conversation_facts",
                 "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
@@ -412,6 +418,41 @@ async def process_media_item_task(
                 metadata={"source": url, "type": "url", "status": "not_implemented"}
             )]
             return docs
+        
+        elif media_type == "pdf": # Presumes written in first person from the target source
+            logging.info("breakpoint")
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+                tmp_file.write(media_item["bytes"])
+                tmp_path = tmp_file.name
+
+            
+
+            loader = PyPDFLoader(tmp_path)
+            docs = loader.load()
+            os.unlink(tmp_path)
+            document = docs[0]
+            # Process data for vectorstore; Identify content
+            classification_metadata = {
+                "classified_situation": "target pdf source document",
+                "classification_reasoning": "predefined classification"
+            }
+            final_documents = []
+            for temp_document in docs:
+                media_item['content'] = temp_document.page_content
+                documents = await process_text_media_item_target_for_vectorstore(
+                    media_item = media_item, 
+                    user_id = user_id, 
+                    assistant_id= assistant_id, 
+                    classification_metadata=classification_metadata,
+                    use_semantic_chunks=False,
+                )
+
+                for document in documents:
+                    document.metadata.update({"vectorstore_acceptable":True})
+                    final_documents.append(document)
+            # Analysis Will be handled here with the appropriate model
+
+            return final_documents
            
         # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
         elif media_type == "audio":
@@ -498,7 +539,7 @@ async def process_media_item_task(
         return documents
     return await tool.ainvoke(media_item["content"])
 
-async def extract_text_from_audio(audio_data: str, user_id: str, assistant_id: str) -> Document:
+async def extract_text_from_audio(audio_data: str, user_id: str, assistant_id: str) -> Document:#
     """Extract text from audio using Hugging Face Whisper Large v3
     reference audio is used if available.
     text is diarized and the target is identified.

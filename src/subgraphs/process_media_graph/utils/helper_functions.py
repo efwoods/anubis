@@ -92,14 +92,14 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 
             
             # is this content written in first person or is this content about the individual?
-            # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
+            # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
             # @dataclass
             # class DetermineTextFirstPersonToneOfVoice:
             #
             #   classification: Literal("first_person_directly_speaking", "content_about_target_NOT_the_target_directly_speaking")
             #   reason: str = Field()
             # model_with_structured_output_classify_text_perspective = init_model()
-            # input = [{"role": "system", "content": DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
+            # input = [{"role": "system", "content": DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
             # response = model_with_structured_output_classify_text_perspective.ainvoke(input=input)
             # 
             # if response['classification'] == "first_person_directly_speaking":
@@ -132,7 +132,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                     use_semantic_chunks=True
                 )
                 for document in documents: 
-                    document.metadata.update({"formatted_type": "vectorstore"})
+                    document.metadata.update({"vectorstore_acceptable": True})
             # TODO: format for analysis: analyze for content about the target
             # USE THE DETERMINATION TO AUGMENT ANALYSIS AND NOTE THAT THE CONTENT IS EITHER ABOUT THE TARGET OR IS FROM THE TARGET SPEAKING DIRECTLY
         elif classification['classified_situation'] == "q_and_a_dialogue":

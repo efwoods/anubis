@@ -168,7 +168,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
 @app.get("/*", include_in_schema=False)
 async def documentation():
     return RedirectResponse(url="/docs")
@@ -752,6 +751,28 @@ async def update_avatar_identity_with_media(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
+
+# # from src.anbis.subgraphs.email import email_graph
+# class EmailBody(BaseModel):
+#     """ Standard Email Body Format """
+#     assistant_id: str
+#     email_to: str
+#     email_from: str 
+#     email_message: str
+
+# @app.post("/handle_email")
+# async def handle_email(body: EmailBody, current_user: dict = Depends(get_current_user)):
+#     user_id = current_user['identities'][0]['user_id']
+#     config = {
+#             "configurable": {
+#                 "user_id": user_id,
+#                 "assistant_id": body.assistant_id,
+#                 "user_ctx": {"name":None, "description": None},
+#                 "assistant_ctx": {"name":None, "description": None}
+#             }
+#         }
+    
+     
 
 
 # @app.post("/process-media-json")

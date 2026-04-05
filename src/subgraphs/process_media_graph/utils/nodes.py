@@ -91,6 +91,7 @@ async def process_uploaded_files_and_label_media_type(
             # Determine media type and convert to standardized format
             if content_type.startswith('image/'):
                 # Convert image to base64
+                # proprietary content creates reference documents from the images otherwise assumes image of source target individual
                 base64_data = base64.b64encode(file_bytes).decode('utf-8')
                 media_list.append({
                     "type": "image",
@@ -101,7 +102,8 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes),
                         "user_id": user_id,
                         "assistant_id": assistant_id, 
-                        "reference_image": reference_image
+                        "reference_image": reference_image,
+                        "proprietary_content": proprietary_content
                     }
                 })
             
@@ -323,6 +325,7 @@ async def process_media_item_task(
         if media_type == "image":
             reference_image = media_item['metadata']["reference_image"]
             if "data" in media_item:
+                
                 # Base64 image
                 image_data = media_item["data"]                
                 

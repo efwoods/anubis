@@ -65,7 +65,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         # Analyze text situation
 
         @dataclass
-        class TextualSituationalAwareness:
+        class TextualSituationalAwareness(BaseModel):
             classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
             reasoning: str = Field(
                 description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
@@ -73,7 +73,10 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         model_with_structured_output = init_model(
             response_format=TextualSituationalAwareness
         )
-        from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
+        from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
+        from langchain_core.messages import SystemMessage, HumanMessage
+
+
         system_prompt = TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
         text_content = media_item.get("content", "")
         
@@ -92,14 +95,85 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 
             
             # is this content written in first person or is this content about the individual?
-            # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
+            # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
+
+            @dataclass
+            class MonologuePresentationOrSeriesOfQuotes(BaseModel):          
+                """ Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker. """
+                classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
+                reason: str = Field()
+            monologue_vs_distinct_quotes_classification_model = init_model(response_format=MonologuePresentationOrSeriesOfQuotes)
+
+            system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
+            input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
+
+            response = monologue_vs_distinct_quotes_classification_model.ainvoke(input=input)
+            classification_metadata = { 
+                "classified_situation": response.get("classified_situation",""),  "classification_reasoning": response.get("reasoning", "")
+            }
+            if response["classified_situation"] == "SeriesOfDistinctQuotes":
+                logger.info("")
+                contiguous_lines = media_item.get("content", "")
+                lines = contiguous_lines.splitlines()
+                idx = 0
+                all_documents = []
+                for line in lines:
+                    # Extract text content
+                    media_type = media_item.get("item", "")
+                    text_content = line
+                    filename = media_item.get("metadata", {}).get("filename", "")
+                    filename_uuid5 = str(uuid5(NAMESPACE_URL, filename))
+
+                    source_metadata = media_item.get("metadata", {})
+                    source = source_metadata.get("source", "user_upload")
+
+                    if not text_content or (text_content == ""):
+                        logger.warning("Empty text content in media_item")
+                        continue
+                    
+                    """ create document of single text chunk """
+                    
+                    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+    
+                    doc = Document(
+                        page_content=text_content,
+                        metadata={
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "created_at": current_timestamp,
+                            "processing_task_id": str(uuid4()),
+                            "source": source,
+                            "type": "text",
+                            "chunk_index": idx,
+                            "filename": filename,
+                            "document_id": str(uuid4()),
+                            "filename_uuid5":filename_uuid5, 
+                            "namespace": "quote"
+                        }
+                    )
+                    idx += 1
+
+                    if classification_metadata is not None:
+                        doc.metadata.update(classification_metadata)
+                        doc.metadata.update({"vectorstore_acceptable": True})
+                    docs = [doc]
+                    all_documents.extend(docs)
+                [document.metadata.update({"total_chunks": idx}) for document in all_documents]
+                # Analysis Acceptable to be determined here on bulk of media
+                return all_documents
+
+            else:
+                # Handle Monologue or Presentation    
+                logger.info("Monologue or Presentation detected")
             # @dataclass
-            # class DetermineTextFirstPersonToneOfVoice:
-            #
-            #   classification: Literal("first_person_directly_speaking", "content_about_target_NOT_the_target_directly_speaking")
-            #   reason: str = Field()
+            # class DetermineTextFirstPersonToneOfVoice(BaseModel):          
+            #     """  """
+            #     classification: Literal["first_person_directly_speaking", "content_about_target_NOT_the_target_directly_speaking"]
+            #     reason: str = Field()
+            # classification_model = init_model(response_format=DetermineTextFirstPersonToneOfVoice)
+
             # model_with_structured_output_classify_text_perspective = init_model()
-            # input = [{"role": "system", "content": DETERMINE_TEXT_SINLGE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
+            # input = [{"role": "system", "content": DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT}, {"role": "user", "content": media_item['content']}]
             # response = model_with_structured_output_classify_text_perspective.ainvoke(input=input)
             # 
             # if response['classification'] == "first_person_directly_speaking":
@@ -132,7 +206,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                     use_semantic_chunks=True
                 )
                 for document in documents: 
-                    document.metadata.update({"formatted_type": "vectorstore"})
+                    document.metadata.update({"vectorstore_acceptable": True})
             # TODO: format for analysis: analyze for content about the target
             # USE THE DETERMINATION TO AUGMENT ANALYSIS AND NOTE THAT THE CONTENT IS EITHER ABOUT THE TARGET OR IS FROM THE TARGET SPEAKING DIRECTLY
         elif classification['classified_situation'] == "q_and_a_dialogue":

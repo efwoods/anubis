@@ -71,3 +71,11 @@ learn_information_about_yourself_through_text_from_the_user_as_a_memory
 
 <!-- # VERIFY FACT DOES NOT ALREADY EXIST in memories -->
 if runtime.state.get('recalled_memory_documents', None) is not None:
+
+<!-- Implementation could use prompt tuning to reduce false positives after quantifying
+        @dataclass
+        class TextualSituationalAwareness(BaseModel):
+            classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
+            reasoning: str = Field(
+                description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
+            ) -->

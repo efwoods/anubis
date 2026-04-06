@@ -557,7 +557,7 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         
         metadata={"user_id": current_user['identities'][0]['user_id']}
 
-        avatars = langgraph_sdk_client.assistants.search(graph_id="Anubis", metadata=metadata)
+        avatars = await langgraph_sdk_client.assistants.search(graph_id="Anubis", metadata=metadata)
 
         for avatar in avatars:
             assistant_id = avatar.get("assistant_id", "")

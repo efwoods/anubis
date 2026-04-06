@@ -107,7 +107,14 @@ class GlobalContext:
     model: str = field(
         default=None,
         metadata={
-            "description": "Model Name Only"
+            "description": "Model Name Only; text response and tool use for thought processing."
+        },
+    )
+    
+    image_model: str = field(
+        default=None,
+        metadata={
+            "description": "Model Name Only; used without tools for image to text descriptions."
         },
     )
 

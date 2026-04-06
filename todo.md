@@ -222,3 +222,13 @@ Chatgpt conversation individual messages are being chunked and the messages incl
 # Modify prompt, data collection, and fine-tuning
 # Analyze Features
 # Compare results
+
+
+
+
+
+
+
+# Upload pdfs for identity;
+# create use case for email response
+# quality.ipynb contains text to analysis prompts and requires a model with structured output to classify documents

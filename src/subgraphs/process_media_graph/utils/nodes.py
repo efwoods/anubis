@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 import base64
 from pathlib import Path
 
+from langchain_community.document_loaders import PyPDFLoader
+import tempfile, os
+
+
 # At top of file
 import tempfile
 
@@ -30,7 +34,7 @@ from langgraph.runtime import Runtime
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
-from src.anubis.utils.model import init_model
+from src.anubis.utils.model import init_model, init_image_description_model
 
 from langchain.tools import tool
 
@@ -38,6 +42,8 @@ from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 from src.anubis.utils.utility import extract_user_id_assistant_id
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
+
+
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -87,6 +93,7 @@ async def process_uploaded_files_and_label_media_type(
             # Determine media type and convert to standardized format
             if content_type.startswith('image/'):
                 # Convert image to base64
+                # proprietary content creates reference documents from the images otherwise assumes image of source target individual
                 base64_data = base64.b64encode(file_bytes).decode('utf-8')
                 media_list.append({
                     "type": "image",
@@ -97,7 +104,8 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes),
                         "user_id": user_id,
                         "assistant_id": assistant_id, 
-                        "reference_image": reference_image
+                        "reference_image": reference_image,
+                        "proprietary_content": proprietary_content
                     }
                 })
             
@@ -186,6 +194,7 @@ async def process_uploaded_files_and_label_media_type(
                 media_list.append({
                     "type": "pdf",
                     "data": base64_data,
+                    "bytes":file_bytes,
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
@@ -318,6 +327,7 @@ async def process_media_item_task(
         if media_type == "image":
             reference_image = media_item['metadata']["reference_image"]
             if "data" in media_item:
+                
                 # Base64 image
                 image_data = media_item["data"]                
                 
@@ -373,7 +383,8 @@ async def process_media_item_task(
                 docs = [doc]
                 return docs
         
-        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5
+        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5 
+        # Handle large continuous text string if proprietary content; classify non-proprietary text content
         elif media_type == "text":
             documents = await process_text_to_document(
                 metadata=metadata, 
@@ -381,7 +392,7 @@ async def process_media_item_task(
                 assistant_id=assistant_id, 
                 media_item=media_item)
             return documents
-        elif media_type == "json":
+        elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             classification_metadata = {
                 "classified_situation": "conversation_facts",
                 "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
@@ -412,6 +423,41 @@ async def process_media_item_task(
                 metadata={"source": url, "type": "url", "status": "not_implemented"}
             )]
             return docs
+        
+        elif media_type == "pdf": # Presumes written in first person from the target source
+            logging.info("breakpoint")
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+                tmp_file.write(media_item["bytes"])
+                tmp_path = tmp_file.name
+
+            
+
+            loader = PyPDFLoader(tmp_path)
+            docs = loader.load()
+            os.unlink(tmp_path)
+            document = docs[0]
+            # Process data for vectorstore; Identify content
+            classification_metadata = {
+                "classified_situation": "target pdf source document",
+                "classification_reasoning": "predefined classification"
+            }
+            final_documents = []
+            for temp_document in docs:
+                media_item['content'] = temp_document.page_content
+                documents = await process_text_media_item_target_for_vectorstore(
+                    media_item = media_item, 
+                    user_id = user_id, 
+                    assistant_id= assistant_id, 
+                    classification_metadata=classification_metadata,
+                    use_semantic_chunks=False,
+                )
+
+                for document in documents:
+                    document.metadata.update({"vectorstore_acceptable":True})
+                    final_documents.append(document)
+            # Analysis Will be handled here with the appropriate model
+
+            return final_documents
            
         # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
         elif media_type == "audio":
@@ -498,7 +544,7 @@ async def process_media_item_task(
         return documents
     return await tool.ainvoke(media_item["content"])
 
-async def extract_text_from_audio(audio_data: str, user_id: str, assistant_id: str) -> Document:
+async def extract_text_from_audio(audio_data: str, user_id: str, assistant_id: str) -> Document:#
     """Extract text from audio using Hugging Face Whisper Large v3
     reference audio is used if available.
     text is diarized and the target is identified.
@@ -541,15 +587,16 @@ async def extract_personality_from_image(
 
     from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
     
-    model = init_model()
+    model = init_image_description_model()
 
     # use reference image if available to target individual
-    assistent_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
+    assistant_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
     key=assistant_id
-    reference_image_item = await store.aget(assistent_reference_image_identity_namespace, key)
-    if len(reference_image_item) != 0:
-        reference_image_data = getattr(reference_image_item,'value', {}).get("reference_image_data", "{}")
+    reference_image_item = await store.aget(assistant_reference_image_identity_namespace, key)
+    if reference_image_item and len(reference_image_item) != 0:
+        reference_image_data = getattr(reference_image_item,'value', {}).get("reference_image_data", None)
 
+    if reference_image_item and reference_image_data:
         image_to_target_textual_description_payload = [
                             {
                                 "type": "text",

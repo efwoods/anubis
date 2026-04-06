@@ -159,6 +159,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                     docs = [doc]
                     all_documents.extend(docs)
                 [document.metadata.update({"total_chunks": idx}) for document in all_documents]
+                # Analysis Acceptable to be determined here on bulk of media
                 return all_documents
 
             else:

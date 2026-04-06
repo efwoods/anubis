@@ -606,6 +606,8 @@ class MessagePayload(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
 
+from time import time_ns
+
 @app.post("/message")
 async def message(
     body: MessagePayload,
@@ -614,6 +616,7 @@ async def message(
     ):
 
     logger.info("breakpoint")
+    start_time = time_ns()
     assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not assistant_config:
         raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
@@ -656,7 +659,7 @@ async def message(
     response = {}
     response["content"] = result['messages'][-1].content
     response["response_metadata"] = result['messages'][-1].response_metadata
-
+    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
 @app.post("/update_avatar_identity_with_media")

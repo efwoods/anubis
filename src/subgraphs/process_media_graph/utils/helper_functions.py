@@ -65,7 +65,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         # Analyze text situation
 
         @dataclass
-        class TextualSituationalAwareness:
+        class TextualSituationalAwareness(BaseModel):
             classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
             reasoning: str = Field(
                 description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"

@@ -34,7 +34,7 @@ from langgraph.runtime import Runtime
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
-from src.anubis.utils.model import init_model
+from src.anubis.utils.model import init_model, init_image_description_model
 
 from langchain.tools import tool
 
@@ -42,6 +42,8 @@ from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 from src.anubis.utils.utility import extract_user_id_assistant_id
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
+
+
 
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
@@ -585,15 +587,16 @@ async def extract_personality_from_image(
 
     from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
     
-    model = init_model()
+    model = init_image_description_model()
 
     # use reference image if available to target individual
-    assistent_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
+    assistant_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
     key=assistant_id
-    reference_image_item = await store.aget(assistent_reference_image_identity_namespace, key)
-    if len(reference_image_item) != 0:
-        reference_image_data = getattr(reference_image_item,'value', {}).get("reference_image_data", "{}")
+    reference_image_item = await store.aget(assistant_reference_image_identity_namespace, key)
+    if reference_image_item and len(reference_image_item) != 0:
+        reference_image_data = getattr(reference_image_item,'value', {}).get("reference_image_data", None)
 
+    if reference_image_item and reference_image_data:
         image_to_target_textual_description_payload = [
                             {
                                 "type": "text",

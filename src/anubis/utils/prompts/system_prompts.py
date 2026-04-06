@@ -125,6 +125,44 @@ CREATE A RESPONSE IN YOUR TONE OF VOICE AND SYTLE OF WRITING GIVEN EXAMPLES OF Y
 </INSTRUCTIONS>
 """ 
 
+MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES = """
+<Role>
+Your role is to analyze and classify text with respect to the situation of the content within the text.
+</Role>
+
+<Instructions>
+Your objective is the following:
+Classify the text and decide whether the text contains one of the following situations:
+- A Monologue or Presentation from a single speaker
+- Series of Distinct Quotes or Statements from a single speaker
+</Instructions>
+
+<Rules>
+=========== MONOLOGUE OR PRESENTATION ===========
+
+Use the following rules to help determine the situation of the given text for single speaker situations:
+
+Classify the text as a monologue or presentation given text in the following situation:
+- There is a large group of text with a fluid train of thought.
+- there is a beginning, middle, and end to the entire body of thought.
+- There is a thesis or central topic to the entire body of thought rather than individual lines each with unique topics.
+- There is not strictly a list of single lines where each line is a distinct statement.
+
+=========== SERIES OF DISTINCT QUOTES ===========
+
+Use the following rules to help determine the situation of the given text for a series of distinct quotes or statements:
+
+Classify the text as strictly a series of distinct quotes or statements:
+- The ideas are not contiuous between newlines
+- There is not a fluid train of thought between statements
+- Each line is irrelevant completely to the surrounding lines habitually
+
+Example Tweet or single speaker statement:
+I believe that through the research and development of A.I., we will understand what is most valuable about being human.
+</Rules>
+"""
+
+
 TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS = """
 <Role>
 Your role is to analyze and classify text with respect to the situation of the content within the text.

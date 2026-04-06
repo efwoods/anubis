@@ -168,7 +168,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
 @app.get("/*", include_in_schema=False)
 async def documentation():
     return RedirectResponse(url="/docs")
@@ -607,6 +606,8 @@ class MessagePayload(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
 
+from time import time_ns
+
 @app.post("/message")
 async def message(
     body: MessagePayload,
@@ -615,6 +616,7 @@ async def message(
     ):
 
     logger.info("breakpoint")
+    start_time = time_ns()
     assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not assistant_config:
         raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
@@ -657,7 +659,7 @@ async def message(
     response = {}
     response["content"] = result['messages'][-1].content
     response["response_metadata"] = result['messages'][-1].response_metadata
-
+    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
 @app.post("/update_avatar_identity_with_media")
@@ -752,6 +754,28 @@ async def update_avatar_identity_with_media(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
+
+# # from src.anbis.subgraphs.email import email_graph
+# class EmailBody(BaseModel):
+#     """ Standard Email Body Format """
+#     assistant_id: str
+#     email_to: str
+#     email_from: str 
+#     email_message: str
+
+# @app.post("/handle_email")
+# async def handle_email(body: EmailBody, current_user: dict = Depends(get_current_user)):
+#     user_id = current_user['identities'][0]['user_id']
+#     config = {
+#             "configurable": {
+#                 "user_id": user_id,
+#                 "assistant_id": body.assistant_id,
+#                 "user_ctx": {"name":None, "description": None},
+#                 "assistant_ctx": {"name":None, "description": None}
+#             }
+#         }
+    
+     
 
 
 # @app.post("/process-media-json")

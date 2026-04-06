@@ -17,6 +17,7 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                tools=[], 
                tool_choice: str = "auto", 
                response_format = None, 
+               image_model: Optional[bool] = False
                ):
     
     context = GlobalContext()
@@ -59,7 +60,7 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             model = model.with_structured_output(schema=response_format)
     elif model_provider == "NVIDIA":
         if response_format is None:
-            model = ChatNVIDIA(
+                model = ChatNVIDIA(
                             model = model_name,
                             temperature=0.1,
                             top_p=0.1,
@@ -107,16 +108,49 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
 
     return model
 
-# from together import Together
+def init_image_description_model():
+    context = GlobalContext()
+    model_name = context.image_model
+    base_url = context.llm_provider_base_url
+    api_key = context.llm_provider_api_key
+    dev = context.dev
+    model_provider = context.model_provider
 
-# client = Together() # auth defaults to os.environ.get("TOGETHER_API_KEY")
+    logger.info(f"dev: {dev}")
+    logger.info(f"api_key: {api_key}")
+    logger.info(f"base_url: {base_url}")
+    logger.info(f"model_name: {model_name}")
 
-# response = client.chat.completions.create(
-#     model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-#     messages=[
-#       {
-#         "role": "user",
-#         "content": "What are some fun things to do in New York?"
-#       }
-#     ]
-# )
+    # from langchain_openai import ChatOpenAI
+    model = ChatNVIDIA(
+                model = model_name,
+                temperature=0.1,
+                top_p=0.1,
+                api_key = api_key,
+            )
+    
+    # if model_provider == "TOGETHER":
+    #     model = ChatTogether(
+    #                 model = model_name,
+    #                 base_url = base_url,
+    #                 temperature=0.1,
+    #                 top_p=0.1,
+    #                 api_key = api_key,
+    #             )
+
+    # elif model_provider == "NVIDIA":
+    #         model = ChatNVIDIA(
+    #                     model = model_name,
+    #                     temperature=0.1,
+    #                     top_p=0.1,
+    #                     api_key = api_key,
+    #                 )
+    # elif model_provider == "META":
+    #     model = ChatOpenAI(
+    #                     model = model_name,
+    #                     base_url = base_url,
+    #                     temperature=0.1,
+    #                     top_p=0.1,
+    #                     api_key = api_key,
+    #                 )
+    return model

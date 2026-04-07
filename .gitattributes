@@ -1,1 +1,3 @@
 langgraph.json merge=ours
+docker-compose-prod.yml merge=ours
+docker-compose.yml merge=ours

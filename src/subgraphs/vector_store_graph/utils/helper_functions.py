@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 from datetime import datetime
 
 from dateutil import parser
+from uuid import NAMESPACE_URL, uuid5
 
 # Convert string timestamps to datetime objects
 def parse_datetime(dt_value):

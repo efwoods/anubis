@@ -616,6 +616,7 @@ async def message(
     ):
 
     logger.info("breakpoint")
+    # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not assistant_config:
@@ -661,6 +662,50 @@ async def message(
     response["response_metadata"] = result['messages'][-1].response_metadata
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
+
+@app.post("/upload_media_file")
+async def upload_media_file(
+    files: List[UploadFile] = File(...),
+    reference_audio: bool = False,
+    reference_image: bool = False, 
+    proprietary_content: bool = False, 
+    current_user: dict = Depends(get_current_user)
+):
+    # Context user_id, assistant_id
+    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
+    """
+    Upload one or more media files for processing and indexing.
+    
+    - **files**: One or more files to process
+    - **user_id**: User identifier
+    - **assistant_id**: Assistant identifier
+    """
+    user_id = current_user['identities'][0]['user_id']
+    assitant_config = current_user['app_metadata']['assistant_config']
+    assistant_id = assitant_config['configurable']['assistant_id']
+    config = {
+        "configurable": {
+            "user_id": user_id,
+            "user_ctx": {"name":None, "description": None},
+        }
+    }
+    config['configurable'].update(assitant_config['configurable'])
+    # Read all uploaded files
+    media_files = []
+    for file in files:
+        content = await file.read()
+        media_files.append({
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "content": content,
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "reference_audio": reference_audio,
+            "reference_image": reference_image,               
+            "proprietary_content": proprietary_content
+        })
+    logger.info("breakpoint")
+
 
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
@@ -708,6 +753,8 @@ async def update_avatar_identity_with_media(
                 "proprietary_content": proprietary_content
             })
 
+        logger.info("breakpoint")
+
         context=app.state.context
         store = app.state.store
         
@@ -754,6 +801,54 @@ async def update_avatar_identity_with_media(
             status_code=500,
             detail=f"Error processing media: {str(e)}"
         )
+
+@app.get("/list_avatar_documents")
+async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
+    token = current_user['API_KEY']
+    langgraph_sdk_client = get_client(headers={"Authorization": f"{token}"})
+    user_id = current_user['identities'][0]['user_id']
+    assistant_id = current_user['app_metadata'].get("assistant_config", {}).get("configurable", {}).get("assistant_id", None)
+    if assistant_id is None:
+        raise HTTPException(detail="Please select an avatar before continuing.", status_code=400)
+    results = {}
+    namespace = (user_id, assistant_id)
+    all_namespaces = await langgraph_sdk_client.store.list_namespaces(namespace, limit=1000000)
+    all_document_items = await langgraph_sdk_client.store.search_items(namespace, limit=1000000)
+    # results['namespaces'] = all_namespaces
+    # results['documents'] = all_document_items
+    uploaded_documents = [item['value']['document']['kwargs']['metadata'].get("filename", None) for item in all_document_items['items']]
+    uploaded_documents = [item for item in set(uploaded_documents) if item is not None]
+    results['uploaded_documents'] = uploaded_documents
+    return results
+
+@app.delete("/delete_avatar_document")
+async def delete_avatar_documents(source_document_name: str, current_user: dict = Depends(get_current_user)):
+    token = current_user['API_KEY']
+    langgraph_sdk_client = get_client(headers={"Authorization": f"{token}"})
+    user_id = current_user['identities'][0]['user_id']
+    assistant_id = current_user['app_metadata'].get("assistant_config", {}).get("configurable", {}).get("assistant_id", None)
+    if assistant_id is None:
+        raise HTTPException(detail="Please select an avatar before continuing.", status_code=400)
+    
+    pool = app.state.pool
+
+    SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s"""
+    SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;""" 
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                params = (
+                    f"{user_id}.{assistant_id}.{source_document_name}",
+                    f"{user_id}.{assistant_id}.{source_document_name}.%",
+                    f"{user_id}.{assistant_id}.%.{source_document_name}",
+                    f"{user_id}.{assistant_id}.%.{source_document_name}.%",
+                )
+                await cur.execute(SQL_STORE_DELETE_QUERY, params)
+                await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
+
+        return JSONResponse(content=f"Successfully deleted: {source_document_name}", status_code=200)
+    except Exception as e:
+        raise HTTPException(detail="Error deleting documents.", status_code=500)
 
 # # from src.anbis.subgraphs.email import email_graph
 # class EmailBody(BaseModel):

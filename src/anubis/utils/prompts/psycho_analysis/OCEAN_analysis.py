@@ -79,7 +79,7 @@ class AGREEABLENESS_OCEAN_ANALYSIS_EXTRACTION(BaseModel):
     """
 
     agreeableness: float = Field(description = "Scale from 0.0 to 1.0. Return a floating point value on a scale from zero to one where zero is the least prominent expression of the trait and one is the most prominent feature of the trait. You will use examples from the text that support the floating point value.")
-    agreeableness_descrption: str = Field(description = "Return clear reasons and examples for both the description and the floating point value from the text that support the defined description and floating point score. ")
+    agreeableness_description: str = Field(description = "Return clear reasons and examples for both the description and the floating point value from the text that support the defined description and floating point score. ")
     agreeableness_reasons_and_examples: str = Field(description = "Return a description of the individual with respect to the trait written in the first person perspective using reasoning from the reasoning and examples and the example definition of the description of the traits.")
 
 

@@ -429,9 +429,6 @@ async def process_media_item_task(
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
                 tmp_file.write(media_item["bytes"])
                 tmp_path = tmp_file.name
-
-            
-
             loader = PyPDFLoader(tmp_path)
             docs = loader.load()
             os.unlink(tmp_path)
@@ -454,6 +451,7 @@ async def process_media_item_task(
 
                 for document in documents:
                     document.metadata.update({"vectorstore_acceptable":True})
+                    document.metadata.update({"namespace":"identity"})
                     final_documents.append(document)
             # Analysis Will be handled here with the appropriate model
 

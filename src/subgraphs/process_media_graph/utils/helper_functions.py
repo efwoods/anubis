@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 from typing import Literal
 from pydantic import Field
+from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
 
 # Process TEXT TO DOCUMENT
 async def process_text_to_document(metadata, user_id, assistant_id, media_item) -> list[Document]:
@@ -64,7 +65,6 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         
         # Analyze text situation
 
-        @dataclass
         class TextualSituationalAwareness(BaseModel):
             classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
             reasoning: str = Field(
@@ -84,20 +84,20 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text_content}
         ])
-        logger.info(f"Situation classification: {classification['classified_situation']}")
+        logger.info(f"Situation classification: {classification.classified_situation}")
 
-        logger.info(f"Reason for classification : {classification.get('reasoning', '')}")
+        logger.info(f"Reason for classification : {classification.reasoning}")
         
         classification_metadata = {
-            "classified_situation": classification.get("classified_situation",""), "classification_reasoning": classification.get("reasoning", "")
+            "classified_situation": classification.classified_situation, 
+            "classification_reasoning": classification.reasoning
         }
-        if classification['classified_situation'] == "single_speaker":
+        if classification.classified_situation == "single_speaker":
             # TODO: Determine if the text is of the single person directly speaking as a quote for the entire document in the media item 
             
             # is this content written in first person or is this content about the individual?
             # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
 
-            @dataclass
             class MonologuePresentationOrSeriesOfQuotes(BaseModel):          
                 """ Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker. """
                 classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
@@ -107,11 +107,11 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
             input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
 
-            response = monologue_vs_distinct_quotes_classification_model.ainvoke(input=input)
+            response = await monologue_vs_distinct_quotes_classification_model.ainvoke(input=input)
             classification_metadata = { 
-                "classified_situation": response.get("classified_situation",""),  "classification_reasoning": response.get("reasoning", "")
+                "classified_situation": response.classified_situation,  "classification_reasoning": response.reason
             }
-            if response["classified_situation"] == "SeriesOfDistinctQuotes":
+            if response.classified_situation == "SeriesOfDistinctQuotes":
                 logger.info("")
                 contiguous_lines = media_item.get("content", "")
                 lines = contiguous_lines.splitlines()
@@ -159,6 +159,23 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                     docs = [doc]
                     all_documents.extend(docs)
                 [document.metadata.update({"total_chunks": idx}) for document in all_documents]
+                
+                additional_metadata={
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "created_at": current_timestamp,
+                
+                            "source": source,
+                            "type": "text",
+                            "filename": filename,
+                            
+                            "filename_uuid5":filename_uuid5, 
+                            "namespace": "identity",
+                            "analysis_acceptable": True
+                        }
+                analysis_documents = await perform_ocean_analysis(human_message = HumanMessage(content = media_item.get("content")), additional_metadata = additional_metadata)
+
+                all_documents.extend(analysis_documents)
                 # Analysis Acceptable to be determined here on bulk of media
                 return all_documents
 

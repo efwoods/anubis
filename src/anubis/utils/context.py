@@ -118,6 +118,21 @@ class GlobalContext:
         },
     )
 
+    image_model_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "API Key; used without tools for image to text descriptions."
+        },
+    )
+
+    image_model_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "Base Url; used without tools for image to text descriptions."
+        },
+    )
+
+
     dev: str = field(
         default=None,
         metadata={

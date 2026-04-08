@@ -31,9 +31,9 @@ if __name__ == "__main__":
     print(f"{progress_file_path}")
     # if args.repo_abs_path:
         # subprocess.run(f"cd {args.repo_abs_path}")
-    subprocess.run(f"git diff HEAD >> progress_1_hour.txt", shell=True, text=True)
+    subprocess.run(f"git diff HEAD > progress_1_hour.txt", shell=True, text=True)
     print("Reviewing hourly progress...")
-    system_message = "Please describe what has been changed within the last hour from the following text:"
+    system_message = "SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself:"
     with open(progress_file_path, 'rb') as fp:
         response = httpx.post(url="http://localhost:8123/chat",
             headers={
@@ -47,7 +47,7 @@ if __name__ == "__main__":
         )
         update_response = json.loads(response.content.decode('utf-8')).get("content")
         fp.close()
-    subprocess.run([f"git commit --allow-empty -m '{update_response}' && git push"], text=True, shell=True)
+    subprocess.run([f"git commit --allow-empty -m \"{update_response}\" && git push"], text=True, shell=True)
     subprocess.run([f"rm {progress_file_path}"], text=True, shell=True)
     print(f"{update_response}")
     

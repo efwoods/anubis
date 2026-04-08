@@ -11,6 +11,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hourly Progress Script")
     # parser.add_argument("--repo_abs_path", nargs="?", help="Optional path to root of the git directory. Otherwise the cwd is used for git commit history.")
     parser.add_argument("--NN_API_KEY", nargs="?", help="Optional path to input file")
+    parser.add_argument("--current", help="Logs current updates since the last commit", action="store_true")
     args = parser.parse_args()
 
     API_KEY = os.environ.get("NN_API_KEY")
@@ -32,15 +33,21 @@ if __name__ == "__main__":
     # if args.repo_abs_path:
         # subprocess.run(f"cd {args.repo_abs_path}")
     subprocess.run(f"git diff HEAD > progress_1_hour.txt", shell=True, text=True)
-    print("Reviewing hourly progress...")
-    system_message = "SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself:"
+    if not args.current:
+        print("Reviewing hourly progress...")
+        system_message = "SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself:"
+        message = "Please describe what has been changed within the last hour from the following text:"
+    else:
+        print("Reviewing progress...")
+        system_message = "SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed since the last commit from the following text and use your own style of writing. Write as if you made the code changes yourself:"
+        message = "Please describe what has been changed since the last commit from the following text:"
     with open(progress_file_path, 'rb') as fp:
-        response = httpx.post(url="http://localhost:8123/chat",
+        response = httpx.post(url="https://api.neuralnexus.site/chat",
             headers={
-              "API-KEY": "sk-Z3BbsvDxw9RbcXrsQIYO_2c-u71sifixKOaMqQyK83M"
+              "API-KEY": API_KEY
             },
             data={
-              "message": "Please describe what has been changed within the last hour from the following text:",
+              "message": message,
             },
             files={"file":fp},
             timeout=httpx.Timeout(120) # timeout in seconds

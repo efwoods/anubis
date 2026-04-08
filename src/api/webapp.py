@@ -653,7 +653,7 @@ async def message(
 
         # logger.info(f"config: {config}")
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
 
     logger.info(f"{result}")
 

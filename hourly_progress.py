@@ -35,11 +35,11 @@ if __name__ == "__main__":
     subprocess.run(f"git diff HEAD > progress_1_hour.txt", shell=True, text=True)
     if not args.current:
         print("Reviewing hourly progress...")
-        system_message = "SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself:"
+        system_message = "<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. Do not include information that was not listed in the git diff:</INSTRUCTIONS>"
         message = "Please describe what has been changed within the last hour from the following text:"
     else:
         print("Reviewing progress...")
-        system_message = "SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed since the last commit from the following text and use your own style of writing. Write as if you made the code changes yourself:"
+        system_message = """<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed since the last commit from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. Do not include information that was not listed in the git diff:</INSTRUCTIONS>"""
         message = "Please describe what has been changed since the last commit from the following text:"
     with open(progress_file_path, 'rb') as fp:
         response = httpx.post(url="https://api.neuralnexus.site/chat",
@@ -54,7 +54,9 @@ if __name__ == "__main__":
         )
         update_response = json.loads(response.content.decode('utf-8')).get("content")
         fp.close()
-    subprocess.run([f"git commit --allow-empty -m \"{update_response}\" && git push"], text=True, shell=True)
+    update_response.replace("'", "\'")
+    UPDATE_COMMAND = "git commit --allow-empty -m '" + update_response.replace("'", "\'") + "' && git push"
+    subprocess.run([f"{UPDATE_COMMAND}"], text=True, shell=True)
     subprocess.run([f"rm {progress_file_path}"], text=True, shell=True)
     print(f"{update_response}")
     

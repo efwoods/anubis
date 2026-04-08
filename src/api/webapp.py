@@ -610,8 +610,8 @@ from time import time_ns
 
 @app.post("/message")
 async def message(
+    response: Response,    
     body: MessagePayload,
-    response: Response,
     current_user: dict = Depends(get_current_user),
     ):
 
@@ -653,7 +653,7 @@ async def message(
 
         # logger.info(f"config: {config}")
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=message)]}, config = config )
 
     logger.info(f"{result}")
 
@@ -662,6 +662,72 @@ async def message(
     response["response_metadata"] = result['messages'][-1].response_metadata
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
+
+from typing import Annotated
+
+@app.post("/chat")
+async def chat(
+    response: Response,    
+    message: Annotated[str, Form(...)],
+    file: Annotated[UploadFile, File(...)],
+    current_user: dict = Depends(get_current_user)
+    ):
+
+    logger.info("breakpoint")
+    # allow for select avatar in query and anonymous user for a dedicated endpoint
+    start_time = time_ns()
+    assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
+    if not assistant_config:
+        raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
+
+    if not current_user:
+        user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
+        user_name = None,
+        user_description = None
+    else:
+        user_id = current_user['identities'][0]['user_id']
+        user_name = None
+        user_description = None 
+
+    config = {
+            "configurable": {
+                "user_ctx": {"name":user_name, "description": user_description},
+                "user_id":user_id
+            }
+        }
+    
+    # update with assistant information
+    config['configurable'].update(assistant_config['configurable'])
+
+        # store = app.state.store
+    graph = app.state.graph
+
+        # system_time = datetime.now(tz=timezone.utc).isoformat
+        # content = [{"type":"text", "text": system_time}]
+        # input = {"messages": HumanMessage(content=content)}
+        # # store = make_pg_store()
+
+        # result = await url_loading_graph.ainvoke(input, config=config)
+
+        # logger.info(f"config: {config}")
+
+    if file.content_type == "text/plain":
+        contents = await file.read()
+        content = contents.decode('utf-8')
+    else:
+        content = ""
+    
+    human_message_content = message + "\n\n" + content
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
+
+    logger.info(f"{result}")
+
+    response = {}
+    response["content"] = result['messages'][-1].content
+    response["response_metadata"] = result['messages'][-1].response_metadata
+    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+    return JSONResponse(response, status_code=200)
+
 
 @app.post("/upload_media_file")
 async def upload_media_file(

@@ -27,7 +27,9 @@ yt_dlp
 bert_score
 rouge
 
-# end of base image 
+yt_dlp
+
+# End of base image
 
 # auth
 supabase

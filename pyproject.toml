@@ -47,7 +47,6 @@ dependencies = [
     "yt-dlp>=2026.3.17",
 ]
 
-
 [project.optional-dependencies]
 dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
 

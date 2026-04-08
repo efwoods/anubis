@@ -675,7 +675,7 @@ import os
 import re
 
 
-def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: str = ".") -> str:
+async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: str = ".") -> str:
     """
     Download transcript/subtitles from a YouTube video.
 
@@ -699,8 +699,8 @@ def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, outp
         "no_warnings": False,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    async with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
         title = info.get("title", "video")
 
     # Find the downloaded .vtt file

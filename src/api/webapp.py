@@ -668,8 +668,8 @@ from typing import Annotated
 @app.post("/chat")
 async def chat(
     response: Response,    
-    message: Annotated[str, Form(...)],
-    file: Annotated[UploadFile, File(...)],
+    message: Optional[Annotated[str, Form(default=None)]],
+    file: Optional[UploadFile] = File(default=None),
     current_user: dict = Depends(get_current_user)
     ):
 
@@ -711,13 +711,20 @@ async def chat(
 
         # logger.info(f"config: {config}")
 
-    if file.content_type == "text/plain":
+    if file and file.content_type == "text/plain":
         contents = await file.read()
         content = contents.decode('utf-8')
     else:
         content = ""
     
-    human_message_content = message + "\n\n" + content
+    if not message:
+        human_message_content = content
+    else:
+        if content == "":
+            human_message_content = message
+        else: 
+            human_message_content = message + "\n\n" + content
+
     result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
 
     logger.info(f"{result}")

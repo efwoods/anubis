@@ -712,8 +712,6 @@ class SubscriptionStatus:
                 self.last_updated = value
         return self.to_dict()
 
-
-
 async def check_subscription_status(request: Request, current_user: dict) -> dict:
     stripe_client = request.app.state.stripe
     subscription_status = current_user['app_metadata'].get("subscription_status", None)
@@ -721,6 +719,10 @@ async def check_subscription_status(request: Request, current_user: dict) -> dic
     if not subscription_status:
         # Identify Customer from email
         customer_df = pd.DataFrame(stripe_client.Customer.list().to_dict()['data'])
+        if len(customer_df) == 0:
+            # Customer is not subscribed
+            customer_subscription_status = SubscriptionStatus()
+            return customer_subscription_status.to_dict()
         customer_id_series = customer_df[customer_df['email']==email]['id'].values
         if len(customer_id_series) != 0:
             customer_id = customer_id_series[0]

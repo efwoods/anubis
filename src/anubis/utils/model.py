@@ -40,6 +40,31 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
         else:
             model = AsyncLlamaAPIClientWrapper(response_format=response_format)
 
+    if model_provider == "OPEN_AI":
+        if response_format is None:
+            model = ChatOpenAI(
+                        model = model_name,
+                        base_url = base_url,
+                        temperature=0.1,
+                        top_p=0.1,
+                        api_key = api_key,
+                    ).bind_tools(
+                        # method='json_schema', 
+                        tools=tools, 
+                        tool_choice=tool_choice, # auto: zero or more tools
+                        # strict=True, # model output will be guaranteed to match the schema
+                        # include_raw=True # model response (JSON e.g.) and the parsed response (Pydantic e.g.) will be returned
+                    )
+        else: 
+            model = ChatOpenAI(
+                model = model_name,
+                base_url = base_url,
+                temperature=0.1,
+                top_p=0.1,
+                api_key = api_key,
+            )
+            model = model.with_structured_output(schema=response_format)
+
     if model_provider == "TOGETHER":
         if response_format is None:
             model = ChatTogether(

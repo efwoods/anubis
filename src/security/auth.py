@@ -58,6 +58,8 @@ def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
+
+
 async def update_assistant_config(hashed_api_key: str, 
                                   provider_encoded_user_id: str, 
                                   assistant_config: dict, 
@@ -512,43 +514,44 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
 
         customer_id = current_user['app_metadata'].get('customer', {}).get('id', "")
 
-        # delete customer information
-        stripe = request.app.state.stripe
-        try:
-            deleted = stripe.Customer.delete(customer_id)
-            if deleted.get("deleted", False) is not True:
-                raise HTTPException(detail="Error deleting customer account.", status_code=500)      
-        except stripe.error.CardError as e:
-          # A declined card error
-          print('Status: %s' % e.http_status)
-          print('Code: %s' % e.code)
-          if e.param:
-            print('Param: %s' % e.param)
-          print('Message: %s' % e.user_message)
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.RateLimitError as e:
-          # Too many requests made to the API too quickly
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.InvalidRequestError as e:
-          # Invalid parameters were supplied to Stripe's API
-          print('Message: %s' % e.user_message)
-          if e.param:
-            print('Param: %s' % e.param)
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.AuthenticationError as e:
-          # Authentication with Stripe's API failed
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.APIConnectionError as e:
-          # Network communication with Stripe failed
-          print('Request ID: %s' % e.request_id)
-        except stripe.error.StripeError as e:
-          # All other Stripe errors
-          print('Status: %s' % e.http_status)
-          print('Code: %s' % e.code)
-          print('Message: %s' % e.user_message)
-          print('Request ID: %s' % e.request_id)
-        except Exception as e:
-          raise HTTPException(detail="Error deleting customer account.", status_code=500)
+        if customer_id and customer_id is not "":
+            # delete customer information
+            stripe = request.app.state.stripe
+            try:
+                deleted = stripe.Customer.delete(customer_id)
+                if deleted.get("deleted", False) is not True:
+                    raise HTTPException(detail="Error deleting customer account.", status_code=500)      
+            except stripe.error.CardError as e:
+              # A declined card error
+              print('Status: %s' % e.http_status)
+              print('Code: %s' % e.code)
+              if e.param:
+                print('Param: %s' % e.param)
+              print('Message: %s' % e.user_message)
+              print('Request ID: %s' % e.request_id)
+            except stripe.error.RateLimitError as e:
+              # Too many requests made to the API too quickly
+              print('Request ID: %s' % e.request_id)
+            except stripe.error.InvalidRequestError as e:
+              # Invalid parameters were supplied to Stripe's API
+              print('Message: %s' % e.user_message)
+              if e.param:
+                print('Param: %s' % e.param)
+              print('Request ID: %s' % e.request_id)
+            except stripe.error.AuthenticationError as e:
+              # Authentication with Stripe's API failed
+              print('Request ID: %s' % e.request_id)
+            except stripe.error.APIConnectionError as e:
+              # Network communication with Stripe failed
+              print('Request ID: %s' % e.request_id)
+            except stripe.error.StripeError as e:
+              # All other Stripe errors
+              print('Status: %s' % e.http_status)
+              print('Code: %s' % e.code)
+              print('Message: %s' % e.user_message)
+              print('Request ID: %s' % e.request_id)
+            except Exception as e:
+              raise HTTPException(detail="Error deleting customer account.", status_code=500)
 
         # retrieve all avatar ids created by the user:
         from langgraph_sdk import get_client
@@ -581,22 +584,26 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         try:
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute(SQL_STORE_DELETE_QUERY, (user_id, ))
-                    await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, (user_id, ))
+                    await cur.execute(SQL_STORE_DELETE_QUERY, params)
+                    await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
         except Exception as e:
             raise HTTPException(detail="Error deleting items from store and store vectors during delete user.")
 
-        # Delete the login information of the user
+        # # Delete the login information of the user
+        headers = await _mgmt_headers(request)
         response = await retry_async_httpx_request(method="DELETE", url=f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}", headers = headers)
-
+        # response = await 
+        # auth0_client = request.app.state.httpx_client
+        # response = await auth0_client.delete(url=f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}")
+        #  headers=headers
         response.raise_for_status()
         if response.status_code == 204:
             del _api_key_cache[api_key_hash]
             return {"message":"User deleted"}
         else:
-            raise HTTPException(status_code=response.status_code, detail=f"Error deleting user: {e}")
+            raise HTTPException(status_code=500, detail=f"Error deleting user: {e}")
     except Exception as e:
-        raise HTTPException(status_code=response.status_code, detail=f"Error deleting user: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting user: {e}")
 
 # @security_route.post("/login")
 # async def login(body: LoginRequest, request: Request):
@@ -666,6 +673,103 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
 #         return {"message": "Logged out successfully"}
 #     except Exception as e:
 #         raise HTTPException(detail = response.json(), status_code=response.status_code)
+
+
+
+import pandas as pd
+import stripe
+from datetime import datetime, timezone
+
+from dataclasses import dataclass
+from typing import Literal
+@dataclass
+class SubscriptionStatus:
+    status: str = None
+    subscription_id: str = None
+    customer_id: str = None
+    email: str = None
+    last_updated: str = None
+
+    def to_dict(self):
+        return {
+            "status": self.status, 
+            "subscription_id": self.subscription_id, 
+            "customer_id": self.customer_id, 
+            "email":self.email
+        }
+    
+    def update(self, field: Literal["status", "subscription_id", "customer_id", "email", "last_updated"], value):
+        match field:
+            case "status":
+                self.status = value
+            case "subscription_id":
+                self.subscription_id = value
+            case "customer_id":
+                self.customer_id = value
+            case "email":
+                self.email = value
+            case "last_updated":
+                self.last_updated = value
+        return self.to_dict()
+
+
+
+async def check_subscription_status(request: Request, current_user: dict) -> dict:
+    stripe_client = request.app.state.stripe
+    subscription_status = current_user['app_metadata'].get("subscription_status", None)
+    email = current_user.get("email")
+    if not subscription_status:
+        # Identify Customer from email
+        customer_df = pd.DataFrame(stripe_client.Customer.list().to_dict()['data'])
+        customer_id_series = customer_df[customer_df['email']==email]['id'].values
+        if len(customer_id_series) != 0:
+            customer_id = customer_id_series[0]
+        else: 
+            # Customer is not subscribed
+            customer_subscription_status = SubscriptionStatus()
+            return customer_subscription_status.to_dict()
+
+        subscription_df = pd.DataFrame(stripe_client.Subscription.list().to_dict()['data'])
+        customer_subscription = subscription_df[subscription_df['customer'] == customer_id]
+        customer_subscription_status = SubscriptionStatus()
+        if len(customer_subscription) != 0:
+            _ = customer_subscription_status.update('email', email)
+            _ = customer_subscription_status.update('subscription_id', customer_subscription.id.values[0])
+            _ = customer_subscription_status.update('customer_id', customer_id)
+            _ = customer_subscription_status.update('status', customer_subscription.status[0])
+            _ = customer_subscription_status.update('last_updated', datetime.now(tz=timezone.utc).isoformat())
+            # Update app_metadata
+            current_user['app_metadata']['subscription_stat s'] = customer_subscription_status.to_dict()
+            headers = await _mgmt_headers(request)
+            
+            payload = {
+                "app_metadata": current_user['app_metadata']
+            }
+
+            provider_encoded_user_id = quote(current_user['user_id'], safe="")
+            try:
+                response = await retry_async_httpx_request(method="PATCH", url=f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}", headers = headers, json=payload)
+
+                response.raise_for_status()
+            except Exception as e:
+                raise HTTPException(detail="Error checking subscription status.", status_code=500)
+    else: 
+        customer_subscription_status = SubscriptionStatus(
+            email=subscription_status['email'], 
+            subscription_id=subscription_status['subscription_id'], 
+            customer_id = subscription_status['customer_id'])
+    
+        try:
+            subscription = stripe.Subscription.retrieve(id=subscription_status['subscription_id'])
+            customer_subscription_status.update('status', subscription.to_dict().get("status", None))
+            customer_subscription_status.update('last_updated',datetime.now(tz=timezone.utc).isoformat())
+        except Exception as e:
+            customer_subscription_status.update('status', subscription_status['status'])
+
+    return customer_subscription_status.to_dict()
+
+    
+    
 
 @auth.authenticate
 async def authenticate(request: Request, authorization: str ) -> dict:

@@ -17,7 +17,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                tools=[], 
                tool_choice: str = "auto", 
                response_format = None, 
-               image_model: Optional[bool] = False
+               image_model: Optional[bool] = False, 
+               model_without_tools: Optional[bool] = False
                ):
     
     context = GlobalContext()
@@ -33,6 +34,11 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
     logger.info(f"model_name: {model_name}")
 
     # from langchain_openai import ChatOpenAI
+    if model_without_tools:
+        if response_format is None:
+            model = AsyncLlamaAPIClientWrapper()
+        else:
+            model = AsyncLlamaAPIClientWrapper(response_format=response_format)
 
     if model_provider == "TOGETHER":
         if response_format is None:
@@ -154,3 +160,66 @@ def init_image_description_model():
     #                     api_key = api_key,
     #                 )
     return model
+
+from llama_api_client import AsyncLlamaAPIClient
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from typing import List, Any
+from typing import Literal
+from pydantic import BaseModel, field_validator, Field
+from typing import Optional
+class AsyncLlamaAPIClientWrapper:
+    def __init__(self, response_format = None):
+        context = GlobalContext()
+        self.llama_api_key = context.llama_api_key
+        pydantic_model = response_format
+
+    async def ainvoke(self, messages: List[Literal[HumanMessage, SystemMessage, AIMessage]]):
+      """ Accept a list of langchain messages and a pydantic_model 
+      and formats the messages for use as a model 
+      with structured output for analysis 
+      or returns an AI message 
+      if no pydantic model is accepted
+      """
+      client = AsyncLlamaAPIClient(api_key=self.llama_api_key)
+      class LlamaMessage(BaseModel):
+          role: Literal["human","user", "system", "assistant"] = Field(validation_alias="type")
+          content: str
+
+          @field_validator('role', mode="before")
+          @classmethod
+          def map_role(cls, value: str) -> str:
+              mapping = {"human": "user", "user":"user", "system":"system", "assistant":"assistant"}
+              return mapping.get(value, "user")
+
+      formatted_messages = [(LlamaMessage.model_validate(message.model_dump()).model_dump()) for message in messages]
+      if self.pydantic_model is not None:
+        response = await client.chat.completions.create(
+            messages=formatted_messages,
+            model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+            stream=False,
+            temperature=0.1,
+            # max_completion_tokens=4096,
+            top_p=0.1,
+            repetition_penalty=1,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": self.pydantic_model.__name__,
+                    "schema": self.pydantic_model.model_json_schema()
+                }
+            }
+        )
+        return self.pydantic_model.model_validate_json(response.completion_message.content.text)
+    
+      else:
+        response = await client.chat.completions.create(
+              messages=formatted_messages,
+              model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+              stream=False,
+              temperature=0.1,
+              max_completion_tokens=16000,
+              top_p=0.1,
+              repetition_penalty=1,
+          )
+        return AIMessage(content=response.completion_message.content.text)
+     

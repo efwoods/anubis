@@ -60,4 +60,3 @@ if __name__ == "__main__":
     subprocess.run([f"{UPDATE_COMMAND}"], text=True, shell=True)
     subprocess.run([f"rm {progress_file_path}"], text=True, shell=True)
     print(f"{update_response}")
-    

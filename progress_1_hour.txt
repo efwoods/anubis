@@ -1,0 +1,504 @@
+diff --git a/hourly_progress.py b/hourly_progress.py
+index cde675b..05a9f00 100644
+--- a/hourly_progress.py
++++ b/hourly_progress.py
+@@ -59,5 +59,4 @@ if __name__ == "__main__":
+     print(f"\n\n")
+     subprocess.run([f"{UPDATE_COMMAND}"], text=True, shell=True)
+     subprocess.run([f"rm {progress_file_path}"], text=True, shell=True)
+-    print(f"{update_response}")
+-    
++    print(f"{update_response}")
+\ No newline at end of file
+diff --git a/src/anubis/graph.py b/src/anubis/graph.py
+index 5d05c1e..074d9bb 100644
+--- a/src/anubis/graph.py
++++ b/src/anubis/graph.py
+@@ -167,7 +167,7 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
+ """
+ 
+     system_message = SystemMessage(content = TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT.format(terms_of_service=TERMS_OF_SERVICE, privacy_policy = PRIVACY_POLICY))
+-    model_with_structured_output = init_model(context=GlobalContext, response_format=TermsAndServicesContentModeration)
++    model_with_structured_output = init_model(model_without_tools=True, response_format=TermsAndServicesContentModeration)
+ 
+     chat_prompt_template = [system_message] + [message]
+ 
+@@ -194,6 +194,29 @@ async def think(state: GlobalState, config: RunnableConfig, runtime: Runtime[Glo
+     # logger.info(f"breakpoint")
+     messages = state['system_message'] + state['messages'] + state['internal_thoughts']
+ 
++    approximate_model_tokens = count_tokens_approximately(messages)
++    if approximate_model_tokens > 7000:
++        from langchain.agents import create_agent
++        from langchain.agents.middleware import SummarizationMiddleware
++
++        avatar_model = init_model(
++            context = runtime.context,
++        )
++        avatar = create_agent(model=avatar_model, 
++            middleware=[
++                SummarizationMiddleware(
++                    model=avatar_model,
++                    trigger={"tokens": 4000},
++                    keep={"messages": 20},
++                ),
++            ],
++            state_schema=GlobalState,
++        )
++        response = await avatar.ainvoke(input={"messages": messages})
++        summarized_messages = response.get("messages", [])[:-2]
++        # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
++        messages = summarized_messages
++
+     response = await avatar_model_with_tools.ainvoke(input=messages)
+     avatar_response_content = getattr(response, 'content')
+     logger.info(f"Avatar Model Response: {avatar_response_content}")
+@@ -258,24 +281,28 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
+ 
+     """ CREATE MODEL """
+ 
+-    avatar_model = init_model(
+-        context = runtime.context,
+-    )
+ 
+-    avatar = create_agent(model=avatar_model, tools=[
+-            # learn_information_about_the_user, 
+-            # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+-            # recall_memories, 
+-            # create_episodic_memory
+-            ],
+-            state_schema=GlobalState,
+-            )
++    """ Agent Implementation """
++    # avatar_model = init_model(
++    #     context = runtime.context,
++    # )
++
++    # avatar = create_agent(model=avatar_model, tools=[
++    #         ],
++    #         state_schema=GlobalState,
++    #         )
+ 
+     messages = state['system_message'] + state['messages']
+-    response = await avatar.ainvoke(input={"messages": messages})
+-    avatar_response = response.get("messages", [])[-1]
++
++    avatar_model = init_model(model_without_tools=True)
++    avatar_response = await avatar_model.ainvoke(messages)
+ 
+     logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
++
++    # response = await avatar.ainvoke(input={"messages": messages})
++    # avatar_response = response.get("messages", [])[-1]
++    # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
++
+     result = {"messages": [avatar_response]}
+ 
+     return result
+diff --git a/src/anubis/utils/analysis/analysis_methods.py b/src/anubis/utils/analysis/analysis_methods.py
+index 520fd86..26cb885 100644
+--- a/src/anubis/utils/analysis/analysis_methods.py
++++ b/src/anubis/utils/analysis/analysis_methods.py
+@@ -30,11 +30,11 @@ async def perform_ocean_analysis(human_message: HumanMessage, additional_metadat
+ 
+     logger.info("breakpoint")
+ 
+-    openness_model_ocean_analysis = init_model(response_format=OPENNESS_OCEAN_ANALYSIS_EXTRACTION)
+-    conscientiousness_model_ocean_analysis = init_model(response_format=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_EXTRACTION)
+-    extraversion_model_ocean_analysis = init_model(response_format=EXTRAVERSION_OCEAN_ANALYSIS_EXTRACTION)
+-    agreeableness_model_ocean_analysis = init_model(response_format=AGREEABLENESS_OCEAN_ANALYSIS_EXTRACTION)
+-    neuroticism_model_ocean_analysis = init_model(response_format=NEUROTICISM_OCEAN_ANALYSIS_EXTRACTION)
++    openness_model_ocean_analysis = init_model(model_without_tools=True, response_format=OPENNESS_OCEAN_ANALYSIS_EXTRACTION)
++    conscientiousness_model_ocean_analysis = init_model(model_without_tools=True, response_format=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_EXTRACTION)
++    extraversion_model_ocean_analysis = init_model(model_without_tools=True, response_format=EXTRAVERSION_OCEAN_ANALYSIS_EXTRACTION)
++    agreeableness_model_ocean_analysis = init_model(model_without_tools=True, response_format=AGREEABLENESS_OCEAN_ANALYSIS_EXTRACTION)
++    neuroticism_model_ocean_analysis = init_model(model_without_tools=True, response_format=NEUROTICISM_OCEAN_ANALYSIS_EXTRACTION)
+ 
+     openness_ocean_analysis_prompt = SystemMessage(content=OPENNESS_OCEAN_ANALYSIS_PROMPT)
+     conscientiousness_ocean_analysis_prompt = SystemMessage(content=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_PROMPT)
+diff --git a/src/anubis/utils/context.py b/src/anubis/utils/context.py
+index ea20025..d8f4e52 100644
+--- a/src/anubis/utils/context.py
++++ b/src/anubis/utils/context.py
+@@ -237,6 +237,11 @@ class GlobalContext:
+         metadata={"description": "Model inference provider."}
+     )
+ 
++    llama_api_key: str = field(
++        default = None, 
++        metadata={"description": "LLama developer api key."}
++    )
++
+     def __post_init__(self):
+         """Fetch env vars for attributes that were not passed as args."""
+         for f in fields(self):
+diff --git a/src/anubis/utils/dataset/formatting.py b/src/anubis/utils/dataset/formatting.py
+index 08334ca..84c1e42 100644
+--- a/src/anubis/utils/dataset/formatting.py
++++ b/src/anubis/utils/dataset/formatting.py
+@@ -50,7 +50,7 @@ async def create_question_list(str_messages_list: list[str]) -> List[str]:
+ 
+     human_messages_list = [HumanMessage(content=message_str) for message_str in str_messages_list]
+ 
+-    model_with_structured_output = init_model(response_format= GeneratedQuestionsList)
++    model_with_structured_output = init_model(model_without_tools=True, response_format= GeneratedQuestionsList)
+ 
+     system_message = SystemMessage(content="Given this list of messages, generate a query to which the message is the response. THERE MUST BE A QUESTION FOR RESPONSE AND THE QUESTION ORDER IN THE LIST MUST MATCH THE RESPONSE ORDER. These questions must be succinct.")
+     
+diff --git a/src/anubis/utils/model.py b/src/anubis/utils/model.py
+index ddea280..578088c 100644
+--- a/src/anubis/utils/model.py
++++ b/src/anubis/utils/model.py
+@@ -17,7 +17,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
+                tools=[], 
+                tool_choice: str = "auto", 
+                response_format = None, 
+-               image_model: Optional[bool] = False
++               image_model: Optional[bool] = False, 
++               model_without_tools: Optional[bool] = False
+                ):
+     
+     context = GlobalContext()
+@@ -33,6 +34,11 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
+     logger.info(f"model_name: {model_name}")
+ 
+     # from langchain_openai import ChatOpenAI
++    if model_without_tools:
++        if response_format is None:
++            model = AsyncLlamaAPIClientWrapper()
++        else:
++            model = AsyncLlamaAPIClientWrapper(response_format=response_format)
+ 
+     if model_provider == "TOGETHER":
+         if response_format is None:
+@@ -153,4 +159,67 @@ def init_image_description_model():
+     #                     top_p=0.1,
+     #                     api_key = api_key,
+     #                 )
+-    return model
+\ No newline at end of file
++    return model
++
++from llama_api_client import AsyncLlamaAPIClient
++from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
++from typing import List, Any
++from typing import Literal
++from pydantic import BaseModel, field_validator, Field
++from typing import Optional
++class AsyncLlamaAPIClientWrapper:
++    def __init__(self, response_format = None):
++        context = GlobalContext()
++        self.llama_api_key = context.llama_api_key
++        pydantic_model = response_format
++
++    async def ainvoke(self, messages: List[Literal[HumanMessage, SystemMessage, AIMessage]]):
++      """ Accept a list of langchain messages and a pydantic_model 
++      and formats the messages for use as a model 
++      with structured output for analysis 
++      or returns an AI message 
++      if no pydantic model is accepted
++      """
++      client = AsyncLlamaAPIClient(api_key=self.llama_api_key)
++      class LlamaMessage(BaseModel):
++          role: Literal["human","user", "system", "assistant"] = Field(validation_alias="type")
++          content: str
++
++          @field_validator('role', mode="before")
++          @classmethod
++          def map_role(cls, value: str) -> str:
++              mapping = {"human": "user", "user":"user", "system":"system", "assistant":"assistant"}
++              return mapping.get(value, "user")
++
++      formatted_messages = [(LlamaMessage.model_validate(message.model_dump()).model_dump()) for message in messages]
++      if self.pydantic_model is not None:
++        response = await client.chat.completions.create(
++            messages=formatted_messages,
++            model="Llama-4-Maverick-17B-128E-Instruct-FP8",
++            stream=False,
++            temperature=0.1,
++            # max_completion_tokens=4096,
++            top_p=0.1,
++            repetition_penalty=1,
++            response_format={
++                "type": "json_schema",
++                "json_schema": {
++                    "name": self.pydantic_model.__name__,
++                    "schema": self.pydantic_model.model_json_schema()
++                }
++            }
++        )
++        return self.pydantic_model.model_validate_json(response.completion_message.content.text)
++    
++      else:
++        response = await client.chat.completions.create(
++              messages=formatted_messages,
++              model="Llama-4-Maverick-17B-128E-Instruct-FP8",
++              stream=False,
++              temperature=0.1,
++              max_completion_tokens=16000,
++              top_p=0.1,
++              repetition_penalty=1,
++          )
++        return AIMessage(content=response.completion_message.content.text)
++     
+\ No newline at end of file
+diff --git a/src/anubis/utils/prompts/system_prompts.py b/src/anubis/utils/prompts/system_prompts.py
+index 341c815..f852299 100644
+--- a/src/anubis/utils/prompts/system_prompts.py
++++ b/src/anubis/utils/prompts/system_prompts.py
+@@ -125,109 +125,6 @@ CREATE A RESPONSE IN YOUR TONE OF VOICE AND SYTLE OF WRITING GIVEN EXAMPLES OF Y
+ </INSTRUCTIONS>
+ """ 
+ 
+-MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES = """
+-<Role>
+-Your role is to analyze and classify text with respect to the situation of the content within the text.
+-</Role>
+-
+-<Instructions>
+-Your objective is the following:
+-Classify the text and decide whether the text contains one of the following situations:
+-- A Monologue or Presentation from a single speaker
+-- Series of Distinct Quotes or Statements from a single speaker
+-</Instructions>
+-
+-<Rules>
+-=========== MONOLOGUE OR PRESENTATION ===========
+-
+-Use the following rules to help determine the situation of the given text for single speaker situations:
+-
+-Classify the text as a monologue or presentation given text in the following situation:
+-- There is a large group of text with a fluid train of thought.
+-- there is a beginning, middle, and end to the entire body of thought.
+-- There is a thesis or central topic to the entire body of thought rather than individual lines each with unique topics.
+-- There is not strictly a list of single lines where each line is a distinct statement.
+-
+-=========== SERIES OF DISTINCT QUOTES ===========
+-
+-Use the following rules to help determine the situation of the given text for a series of distinct quotes or statements:
+-
+-Classify the text as strictly a series of distinct quotes or statements:
+-- The ideas are not contiuous between newlines
+-- There is not a fluid train of thought between statements
+-- Each line is irrelevant completely to the surrounding lines habitually
+-
+-Example Tweet or single speaker statement:
+-I believe that through the research and development of A.I., we will understand what is most valuable about being human.
+-</Rules>
+-"""
+-
+-
+-TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS = """
+-<Role>
+-Your role is to analyze and classify text with respect to the situation of the content within the text.
+-</Role>
+-
+-<Instructions>
+-Your objective is the following:
+-Classify the text and decide whether the text contains one of the following situations:
+-- A single speaker
+-- Strictly question and answer between two speakers in a dialogue
+-- Multiple speakers
+-- Other 
+-</Instructions>
+-
+-<Rules>
+-=========== SINGLE SPEAKER GUIDELINES FOLLOW ===========
+-
+-Use the following rules to help determine the situation of the given text for single speaker situations:
+-
+-Classify the text as a single speaker given text in the following situations:
+-- There is a single tweet
+-- There is a single statement
+-- There is a label of the speaker and there is only one speaker
+-- There is only a single speaker detected in the content
+-
+-Use the following examples to help determine the situation of the given text for single speaker situations:
+-
+-Example Tweet or single speaker statement:
+-I believe that through the research and development of A.I., we will understand what is most valuable about being human.
+-
+-=========== QUESTION AND ANSWER DIALOGUE GUIDELINES FOLLOW ===========
+-
+-Use the following rules to help determine the situation of the given text for question and answer dialogue situations:
+-
+-Classify the text as strictly question and answer between two speakers in a dialogue:
+-- There is more than one speaker but less than three speakers in the text
+-- There is turn-taking between two speakers
+-- There are labels of the speakers and there are only two speakers
+-
+-=========== MULITPLE SPEAKER GUIDELINES FOLLOW ===========
+-
+-Use the following rules to help determine the situation of the given text for multiple speaker situations:
+-
+-Classify the text as multiple speakrs:
+-- There is more than one speaker but less than three speakers in the text
+-- There is turn-taking between two speakers
+-- There are labels of the speakers and there are only two speakers
+-
+-=========== OTHER GUIDELINES FOLLOW ===========
+-
+-Use the following rules to help determine the situation of the given text for situations that do not appropriately match and of the situations for single speakers, question and answer dialogue, or multiple speakers. 
+-
+-Classify the text as other:
+-- The criteria for single speaker, question and answer dialogue, and multiple speakers do not apply
+-
+-Rules for classifying the situation of the text as Other:
+-- This should not often be used and is treated as an unclassified error and failure in analysis
+-- This should almost never be used
+-- There needs to be an explicit reason why this is classified as other, why the single speaker classification does not match, why the question and answer dialogue does not match, why the multiple speaker classification does not match, and each reason needs to be explicitly listed for each reason why the previous classifications did not match the criteria.
+-- There needs a suggested classification for this situation with an explicit reason why this new suggested classification appropriately classifies the situation of the text better than any of the other reasons.
+-- Try not to classify any situation of the text as Other.
+-</Rules>
+-"""
+-
+-
+ FACT_FORMATTING_STRING_PROMPT="""
+ <Instructions>
+ Extract and write the following as a list of facts only. 
+diff --git a/src/anubis/utils/schema.py b/src/anubis/utils/schema.py
+index d9bf121..e377e80 100644
+--- a/src/anubis/utils/schema.py
++++ b/src/anubis/utils/schema.py
+@@ -23,3 +23,108 @@ class MonologuePresentationOrSeriesOfQuotes(BaseModel):
+     classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
+     reason: str = Field()
+ 
++
++""" ASSOCIATED PROMPTS """
++
++MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES = """
++<Role>
++Your role is to analyze and classify text with respect to the situation of the content within the text.
++</Role>
++
++<Instructions>
++Your objective is the following:
++Classify the text and decide whether the text contains one of the following situations:
++- A Monologue or Presentation from a single speaker
++- Series of Distinct Quotes or Statements from a single speaker
++</Instructions>
++
++<Rules>
++=========== MONOLOGUE OR PRESENTATION ===========
++
++Use the following rules to help determine the situation of the given text for single speaker situations:
++
++Classify the text as a monologue or presentation given text in the following situation:
++- There is a large group of text with a fluid train of thought.
++- there is a beginning, middle, and end to the entire body of thought.
++- There is a thesis or central topic to the entire body of thought rather than individual lines each with unique topics.
++- There is not strictly a list of single lines where each line is a distinct statement.
++
++=========== SERIES OF DISTINCT QUOTES ===========
++
++Use the following rules to help determine the situation of the given text for a series of distinct quotes or statements:
++
++Classify the text as strictly a series of distinct quotes or statements:
++- The ideas are not contiuous between newlines
++- There is not a fluid train of thought between statements
++- Each line is irrelevant completely to the surrounding lines habitually
++
++Example Tweet or single speaker statement:
++I believe that through the research and development of A.I., we will understand what is most valuable about being human.
++</Rules>
++"""
++
++
++TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS = """
++<Role>
++Your role is to analyze and classify text with respect to the situation of the content within the text.
++</Role>
++
++<Instructions>
++Your objective is the following:
++Classify the text and decide whether the text contains one of the following situations:
++- A single speaker
++- Strictly question and answer between two speakers in a dialogue
++- Multiple speakers
++- Other 
++</Instructions>
++
++<Rules>
++=========== SINGLE SPEAKER GUIDELINES FOLLOW ===========
++
++Use the following rules to help determine the situation of the given text for single speaker situations:
++
++Classify the text as a single speaker given text in the following situations:
++- There is a single tweet
++- There is a single statement
++- There is a label of the speaker and there is only one speaker
++- There is only a single speaker detected in the content
++
++Use the following examples to help determine the situation of the given text for single speaker situations:
++
++Example Tweet or single speaker statement:
++I believe that through the research and development of A.I., we will understand what is most valuable about being human.
++
++=========== QUESTION AND ANSWER DIALOGUE GUIDELINES FOLLOW ===========
++
++Use the following rules to help determine the situation of the given text for question and answer dialogue situations:
++
++Classify the text as strictly question and answer between two speakers in a dialogue:
++- There is more than one speaker but less than three speakers in the text
++- There is turn-taking between two speakers
++- There are labels of the speakers and there are only two speakers
++
++=========== MULITPLE SPEAKER GUIDELINES FOLLOW ===========
++
++Use the following rules to help determine the situation of the given text for multiple speaker situations:
++
++Classify the text as multiple speakrs:
++- There is more than one speaker but less than three speakers in the text
++- There is turn-taking between two speakers
++- There are labels of the speakers and there are only two speakers
++
++=========== OTHER GUIDELINES FOLLOW ===========
++
++Use the following rules to help determine the situation of the given text for situations that do not appropriately match and of the situations for single speakers, question and answer dialogue, or multiple speakers. 
++
++Classify the text as other:
++- The criteria for single speaker, question and answer dialogue, and multiple speakers do not apply
++
++Rules for classifying the situation of the text as Other:
++- This should not often be used and is treated as an unclassified error and failure in analysis
++- This should almost never be used
++- There needs to be an explicit reason why this is classified as other, why the single speaker classification does not match, why the question and answer dialogue does not match, why the multiple speaker classification does not match, and each reason needs to be explicitly listed for each reason why the previous classifications did not match the criteria.
++- There needs a suggested classification for this situation with an explicit reason why this new suggested classification appropriately classifies the situation of the text better than any of the other reasons.
++- Try not to classify any situation of the text as Other.
++</Rules>
++"""
++
+diff --git a/src/subgraphs/process_media_graph/utils/helper_functions.py b/src/subgraphs/process_media_graph/utils/helper_functions.py
+index 2d416f4..1f7e1f2 100644
+--- a/src/subgraphs/process_media_graph/utils/helper_functions.py
++++ b/src/subgraphs/process_media_graph/utils/helper_functions.py
+@@ -71,9 +71,10 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item)
+                 description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
+             )
+         model_with_structured_output = init_model(
++            model_without_tools=True,
+             response_format=TextualSituationalAwareness
+         )
+-        from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
++        from src.anubis.utils.schema import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
+         from langchain_core.messages import SystemMessage, HumanMessage
+ 
+ 
+@@ -102,7 +103,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item)
+                 """ Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker. """
+                 classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
+                 reason: str = Field()
+-            monologue_vs_distinct_quotes_classification_model = init_model(response_format=MonologuePresentationOrSeriesOfQuotes)
++            monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=True, response_format=MonologuePresentationOrSeriesOfQuotes)
+ 
+             system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
+             input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
+@@ -406,6 +407,7 @@ async def process_text_media_item_target_for_vectorstore(
+             # Define meaningful chunks first
+ 
+             model_structured_output = init_model(
++                        model_without_tools=True,
+                         response_format=SemanticChunkIndexList
+             )
+ 

@@ -234,6 +234,7 @@ async def signup_user(email: str, password: str, request:Request, name: Optional
             "connection": CONNECTION,
             "app_metadata":{
                 "api_key": api_key_hash,
+                "customer_dict": customer_dict
             }
         }
 
@@ -568,7 +569,7 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
 
         # Delete all entries in the store and store vectors for the created avatars
         pool = request.app.state.pool
-        user_id = current_user.get("identities", {}).get("user_id")
+        user_id = current_user['identities'][0].get("user_id")
         SQL_STORE_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
         SQL_STORE_VECTOR_DELETE_QUERY="""DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;""" 
         params = (

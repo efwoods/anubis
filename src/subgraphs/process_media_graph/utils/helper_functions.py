@@ -71,9 +71,10 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                 description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
             )
         model_with_structured_output = init_model(
+            model_without_tools=True,
             response_format=TextualSituationalAwareness
         )
-        from src.anubis.utils.prompts.system_prompts import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
+        from src.anubis.utils.schema import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
         from langchain_core.messages import SystemMessage, HumanMessage
 
 
@@ -102,7 +103,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                 """ Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker. """
                 classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
                 reason: str = Field()
-            monologue_vs_distinct_quotes_classification_model = init_model(response_format=MonologuePresentationOrSeriesOfQuotes)
+            monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=True, response_format=MonologuePresentationOrSeriesOfQuotes)
 
             system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
             input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
@@ -406,6 +407,7 @@ async def process_text_media_item_target_for_vectorstore(
             # Define meaningful chunks first
 
             model_structured_output = init_model(
+                        model_without_tools=True,
                         response_format=SemanticChunkIndexList
             )
 

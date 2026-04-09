@@ -237,6 +237,11 @@ class GlobalContext:
         metadata={"description": "Model inference provider."}
     )
 
+    llama_api_key: str = field(
+        default = None, 
+        metadata={"description": "LLama developer api key."}
+    )
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
         for f in fields(self):

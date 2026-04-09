@@ -167,7 +167,7 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
 """
 
     system_message = SystemMessage(content = TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT.format(terms_of_service=TERMS_OF_SERVICE, privacy_policy = PRIVACY_POLICY))
-    model_with_structured_output = init_model(context=GlobalContext, response_format=TermsAndServicesContentModeration)
+    model_with_structured_output = init_model(model_without_tools=True, response_format=TermsAndServicesContentModeration)
 
     chat_prompt_template = [system_message] + [message]
 
@@ -258,24 +258,28 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
 
     """ CREATE MODEL """
 
-    avatar_model = init_model(
-        context = runtime.context,
-    )
 
-    avatar = create_agent(model=avatar_model, tools=[
-            # learn_information_about_the_user, 
-            # learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
-            # recall_memories, 
-            # create_episodic_memory
-            ],
-            state_schema=GlobalState,
-            )
+    """ Agent Implementation """
+    # avatar_model = init_model(
+    #     context = runtime.context,
+    # )
+
+    # avatar = create_agent(model=avatar_model, tools=[
+    #         ],
+    #         state_schema=GlobalState,
+    #         )
 
     messages = state['system_message'] + state['messages']
-    response = await avatar.ainvoke(input={"messages": messages})
-    avatar_response = response.get("messages", [])[-1]
+
+    avatar_model = init_model(model_without_tools=True)
+    avatar_response = await avatar_model.ainvoke(messages)
 
     logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+
+    # response = await avatar.ainvoke(input={"messages": messages})
+    # avatar_response = response.get("messages", [])[-1]
+    # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+
     result = {"messages": [avatar_response]}
 
     return result

@@ -1,6 +1,0 @@
-- Added a new CLI flag: `--mass_commit` (boolean).  
-- Updated the `system_message` strings in both branches (`not args.current` and `else`) to include the “If there are no changes, indicate that there are no changes.” instruction.  
-- Changed the commit/push behavior:
-  - If `--mass_commit` is set, it now runs `git add -A` and then commits using `-F progress_file_path`, followed by `git push`.
-  - Otherwise, it keeps the old behavior: `git commit --allow-empty -F progress_file_path && git push`.
-- Commented out the debug `print` statements for `UPDATE_COMMAND` (they’re no longer printed).

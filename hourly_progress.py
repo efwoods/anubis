@@ -53,8 +53,11 @@ if __name__ == "__main__":
         update_response = json.loads(response.content.decode('utf-8')).get("content")
         fp.close()
         update_response = update_response
-    update_response_str = update_response.replace("'", "'\"'\"'")
-    UPDATE_COMMAND = "git commit --allow-empty -m '" + update_response_str + "' && git push"
+    with open(progress_file_path, "w") as fp:
+        fp.write(update_response)
+    # update_response_str = update_response.replace("'", "'\"'\"'")
+    # UPDATE_COMMAND = "git commit --allow-empty -m '" + update_response_str + "' && git push"
+    UPDATE_COMMAND = "git commit --allow-empty -F '" + progress_file_path + "' && git push"
     print(f"{UPDATE_COMMAND}")
     print(f"\n\n")
     subprocess.run([f"{UPDATE_COMMAND}"], text=True, shell=True)

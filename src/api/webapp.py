@@ -49,11 +49,14 @@ from typing import Any
 from uuid import UUID
 
 from langgraph_sdk.schema import Assistant
+from typing import Annotated
+
 from psycopg.rows import class_row
 
 from urllib.parse import quote
     
 from src.security.auth import update_assistant_config
+from src.security.auth import check_subscription_status
 
 class ASSISTANT_QUERY(BaseModel):
     assistant_id: UUID
@@ -110,6 +113,9 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
             data = await cur.fetchall()
 
             return [assistant_query.to_assistant() for assistant_query in data]
+
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -189,34 +195,35 @@ async def subscribe(current_user: dict = Depends(get_current_user)):
     verified_email = current_user.get("email_verified", None)
     if not verified_email:
         raise HTTPException(detail="Please verify your email before subscribing.", status_code=401)
-    
-    return RedirectResponse(url=app.state.context.stripe_payment_url)
+    email = current_user.get("email")
+    user_id = current_user['app_metadata']['customer_dict']['id']
+    redirect_url = f"{app.state.context.stripe_payment_url}?client_reference_id={user_id}&locked_prefilled_email={email}"
 
-    # try: 
-    #     checkout_session = stripe.checkout.Session.create(
-    #         line_items=[
-    #             {
-    #                 # Provide the exact Price ID 
-    #                 'price': app.state.context.stripe_product_id
-    #             }
-    #         ], 
-    #         mode='subscription',
-    #         success_url="api.neuralnexus.site" + '?success=true',
-    #         automatic_tax={'enabled': True},
-    #     )
-    # except Exception as e:
-    #         return str(e)
-    # return RedirectResponse(url=checkout_session.url, code=303)
+    return {
+        "url" : redirect_url, 
+        "message":"Follow this link to subscribe."
+    }
 
+@app.get("/manage_subscription")
+async def manage_subscription(current_user: dict = Depends(get_current_user)):
+    return {
+        "url" : "https://billing.stripe.com/p/login/eVq28s6XA53C5XpdqH1oI00", 
+        "message":"Follow this link to manage your subscription."
+    }
 
+@app.get("/cancel_subscription")
+async def cancel_subscription(current_user: dict = Depends(get_current_user)):
+    return {
+        "url" : "https://billing.stripe.com/p/login/eVq28s6XA53C5XpdqH1oI00", 
+        "message":"Follow this link to manage and cancel your subscription."
+    }
 
-@app.post("/unsubscribe")
-async def unsubscribe():
-    """
-    Cancel a monthly subscription.
-    """
-
-
+@app.get("/verify_subscription_status")
+async def verify_subscription_status(request: Request, current_user: dict = Depends(get_current_user)):
+    status = await check_subscription_status(request=request, current_user=current_user)
+    if status['status'] == None:
+        return {"subscription_status:" "Not Subscribed"}
+    return status
 
 # shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
 # test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
@@ -663,8 +670,6 @@ async def message(
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
-from typing import Annotated
-
 @app.post("/chat")
 async def chat(
     response: Response,    
@@ -734,7 +739,6 @@ async def chat(
     response["response_metadata"] = result['messages'][-1].response_metadata
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
-
 
 @app.post("/upload_media_file")
 async def upload_media_file(

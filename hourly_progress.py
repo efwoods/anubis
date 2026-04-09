@@ -12,6 +12,7 @@ if __name__ == "__main__":
     # parser.add_argument("--repo_abs_path", nargs="?", help="Optional path to root of the git directory. Otherwise the cwd is used for git commit history.")
     parser.add_argument("--NN_API_KEY", nargs="?", help="Optional path to input file")
     parser.add_argument("--current", help="Logs current updates since the last commit", action="store_true")
+    parser.add_argument("--mass_commit", help="non-empty commit message including all files and changes", action="store_true")
     args = parser.parse_args()
 
     API_KEY = os.environ.get("NN_API_KEY")
@@ -35,10 +36,10 @@ if __name__ == "__main__":
     subprocess.run(f"git diff HEAD > progress_1_hour.txt", shell=True, text=True)
     if not args.current:
         print("Reviewing hourly progress...")
-        system_message = "<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. Do not include information that was not listed in the git diff:</INSTRUCTIONS>Please describe what has been changed since the last commit from the following text:"
+        system_message = "<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed within the last hour from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. If there are no changes, indicate that there are no changes. Do not ask for follow up information as you are immediately posting an update. Do not talk about anything other than then changes to the code.  Do not include information that was not listed in the git diff:</INSTRUCTIONS>Please describe what has been changed since the last commit from the following text:"
     else:
         print("Reviewing progress...")
-        system_message = """<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed since the last commit from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. Do not include information that was not listed in the git diff:</INSTRUCTIONS>Please describe what has been changed since the last commit from the following text:"""
+        system_message = """<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed since the last commit from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. If there are no changes, indicate that there are no changes. Do not ask for follow up information as you are immediately posting an update. Do not talk about anything other than then changes to the code. Do not include information that was not listed in the git diff:</INSTRUCTIONS>Please describe what has been changed since the last commit from the following text:"""
     with open(progress_file_path, 'rb') as fp:
         response = httpx.post(url="http://localhost:8123/chat",
             headers={
@@ -57,9 +58,12 @@ if __name__ == "__main__":
         fp.write(update_response)
     # update_response_str = update_response.replace("'", "'\"'\"'")
     # UPDATE_COMMAND = "git commit --allow-empty -m '" + update_response_str + "' && git push"
-    UPDATE_COMMAND = "git commit --allow-empty -F '" + progress_file_path + "' && git push"
-    print(f"{UPDATE_COMMAND}")
-    print(f"\n\n")
+    if args.mass_commit:
+        UPDATE_COMMAND = "git add -A && git commit -F '" + progress_file_path + "' && git push"
+    else:
+        UPDATE_COMMAND = "git commit --allow-empty -F '" + progress_file_path + "' && git push"
+    # print(f"{UPDATE_COMMAND}")
+    # print(f"\n\n")
     subprocess.run([f"{UPDATE_COMMAND}"], text=True, shell=True)
     subprocess.run([f"rm {progress_file_path}"], text=True, shell=True)
     print(f"{update_response}")

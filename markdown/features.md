@@ -68,7 +68,7 @@ OCR for images of handwritten documents to text
     Anonymous user 
     query committed endpoint 
     ip is returned for anonymous user
-    New anonymous user is created w/ pull stored in db per ip for suggestions
+    New anonymous user is created w/ preferences stored in db per ip for suggestions
     Slim image for the container inference
     RAG for Menu w/ initial suggestion from previous messages
     studio UI
@@ -93,6 +93,7 @@ OCR for images of handwritten documents to text
     high quality retrieval and indexing 
     high retrieval scores during vector query
 
+
     # Important Z:
     Continuous Learn & improve from
         User interactions (positive sentiment continued
@@ -105,5 +106,12 @@ OCR for images of handwritten documents to text
     Learn preferences personalization and communication styles
     working w/ authorities
     
+    focus on quality 
+    persistent memory and relationships    
     
-    
+    write emails
+    describe images
+    send texts
+    subscribe to channels for updates from social media
+
+# URL facts need to be rewritten and stored in a db to prevent copyright violations

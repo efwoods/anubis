@@ -232,7 +232,7 @@ async def verify_subscription_status(request: Request, current_user: dict = Depe
 async def create_avatar(
     name: str, 
     description: Optional[str] = None,
-    is_public: Optional[bool] = False,
+    is_public: bool = False,
     # is_self_avatar: Optional[bool] = False,
     current_user: dict = Depends(get_current_user),
     ):
@@ -288,13 +288,14 @@ async def share_avatar(
 ):
     context = app.state.context
     user_id = current_user['identities'][0]['user_id']
-    if ((user_id is context.admin_user_id)):
+
+    if ((user_id == context.admin_user_id)):
             """ verify users are creating avatars of their own likeness in the future"""
             metadata = {"is_public": is_public}
 
     # Only admins may share avatars; 
     # Users will authenticate and share avatars in the near future.
-    if user_id is context.admin_user_id:
+    if user_id == context.admin_user_id:
         try:
             token = current_user['API_KEY']
             client = get_client(headers={"Authorization": f"Bearer {token}"})
@@ -740,8 +741,8 @@ async def chat(
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
-@app.post("/upload_media_file")
-async def upload_media_file(
+@app.post("/test_upload_media_file")
+async def test_upload_media_file(
     files: List[UploadFile] = File(...),
     reference_audio: bool = False,
     reference_image: bool = False, 
@@ -786,7 +787,9 @@ async def upload_media_file(
 
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
-    files: List[UploadFile] = File(...),
+    files: Optional[List[UploadFile]] = File(...),
+    url: Optional[str] = None,
+    assistant_id: str = None,
     reference_audio: bool = False,
     reference_image: bool = False, 
     proprietary_content: bool = False, 
@@ -804,8 +807,11 @@ async def update_avatar_identity_with_media(
     try:
 
         user_id = current_user['identities'][0]['user_id']
-        assitant_config = current_user['app_metadata']['assistant_config']
-        assistant_id = assitant_config['configurable']['assistant_id']
+
+        # assitant_config = current_user['app_metadata']['assistant_config']
+        # assistant_id = assitant_config['configurable']['assistant_id']  
+        # config['configurable'].update(assitant_config['configurable'])
+        
         config = {
             "configurable": {
                 "user_id": user_id,
@@ -813,8 +819,8 @@ async def update_avatar_identity_with_media(
             }
         }
 
-        config['configurable'].update(assitant_config['configurable'])
-
+        config['configurable']['assistant_id'] = assistant_id
+        config['configurable']['assistant_ctx'] = {"name":None, "description": None},
         # Read all uploaded files
         media_files = []
         for file in files:
@@ -874,6 +880,9 @@ async def update_avatar_identity_with_media(
             )
     
     except Exception as e:
+        # if type(e) is KeyError and e.args[0] == 'assistant_config':
+            # raise HTTPException(status_code=400, detail=f"Please select an avatar to upload media to before uploading media.")
+
         raise HTTPException(
             status_code=500,
             detail=f"Error processing media: {str(e)}"

@@ -29,6 +29,12 @@ from typing import Literal
 from pydantic import Field
 from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
 
+from src.anubis.utils.schema import (TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES, NON_PII_DOCUMENT)
+from src.anubis.utils.schema import (TextualSituationalAwareness, MonologuePresentationOrSeriesOfQuotes, ProprietaryContentClassification)
+
+from langchain_core.messages import SystemMessage, HumanMessage
+
+
 # Process TEXT TO DOCUMENT
 async def process_text_to_document(metadata, user_id, assistant_id, media_item) -> list[Document]:
     """ Process text to document; 
@@ -39,13 +45,18 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
     logger.info(f"Handling text in process media")
     
     proprietary_content = metadata.get("proprietary_content", False)
+
+    proprietary_content_classification_model = init_model(model_without_tools=True, response_format=ProprietaryContentClassification)
+    text_content = media_item.get("content", "")
     
-    if proprietary_content:
-        logger.info(f"proprietary content: No single target; media is only uploaded to vectorstore")
+    classification = await proprietary_content_classification_model.ainvoke([SystemMessage(content=NON_PII_DOCUMENT), HumanMessage(content=text_content[:5000])])
+    # if proprietary_content:
+    if classification.non_personally_identifiable_information:
+        logger.warning(f"proprietary content: No single target; media is only uploaded to vectorstore")
         
         classification_metadata = {
             "classified_situation": "proprietary content",
-            "classification_reasoning": "user_selected_classification_of_proprietary_content"
+            "classification_reasoning": classification.reasoning
         }
         
         documents = await process_text_media_item_target_for_vectorstore(
@@ -65,23 +76,17 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
         
         # Analyze text situation
 
-        class TextualSituationalAwareness(BaseModel):
-            classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
-            reasoning: str = Field(
-                description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
-            )
+        
         model_with_structured_output = init_model(
             model_without_tools=True,
             response_format=TextualSituationalAwareness
         )
-        from src.anubis.utils.schema import TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
-        from langchain_core.messages import SystemMessage, HumanMessage
+        
 
 
         system_prompt = TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS
-        text_content = media_item.get("content", "")
         
-        classification = await model_with_structured_output.ainvoke(input=[
+        classification = await model_with_structured_output.ainvoke([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text_content}
         ])
@@ -99,16 +104,12 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             # is this content written in first person or is this content about the individual?
             # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
 
-            class MonologuePresentationOrSeriesOfQuotes(BaseModel):          
-                """ Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker. """
-                classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
-                reason: str = Field()
             monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=True, response_format=MonologuePresentationOrSeriesOfQuotes)
 
             system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
             input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
 
-            response = await monologue_vs_distinct_quotes_classification_model.ainvoke(input=input)
+            response = await monologue_vs_distinct_quotes_classification_model.ainvoke(input)
             classification_metadata = { 
                 "classified_situation": response.classified_situation,  "classification_reasoning": response.reason
             }
@@ -221,7 +222,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
                     user_id=user_id, 
                     assistant_id=assistant_id,
                     classification_metadata=classification_metadata,
-                    use_semantic_chunks=True
+                    use_semantic_chunks=False
                 )
                 for document in documents: 
                     document.metadata.update({"vectorstore_acceptable": True})
@@ -277,8 +278,8 @@ Text chunking module for processing large text files into Documents
 for LangGraph-MongoDB vectorstore with all-MiniLM-L6-v2 embeddings (384 dimensions)
 """
 
-@dataclass
-class SemanticChunkIndexList:
+from pydantic import BaseModel
+class SemanticChunkIndexList(BaseModel):
     index: list[int]
 
 async def split_text_into_chunks(
@@ -342,7 +343,7 @@ async def process_text_media_item_target_for_vectorstore(
     chunk_overlap: int = 25,
     separators: Optional[List[str]] = None,
     classification_metadata: Optional[dict] = None,
-    use_semantic_chunks: bool = True
+    use_semantic_chunks: bool = False
 ) -> List[Document]:
     """
     USAGE README: 
@@ -479,7 +480,7 @@ async def process_text_media_item_target_for_vectorstore(
 
             formatted_system_prompt = SEMANTICALLY_CHUNK_TEXT_SYSTEM_PROMPT.format(chunk_size=chunk_size)
 
-            model_result = await model_structured_output.ainvoke(input=[
+            model_result = await model_structured_output.ainvoke([
                 {"role": "system", "content": formatted_system_prompt}, 
                 {"role": "user", "content": text_content}
             ])

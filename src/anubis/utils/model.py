@@ -39,7 +39,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             model = AsyncLlamaAPIClientWrapper()
         else:
             model = AsyncLlamaAPIClientWrapper(response_format=response_format)
-
+        return model 
+    
     if model_provider == "OPEN_AI":
         if response_format is None:
             model = ChatOpenAI(
@@ -192,13 +193,16 @@ from typing import List, Any
 from typing import Literal
 from pydantic import BaseModel, field_validator, Field
 from typing import Optional
+
+from langchain_core.messages.utils import count_tokens_approximately
+
 class AsyncLlamaAPIClientWrapper:
     def __init__(self, response_format = None):
         context = GlobalContext()
         self.llama_api_key = context.llama_api_key
-        pydantic_model = response_format
+        self.pydantic_model = response_format
 
-    async def ainvoke(self, messages: List[Literal[HumanMessage, SystemMessage, AIMessage]]):
+    async def ainvoke(self, messages: List[Literal[HumanMessage, SystemMessage, AIMessage, dict]]):
       """ Accept a list of langchain messages and a pydantic_model 
       and formats the messages for use as a model 
       with structured output for analysis 
@@ -216,7 +220,17 @@ class AsyncLlamaAPIClientWrapper:
               mapping = {"human": "user", "user":"user", "system":"system", "assistant":"assistant"}
               return mapping.get(value, "user")
 
-      formatted_messages = [(LlamaMessage.model_validate(message.model_dump()).model_dump()) for message in messages]
+      if type(messages[0]) is not dict:
+        formatted_messages = [(LlamaMessage.model_validate(message.model_dump()).model_dump()) for message in messages]
+      else:
+          formatted_messages = messages
+
+      if self.pydantic_model is not None:
+          if self.pydantic_model.__name__ == "TextualSituationalAwareness":
+              approximate_message_length = count_tokens_approximately(formatted_messages[1]['content'])
+              if approximate_message_length > 4000:
+                  formatted_messages[1]['content'] = formatted_messages[1]['content'][:4000] # truncate messages for situational analysis classification
+      
       if self.pydantic_model is not None:
         response = await client.chat.completions.create(
             messages=formatted_messages,

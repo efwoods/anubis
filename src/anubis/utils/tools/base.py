@@ -3,20 +3,20 @@ from langchain_core.tools import BaseTool
 
 from src.anubis.utils.tools.identity.identity_tools import (
     learn_information_about_the_user, 
-    learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+    update_self_identity_mem_from_user_txt, 
     recall_memories
 )
 
 
 # tools dictionary
 all_tools = {
-    "learn_information_about_yourself_through_text_from_the_user_as_a_memory": learn_information_about_yourself_through_text_from_the_user_as_a_memory,
+    "update_self_identity_mem_from_user_txt": update_self_identity_mem_from_user_txt,
     "learn_information_about_the_user":learn_information_about_the_user,       
     "recall_memories":recall_memories
 }
 
 identity_tools = {
-    "learn_information_about_yourself_through_text_from_the_user_as_a_memory": learn_information_about_yourself_through_text_from_the_user_as_a_memory,
+    "update_self_identity_mem_from_user_txt": update_self_identity_mem_from_user_txt,
     "learn_information_about_the_user":learn_information_about_the_user,       
 }
 

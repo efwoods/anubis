@@ -564,7 +564,7 @@ async def select_avatar(
         else: 
             return HTTPException(detail = "Error: either assistant_id or assistant_name is required.", status_code=400)
 
-from src.anubis.utils.tools.identity.identity_tools import learn_information_about_yourself_through_text_from_the_user_as_a_memory
+from src.anubis.utils.tools.identity.identity_tools import update_self_identity_mem_from_user_txt
 
 from langgraph.runtime import Runtime
 from langchain_core.runnables import RunnableConfig
@@ -605,7 +605,7 @@ from langchain_core.runnables import RunnableConfig
         #     }
         # }
 
-#     learn_information_about_yourself_through_text_from_the_user_as_a_memory(
+#     update_self_identity_mem_from_user_txt(
 #         assistant_fact: str, fact_context: str, )
 
 

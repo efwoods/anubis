@@ -61,7 +61,7 @@ from src.anubis.utils.utility import (
 
 from src.anubis.utils.tools.identity.identity_tools import (
     learn_information_about_the_user, 
-    learn_information_about_yourself_through_text_from_the_user_as_a_memory,
+    update_self_identity_mem_from_user_txt,
     # learn_information_about_yourself_through_images,
     # learn_information_about_yourself_through_tweets,
     # learn_information_about_yourself_through_youtube_videos,
@@ -73,7 +73,7 @@ from src.anubis.utils.tools.identity.identity_tools import (
 
 identity_tools = [
     learn_information_about_the_user, 
-    learn_information_about_yourself_through_text_from_the_user_as_a_memory,
+    update_self_identity_mem_from_user_txt,
     # learn_information_about_yourself_through_images,
     # learn_information_about_yourself_through_tweets,
     # learn_information_about_yourself_through_youtube_videos,
@@ -218,7 +218,7 @@ async def considering(state:GlobalState, config: RunnableConfig, runtime: Runtim
 # [GlobalContext]) -> GlobalState:
 #     avatar_accessible_tools_dict = {
 #         "learn_information_about_the_user": learn_information_about_the_user,
-#         "learn_information_about_yourself_through_text_from_the_user_as_a_memory":learn_information_about_yourself_through_text_from_the_user_as_a_memory, 
+#         "update_self_identity_mem_from_user_txt":update_self_identity_mem_from_user_txt, 
 #         "recall_memories":recall_memories,
 #         "create_episodic_memory": create_episodic_memory,
 #         "test_update": test_update,

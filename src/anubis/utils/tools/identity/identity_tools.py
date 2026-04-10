@@ -313,8 +313,8 @@ class AssistantFactAndContext(BaseModel):
     fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
     
 
-@tool("learn_information_about_yourself_through_text_from_the_user_as_a_memory", args_schema = AssistantFactAndContext)
-async def learn_information_about_yourself_through_text_from_the_user_as_a_memory( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
+@tool("update_self_identity_mem_from_user_txt", args_schema = AssistantFactAndContext)
+async def update_self_identity_mem_from_user_txt( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
     assistant_fact: str, 
     fact_context: str,
     # Hide these arguments from the model.

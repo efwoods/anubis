@@ -741,48 +741,48 @@ async def chat(
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
-@app.post("/test_upload_media_file")
-async def test_upload_media_file(
-    files: List[UploadFile] = File(...),
-    reference_audio: bool = False,
-    reference_image: bool = False, 
-    proprietary_content: bool = False, 
-    current_user: dict = Depends(get_current_user)
-):
-    # Context user_id, assistant_id
-    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
-    """
-    Upload one or more media files for processing and indexing.
+# @app.post("/test_upload_media_file")
+# async def test_upload_media_file(
+#     files: List[UploadFile] = File(...),
+#     reference_audio: bool = False,
+#     reference_image: bool = False, 
+#     proprietary_content: bool = False, 
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     # Context user_id, assistant_id
+#     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
+#     """
+#     Upload one or more media files for processing and indexing.
     
-    - **files**: One or more files to process
-    - **user_id**: User identifier
-    - **assistant_id**: Assistant identifier
-    """
-    user_id = current_user['identities'][0]['user_id']
-    assitant_config = current_user['app_metadata']['assistant_config']
-    assistant_id = assitant_config['configurable']['assistant_id']
-    config = {
-        "configurable": {
-            "user_id": user_id,
-            "user_ctx": {"name":None, "description": None},
-        }
-    }
-    config['configurable'].update(assitant_config['configurable'])
-    # Read all uploaded files
-    media_files = []
-    for file in files:
-        content = await file.read()
-        media_files.append({
-            "filename": file.filename,
-            "content_type": file.content_type,
-            "content": content,
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "reference_audio": reference_audio,
-            "reference_image": reference_image,               
-            "proprietary_content": proprietary_content
-        })
-    logger.info("breakpoint")
+#     - **files**: One or more files to process
+#     - **user_id**: User identifier
+#     - **assistant_id**: Assistant identifier
+#     """
+#     user_id = current_user['identities'][0]['user_id']
+#     assitant_config = current_user['app_metadata']['assistant_config']
+#     assistant_id = assitant_config['configurable']['assistant_id']
+#     config = {
+#         "configurable": {
+#             "user_id": user_id,
+#             "user_ctx": {"name":None, "description": None},
+#         }
+#     }
+#     config['configurable'].update(assitant_config['configurable'])
+#     # Read all uploaded files
+#     media_files = []
+#     for file in files:
+#         content = await file.read()
+#         media_files.append({
+#             "filename": file.filename,
+#             "content_type": file.content_type,
+#             "content": content,
+#             "user_id": user_id,
+#             "assistant_id": assistant_id,
+#             "reference_audio": reference_audio,
+#             "reference_image": reference_image,               
+#             "proprietary_content": proprietary_content
+#         })
+#     logger.info("breakpoint")
 
 
 @app.post("/update_avatar_identity_with_media")

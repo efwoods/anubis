@@ -128,15 +128,15 @@ I believe that through the research and development of A.I., we will understand 
 </Rules>
 """
 
-class ProprietaryContentClassification(BaseModel):
-           """ Determine if the content is non-personally identifiable such as in a menu or a well known religious text such as the bible or is personally identifiable information such as in an interview, a monoluge, a persentation, or a script. """
-           non_personally_identifiable_information: bool = Field(description= "This is TRUE when the text is a menu or well-known religious text such as the bible. This is FALSE otherwise and is intended to be FALSE when there is a script or a monologue or an interview between two people.")
+class ReferenceDocumentOrBiographicalConversationalInformation(BaseModel):
+           """ Determine if the content is one of two categories: the first category is a reference document such as a menu or a well known religious text such as the bible. The second category is conversational or biographical information such as in an interview, a monologue, a persentation, biography, or a script. """
+           is_reference_document: bool = Field(description= "This is TRUE when the text is a menu or well-known religious text such as the bible. This is FALSE otherwise and is intended to be FALSE when there is a script or a monologue or an interview between two people.")
            reasoning: str = Field(
-               description = "Step-by-step reasoning behind the decision for the classified situation of the text. (Non-proprietary content includes: single speaker monologue, single tweet from user, strictly Q & A, multi-speaker that is Non-religious. There is a target to identify in the non-religious text document in non-proprietary content.)"
+               description = "Step-by-step reasoning behind the decision for the classified situation of the text. (Biographical conversational informaiton includes: single speaker monologue, single tweet from user, a biography, strictly Question and answer, multi-speaker content that is Non-religious. There is a target to identify in the non-religious text document in biographical conversational informaiton when is_reference_document is FALSE.)"
            )
 
 
-NON_PII_DOCUMENT = """
+REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION = """
 <Role>
 Your role is to analyze and classify text with respect to the situation of the content within the text.
 </Role>
@@ -289,19 +289,21 @@ class ContentSituationClassification(BaseModel):
             "Cite specific evidence from the text to support the decision."
         )
     )
-    has_identifiable_target: bool = Field(
-        description=(
-            "True when a single named individual is the clear subject or "
-            "primary speaker of the text."
-        )
-    )
-    target_name: Optional[str] = Field(
-        default=None,
-        description=(
-            "The full name (or best identifier) of the primary target individual, "
-            "if one can be identified. Null otherwise."
-        )
-    )
+
+
+    # has_identifiable_target: bool = Field(
+    #     description=(
+    #         "True when a single named individual is the clear subject or "
+    #         "primary speaker of the text."
+    #     )
+    # )
+    # target_name: Optional[str] = Field(
+    #     
+    #     description=(
+    #         "The full name (or best identifier) of the primary target individual, "
+    #         "if one can be identified. Null otherwise."
+    #     )
+    # )
  
  
 CONTENT_SITUATION_CLASSIFICATION_SYSTEM_PROMPT = """
@@ -381,8 +383,7 @@ class SpeakerMessage(BaseModel):
             "e.g. *smiles warmly* or *pauses to think*."
         )
     )
- 
- 
+
 class NamedSpeakerMessageFormat(BaseModel):
     """
     Intermediate message format: every turn is attributed to a named speaker
@@ -440,6 +441,8 @@ Return a JSON object that matches this schema exactly:
 <Rules>
 - Every message MUST have a "speaker" and a "content" field.
 - The narrator speaks only in third-person present tense.
+- Do NOT exclude brackets or narrative markers from extracted text.
+- Copy the text completely and do not alter the text in any way.
 - Speaker names must be consistent throughout (use the same form each time).
 - Do not collapse multiple turns from the same speaker into one if they were
   separated by another speaker or a narrator beat.
@@ -621,12 +624,12 @@ ConfidenceLevel = Literal["low", "medium", "high"]
 # ─────────────────────────────────────────────────────────────
  
 class NameExtraction(BaseModel):
-    value: Optional[str] = Field(
-        default=None,
+    value: str = Field(
         description="Full name or best available identifier of the target individual."
     )
-    evidence: Optional[str] = Field(
-        default=None,
+    evidence: str = Field(
+        
+
         description="The exact text passage where the name was found or inferred."
     )
     confidence: ConfidenceLevel = Field(
@@ -667,21 +670,20 @@ individual from the provided text.
 # ─────────────────────────────────────────────────────────────
  
 class DescriptionExtraction(BaseModel):
-    value: Optional[str] = Field(
-        default=None,
+    """ Extracts Description of a Target individual. """
+    description: str = Field(
         description="A concise one-to-two paragraph summary of who this person is."
     )
-    evidence: Optional[str] = Field(
-        default=None,
-        description="Key passages that were synthesised to form this description."
-    )
-    confidence: ConfidenceLevel = Field(
-        description="Confidence in the completeness and accuracy of the description."
-    )
+
     reasoning: str = Field(
         description="How the summary was constructed from the available text."
     )
  
+    evidence: str = Field(
+        description="Key passages that were synthesised to form this description."
+    )
+
+
  
 DESCRIPTION_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
@@ -695,6 +697,11 @@ accurate summary of the target individual.
 3. Write a one-to-two paragraph description in third-person present tense.
 4. Include: who the person is, what they are known for, and any defining traits.
 5. Cite the key passages you drew on in the evidence field.
+
+Describe the following target individual: 
+
+{target_individual}
+
 </Instructions>
  
 <Rules>
@@ -712,14 +719,15 @@ accurate summary of the target individual.
  
 class IdentityExtraction(BaseModel):
     value: Optional[str] = Field(
-        default=None,
+        
+
         description=(
             "How the person defines themselves: profession, role, community, "
             "cultural identity, or other primary self-concept."
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Text passages that reveal how the target self-identifies."
     )
     confidence: ConfidenceLevel = Field(
@@ -761,14 +769,14 @@ defines themselves based on the text.
  
 class HistoryExtraction(BaseModel):
     value: Optional[str] = Field(
-        default=None,
+        
         description=(
             "Key biographical facts, background, and formative events, "
             "presented in roughly chronological order."
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Source passages describing past events or biographical details."
     )
     confidence: ConfidenceLevel = Field(
@@ -809,7 +817,7 @@ individual from the provided text.
  
 class EmotionsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Dominant or recurring emotional states expressed or implied "
             "by the target. Each item is a concise label + brief explanation, "
@@ -817,7 +825,7 @@ class EmotionsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that demonstrate the listed emotional states."
     )
     confidence: ConfidenceLevel = Field(
@@ -861,14 +869,14 @@ dominant emotional states of the target individual from the text.
  
 class BeliefsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Core beliefs or worldview statements. Each item is a declarative "
             "sentence capturing one belief, e.g. 'People are fundamentally good.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that reveal these beliefs."
     )
     confidence: ConfidenceLevel = Field(
@@ -912,7 +920,7 @@ target individual from the text.
  
 class ValuesExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "What the person demonstrably prioritises and protects. These are synonymous with priorities. "
             "Each item names the value and briefly explains how it is demonstrated, "
@@ -920,7 +928,7 @@ class ValuesExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages where these values are shown in action or statement."
     )
     confidence: ConfidenceLevel = Field(
@@ -962,7 +970,7 @@ individual demonstrably values most from the text.
  
 class OpinionsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Specific stated or strongly implied opinions on concrete topics. "
             "Each item includes the topic and the opinion, "
@@ -970,7 +978,7 @@ class OpinionsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages where opinions are expressed."
     )
     confidence: ConfidenceLevel = Field(
@@ -1011,14 +1019,14 @@ holds on concrete topics, as expressed in the text.
  
 class GoalsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Long-term ambitions and objectives. Each item is a concise statement "
             "of a goal, e.g. 'Build a company that outlasts its founder.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages where goals are stated or clearly implied."
     )
     confidence: ConfidenceLevel = Field(
@@ -1058,14 +1066,14 @@ the target individual from the text.
  
 class WantsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Immediate desires or things the person is actively pursuing right now. "
             "e.g. 'Wants public recognition for recent work.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages where immediate wants are expressed."
     )
     confidence: ConfidenceLevel = Field(
@@ -1105,14 +1113,14 @@ right now — their immediate desires and active pursuits — from the text.
  
 class NeedsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Deeper psychological or practical needs, stated or implied. "
             "e.g. 'Needs external validation to feel secure in decisions.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that reveal underlying needs."
     )
     confidence: ConfidenceLevel = Field(
@@ -1154,14 +1162,14 @@ the target individual from the text.
  
 class FearsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Things the person is afraid of or actively avoids. "
             "e.g. 'Fear of irrelevance — avoids topics where their authority could be challenged.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that reveal fears, avoidance, or anxiety."
     )
     confidence: ConfidenceLevel = Field(
@@ -1203,14 +1211,14 @@ fears or actively avoids, as revealed in the text.
  
 class FlawsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Acknowledged or observable weaknesses, blind spots, or contradictions. "
             "e.g. 'Impatience — frequently interrupts others and rushes decisions.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that reveal flaws or contradictions."
     )
     confidence: ConfidenceLevel = Field(
@@ -1254,14 +1262,14 @@ of the target individual from the text.
  
 class StrengthsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Demonstrated strengths, skills, or exceptional qualities. "
             "e.g. 'Strategic clarity — consistently identifies the core issue quickly.'"
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that demonstrate these strengths."
     )
     confidence: ConfidenceLevel = Field(
@@ -1305,7 +1313,7 @@ from the text.
  
 class ProblemsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Active problems, challenges, conflicts, or obstacles the target "
             "is facing or has faced. "
@@ -1313,7 +1321,7 @@ class ProblemsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages that reveal these problems."
     )
     confidence: ConfidenceLevel = Field(
@@ -1369,11 +1377,11 @@ class RelationshipEntry(BaseModel):
  
 class RelationshipsExtraction(BaseModel):
     value: Optional[List[RelationshipEntry]] = Field(
-        default=None,
+        
         description="Named individuals and the nature of their relationship to the target."
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description="Passages describing or implying these relationships."
     )
     confidence: ConfidenceLevel = Field(
@@ -1419,7 +1427,7 @@ relationships of the target individual from the text.
  
 class SecretsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Information the target holds privately and does not wish to expose "
             "or share with others, revealed only through trust or confidential "
@@ -1429,7 +1437,7 @@ class SecretsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        default=None,
+        
         description=(
             "Passages — including omissions, deflections, contradictions, or "
             "confidential disclosures — that hint at or reveal withheld information."
@@ -1560,66 +1568,66 @@ class GeneralCharacteristicExtraction(BaseModel):
     analysis; use this model for a single-pass broad profile.
     """
     name: Optional[str] = Field(
-        default=None,
+        
         description="Full name of the target individual."
     )
     description: Optional[str] = Field(
-        default=None,
+        
         description="One-paragraph summary of who this person is."
     )
     identity: Optional[str] = Field(
-        default=None,
+        
         description="How the person identifies themselves (profession, role, community, etc.)."
     )
     history: Optional[str] = Field(
-        default=None,
+        
         description="Key biographical facts, background, formative events."
     )
     emotions: Optional[List[str]] = Field(
-        default=None,
+        
         description="Dominant or recurring emotional states expressed or implied."
     )
     beliefs: Optional[List[str]] = Field(
-        default=None,
+        
         description="Core beliefs or worldview statements inferred from the text."
     )
     values: Optional[List[str]] = Field(
-        default=None,
+        
         description="What the person demonstrably cares about most."
     )
     opinions: Optional[List[str]] = Field(
-        default=None,
+        
         description="Specific stated or strongly implied opinions on topics."
     )
     goals: Optional[List[str]] = Field(
-        default=None,
+        
         description="Long-term ambitions or objectives."
     )
     wants: Optional[List[str]] = Field(
-        default=None,
+        
         description="Immediate desires or things the person is actively pursuing."
     )
     needs: Optional[List[str]] = Field(
-        default=None,
+        
         description="Deeper psychological or practical needs, stated or implied."
     )
     fears: Optional[List[str]] = Field(
-        default=None,
+        
         description="Things the person is afraid of or actively avoids."
     )
     problems: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Current challenges the individual is facing. These could be internal "
             "conflicts or external conflicts that the individual needs to resolve."
         )
     )
     flaws: Optional[List[str]] = Field(
-        default=None,
+        
         description="Acknowledged or observable weaknesses, blind spots, or contradictions."
     )
     strengths: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Features of the individual that the individual excels at. The best "
             "qualities of the individual and what the individual is best at doing "
@@ -1627,7 +1635,7 @@ class GeneralCharacteristicExtraction(BaseModel):
         )
     )
     secrets: Optional[List[str]] = Field(
-        default=None,
+        
         description=(
             "Information held privately by the individual that they do not wish to "
             "expose or share with others unless they trust and confidently confide "
@@ -1635,7 +1643,7 @@ class GeneralCharacteristicExtraction(BaseModel):
         )
     )
     relationships: Optional[List[RelationshipEntry]] = Field(
-        default=None,
+        
         description="Named individuals and the nature of their relationship to the target."
     )
     reasoning: str = Field(

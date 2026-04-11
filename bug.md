@@ -73,3 +73,21 @@ if runtime.state.get('recalled_memory_documents', None) is not None:
             reasoning: str = Field(
                 description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
             ) -->
+
+# Retry on error:
+        response = await client.chat.completions.create(
+            messages=formatted_messages,
+            model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+            stream=False,
+            temperature=0.1,
+            # max_completion_tokens=4096,
+            top_p=0.1,
+            repetition_penalty=1,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": self.pydantic_model.__name__,
+                    "schema": self.pydantic_model.model_json_schema()
+                }
+            }
+        )

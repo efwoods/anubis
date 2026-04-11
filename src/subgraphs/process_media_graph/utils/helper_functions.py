@@ -29,8 +29,8 @@ from typing import Literal
 from pydantic import Field
 from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
 
-from src.anubis.utils.schema import (TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES, NON_PII_DOCUMENT)
-from src.anubis.utils.schema import (TextualSituationalAwareness, MonologuePresentationOrSeriesOfQuotes, ProprietaryContentClassification)
+from src.anubis.utils.schema import (TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS, MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES, REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION)
+from src.anubis.utils.schema import (TextualSituationalAwareness, MonologuePresentationOrSeriesOfQuotes, ReferenceDocumentOrBiographicalConversationalInformation)
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -46,10 +46,10 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
     
     proprietary_content = metadata.get("proprietary_content", False)
 
-    proprietary_content_classification_model = init_model(model_without_tools=True, response_format=ProprietaryContentClassification)
+    proprietary_content_classification_model = init_model(model_without_tools=True, response_format=ReferenceDocumentOrBiographicalConversationalInformation)
     text_content = media_item.get("content", "")
     
-    classification = await proprietary_content_classification_model.ainvoke([SystemMessage(content=NON_PII_DOCUMENT), HumanMessage(content=text_content[:5000])])
+    classification = await proprietary_content_classification_model.ainvoke([SystemMessage(content=REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION), HumanMessage(content=text_content[:5000])])
     # if proprietary_content:
     if classification.non_personally_identifiable_information:
         logger.warning(f"proprietary content: No single target; media is only uploaded to vectorstore")

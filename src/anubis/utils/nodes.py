@@ -37,8 +37,8 @@ async def load_consciousness(state: GlobalState, config: RunnableConfig, runtime
             user_description = runtime.context.user_ctx.get("description", None) 
     else:
         assert(type(config.get("assistant_ctx", {}) is dict))
-        assistant_name = config.get("assistant_ctx", {}).get("name", None)
-        assistant_description = config.get("assistant_ctx", {}).get("description", None)
+        assistant_name = config.get("configurable", {}).get("assistant_ctx", {}).get("name", None)
+        assistant_description = config.get("configurable", {}).get("assistant_ctx", {}).get("description", None)
         
         assert(type(config.get("user_ctx", {}) is dict))
         user_name = config.get("user_ctx", {}).get("name", None)

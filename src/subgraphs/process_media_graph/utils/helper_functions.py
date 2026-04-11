@@ -51,7 +51,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
     
     classification = await proprietary_content_classification_model.ainvoke([SystemMessage(content=REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION), HumanMessage(content=text_content[:5000])])
     # if proprietary_content:
-    if classification.non_personally_identifiable_information:
+    if classification.is_menu_or_religious_text:
         logger.warning(f"proprietary content: No single target; media is only uploaded to vectorstore")
         
         classification_metadata = {

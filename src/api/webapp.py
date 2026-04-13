@@ -26,7 +26,7 @@ from langgraph.store.base import IndexConfig
 from typing import Optional
 from langgraph_sdk import get_client
 
-from src.anubis.graph import graph, message_workflow
+from src.anubis.graph import graph, message_workflow, response_only_workflow
 from src.security.auth import security_route, auth
 
 from langgraph_sdk.auth import Auth
@@ -57,6 +57,8 @@ from urllib.parse import quote
     
 from src.security.auth import update_assistant_config
 from src.security.auth import check_subscription_status
+
+from src.security.auth import get_current_user_or_anonymous_user
 
 class ASSISTANT_QUERY(BaseModel):
     assistant_id: UUID
@@ -133,36 +135,29 @@ async def lifespan(app: FastAPI):
     if app.state.context.deployment == 'FALSE':
         async_postgres_store_uri = app.state.context.async_postgres_store_uri
         logger.warning(f"app.state.context.dev: {app.state.context.dev}")
-        if app.state.context.dev == "FALSE":
-            pool = AsyncConnectionPool(
-                conninfo=async_postgres_store_uri,
-                max_size=20,
-                kwargs={"autocommit": True, "prepare_threshold": 0},
-                open=False,  # don't open on construction
-            )
-
-            app.state.pool = pool
-
-            await app.state.pool.open()
-            try:
-                embed = "huggingface:" + app.state.context.embedding_model
-                field = ["document.kwargs.page_content"]
-                store = AsyncPostgresStore(app.state.pool, index = IndexConfig(dims=384, embed=embed, field=field))
-                await store.setup()
-                logger.info("Store setup complete")
-
-                app.state.store = store
-                app.state.graph = message_workflow.compile(store=store)
-                logger.info("Application startup: lifecycle complete")
-
-                yield
-            finally:
-                await pool.close()
-        else:
-            store = InMemoryStore()
+        pool = AsyncConnectionPool(
+            conninfo=async_postgres_store_uri,
+            max_size=5,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+            open=False,  # don't open on construction
+        )
+        app.state.pool = pool
+        await app.state.pool.open()
+        try:
+            embed = "huggingface:" + app.state.context.embedding_model
+            field = ["document.kwargs.page_content"]
+            store = AsyncPostgresStore(app.state.pool, index = IndexConfig(dims=384, embed=embed, field=field))
+            await store.setup()
+            logger.info("Store setup complete")
             app.state.store = store
             app.state.graph = message_workflow.compile(store=store)
-            yield        
+            app.state.response_only_graph = response_only_workflow.compile(store=store)
+            app.state.response_only_graph.name = "Anubis"
+            app.state.graph.name = "Anubis"
+            logger.info("Application startup: lifecycle complete")
+            yield
+        finally:
+            await pool.close()     
     else:
         yield
         
@@ -671,6 +666,86 @@ async def message(
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
+
+class PublicAvatarMessagePayload(BaseModel):
+    message: str = "Hey! Please tell me about yourself and what you can do for me."
+    your_name: Optional[str] = None
+    your_description: Optional[str] = None
+
+@app.post("/message/{assistant_id}")
+async def message(
+    request: Request,     
+    assistant_id: str,    
+    body: PublicAvatarMessagePayload,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+    ):
+
+    logger.info("breakpoint")
+    # allow for select avatar in query and anonymous user for a dedicated endpoint
+    start_time = time_ns()
+    config = current_user.get("app_metadata", {}).get("assistant_config", {})
+    if not config:
+        raise HTTPException(detail="Error retrieving assistant information.", status_code=400)
+
+    user_name = body.your_name
+    user_description = body.your_description
+    if request.headers.get("api-key") != '':
+
+        user_id = current_user['identities'][0]['user_id']
+
+        try:
+            langgraph_client = get_client()
+            assistant = await langgraph_client.assistants.get(assistant_id = assistant_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error selecting avatar.")
+        
+        config_update = {
+                "configurable": {
+                    "user_ctx": {"name":user_name, "description": user_description},
+                    "user_id":user_id,
+                    "assistant_id":assistant_id,
+                    "assistant_ctx": {
+                      "name": assistant.get("name", None),
+                      "description": assistant.get("description", None),
+                      "metadata": assistant.get("metadata", {})
+                    }
+                }
+            }
+    
+    else:
+        config_update = {
+            "configurable": {
+                "user_ctx": {"name":user_name, "description": user_description}
+            }
+        }
+    # update with user information
+    config['configurable'].update(config_update['configurable'])
+
+        # store = app.state.store
+    graph = app.state.response_only_graph
+
+        # system_time = datetime.now(tz=timezone.utc).isoformat
+        # content = [{"type":"text", "text": system_time}]
+        # input = {"messages": HumanMessage(content=content)}
+        # # store = make_pg_store()
+
+        # result = await url_loading_graph.ainvoke(input, config=config)
+
+        # logger.info(f"config: {config}")
+        
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
+
+    logger.info(f"{result}")
+
+    response = {}
+    response["content"] = result['messages'][-1].content
+    response_metadata = result['messages'][-1].response_metadata
+    if response_metadata:
+        response["response_metadata"] = response_metadata
+    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+    return JSONResponse(response, status_code=200)
+
+
 @app.post("/chat")
 async def chat(
     response: Response,    
@@ -741,48 +816,48 @@ async def chat(
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
     return JSONResponse(response, status_code=200)
 
-@app.post("/test_upload_media_file")
-async def test_upload_media_file(
-    files: List[UploadFile] = File(...),
-    reference_audio: bool = False,
-    reference_image: bool = False, 
-    proprietary_content: bool = False, 
-    current_user: dict = Depends(get_current_user)
-):
-    # Context user_id, assistant_id
-    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
-    """
-    Upload one or more media files for processing and indexing.
+# @app.post("/test_upload_media_file")
+# async def test_upload_media_file(
+#     files: List[UploadFile] = File(...),
+#     reference_audio: bool = False,
+#     reference_image: bool = False, 
+#     proprietary_content: bool = False, 
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     # Context user_id, assistant_id
+#     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
+#     """
+#     Upload one or more media files for processing and indexing.
     
-    - **files**: One or more files to process
-    - **user_id**: User identifier
-    - **assistant_id**: Assistant identifier
-    """
-    user_id = current_user['identities'][0]['user_id']
-    assitant_config = current_user['app_metadata']['assistant_config']
-    assistant_id = assitant_config['configurable']['assistant_id']
-    config = {
-        "configurable": {
-            "user_id": user_id,
-            "user_ctx": {"name":None, "description": None},
-        }
-    }
-    config['configurable'].update(assitant_config['configurable'])
-    # Read all uploaded files
-    media_files = []
-    for file in files:
-        content = await file.read()
-        media_files.append({
-            "filename": file.filename,
-            "content_type": file.content_type,
-            "content": content,
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "reference_audio": reference_audio,
-            "reference_image": reference_image,               
-            "proprietary_content": proprietary_content
-        })
-    logger.info("breakpoint")
+#     - **files**: One or more files to process
+#     - **user_id**: User identifier
+#     - **assistant_id**: Assistant identifier
+#     """
+#     user_id = current_user['identities'][0]['user_id']
+#     assitant_config = current_user['app_metadata']['assistant_config']
+#     assistant_id = assitant_config['configurable']['assistant_id']
+#     config = {
+#         "configurable": {
+#             "user_id": user_id,
+#             "user_ctx": {"name":None, "description": None},
+#         }
+#     }
+#     config['configurable'].update(assitant_config['configurable'])
+#     # Read all uploaded files
+#     media_files = []
+#     for file in files:
+#         content = await file.read()
+#         media_files.append({
+#             "filename": file.filename,
+#             "content_type": file.content_type,
+#             "content": content,
+#             "user_id": user_id,
+#             "assistant_id": assistant_id,
+#             "reference_audio": reference_audio,
+#             "reference_image": reference_image,               
+#             "proprietary_content": proprietary_content
+#         })
+#     logger.info("breakpoint")
 
 
 @app.post("/update_avatar_identity_with_media")

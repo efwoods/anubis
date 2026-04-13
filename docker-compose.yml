@@ -3,7 +3,7 @@ volumes:
         driver: local
         
 services:
-    langgraph-api:
+    langgraph-api-dev:
         image: evdev3/anubis-langgraph-api:latest
         pull_policy: never
         dns:
@@ -18,7 +18,7 @@ services:
             start_interval: 1s
             start_period: 10s
         env_file:
-            - .env
+            - .env.dev
         volumes:
             - .:/deps/anubis
             - ~/.cache/huggingface:/root/.cache/huggingface

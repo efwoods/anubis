@@ -611,81 +611,104 @@ from langchain_core.runnables import RunnableConfig
 #     update_self_identity_mem_from_user_txt(
 #         assistant_fact: str, fact_context: str, )
 
-
 class MessagePayload(BaseModel):
-    message: Optional[str] = "Hello!"
-    name: Optional[str] = None
-    description: Optional[str] = None
+    message: str = "Hey! Please tell me about yourself and what you can do for me."
+    your_name: Optional[str] = None
+    your_description: Optional[str] = None
+    conversation_title: Optional[str] = None
 
 from time import time_ns
 
 @app.post("/message")
-async def message(
+async def message_selected_avatar(
     response: Response,    
-    body: MessagePayload,
+    message: str = "Hey! Please tell me about yourself and what you can do for me.",
+    your_name: Optional[str] = None,
+    your_description: Optional[str] = None,
+    conversation_title: Optional[str] = None,
+    file: Optional[UploadFile] = None,
+    thread_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     ):
 
-    logger.info("breakpoint")
+    logger.info("breakpoint update")
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
-    assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
-    if not assistant_config:
-        raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
+    config = current_user.get("app_metadata", {}).get("assistant_config", {})
+    if not config:
+        raise HTTPException(detail="Error retrieving assistant information.", status_code=400)
 
-    if not current_user:
-        user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
-        user_name = None,
-        user_description = None
-    else:
-        user_id = current_user['identities'][0]['user_id']
-        user_name = body.name
-        user_description = body.description
-
-    config = {
+    user_name = your_name
+    user_description = your_description
+    user_id = current_user['identities'][0]['user_id']
+    config_update = {
             "configurable": {
                 "user_ctx": {"name":user_name, "description": user_description},
-                "user_id":user_id
+                "user_id":user_id,
             }
         }
-    
-    # update with assistant information
-    config['configurable'].update(assistant_config['configurable'])
+    assistant_id = config['configurable'].get("assistant_id")
 
-        # store = app.state.store
+
+    # Handle thread_id
+    if not thread_id:
+        thread_id = str(uuid4())
+        thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id}, "graph_id": "Anubis"}
+        # create thread_id
+        try:
+            langgraph_client = get_client()
+            thread_create_response = await langgraph_client.threads.create(thread_id=thread_id, 
+            metadata=thread_metadata)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error creating new conversation thread.")
+
+    # update with user information
+    config_update['configurable']['thread_id'] = thread_id
+    config['configurable'].update(config_update['configurable'])
+
+    # store = app.state.store
     graph = app.state.graph
 
-        # system_time = datetime.now(tz=timezone.utc).isoformat
-        # content = [{"type":"text", "text": system_time}]
-        # input = {"messages": HumanMessage(content=content)}
-        # # store = make_pg_store()
 
-        # result = await url_loading_graph.ainvoke(input, config=config)
+    if file and file.content_type == "text/plain":
+        contents = await file.read()
+        content = contents.decode('utf-8')
+    else:
+        content = ""
 
-        # logger.info(f"config: {config}")
+    if content == "":
+        human_message_content = message
+    else: 
+        human_message_content = message + "\n\n" + content
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
 
     logger.info(f"{result}")
 
+    # Update most_recent_message
+    langgraph_client = get_client()
+    thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id, "most_recent_message": datetime.now(timezone.utc).isoformat(), "conversation_title": conversation_title}, "graph_id": "Anubis"}
+    await langgraph_client.threads.update(thread_id=thread_id, metadata = thread_metadata)
+
     response = {}
     response["content"] = result['messages'][-1].content
-    response["response_metadata"] = result['messages'][-1].response_metadata
+    response_metadata = result['messages'][-1].response_metadata
+    if response_metadata:
+        response["response_metadata"] = response_metadata
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+    response['thread_id'] = thread_id
     return JSONResponse(response, status_code=200)
 
 
-class PublicAvatarMessagePayload(BaseModel):
-    message: str = "Hey! Please tell me about yourself and what you can do for me."
-    your_name: Optional[str] = None
-    your_description: Optional[str] = None
+
 
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,     
     assistant_id: str,
-    body: PublicAvatarMessagePayload,
+    body: MessagePayload,
     thread_id: Optional[str] = None,
+    file: Optional[UploadFile] = File(default=None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
     ):
 
@@ -745,10 +768,27 @@ async def message_avatar(
 
     # store = app.state.store
     graph = app.state.graph
+
+
+    if file and file.content_type == "text/plain":
+        contents = await file.read()
+        content = contents.decode('utf-8')
+    else:
+        content = ""
+
+    if content == "":
+        human_message_content = body.message
+    else: 
+        human_message_content = body.message + "\n\n" + content
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
 
     logger.info(f"{result}")
+
+    # Update most_recent_message
+    langgraph_client = get_client()
+    thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id, "most_recent_message": datetime.now(timezone.utc).isoformat(), "conversation_title":getattr(body, "conversation_title", thread_id)}, "graph_id": "Anubis"}
+    await langgraph_client.threads.update(thread_id=thread_id, metadata = thread_metadata)
 
     response = {}
     response["content"] = result['messages'][-1].content
@@ -760,75 +800,128 @@ async def message_avatar(
     return JSONResponse(response, status_code=200)
 
 
-@app.post("/chat")
-async def chat(
-    response: Response,    
-    message: Optional[Annotated[str, Form(default=None)]],
-    file: Optional[UploadFile] = File(default=None),
-    current_user: dict = Depends(get_current_user)
-    ):
+# @app.post("/chat")
+# async def chat(
+#     response: Response,    
+#     message: Optional[Annotated[str, Form(default=None)]],
+#     file: Optional[UploadFile] = File(default=None),
+#     thread_id: Optional[str] = None,
+#     current_user: dict = Depends(get_current_user)
+#     ):
 
-    logger.info("breakpoint")
-    # allow for select avatar in query and anonymous user for a dedicated endpoint
-    start_time = time_ns()
-    assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
-    if not assistant_config:
-        raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
+#     logger.info("breakpoint")
+#     # allow for select avatar in query and anonymous user for a dedicated endpoint
+#     start_time = time_ns()
+#     assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
+#     if not assistant_config:
+#         raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
 
-    if not current_user:
-        user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
-        user_name = None,
-        user_description = None
-    else:
-        user_id = current_user['identities'][0]['user_id']
-        user_name = None
-        user_description = None 
+#     if not current_user:
+#         user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
+#         user_name = None,
+#         user_description = None
+#     else:
+#         user_id = current_user['identities'][0]['user_id']
+#         user_name = None
+#         user_description = None 
 
-    config = {
-            "configurable": {
-                "user_ctx": {"name":user_name, "description": user_description},
-                "user_id":user_id
-            }
-        }
+#     # Handle thread_id
+#     if not thread_id:
+#         thread_id = str(uuid4())
+#         thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_config.get('configurable', {}).get("assistant_id")}, "graph_id": "Anubis"}
+#         # create thread_id
+#         try:
+#             langgraph_client = get_client()
+#             thread_create_response = await langgraph_client.threads.create(thread_id=thread_id, 
+#             metadata=thread_metadata)
+#         except Exception as e:
+#             raise HTTPException(status_code=500, detail="Error creating new conversation thread.")
+
+#     config = {
+#             "configurable": {
+#                 "user_ctx": {"name":user_name, "description": user_description},
+#                 "user_id":user_id, 
+#                 "thread_id":str(uuid4())
+#             }
+#         }
     
-    # update with assistant information
-    config['configurable'].update(assistant_config['configurable'])
+#     # update with assistant information
+#     config['configurable'].update(assistant_config['configurable'])
 
-        # store = app.state.store
-    graph = app.state.graph
+#         # store = app.state.store
+#     graph = app.state.graph
 
-        # system_time = datetime.now(tz=timezone.utc).isoformat
-        # content = [{"type":"text", "text": system_time}]
-        # input = {"messages": HumanMessage(content=content)}
-        # # store = make_pg_store()
+#         # system_time = datetime.now(tz=timezone.utc).isoformat
+#         # content = [{"type":"text", "text": system_time}]
+#         # input = {"messages": HumanMessage(content=content)}
+#         # # store = make_pg_store()
 
-        # result = await url_loading_graph.ainvoke(input, config=config)
+#         # result = await url_loading_graph.ainvoke(input, config=config)
 
-        # logger.info(f"config: {config}")
+#         # logger.info(f"config: {config}")
 
-    if file and file.content_type == "text/plain":
-        contents = await file.read()
-        content = contents.decode('utf-8')
-    else:
-        content = ""
+#     if file and file.content_type == "text/plain":
+#         contents = await file.read()
+#         content = contents.decode('utf-8')
+#     else:
+#         content = ""
     
-    if not message:
-        human_message_content = content
-    else:
-        if content == "":
-            human_message_content = message
-        else: 
-            human_message_content = message + "\n\n" + content
+#     if not message:
+#         human_message_content = content
+#     else:
+#         if content == "":
+#             human_message_content = message
+#         else: 
+#             human_message_content = message + "\n\n" + content
 
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
+#     result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
 
-    logger.info(f"{result}")
+#     logger.info(f"{result}")
 
-    response = {}
-    response["content"] = result['messages'][-1].content
-    response["response_metadata"] = result['messages'][-1].response_metadata
-    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
-    return JSONResponse(response, status_code=200)
+#     response = {}
+#     response["content"] = result['messages'][-1].content
+#     response["response_metadata"] = result['messages'][-1].response_metadata
+#     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+#     return JSONResponse(response, status_code=200)
+
+from fastapi import Depends, HTTPException
+from fastapi.responses import JSONResponse
+  
+@app.get("/conversations")
+async def get_all_conversations(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Return all threads for this user + assistant, newest-first."""
+    user_id = current_user["identities"][0]["user_id"]
+    try:
+        langgraph_client = get_client()
+        threads = await langgraph_client.threads.search(
+            metadata={"thread_metadata": {"user_id": user_id, "assistant_id": assistant_id}},
+            sort_by="updated_at",
+            sort_order="desc",
+        )
+        return JSONResponse(threads)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error loading threads: {exc}")
+ 
+ 
+@app.get("/conversations/{thread_id}/messages")
+async def get_thread_messages(
+    thread_id: str,
+    assistant_id: str, 
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Return the message history for a single thread."""
+    try:
+        langgraph_client = get_client()
+        state = await langgraph_client.threads.get_state(thread_id=thread_id)
+        messages = state.get("values", {}).get("messages", []) if state else []
+        return JSONResponse({"messages": messages})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
+ 
+
 
 # @app.post("/test_upload_media_file")
 # async def test_upload_media_file(

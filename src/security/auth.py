@@ -461,55 +461,48 @@ async def get_anonymous_user_with_anonymous_api_key(request: Request, assistant_
         user = json.loads(auth_response.user.model_dump_json())
     except Exception as e:
         raise HTTPException(status_code=500, detail="Error creating anonymous user sign-in.")
-    
-    try:
-        langgraph_client = get_client()
-        assistant = await langgraph_client.assistants.get(assistant_id = assistant_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Error selecting avatar.")
+    if assistant_id is not "":
+        try:
+            langgraph_client = get_client()
+            assistant = await langgraph_client.assistants.get(assistant_id = assistant_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error selecting avatar.")
 
-    public_assistant = assistant.get("metadata", {}).get("is_public", False)
-    if not public_assistant:
-        raise HTTPException(status_code=401, detail="Please select a public avatar or use your API key from signup.")
+        public_assistant = assistant.get("metadata", {}).get("is_public", False)
+        if not public_assistant:
+            raise HTTPException(status_code=401, detail="Please select a public avatar or use your API key from signup.")
 
-    user['identities'] = [{}]
+        user['identities'] = [{}]
 
-    user['identities'][0]['user_id'] = hashed_ip
+        user['identities'][0]['user_id'] = hashed_ip
 
-    app_metadata = {
-      "api_key": _hash_key(context.anonymous_api_key),
-      "assistant_config": {
-        "configurable": {
-          "assistant_id": assistant_id,
-          "user_id": hashed_ip,
-          "user_ctx": {
-              "name": "Anonymous",
-              "description": None
-          },
-          "assistant_ctx": {
-            "name": assistant.get("name", None),
-            "description": assistant.get("description", None),
-            "metadata": assistant.get("metadata", {})
+        app_metadata = {
+          "api_key": _hash_key(context.anonymous_api_key),
+          "assistant_config": {
+            "configurable": {
+              "assistant_id": assistant_id,
+              "user_id": hashed_ip,
+              "user_ctx": {
+                  "name": "Anonymous",
+                  "description": None
+              },
+              "assistant_ctx": {
+                "name": assistant.get("name", None),
+                "description": assistant.get("description", None),
+                "metadata": assistant.get("metadata", {})
+              }
+            }
           }
         }
-      }
-    }
-    user['app_metadata'] = app_metadata
-    user['API-KEY'] = context.anonymous_api_key
-
-
-    # result.raise_for_status()
-    # users = result.json()
-    # if not users:
-    #     return None
-    # user = users[0]
-
-    # if user['email_verified'] != True:
-    #     raise print(detail="Email is not yet verified. Please verify email to continue.", status_code=401)
-    
+        user['app_metadata'] = app_metadata
+        user['API-KEY'] = context.anonymous_api_key
+    else:
+        user['identities'] = [{}]
+        user['identities'][0]['user_id'] = hashed_ip
+   
     return user
 
-async def get_current_user_or_anonymous_user(request: Request, assistant_id: str, api_key: str | None = Depends(anonymous_api_key_scheme)) -> dict:
+async def get_current_user_or_anonymous_user(request: Request, assistant_id: str = "", api_key: str | None = Depends(anonymous_api_key_scheme)) -> dict:
     """
     This dependency validates the JWT and returns the payload.
     The 'sub' field in the payload is the Auth0 user_id.
@@ -529,25 +522,39 @@ async def get_current_user_or_anonymous_user(request: Request, assistant_id: str
             raise HTTPException(status_code=401, detail="Invalid API key")
     
     return user
-    # if not res:
-        # return None
-    
-    # try:
-    #     token = res.credentials
-    #     payload = await verify_token(token, request=request)
-    #     return payload  # This contains 'sub', 'email', etc.
-    # except Exception as e:
-    #     raise HTTPException(
-    #         status_code=401, 
-    #         detail=f"Invalid or expired token: {str(e)}"
-    #     )
 
+
+
+async def get_current_user_or_anonymous_user_id(request: Request, api_key: str | None = Depends(anonymous_api_key_scheme)) -> dict:
+    """
+    This dependency validates the JWT and returns the payload.
+    The 'sub' field in the payload is the Auth0 user_id.
+    """
+    logger.info("breakpoint")
+    if not api_key:
+        # create anonymous user
+        user = await get_anonymous_user_with_anonymous_api_key(request=request, assistant_id="")
+    else:
+        user = await get_user_with_api_key(api_key, request)    
+    
+    if not user:
+        # create anonymous user
+        if not api_key:
+            raise HTTPException(status_code=500, detail="Error creating anonymous user.")
+        else:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    return user
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 @security_route.post("/signup")
 async def signup(body: SignupRequest, request:Request):
         user = await signup_user(body.email, body.password, name=body.name, request=request)
         return user
+
+@security_route.get("/get_current_user_id")
+async def get_current_user_id(current_user: dict = Depends(get_current_user_or_anonymous_user_id)):
+    return current_user['identities'][0]['user_id']
 
 @security_route.get("/resend_verification_email")
 async def resend_verification_email(request:Request, current_user: dict = Depends(get_current_user)):

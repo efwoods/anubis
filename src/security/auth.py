@@ -35,6 +35,8 @@ security = HTTPBearer()
 
 api_key_scheme = APIKeyHeader(name="API-KEY")
 
+anonymous_api_key_scheme = APIKeyHeader(name="API-KEY", auto_error=False)
+
 ALGORITHMS = ["RS256"]
 
 DOMAIN = os.getenv("AUTH0_DOMAIN")
@@ -56,8 +58,6 @@ def generate_api_key() -> str:
 
 def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
-
-
 
 
 async def update_assistant_config(hashed_api_key: str, 
@@ -421,6 +421,114 @@ async def get_current_user(request: Request, api_key: str | None = Depends(api_k
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     return user
+
+from supabase import create_async_client
+from langgraph_sdk import get_client
+import json
+
+async def get_anonymous_user_with_anonymous_api_key(request: Request, assistant_id: str) -> dict | None:
+
+    logger.info(f"test breakpoint")
+    # cache_key = _hash_key(request.headers.get('x-forwarded-for'))
+    if request.app.state.context.dev == "TRUE":
+        hashed_ip = _hash_key("172.18.0.1")
+    else:
+        hashed_ip = _hash_key(request.headers.get('x-forwarded-for'))
+    # async with _cache_lock:
+    #     if cache_key in _api_key_cache:
+    #         return _api_key_cache[cache_key]
+
+    # is_banned = False
+    # pool = request.app.state.pool
+    # async with pool.connection() as conn:
+    #     async with conn.cursor() as cur:
+    #         await cur.execute(
+    #             "SELECT 1 FROM user_schema.banned_users WHERE banned_user_id = %s LIMIT 1;",
+    #             (hashed_ip,)
+    #         )
+    #         result = await cur.fetchone()
+    #         if result:
+    #             is_banned = True
+
+    # if is_banned:
+    #     raise HTTPException(status_code=401, detail="You have violated the terms of service. Please contact contact@neuralnexus.site to request appeal.")
+        # Handle banned user (e.g., raise HTTPException)
+
+    context = request.app.state.context
+    try:
+        supabase_client = await create_async_client(supabase_key=context.supabase_key, supabase_url=context.supabase_url)
+        auth_response = await supabase_client.auth.sign_in_anonymously()
+        user = json.loads(auth_response.user.model_dump_json())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Error creating anonymous user sign-in.")
+    
+    try:
+        langgraph_client = get_client()
+        assistant = await langgraph_client.assistants.get(assistant_id = assistant_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Error selecting avatar.")
+
+    public_assistant = assistant.get("metadata", {}).get("is_public", False)
+    if not public_assistant:
+        raise HTTPException(status_code=401, detail="Please select a public avatar or use your API key from signup.")
+
+    user['identities'] = [{}]
+
+    user['identities'][0]['user_id'] = hashed_ip
+
+    app_metadata = {
+      "api_key": _hash_key(context.anonymous_api_key),
+      "assistant_config": {
+        "configurable": {
+          "assistant_id": assistant_id,
+          "user_id": hashed_ip,
+          "user_ctx": {
+              "name": "Anonymous",
+              "description": None
+          },
+          "assistant_ctx": {
+            "name": assistant.get("name", None),
+            "description": assistant.get("description", None),
+            "metadata": assistant.get("metadata", {})
+          }
+        }
+      }
+    }
+    user['app_metadata'] = app_metadata
+    user['API-KEY'] = context.anonymous_api_key
+
+
+    # result.raise_for_status()
+    # users = result.json()
+    # if not users:
+    #     return None
+    # user = users[0]
+
+    # if user['email_verified'] != True:
+    #     raise print(detail="Email is not yet verified. Please verify email to continue.", status_code=401)
+    
+    return user
+
+async def get_current_user_or_anonymous_user(request: Request, assistant_id: str, api_key: str | None = Depends(anonymous_api_key_scheme)) -> dict:
+    """
+    This dependency validates the JWT and returns the payload.
+    The 'sub' field in the payload is the Auth0 user_id.
+    """
+    logger.info("breakpoint")
+    if not api_key:
+        # create anonymous user
+        user = await get_anonymous_user_with_anonymous_api_key(request=request, assistant_id=assistant_id)
+    else:
+        user = await get_user_with_api_key(api_key, request)    
+    
+    if not user:
+        # create anonymous user
+        if not api_key:
+            raise HTTPException(status_code=500, detail="Error creating anonymous user.")
+        else:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    return user
     # if not res:
         # return None
     
@@ -514,7 +622,7 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
 
         customer_id = current_user['app_metadata'].get('customer', {}).get('id', "")
 
-        if customer_id and customer_id is not "":
+        if customer_id and customer_id != "":
             # delete customer information
             stripe = request.app.state.stripe
             try:

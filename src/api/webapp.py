@@ -699,16 +699,12 @@ async def message_selected_avatar(
     response['thread_id'] = thread_id
     return JSONResponse(response, status_code=200)
 
-
-
-
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,     
     assistant_id: str,
     body: MessagePayload,
     thread_id: Optional[str] = None,
-    file: Optional[UploadFile] = File(default=None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
     ):
 
@@ -770,18 +766,18 @@ async def message_avatar(
     graph = app.state.graph
 
 
-    if file and file.content_type == "text/plain":
-        contents = await file.read()
-        content = contents.decode('utf-8')
-    else:
-        content = ""
+    # if file and file.content_type == "text/plain":
+    #     contents = await file.read()
+    #     content = contents.decode('utf-8')
+    # else:
+    #     content = ""
 
-    if content == "":
-        human_message_content = body.message
-    else: 
-        human_message_content = body.message + "\n\n" + content
+    # if content == "":
+    #     human_message_content = body.message
+    # else: 
+    #     human_message_content = body.message + "\n\n" + content
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
 
     logger.info(f"{result}")
 

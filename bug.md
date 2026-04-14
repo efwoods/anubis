@@ -136,3 +136,5 @@ if runtime.state.get('recalled_memory_documents', None) is not None:
    'user_identity_documents': [],
    'user_state': {'user_id': '9977df19-9ceb-5f87-a130-55f6a6282069'}},
   'interrupts': {}}]
+
+reference image to text needs to be debugged

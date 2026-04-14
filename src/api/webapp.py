@@ -62,6 +62,8 @@ from src.security.auth import get_current_user_or_anonymous_user
 
 from uuid import uuid4
 
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
 class ASSISTANT_QUERY(BaseModel):
     assistant_id: UUID
     graph_id: str
@@ -153,8 +155,11 @@ async def lifespan(app: FastAPI):
             await store.setup()
             logger.info("Store setup complete")
             app.state.store = store
-            app.state.graph = message_workflow.compile(store=store)
-            app.state.response_only_graph = response_only_workflow.compile(store=store)
+            checkpointer = AsyncPostgresSaver(app.state.pool)
+            await checkpointer.setup()
+            app.state.checkpointer = checkpointer
+            app.state.graph = message_workflow.compile(store=store, checkpointer=checkpointer)
+            app.state.response_only_graph = response_only_workflow.compile(store=store, checkpointer=checkpointer)
             app.state.response_only_graph.name = "Anubis"
             app.state.graph.name = "Anubis"
             logger.info("Application startup: lifecycle complete")
@@ -701,7 +706,6 @@ async def message_avatar(
         except Exception as e:
             raise HTTPException(status_code=500, detail="Error selecting avatar.")
         
-
         config_update = {
                 "configurable": {
                     "user_ctx": {"name":user_name, "description": user_description},
@@ -716,6 +720,7 @@ async def message_avatar(
             }
     
     else:
+        # anonymous user_id and assistant_id is handled in the current_user dependency function
         config_update = {
             "configurable": {
                 "user_ctx": {"name":user_name, "description": user_description},
@@ -725,39 +730,21 @@ async def message_avatar(
     # Handle thread_id
     if not thread_id:
         thread_id = str(uuid4())
-        thread_metadata = {"user_id":user_id, "assistant_id":assistant_id, "graph_id": "Anubis"}
+        thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id}, "graph_id": "Anubis"}
         # create thread_id
         try:
             langgraph_client = get_client()
             thread_create_response = await langgraph_client.threads.create(thread_id=thread_id, 
-            metadata={"graph_id":"Anubis"})
+            metadata=thread_metadata)
         except Exception as e:
             raise HTTPException(status_code=500, detail="Error creating new conversation thread.")
-        try:
-            thread_update_response = await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail="Error updating conversation metadata with assistant_id.")
-    else:
-        try:
-            thread_response = await langgraph_client.threads.get(thread_id=thread_id)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail="Error retrieving historical messages.")
-    
+
     # update with user information
     config_update['configurable']['thread_id'] = thread_id
     config['configurable'].update(config_update['configurable'])
 
-        # store = app.state.store
-    graph = app.state.response_only_graph
-
-        # system_time = datetime.now(tz=timezone.utc).isoformat
-        # content = [{"type":"text", "text": system_time}]
-        # input = {"messages": HumanMessage(content=content)}
-        # # store = make_pg_store()
-
-        # result = await url_loading_graph.ainvoke(input, config=config)
-
-        # logger.info(f"config: {config}")
+    # store = app.state.store
+    graph = app.state.graph
         
     result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
 

@@ -60,6 +60,8 @@ from src.security.auth import check_subscription_status
 
 from src.security.auth import get_current_user_or_anonymous_user
 
+from uuid import uuid4
+
 class ASSISTANT_QUERY(BaseModel):
     assistant_id: UUID
     graph_id: str
@@ -137,6 +139,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"app.state.context.dev: {app.state.context.dev}")
         pool = AsyncConnectionPool(
             conninfo=async_postgres_store_uri,
+            min_size=1,
             max_size=5,
             kwargs={"autocommit": True, "prepare_threshold": 0},
             open=False,  # don't open on construction
@@ -673,10 +676,11 @@ class PublicAvatarMessagePayload(BaseModel):
     your_description: Optional[str] = None
 
 @app.post("/message/{assistant_id}")
-async def message(
+async def message_avatar(
     request: Request,     
-    assistant_id: str,    
+    assistant_id: str,
     body: PublicAvatarMessagePayload,
+    thread_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
     ):
 
@@ -689,16 +693,15 @@ async def message(
 
     user_name = body.your_name
     user_description = body.your_description
+    user_id = current_user['identities'][0]['user_id']
     if request.headers.get("api-key") != '':
-
-        user_id = current_user['identities'][0]['user_id']
-
         try:
             langgraph_client = get_client()
             assistant = await langgraph_client.assistants.get(assistant_id = assistant_id)
         except Exception as e:
             raise HTTPException(status_code=500, detail="Error selecting avatar.")
         
+
         config_update = {
                 "configurable": {
                     "user_ctx": {"name":user_name, "description": user_description},
@@ -715,10 +718,33 @@ async def message(
     else:
         config_update = {
             "configurable": {
-                "user_ctx": {"name":user_name, "description": user_description}
+                "user_ctx": {"name":user_name, "description": user_description},
             }
         }
+
+    # Handle thread_id
+    if not thread_id:
+        thread_id = str(uuid4())
+        thread_metadata = {"user_id":user_id, "assistant_id":assistant_id, "graph_id": "Anubis"}
+        # create thread_id
+        try:
+            langgraph_client = get_client()
+            thread_create_response = await langgraph_client.threads.create(thread_id=thread_id, 
+            metadata={"graph_id":"Anubis"})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error creating new conversation thread.")
+        try:
+            thread_update_response = await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error updating conversation metadata with assistant_id.")
+    else:
+        try:
+            thread_response = await langgraph_client.threads.get(thread_id=thread_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error retrieving historical messages.")
+    
     # update with user information
+    config_update['configurable']['thread_id'] = thread_id
     config['configurable'].update(config_update['configurable'])
 
         # store = app.state.store
@@ -743,6 +769,7 @@ async def message(
     if response_metadata:
         response["response_metadata"] = response_metadata
     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+    response['thread_id'] = thread_id
     return JSONResponse(response, status_code=200)
 
 

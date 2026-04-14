@@ -91,3 +91,50 @@ if runtime.state.get('recalled_memory_documents', None) is not None:
                 }
             }
         )
+
+
+{'thread_id': '46138c1c-a252-49cf-bb4c-38c49ae90731', 'created_at': '2026-04-13T17:37:49.323915+00:00', 'updated_at': '2026-04-13T17:37:49.323915+00:00', 'state_updated_at': '2026-04-13T17:37:49.323915+00:00', 'metadata': {'graph_id': 'Anubis', 'user_id': '69d84efdd88d8ee81c7dcb45'}, 'config': {}, 'error': None, 'status': 'idle', 'values': None, 'interrupts': {}}
+
+[{'thread_id': '1e3bb8d5-f69f-457c-b328-6b85c016ad6f',
+  'created_at': '2026-04-13T14:27:37.423798+00:00',
+  'updated_at': '2026-04-13T15:24:22.243253+00:00',
+  'state_updated_at': '2026-04-13T15:24:22.243253+00:00',
+  'metadata': {'assistant_id': '79fab19b-a868-480f-8f46-d31745d838b7',
+   'graph_id': 'Anubis'},
+  'config': {'configurable': {'__after_seconds__': 0,
+    '__request_start_time_ms__': 1776090542175,
+    'assistant_id': '79fab19b-a868-480f-8f46-d31745d838b7',
+    'langgraph_auth_permissions': [],
+    'langgraph_auth_user': None,
+    'langgraph_auth_user_id': '',
+    'langgraph_request_id': 'e1a7aa33-5b8e-4969-b87e-521f7e870ef7',
+    'run_id': '019d873e-f060-70b2-b136-e4af1732fe5e',
+    'user_id': ''}},
+  'error': {'error': 'KeyError', 'message': "'assistant_ctx'"},
+  'status': 'error',
+  'values': {'assistant_identity_documents': [],
+   'assistant_state': {'assistant_id': '79fab19b-a868-480f-8f46-d31745d838b7'},
+   'internal_thoughts': [],
+   'media_list': [],
+   'messages': [{'additional_kwargs': {},
+     'content': [{'text': 'hi', 'type': 'text'}],
+     'id': 'fde1fa40-75c8-4364-a634-bb62e9c8f280',
+     'name': None,
+     'response_metadata': {},
+     'type': 'human'},
+    {'additional_kwargs': {},
+     'content': [{'text': 'test', 'type': 'text'}],
+     'id': '1cd4f8c7-bb40-4dc7-bd06-2ca53da38fb8',
+     'name': None,
+     'response_metadata': {},
+     'type': 'human'}],
+   'processed_media_to_be_formatted': [],
+   'queries': [],
+   'recalled_memory_documents': [],
+   'retrieved_docs': [],
+   'system_message': [],
+   'user_identity_documents': [],
+   'user_state': {'user_id': '9977df19-9ceb-5f87-a130-55f6a6282069'}},
+  'interrupts': {}}]
+
+reference image to text needs to be debugged

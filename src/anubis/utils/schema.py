@@ -130,7 +130,7 @@ I believe that through the research and development of A.I., we will understand 
 
 class ReferenceDocumentOrBiographicalConversationalInformation(BaseModel):
            """ Determine if the content is one of two categories: the first category is a reference document such as a menu or a well known religious text such as the bible. The second category is conversational or biographical information such as in an interview, a monologue, a persentation, biography, or a script. """
-           is_reference_document: bool = Field(description= "This is TRUE when the text is a menu or well-known religious text such as the bible. This is FALSE otherwise and is intended to be FALSE when there is a script or a monologue or an interview between two people.")
+           is_menu_or_religious_text: bool = Field(description= """This is TRUE when the text is a menu or well-known religious text such as the bible. This is FALSE otherwise and is intended to be FALSE when there is a script or a monologue or an interview between two people. This is FALSE when there is a biography of a real or fictional person. If the reasoning determines this is FALSE, then is_reference_document needs to match the reasoning determination exactly. TRUE only when the text is a restaurant/food menu OR a well-known religious holy text (e.g. Bible, Quran, Torah). FALSE for everything else — including wiki pages, character biopages, interviews, monologues, biographies, scripts, tweets, and Q&A. A formal or encyclopedic writing style does NOT make a document a reference document. IMPORTANT: this value MUST match the conclusion in your reasoning field. If reasoning says FALSE, this must be FALSE.""")
            reasoning: str = Field(
                description = "Step-by-step reasoning behind the decision for the classified situation of the text. (Biographical conversational informaiton includes: single speaker monologue, single tweet from user, a biography, strictly Question and answer, multi-speaker content that is Non-religious. There is a target to identify in the non-religious text document in biographical conversational informaiton when is_reference_document is FALSE.)"
            )
@@ -144,22 +144,22 @@ Your role is to analyze and classify text with respect to the situation of the c
 <Instructions>
 Your objective is the following:
 Classify the text and decide whether the text contains one of the following situations:
-- A Non-Personally Identifiable Document
-- A Personally Identifiable Document
+- Menu or Religious Document
+- A Biographical or Conversational Document
 
 Present a clear succinct reason why the classification was chosen using examples from the source text to support your reasoning.
 </Instructions>
 
 <Rules>
-=========== Non-Personally Identifiable Document GUIDELINES FOLLOW ===========
+=========== Non-biographical or Conversational Document GUIDELINES FOLLOW ===========
 
-Use the following rules to help determine the situation of the given text for a Non-Personally Identifiable Document:
+Use the following rules to help determine the situation of the given text for a Non-biographical or Conversational Document:
 
-Classify the text as a Non-Personally Identifiable Document given text in the following situations:
+Classify the text as a Non-biographical or Conversational Document given text in the following situations:
 - The text is a menu for a restaurant
 - The text is a religious document such as the Bible or the Koran or other well-known Holy Text.
 
-Use the following examples to help determine the situation of the given text for a Non-Personally Identifiable Document situation:
+Use the following examples to help determine the situation of the given text for a Non-biographical or Conversational Document situation:
 
 Example of a menu:
 Starbucks Drinks Menu
@@ -243,27 +243,56 @@ unto one place, and let the dry land appear: and it was so.
 1:10 And God called the dry land Earth; and the gathering together of
 the waters called he Seas: and God saw that it was good.
 
-=========== Personally Identifiable Document GUIDELINES FOLLOW ===========
+=========== Biographical or Conversational Document GUIDELINES FOLLOW ===========
 
-Use the following rules to help determine the situation of the given text for Personally Identifiable Document situations:
+Use the following rules to help determine the situation of the given text for Biographical or Conversational Document situations:
 
-Classify the text as a Personally Identifiable Document:
+Classify the text as a Biographical or Conversational Document:
 - There is a single tweet
 - There is a single statement
 - There is a label of the speaker and there is only one speaker
 - There is only a single speaker detected in the content
+- There is biographical information about a real person or fictional character.
 
 - There is more than one speaker 
 - There is turn-taking between two or more speakers
 - There are labels of the speakers and the text is NON-RELIGIOUS
 
-Examples of Personally Identifiable Document situations:
+IMPORTANT
+- Wiki articles or encyclopedia-style pages about characters, people, or topics
+- Pages from fandom/fan wikis (e.g. Narutopedia, Wookieepedia)
+- Biographical pages about real or fictional persons, regardless of writing style
+- Any formal or structured document that is NOT a menu or religious text
+</Rules>
+
+
+<EXAMPLE>
+Examples of Biographical or Conversational Document situations:
 
 @elonmusk I think you're amazing. Thank you for pushing the envelope forward for all of humanity!
+</EXAMPLE>
 
+<EXAMPLE>
+Examples of Biographical or Conversational Document situations:
 Joe Rogan: That's my favorite watch.
 Lex Fridman: Thanks Brother.
-</Rules>
+</EXAMPLE>
+
+<EXAMPLE>
+Examples of Biographical or Conversational Document situations:
+The given text is a wiki page about the character Kurama from the Naruto series. It contains detailed information about the character\'s background, personality, appearance, abilities, and other relevant details. The text is written in a formal and informative style, typical of a wiki article
+</EXAMPLE>
+
+<Instructions>
+Your objective is the following:
+Classify the text and decide whether the text contains one of the following situations:
+- Menu or Religious Document
+- A Biographical or Conversational Document
+
+Present a clear succinct reason why the classification was chosen using examples from the source text to support your reasoning.
+</Instructions>
+
+
 """
 
 

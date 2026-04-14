@@ -289,6 +289,48 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
 # async def update_response_metadata()
 
 """ GRAPH """
+
+
+""" RESPONSE ONLY FOR API ENDPOINT """
+
+# Build minimal graph: START -> agent -> END
+response_only_subgraph_workflow = StateGraph(
+    state_schema = GlobalState,
+    input_schema = GlobalState,
+    output_schema = MessagesState,
+    context_schema = GlobalContext
+)
+
+""" RESPONSE ONLY WORKFLOW NODES """
+
+response_only_subgraph_workflow.add_node("load_consciousness", load_consciousness)
+response_only_subgraph_workflow.add_node("respond", respond)
+
+""" RESPONSE ONLY WORKFLOW EDGES """
+
+response_only_subgraph_workflow.add_edge(START, "load_consciousness")
+response_only_subgraph_workflow.add_edge("load_consciousness", "respond")
+response_only_subgraph_workflow.add_edge("respond", END)
+
+response_graph = response_only_subgraph_workflow.compile()
+
+response_only_workflow = StateGraph(
+    state_schema = GlobalState,
+    input_schema = MessagesState,
+    output_schema = MessagesState,
+    context_schema = GlobalContext
+)
+
+# workflow.add_edge("terms_and_services_content_moderation", END)
+response_only_workflow.add_node("chat", message_interface)
+response_only_workflow.add_node("anubis", response_graph)
+
+response_only_workflow.add_edge(START, "chat")
+response_only_workflow.add_edge("chat", "anubis")
+response_only_workflow.add_edge("anubis", END)
+
+""" END OF REPSONSE ONLY FOR API ENDPOINT """
+
 # Build minimal graph: START -> agent -> END
 anubis_workflow = StateGraph(
     state_schema = GlobalState,

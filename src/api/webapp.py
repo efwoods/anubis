@@ -105,11 +105,11 @@ async def store_api_metrics(
         return
 
     query = """
-    INSERT INTO api_metrics (
-        request_id, user_id, endpoint, method, model, prompt_tokens, completion_tokens,
-        total_tokens, request_latency_ms, response_status, cost_usd, conversation_id,
-        langsmith_trace_id, error_message
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        INSERT INTO api_metrics (
+            request_id, user_id, endpoint, method, model, prompt_tokens, completion_tokens,
+            total_tokens, request_latency_ms, response_status, cost_usd, conversation_id,
+            langsmith_trace_id, error_message
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     try:

@@ -12,6 +12,8 @@ services:
         ports:
             - "8123:8000"
             - "5678:5678"
+        extra_hosts:
+            - "host.docker.internal:host-gateway" 
         healthcheck:
             test: python /api/healthcheck.py
             interval: 60s

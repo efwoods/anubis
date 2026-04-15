@@ -1,10 +1,8 @@
 # src/anubis/webapp.py
 import os
 from typing import List
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Depends, Request
 
-from fastapi import Request
 import httpx
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
@@ -14,6 +12,12 @@ from psycopg_pool import AsyncConnectionPool
 
 import logging
 logger = logging.getLogger(__name__)
+
+# Add metrics imports
+import time
+from time import time_ns
+import uuid
+from decimal import Decimal
 
 # Preload audio to text processor [this needs a startup in a lifecycle call]
  
@@ -32,13 +36,12 @@ from src.security.auth import security_route, auth
 from langgraph_sdk.auth import Auth
 
 from src.security.auth import get_current_user
-from fastapi import Response, Depends
 
 from src.security.auth import security
 from fastapi.security import HTTPAuthorizationCredentials
 import json
 
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 
 from uuid import uuid4, uuid5, NAMESPACE_URL
 
@@ -58,7 +61,7 @@ from urllib.parse import quote
 from src.security.auth import update_assistant_config
 from src.security.auth import check_subscription_status
 
-from src.security.auth import get_current_user_or_anonymous_user
+from src.security.auth import get_current_user_or_anonymous_user, get_current_user_or_anonymous_user_id
 
 from uuid import uuid4
 
@@ -78,6 +81,62 @@ class ASSISTANT_QUERY(BaseModel):
 
     def to_assistant(self) -> Assistant:
         return self.model_dump(mode='json')
+
+# Metrics helper functions
+async def store_api_metrics(
+    request_id: str,
+    user_id: str = None,
+    endpoint: str = None,
+    method: str = None,
+    model: str = None,
+    prompt_tokens: int = None,
+    completion_tokens: int = None,
+    total_tokens: int = None,
+    request_latency_ms: int = None,
+    response_status: int = None,
+    cost_usd: float = None,
+    conversation_id: str = None,
+    langsmith_trace_id: str = None,
+    error_message: str = None,
+    pool=None
+):
+    """Store API metrics in the database"""
+    if not pool:
+        return
+
+    query = """
+    INSERT INTO api_metrics (
+        request_id, user_id, endpoint, method, model, prompt_tokens, completion_tokens,
+        total_tokens, request_latency_ms, response_status, cost_usd, conversation_id,
+        langsmith_trace_id, error_message
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    """
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query, (
+                    request_id, user_id, endpoint, method, model, prompt_tokens,
+                    completion_tokens, total_tokens, request_latency_ms, response_status,
+                    cost_usd, conversation_id, langsmith_trace_id, error_message
+                ))
+    except Exception as e:
+        logger.error(f"Failed to store metrics: {e}")
+
+def calculate_openai_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Calculate OpenAI API cost based on model and token usage"""
+    # Pricing as of 2024 (update as needed)
+    pricing = {
+        'gpt-5.4-nano': {'prompt': 0.0000002, 'completion': 0.00000125},
+        'google/gemma-3-27b-it': {'prompt': 0.00000023, 'completion':0.00000038},
+        'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8': {'prompt':0.00000027, "completion": 0.00000085}
+    }
+
+    if model not in pricing:
+        return 0.0
+
+    cost = (prompt_tokens * pricing[model]['prompt']) + (completion_tokens * pricing[model]['completion'])
+    return round(cost, 6)
 
 import debugpy
 if os.getenv("DEBUG", 'false').lower() == 'true':
@@ -119,9 +178,6 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
             data = await cur.fetchall()
 
             return [assistant_query.to_assistant() for assistant_query in data]
-
-
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -176,6 +232,43 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Middleware for request metrics
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start_time = time_ns()
+    request_id = str(uuid.uuid4())
+
+    # Add request ID to request state
+    request.state.request_id = request_id
+
+    try:
+        response = await call_next(request)
+        latency_ms = (time_ns() - start_time) // 1_000_000
+
+        # Store basic request metrics
+        await store_api_metrics(
+            request_id=request_id,
+            endpoint=str(request.url.path),
+            method=request.method,
+            request_latency_ms=latency_ms,
+            response_status=response.status_code,
+            pool=getattr(request.app.state, 'pool', None)
+        )
+
+        return response
+    except Exception as e:
+        latency_ms = (time_ns() - start_time) // 1_000_000
+        await store_api_metrics(
+            request_id=request_id,
+            endpoint=str(request.url.path),
+            method=request.method,
+            request_latency_ms=latency_ms,
+            response_status=500,
+            error_message=str(e),
+            pool=getattr(request.app.state, 'pool', None)
+        )
+        raise
 
 @app.get("/*", include_in_schema=False)
 async def documentation():
@@ -617,10 +710,78 @@ class MessagePayload(BaseModel):
     your_description: Optional[str] = None
     conversation_title: Optional[str] = None
 
+class FeedbackData(BaseModel):
+    """Feedback data for human-in-the-loop responses"""
+    feedback_type: str  # 'like', 'dislike'
+    score: Optional[float] = None  # 0 or 1 for thumbs, or custom score
+    comment: Optional[str] = None
+    edited_response: Optional[str] = None  # User edited the response
+    
+class MessageResponse(BaseModel):
+    """Response model for message endpoints with feedback support"""
+    content: str
+    response_metadata: Optional[dict] = None
+    total_response_time_ms: int
+    thread_id: str
+    request_id: str  # For feedback submission
+    feedback: Optional[FeedbackData] = None
+
+async def update_user_preferences_from_feedback(
+    store,
+    user_id: str,
+    assistant_id: str,
+    feedback_type: str,
+    edited_response: Optional[str] = None,
+    comment: Optional[str] = None
+):
+    """Update user preferences in store based on feedback"""
+    if not store:
+        return
+    
+    try:
+        namespace = (user_id, assistant_id, "preferences")
+        
+        # Retrieve existing preferences
+        try:
+            existing = await store.get_items(namespace, limit=1)
+            preferences = existing[0]['value'] if existing else {}
+        except:
+            preferences = {}
+        
+        # Update feedback history
+        if 'feedback_history' not in preferences:
+            preferences['feedback_history'] = []
+        
+        feedback_entry = {
+            'type': feedback_type,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'comment': comment
+        }
+        
+        # If user edited the response, capture it
+        if edited_response:
+            feedback_entry['edited_response'] = edited_response
+            feedback_entry['edit_type'] = 'response_correction'
+        
+        preferences['feedback_history'].append(feedback_entry)
+        
+        # Update store
+        await store.put_items(
+            namespace,
+            [{
+                'key': 'user_preferences',
+                'value': preferences
+            }]
+        )
+        logger.info(f"Updated preferences for user {user_id}, assistant {assistant_id}")
+    except Exception as e:
+        logger.error(f"Failed to update user preferences: {e}")
+
 from time import time_ns
 
 @app.post("/message")
 async def message_selected_avatar(
+    request: Request,
     response: Response,    
     message: str = "Hey! Please tell me about yourself and what you can do for me.",
     your_name: Optional[str] = None,
@@ -690,14 +851,43 @@ async def message_selected_avatar(
     thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id, "most_recent_message": datetime.now(timezone.utc).isoformat(), "conversation_title": conversation_title}, "graph_id": "Anubis"}
     await langgraph_client.threads.update(thread_id=thread_id, metadata = thread_metadata)
 
-    response = {}
-    response["content"] = result['messages'][-1].content
+    response_data = {}
+    response_data["content"] = result['messages'][-1].content
     response_metadata = result['messages'][-1].response_metadata
     if response_metadata:
-        response["response_metadata"] = response_metadata
-    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
-    response['thread_id'] = thread_id
-    return JSONResponse(response, status_code=200)
+        response_data["response_metadata"] = response_metadata
+
+        # Extract OpenAI usage for metrics
+        usage = response_metadata.get('usage', {})
+        model = response_metadata.get('model', '')
+        prompt_tokens = usage.get('prompt_tokens')
+        completion_tokens = usage.get('completion_tokens')
+        total_tokens = usage.get('total_tokens')
+
+        # Calculate cost
+        cost_usd = calculate_openai_cost(model, prompt_tokens or 0, completion_tokens or 0) if model else 0
+
+        # Store detailed metrics
+        await store_api_metrics(
+            request_id=request.state.request_id,
+            user_id=user_id,
+            endpoint='/message',
+            method='POST',
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            request_latency_ms=((time_ns() - start_time) // 1000000),
+            response_status=200,
+            cost_usd=cost_usd,
+            conversation_id=thread_id,
+            pool=request.app.state.pool
+        )
+
+    response_data['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+    response_data['thread_id'] = thread_id
+    response_data['request_id'] = request.state.request_id
+    return JSONResponse(response_data, status_code=200)
 
 @app.post("/message/{assistant_id}")
 async def message_avatar(
@@ -786,103 +976,80 @@ async def message_avatar(
     thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id, "most_recent_message": datetime.now(timezone.utc).isoformat(), "conversation_title":getattr(body, "conversation_title", thread_id)}, "graph_id": "Anubis"}
     await langgraph_client.threads.update(thread_id=thread_id, metadata = thread_metadata)
 
-    response = {}
-    response["content"] = result['messages'][-1].content
+    response_data = {}
+    response_data["content"] = result['messages'][-1].content
     response_metadata = result['messages'][-1].response_metadata
     if response_metadata:
-        response["response_metadata"] = response_metadata
-    response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
-    response['thread_id'] = thread_id
-    return JSONResponse(response, status_code=200)
+        response_data["response_metadata"] = response_metadata
+
+        # Extract OpenAI usage for metrics
+        usage = response_metadata.get('usage', {})
+        model = response_metadata.get('model', '')
+        prompt_tokens = usage.get('prompt_tokens')
+        completion_tokens = usage.get('completion_tokens')
+        total_tokens = usage.get('total_tokens')
+
+        # Calculate cost
+        cost_usd = calculate_openai_cost(model, prompt_tokens or 0, completion_tokens or 0) if model else 0
+
+        # Store detailed metrics
+        await store_api_metrics(
+            request_id=request.state.request_id,
+            user_id=user_id,
+            endpoint=f'/message/{assistant_id}',
+            method='POST',
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            request_latency_ms=((time_ns() - start_time) // 1000000),
+            response_status=200,
+            cost_usd=cost_usd,
+            conversation_id=thread_id,
+            pool=request.app.state.pool
+        )
+
+    response_data['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
+    response_data['thread_id'] = thread_id
+    response_data['request_id'] = request.state.request_id
+    return JSONResponse(response_data, status_code=200)
 
 
-# @app.post("/chat")
-# async def chat(
-#     response: Response,    
-#     message: Optional[Annotated[str, Form(default=None)]],
-#     file: Optional[UploadFile] = File(default=None),
-#     thread_id: Optional[str] = None,
-#     current_user: dict = Depends(get_current_user)
-#     ):
+@app.post("/feedback")
+async def submit_feedback(
+    request: Request,
+    conversation_id: str,
+    feedback_type: str,  # 'like', 'dislike', 'rating'
+    rating: Optional[float] = None,  # 1-5 scale
+    comment: Optional[str] = None,
+    current_user: dict = Depends(get_current_user_or_anonymous_user_id),
+):
+    """Submit user feedback for a conversation"""
+    user_id = current_user['identities'][0]['user_id']
 
-#     logger.info("breakpoint")
-#     # allow for select avatar in query and anonymous user for a dedicated endpoint
-#     start_time = time_ns()
-#     assistant_config = current_user.get("app_metadata", {}).get("assistant_config", {})
-#     if not assistant_config:
-#         raise HTTPException(detail="Please select assistant before messaging.", status_code=400)
+    # Store feedback in database
+    query = """
+    INSERT INTO user_feedback (
+        request_id, user_id, conversation_id, feedback_type, rating, comment
+    ) VALUES ($1, $2, $3, $4, $5, $6)
+    """
 
-#     if not current_user:
-#         user_id = str(uuid5(NAMESPACE_URL, 'ANONYMOUS_USER'))
-#         user_name = None,
-#         user_description = None
-#     else:
-#         user_id = current_user['identities'][0]['user_id']
-#         user_name = None
-#         user_description = None 
+    try:
+        async with request.app.state.pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query, (
+                    request.state.request_id,
+                    user_id,
+                    conversation_id,
+                    feedback_type,
+                    rating,
+                    comment
+                ))
+        return {"status": "feedback recorded"}
+    except Exception as e:
+        logger.error(f"Failed to store feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record feedback")
 
-#     # Handle thread_id
-#     if not thread_id:
-#         thread_id = str(uuid4())
-#         thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_config.get('configurable', {}).get("assistant_id")}, "graph_id": "Anubis"}
-#         # create thread_id
-#         try:
-#             langgraph_client = get_client()
-#             thread_create_response = await langgraph_client.threads.create(thread_id=thread_id, 
-#             metadata=thread_metadata)
-#         except Exception as e:
-#             raise HTTPException(status_code=500, detail="Error creating new conversation thread.")
-
-#     config = {
-#             "configurable": {
-#                 "user_ctx": {"name":user_name, "description": user_description},
-#                 "user_id":user_id, 
-#                 "thread_id":str(uuid4())
-#             }
-#         }
-    
-#     # update with assistant information
-#     config['configurable'].update(assistant_config['configurable'])
-
-#         # store = app.state.store
-#     graph = app.state.graph
-
-#         # system_time = datetime.now(tz=timezone.utc).isoformat
-#         # content = [{"type":"text", "text": system_time}]
-#         # input = {"messages": HumanMessage(content=content)}
-#         # # store = make_pg_store()
-
-#         # result = await url_loading_graph.ainvoke(input, config=config)
-
-#         # logger.info(f"config: {config}")
-
-#     if file and file.content_type == "text/plain":
-#         contents = await file.read()
-#         content = contents.decode('utf-8')
-#     else:
-#         content = ""
-    
-#     if not message:
-#         human_message_content = content
-#     else:
-#         if content == "":
-#             human_message_content = message
-#         else: 
-#             human_message_content = message + "\n\n" + content
-
-#     result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
-
-#     logger.info(f"{result}")
-
-#     response = {}
-#     response["content"] = result['messages'][-1].content
-#     response["response_metadata"] = result['messages'][-1].response_metadata
-#     response['total_response_time_ms'] = ((time_ns() - start_time) // 1000000)
-#     return JSONResponse(response, status_code=200)
-
-from fastapi import Depends, HTTPException
-from fastapi.responses import JSONResponse
-  
 @app.get("/conversations")
 async def get_all_conversations(
     assistant_id: str,

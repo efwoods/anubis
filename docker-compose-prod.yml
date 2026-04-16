@@ -23,9 +23,8 @@ services:
         env_file:
             - .env
         volumes:
-            - .:/deps/anubis`
+            - .:/deps/anubis
             - ~/.cache/huggingface:/root/.cache/huggingface
-
     grafana:
         image: grafana/grafana:latest
         ports:

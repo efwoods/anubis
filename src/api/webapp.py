@@ -19,6 +19,55 @@ from time import time_ns
 import uuid
 from decimal import Decimal
 
+# Prometheus metrics
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import CollectorRegistry
+
+# Create a custom registry for metrics
+registry = CollectorRegistry()
+
+# Define metrics
+REQUEST_COUNT = Counter(
+    'anubis_requests_total',
+    'Total number of requests',
+    ['method', 'endpoint', 'status'],
+    registry=registry
+)
+
+REQUEST_LATENCY = Histogram(
+    'anubis_request_duration_seconds',
+    'Request duration in seconds',
+    ['method', 'endpoint'],
+    registry=registry
+)
+
+ACTIVE_REQUESTS = Gauge(
+    'anubis_active_requests',
+    'Number of active requests',
+    registry=registry
+)
+
+MODEL_TOKENS_TOTAL = Counter(
+    'anubis_model_tokens_total',
+    'Total number of tokens used by model',
+    ['model', 'type'],  # type: prompt or completion
+    registry=registry
+)
+
+MODEL_COST_TOTAL = Counter(
+    'anubis_model_cost_total_usd',
+    'Total cost in USD for model usage',
+    ['model'],
+    registry=registry
+)
+
+API_RESPONSE_STATUS = Counter(
+    'anubis_api_response_status_total',
+    'Response status codes',
+    ['status'],
+    registry=registry
+)
+
 # Preload audio to text processor [this needs a startup in a lifecycle call]
  
 from contextlib import asynccontextmanager
@@ -138,9 +187,6 @@ def calculate_inference_cost(model: str, prompt_tokens: int, completion_tokens: 
     cost = (prompt_tokens * pricing[model]['prompt']) + (completion_tokens * pricing[model]['completion'])
     return round(cost, 9)
 
-import debugpy
-if os.getenv("DEBUG", 'false').lower() == 'true':
-        debugpy.listen(('0.0.0.0', 5678))
 
 async def get_public_avatars(assistant_id: Optional[str] = None, 
                              user_id: Optional[str] = None):
@@ -179,6 +225,12 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
 
             return [assistant_query.to_assistant() for assistant_query in data]
 
+import debugpy
+if os.getenv("DEBUG", 'false').lower() == 'true':
+        debugpy.listen(('0.0.0.0', 5678))
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown events"""
@@ -192,38 +244,35 @@ async def lifespan(app: FastAPI):
     app.state.stripe = stripe
     app.state.stripe.api_key = app.state.context.stripe_secret_key
     
-    if app.state.context.deployment == 'FALSE':
-        async_postgres_store_uri = app.state.context.async_postgres_store_uri
-        logger.warning(f"app.state.context.dev: {app.state.context.dev}")
-        pool = AsyncConnectionPool(
-            conninfo=async_postgres_store_uri,
-            min_size=1,
-            max_size=5,
-            kwargs={"autocommit": True, "prepare_threshold": 0},
-            open=False,  # don't open on construction
-        )
-        app.state.pool = pool
-        await app.state.pool.open()
-        try:
-            embed = "huggingface:" + app.state.context.embedding_model
-            field = ["document.kwargs.page_content"]
-            store = AsyncPostgresStore(app.state.pool, index = IndexConfig(dims=384, embed=embed, field=field))
-            await store.setup()
-            logger.info("Store setup complete")
-            app.state.store = store
-            checkpointer = AsyncPostgresSaver(app.state.pool)
-            await checkpointer.setup()
-            app.state.checkpointer = checkpointer
-            app.state.graph = message_workflow.compile(store=store, checkpointer=checkpointer)
-            app.state.response_only_graph = response_only_workflow.compile(store=store, checkpointer=checkpointer)
-            app.state.response_only_graph.name = "Anubis"
-            app.state.graph.name = "Anubis"
-            logger.info("Application startup: lifecycle complete")
-            yield
-        finally:
-            await pool.close()     
-    else:
+    async_postgres_store_uri = app.state.context.async_postgres_store_uri
+    logger.warning(f"app.state.context.dev: {app.state.context.dev}")
+    pool = AsyncConnectionPool(
+        conninfo=async_postgres_store_uri,
+        min_size=1,
+        max_size=5,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+        open=False, # do not open on create
+    )
+    app.state.pool = pool
+    await app.state.pool.open()
+    try:
+        embed = "huggingface:" + app.state.context.embedding_model
+        field = ["document.kwargs.page_content"]
+        store = AsyncPostgresStore(app.state.pool, index = IndexConfig(dims=384, embed=embed, field=field))
+        await store.setup()
+        logger.info("Store setup complete")
+        app.state.store = store
+        checkpointer = AsyncPostgresSaver(app.state.pool)
+        await checkpointer.setup()
+        app.state.checkpointer = checkpointer
+        app.state.graph = message_workflow.compile(store=store, checkpointer=checkpointer)
+        app.state.response_only_graph = response_only_workflow.compile(store=store, checkpointer=checkpointer)
+        app.state.response_only_graph.name = "Anubis"
+        app.state.graph.name = "Anubis"
+        logger.info("Application startup: lifecycle complete")
         yield
+    finally:
+        await pool.close()     
         
 
 app = FastAPI(
@@ -239,14 +288,24 @@ async def metrics_middleware(request: Request, call_next):
     start_time = time_ns()
     request_id = str(uuid.uuid4())
 
-    # Add request ID to request state
     request.state.request_id = request_id
+    ACTIVE_REQUESTS.inc()
 
     try:
         response = await call_next(request)
         latency_ms = (time_ns() - start_time) // 1_000_000
 
-        # Store basic request metrics
+        REQUEST_COUNT.labels(
+            method=request.method,
+            endpoint=str(request.url.path),
+            status=response.status_code
+        ).inc()
+        REQUEST_LATENCY.labels(
+            method=request.method,
+            endpoint=str(request.url.path)
+        ).observe(latency_ms / 1000)
+        API_RESPONSE_STATUS.labels(status=response.status_code).inc()
+
         await store_api_metrics(
             request_id=request_id,
             endpoint=str(request.url.path),
@@ -259,6 +318,7 @@ async def metrics_middleware(request: Request, call_next):
         return response
     except Exception as e:
         latency_ms = (time_ns() - start_time) // 1_000_000
+        API_RESPONSE_STATUS.labels(status=500).inc()
         await store_api_metrics(
             request_id=request_id,
             endpoint=str(request.url.path),
@@ -269,6 +329,12 @@ async def metrics_middleware(request: Request, call_next):
             pool=getattr(request.app.state, 'pool', None)
         )
         raise
+    finally:
+        ACTIVE_REQUESTS.dec()
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/*", include_in_schema=False)
 async def documentation():
@@ -321,8 +387,6 @@ async def verify_subscription_status(request: Request, current_user: dict = Depe
         return {"subscription_status:" "Not Subscribed"}
     return status
 
-# shivon zilis assistant_id: 59b682f8-9a9c-4f01-bc86-29d487131e5e
-# test user_id: 61f439e3-8557-4710-9d81-13124b35ceca
 
 @app.post("/create_avatar")
 async def create_avatar(
@@ -452,25 +516,6 @@ async def modify_avatar(
                 name=new_avatar_name)
         try:
             assert(type(result) == dict)
-
-            # Update the selected avatar if the avatar was selected
-            # selected_assistant_id = current_user.get('app_metadata', {}).get("assistant_config", {}).get("configurable", {}).get("assistant_id", None)
-
-            # selected_assistant_config = current_user.get('app_metadata', {}).get("assistant_config", {})
-
-            # if selected_assistant_id:
-            #     if selected_assistant_id == assistant_id:
-            #         if selected_assistant_config.get("configurable", {}).get("assistant_ctx", None):
-            #             if new_avatar_description:
-            #                 selected_assistant_config['configurable']['assistant_ctx']['description'] = new_avatar_description
-
-            #             if new_avatar_name: 
-            #                 selected_assistant_config['configurable']['assistant_ctx']['name'] = new_avatar_description
-
-            #             provider_encoded_user_id = quote(current_user['user_id'], safe="")
-
-            #             hashed_api_key = current_user['app_metadata']['api_key']
-            #             update_assistant_config(hashed_api_key, provider_encoded_user_id, assistant_config=selected_assistant_config)
 
             return JSONResponse(content=result, status_code=200)
         except Exception as e:
@@ -659,50 +704,103 @@ from src.anubis.utils.tools.identity.identity_tools import update_self_identity_
 from langgraph.runtime import Runtime
 from langchain_core.runnables import RunnableConfig
 
-# from langgraph.types import StreamWriter
-
-# from langgraph.prebuilt import ToolRuntime
-# ToolRuntime(state=[], store=app.state.store, context = app.state.context, config=config, streamWriter = StreamWriter())
-
-
-# @app.post("/update_avatar_identity")
-# async def update_avatar_identity(
-
-#     assistant_fact: str,
-#     current_user: dict = Depends(get_current_user), 
-#     ):
-
-#     assistant_config = current_user.get('app_metadata', {}).get('assistant_config', {})
-#     user_id = current_user.get("identities", {}).get("user_id", None)
-
-
-
-
-        # context=app.state.context
-        # store = app.state.store
-        # runtime = Runtime(context=context, store=store)
-        # config = {
-        #     "configurable": {
-        #         "user_id": None,
-        #         "assistant_id": None,
-        #         "user_ctx": {
-        #             "name": None, "description": None
-        #         },
-        #         "assistant_ctx": {
-        #             "name": None, 
-        #             "description": None
-        #         }
-        #     }
-        # }
-
-#     update_self_identity_mem_from_user_txt(
-#         assistant_fact: str, fact_context: str, )
-
 class MessagePayload(BaseModel):
     message: str = "Hey! Please tell me about yourself and what you can do for me."
     your_name: Optional[str] = None
     your_description: Optional[str] = None
     conversation_title: Optional[str] = None
+
+import base64
+import tempfile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.messages import HumanMessage
+
+async def process_files_for_message(files: Optional[List[UploadFile]] = None) -> tuple:
+    """Process uploaded files and return content for inclusion in messages.
+    
+    Returns:
+        tuple: (text_content, multimodal_content)
+        - text_content: str - concatenated text from text files
+        - multimodal_content: list or None - multimodal content for vision models
+    """
+    if not files:
+        return "", None
+
+    text_contents = []
+    multimodal_parts = []
+    has_images = False
+
+    for file in files:
+        try:
+            content = await file.read()
+            filename = file.filename or "unknown_file"
+            content_type = file.content_type or ""
+
+            if content_type.startswith('image/'):
+                # Encode image as base64 for vision models
+                base64_image = base64.b64encode(content).decode("utf-8")
+                image_url = f"data:{content_type};base64,{base64_image}"
+                
+                multimodal_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_url}
+                })
+                has_images = True
+                text_contents.append(f"[Image: {filename}]")
+
+            elif content_type.startswith('text/') or content_type == 'application/pdf':
+                # Handle text files and PDFs
+                if content_type == 'application/pdf':
+                    try:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+                            temp_pdf.write(content)
+                            temp_pdf.flush()
+                            pdf_loader = PyPDFLoader(temp_pdf.name)
+                            pdf_docs = pdf_loader.load()
+
+                        pdf_text = "\n\n".join([doc.page_content for doc in pdf_docs if hasattr(doc, 'page_content')])
+                        if pdf_text:
+                            text_contents.append(f"[PDF File: {filename}]\n{pdf_text}")
+                        else:
+                            text_contents.append(f"[PDF File: {filename} - no extractable text]")
+                    except Exception as pdf_error:
+                        logger.error(f"Failed to extract PDF text from {filename}: {pdf_error}")
+                        text_contents.append(f"[PDF File: {filename}]")
+                    finally:
+                        try:
+                            os.unlink(temp_pdf.name)
+                        except Exception:
+                            pass
+                else:
+                    # Text files
+                    try:
+                        text_content = content.decode('utf-8')
+                        text_contents.append(f"[File: {filename}]\n{text_content}")
+                    except UnicodeDecodeError:
+                        text_contents.append(f"[Binary Text File: {filename}]")
+
+            elif content_type.startswith('audio/'):
+                # Audio files - describe that audio was uploaded
+                text_contents.append(f"[Audio File: {filename} - {content_type}]")
+
+            else:
+                # Other file types
+                text_contents.append(f"[File: {filename} - {content_type}]")
+
+        except Exception as e:
+            logger.error(f"Error processing file {file.filename}: {e}")
+            text_contents.append(f"[Error processing file: {file.filename}]")
+
+    # Combine text content
+    combined_text = "\n\n".join(text_contents) if text_contents else ""
+    
+    # Return multimodal content if images are present
+    if has_images:
+        # Create multimodal content with text and images
+        multimodal_content = [{"type": "text", "text": combined_text}] + multimodal_parts
+        return combined_text, multimodal_content
+    
+    return combined_text, None
 
 class FeedbackData(BaseModel):
     """Feedback data for human-in-the-loop responses"""
@@ -861,7 +959,7 @@ async def message_selected_avatar(
     your_name: Optional[str] = None,
     your_description: Optional[str] = None,
     conversation_title: Optional[str] = None,
-    file: Optional[UploadFile] = None,
+    files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     ):
@@ -904,19 +1002,22 @@ async def message_selected_avatar(
     # store = app.state.store
     graph = app.state.graph
 
+    # Process any uploaded files
+    file_text_content, multimodal_content = await process_files_for_message(files)
 
-    if file and file.content_type == "text/plain":
-        contents = await file.read()
-        content = contents.decode('utf-8')
+    # Create the human message content
+    if multimodal_content:
+        # Use multimodal content for vision models
+        human_message = HumanMessage(content=multimodal_content)
     else:
-        content = ""
-
-    if content == "":
-        human_message_content = message
-    else: 
-        human_message_content = message + "\n\n" + content
+        # Use text-only content
+        if file_text_content:
+            human_message_content = message + "\n\n" + file_text_content
+        else:
+            human_message_content = message
+        human_message = HumanMessage(content=human_message_content)
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=human_message_content)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[human_message]}, config = config )
 
     logger.info(f"{result}")
 
@@ -965,9 +1066,13 @@ async def message_selected_avatar(
 
 @app.post("/message/{assistant_id}")
 async def message_avatar(
-    request: Request,     
+    request: Request,
     assistant_id: str,
-    body: MessagePayload,
+    message: str = Form("Hey! Please tell me about yourself and what you can do for me."),
+    your_name: Optional[str] = Form(None),
+    your_description: Optional[str] = Form(None),
+    conversation_title: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
     ):
@@ -979,8 +1084,8 @@ async def message_avatar(
     if not config:
         raise HTTPException(detail="Error retrieving assistant information.", status_code=400)
 
-    user_name = body.your_name
-    user_description = body.your_description
+    user_name = your_name
+    user_description = your_description
     user_id = current_user['identities'][0]['user_id']
     if request.headers.get("api-key") != '':
         try:
@@ -1029,24 +1134,33 @@ async def message_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    # if file and file.content_type == "text/plain":
-    #     contents = await file.read()
-    #     content = contents.decode('utf-8')
-    # else:
-    #     content = ""
+    # Process any uploaded files
+    file_text_content, multimodal_content = await process_files_for_message(files)
 
-    # if content == "":
-    #     human_message_content = body.message
-    # else: 
-    #     human_message_content = body.message + "\n\n" + content
+    # Create the human message content
+    if multimodal_content:
+        # Use multimodal content for vision models
+        human_message = HumanMessage(content=multimodal_content)
+    else:
+        # Use text-only content
+        if file_text_content:
+            human_message_content = message + "\n\n" + file_text_content
+        else:
+            human_message_content = message
+        human_message = HumanMessage(content=human_message_content)
         
-    result = await graph.ainvoke(input={"messages":[HumanMessage(content=body.message)]}, config = config )
+    result = await graph.ainvoke(input={"messages":[human_message]}, config = config )
 
     logger.info(f"{result}")
 
     # Update most_recent_message
+    if conversation_title is not "":
+        conversation_title_data = conversation_title    
+    else:
+        conversation_title_data = thread_id
+    
     langgraph_client = get_client()
-    thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id, "most_recent_message": datetime.now(timezone.utc).isoformat(), "conversation_title":getattr(body, "conversation_title", thread_id)}, "graph_id": "Anubis"}
+    thread_metadata = {"thread_metadata": {"user_id":user_id, "assistant_id":assistant_id, "most_recent_message": datetime.now(timezone.utc).isoformat(), "conversation_title": conversation_title_data}, "graph_id": "Anubis"}
     await langgraph_client.threads.update(thread_id=thread_id, metadata = thread_metadata)
 
     response_data = {}
@@ -1086,38 +1200,6 @@ async def message_avatar(
     response_data['thread_id'] = thread_id
     response_data['request_id'] = request.state.request_id
     return JSONResponse(response_data, status_code=200)
-
-
-@app.post("/feedback")
-async def submit_feedback(
-    request: Request,
-    thread_id: str,
-    feedback_type: str,  # 'like', 'dislike', 'rating', 'edit'
-    rating: Optional[float] = None,  # 1-5 scale for 'rating' type
-    comment: Optional[str] = None,
-    edited_response: Optional[str] = None,  # For 'edit' feedback type
-    current_user: dict = Depends(get_current_user_or_anonymous_user_id),
-):
-    """API endpoint to submit user feedback for a conversation
-    
-    Feedback types:
-    - 'like': User approved the response
-    - 'dislike': User disapproved the response
-    - 'rating': User provided a numerical rating (1-5)
-    - 'edit': User edited/corrected the response
-    """
-    user_id = current_user['identities'][0]['user_id']
-    
-    return await store_user_feedback(
-        pool=request.app.state.pool,
-        user_id=user_id,
-        thread_id=thread_id,
-        feedback_type=feedback_type,
-        request_id=request.state.request_id,
-        rating=rating,
-        comment=comment,
-        edited_response=edited_response
-    )
 
 @app.get("/conversations")
 async def get_all_conversations(
@@ -1347,79 +1429,6 @@ async def delete_avatar_documents(source_document_name: str, current_user: dict 
         return JSONResponse(content=f"Successfully deleted: {source_document_name}", status_code=200)
     except Exception as e:
         raise HTTPException(detail="Error deleting documents.", status_code=500)
-
-# # from src.anbis.subgraphs.email import email_graph
-# class EmailBody(BaseModel):
-#     """ Standard Email Body Format """
-#     assistant_id: str
-#     email_to: str
-#     email_from: str 
-#     email_message: str
-
-# @app.post("/handle_email")
-# async def handle_email(body: EmailBody, current_user: dict = Depends(get_current_user)):
-#     user_id = current_user['identities'][0]['user_id']
-#     config = {
-#             "configurable": {
-#                 "user_id": user_id,
-#                 "assistant_id": body.assistant_id,
-#                 "user_ctx": {"name":None, "description": None},
-#                 "assistant_ctx": {"name":None, "description": None}
-#             }
-#         }
-    
-     
-# @app.post("/process-media-json")
-# async def process_media_json(
-#     media_list: List[dict],
-#     user_id: str = "test_user_1234",
-#     assistant_id: str = "project_gutenberg_assistant_uuid_1234", 
-#     reference_audo: bool = False, 
-#     reference_image: bool = False
-# ):
-#     """
-#     Process media from JSON payload (for pre-encoded base64 data).
-    
-#     Expected format:
-#     {
-#         "media_list": [
-#             {
-#                 "type": "image",
-#                 "data": "base64_encoded_data",
-#                 "metadata": {...}
-#             }
-#         ],
-#         "user_id": "user123",
-#         "assistant_id": "assistant456"
-#     }
-#     """
-#     try:
-#         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import process_media_graph_api_endpoint
-        
-#         initial_state = {
-#             "media_list": media_list,   
-#         }
-
-        
-#         config = {
-#             "configurable": {
-#                 "user_ctx": {"user_id":user_id},
-#                 "assistant_ctx": {"user_id":user_id, "assistant_id":assistant_id}
-#             }
-#         }
-#         result = await process_media_graph_api_endpoint.ainvoke(initial_state, config)
-#         indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-#         return {
-#             "status": "success",
-#             "media_items_processed": len(media_list),
-#             "documents_indexed": len(indexed_docs)
-#         }
-    
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Error processing media: {str(e)}"
-#         )
 
 if __name__ == "__main__":
     import uvicorn

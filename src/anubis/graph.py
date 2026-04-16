@@ -162,8 +162,8 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
 
     response = await model_with_structured_output.ainvoke(input=chat_prompt_template.messages)
     moderation_response = {
-        "violation": response['result'].violation,
-        "reasoning": response['result'].reasoning,
+        "violation": response.violation,
+        "reasoning": response.reasoning,
     }
     return {"moderation_response": moderation_response}
 
@@ -265,13 +265,13 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
 
     # TODO: CALCULATE TOKEN USAGE response['response_metadata']
 
-    logger.info(f"Avatar RESPONSE: {getattr(avatar_response['result'], 'content')}")
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
 
     # response = await avatar.ainvoke(input={"messages": messages})
     # avatar_response = response.get("messages", [])[-1]
     # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
 
-    result = {"messages": [avatar_response['result']]}
+    result = {"messages": [avatar_response]}
 
     return result
 

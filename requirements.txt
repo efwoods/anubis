@@ -11,6 +11,7 @@ langchain-openai
 langchain-together
 langchain-nvidia-ai-endpoints
 
+
 llama-api-client
 pydantic
 openai
@@ -41,3 +42,5 @@ debugpy
 stripe
 
 slack-sdk
+
+prometheus-client

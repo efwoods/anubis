@@ -111,6 +111,20 @@ class GlobalContext:
         },
     )
     
+    model_prompt_cost: str = field(
+        default=None,
+        metadata={
+            "description": "Cost of input tokens."
+        },
+    )
+
+    model_completion_cost: str = field(
+        default=None,
+        metadata={
+            "description": "Completion token cost."
+        },
+    )
+
     image_model: str = field(
         default=None,
         metadata={
@@ -131,6 +145,22 @@ class GlobalContext:
             "description": "Base Url; used without tools for image to text descriptions."
         },
     )
+
+    image_model_prompt_cost: str = field(
+        default=None,
+        metadata={
+            "description": "Cost of input tokens."
+        },
+    )
+
+    image_model_completion_cost: str = field(
+        default=None,
+        metadata={
+            "description": "Completion token cost."
+        },
+    )
+
+
 
 
     dev: str = field(
@@ -240,6 +270,25 @@ class GlobalContext:
     llama_api_key: str = field(
         default = None, 
         metadata={"description": "LLama developer api key."}
+    )
+
+    llama_model: str = field(
+        default = None, 
+        metadata={"description": "LLama model name."}
+    )
+
+    llama_model_prompt_cost: str = field(
+        default=None,
+        metadata={
+            "description": "Cost of input tokens."
+        },
+    )
+
+    llama_model_completion_cost: str = field(
+        default=None,
+        metadata={
+            "description": "Completion token cost."
+        },
     )
 
     def __post_init__(self):

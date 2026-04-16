@@ -11,13 +11,38 @@ from langchain_together import ChatTogether
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_openai import ChatOpenAI
 
+from typing import TypedDict
+
+
+
+from llama_api_client import AsyncLlamaAPIClient
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from typing import List, Any
+from typing import Literal
+from pydantic import BaseModel, field_validator, Field
+from typing import Optional
+
+from langchain_core.messages.utils import count_tokens_approximately
+import json 
+
+# TODO: identify all model call token usage
+
+
+class TokenUsage(TypedDict):
+    prompt_tokens: int
+    total_tokens: int
+    completion_tokens: int
+class ResponseMetadata(TypedDict):
+    model_name: str
+    token_usage: TokenUsage
+
+
 """ TODO: Prevent Rate Limiting and Token Limiting Errors and Handle Message Failures """
 
 def init_model(context: Optional[GlobalContext] = GlobalContext(), 
                tools=[], 
                tool_choice: str = "auto", 
                response_format = None, 
-               image_model: Optional[bool] = False, 
                model_without_tools: Optional[bool] = False
                ):
     
@@ -143,8 +168,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
 def init_image_description_model():
     context = GlobalContext()
     model_name = context.image_model
-    base_url = context.llm_provider_base_url
-    api_key = context.llm_provider_api_key
+    base_url = context.image_model_base_url
+    api_key = context.image_model_api_key
     dev = context.dev
     model_provider = context.model_provider
 
@@ -187,23 +212,29 @@ def init_image_description_model():
     #                 )
     return model
 
-from llama_api_client import AsyncLlamaAPIClient
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from typing import List, Any
-from typing import Literal
-from pydantic import BaseModel, field_validator, Field
-from typing import Optional
 
-from langchain_core.messages.utils import count_tokens_approximately
+async def calculate_token_usage_description_model(model_structured_output_response: any, input_str: str):
+    from langchain_core.messages.utils import count_tokens_approximately
+    class TokenUsage(TypedDict):
+        prompt_tokens: int
+        total_tokens: int
+        completion_tokens: int
 
-# TODO: identify all model call token usage
+    input_tokens = count_tokens_approximately(input_str)
+    completion_tokens = sum([count_tokens_approximately(str(value)) for value in model_structured_output_response.model_dump().values()])
+    total_tokens = input_tokens + completion_tokens
+
+    token_usage = TokenUsage(prompt_tokens=input_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
+    return token_usage
+
+
 
 class AsyncLlamaAPIClientWrapper:
     def __init__(self, response_format = None):
         context = GlobalContext()
         self.llama_api_key = context.llama_api_key
         self.pydantic_model = response_format
-        self.model_name = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+        self.model_name = context.llama_model
 
     async def ainvoke(self, messages: List[Literal[HumanMessage, SystemMessage, AIMessage, dict]]):
       """ Accept a list of langchain messages and a pydantic_model 
@@ -251,7 +282,13 @@ class AsyncLlamaAPIClientWrapper:
                 }
             }
         )
-        return self.pydantic_model.model_validate_json(response.completion_message.content.text)
+
+        formatted_messages_content_str = json.dumps(formatted_messages)
+        token_usage = await calculate_token_usage_description_model(model_structured_output_response=model, input_str=formatted_messages_content_str)
+        model = self.pydantic_model.model_validate_json(response.completion_message.content.text)
+
+        result = {"result": model, "response_metadata": ResponseMetadata(model_name=self.model_name, token_usage=token_usage)}
+        return result
     
       else:
         response = await client.chat.completions.create(
@@ -263,5 +300,7 @@ class AsyncLlamaAPIClientWrapper:
               top_p=0.1,
               repetition_penalty=1,
           )
-        return AIMessage(content=response.completion_message.content.text)
+        # return AIMessage(content=response.completion_message.content.text)
+        result = {"result": AIMessage(content=response.completion_message.content.text), "response_metadata": ResponseMetadata(model_name=self.model_name, token_usage = TokenUsage(prompt_tokens=response.metrics.num_prompt_tokens, total_tokens=response.metrics.num_total_tokens, completion_tokens=response.metrics.num_completion_tokens))}
+        return response
      

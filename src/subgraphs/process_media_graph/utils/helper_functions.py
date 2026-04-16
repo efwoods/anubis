@@ -46,11 +46,13 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
     
     proprietary_content = metadata.get("proprietary_content", False)
 
-    proprietary_content_classification_model = init_model(model_without_tools=True, response_format=ReferenceDocumentOrBiographicalConversationalInformation)
+    proprietary_content_classification_model = init_model(model_without_tools=False, response_format=ReferenceDocumentOrBiographicalConversationalInformation)
     text_content = media_item.get("content", "")
     
     classification = await proprietary_content_classification_model.ainvoke([SystemMessage(content=REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION), HumanMessage(content=text_content[:5000])])
     # if proprietary_content:
+    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
+
     if classification.is_menu_or_religious_text:
         logger.warning(f"proprietary content: No single target; media is only uploaded to vectorstore")
         
@@ -78,7 +80,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
 
         
         model_with_structured_output = init_model(
-            model_without_tools=True,
+            model_without_tools=False,
             response_format=TextualSituationalAwareness
         )
         
@@ -104,17 +106,19 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             # is this content written in first person or is this content about the individual?
             # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
 
-            monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=True, response_format=MonologuePresentationOrSeriesOfQuotes)
+            monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=False, response_format=MonologuePresentationOrSeriesOfQuotes)
 
             system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
             input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
 
+            # TODO: CALCULATE TOKEN USAGE response['response_metadata']
+
             response = await monologue_vs_distinct_quotes_classification_model.ainvoke(input)
+
             classification_metadata = { 
                 "classified_situation": response.classified_situation,  "classification_reasoning": response.reason
             }
             if response.classified_situation == "SeriesOfDistinctQuotes":
-                logger.info("")
                 contiguous_lines = media_item.get("content", "")
                 lines = contiguous_lines.splitlines()
                 idx = 0
@@ -269,8 +273,6 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             logger.warning(f"Error: situation classification is not of type other, multi_speaker, q_and_a_dialogue, or single_speaker")
         return documents
 
-
-
 # TEXT TO VECTORSTORE
 
 """
@@ -408,7 +410,7 @@ async def process_text_media_item_target_for_vectorstore(
             # Define meaningful chunks first
 
             model_structured_output = init_model(
-                        model_without_tools=True,
+                        model_without_tools=False,
                         response_format=SemanticChunkIndexList
             )
 

@@ -123,20 +123,20 @@ async def store_api_metrics(
     except Exception as e:
         logger.error(f"Failed to store metrics: {e}")
 
-def calculate_openai_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+def calculate_inference_cost(model: str, prompt_tokens: int, completion_tokens: int, context: GlobalContext) -> float:
     """Calculate OpenAI API cost based on model and token usage"""
-    # Pricing as of 2024 (update as needed)
+    # Pricing as of 2026
     pricing = {
-        'gpt-5.4-nano': {'prompt': 0.0000002, 'completion': 0.00000125},
-        'google/gemma-3-27b-it': {'prompt': 0.00000023, 'completion':0.00000038},
-        'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8': {'prompt':0.00000027, "completion": 0.00000085}
+        'gpt-5.4-nano': {'prompt': context.model_prompt_cost, 'completion': context.model_completion_cost},
+        'google/gemma-3-27b-it': {'prompt': context.image_model_prompt_cost, 'completion':context.image_model_completion_cost},
+        'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8': {'prompt':context.llama_model_prompt_cost, "completion": context.llama_model_completion_cost}
     }
 
     if model not in pricing:
         return 0.0
 
     cost = (prompt_tokens * pricing[model]['prompt']) + (completion_tokens * pricing[model]['completion'])
-    return round(cost, 6)
+    return round(cost, 9)
 
 import debugpy
 if os.getenv("DEBUG", 'false').lower() == 'true':
@@ -939,7 +939,7 @@ async def message_selected_avatar(
         total_tokens = usage.get('total_tokens')
 
         # Calculate cost
-        cost_usd = calculate_openai_cost(model, prompt_tokens or 0, completion_tokens or 0) if model else 0
+        cost_usd = calculate_inference_cost(model, prompt_tokens or 0, completion_tokens or 0) if model else 0
 
         # Store detailed metrics
         await store_api_metrics(
@@ -1063,7 +1063,7 @@ async def message_avatar(
         total_tokens = usage.get('total_tokens')
 
         # Calculate cost
-        cost_usd = calculate_openai_cost(model, prompt_tokens or 0, completion_tokens or 0) if model else 0
+        cost_usd = calculate_inference_cost(model, prompt_tokens or 0, completion_tokens or 0) if model else 0
 
         # Store detailed metrics
         await store_api_metrics(

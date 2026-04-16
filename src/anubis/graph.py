@@ -154,15 +154,16 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     </ROLE>
 """
 
+    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
     system_message = SystemMessage(content = TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT.format(terms_of_service=TERMS_OF_SERVICE, privacy_policy = PRIVACY_POLICY))
-    model_with_structured_output = init_model(model_without_tools=True, response_format=TermsAndServicesContentModeration)
+    model_with_structured_output = init_model(model_without_tools=False, response_format=TermsAndServicesContentModeration)
 
     chat_prompt_template = [system_message] + [message]
 
     response = await model_with_structured_output.ainvoke(input=chat_prompt_template.messages)
     moderation_response = {
-        "violation": response.violation,
-        "reasoning": response.reasoning,
+        "violation": response['result'].violation,
+        "reasoning": response['result'].reasoning,
     }
     return {"moderation_response": moderation_response}
 
@@ -259,16 +260,18 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
 
     messages = state['system_message'] + state['messages']
 
-    avatar_model = init_model(model_without_tools=True)
+    avatar_model = init_model(model_without_tools=False)
     avatar_response = await avatar_model.ainvoke(messages)
 
-    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
+
+    logger.info(f"Avatar RESPONSE: {getattr(avatar_response['result'], 'content')}")
 
     # response = await avatar.ainvoke(input={"messages": messages})
     # avatar_response = response.get("messages", [])[-1]
     # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
 
-    result = {"messages": [avatar_response]}
+    result = {"messages": [avatar_response['result']]}
 
     return result
 

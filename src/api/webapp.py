@@ -857,7 +857,6 @@ from time import time_ns
 @app.post("/message")
 async def message_selected_avatar(
     request: Request,
-    response: Response,    
     message: str = "Hey! Please tell me about yourself and what you can do for me.",
     your_name: Optional[str] = None,
     your_description: Optional[str] = None,

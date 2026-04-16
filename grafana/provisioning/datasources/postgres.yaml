@@ -7,12 +7,12 @@ datasources:
     access: proxy
     url: host.docker.internal:5432
     user: ${PG_USER}
-    database: ${PG_DB}
+    database: postgres
     secureJsonData:
       password: ${PG_PASSWORD}
     jsonData:
       sslmode: disable
       postgresVersion: 1500
       timescaledb: false
-    isDefault: false
+    isDefault: true
     editable: true

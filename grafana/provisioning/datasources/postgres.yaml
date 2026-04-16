@@ -2,12 +2,17 @@ apiVersion: 1
 
 datasources:
   - name: MyPostgresData
+    uid: MyPostgresData
     type: postgres
+    access: proxy
     url: host.docker.internal:5432
     user: ${PG_USER}
     database: ${PG_DB}
     secureJsonData:
       password: ${PG_PASSWORD}
     jsonData:
-      sslmode: 'disable' # Standard for local dev
-      postgresVersion: 15
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: false
+    isDefault: false
+    editable: true

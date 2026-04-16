@@ -34,6 +34,8 @@ services:
         environment:
             - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
             - GF_PROVISIONING_ENABLED_ENV_SUBST=true
+        env_file:
+            - .env
         volumes:
             - grafana-storage:/var/lib/grafana            
             - ./grafana/provisioning:/etc/grafana/provisioning        

@@ -40,7 +40,7 @@ if __name__ == "__main__":
             data={
               "message": system_message,
             },
-            files=[("files", ("progress_1_hour.txt", fp, "text/plain"))],
+            files={"files": ("progress_1_hour.txt", fp, "text/plain")},
             timeout=httpx.Timeout(120) # timeout in seconds
         )
         update_response = json.loads(response.content.decode('utf-8')).get("content")

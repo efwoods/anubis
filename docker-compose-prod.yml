@@ -1,6 +1,8 @@
 volumes:
     langgraph-data:
         driver: local
+    grafana-storage:
+        driver: local
         
 services:
     langgraph-api-prod:
@@ -21,7 +23,7 @@ services:
         env_file:
             - .env
         volumes:
-            - .:/deps/anubis
+            - .:/deps/anubis`
             - ~/.cache/huggingface:/root/.cache/huggingface
 
     grafana:
@@ -32,4 +34,6 @@ services:
             - "host.docker.internal:host-gateway" 
         environment:
             - GF_SECURITY_ADMIN_PASSWORD=admin
+        volumes:
+            - grafana-storage:/var/lib/grafana
         restart: unless-stopped

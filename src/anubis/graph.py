@@ -88,18 +88,6 @@ from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 """ NODES """
 
 async def message_interface(state:MessagesState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> GlobalState:
-    # logger.info(f"state:{state}")
-    # logger.info(f"config:{config}")
-    # logger.info(f"runtime:{runtime}")
-    # logger.info(f"runtime.store:{runtime.store}")
-    # logger.info(f"runtime.context: {runtime.context}")
-
-    # logger.info(f"assistant_id:{config['configurable']['assistant_id']}")
-    # logger.info(f"configurable:{config['configurable']['langgraph_auth_user_id']}")
-    # logger.info(f"configurable:{config['configurable']}")
-    # logger.info(f"THIS IS AN UPDATE")
-    # logger.info(f"THIS IS ANOTHER UPDATE")
-
     assistant_state = {}
     user_state = {}
 

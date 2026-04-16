@@ -95,7 +95,7 @@ async def store_api_metrics(
     request_latency_ms: int = None,
     response_status: int = None,
     cost_usd: float = None,
-    conversation_id: str = None,
+    thread_id: str = None,
     langsmith_trace_id: str = None,
     error_message: str = None,
     pool=None
@@ -107,7 +107,7 @@ async def store_api_metrics(
     query = """
         INSERT INTO api_metrics (
             request_id, user_id, endpoint, method, model, prompt_tokens, completion_tokens,
-            total_tokens, request_latency_ms, response_status, cost_usd, conversation_id,
+            total_tokens, request_latency_ms, response_status, cost_usd, thread_id,
             langsmith_trace_id, error_message
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
@@ -118,7 +118,7 @@ async def store_api_metrics(
                 await cur.execute(query, (
                     request_id, user_id, endpoint, method, model, prompt_tokens,
                     completion_tokens, total_tokens, request_latency_ms, response_status,
-                    cost_usd, conversation_id, langsmith_trace_id, error_message
+                    cost_usd, thread_id, langsmith_trace_id, error_message
                 ))
     except Exception as e:
         logger.error(f"Failed to store metrics: {e}")
@@ -166,7 +166,7 @@ async def get_public_avatars(assistant_id: Optional[str] = None,
         SELECT * FROM assistant
         WHERE (metadata->>'is_public')::boolean = TRUE
         """
-# WHERE metadata->>'is_public'::boolean IS TRUE
+
     async with pool.connection() as conn:
         async with conn.cursor(row_factory=class_row(ASSISTANT_QUERY)) as cur:
             if assistant_id:
@@ -517,10 +517,6 @@ async def delete_avatar(
     return JSONResponse("Deleted Avatar Successfully", status_code=200)
 
 
-# @app.get("/test")
-# async def test(current_user: dict = Depends(get_current_user)):
-#     return {"current_user": current_user}
-
 @app.get("/list_public_avatars")
 async def list_public_avatars(assistant_id: Optional[str] = None):
     logger.info("breakpoint")
@@ -547,8 +543,6 @@ async def list_user_avatars(
     except Exception as e:
         error = f"Error in listing avatars: {e}"
         return HTTPException(detail=error, status_code=500)
-
-
 
 @app.post("/select_avatar")
 async def select_avatar(
@@ -712,8 +706,8 @@ class MessagePayload(BaseModel):
 
 class FeedbackData(BaseModel):
     """Feedback data for human-in-the-loop responses"""
-    feedback_type: str  # 'like', 'dislike'
-    score: Optional[float] = None  # 0 or 1 for thumbs, or custom score
+    feedback_type: str  # 'like', 'dislike', 'rating', 'edit'
+    rating: Optional[float] = None  # 1-5 scale for 'rating' type
     comment: Optional[str] = None
     edited_response: Optional[str] = None  # User edited the response
     
@@ -725,6 +719,87 @@ class MessageResponse(BaseModel):
     thread_id: str
     request_id: str  # For feedback submission
     feedback: Optional[FeedbackData] = None
+
+async def store_user_feedback(
+    pool,
+    user_id: str,
+    thread_id: str,
+    feedback_type: str,  # 'like', 'dislike', 'rating', 'edit'
+    request_id: str = None,
+    rating: Optional[float] = None,  # 1-5 scale for 'rating' type
+    comment: Optional[str] = None,
+    edited_response: Optional[str] = None,  # For 'edit' feedback type
+) -> dict:
+    """Helper function to store user feedback in the database
+    
+    Args:
+        pool: Database connection pool
+        user_id: ID of the user providing feedback
+        thread_id: ID of the conversation thread being feedback on
+        feedback_type: Type of feedback ('like', 'dislike', 'rating', 'edit')
+        request_id: Optional request ID for tracking
+        rating: Rating value (1-5) if feedback_type is 'rating'
+        comment: Optional comment text
+        edited_response: Edited response content if feedback_type is 'edit'
+    
+    Returns:
+        dict: Status response with feedback_type included
+        
+    Raises:
+        HTTPException: If validation fails or database error occurs
+    """
+    if not pool:
+        raise HTTPException(status_code=500, detail="Database pool not available")
+    
+    # Validate feedback_type
+    valid_feedback_types = {'like', 'dislike', 'rating', 'edit'}
+    if feedback_type not in valid_feedback_types:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid feedback_type. Must be one of {valid_feedback_types}"
+        )
+    
+    # Validate rating if feedback_type is 'rating'
+    if feedback_type == 'rating':
+        if rating is None or not (1 <= rating <= 5):
+            raise HTTPException(
+                status_code=400,
+                detail="Rating feedback requires a rating value between 1 and 5"
+            )
+    
+    # Validate edited_response if feedback_type is 'edit'
+    if feedback_type == 'edit':
+        if not edited_response:
+            raise HTTPException(
+                status_code=400,
+                detail="Edit feedback requires the edited_response field"
+            )
+        # Store edited response in comment field
+        comment = edited_response
+
+    # Store feedback in database
+    query = """
+    INSERT INTO user_feedback (
+        request_id, user_id, thread_id, feedback_type, rating, comment
+    ) VALUES (%s, %s, %s, %s, %s, %s)
+    """
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query, (
+                    request_id,
+                    user_id,
+                    thread_id,
+                    feedback_type,
+                    rating if feedback_type == 'rating' else None,
+                    comment
+                ))
+        logger.info(f"Stored {feedback_type} feedback for user {user_id} on thread {thread_id}")
+        return {"status": "feedback recorded", "feedback_type": feedback_type}
+    except Exception as e:
+        logger.error(f"Failed to store feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record feedback")
 
 async def update_user_preferences_from_feedback(
     store,
@@ -880,7 +955,7 @@ async def message_selected_avatar(
             request_latency_ms=((time_ns() - start_time) // 1000000),
             response_status=200,
             cost_usd=cost_usd,
-            conversation_id=thread_id,
+            thread_id=thread_id,
             pool=request.app.state.pool
         )
 
@@ -955,7 +1030,6 @@ async def message_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-
     # if file and file.content_type == "text/plain":
     #     contents = await file.read()
     #     content = contents.decode('utf-8')
@@ -1005,7 +1079,7 @@ async def message_avatar(
             request_latency_ms=((time_ns() - start_time) // 1000000),
             response_status=200,
             cost_usd=cost_usd,
-            conversation_id=thread_id,
+            thread_id=thread_id,
             pool=request.app.state.pool
         )
 
@@ -1018,37 +1092,33 @@ async def message_avatar(
 @app.post("/feedback")
 async def submit_feedback(
     request: Request,
-    conversation_id: str,
-    feedback_type: str,  # 'like', 'dislike', 'rating'
-    rating: Optional[float] = None,  # 1-5 scale
+    thread_id: str,
+    feedback_type: str,  # 'like', 'dislike', 'rating', 'edit'
+    rating: Optional[float] = None,  # 1-5 scale for 'rating' type
     comment: Optional[str] = None,
+    edited_response: Optional[str] = None,  # For 'edit' feedback type
     current_user: dict = Depends(get_current_user_or_anonymous_user_id),
 ):
-    """Submit user feedback for a conversation"""
-    user_id = current_user['identities'][0]['user_id']
-
-    # Store feedback in database
-    query = """
-    INSERT INTO user_feedback (
-        request_id, user_id, conversation_id, feedback_type, rating, comment
-    ) VALUES ($1, $2, $3, $4, $5, $6)
+    """API endpoint to submit user feedback for a conversation
+    
+    Feedback types:
+    - 'like': User approved the response
+    - 'dislike': User disapproved the response
+    - 'rating': User provided a numerical rating (1-5)
+    - 'edit': User edited/corrected the response
     """
-
-    try:
-        async with request.app.state.pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(query, (
-                    request.state.request_id,
-                    user_id,
-                    conversation_id,
-                    feedback_type,
-                    rating,
-                    comment
-                ))
-        return {"status": "feedback recorded"}
-    except Exception as e:
-        logger.error(f"Failed to store feedback: {e}")
-        raise HTTPException(status_code=500, detail="Failed to record feedback")
+    user_id = current_user['identities'][0]['user_id']
+    
+    return await store_user_feedback(
+        pool=request.app.state.pool,
+        user_id=user_id,
+        thread_id=thread_id,
+        feedback_type=feedback_type,
+        request_id=request.state.request_id,
+        rating=rating,
+        comment=comment,
+        edited_response=edited_response
+    )
 
 @app.get("/conversations")
 async def get_all_conversations(
@@ -1084,8 +1154,6 @@ async def get_thread_messages(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
  
-
-
 # @app.post("/test_upload_media_file")
 # async def test_upload_media_file(
 #     files: List[UploadFile] = File(...),
@@ -1302,8 +1370,6 @@ async def delete_avatar_documents(source_document_name: str, current_user: dict 
 #         }
     
      
-
-
 # @app.post("/process-media-json")
 # async def process_media_json(
 #     media_list: List[dict],

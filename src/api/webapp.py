@@ -955,12 +955,12 @@ from time import time_ns
 @app.post("/message")
 async def message_selected_avatar(
     request: Request,
-    message: str = "Hey! Please tell me about yourself and what you can do for me.",
-    your_name: Optional[str] = None,
-    your_description: Optional[str] = None,
-    conversation_title: Optional[str] = None,
+    message: str = Form("Hey! Please tell me about yourself and what you can do for me."),
+    your_name: Optional[str] = Form(None),
+    your_description: Optional[str] = Form(None),
+    conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
-    thread_id: Optional[str] = None,
+    thread_id: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user),
     ):
 
@@ -1154,7 +1154,7 @@ async def message_avatar(
     logger.info(f"{result}")
 
     # Update most_recent_message
-    if conversation_title is not "":
+    if conversation_title != "":
         conversation_title_data = conversation_title    
     else:
         conversation_title_data = thread_id

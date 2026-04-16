@@ -37,10 +37,10 @@ if __name__ == "__main__":
             headers={
               "API-KEY": API_KEY
             },
-            params={
+            data={
               "message": system_message,
             },
-            files={"file":fp},
+            files={"files": ("progress_1_hour.txt", fp, "text/plain")},
             timeout=httpx.Timeout(120) # timeout in seconds
         )
         update_response = json.loads(response.content.decode('utf-8')).get("content")

@@ -1,6 +1,14 @@
 // .vscode/launch.json
 {
   "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "apiKey",
+      "description": "Enter your Neural Nexus API Key",
+      "default": "",
+      "type": "promptString"
+    }
+  ],
   "configurations": [
     {
       "name": "Attach to Docker LangGraph Server",
@@ -33,6 +41,18 @@
         }
       ],
       "justMyCode": false
+    },
+    {
+      "name": "Debug hourly_progress.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": ["--current"],
+      "env": {
+        "NN_API_KEY": "${env:NN_API_KEY}"
+      }
     }
   ]
 }

@@ -1,5 +1,6 @@
 # src/anubis/webapp.py
 import os
+import re
 from typing import List
 from fastapi import (
     FastAPI,
@@ -339,6 +340,82 @@ app = FastAPI(
 )
 
 
+AUTH_CATCH_ALL_PATTERNS = (
+    # assistants
+    ("POST", re.compile(r"^/assistants$")),
+    ("POST", re.compile(r"^/assistants/search$")),
+    ("POST", re.compile(r"^/assistants/count$")),
+    ("GET", re.compile(r"^/assistants/[^/]+$")),
+    ("DELETE", re.compile(r"^/assistants/[^/]+$")),
+    ("PATCH", re.compile(r"^/assistants/[^/]+$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/graph$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/subgraphs$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/subgraphs/[^/]+$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/schemas$")),
+    ("POST", re.compile(r"^/assistants/[^/]+/versions$")),
+    ("POST", re.compile(r"^/assistants/[^/]+/latest$")),
+    # threads
+    ("POST", re.compile(r"^/threads$")),
+    ("POST", re.compile(r"^/threads/search$")),
+    ("POST", re.compile(r"^/threads/count$")),
+    ("POST", re.compile(r"^/threads/prune$")),
+    ("GET", re.compile(r"^/threads/[^/]+/state$")),
+    ("POST", re.compile(r"^/threads/[^/]+/state$")),
+    ("GET", re.compile(r"^/threads/[^/]+/state/[^/]+$")),
+    ("POST", re.compile(r"^/threads/[^/]+/state/checkpoint$")),
+    ("GET", re.compile(r"^/threads/[^/]+/history$")),
+    ("POST", re.compile(r"^/threads/[^/]+/history$")),
+    ("POST", re.compile(r"^/threads/[^/]+/copy$")),
+    ("GET", re.compile(r"^/threads/[^/]+$")),
+    ("DELETE", re.compile(r"^/threads/[^/]+$")),
+    ("PATCH", re.compile(r"^/threads/[^/]+$")),
+    ("GET", re.compile(r"^/threads/[^/]+/stream$")),
+    # thread runs
+    ("GET", re.compile(r"^/threads/[^/]+/runs$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs/stream$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs/wait$")),
+    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+$")),
+    ("DELETE", re.compile(r"^/threads/[^/]+/runs/[^/]+$")),
+    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+/join$")),
+    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+/stream$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs/[^/]+/cancel$")),
+    # runs
+    ("POST", re.compile(r"^/runs/cancel$")),
+    ("POST", re.compile(r"^/runs/stream$")),
+    ("POST", re.compile(r"^/runs/wait$")),
+    ("POST", re.compile(r"^/runs$")),
+    ("POST", re.compile(r"^/runs/batch$")),
+    # crons
+    ("POST", re.compile(r"^/threads/[^/]+/runs/crons$")),
+    ("POST", re.compile(r"^/runs/crons$")),
+    ("POST", re.compile(r"^/runs/crons/search$")),
+    ("POST", re.compile(r"^/runs/crons/count$")),
+    ("PATCH", re.compile(r"^/runs/crons/[^/]+$")),
+    ("DELETE", re.compile(r"^/runs/crons/[^/]+$")),
+    # store
+    ("PUT", re.compile(r"^/store/items$")),
+    ("DELETE", re.compile(r"^/store/items$")),
+    ("GET", re.compile(r"^/store/items$")),
+    ("POST", re.compile(r"^/store/items/search$")),
+    ("POST", re.compile(r"^/store/namespaces$")),
+    # a2a
+    ("POST", re.compile(r"^/a2a/[^/]+$")),
+    # mcp
+    ("POST", re.compile(r"^/mcp$")),
+    ("GET", re.compile(r"^/mcp$")),
+    ("DELETE", re.compile(r"^/mcp$")),
+)
+
+
+def _is_auth_catch_all_target(method: str, path: str) -> bool:
+    normalized_path = path.rstrip("/") or "/"
+    for expected_method, pattern in AUTH_CATCH_ALL_PATTERNS:
+        if method == expected_method and pattern.match(normalized_path):
+            return True
+    return False
+
+
 # Middleware for request metrics
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
@@ -349,6 +426,16 @@ async def metrics_middleware(request: Request, call_next):
     ACTIVE_REQUESTS.inc()
 
     try:
+        if _is_auth_catch_all_target(method=request.method, path=request.url.path):
+            try:
+                await get_current_user(
+                    request=request, api_key=request.headers.get("API-KEY")
+                )
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code, content={"detail": exc.detail}
+                )
+
         response = await call_next(request)
         latency_ms = (time_ns() - start_time) // 1_000_000
 

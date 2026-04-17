@@ -461,9 +461,10 @@ async def get_anonymous_user_with_anonymous_api_key(request: Request, assistant_
         user = json.loads(auth_response.user.model_dump_json())
     except Exception as e:
         raise HTTPException(status_code=500, detail="Error creating anonymous user sign-in.")
-    if assistant_id is not "":
+    if assistant_id != "":
         try:
-            langgraph_client = get_client()
+            langgraph_client_headers = {"API-KEY": context.anonymous_api_key}
+            langgraph_client = get_client(headers=langgraph_client_headers)
             assistant = await langgraph_client.assistants.get(assistant_id = assistant_id)
         except Exception as e:
             raise HTTPException(status_code=500, detail="Error selecting avatar.")

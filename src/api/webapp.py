@@ -1190,6 +1190,7 @@ async def message_selected_avatar(
 ):
 
     logger.info("breakpoint update")
+    langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1218,7 +1219,7 @@ async def message_selected_avatar(
         }
         # create thread_id
         try:
-            langgraph_client = get_client()
+            langgraph_client = get_client(headers=langgraph_client_headers)
             thread_create_response = await langgraph_client.threads.create(
                 thread_id=thread_id, metadata=thread_metadata
             )
@@ -1254,7 +1255,7 @@ async def message_selected_avatar(
     logger.info(f"{result}")
 
     # Update most_recent_message
-    langgraph_client = get_client()
+    langgraph_client = get_client(headers=langgraph_client_headers)
     thread_metadata = {
         "thread_metadata": {
             "user_id": user_id,
@@ -1325,6 +1326,7 @@ async def message_avatar(
 ):
 
     logger.info("breakpoint")
+    breakpoint()
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1337,8 +1339,9 @@ async def message_avatar(
     user_description = your_description
     user_id = current_user["identities"][0]["user_id"]
     if request.headers.get("api-key") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
         try:
-            langgraph_client = get_client()
+            langgraph_client = get_client(headers=langgraph_client_headers)
             assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
         except Exception as e:
             raise HTTPException(status_code=500, detail="Error selecting avatar.")
@@ -1358,6 +1361,7 @@ async def message_avatar(
 
     else:
         # anonymous user_id and assistant_id is handled in the current_user dependency function
+        langgraph_client_headers = {"API-KEY": app.state.context.anonymous_api_key}
         config_update = {
             "configurable": {
                 "user_ctx": {"name": user_name, "description": user_description},
@@ -1373,7 +1377,7 @@ async def message_avatar(
         }
         # create thread_id
         try:
-            langgraph_client = get_client()
+            langgraph_client = get_client(headers=langgraph_client_headers)
             thread_create_response = await langgraph_client.threads.create(
                 thread_id=thread_id, metadata=thread_metadata
             )
@@ -1414,7 +1418,7 @@ async def message_avatar(
     else:
         conversation_title_data = thread_id
 
-    langgraph_client = get_client()
+    langgraph_client = get_client(headers=langgraph_client_headers)
     thread_metadata = {
         "thread_metadata": {
             "user_id": user_id,
@@ -1471,13 +1475,18 @@ async def message_avatar(
 
 @app.get("/conversations")
 async def get_all_conversations(
+    request: Request,
     assistant_id: str,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return all threads for this user + assistant, newest-first."""
     user_id = current_user["identities"][0]["user_id"]
+    if request.app.get('api-key') != '':
+        langgraph_client_headers = {"API-KEY":request.app.get('api-key')}
+    else:
+        langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
     try:
-        langgraph_client = get_client()
+        langgraph_client = get_client(headers=langgraph_client_headers)
         threads = await langgraph_client.threads.search(
             metadata={
                 "thread_metadata": {"user_id": user_id, "assistant_id": assistant_id}
@@ -1492,13 +1501,18 @@ async def get_all_conversations(
 
 @app.get("/conversations/{thread_id}/messages")
 async def get_thread_messages(
+    request: Request,
     thread_id: str,
     assistant_id: str,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return the message history for a single thread."""
+    if request.app.get('api-key') != '':
+        langgraph_client_headers = {"API-KEY":request.app.get('api-key')}
+    else:
+        langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
     try:
-        langgraph_client = get_client()
+        langgraph_client = get_client(headers=langgraph_client_headers)
         state = await langgraph_client.threads.get_state(thread_id=thread_id)
         messages = state.get("values", {}).get("messages", []) if state else []
         return JSONResponse({"messages": messages})

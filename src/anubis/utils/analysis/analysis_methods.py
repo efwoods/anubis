@@ -29,12 +29,13 @@ async def perform_ocean_analysis(human_message: HumanMessage, additional_metadat
     containing the five results of the analysis."""
 
     logger.info("breakpoint")
+    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
 
-    openness_model_ocean_analysis = init_model(model_without_tools=True, response_format=OPENNESS_OCEAN_ANALYSIS_EXTRACTION)
-    conscientiousness_model_ocean_analysis = init_model(model_without_tools=True, response_format=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_EXTRACTION)
-    extraversion_model_ocean_analysis = init_model(model_without_tools=True, response_format=EXTRAVERSION_OCEAN_ANALYSIS_EXTRACTION)
-    agreeableness_model_ocean_analysis = init_model(model_without_tools=True, response_format=AGREEABLENESS_OCEAN_ANALYSIS_EXTRACTION)
-    neuroticism_model_ocean_analysis = init_model(model_without_tools=True, response_format=NEUROTICISM_OCEAN_ANALYSIS_EXTRACTION)
+    openness_model_ocean_analysis = init_model(model_without_tools=False, response_format=OPENNESS_OCEAN_ANALYSIS_EXTRACTION)
+    conscientiousness_model_ocean_analysis = init_model(model_without_tools=False, response_format=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_EXTRACTION)
+    extraversion_model_ocean_analysis = init_model(model_without_tools=False, response_format=EXTRAVERSION_OCEAN_ANALYSIS_EXTRACTION)
+    agreeableness_model_ocean_analysis = init_model(model_without_tools=False, response_format=AGREEABLENESS_OCEAN_ANALYSIS_EXTRACTION)
+    neuroticism_model_ocean_analysis = init_model(model_without_tools=False, response_format=NEUROTICISM_OCEAN_ANALYSIS_EXTRACTION)
 
     openness_ocean_analysis_prompt = SystemMessage(content=OPENNESS_OCEAN_ANALYSIS_PROMPT)
     conscientiousness_ocean_analysis_prompt = SystemMessage(content=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_PROMPT)

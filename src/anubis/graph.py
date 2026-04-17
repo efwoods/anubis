@@ -88,18 +88,6 @@ from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 """ NODES """
 
 async def message_interface(state:MessagesState, config: RunnableConfig, runtime: Runtime[GlobalContext]) -> GlobalState:
-    # logger.info(f"state:{state}")
-    # logger.info(f"config:{config}")
-    # logger.info(f"runtime:{runtime}")
-    # logger.info(f"runtime.store:{runtime.store}")
-    # logger.info(f"runtime.context: {runtime.context}")
-
-    # logger.info(f"assistant_id:{config['configurable']['assistant_id']}")
-    # logger.info(f"configurable:{config['configurable']['langgraph_auth_user_id']}")
-    # logger.info(f"configurable:{config['configurable']}")
-    # logger.info(f"THIS IS AN UPDATE")
-    # logger.info(f"THIS IS ANOTHER UPDATE")
-
     assistant_state = {}
     user_state = {}
 
@@ -166,8 +154,9 @@ async def terms_and_services_content_moderation(config: RunnableConfig, runtime:
     </ROLE>
 """
 
+    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
     system_message = SystemMessage(content = TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT.format(terms_of_service=TERMS_OF_SERVICE, privacy_policy = PRIVACY_POLICY))
-    model_with_structured_output = init_model(model_without_tools=True, response_format=TermsAndServicesContentModeration)
+    model_with_structured_output = init_model(model_without_tools=False, response_format=TermsAndServicesContentModeration)
 
     chat_prompt_template = [system_message] + [message]
 
@@ -271,8 +260,10 @@ async def respond(state: GlobalState, config: RunnableConfig, runtime: Runtime[G
 
     messages = state['system_message'] + state['messages']
 
-    avatar_model = init_model(model_without_tools=True)
+    avatar_model = init_model(model_without_tools=False)
     avatar_response = await avatar_model.ainvoke(messages)
+
+    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
 
     logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
 

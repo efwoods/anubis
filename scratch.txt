@@ -32,3 +32,5 @@ print(response)
                     # strict=True, # model output will be guaranteed to match the schema
                     # include_raw=True # model response (JSON e.g.) and the parsed response (Pydantic e.g.) will be returned
                 )
+
+

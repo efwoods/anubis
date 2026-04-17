@@ -287,7 +287,7 @@ class AsyncLlamaAPIClientWrapper:
         token_usage = await calculate_token_usage_description_model(model_structured_output_response=model, input_str=formatted_messages_content_str)
         model = self.pydantic_model.model_validate_json(response.completion_message.content.text)
 
-        result = {"result": model, "response_metadata": ResponseMetadata(model_name=self.model_name, token_usage=token_usage)}
+        result = (model, ResponseMetadata(model_name=self.model_name, token_usage=token_usage))
         return result
     
       else:
@@ -301,6 +301,6 @@ class AsyncLlamaAPIClientWrapper:
               repetition_penalty=1,
           )
         # return AIMessage(content=response.completion_message.content.text)
-        result = {"result": AIMessage(content=response.completion_message.content.text), "response_metadata": ResponseMetadata(model_name=self.model_name, token_usage = TokenUsage(prompt_tokens=response.metrics.num_prompt_tokens, total_tokens=response.metrics.num_total_tokens, completion_tokens=response.metrics.num_completion_tokens))}
+        result = (AIMessage(content=response.completion_message.content.text),ResponseMetadata(model_name=self.model_name, token_usage = TokenUsage(prompt_tokens=response.metrics.num_prompt_tokens, total_tokens=response.metrics.num_total_tokens, completion_tokens=response.metrics.num_completion_tokens)))
         return response
      

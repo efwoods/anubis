@@ -1305,6 +1305,7 @@ async def message_selected_avatar(
         )
 
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
+    logger.warning(f"RESPONSE_DATA: {response_data}")
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
     return JSONResponse(response_data, status_code=200)
@@ -1321,7 +1322,7 @@ async def message_avatar(
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
-    thread_id: Optional[str] = None,
+    thread_id: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
 
@@ -1481,8 +1482,8 @@ async def get_all_conversations(
 ):
     """Return all threads for this user + assistant, newest-first."""
     user_id = current_user["identities"][0]["user_id"]
-    if request.app.get('api-key') != '':
-        langgraph_client_headers = {"API-KEY":request.app.get('api-key')}
+    if request.headers.get('api-key') != '':
+        langgraph_client_headers = {"API-KEY":request.headers.get('api-key')}
     else:
         langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
     try:
@@ -1507,8 +1508,8 @@ async def get_thread_messages(
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return the message history for a single thread."""
-    if request.app.get('api-key') != '':
-        langgraph_client_headers = {"API-KEY":request.app.get('api-key')}
+    if request.headers.get('api-key') != '':
+        langgraph_client_headers = {"API-KEY":request.headers.get('api-key')}
     else:
         langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
     try:

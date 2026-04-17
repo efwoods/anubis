@@ -1322,7 +1322,7 @@ async def message_avatar(
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
-    thread_id: Optional[str] = None,
+    thread_id: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
 

@@ -67,7 +67,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
     
     proprietary_content = metadata.get("proprietary_content", False)
 
-    proprietary_content_classification_model = init_model(model_without_tools=True, response_format=ReferenceDocumentOrBiographicalConversationalInformation)
+    proprietary_content_classification_model = init_model(model_without_tools=False, response_format=ReferenceDocumentOrBiographicalConversationalInformation)
     text_content = media_item.get("content", "")
     
     classification = await proprietary_content_classification_model.ainvoke([SystemMessage(content=REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION), HumanMessage(content=text_content[:5000])])
@@ -99,7 +99,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
 
         
         model_with_structured_output = init_model(
-            model_without_tools=True,
+            model_without_tools=False,
             response_format=TextualSituationalAwareness
         )
         
@@ -125,7 +125,7 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
             # is this content written in first person or is this content about the individual?
             # from src.anubis.utils.prompts.system_prompts import DETERMINE_TEXT_SINGLE_SPEAKER_FIRST_PERSON_TONE_OF_VOICE_SYSTEM_PROMPT
 
-            monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=True, response_format=MonologuePresentationOrSeriesOfQuotes)
+            monologue_vs_distinct_quotes_classification_model = init_model(model_without_tools=False, response_format=MonologuePresentationOrSeriesOfQuotes)
 
             system_prompt = MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES
             input = [SystemMessage(content=system_prompt), HumanMessage(content=text_content)]
@@ -263,7 +263,7 @@ async def create_question_list(str_messages_list: list[str]) -> List[str]:
 
     human_messages_list = [HumanMessage(content=message_str) for message_str in str_messages_list]
 
-    model_with_structured_output = init_model(model_without_tools=True, response_format= GeneratedQuestionsList)
+    model_with_structured_output = init_model(model_without_tools=False, response_format= GeneratedQuestionsList)
 
     system_message = SystemMessage(content="Given this list of messages, generate a query to which the message is the response. THERE MUST BE A QUESTION FOR RESPONSE AND THE QUESTION ORDER IN THE LIST MUST MATCH THE RESPONSE ORDER. These questions must be succinct.")
     

@@ -5,3 +5,4 @@ https://github.com/langchain-ai/deep_research_from_scratch
 collect all information about a person and verify the source (Evan Woods or Shivon Zilis)
 
 or collect all information about a persona (Curie fallout wiki etc. or Jester from the Mighty Nein)
+crawl link trees (ev0ra)

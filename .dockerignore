@@ -1,3 +1,14 @@
+.amazonq/
+features/
+milestone/
+markdown/
+metrics/
+q_and_a_testing/
+static/
+tests/
+certificate/
+
+
 notebooks/
 response.md
 error.md

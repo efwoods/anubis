@@ -355,7 +355,7 @@ async def lifespan(app: FastAPI):
         embed = "huggingface:" + app.state.context.embedding_model
         field = ["document.kwargs.page_content"]
         store = AsyncPostgresStore(
-            app.state.pool, index=IndexConfig(dims=384, embed=embed, field=field)
+            app.state.pool, index=IndexConfig(dims=640, embed=embed, field=field)
         )
         await store.setup()
         logger.info("Store setup complete")

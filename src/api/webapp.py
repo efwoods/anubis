@@ -31,6 +31,47 @@ from time import time_ns
 import uuid
 from decimal import Decimal
 
+from src.anubis.utils.tools.identity.identity_tools import (
+    update_self_identity_mem_from_user_txt,
+)
+
+from langgraph.runtime import Runtime
+from langchain_core.runnables import RunnableConfig
+
+
+class MessagePayload(BaseModel):
+    message: str = "Hey! Please tell me about yourself and what you can do for me."
+    your_name: Optional[str] = None
+    your_description: Optional[str] = None
+    conversation_title: Optional[str] = None
+
+
+import base64
+import tempfile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.messages import HumanMessage
+
+
+class FeedbackData(BaseModel):
+    """Feedback data for human-in-the-loop responses"""
+
+    feedback_type: str  # 'like', 'dislike', 'rating', 'edit'
+    rating: Optional[float] = None  # 1-5 scale for 'rating' type
+    comment: Optional[str] = None
+    edited_response: Optional[str] = None  # User edited the response
+
+
+class MessageResponse(BaseModel):
+    """Response model for message endpoints with feedback support"""
+
+    content: str
+    response_metadata: Optional[dict] = None
+    total_response_time_ms: int
+    thread_id: str
+    request_id: str  # For feedback submission
+    feedback: Optional[FeedbackData] = None
+
+
 # Prometheus metrics
 from prometheus_client import (
     Counter,
@@ -158,7 +199,6 @@ async def store_api_metrics(
     user_id: str = None,
     endpoint: str = None,
     method: str = None,
-    model: str = None,
     prompt_tokens: int = None,
     completion_tokens: int = None,
     total_tokens: int = None,
@@ -166,6 +206,10 @@ async def store_api_metrics(
     response_status: int = None,
     cost_usd: float = None,
     thread_id: str = None,
+    feedback_type: str = None,
+    rating: float = None,
+    inference_type_response_metrics: list | None = None,
+    model_type_response_metrics: list | None = None,
     langsmith_trace_id: str = None,
     error_message: str = None,
     pool=None,
@@ -176,10 +220,11 @@ async def store_api_metrics(
 
     query = """
         INSERT INTO api_metrics (
-            request_id, user_id, endpoint, method, model, prompt_tokens, completion_tokens,
+            request_id, user_id, endpoint, method, prompt_tokens, completion_tokens,
             total_tokens, request_latency_ms, response_status, cost_usd, thread_id,
+            feedback_type, rating, inference_type_response_metrics, model_type_response_metrics,
             langsmith_trace_id, error_message
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     try:
@@ -192,7 +237,6 @@ async def store_api_metrics(
                         user_id,
                         endpoint,
                         method,
-                        model,
                         prompt_tokens,
                         completion_tokens,
                         total_tokens,
@@ -234,6 +278,7 @@ def calculate_inference_cost(
     cost = (prompt_tokens * pricing[model]["prompt"]) + (
         completion_tokens * pricing[model]["completion"]
     )
+    return round(cost, 9)
     return round(cost, 9)
 
 
@@ -895,27 +940,6 @@ async def select_avatar(
             )
 
 
-from src.anubis.utils.tools.identity.identity_tools import (
-    update_self_identity_mem_from_user_txt,
-)
-
-from langgraph.runtime import Runtime
-from langchain_core.runnables import RunnableConfig
-
-
-class MessagePayload(BaseModel):
-    message: str = "Hey! Please tell me about yourself and what you can do for me."
-    your_name: Optional[str] = None
-    your_description: Optional[str] = None
-    conversation_title: Optional[str] = None
-
-
-import base64
-import tempfile
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import HumanMessage
-
-
 async def process_files_for_message(files: Optional[List[UploadFile]] = None) -> tuple:
     """Process uploaded files and return content for inclusion in messages.
 
@@ -1015,26 +1039,6 @@ async def process_files_for_message(files: Optional[List[UploadFile]] = None) ->
         return combined_text, multimodal_content
 
     return combined_text, None
-
-
-class FeedbackData(BaseModel):
-    """Feedback data for human-in-the-loop responses"""
-
-    feedback_type: str  # 'like', 'dislike', 'rating', 'edit'
-    rating: Optional[float] = None  # 1-5 scale for 'rating' type
-    comment: Optional[str] = None
-    edited_response: Optional[str] = None  # User edited the response
-
-
-class MessageResponse(BaseModel):
-    """Response model for message endpoints with feedback support"""
-
-    content: str
-    response_metadata: Optional[dict] = None
-    total_response_time_ms: int
-    thread_id: str
-    request_id: str  # For feedback submission
-    feedback: Optional[FeedbackData] = None
 
 
 async def store_user_feedback(
@@ -1170,9 +1174,6 @@ async def update_user_preferences_from_feedback(
         logger.info(f"Updated preferences for user {user_id}, assistant {assistant_id}")
     except Exception as e:
         logger.error(f"Failed to update user preferences: {e}")
-
-
-from time import time_ns
 
 
 @app.post("/message")
@@ -1437,36 +1438,17 @@ async def message_avatar(
     if response_metadata:
         response_data["response_metadata"] = response_metadata
 
-        # Extract OpenAI usage for metrics
-        usage = response_metadata.get("usage", {})
-        model = response_metadata.get("model", "")
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        total_tokens = usage.get("total_tokens")
-
-        # Calculate cost
-        cost_usd = (
-            calculate_inference_cost(model, prompt_tokens or 0, completion_tokens or 0)
-            if model
-            else 0
-        )
-
-        # Store detailed metrics
-        await store_api_metrics(
-            request_id=request.state.request_id,
-            user_id=user_id,
-            endpoint=f"/message/{assistant_id}",
-            method="POST",
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            request_latency_ms=((time_ns() - start_time) // 1000000),
-            response_status=200,
-            cost_usd=cost_usd,
-            thread_id=thread_id,
-            pool=request.app.state.pool,
-        )
+    # await store_message_request_metrics(
+    #     request=request,
+    #     request_id=request.state.request_id,
+    #     user_id=user_id,
+    #     thread_id=thread_id,
+    #     endpoint=f"/message/{assistant_id}",
+    #     method="POST",
+    #     result=result,
+    #     latency_ms=((time_ns() - start_time) // 1000000),
+    #     response_status=200,
+    # )
 
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
@@ -1482,10 +1464,12 @@ async def get_all_conversations(
 ):
     """Return all threads for this user + assistant, newest-first."""
     user_id = current_user["identities"][0]["user_id"]
-    if request.headers.get('api-key') != '':
-        langgraph_client_headers = {"API-KEY":request.headers.get('api-key')}
+    if request.headers.get("api-key") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
-        langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
+        langgraph_client_headers = {
+            "API-KEY": request.app.state.context.anonymous_api_key
+        }
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         threads = await langgraph_client.threads.search(
@@ -1508,10 +1492,12 @@ async def get_thread_messages(
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return the message history for a single thread."""
-    if request.headers.get('api-key') != '':
-        langgraph_client_headers = {"API-KEY":request.headers.get('api-key')}
+    if request.headers.get("api-key") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
-        langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
+        langgraph_client_headers = {
+            "API-KEY": request.app.state.context.anonymous_api_key
+        }
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         state = await langgraph_client.threads.get_state(thread_id=thread_id)

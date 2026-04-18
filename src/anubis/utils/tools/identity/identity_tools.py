@@ -695,6 +695,7 @@ async def update_identity_via_text_content_url(
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
+    # TODO: response_metrics_aggregation
     model = init_model()
     
     system_message = SystemMessage(content = FACT_FORMATTING_STRING_PROMPT.format(assistant_name=assistant_name))

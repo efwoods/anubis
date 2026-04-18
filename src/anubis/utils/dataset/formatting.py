@@ -52,6 +52,7 @@ async def create_question_list(str_messages_list: list[str]) -> List[str]:
 
     # TODO: CALCULATE TOKEN USAGE response['response_metadata']
 
+    # TODO: response_metrics_aggregation
     model_with_structured_output = init_model(model_without_tools=False, response_format= GeneratedQuestionsList)
 
     system_message = SystemMessage(content="Given this list of messages, generate a query to which the message is the response. THERE MUST BE A QUESTION FOR RESPONSE AND THE QUESTION ORDER IN THE LIST MUST MATCH THE RESPONSE ORDER. These questions must be succinct.")

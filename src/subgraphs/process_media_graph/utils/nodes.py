@@ -585,6 +585,7 @@ async def extract_personality_from_image(
 
     from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
     
+    # TODO: response_metrics_aggregation
     model = init_image_description_model()
 
     # use reference image if available to target individual

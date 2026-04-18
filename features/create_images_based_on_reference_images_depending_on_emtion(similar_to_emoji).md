@@ -1,0 +1,1 @@
+https://docs.x.ai/developers/model-capabilities/images/generation

@@ -95,8 +95,6 @@ ORDER BY avg_daily_messages DESC
 LIMIT 100;
 ```
 
-
-
 ### Average Feedback Rating  Scores
 ```sql
 SELECT
@@ -180,4 +178,43 @@ LEFT JOIN daily_active da ON ufs.user_id = da.user_id
 WHERE first_date >= CURRENT_DATE - INTERVAL '90 days'
 GROUP BY first_date
 ORDER BY first_date DESC;
+```
+
+
+# Model Usage Analysis
+## Per model usage
+
+```sql
+SELECT
+  timestamp,
+  request_id,
+  elem->>'model' AS model,
+  (elem->>'cost')::numeric AS cost,
+  (elem->>'latency')::int AS latency_ms,
+  (elem->>'prompt_tokens')::int AS prompt_tokens,
+  (elem->>'completion_tokens')::int AS completion_tokens,
+  (elem->>'total_tokens')::int AS total_tokens,
+  request_latency_ms AS request_latency_ms
+FROM api_metrics,
+     jsonb_array_elements(COALESCE(model_type_response_metrics, '[]'::jsonb)) AS elem
+WHERE endpoint LIKE '/message%';
+```
+
+`latency_ms` in each row is the full `/message` request wall-clock (milliseconds), duplicated per model until per-model timings are instrumented. Use `request_latency_ms` on the parent row for a single per-request value.
+
+## Per inference type usage
+```sql
+SELECT
+  timestamp,
+  request_id,
+  elem->>'inference_type' AS inference_type,
+  (elem->>'cost')::numeric AS cost,
+  (elem->>'latency')::int AS latency_ms,
+  (elem->>'prompt_tokens')::int AS prompt_tokens,
+  (elem->>'completion_tokens')::int AS completion_tokens,
+  (elem->>'total_tokens')::int AS total_tokens,
+  request_latency_ms AS request_latency_ms
+FROM api_metrics,
+     jsonb_array_elements(COALESCE(inference_type_response_metrics, '[]'::jsonb)) AS elem
+WHERE endpoint LIKE '/message%';
 ```

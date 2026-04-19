@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import operator 
+import operator
 
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -16,17 +16,19 @@ from typing_extensions import Annotated
 from typing import Annotated, List, Dict, Optional, Any
 from typing_extensions import TypedDict
 from asyncio import Task
-from langgraph.graph.message import add_messages # Built-in reducer
-from langchain_core.documents import Document 
+from langgraph.graph.message import add_messages  # Built-in reducer
+from langchain_core.documents import Document
 
 
 from src.anubis.utils.utility import (
-    add_queries, 
-    reduce_docs, 
+    add_queries,
+    reduce_docs,
 )
 
 import logging
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass(kw_only=True)
 class VectorstoreIndexState:
@@ -39,6 +41,7 @@ class VectorstoreIndexState:
     vectorstore_documents_to_be_indexed: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can index."""
 
+
 @dataclass(kw_only=True)
 class AnalysisIndexState:
     """Represents the state for document indexing and retrieval.
@@ -47,7 +50,9 @@ class AnalysisIndexState:
     the documents to be indexed. Will be deleted after indexed
     """
 
-    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: Annotated[Sequence[Document], reduce_docs]
+    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: (
+        Annotated[Sequence[Document], reduce_docs]
+    )
     """A list of documents that the agent can index."""
 
 
@@ -59,8 +64,11 @@ class AdapterIndexState:
     the documents to be indexed. Will be deleted after indexed
     """
 
-    documents_to_be_processed_for_adapter_training: Annotated[Sequence[Document], reduce_docs]
+    documents_to_be_processed_for_adapter_training: Annotated[
+        Sequence[Document], reduce_docs
+    ]
     """A list of documents that the agent can index."""
+
 
 @dataclass(kw_only=True)
 class BaselineIndexState:
@@ -70,7 +78,9 @@ class BaselineIndexState:
     the documents to be stored. Will be deleted after stored appropriately.
     """
 
-    ground_truth_user_first_person_speech_baseline_for_evaluation: Annotated[Sequence[Document], reduce_docs]
+    ground_truth_user_first_person_speech_baseline_for_evaluation: Annotated[
+        Sequence[Document], reduce_docs
+    ]
     """A list of documents that the agent can store or otherwise process."""
 
 
@@ -85,6 +95,7 @@ class UserIdentityState:
     user_identity_documents: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can store or otherwise process."""
 
+
 @dataclass(kw_only=True)
 class AssistantIdentityState:
     """Represents the state for documents stored for textual baseline evaluation of generated content (stored in pg store).
@@ -94,8 +105,9 @@ class AssistantIdentityState:
     """
 
     assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
-    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs]
     """A list of documents that the agent can store or otherwise process."""
+
 
 @dataclass(kw_only=True)
 class RecalledMemories:
@@ -103,22 +115,28 @@ class RecalledMemories:
 
     This class defines the structure of the recalled memories.
     """
-    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+
+    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs]
+
 
 class AssistantState(TypedDict):
     assistant_id: str
     assistant_name: str
     assistant_description: str
 
+
 class UserState(TypedDict):
     user_id: str
     user_name: str
     user_description: str
 
+
 from pydantic import BaseModel
 
+
 class EmotionSummarization(BaseModel):
-    """ Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning. """
+    """Given the retrieved content, summarize the feelings of the user. Detect current levels of emotion, emotional triggers, and clear reasoning."""
+
     emotional_summary: str
     emotional_summary_reasoning: str
 
@@ -127,7 +145,7 @@ class EmotionSummarization(BaseModel):
     ecstacy: float
     love: float
     acceptance: float
-    trust : float
+    trust: float
     admiration: float
     submission: float
     apprehension: float
@@ -155,7 +173,10 @@ class EmotionSummarization(BaseModel):
     vigilance: float
     optimism: float
 
+
 from langchain_core.messages import AIMessage, ToolMessage
+
+
 class GlobalState(TypedDict):
     # Additional attributes can be added here as needed.
     # Common examples include:
@@ -163,7 +184,7 @@ class GlobalState(TypedDict):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
 
-    messages: Annotated[list[AnyMessage], add_messages] # type: ignore # enables append/update
+    messages: Annotated[list[AnyMessage], add_messages]  # type: ignore # enables append/update
 
     internal_thoughts: Annotated[list[AIMessage, ToolMessage], add_messages]
 
@@ -174,27 +195,26 @@ class GlobalState(TypedDict):
     queries: Annotated[list[str], add_queries] = field(
         default_factory=list,
         metadata={
-            "description":"A list of search queries that the agent has generated during vectorstore retrieval"
-        }
+            "description": "A list of search queries that the agent has generated during vectorstore retrieval"
+        },
     )
 
     retrieved_docs: Annotated[list[Document], operator.add] = field(
-        default_factory=list, 
+        default_factory=list,
         metadata={
-            "description":"Populated by the vector store graph retriever. This is a list of documents for reference during chat."
-        }
+            "description": "Populated by the vector store graph retriever. This is a list of documents for reference during chat."
+        },
     )
-
 
     """ User Identity"""
     user_state: UserState
-    
+
     current_user_emotions: str
     # current_user_beliefs: str
     # current_user_desires: str
     # current_user_fears: str
     # current_user_hopes: str
-    
+
     # current_user_action: str
 
     # current_user_objective: str
@@ -203,7 +223,7 @@ class GlobalState(TypedDict):
 
     """ Assistant Identity """
     assistant_state: AssistantState
-    
+
     current_assistant_emotions: str
     # current_assistant_beliefs: str
     # current_assistant_desires: str
@@ -214,16 +234,18 @@ class GlobalState(TypedDict):
 
     # current_user_objective: str
 
-    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs] 
+    recalled_memory_documents: Annotated[Sequence[Document], reduce_docs]
     assistant_identity_documents: Annotated[Sequence[Document], reduce_docs]
 
     """ Data Uploading and Processing """
 
-    # List of media items to be converted to text 
+    # List of media items to be converted to text
 
-    media_files: Optional[List[Dict[str, Any]]] # Raw uploaded files
+    media_files: Optional[List[Dict[str, Any]]]  # Raw uploaded files
 
-    media_list: Annotated[List[Dict], operator.add]  # media is moved into the task list and overwritten on message send from the chat message interface
+    media_list: Annotated[
+        List[Dict], operator.add
+    ]  # media is moved into the task list and overwritten on message send from the chat message interface
 
     # List of media extracted from chat with the media type determined, and converted into text.
     processed_media_to_be_formatted: Annotated[Sequence[Document], operator.add]
@@ -232,13 +254,15 @@ class GlobalState(TypedDict):
     vectorstore_documents_to_be_indexed: VectorstoreIndexState
 
     # Analysis list
-    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: AnalysisIndexState
+    documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: (
+        AnalysisIndexState
+    )
 
     # Adapter list
     documents_to_be_processed_for_adapter_training: AdapterIndexState
 
     # Ground Truth User First Person Speech (literal quotes from the target entity)
-    ground_truth_user_first_person_speech_baseline_for_evaluation: BaselineIndexState 
+    ground_truth_user_first_person_speech_baseline_for_evaluation: BaselineIndexState
 
     """ Node Routing """
 

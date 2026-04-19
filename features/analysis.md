@@ -1,0 +1,1 @@
+implement analysis with structured output for features as part of updating the identity whenever media is used to update the identity.

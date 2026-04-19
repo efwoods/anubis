@@ -15,6 +15,42 @@ from fastapi import (
 
 import httpx
 
+
+from contextlib import asynccontextmanager
+from langgraph.store.postgres import AsyncPostgresStore
+
+from langgraph.store.base import IndexConfig
+
+from typing import Optional
+from langgraph_sdk import get_client
+
+from src.anubis.graph import message_workflow, response_only_workflow
+from src.security.auth import security_route
+from src.security.auth import get_current_user
+from fastapi.responses import RedirectResponse, JSONResponse
+from uuid import uuid4
+import httpx
+from pydantic import BaseModel
+from typing import Any
+from uuid import UUID
+
+from langgraph_sdk.schema import Assistant
+
+from psycopg.rows import class_row
+
+from urllib.parse import quote
+
+from src.security.auth import update_assistant_config
+from src.security.auth import check_subscription_status
+
+from src.security.auth import (
+    get_current_user_or_anonymous_user,
+)
+
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+import stripe
+
+
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
 from langchain_core.messages import HumanMessage
@@ -29,18 +65,28 @@ logger = logging.getLogger(__name__)
 from time import time_ns
 import uuid
 
+import base64
+import tempfile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.messages import HumanMessage
+
+
+# Prometheus metrics
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
+from prometheus_client import CollectorRegistry
+
 
 class MessagePayload(BaseModel):
     message: str = "Hey! Please tell me about yourself and what you can do for me."
     your_name: Optional[str] = None
     your_description: Optional[str] = None
     conversation_title: Optional[str] = None
-
-
-import base64
-import tempfile
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import HumanMessage
 
 
 class FeedbackData(BaseModel):
@@ -62,16 +108,6 @@ class MessageResponse(BaseModel):
     request_id: str  # For feedback submission
     feedback: Optional[FeedbackData] = None
 
-
-# Prometheus metrics
-from prometheus_client import (
-    Counter,
-    Histogram,
-    Gauge,
-    generate_latest,
-    CONTENT_TYPE_LATEST,
-)
-from prometheus_client import CollectorRegistry
 
 # Create a custom registry for metrics
 registry = CollectorRegistry()
@@ -116,41 +152,73 @@ API_RESPONSE_STATUS = Counter(
     registry=registry,
 )
 
-# Preload audio to text processor [this needs a startup in a lifecycle call]
 
-from contextlib import asynccontextmanager
-from langgraph.store.postgres import AsyncPostgresStore
-
-from langgraph.store.base import IndexConfig
-
-from typing import Optional
-from langgraph_sdk import get_client
-
-from src.anubis.graph import message_workflow, response_only_workflow
-from src.security.auth import security_route
-from src.security.auth import get_current_user
-from fastapi.responses import RedirectResponse, JSONResponse
-from uuid import uuid4
-import httpx
-from pydantic import BaseModel
-from typing import Any
-from uuid import UUID
-
-from langgraph_sdk.schema import Assistant
-
-from psycopg.rows import class_row
-
-from urllib.parse import quote
-
-from src.security.auth import update_assistant_config
-from src.security.auth import check_subscription_status
-
-from src.security.auth import (
-    get_current_user_or_anonymous_user,
+AUTH_CATCH_ALL_PATTERNS = (
+    # assistants
+    ("POST", re.compile(r"^/assistants$")),
+    ("POST", re.compile(r"^/assistants/search$")),
+    ("POST", re.compile(r"^/assistants/count$")),
+    ("GET", re.compile(r"^/assistants/[^/]+$")),
+    ("DELETE", re.compile(r"^/assistants/[^/]+$")),
+    ("PATCH", re.compile(r"^/assistants/[^/]+$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/graph$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/subgraphs$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/subgraphs/[^/]+$")),
+    ("GET", re.compile(r"^/assistants/[^/]+/schemas$")),
+    ("POST", re.compile(r"^/assistants/[^/]+/versions$")),
+    ("POST", re.compile(r"^/assistants/[^/]+/latest$")),
+    # threads
+    ("POST", re.compile(r"^/threads$")),
+    ("POST", re.compile(r"^/threads/search$")),
+    ("POST", re.compile(r"^/threads/count$")),
+    ("POST", re.compile(r"^/threads/prune$")),
+    ("GET", re.compile(r"^/threads/[^/]+/state$")),
+    ("POST", re.compile(r"^/threads/[^/]+/state$")),
+    ("GET", re.compile(r"^/threads/[^/]+/state/[^/]+$")),
+    ("POST", re.compile(r"^/threads/[^/]+/state/checkpoint$")),
+    ("GET", re.compile(r"^/threads/[^/]+/history$")),
+    ("POST", re.compile(r"^/threads/[^/]+/history$")),
+    ("POST", re.compile(r"^/threads/[^/]+/copy$")),
+    ("GET", re.compile(r"^/threads/[^/]+$")),
+    ("DELETE", re.compile(r"^/threads/[^/]+$")),
+    ("PATCH", re.compile(r"^/threads/[^/]+$")),
+    ("GET", re.compile(r"^/threads/[^/]+/stream$")),
+    # thread runs
+    ("GET", re.compile(r"^/threads/[^/]+/runs$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs/stream$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs/wait$")),
+    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+$")),
+    ("DELETE", re.compile(r"^/threads/[^/]+/runs/[^/]+$")),
+    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+/join$")),
+    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+/stream$")),
+    ("POST", re.compile(r"^/threads/[^/]+/runs/[^/]+/cancel$")),
+    # runs
+    ("POST", re.compile(r"^/runs/cancel$")),
+    ("POST", re.compile(r"^/runs/stream$")),
+    ("POST", re.compile(r"^/runs/wait$")),
+    ("POST", re.compile(r"^/runs$")),
+    ("POST", re.compile(r"^/runs/batch$")),
+    # crons
+    ("POST", re.compile(r"^/threads/[^/]+/runs/crons$")),
+    ("POST", re.compile(r"^/runs/crons$")),
+    ("POST", re.compile(r"^/runs/crons/search$")),
+    ("POST", re.compile(r"^/runs/crons/count$")),
+    ("PATCH", re.compile(r"^/runs/crons/[^/]+$")),
+    ("DELETE", re.compile(r"^/runs/crons/[^/]+$")),
+    # store
+    ("PUT", re.compile(r"^/store/items$")),
+    ("DELETE", re.compile(r"^/store/items$")),
+    ("GET", re.compile(r"^/store/items$")),
+    ("POST", re.compile(r"^/store/items/search$")),
+    ("POST", re.compile(r"^/store/namespaces$")),
+    # a2a
+    ("POST", re.compile(r"^/a2a/[^/]+$")),
+    # mcp
+    ("POST", re.compile(r"^/mcp$")),
+    ("GET", re.compile(r"^/mcp$")),
+    ("DELETE", re.compile(r"^/mcp$")),
 )
-
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-import stripe
 
 
 class ASSISTANT_QUERY(BaseModel):
@@ -269,74 +337,6 @@ app = FastAPI(
     description="LangGraph-based API",
     version="1.0.0",
     lifespan=lifespan,
-)
-
-
-AUTH_CATCH_ALL_PATTERNS = (
-    # assistants
-    ("POST", re.compile(r"^/assistants$")),
-    ("POST", re.compile(r"^/assistants/search$")),
-    ("POST", re.compile(r"^/assistants/count$")),
-    ("GET", re.compile(r"^/assistants/[^/]+$")),
-    ("DELETE", re.compile(r"^/assistants/[^/]+$")),
-    ("PATCH", re.compile(r"^/assistants/[^/]+$")),
-    ("GET", re.compile(r"^/assistants/[^/]+/graph$")),
-    ("GET", re.compile(r"^/assistants/[^/]+/subgraphs$")),
-    ("GET", re.compile(r"^/assistants/[^/]+/subgraphs/[^/]+$")),
-    ("GET", re.compile(r"^/assistants/[^/]+/schemas$")),
-    ("POST", re.compile(r"^/assistants/[^/]+/versions$")),
-    ("POST", re.compile(r"^/assistants/[^/]+/latest$")),
-    # threads
-    ("POST", re.compile(r"^/threads$")),
-    ("POST", re.compile(r"^/threads/search$")),
-    ("POST", re.compile(r"^/threads/count$")),
-    ("POST", re.compile(r"^/threads/prune$")),
-    ("GET", re.compile(r"^/threads/[^/]+/state$")),
-    ("POST", re.compile(r"^/threads/[^/]+/state$")),
-    ("GET", re.compile(r"^/threads/[^/]+/state/[^/]+$")),
-    ("POST", re.compile(r"^/threads/[^/]+/state/checkpoint$")),
-    ("GET", re.compile(r"^/threads/[^/]+/history$")),
-    ("POST", re.compile(r"^/threads/[^/]+/history$")),
-    ("POST", re.compile(r"^/threads/[^/]+/copy$")),
-    ("GET", re.compile(r"^/threads/[^/]+$")),
-    ("DELETE", re.compile(r"^/threads/[^/]+$")),
-    ("PATCH", re.compile(r"^/threads/[^/]+$")),
-    ("GET", re.compile(r"^/threads/[^/]+/stream$")),
-    # thread runs
-    ("GET", re.compile(r"^/threads/[^/]+/runs$")),
-    ("POST", re.compile(r"^/threads/[^/]+/runs$")),
-    ("POST", re.compile(r"^/threads/[^/]+/runs/stream$")),
-    ("POST", re.compile(r"^/threads/[^/]+/runs/wait$")),
-    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+$")),
-    ("DELETE", re.compile(r"^/threads/[^/]+/runs/[^/]+$")),
-    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+/join$")),
-    ("GET", re.compile(r"^/threads/[^/]+/runs/[^/]+/stream$")),
-    ("POST", re.compile(r"^/threads/[^/]+/runs/[^/]+/cancel$")),
-    # runs
-    ("POST", re.compile(r"^/runs/cancel$")),
-    ("POST", re.compile(r"^/runs/stream$")),
-    ("POST", re.compile(r"^/runs/wait$")),
-    ("POST", re.compile(r"^/runs$")),
-    ("POST", re.compile(r"^/runs/batch$")),
-    # crons
-    ("POST", re.compile(r"^/threads/[^/]+/runs/crons$")),
-    ("POST", re.compile(r"^/runs/crons$")),
-    ("POST", re.compile(r"^/runs/crons/search$")),
-    ("POST", re.compile(r"^/runs/crons/count$")),
-    ("PATCH", re.compile(r"^/runs/crons/[^/]+$")),
-    ("DELETE", re.compile(r"^/runs/crons/[^/]+$")),
-    # store
-    ("PUT", re.compile(r"^/store/items$")),
-    ("DELETE", re.compile(r"^/store/items$")),
-    ("GET", re.compile(r"^/store/items$")),
-    ("POST", re.compile(r"^/store/items/search$")),
-    ("POST", re.compile(r"^/store/namespaces$")),
-    # a2a
-    ("POST", re.compile(r"^/a2a/[^/]+$")),
-    # mcp
-    ("POST", re.compile(r"^/mcp$")),
-    ("GET", re.compile(r"^/mcp$")),
-    ("DELETE", re.compile(r"^/mcp$")),
 )
 
 

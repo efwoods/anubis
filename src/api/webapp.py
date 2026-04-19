@@ -15,55 +15,18 @@ from fastapi import (
 
 import httpx
 
-
-from contextlib import asynccontextmanager
-from langgraph.store.postgres import AsyncPostgresStore
-
-from langgraph.store.base import IndexConfig
-
-from typing import Optional
-from langgraph_sdk import get_client
-
-from src.anubis.graph import message_workflow, response_only_workflow
-from src.security.auth import security_route
-from src.security.auth import get_current_user
-from fastapi.responses import RedirectResponse, JSONResponse
-from uuid import uuid4
-import httpx
-from pydantic import BaseModel
-from typing import Any
-from uuid import UUID
-
-from langgraph_sdk.schema import Assistant
-
-from psycopg.rows import class_row
-
-from urllib.parse import quote
-
-from src.security.auth import update_assistant_config
-from src.security.auth import check_subscription_status
-
-from src.security.auth import (
-    get_current_user_or_anonymous_user,
-)
-
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-import stripe
-
-
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
 from langchain_core.messages import HumanMessage
 from src.anubis.utils.context import GlobalContext
 from psycopg_pool import AsyncConnectionPool
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 # Add metrics imports
 from time import time_ns
 import uuid
+from uuid import UUID
+from uuid import uuid4
 
 import base64
 import tempfile
@@ -80,6 +43,41 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 from prometheus_client import CollectorRegistry
+from contextlib import asynccontextmanager
+from langgraph.store.postgres import AsyncPostgresStore
+
+from langgraph.store.base import IndexConfig
+
+from typing import Optional
+from langgraph_sdk import get_client
+
+from src.anubis.graph import message_workflow, response_only_workflow
+from src.security.auth import security_route
+from src.security.auth import get_current_user
+from src.security.auth import update_assistant_config
+from src.security.auth import check_subscription_status
+
+from src.security.auth import (
+    get_current_user_or_anonymous_user,
+)
+
+from fastapi.responses import RedirectResponse, JSONResponse
+
+from pydantic import BaseModel
+from typing import Any
+
+from langgraph_sdk.schema import Assistant
+from psycopg.rows import class_row
+
+from urllib.parse import quote
+
+
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+import stripe
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MessagePayload(BaseModel):
@@ -153,6 +151,22 @@ API_RESPONSE_STATUS = Counter(
 )
 
 
+class ASSISTANT_QUERY(BaseModel):
+    assistant_id: UUID
+    graph_id: str
+    created_at: datetime
+    updated_at: datetime
+    config: dict[str, Any]
+    metadata: dict[str, Any]
+    version: int
+    name: str
+    description: str | None
+    context: dict[str, Any]
+
+    def to_assistant(self) -> Assistant:
+        return self.model_dump(mode="json")
+
+
 AUTH_CATCH_ALL_PATTERNS = (
     # assistants
     ("POST", re.compile(r"^/assistants$")),
@@ -221,20 +235,12 @@ AUTH_CATCH_ALL_PATTERNS = (
 )
 
 
-class ASSISTANT_QUERY(BaseModel):
-    assistant_id: UUID
-    graph_id: str
-    created_at: datetime
-    updated_at: datetime
-    config: dict[str, Any]
-    metadata: dict[str, Any]
-    version: int
-    name: str
-    description: str | None
-    context: dict[str, Any]
-
-    def to_assistant(self) -> Assistant:
-        return self.model_dump(mode="json")
+def _is_auth_catch_all_target(method: str, path: str) -> bool:
+    normalized_path = path.rstrip("/") or "/"
+    for expected_method, pattern in AUTH_CATCH_ALL_PATTERNS:
+        if method == expected_method and pattern.match(normalized_path):
+            return True
+    return False
 
 
 async def get_public_avatars(
@@ -350,6 +356,15 @@ async def metrics_middleware(request: Request, call_next):
     ACTIVE_REQUESTS.inc()
 
     try:
+        if _is_auth_catch_all_target(method=request.method, path=request.url.path):
+            try:
+                await get_current_user(
+                    request=request, api_key=request.headers.get("API-KEY")
+                )
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code, content={"detail": exc.detail}
+                )
 
         response = await call_next(request)
         latency_ms = (time_ns() - start_time) // 1_000_000

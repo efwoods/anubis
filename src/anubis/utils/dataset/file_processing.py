@@ -33,6 +33,7 @@ async def csv_to_doc(file_path):
         """Given a list of column names and values, deterimine the column name containing text from the user only"""
         text_column: Literal[tuple(df.columns.to_list())]
     
+    # TODO: response_metrics_aggregation
     model_with_struct_output = init_model(response_format=DetermineColumnNameContainingHumanText)
 
     message_content = str(df.columns) + "\n\n values: " + str(df.values[0])

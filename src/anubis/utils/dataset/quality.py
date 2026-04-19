@@ -98,6 +98,7 @@ async def get_llm_eval_scores(
             quality: int
             reason: str
 
+        # TODO: response_metrics_aggregation
         model = init_model(response_format = CriteriaResponseModel)
 
         results = []
@@ -127,6 +128,7 @@ async def get_llm_eval_scores(
               normalization_scale_max = normalization_scale_max
         ))
 
+        # TODO: response_metrics_aggregation
         model = init_model()
         results = await model.ainvoke(system_prompt)
 

@@ -295,6 +295,7 @@ async def image_to_text(target_image_url: str,
 
     messages = system_message + human_message
 
+    # TODO: response_metrics_aggregation
     model = init_model()
 
     response = await model.ainvoke(input=messages)
@@ -367,6 +368,7 @@ async def summarize_messages(
                 # Summarize the long message into a single query
                 system_message = system_message_instruction_single_message
                 input = [SystemMessage(content=[{'type': 'text', 'text': system_message}]), HumanMessage(content=[{'type': 'text', 'text': human_input}])]
+                # TODO: response_metrics_aggregation
                 model = init_model(context)
                 response = model.ainvoke(input=input)
 
@@ -469,6 +471,7 @@ async def summarize_messages(
 
                 summarization_messages = human_message_list[:idx]
 
+                # TODO: response_metrics_aggregation
                 model = init_model(context=context) 
 
                 # Save the optional system message and the retained messages

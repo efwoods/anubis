@@ -21,15 +21,18 @@ from langchain_core.messages import HumanMessage
 from src.anubis.utils.context import GlobalContext
 from psycopg_pool import AsyncConnectionPool
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 # Add metrics imports
-import time
 from time import time_ns
 import uuid
-from decimal import Decimal
+from uuid import UUID
+from uuid import uuid4
+
+import base64
+import tempfile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.messages import HumanMessage
+
 
 # Prometheus metrics
 from prometheus_client import (
@@ -40,6 +43,69 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 from prometheus_client import CollectorRegistry
+from contextlib import asynccontextmanager
+from langgraph.store.postgres import AsyncPostgresStore
+
+from langgraph.store.base import IndexConfig
+
+from typing import Optional
+from langgraph_sdk import get_client
+
+from src.anubis.graph import message_workflow, response_only_workflow
+from src.security.auth import security_route
+from src.security.auth import get_current_user
+from src.security.auth import update_assistant_config
+from src.security.auth import check_subscription_status
+
+from src.security.auth import (
+    get_current_user_or_anonymous_user,
+)
+
+from fastapi.responses import RedirectResponse, JSONResponse
+
+from pydantic import BaseModel
+from typing import Any
+
+from langgraph_sdk.schema import Assistant
+from psycopg.rows import class_row
+
+from urllib.parse import quote
+
+
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+import stripe
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class MessagePayload(BaseModel):
+    message: str = "Hey! Please tell me about yourself and what you can do for me."
+    your_name: Optional[str] = None
+    your_description: Optional[str] = None
+    conversation_title: Optional[str] = None
+
+
+class FeedbackData(BaseModel):
+    """Feedback data for human-in-the-loop responses"""
+
+    feedback_type: str  # 'like', 'dislike', 'rating', 'edit'
+    rating: Optional[float] = None  # 1-5 scale for 'rating' type
+    comment: Optional[str] = None
+    edited_response: Optional[str] = None  # User edited the response
+
+
+class MessageResponse(BaseModel):
+    """Response model for message endpoints with feedback support"""
+
+    content: str
+    response_metadata: Optional[dict] = None
+    total_response_time_ms: int
+    thread_id: str
+    request_id: str  # For feedback submission
+    feedback: Optional[FeedbackData] = None
+
 
 # Create a custom registry for metrics
 registry = CollectorRegistry()
@@ -84,57 +150,6 @@ API_RESPONSE_STATUS = Counter(
     registry=registry,
 )
 
-# Preload audio to text processor [this needs a startup in a lifecycle call]
-
-from contextlib import asynccontextmanager
-from langgraph.store.postgres import AsyncPostgresStore
-
-from langgraph.store.memory import InMemoryStore
-from langgraph.store.base import IndexConfig
-
-from typing import Optional
-from langgraph_sdk import get_client
-
-from src.anubis.graph import graph, message_workflow, response_only_workflow
-from src.security.auth import security_route, auth
-
-from langgraph_sdk.auth import Auth
-
-from src.security.auth import get_current_user
-
-from src.security.auth import security
-from fastapi.security import HTTPAuthorizationCredentials
-import json
-
-from fastapi.responses import RedirectResponse, JSONResponse
-
-from uuid import uuid4, uuid5, NAMESPACE_URL
-
-import httpx
-
-from pydantic import BaseModel
-from typing import Any
-from uuid import UUID
-
-from langgraph_sdk.schema import Assistant
-from typing import Annotated
-
-from psycopg.rows import class_row
-
-from urllib.parse import quote
-
-from src.security.auth import update_assistant_config
-from src.security.auth import check_subscription_status
-
-from src.security.auth import (
-    get_current_user_or_anonymous_user,
-    get_current_user_or_anonymous_user_id,
-)
-
-from uuid import uuid4
-
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
 
 class ASSISTANT_QUERY(BaseModel):
     assistant_id: UUID
@@ -150,194 +165,6 @@ class ASSISTANT_QUERY(BaseModel):
 
     def to_assistant(self) -> Assistant:
         return self.model_dump(mode="json")
-
-
-# Metrics helper functions
-async def store_api_metrics(
-    request_id: str,
-    user_id: str = None,
-    endpoint: str = None,
-    method: str = None,
-    model: str = None,
-    prompt_tokens: int = None,
-    completion_tokens: int = None,
-    total_tokens: int = None,
-    request_latency_ms: int = None,
-    response_status: int = None,
-    cost_usd: float = None,
-    thread_id: str = None,
-    langsmith_trace_id: str = None,
-    error_message: str = None,
-    pool=None,
-):
-    """Store API metrics in the database"""
-    if not pool:
-        return
-
-    query = """
-        INSERT INTO api_metrics (
-            request_id, user_id, endpoint, method, model, prompt_tokens, completion_tokens,
-            total_tokens, request_latency_ms, response_status, cost_usd, thread_id,
-            langsmith_trace_id, error_message
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
-
-    try:
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    query,
-                    (
-                        request_id,
-                        user_id,
-                        endpoint,
-                        method,
-                        model,
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens,
-                        request_latency_ms,
-                        response_status,
-                        cost_usd,
-                        thread_id,
-                        langsmith_trace_id,
-                        error_message,
-                    ),
-                )
-    except Exception as e:
-        logger.error(f"Failed to store metrics: {e}")
-
-
-def calculate_inference_cost(
-    model: str, prompt_tokens: int, completion_tokens: int, context: GlobalContext
-) -> float:
-    """Calculate OpenAI API cost based on model and token usage"""
-    # Pricing as of 2026
-    pricing = {
-        "gpt-5.4-nano": {
-            "prompt": context.model_prompt_cost,
-            "completion": context.model_completion_cost,
-        },
-        "google/gemma-3-27b-it": {
-            "prompt": context.image_model_prompt_cost,
-            "completion": context.image_model_completion_cost,
-        },
-        "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8": {
-            "prompt": context.llama_model_prompt_cost,
-            "completion": context.llama_model_completion_cost,
-        },
-    }
-
-    if model not in pricing:
-        return 0.0
-
-    cost = (prompt_tokens * pricing[model]["prompt"]) + (
-        completion_tokens * pricing[model]["completion"]
-    )
-    return round(cost, 9)
-
-
-async def get_public_avatars(
-    assistant_id: Optional[str] = None, user_id: Optional[str] = None
-):
-    pool = app.state.pool
-
-    if assistant_id:
-        # Retrieve the public avatar matching the assistant_id
-        search_query = """
-        SELECT * FROM assistant 
-        WHERE (metadata->>'is_public')::boolean = TRUE
-        AND assistant_id = %s
-        """
-    elif user_id:
-        # Retrieve all public avatars not owned by the current user.
-        search_query = """
-        SELECT * FROM assistant
-        WHERE (metadata->>'is_public')::boolean = TRUE
-        AND (metadata->>'user_id') != %s
-        """
-    else:
-        # Retrieve all public avatars
-        search_query = """
-        SELECT * FROM assistant
-        WHERE (metadata->>'is_public')::boolean = TRUE
-        """
-
-    async with pool.connection() as conn:
-        async with conn.cursor(row_factory=class_row(ASSISTANT_QUERY)) as cur:
-            if assistant_id:
-                await cur.execute(search_query, (assistant_id,))
-            elif user_id:
-                await cur.execute(search_query, (user_id,))
-            else:
-                await cur.execute(search_query)
-            data = await cur.fetchall()
-
-            return [assistant_query.to_assistant() for assistant_query in data]
-
-
-import debugpy
-
-if os.getenv("DEBUG", "false").lower() == "true":
-    debugpy.listen(("0.0.0.0", 5678))
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup/shutdown events"""
-    # Startup: Preload the Whisper model pipeline
-    global context
-    global store_context_manager
-
-    # Initialize context / context
-    app.state.context = GlobalContext()
-    app.state.httpx_client = httpx.AsyncClient()
-    app.state.stripe = stripe
-    app.state.stripe.api_key = app.state.context.stripe_secret_key
-
-    async_postgres_store_uri = app.state.context.async_postgres_store_uri
-    logger.warning(f"app.state.context.dev: {app.state.context.dev}")
-    pool = AsyncConnectionPool(
-        conninfo=async_postgres_store_uri,
-        min_size=1,
-        max_size=5,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
-        open=False,  # do not open on create
-    )
-    app.state.pool = pool
-    await app.state.pool.open()
-    try:
-        embed = "huggingface:" + app.state.context.embedding_model
-        field = ["document.kwargs.page_content"]
-        store = AsyncPostgresStore(
-            app.state.pool, index=IndexConfig(dims=384, embed=embed, field=field)
-        )
-        await store.setup()
-        logger.info("Store setup complete")
-        app.state.store = store
-        checkpointer = AsyncPostgresSaver(app.state.pool)
-        await checkpointer.setup()
-        app.state.checkpointer = checkpointer
-        app.state.graph = message_workflow.compile(
-            store=store, checkpointer=checkpointer
-        )
-        app.state.response_only_graph = response_only_workflow.compile(
-            store=store, checkpointer=checkpointer
-        )
-        app.state.response_only_graph.name = "Anubis"
-        app.state.graph.name = "Anubis"
-        logger.info("Application startup: lifecycle complete")
-        yield
-    finally:
-        await pool.close()
-
-
-app = FastAPI(
-    title="Neural Nexus API",
-    description="LangGraph-based API",
-    version="1.0.0",
-    lifespan=lifespan,
-)
 
 
 AUTH_CATCH_ALL_PATTERNS = (
@@ -416,6 +243,109 @@ def _is_auth_catch_all_target(method: str, path: str) -> bool:
     return False
 
 
+async def get_public_avatars(
+    assistant_id: Optional[str] = None, user_id: Optional[str] = None
+):
+    pool = app.state.pool
+
+    if assistant_id:
+        # Retrieve the public avatar matching the assistant_id
+        search_query = """
+        SELECT * FROM assistant 
+        WHERE (metadata->>'is_public')::boolean = TRUE
+        AND assistant_id = %s
+        """
+    elif user_id:
+        # Retrieve all public avatars not owned by the current user.
+        search_query = """
+        SELECT * FROM assistant
+        WHERE (metadata->>'is_public')::boolean = TRUE
+        AND (metadata->>'user_id') != %s
+        """
+    else:
+        # Retrieve all public avatars
+        search_query = """
+        SELECT * FROM assistant
+        WHERE (metadata->>'is_public')::boolean = TRUE
+        """
+
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=class_row(ASSISTANT_QUERY)) as cur:
+            if assistant_id:
+                await cur.execute(search_query, (assistant_id,))
+            elif user_id:
+                await cur.execute(search_query, (user_id,))
+            else:
+                await cur.execute(search_query)
+            data = await cur.fetchall()
+
+            return [assistant_query.to_assistant() for assistant_query in data]
+
+
+import debugpy
+
+if os.getenv("DEBUG", "false").lower() == "true":
+    debugpy.listen(("0.0.0.0", 5678))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events"""
+    # Startup: Preload the Whisper model pipeline
+    global context
+    global store_context_manager
+
+    # Initialize context / context
+    app.state.context = GlobalContext()
+    app.state.httpx_client = httpx.AsyncClient()
+    app.state.stripe = stripe
+    app.state.stripe.api_key = app.state.context.stripe_secret_key
+
+    async_postgres_store_uri = app.state.context.async_postgres_store_uri
+    logger.warning(f"app.state.context.dev: {app.state.context.dev}")
+    pool = AsyncConnectionPool(
+        conninfo=async_postgres_store_uri,
+        min_size=1,
+        max_size=5,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+        open=False,  # do not open on create
+    )
+    app.state.pool = pool
+    await app.state.pool.open()
+    try:
+        embed = "huggingface:" + app.state.context.embedding_model
+        field = ["document.kwargs.page_content"]
+        store = AsyncPostgresStore(
+            app.state.pool, index=IndexConfig(dims=640, embed=embed, field=field)
+        )
+        await store.setup()
+        logger.info("Store setup complete")
+        app.state.store = store
+        checkpointer = AsyncPostgresSaver(app.state.pool)
+        await checkpointer.setup()
+        app.state.checkpointer = checkpointer
+        app.state.graph = message_workflow.compile(
+            store=store, checkpointer=checkpointer
+        )
+        app.state.response_only_graph = response_only_workflow.compile(
+            store=store, checkpointer=checkpointer
+        )
+        app.state.response_only_graph.name = "Anubis"
+        app.state.graph.name = "Anubis"
+        logger.info("Application startup: lifecycle complete")
+        yield
+    finally:
+        await pool.close()
+
+
+app = FastAPI(
+    title="Neural Nexus API",
+    description="LangGraph-based API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
 # Middleware for request metrics
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
@@ -449,28 +379,10 @@ async def metrics_middleware(request: Request, call_next):
         ).observe(latency_ms / 1000)
         API_RESPONSE_STATUS.labels(status=response.status_code).inc()
 
-        await store_api_metrics(
-            request_id=request_id,
-            endpoint=str(request.url.path),
-            method=request.method,
-            request_latency_ms=latency_ms,
-            response_status=response.status_code,
-            pool=getattr(request.app.state, "pool", None),
-        )
-
         return response
     except Exception as e:
         latency_ms = (time_ns() - start_time) // 1_000_000
         API_RESPONSE_STATUS.labels(status=500).inc()
-        await store_api_metrics(
-            request_id=request_id,
-            endpoint=str(request.url.path),
-            method=request.method,
-            request_latency_ms=latency_ms,
-            response_status=500,
-            error_message=str(e),
-            pool=getattr(request.app.state, "pool", None),
-        )
         raise
     finally:
         ACTIVE_REQUESTS.dec()
@@ -492,9 +404,6 @@ async def documentation():
 
 
 app.include_router(router=security_route)
-from fastapi.responses import HTMLResponse, RedirectResponse
-
-import stripe
 
 
 @app.get("/subscribe")
@@ -564,8 +473,6 @@ async def create_avatar(
         )
 
     try:
-        # token = auth_cred.credentials
-        # client = get_client(headers={"Authorization": f"Bearer {token}"})
         assistant_id = str(uuid4())
         user_id = current_user["identities"][0]["user_id"]
         metadata = {"user_id": user_id, "is_public": False}
@@ -895,27 +802,6 @@ async def select_avatar(
             )
 
 
-from src.anubis.utils.tools.identity.identity_tools import (
-    update_self_identity_mem_from_user_txt,
-)
-
-from langgraph.runtime import Runtime
-from langchain_core.runnables import RunnableConfig
-
-
-class MessagePayload(BaseModel):
-    message: str = "Hey! Please tell me about yourself and what you can do for me."
-    your_name: Optional[str] = None
-    your_description: Optional[str] = None
-    conversation_title: Optional[str] = None
-
-
-import base64
-import tempfile
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import HumanMessage
-
-
 async def process_files_for_message(files: Optional[List[UploadFile]] = None) -> tuple:
     """Process uploaded files and return content for inclusion in messages.
 
@@ -1017,164 +903,6 @@ async def process_files_for_message(files: Optional[List[UploadFile]] = None) ->
     return combined_text, None
 
 
-class FeedbackData(BaseModel):
-    """Feedback data for human-in-the-loop responses"""
-
-    feedback_type: str  # 'like', 'dislike', 'rating', 'edit'
-    rating: Optional[float] = None  # 1-5 scale for 'rating' type
-    comment: Optional[str] = None
-    edited_response: Optional[str] = None  # User edited the response
-
-
-class MessageResponse(BaseModel):
-    """Response model for message endpoints with feedback support"""
-
-    content: str
-    response_metadata: Optional[dict] = None
-    total_response_time_ms: int
-    thread_id: str
-    request_id: str  # For feedback submission
-    feedback: Optional[FeedbackData] = None
-
-
-async def store_user_feedback(
-    pool,
-    user_id: str,
-    thread_id: str,
-    feedback_type: str,  # 'like', 'dislike', 'rating', 'edit'
-    request_id: str = None,
-    rating: Optional[float] = None,  # 1-5 scale for 'rating' type
-    comment: Optional[str] = None,
-    edited_response: Optional[str] = None,  # For 'edit' feedback type
-) -> dict:
-    """Helper function to store user feedback in the database
-
-    Args:
-        pool: Database connection pool
-        user_id: ID of the user providing feedback
-        thread_id: ID of the conversation thread being feedback on
-        feedback_type: Type of feedback ('like', 'dislike', 'rating', 'edit')
-        request_id: Optional request ID for tracking
-        rating: Rating value (1-5) if feedback_type is 'rating'
-        comment: Optional comment text
-        edited_response: Edited response content if feedback_type is 'edit'
-
-    Returns:
-        dict: Status response with feedback_type included
-
-    Raises:
-        HTTPException: If validation fails or database error occurs
-    """
-    if not pool:
-        raise HTTPException(status_code=500, detail="Database pool not available")
-
-    # Validate feedback_type
-    valid_feedback_types = {"like", "dislike", "rating", "edit"}
-    if feedback_type not in valid_feedback_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid feedback_type. Must be one of {valid_feedback_types}",
-        )
-
-    # Validate rating if feedback_type is 'rating'
-    if feedback_type == "rating":
-        if rating is None or not (1 <= rating <= 5):
-            raise HTTPException(
-                status_code=400,
-                detail="Rating feedback requires a rating value between 1 and 5",
-            )
-
-    # Validate edited_response if feedback_type is 'edit'
-    if feedback_type == "edit":
-        if not edited_response:
-            raise HTTPException(
-                status_code=400,
-                detail="Edit feedback requires the edited_response field",
-            )
-        # Store edited response in comment field
-        comment = edited_response
-
-    # Store feedback in database
-    query = """
-    INSERT INTO user_feedback (
-        request_id, user_id, thread_id, feedback_type, rating, comment
-    ) VALUES (%s, %s, %s, %s, %s, %s)
-    """
-
-    try:
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    query,
-                    (
-                        request_id,
-                        user_id,
-                        thread_id,
-                        feedback_type,
-                        rating if feedback_type == "rating" else None,
-                        comment,
-                    ),
-                )
-        logger.info(
-            f"Stored {feedback_type} feedback for user {user_id} on thread {thread_id}"
-        )
-        return {"status": "feedback recorded", "feedback_type": feedback_type}
-    except Exception as e:
-        logger.error(f"Failed to store feedback: {e}")
-        raise HTTPException(status_code=500, detail="Failed to record feedback")
-
-
-async def update_user_preferences_from_feedback(
-    store,
-    user_id: str,
-    assistant_id: str,
-    feedback_type: str,
-    edited_response: Optional[str] = None,
-    comment: Optional[str] = None,
-):
-    """Update user preferences in store based on feedback"""
-    if not store:
-        return
-
-    try:
-        namespace = (user_id, assistant_id, "preferences")
-
-        # Retrieve existing preferences
-        try:
-            existing = await store.get_items(namespace, limit=1)
-            preferences = existing[0]["value"] if existing else {}
-        except:
-            preferences = {}
-
-        # Update feedback history
-        if "feedback_history" not in preferences:
-            preferences["feedback_history"] = []
-
-        feedback_entry = {
-            "type": feedback_type,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "comment": comment,
-        }
-
-        # If user edited the response, capture it
-        if edited_response:
-            feedback_entry["edited_response"] = edited_response
-            feedback_entry["edit_type"] = "response_correction"
-
-        preferences["feedback_history"].append(feedback_entry)
-
-        # Update store
-        await store.put_items(
-            namespace, [{"key": "user_preferences", "value": preferences}]
-        )
-        logger.info(f"Updated preferences for user {user_id}, assistant {assistant_id}")
-    except Exception as e:
-        logger.error(f"Failed to update user preferences: {e}")
-
-
-from time import time_ns
-
-
 @app.post("/message")
 async def message_selected_avatar(
     request: Request,
@@ -1272,37 +1000,6 @@ async def message_selected_avatar(
     response_metadata = result["messages"][-1].response_metadata
     if response_metadata:
         response_data["response_metadata"] = response_metadata
-
-        # Extract OpenAI usage for metrics
-        usage = response_metadata.get("usage", {})
-        model = response_metadata.get("model", "")
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        total_tokens = usage.get("total_tokens")
-
-        # Calculate cost
-        cost_usd = (
-            calculate_inference_cost(model, prompt_tokens or 0, completion_tokens or 0)
-            if model
-            else 0
-        )
-
-        # Store detailed metrics
-        await store_api_metrics(
-            request_id=request.state.request_id,
-            user_id=user_id,
-            endpoint="/message",
-            method="POST",
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            request_latency_ms=((time_ns() - start_time) // 1000000),
-            response_status=200,
-            cost_usd=cost_usd,
-            thread_id=thread_id,
-            pool=request.app.state.pool,
-        )
 
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     logger.warning(f"RESPONSE_DATA: {response_data}")
@@ -1437,37 +1134,6 @@ async def message_avatar(
     if response_metadata:
         response_data["response_metadata"] = response_metadata
 
-        # Extract OpenAI usage for metrics
-        usage = response_metadata.get("usage", {})
-        model = response_metadata.get("model", "")
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        total_tokens = usage.get("total_tokens")
-
-        # Calculate cost
-        cost_usd = (
-            calculate_inference_cost(model, prompt_tokens or 0, completion_tokens or 0)
-            if model
-            else 0
-        )
-
-        # Store detailed metrics
-        await store_api_metrics(
-            request_id=request.state.request_id,
-            user_id=user_id,
-            endpoint=f"/message/{assistant_id}",
-            method="POST",
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            request_latency_ms=((time_ns() - start_time) // 1000000),
-            response_status=200,
-            cost_usd=cost_usd,
-            thread_id=thread_id,
-            pool=request.app.state.pool,
-        )
-
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
@@ -1482,10 +1148,12 @@ async def get_all_conversations(
 ):
     """Return all threads for this user + assistant, newest-first."""
     user_id = current_user["identities"][0]["user_id"]
-    if request.headers.get('api-key') != '':
-        langgraph_client_headers = {"API-KEY":request.headers.get('api-key')}
+    if request.headers.get("api-key") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
-        langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
+        langgraph_client_headers = {
+            "API-KEY": request.app.state.context.anonymous_api_key
+        }
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         threads = await langgraph_client.threads.search(
@@ -1508,10 +1176,12 @@ async def get_thread_messages(
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return the message history for a single thread."""
-    if request.headers.get('api-key') != '':
-        langgraph_client_headers = {"API-KEY":request.headers.get('api-key')}
+    if request.headers.get("api-key") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
-        langgraph_client_headers = {"API-KEY":request.app.state.context.anonymous_api_key}
+        langgraph_client_headers = {
+            "API-KEY": request.app.state.context.anonymous_api_key
+        }
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         state = await langgraph_client.threads.get_state(thread_id=thread_id)
@@ -1519,50 +1189,6 @@ async def get_thread_messages(
         return JSONResponse({"messages": messages})
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
-
-
-# @app.post("/test_upload_media_file")
-# async def test_upload_media_file(
-#     files: List[UploadFile] = File(...),
-#     reference_audio: bool = False,
-#     reference_image: bool = False,
-#     proprietary_content: bool = False,
-#     current_user: dict = Depends(get_current_user)
-# ):
-#     # Context user_id, assistant_id
-#     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
-#     """
-#     Upload one or more media files for processing and indexing.
-
-#     - **files**: One or more files to process
-#     - **user_id**: User identifier
-#     - **assistant_id**: Assistant identifier
-#     """
-#     user_id = current_user['identities'][0]['user_id']
-#     assitant_config = current_user['app_metadata']['assistant_config']
-#     assistant_id = assitant_config['configurable']['assistant_id']
-#     config = {
-#         "configurable": {
-#             "user_id": user_id,
-#             "user_ctx": {"name":None, "description": None},
-#         }
-#     }
-#     config['configurable'].update(assitant_config['configurable'])
-#     # Read all uploaded files
-#     media_files = []
-#     for file in files:
-#         content = await file.read()
-#         media_files.append({
-#             "filename": file.filename,
-#             "content_type": file.content_type,
-#             "content": content,
-#             "user_id": user_id,
-#             "assistant_id": assistant_id,
-#             "reference_audio": reference_audio,
-#             "reference_image": reference_image,
-#             "proprietary_content": proprietary_content
-#         })
-#     logger.info("breakpoint")
 
 
 @app.post("/update_avatar_identity_with_media")
@@ -1587,10 +1213,6 @@ async def update_avatar_identity_with_media(
     try:
 
         user_id = current_user["identities"][0]["user_id"]
-
-        # assitant_config = current_user['app_metadata']['assistant_config']
-        # assistant_id = assitant_config['configurable']['assistant_id']
-        # config['configurable'].update(assitant_config['configurable'])
 
         config = {
             "configurable": {
@@ -1629,8 +1251,6 @@ async def update_avatar_identity_with_media(
             workflow,
         )
 
-        # process_media_graph_api_endpoint
-
         process_media_graph_api_endpoint = workflow.compile(store=store)
 
         # Prepare input state
@@ -1668,9 +1288,6 @@ async def update_avatar_identity_with_media(
             )
 
     except Exception as e:
-        # if type(e) is KeyError and e.args[0] == 'assistant_config':
-        # raise HTTPException(status_code=400, detail=f"Please select an avatar to upload media to before uploading media.")
-
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
 
 
@@ -1697,8 +1314,6 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
     all_document_items = await langgraph_sdk_client.store.search_items(
         namespace, limit=1000000
     )
-    # results['namespaces'] = all_namespaces
-    # results['documents'] = all_document_items
     uploaded_documents = [
         item["value"]["document"]["kwargs"]["metadata"].get("filename", None)
         for item in all_document_items["items"]

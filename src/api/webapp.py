@@ -622,7 +622,6 @@ async def delete_avatar(
         await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
     except Exception as e:
         raise HTTPException(detail="Error Deleting Assistant", status_code=500)
-
     return JSONResponse("Deleted Avatar Successfully", status_code=200)
 
 
@@ -646,7 +645,7 @@ async def list_user_avatars(
             user_id=current_user["identities"][0]["user_id"]
         )
         token = current_user["API_KEY"]
-        client = get_client(headers={"Authentication": f"{token}"})
+        client = get_client(headers={"API-KEY": f"{token}"})
         response = await client.assistants.search(
             metadata={"user_id": current_user["identities"][0]["user_id"]}
         )
@@ -656,7 +655,7 @@ async def list_user_avatars(
         return JSONResponse(public_avatars_result, status_code=200)
     except Exception as e:
         error = f"Error in listing avatars: {e}"
-        return HTTPException(detail=error, status_code=500)
+        raise HTTPException(detail=error, status_code=500)
 
 
 @app.post("/select_avatar")

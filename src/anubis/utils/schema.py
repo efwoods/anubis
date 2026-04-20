@@ -1,12 +1,59 @@
 # src/anubis/utils/classes
 
 from __future__ import annotations
+from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
-from typing import Literal, List, Optional
+from typing import Literal, List, Optional, Annotated, Sequence
+from dataclasses import dataclass, field
+
+import operator
+
+
+class ModelResponseMetricMetadata:
+    """Represents a standardized set of metrics for a specific model type."""
+
+    def __init__(self):
+        self.latency_list_ms: list[float] = []
+        self.calls_count: int = 0
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self.total_tokens: int = 0
+        self.total_cost: float = 0.0
+        self.average_latency_ms: float = 0.0
+
+    async def update_metrics(self, response) -> None:
+        """Update the metrics with the response from the model."""
+        self.latency_list_ms.append(response.get("latency_ms", 0.0))
+        self.calls_count += 1
+        self.prompt_tokens += response.get("token_usage", {}).get("prompt_tokens", 0)
+        self.completion_tokens += response.get("token_usage", {}).get(
+            "completion_tokens", 0
+        )
+        self.total_tokens += response.get("token_usage", {}).get("total_tokens", 0)
+        self.total_cost += response.get("total_cost", 0.0)
+
+        if self.latency_list_ms:
+            self.average_latency_ms = sum(self.latency_list_ms) / len(
+                self.latency_list_ms
+            )
+
+    async def to_dict(self) -> dict:
+        """Returns the metrics as a dictionary for serialization."""
+        return {
+            "latency_list_ms": self.latency_list_ms,
+            "calls_count": self.calls_count,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "total_cost": self.total_cost,
+            "average_latency_ms": self.average_latency_ms,
+        }
+
 
 class RouteDecision(BaseModel):
-    """"Determine whether to upload media or respond to the conversation. """
+    """Determine whether to upload media or respond to the conversation."""
+
     reasoning: str = Field(
         description="Step-by-step reasoning behind the decision for the route."
     )
@@ -14,11 +61,15 @@ class RouteDecision(BaseModel):
         description="Classification of the route. chat if responding to the conversation. upload if the user indicates the attached media needs to be added to the identity or uploaded."
     )
 
+
 class TextualSituationalAwareness(BaseModel):
-    classified_situation: Literal["single_speaker", "q_and_a_dialogue", "multi_speaker", "other"]
+    classified_situation: Literal[
+        "single_speaker", "q_and_a_dialogue", "multi_speaker", "other"
+    ]
     reasoning: str = Field(
-        description = "Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
+        description="Step-by-step reasoning behind the decision for the classified situation of the text. (single speaker monologue, single tweet from user, strictly Q & A, multi-speaker, Other)"
     )
+
 
 TEXTUAL_SITUATIONAL_AWARENESS_DECISION_INSTRUCTIONS = """
 <Role>
@@ -86,10 +137,13 @@ Rules for classifying the situation of the text as Other:
 </Rules>
 """
 
-class MonologuePresentationOrSeriesOfQuotes(BaseModel):          
-    """ Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker. """
+
+class MonologuePresentationOrSeriesOfQuotes(BaseModel):
+    """Determine if this is a fluid train of thought as if in a monologue or presentation for a single speaker or if this is a series of direct quotes from the speaker."""
+
     classified_situation: Literal["MonologueOrPresentation", "SeriesOfDistinctQuotes"]
     reason: str = Field(description="Step-by-step reasoning behind the decision")
+
 
 MONOLOGUE_PRESENTATION_OR_SERIES_OF_QUOTES = """
 <Role>
@@ -128,12 +182,16 @@ I believe that through the research and development of A.I., we will understand 
 </Rules>
 """
 
+
 class ReferenceDocumentOrBiographicalConversationalInformation(BaseModel):
-           """ Determine if the content is one of two categories: the first category is a reference document such as a menu or a well known religious text such as the bible. The second category is conversational or biographical information such as in an interview, a monologue, a persentation, biography, or a script. """
-           is_menu_or_religious_text: bool = Field(description= """This is TRUE when the text is a menu or well-known religious text such as the bible. This is FALSE otherwise and is intended to be FALSE when there is a script or a monologue or an interview between two people. This is FALSE when there is a biography of a real or fictional person. If the reasoning determines this is FALSE, then is_reference_document needs to match the reasoning determination exactly. TRUE only when the text is a restaurant/food menu OR a well-known religious holy text (e.g. Bible, Quran, Torah). FALSE for everything else — including wiki pages, character biopages, interviews, monologues, biographies, scripts, tweets, and Q&A. A formal or encyclopedic writing style does NOT make a document a reference document. IMPORTANT: this value MUST match the conclusion in your reasoning field. If reasoning says FALSE, this must be FALSE.""")
-           reasoning: str = Field(
-               description = "Step-by-step reasoning behind the decision for the classified situation of the text. (Biographical conversational informaiton includes: single speaker monologue, single tweet from user, a biography, strictly Question and answer, multi-speaker content that is Non-religious. There is a target to identify in the non-religious text document in biographical conversational informaiton when is_reference_document is FALSE.)"
-           )
+    """Determine if the content is one of two categories: the first category is a reference document such as a menu or a well known religious text such as the bible. The second category is conversational or biographical information such as in an interview, a monologue, a persentation, biography, or a script."""
+
+    is_menu_or_religious_text: bool = Field(
+        description="""This is TRUE when the text is a menu or well-known religious text such as the bible. This is FALSE otherwise and is intended to be FALSE when there is a script or a monologue or an interview between two people. This is FALSE when there is a biography of a real or fictional person. If the reasoning determines this is FALSE, then is_reference_document needs to match the reasoning determination exactly. TRUE only when the text is a restaurant/food menu OR a well-known religious holy text (e.g. Bible, Quran, Torah). FALSE for everything else — including wiki pages, character biopages, interviews, monologues, biographies, scripts, tweets, and Q&A. A formal or encyclopedic writing style does NOT make a document a reference document. IMPORTANT: this value MUST match the conclusion in your reasoning field. If reasoning says FALSE, this must be FALSE."""
+    )
+    reasoning: str = Field(
+        description="Step-by-step reasoning behind the decision for the classified situation of the text. (Biographical conversational informaiton includes: single speaker monologue, single tweet from user, a biography, strictly Question and answer, multi-speaker content that is Non-religious. There is a target to identify in the non-religious text document in biographical conversational informaiton when is_reference_document is FALSE.)"
+    )
 
 
 REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION = """
@@ -299,12 +357,14 @@ Present a clear succinct reason why the classification was chosen using examples
 # ===========================================================
 # STEP 2 — Content Situation Classification
 # ============================================================
- 
+
+
 class ContentSituationClassification(BaseModel):
     """
     Classifies text into one of five situations so downstream
     routing logic knows how to handle the document.
     """
+
     classified_situation: Literal[
         "biographical_facts",
         "dialogue",
@@ -319,7 +379,6 @@ class ContentSituationClassification(BaseModel):
         )
     )
 
-
     # has_identifiable_target: bool = Field(
     #     description=(
     #         "True when a single named individual is the clear subject or "
@@ -327,14 +386,14 @@ class ContentSituationClassification(BaseModel):
     #     )
     # )
     # target_name: Optional[str] = Field(
-    #     
+    #
     #     description=(
     #         "The full name (or best identifier) of the primary target individual, "
     #         "if one can be identified. Null otherwise."
     #     )
     # )
- 
- 
+
+
 CONTENT_SITUATION_CLASSIFICATION_SYSTEM_PROMPT = """
 <Role>
 You are an expert content analyst. Your job is to read a body of text and
@@ -394,11 +453,11 @@ Choose exactly ONE of the following classified_situation values:
 """
 
 
-
 # ============================================================
 # STEP 3 — Conversational → Named Speaker Message Format
 # ============================================================
- 
+
+
 class SpeakerMessage(BaseModel):
     speaker: str = Field(
         description=(
@@ -413,11 +472,13 @@ class SpeakerMessage(BaseModel):
         )
     )
 
+
 class NamedSpeakerMessageFormat(BaseModel):
     """
     Intermediate message format: every turn is attributed to a named speaker
     or 'narrator'. This is the Step 3 output that feeds into Step 4.
     """
+
     messages: List[SpeakerMessage] = Field(
         description=(
             "Ordered list of speaker turns. Narration and stage directions use "
@@ -427,8 +488,8 @@ class NamedSpeakerMessageFormat(BaseModel):
     identified_speakers: List[str] = Field(
         description="Deduplicated list of every named speaker found in the text (excluding 'narrator')."
     )
- 
- 
+
+
 NAMED_SPEAKER_MESSAGE_FORMAT_SYSTEM_PROMPT = """
 <Role>
 You are a skilled script formatter and dialogue reconstructor. Your job is to
@@ -482,23 +543,25 @@ Return a JSON object that matches this schema exactly:
   metadata (date, platform, thread) is present.
 </Rules>
 """
- 
+
 
 # ============================================================
 # STEP 4 — Target Identification + Role Conversion (Best suited for a function)
 # ============================================================
- 
+
+
 class RoleMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
- 
- 
+
+
 class RoleConvertedMessageFormat(BaseModel):
     """
     Final training-ready format. The target individual becomes 'assistant';
     all other speakers become 'user'. No system message is emitted here —
     the caller injects it separately.
     """
+
     messages: List[RoleMessage] = Field(
         description=(
             "Ordered role-labelled messages. Target → assistant. "
@@ -512,8 +575,8 @@ class RoleConvertedMessageFormat(BaseModel):
     non_target_speakers: List[str] = Field(
         description="Names of all speakers whose turns were converted to 'user'."
     )
- 
- 
+
+
 TARGET_IDENTIFICATION_AND_ROLE_CONVERSION_SYSTEM_PROMPT = """
 <Role>
 You are a training-data formatter. Given:
@@ -555,25 +618,32 @@ their content is prepended to the next user turn in square brackets, e.g.:
 - Return an empty messages list if no target turns are found.
 </Rules>
 """
- 
 
- 
+
 # ============================================================
 # STEP 5a — Target Identification in Conversational Text
 # ============================================================
- 
+
+
 class SpeakerStatement(BaseModel):
     speaker: str = Field(description="Name of the speaker for this statement.")
-    content: str = Field(description="Verbatim or near-verbatim content of the statement.")
-    is_target: bool = Field(description="True if this speaker is the identified target individual.")
- 
- 
+    content: str = Field(
+        description="Verbatim or near-verbatim content of the statement."
+    )
+    is_target: bool = Field(
+        description="True if this speaker is the identified target individual."
+    )
+
+
 class TargetIdentificationInText(BaseModel):
     """
     Given conversational text, identifies the TARGET individual and labels
     every speaker turn. This is used between Step 2 and Step 3.
     """
-    target_name: str = Field(description="Full name (or best identifier) of the target individual.")
+
+    target_name: str = Field(
+        description="Full name (or best identifier) of the target individual."
+    )
     target_identification_reasoning: str = Field(
         description="Why this person was chosen as the target — the primary subject or persona of interest."
     )
@@ -583,8 +653,8 @@ class TargetIdentificationInText(BaseModel):
     other_speakers: List[str] = Field(
         description="Names of all other (non-target) speakers found in the text."
     )
- 
- 
+
+
 TARGET_IDENTIFICATION_IN_TEXT_SYSTEM_PROMPT = """
 <Role>
 You are an expert at parsing conversational and multi-speaker text. Given a body
@@ -623,12 +693,12 @@ Steps:
   explain why in target_identification_reasoning.
 </Rules>
 """
- 
+
 
 # ============================================================
 # STEP 5b — Characteristic Extraction (Identity Analysis)
 # ============================================================
- 
+
 
 """
 characteristic_extraction.py
@@ -640,25 +710,24 @@ All models follow the same pattern:
   - A `confidence` field (low / medium / high) so callers can gate on quality
   - An `evidence` field quoting or paraphrasing the specific source text
 """
- 
+
 # ─────────────────────────────────────────────────────────────
 # Shared confidence type
 # ─────────────────────────────────────────────────────────────
- 
+
 ConfidenceLevel = Literal["low", "medium", "high"]
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 1. NAME
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class NameExtraction(BaseModel):
     value: str = Field(
         description="Full name or best available identifier of the target individual."
     )
     evidence: str = Field(
-        
-
         description="The exact text passage where the name was found or inferred."
     )
     confidence: ConfidenceLevel = Field(
@@ -667,8 +736,8 @@ class NameExtraction(BaseModel):
     reasoning: str = Field(
         description="Why this name was chosen, including any disambiguation logic."
     )
- 
- 
+
+
 NAME_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are an expert text analyst. Extract the full name of the primary target
@@ -692,14 +761,16 @@ individual from the provided text.
   explain in reasoning.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 2. DESCRIPTION
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class DescriptionExtraction(BaseModel):
-    """ Extracts Description of a Target individual. """
+    """Extracts Description of a Target individual."""
+
     description: str = Field(
         description="A concise one-to-two paragraph summary of who this person is."
     )
@@ -707,13 +778,12 @@ class DescriptionExtraction(BaseModel):
     reasoning: str = Field(
         description="How the summary was constructed from the available text."
     )
- 
+
     evidence: str = Field(
         description="Key passages that were synthesised to form this description."
     )
 
 
- 
 DESCRIPTION_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a skilled biographer. Synthesise the source text into a concise,
@@ -740,23 +810,21 @@ Describe the following target individual:
   and explain in reasoning.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 3. IDENTITY
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class IdentityExtraction(BaseModel):
     value: Optional[str] = Field(
-        
-
         description=(
             "How the person defines themselves: profession, role, community, "
             "cultural identity, or other primary self-concept."
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Text passages that reveal how the target self-identifies."
     )
     confidence: ConfidenceLevel = Field(
@@ -765,8 +833,8 @@ class IdentityExtraction(BaseModel):
     reasoning: str = Field(
         description="Explanation of how the identity was inferred from the text."
     )
- 
- 
+
+
 IDENTITY_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a sociologist and identity analyst. Determine how the target individual
@@ -790,22 +858,21 @@ defines themselves based on the text.
   explicitly claims them.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 4. HISTORY
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class HistoryExtraction(BaseModel):
     value: Optional[str] = Field(
-        
         description=(
             "Key biographical facts, background, and formative events, "
             "presented in roughly chronological order."
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Source passages describing past events or biographical details."
     )
     confidence: ConfidenceLevel = Field(
@@ -814,8 +881,8 @@ class HistoryExtraction(BaseModel):
     reasoning: str = Field(
         description="How the history was assembled and ordered from the text."
     )
- 
- 
+
+
 HISTORY_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a biographical researcher. Extract the life history of the target
@@ -838,15 +905,15 @@ individual from the provided text.
 - Set value to null if no historical information is available.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 5. EMOTIONS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class EmotionsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Dominant or recurring emotional states expressed or implied "
             "by the target. Each item is a concise label + brief explanation, "
@@ -854,7 +921,6 @@ class EmotionsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages that demonstrate the listed emotional states."
     )
     confidence: ConfidenceLevel = Field(
@@ -863,8 +929,8 @@ class EmotionsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each emotional state was inferred from tone, word choice, or explicit statements."
     )
- 
- 
+
+
 EMOTIONS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are an expert in affective analysis and emotional intelligence. Identify the
@@ -890,32 +956,27 @@ dominant emotional states of the target individual from the text.
 - Set value to null if the text contains insufficient emotional signal.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 6. BELIEFS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class BeliefsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Core beliefs or worldview statements. Each item is a declarative "
             "sentence capturing one belief, e.g. 'People are fundamentally good.'"
         )
     )
-    evidence: Optional[str] = Field(
-        
-        description="Passages that reveal these beliefs."
-    )
+    evidence: Optional[str] = Field(description="Passages that reveal these beliefs.")
     confidence: ConfidenceLevel = Field(
         description="Confidence in the belief characterisation."
     )
-    reasoning: str = Field(
-        description="How each belief was inferred from the text."
-    )
- 
- 
+    reasoning: str = Field(description="How each belief was inferred from the text.")
+
+
 BELIEFS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a philosopher and worldview analyst. Extract the core beliefs of the
@@ -941,15 +1002,15 @@ target individual from the text.
   note both versions in reasoning.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 7. VALUES
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class ValuesExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "What the person demonstrably prioritises and protects. These are synonymous with priorities. "
             "Each item names the value and briefly explains how it is demonstrated, "
@@ -957,7 +1018,6 @@ class ValuesExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages where these values are shown in action or statement."
     )
     confidence: ConfidenceLevel = Field(
@@ -966,8 +1026,8 @@ class ValuesExtraction(BaseModel):
     reasoning: str = Field(
         description="How each value was inferred from behaviour, choices, or explicit statements."
     )
- 
- 
+
+
 VALUES_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a values analyst and moral psychologist. Identify what the target
@@ -991,15 +1051,15 @@ individual demonstrably values most from the text.
 - Rank by apparent importance if possible (most central first).
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 8. OPINIONS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class OpinionsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Specific stated or strongly implied opinions on concrete topics. "
             "Each item includes the topic and the opinion, "
@@ -1007,7 +1067,6 @@ class OpinionsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages where opinions are expressed."
     )
     confidence: ConfidenceLevel = Field(
@@ -1016,8 +1075,8 @@ class OpinionsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each opinion was identified and distinguished from broader beliefs."
     )
- 
- 
+
+
 OPINIONS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a discourse analyst. Extract the specific opinions the target individual
@@ -1040,22 +1099,21 @@ holds on concrete topics, as expressed in the text.
 - If an opinion appears to have changed across the text, note the evolution.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 9. GOALS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class GoalsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Long-term ambitions and objectives. Each item is a concise statement "
             "of a goal, e.g. 'Build a company that outlasts its founder.'"
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages where goals are stated or clearly implied."
     )
     confidence: ConfidenceLevel = Field(
@@ -1064,8 +1122,8 @@ class GoalsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each goal was identified and distinguished from short-term wants."
     )
- 
- 
+
+
 GOALS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a motivational analyst. Identify the long-term goals and ambitions of
@@ -1087,22 +1145,21 @@ the target individual from the text.
 - If a goal is explicitly stated as already achieved, note that it was a past goal.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 10. WANTS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class WantsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Immediate desires or things the person is actively pursuing right now. "
             "e.g. 'Wants public recognition for recent work.'"
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages where immediate wants are expressed."
     )
     confidence: ConfidenceLevel = Field(
@@ -1111,8 +1168,8 @@ class WantsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each want was distinguished from deeper needs or long-term goals."
     )
- 
- 
+
+
 WANTS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a behavioural analyst. Identify what the target individual wants
@@ -1134,22 +1191,21 @@ right now — their immediate desires and active pursuits — from the text.
 - Include wants the person expresses frustration about not yet having.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 11. NEEDS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class NeedsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Deeper psychological or practical needs, stated or implied. "
             "e.g. 'Needs external validation to feel secure in decisions.'"
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages that reveal underlying needs."
     )
     confidence: ConfidenceLevel = Field(
@@ -1158,8 +1214,8 @@ class NeedsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each need was inferred, especially when not explicitly stated."
     )
- 
- 
+
+
 NEEDS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a depth psychologist. Identify the deeper, often unspoken needs of
@@ -1183,22 +1239,21 @@ the target individual from the text.
 - Do not speculate beyond what the text supports. Rate confidence honestly.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 12. FEARS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class FearsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Things the person is afraid of or actively avoids. "
             "e.g. 'Fear of irrelevance — avoids topics where their authority could be challenged.'"
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages that reveal fears, avoidance, or anxiety."
     )
     confidence: ConfidenceLevel = Field(
@@ -1207,8 +1262,8 @@ class FearsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each fear was identified, including whether it is stated or inferred."
     )
- 
- 
+
+
 FEARS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a clinical narrative analyst. Identify what the target individual
@@ -1232,22 +1287,21 @@ fears or actively avoids, as revealed in the text.
 - Rate confidence carefully: stated fears = high; inferred = medium or low.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 13. FLAWS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class FlawsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Acknowledged or observable weaknesses, blind spots, or contradictions. "
             "e.g. 'Impatience — frequently interrupts others and rushes decisions.'"
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages that reveal flaws or contradictions."
     )
     confidence: ConfidenceLevel = Field(
@@ -1256,8 +1310,8 @@ class FlawsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each flaw was identified and supported by the text."
     )
- 
- 
+
+
 FLAWS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a character analyst. Identify the flaws, weaknesses, and blind spots
@@ -1283,22 +1337,21 @@ of the target individual from the text.
 - Note whether the flaw is self-reported or observed by others.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 14. STRENGTHS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class StrengthsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Demonstrated strengths, skills, or exceptional qualities. "
             "e.g. 'Strategic clarity — consistently identifies the core issue quickly.'"
         )
     )
     evidence: Optional[str] = Field(
-        
         description="Passages that demonstrate these strengths."
     )
     confidence: ConfidenceLevel = Field(
@@ -1307,8 +1360,8 @@ class StrengthsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each strength was identified from the text."
     )
- 
- 
+
+
 STRENGTHS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a strengths-based psychologist and talent analyst. Identify the
@@ -1334,33 +1387,30 @@ from the text.
 - Distinguish consistent strengths from one-time achievements.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 15. PROBLEMS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class ProblemsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Active problems, challenges, conflicts, or obstacles the target "
             "is facing or has faced. "
             "e.g. 'Strained relationship with co-founder creating organisational tension.'"
         )
     )
-    evidence: Optional[str] = Field(
-        
-        description="Passages that reveal these problems."
-    )
+    evidence: Optional[str] = Field(description="Passages that reveal these problems.")
     confidence: ConfidenceLevel = Field(
         description="Confidence in the problem identification."
     )
     reasoning: str = Field(
         description="How each problem was identified and whether it is current or past."
     )
- 
- 
+
+
 PROBLEMS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a situational analyst. Identify the active problems, challenges,
@@ -1385,12 +1435,13 @@ conflicts, and obstacles facing the target individual, as described in the text.
 - If a problem appears resolved, mark it as past in your reasoning.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 16. RELATIONSHIPS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class RelationshipEntry(BaseModel):
     person: str = Field(description="Name of the other individual.")
     relationship_type: str = Field(
@@ -1402,15 +1453,13 @@ class RelationshipEntry(BaseModel):
     sentiment: Literal["positive", "negative", "ambivalent", "neutral"] = Field(
         description="The target's apparent emotional orientation toward this person."
     )
- 
- 
+
+
 class RelationshipsExtraction(BaseModel):
     value: Optional[List[RelationshipEntry]] = Field(
-        
         description="Named individuals and the nature of their relationship to the target."
     )
     evidence: Optional[str] = Field(
-        
         description="Passages describing or implying these relationships."
     )
     confidence: ConfidenceLevel = Field(
@@ -1419,8 +1468,8 @@ class RelationshipsExtraction(BaseModel):
     reasoning: str = Field(
         description="How each relationship and its dynamic were inferred from the text."
     )
- 
- 
+
+
 RELATIONSHIPS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are a relational analyst and social psychologist. Map the significant
@@ -1448,15 +1497,15 @@ relationships of the target individual from the text.
 - Do not infer romantic or adversarial relationships without textual support.
 </Rules>
 """
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # 17. SECRETS
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class SecretsExtraction(BaseModel):
     value: Optional[List[str]] = Field(
-        
         description=(
             "Information the target holds privately and does not wish to expose "
             "or share with others, revealed only through trust or confidential "
@@ -1466,7 +1515,6 @@ class SecretsExtraction(BaseModel):
         )
     )
     evidence: Optional[str] = Field(
-        
         description=(
             "Passages — including omissions, deflections, contradictions, or "
             "confidential disclosures — that hint at or reveal withheld information."
@@ -1487,8 +1535,8 @@ class SecretsExtraction(BaseModel):
             "evasion, or indirect reference."
         )
     )
- 
- 
+
+
 SECRETS_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are an expert in subtext analysis, narrative psychology, and confidential
@@ -1543,44 +1591,45 @@ A secret is any of the following:
   the secret rather than sensationalising it.
 </Rules>
 """
- 
 
- 
+
 # ─────────────────────────────────────────────────────────────
 # Master registry — maps dimension name → (model class, system prompt)
 # Canonical order matches GeneralCharacteristicExtraction field order.
 # Useful for iterating all analyses programmatically.
 # ─────────────────────────────────────────────────────────────
- 
+
 CHARACTERISTIC_EXTRACTORS: dict[str, tuple[type[BaseModel], str]] = {
-    "name":          (NameExtraction,          NAME_EXTRACTION_SYSTEM_PROMPT),
-    "description":   (DescriptionExtraction,   DESCRIPTION_EXTRACTION_SYSTEM_PROMPT),
-    "identity":      (IdentityExtraction,      IDENTITY_EXTRACTION_SYSTEM_PROMPT),
-    "history":       (HistoryExtraction,       HISTORY_EXTRACTION_SYSTEM_PROMPT),
-    "emotions":      (EmotionsExtraction,      EMOTIONS_EXTRACTION_SYSTEM_PROMPT),
-    "beliefs":       (BeliefsExtraction,       BELIEFS_EXTRACTION_SYSTEM_PROMPT),
-    "values":        (ValuesExtraction,        VALUES_EXTRACTION_SYSTEM_PROMPT),
-    "opinions":      (OpinionsExtraction,      OPINIONS_EXTRACTION_SYSTEM_PROMPT),
-    "goals":         (GoalsExtraction,         GOALS_EXTRACTION_SYSTEM_PROMPT),
-    "wants":         (WantsExtraction,         WANTS_EXTRACTION_SYSTEM_PROMPT),
-    "needs":         (NeedsExtraction,         NEEDS_EXTRACTION_SYSTEM_PROMPT),
-    "fears":         (FearsExtraction,         FEARS_EXTRACTION_SYSTEM_PROMPT),
-    "problems":      (ProblemsExtraction,      PROBLEMS_EXTRACTION_SYSTEM_PROMPT),
-    "flaws":         (FlawsExtraction,         FLAWS_EXTRACTION_SYSTEM_PROMPT),
-    "strengths":     (StrengthsExtraction,     STRENGTHS_EXTRACTION_SYSTEM_PROMPT),
-    "secrets":       (SecretsExtraction,       SECRETS_EXTRACTION_SYSTEM_PROMPT),
+    "name": (NameExtraction, NAME_EXTRACTION_SYSTEM_PROMPT),
+    "description": (DescriptionExtraction, DESCRIPTION_EXTRACTION_SYSTEM_PROMPT),
+    "identity": (IdentityExtraction, IDENTITY_EXTRACTION_SYSTEM_PROMPT),
+    "history": (HistoryExtraction, HISTORY_EXTRACTION_SYSTEM_PROMPT),
+    "emotions": (EmotionsExtraction, EMOTIONS_EXTRACTION_SYSTEM_PROMPT),
+    "beliefs": (BeliefsExtraction, BELIEFS_EXTRACTION_SYSTEM_PROMPT),
+    "values": (ValuesExtraction, VALUES_EXTRACTION_SYSTEM_PROMPT),
+    "opinions": (OpinionsExtraction, OPINIONS_EXTRACTION_SYSTEM_PROMPT),
+    "goals": (GoalsExtraction, GOALS_EXTRACTION_SYSTEM_PROMPT),
+    "wants": (WantsExtraction, WANTS_EXTRACTION_SYSTEM_PROMPT),
+    "needs": (NeedsExtraction, NEEDS_EXTRACTION_SYSTEM_PROMPT),
+    "fears": (FearsExtraction, FEARS_EXTRACTION_SYSTEM_PROMPT),
+    "problems": (ProblemsExtraction, PROBLEMS_EXTRACTION_SYSTEM_PROMPT),
+    "flaws": (FlawsExtraction, FLAWS_EXTRACTION_SYSTEM_PROMPT),
+    "strengths": (StrengthsExtraction, STRENGTHS_EXTRACTION_SYSTEM_PROMPT),
+    "secrets": (SecretsExtraction, SECRETS_EXTRACTION_SYSTEM_PROMPT),
     "relationships": (RelationshipsExtraction, RELATIONSHIPS_EXTRACTION_SYSTEM_PROMPT),
 }
- 
- 
 
 
 class Relationship(BaseModel):
     person: str
-    relationship_type: str = Field(description="e.g. 'close friend', 'rival', 'mentor', 'romantic partner'")
-    description: str = Field(description="Brief description of the dynamic between the target and this person.")
- 
- 
+    relationship_type: str = Field(
+        description="e.g. 'close friend', 'rival', 'mentor', 'romantic partner'"
+    )
+    description: str = Field(
+        description="Brief description of the dynamic between the target and this person."
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # GeneralCharacteristicExtraction
 # Aggregate model — all 17 dimensions in one structured output.
@@ -1588,7 +1637,8 @@ class Relationship(BaseModel):
 # dimension at once instead of running CHARACTERISTIC_EXTRACTORS
 # individually.
 # ─────────────────────────────────────────────────────────────
- 
+
+
 class GeneralCharacteristicExtraction(BaseModel):
     """
     Rich identity profile inferred from a body of text about or by a target.
@@ -1596,67 +1646,49 @@ class GeneralCharacteristicExtraction(BaseModel):
     Run the individual *Extraction models for higher-fidelity per-dimension
     analysis; use this model for a single-pass broad profile.
     """
-    name: Optional[str] = Field(
-        
-        description="Full name of the target individual."
-    )
+
+    name: Optional[str] = Field(description="Full name of the target individual.")
     description: Optional[str] = Field(
-        
         description="One-paragraph summary of who this person is."
     )
     identity: Optional[str] = Field(
-        
         description="How the person identifies themselves (profession, role, community, etc.)."
     )
     history: Optional[str] = Field(
-        
         description="Key biographical facts, background, formative events."
     )
     emotions: Optional[List[str]] = Field(
-        
         description="Dominant or recurring emotional states expressed or implied."
     )
     beliefs: Optional[List[str]] = Field(
-        
         description="Core beliefs or worldview statements inferred from the text."
     )
     values: Optional[List[str]] = Field(
-        
         description="What the person demonstrably cares about most."
     )
     opinions: Optional[List[str]] = Field(
-        
         description="Specific stated or strongly implied opinions on topics."
     )
-    goals: Optional[List[str]] = Field(
-        
-        description="Long-term ambitions or objectives."
-    )
+    goals: Optional[List[str]] = Field(description="Long-term ambitions or objectives.")
     wants: Optional[List[str]] = Field(
-        
         description="Immediate desires or things the person is actively pursuing."
     )
     needs: Optional[List[str]] = Field(
-        
         description="Deeper psychological or practical needs, stated or implied."
     )
     fears: Optional[List[str]] = Field(
-        
         description="Things the person is afraid of or actively avoids."
     )
     problems: Optional[List[str]] = Field(
-        
         description=(
             "Current challenges the individual is facing. These could be internal "
             "conflicts or external conflicts that the individual needs to resolve."
         )
     )
     flaws: Optional[List[str]] = Field(
-        
         description="Acknowledged or observable weaknesses, blind spots, or contradictions."
     )
     strengths: Optional[List[str]] = Field(
-        
         description=(
             "Features of the individual that the individual excels at. The best "
             "qualities of the individual and what the individual is best at doing "
@@ -1664,7 +1696,6 @@ class GeneralCharacteristicExtraction(BaseModel):
         )
     )
     secrets: Optional[List[str]] = Field(
-        
         description=(
             "Information held privately by the individual that they do not wish to "
             "expose or share with others unless they trust and confidently confide "
@@ -1672,7 +1703,6 @@ class GeneralCharacteristicExtraction(BaseModel):
         )
     )
     relationships: Optional[List[RelationshipEntry]] = Field(
-        
         description="Named individuals and the nature of their relationship to the target."
     )
     reasoning: str = Field(
@@ -1681,8 +1711,8 @@ class GeneralCharacteristicExtraction(BaseModel):
             "from the source text, with cited evidence for every claim."
         )
     )
- 
- 
+
+
 GENERAL_CHARACTERISTIC_EXTRACTION_SYSTEM_PROMPT = """
 <Role>
 You are an expert psychologist, biographer, and narrative analyst. Your task is
@@ -1773,4 +1803,3 @@ BELIEFS vs OPINIONS
   citing the specific textual evidence for each populated dimension.
 </Rules>
 """
- 

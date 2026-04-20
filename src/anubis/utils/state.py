@@ -9,7 +9,6 @@ from typing import Sequence
 
 from langchain_core.messages import AnyMessage, SystemMessage
 from langgraph.graph import add_messages
-from langgraph.managed import IsLastStep
 from typing_extensions import Annotated
 
 
@@ -267,3 +266,28 @@ class GlobalState(TypedDict):
     """ Node Routing """
 
     route_decision: str = ""
+
+    """ Model Metrics """
+    structured_response_calls_count: int = 0
+    structured_response_prompt_tokens: int = 0
+    structured_response_completion_tokens: int = 0
+    structured_response_total_tokens: int = 0
+    structured_response_total_cost: float = 0.0
+    structured_response_latency_list_ms: Annotated[Sequence[float], operator.add]
+    structured_response_average_latency_ms: float = 0.0
+
+    image_model_calls_count: int = 0
+    image_model_prompt_tokens: int = 0
+    image_model_completion_tokens: int = 0
+    image_model_total_tokens: int = 0
+    image_model_total_cost: float = 0.0
+    image_model_response_latency_list_ms: Annotated[Sequence[float], operator.add]
+    image_model_average_latency_ms: float = 0.0
+
+    inference_calls_count: int = 0
+    inference_model_prompt_tokens: int = 0
+    inference_model_completion_tokens: int = 0
+    inference_model_total_tokens: int = 0
+    inference_model_total_cost: float = 0.0
+    inference_model_latency_list_ms: Annotated[Sequence[float], operator.add]
+    inference_model_average_latency_ms: float = 0.0

@@ -355,7 +355,7 @@ async def process_text_to_document(
 
 """
 Text chunking module for processing large text files into Documents
-for LangGraph-MongoDB vectorstore with all-MiniLM-L6-v2 embeddings (384 dimensions)
+for LangGraph-MongoDB vectorstore with harrier-oss-v1-270m embeddings (384 dimensions)
 """
 
 from pydantic import BaseModel
@@ -447,7 +447,7 @@ async def process_text_media_item_target_for_vectorstore(
         user_id: User identifier for metadata
         assistant_id: Assistant identifier for metadata
         chunk_size: Maximum size of each text chunk (default: 500)
-                   Optimized for all-MiniLM-L6-v2 (384 dimensions)
+                   Optimized for harrier-oss-v1-270m (384 dimensions)
         chunk_overlap: Number of overlapping characters between chunks (default: 50)
         separators: Custom separators for text splitting (optional)
 

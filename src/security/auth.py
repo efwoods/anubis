@@ -23,6 +23,8 @@ import asyncio
 
 import logging
 import stripe
+import time
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +426,6 @@ async def get_current_user(
 
 from supabase import create_async_client
 from langgraph_sdk import get_client
-import json
 
 
 async def get_anonymous_user_with_anonymous_api_key(
@@ -719,7 +720,7 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         from langgraph_sdk import get_client
 
         token = current_user["API_KEY"]
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"API-KEY": f"{token}"}
         langgraph_sdk_client = get_client(headers=headers)
 
         metadata = {"user_id": current_user["identities"][0]["user_id"]}

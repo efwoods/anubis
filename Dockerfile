@@ -14,7 +14,7 @@ RUN for dep in /deps/*; do \
         fi; \
     done
  
-ENV LANGGRAPH_STORE='{"index": {"dims": 384, "embed": "huggingface:sentence-transformers/all-MiniLM-l6-v2", "fields": ["document.kwargs.page_content"]}}'
+ENV LANGGRAPH_STORE='{"index": {"dims": 640, "embed": "huggingface:microsoft/harrier-oss-v1-270m", "fields": ["document.kwargs.page_content"]}}'
 ENV LANGGRAPH_HTTP='{"app": "/deps/anubis/src/api/webapp.py:app"}'
 ENV LANGSERVE_GRAPHS='{"Anubis": "/deps/anubis/src/anubis/graph.py:graph"}'
 

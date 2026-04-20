@@ -481,7 +481,7 @@ async def create_avatar(
             metadata["is_public"] = is_public
 
         token = current_user["API_KEY"]
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"API-KEY": f"{token}"}
         client = get_client(headers=headers)
 
         create_avatar_response = await client.assistants.create(
@@ -517,7 +517,7 @@ async def share_avatar(
     if user_id == context.admin_user_id:
         try:
             token = current_user["API_KEY"]
-            client = get_client(headers={"Authorization": f"Bearer {token}"})
+            client = get_client(headers={"API-KEY": f"{token}"})
             result = await client.assistants.update(
                 assistant_id=assistant_id, metadata=metadata
             )
@@ -557,7 +557,7 @@ async def modify_avatar(
         )
 
     token = current_user["API_KEY"]
-    client = get_client(headers={"Authorization": f"Bearer {token}"})
+    client = get_client(headers={"API-KEY": f"{token}"})
     if assistant_id:
         if new_avatar_name and new_avatar_description:
             result = await client.assistants.update(
@@ -593,7 +593,7 @@ async def delete_avatar(
 
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
-    client = get_client(headers={"Authorization": f"Bearer {token}"})
+    client = get_client(headers={"API-KEY": f"{token}"})
 
     metadata = {"user_id": user_id}
     metadata.update({"assistant_id": assistant_id})
@@ -628,6 +628,7 @@ async def delete_avatar(
 @app.get("/list_public_avatars")
 async def list_public_avatars(assistant_id: Optional[str] = None):
     logger.info("breakpoint")
+    breakpoint()
     public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
     return public_avatars_result
 
@@ -695,7 +696,7 @@ async def select_avatar(
         return assistant_config
     else:
         token = current_user["API_KEY"]
-        client = get_client(headers={"Authorization": f"{token}"})
+        client = get_client(headers={"API-KEY": token})
         user_id = current_user["identities"][0]["user_id"]
         if assistant_id:
             try:

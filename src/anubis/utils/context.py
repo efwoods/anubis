@@ -15,6 +15,8 @@ from src.anubis.utils.prompts.subgraphs import vector_store_graph_prompts
 from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
+import typing
+
 
 @dataclass
 class IdentityContext:
@@ -24,11 +26,11 @@ class IdentityContext:
     def update_metadata(self, key: str, value: Any):
         """Update a specific metadata field."""
         self.metadata[key] = value
-    
+
     def merge_metadata(self, new_metadata: Dict[str, Any]):
         """Merge new metadata into existing."""
         self._deep_merge(self.metadata, new_metadata)
-    
+
     def _deep_merge(self, base: Dict, update: Dict):
         """Recursively merge dictionaries."""
         for key, value in update.items():
@@ -37,24 +39,25 @@ class IdentityContext:
             else:
                 base[key] = value
 
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for prompt injection."""
-        return {
-            "name": self.name,
-            **self.metadata  # Unpack all metadata at top level
-        }
+        return {"name": self.name, **self.metadata}  # Unpack all metadata at top level
+
 
 @dataclass
 class AssistantContext(IdentityContext):
     metadata: dict = field(
-        default=None, 
-        metadata={"description": "This is metadata that includes the user_id of the creator."}
+        default=None,
+        metadata={
+            "description": "This is metadata that includes the user_id of the creator."
+        },
     )
 
-@dataclass 
+
+@dataclass
 class UserContext(IdentityContext):
     pass
+
 
 @dataclass(kw_only=True)
 class GlobalContext:
@@ -64,7 +67,7 @@ class GlobalContext:
     user_ctx: UserContext = field(default_factory=UserContext)
 
     # max_search_results: int = field(
-    #     default=10, 
+    #     default=10,
     #     metadata={
     #         "description":"Maximum number of search results to return for each search query."
     #     },
@@ -84,24 +87,26 @@ class GlobalContext:
 
     """ Default Environment Variables """
 
-    together_api_key: str = field(
-        default=None, 
-        metadata={"description": "inference provider for production use and for adapter training."}
-    )
-    
+    """ <Inference Model> """
 
-    llm_provider_api_key: str = field(
+    model_provider: str = field(
+        default=None, metadata={"description": "Model inference provider."}
+    )
+
+    together_api_key: str = field(
         default=None,
         metadata={
-            "description": "API key for llama models"
+            "description": "inference provider for production use and for adapter training."
         },
     )
 
-    llm_provider_base_url: str = field(
+    llm_provider_api_key: str = field(
         default=None,
-        metadata={
-            "description": "base url for the llama model"
-        }
+        metadata={"description": "API key for llama models"},
+    )
+
+    llm_provider_base_url: str = field(
+        default=None, metadata={"description": "base url for the llama model"}
     )
 
     model: str = field(
@@ -110,20 +115,16 @@ class GlobalContext:
             "description": "Model Name Only; text response and tool use for thought processing."
         },
     )
-    
-    model_prompt_cost: str = field(
-        default=None,
-        metadata={
-            "description": "Cost of input tokens."
-        },
-    )
 
-    model_completion_cost: str = field(
-        default=None,
-        metadata={
-            "description": "Completion token cost."
-        },
-    )
+    model_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of input tokens."},
+
+    model_completion_cost: float = 0.0
+    # metadata={"description": "Completion token cost."},
+
+    """ </Inference Model> """
+
+    """ <Image Model> """
 
     image_model: str = field(
         default=None,
@@ -146,47 +147,50 @@ class GlobalContext:
         },
     )
 
-    image_model_prompt_cost: str = field(
-        default=None,
-        metadata={
-            "description": "Cost of input tokens."
-        },
+    image_model_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of input tokens."},
+
+    image_model_completion_cost: float = 0.0
+    # metadata={"description": "Completion token cost."},
+
+    """ </Image Model> """
+
+    """ <Llama Model> """
+
+    llama_api_key: str = field(
+        default=None, metadata={"description": "LLama developer api key."}
     )
 
-    image_model_completion_cost: str = field(
-        default=None,
-        metadata={
-            "description": "Completion token cost."
-        },
+    llama_model: str = field(
+        default=None, metadata={"description": "LLama model name."}
     )
 
+    llama_model_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of input tokens."},
 
+    llama_model_completion_cost: float = 0.0
+    # metadata={"description": "Completion token cost."},
 
+    """ </Llama Model> """
 
     dev: str = field(
         default=None,
         metadata={
             "description": "development mode; single user model; 10 requests/minute; no adapters/training"
-        }
-    )
-    
-    debug: str = field(
-        default=None, 
-        metadata={
-            "description": "debugging available"
-        }
+        },
     )
 
+    debug: str = field(default=None, metadata={"description": "debugging available"})
+
     huggingface_token: str = field(
-        default=None,
-        metadata={"description": "Token to use huggingface models"}
+        default=None, metadata={"description": "Token to use huggingface models"}
     )
 
     embedding_model: Annotated[
         str,
         {"__template_metadata__": {"kind": "embeddings"}},
     ] = field(
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="microsoft/harrier-oss-v1-270m",
         metadata={
             "description": "Name of the embedding model to use. Must be a valid embedding model name."
         },
@@ -194,108 +198,99 @@ class GlobalContext:
 
     vectorstore_postgres_uri: str = field(
         default=None,
-        metadata={"description": "Connection string to postgres db for persistent document storage via vector store"}
+        metadata={
+            "description": "Connection string to postgres db for persistent document storage via vector store"
+        },
     )
 
     async_postgres_store_uri: str = field(
         default=None,
-        metadata={"description": "Connection string to async postgres store for persistent storage of avatar metadata for contextual prompt injection"}
+        metadata={
+            "description": "Connection string to async postgres store for persistent storage of avatar metadata for contextual prompt injection"
+        },
     )
 
     model_token_limit: int = field(
         default=128000,
-        metadata={"description": "number of acceptable tokens in a request to the current llm in thousands of tokens."}
+        metadata={
+            "description": "number of acceptable tokens in a request to the current llm in thousands of tokens."
+        },
     )
 
-    langsmith_api_key: str = field(
-        default = None, 
-        metadata={"description": "api key"}
-    )
+    langsmith_api_key: str = field(default=None, metadata={"description": "api key"})
 
     deployment: str = field(
-        default= None,
-        metadata={"description": "True for langsmith deployments to use autoconfiguration of store; disables functionality of api yet allows the graph to run for deployments."}
+        default=None,
+        metadata={
+            "description": "True for langsmith deployments to use autoconfiguration of store; disables functionality of api yet allows the graph to run for deployments."
+        },
     )
 
     supabase_url: str = field(
-        default=None, 
-        metadata={"description": "url for user authentication"}
+        default=None, metadata={"description": "url for user authentication"}
     )
 
     supabase_key: str = field(
-        default=None, 
-        metadata={"description": "api key for user authentication"}
+        default=None, metadata={"description": "api key for user authentication"}
     )
 
     admin_user_id: str = field(
         default=None,
-        metadata={"description": "user_id to allow the creation of public avatars. Reserved for CEO."}
+        metadata={
+            "description": "user_id to allow the creation of public avatars. Reserved for CEO."
+        },
     )
 
     anonymous_user_id: str = field(
         default=None,
-        metadata={"description": "user_id to allow the creation of public avatars. Reserved for anonymous users to store the creation of avatars in a cookie."}
+        metadata={
+            "description": "user_id to allow the creation of public avatars. Reserved for anonymous users to store the creation of avatars in a cookie."
+        },
     )
 
     anonymous_api_key: str = field(
         default=None,
-        metadata={"description": "api key for anonymous user data analytics to monitor content."}
+        metadata={
+            "description": "api key for anonymous user data analytics to monitor content."
+        },
     )
 
-    # stripe_publishable_key: str = field(
-    #     default=None, 
-    #     metadata={"description": "API key for interacting with the stripe API."}
-    # )
-
     stripe_secret_key: str = field(
-        default=None, 
-        metadata={"description": "API key for interacting with the stripe API."}
+        default=None,
+        metadata={"description": "API key for interacting with the stripe API."},
     )
 
     stripe_product_id: str = field(
-        default=None, 
-        metadata={"description": "Neural Nexus API monthly subscription product id."}
+        default=None,
+        metadata={"description": "Neural Nexus API monthly subscription product id."},
     )
 
     stripe_payment_url: str = field(
-        default=None, 
-        metadata={"description": "Payment URL for subscriptions."}
-    )
-
-    model_provider: str = field(
-        default=None, 
-        metadata={"description": "Model inference provider."}
-    )
-
-    llama_api_key: str = field(
-        default = None, 
-        metadata={"description": "LLama developer api key."}
-    )
-
-    llama_model: str = field(
-        default = None, 
-        metadata={"description": "LLama model name."}
-    )
-
-    llama_model_prompt_cost: str = field(
-        default=None,
-        metadata={
-            "description": "Cost of input tokens."
-        },
-    )
-
-    llama_model_completion_cost: str = field(
-        default=None,
-        metadata={
-            "description": "Completion token cost."
-        },
+        default=None, metadata={"description": "Payment URL for subscriptions."}
     )
 
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args."""
+        hints = typing.get_type_hints(self.__class__)
+
         for f in fields(self):
             if not f.init:
                 continue
 
             if getattr(self, f.name) == f.default:
-                setattr(self, f.name, os.environ.get(f.name.upper(), f.default))
+                env_val = os.environ.get(f.name.upper(), f.default)
+
+                if env_val is not None:
+                    field_type = hints.get(f.name)
+                    # Unwrap Optional[float] -> float
+                    origin = typing.get_origin(field_type)
+                    args = typing.get_args(field_type)
+                    if origin is typing.Union:
+                        field_type = next(
+                            (a for a in args if a is not type(None)), field_type
+                        )
+
+                    if field_type is float:
+                        env_val = float(env_val)
+
+                setattr(self, f.name, env_val)

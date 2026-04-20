@@ -19,7 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 ## Encoder constructors
-async def make_text_encoder(model: str = "sentence-transformers/all-MiniLM-L6-v2") -> Embeddings:
+async def make_text_encoder(model: str = "microsoft/harrier-oss-v1-270m") -> Embeddings:
     """Connect to the configured text encoder."""
     from langchain_huggingface import HuggingFaceEmbeddings
     logger.info(f"Make text encoder  ENTRYPOINT")

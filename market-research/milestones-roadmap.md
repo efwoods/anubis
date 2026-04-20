@@ -1,0 +1,3 @@
+Instructions:
+I need to Create milestones to reach the following goal. I am creating weekly updates to propel this startup. These are the categories of features including chain-of-thought reasoning patterns and fine-tuned-adapters and human in the loop feedback on responses for liked or disliked and edited responses to improve the authenticity of the responses. there are six categories. This is the application, the categories, my current work effort, and the deadline for the requirements please assist in creating a milestone road map to meet these requirements as soon as effectively possible. 
+

@@ -49,7 +49,7 @@ from langchain_core.documents import Document
 
 
 def normal_chunking(
-    text_content: str, metadata: dict, chunk_size: int = 512, chunk_overlap: int = 50
+    text_content: str, metadata: dict, chunk_size: int = 1024, chunk_overlap: int = 150
 ):
     # 1. Define the hierarchy of separators
     # The order matters: it tries to split at the top of the list first.

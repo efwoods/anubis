@@ -312,7 +312,6 @@ async def process_media_item_task(
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
 
-
     try:
         # Handle base64 images
         if media_type == "image":

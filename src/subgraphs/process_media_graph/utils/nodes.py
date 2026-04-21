@@ -60,12 +60,6 @@ async def process_uploaded_files_and_label_media_type(
     breakpoint()
     user_id, assistant_id = await extract_user_id_assistant_id(config)
 
-    # logger.info("STORE ACCESS TESTING")
-    # namespace = ("evan")
-    # await store.aput(namespace=namespace, key="evan", value={"name": "evan"})
-    # get_value = await store.aget("evan", key="name")
-    # logger.info("get_value: {get_value}")
-
     media_files = state.get('media_files', [])
     
     if not media_files:
@@ -318,14 +312,6 @@ async def process_media_item_task(
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
 
-    logger.info(f"Testing store access")
-
-    # namespace = ("testing","document")
-    # await store.aput(namespace=namespace, key="media", value={"media":media_item, "document":media_item['content']})
-    # testing_get = await store.aget(namespace=namespace, key="media")
-    # testing_search = await store.asearch(("testing", "document"), query="Shivon Zilis")
-    # logger.info(f"testing_get: {testing_get}")
-    # logger.info(f"get_value: {testing_search}")
 
     try:
         # Handle base64 images

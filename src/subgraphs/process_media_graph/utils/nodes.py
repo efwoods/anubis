@@ -57,6 +57,7 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
+    breakpoint()
     user_id, assistant_id = await extract_user_id_assistant_id(config)
 
     # logger.info("STORE ACCESS TESTING")
@@ -140,10 +141,13 @@ async def process_uploaded_files_and_label_media_type(
                     }
                 })
             
-            elif content_type in ['text/plain', 'application/json', 'text/markdown', 'application/octet-stream']:
+            elif content_type in [
+                'text/plain', 
+            'application/json', 
+            'text/markdown', 
+            'application/octet-stream'
+            ]:
                 # Handle text files
-                
-                
                 if suffix == '.txt':
                     text_content = file_bytes.decode('utf-8')
                     media_list.append({
@@ -243,6 +247,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     """
     
     logging.info(f"DETERMINE_MEDIA_TYPE NODE")
+    breakpoint()
     
     media_list = state.get('media_list', [])
 

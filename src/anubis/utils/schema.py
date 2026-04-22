@@ -379,19 +379,19 @@ class ContentSituationClassification(BaseModel):
         )
     )
 
-    # has_identifiable_target: bool = Field(
-    #     description=(
-    #         "True when a single named individual is the clear subject or "
-    #         "primary speaker of the text."
-    #     )
-    # )
-    # target_name: Optional[str] = Field(
-    #
-    #     description=(
-    #         "The full name (or best identifier) of the primary target individual, "
-    #         "if one can be identified. Null otherwise."
-    #     )
-    # )
+    has_identifiable_target: bool = Field(
+        description=(
+            "True when a single named individual is the clear subject or "
+            "primary speaker of the text."
+        )
+    )
+    target_name: Optional[str] = Field(
+    
+        description=(
+            "The full name (or best identifier) of the primary target individual, "
+            "if one can be identified. Null otherwise."
+        )
+    )
 
 
 CONTENT_SITUATION_CLASSIFICATION_SYSTEM_PROMPT = """

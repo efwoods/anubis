@@ -1,4 +1,4 @@
-I'm processing the document type in the webapp, then again here: process_uploaded_files_and_label_media_type, then again in convert_media_list_to_text_document (where the document situation is analyzed then chunked and marked for the appropriate namespace), then I am indexing. 
+I'm processing the document type in the webapp, then again here: process_uploaded_files_and_label_media_type, then again in convert_media_list_to_text_document (where the document situation is analyzed then chunked and marked for the appropriate namespace), then I am indexing the documents through a batching process into the vectorstore. 
 
 I want to do this in a single step (extracting the document metadata for example. ) I will need to take the document before sending to chunking into a vectorstore and analyze the document. 
 

@@ -3,8 +3,22 @@ volumes:
         driver: local
     grafana-storage:
         driver: local
-        
+    redis-data:
+        driver: local
+
 services:
+    redis:
+        image: redis:7-alpine
+        command: redis-server --appendonly yes
+        volumes:
+            - redis-data:/data
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 5s
+            timeout: 3s
+            retries: 5
+        restart: unless-stopped
+
     langgraph-api-prod:
         image: evdev3/anubis-langgraph-api:latest
         pull_policy: never
@@ -22,6 +36,9 @@ services:
             start_period: 10s
         env_file:
             - .env
+        depends_on:
+            redis:
+                condition: service_healthy
         volumes:
             - .:/deps/anubis
             - ~/.cache/huggingface:/root/.cache/huggingface

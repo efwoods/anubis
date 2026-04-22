@@ -1,4 +1,3 @@
-# alter embedding model in db
 # collect token usage metrics
 
 # response evaluation loop with langsmith dataset from langsmith import RunEvalConfig(evaluators=["sentiment", "cot_qa","bleu", "rouge"], custom_evaluators=[RunEvalConfig.Criteria({"authenticity":"AUTHENTICITY_PROMPT (were these text written by the same author?)"}), eval_llm="gpt-5.4-nano"])

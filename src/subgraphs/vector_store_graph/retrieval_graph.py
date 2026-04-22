@@ -37,9 +37,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.anubis.utils.model import init_model
 
-from src.anubis.utils.utility import summarize_messages
-
-
 async def generate_query(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, list[str]]:
@@ -96,21 +93,6 @@ async def generate_query(
     # response = await model.ainvoke(input=input)
 
 
-    # master_message_list = await summarize_messages(
-    #     messages, 
-    #     configuration, 
-    #     future_updated_system_message, 
-    #     future_updated_system_message_failsafe, 
-    #     system_message_instruction_single_message,
-    #     query_l = query_l, 
-    #     query_generation_mode=True
-    # )
-    # # Create a model for invocation
-    # model_structured_output = init_model(
-    #             configuration = configuration,
-    #             response_format=SearchQuery
-    #         )
-    # generated = cast(SearchQuery, await model_structured_output.ainvoke(master_message_list))
 
     # return {"queries": [generated.query]}
 

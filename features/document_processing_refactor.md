@@ -1,6 +1,6 @@
 I'm processing the document type in the webapp, then again here: process_uploaded_files_and_label_media_type, then again in convert_media_list_to_text_document (where the document situation is analyzed then chunked and marked for the appropriate namespace), then I am indexing the documents through a batching process into the vectorstore. 
 
-I want to do this in a single step (extracting the document metadata for example. ) I will need to take the document before sending to chunking into a vectorstore and analyze the document. 
+I want to do this in a single step (extracting the document metadata for example) before 
 
 The document needs to be in a format for analysis, 
 vector store versions of the text need to be formatted such as to strictly store only information that are facts about the target or direct quotes from the target, and there needs to be an analysis step to identify if the content would be suitable for adapter dataset creation and creation of the prompt questions and pairing with the answers (if a monologue then a prompt question is created, if a series of distinct quotes then a series of paired provoking questions are generated, if facts about the target then this format is not acceptable for adapter dataset creation) and the dataset would need to be created and stored and training would need to be triggered after a sufficient amount of data is created. 

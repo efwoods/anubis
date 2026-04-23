@@ -1,15 +1,3 @@
-# document refactor
-
-# collect token usage metrics
-
-# response evaluation loop with langsmith dataset from langsmith import RunEvalConfig(evaluators=["sentiment", "cot_qa","bleu", "rouge"], custom_evaluators=[RunEvalConfig.Criteria({"authenticity":"AUTHENTICITY_PROMPT (were these text written by the same author?)"}), eval_llm="gpt-5.4-nano"])
-
-<!-- https://reference.langchain.com/python/langchain-classic/smith/evaluation/config/RunEvalConfig -->
-<!-- https://github.com/langchain-ai/langsmith-cookbook/blob/main/testing-examples/qa-correctness/qa-correctness.ipynb -->
-
-# Clean semantic chunking (use defined context window with overlap in process documents to text)
-# clean conversation summaries
-
 # Kickstarter
 I had a friend growing up in high school who met an early end. Everyone at school went to her Facebook profile to leave messages after her passing. Her mom logged in to her profile and responded to the messages. Today, we have AI generative media and a plethora of social media content. I have been creating a platform to upload any content or share any story to recreate a personal presence of yourself - to create a digital soul to share of yourself with others for years to come. My avatar knows information about what I value, my personal history, and I have created a Pastor that uses the King James Bible for contextually relevant responses. I am looking for people to both back and beta test the current platform (neuralnexus.site, api.neuralnexus.site, ui.neuralnexus.site). There are many use cases, and I hope you join the digital afterlife, live long, and prosper.
 

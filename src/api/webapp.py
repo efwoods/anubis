@@ -918,6 +918,7 @@ async def message_selected_avatar(
 ):
 
     logger.info("breakpoint update")
+    breakpoint()
     langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()

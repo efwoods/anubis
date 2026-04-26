@@ -193,10 +193,6 @@ async def terms_and_services_content_moderation(
     }
     return {"moderation_response": moderation_response}
 
-
-from src.anubis.utils.tools.identity.identity_tools import test_update
-
-
 async def think(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):

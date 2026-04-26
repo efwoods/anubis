@@ -1,1 +1,0 @@
-https://smith.langchain.com/o/68a934f8-fa1f-4950-a288-1bcedacf9f09/studio/thread?organizationId=68a934f8-fa1f-4950-a288-1bcedacf9f09&render=interact&baseUrl=http%3A%2F%2Flocalhost%3A8123&mode=chat&assistantId=d068614c-e072-41bc-8c45-b634c5e06a8c&threadId=681a4c36-cc77-421c-bc3e-98c88e1e6785

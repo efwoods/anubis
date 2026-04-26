@@ -25,6 +25,17 @@ from datetime import timezone
 from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
 from typing import Optional
 
+import math
+import shutil
+import tempfile
+from pathlib import Path
+from moviepy import AudioFileClip, VideoFileClip
+from time import time_ns
+from fastapi import UploadFile
+from openai import OpenAI
+from openai.types.audio.transcription_diarized import TranscriptionDiarized
+import base64
+
 logger = logging.getLogger(__name__)
 
 
@@ -464,3 +475,496 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
 
 #     print("\n--- Transcript Preview ---")
 #     print(text[:500])
+
+""" AUDIO TRANSCRIPTION """
+
+
+def _openai_client_for_speech(context: GlobalContext) -> OpenAI:
+    key = context.openai_api_key or context.llm_provider_api_key
+    if not key:
+        msg = "Set `openai_api_key` / OPENAI_API_KEY or `llm_provider_api_key` for speech APIs."
+        raise ValueError(msg)
+    return OpenAI(api_key=key)
+
+
+def _audio_mime_from_suffix(suffix: str) -> str:
+    s = (suffix or "").lower()
+    if s == ".mp3":
+        return "audio/mpeg"
+    if s in (".m4a", ".mp4", ".aac"):
+        return "audio/mp4"
+    if s == ".wav":
+        return "audio/wav"
+    if s == ".webm":
+        return "audio/webm"
+    return "audio/mp4"
+
+
+def _truncate_reference_audio_path_if_long(path: str, context: GlobalContext) -> str:
+    """If audio is longer than _REFERENCE_AUDIO_CLIP_MAX_S, keep the first segment and return a new .mp3 path."""
+    clip = AudioFileClip(path)
+    try:
+        duration = float(clip.duration or 0.0)
+        if duration <= context.reference_audio_clip_max_seconds:
+            return path
+        sub = clip.subclipped(0.0, context.reference_audio_clip_max_seconds)
+        fd, out_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            sub.write_audiofile(out_path, logger=None)
+        except Exception:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+        finally:
+            sub.close()
+    finally:
+        clip.close()
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return out_path
+
+
+# 1. Save the bytes to a temp file
+async def get_audio_duration_seconds(data: UploadFile) -> float:
+    with tempfile.NamedTemporaryFile(suffix=Path(data.filename).suffix, delete=True) as temp_audio:
+        data.file.seek(0)
+        temp_audio.write(data.file.read())
+        temp_audio.flush()
+
+        # 2. Load with MoviePy
+        with AudioFileClip(temp_audio.name) as clip:
+            duration_seconds = float(clip.duration or 0.0)
+        data.file.seek(0)
+        return duration_seconds
+
+
+def _transcribe_one_segment_path(
+    path: str,
+    upload_filename: str,
+    context: GlobalContext,
+    client: OpenAI,
+) -> dict:
+    start = time_ns()
+    with AudioFileClip(path) as clip:
+        duration_seconds = float(clip.duration or 0.0)
+    transcription_cost = duration_seconds * context.audio_transcription_price_per_minute
+    model = context.audio_transcription_model or "whisper-1"
+    with open(path, "rb") as audio_f:
+        content = client.audio.transcriptions.create(
+            file=(upload_filename, audio_f),
+            model=model,
+            response_format="text",
+        )
+    return {
+        "content": content,
+        "file_duration_s": duration_seconds,
+        "total_cost": transcription_cost,
+        "latency_ms": (time_ns() - start) / 1e6,
+        "model": model,
+        "inference_type": "transcription",
+    }
+
+
+async def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
+    """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit."""
+    start_time = time_ns()
+    size_bytes = os.path.getsize(path)
+    client = _openai_client_for_speech(context)
+
+    if size_bytes <= context.whisper_max_bytes:
+        seg = _transcribe_one_segment_path(path, upload_filename, context, client)
+        seg["latency_ms"] = (time_ns() - start_time) / 1e6
+        return seg
+
+    clip = AudioFileClip(path)
+    try:
+        duration = float(clip.duration or 0.0)
+        n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
+        chunk_dur = duration / n
+        parts: list[str] = []
+        total_cost = 0.0
+        inner_latency = 0.0
+        for i in range(n):
+            t0 = i * chunk_dur
+            t1 = duration if i == n - 1 else (i + 1) * chunk_dur
+            sub = clip.subclipped(t0, t1)
+            fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            try:
+                sub.write_audiofile(chunk_path, logger=None)
+                seg = _transcribe_one_segment_path(
+                    chunk_path, f"chunk_{i}.mp3", context, client
+                )
+                parts.append(seg["content"])
+                total_cost += seg["transcription_cost"]
+                inner_latency += seg["latency_ms"]
+            finally:
+                sub.close()
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+        return {
+            "content": " ".join(parts),
+            "file_duration_s": duration,
+            "total_cost": total_cost,
+            "latency_ms": inner_latency,
+            "whisper_chunk_count": n,
+            "model": context.audio_transcription_model, 
+            "inference_type": "transcription"
+        }
+    finally:
+        clip.close()
+
+
+async def transcribe_audio(data: UploadFile, context: GlobalContext) -> dict:
+    suffix = Path(data.filename or "audio.m4a").suffix or ".m4a"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        data.file.seek(0)
+        shutil.copyfileobj(data.file, tmp)
+        path = tmp.name
+    data.file.seek(0)
+    try:
+        name = Path(data.filename or f"audio{suffix}").name
+        return await _transcribe_saved_path(path, name, context)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+async def get_file_size_MB(data: UploadFile) -> float:
+    with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+        data.file.seek(0)
+        temp_file.write(data.file.read())
+        temp_file.flush()
+        size_MB = os.fstat(temp_file.fileno()).st_size / 1048576
+        return size_MB
+
+
+async def process_reference_audio(data: UploadFile, context: GlobalContext) -> dict:
+    start_time = time_ns()
+    suffix = Path(data.filename or "audio.m4a").suffix or ".m4a"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        data.file.seek(0)
+        shutil.copyfileobj(data.file, tmp)
+        path = tmp.name
+    data.file.seek(0)
+    path = _truncate_reference_audio_path_if_long(path, context)
+    mime = _audio_mime_from_suffix(Path(path).suffix)
+    try:
+        size_bytes = os.path.getsize(path)
+        if size_bytes <= context.whisper_max_bytes:
+            with open(path, "rb") as rf:
+                b64_encoded_reference_audio = (
+                    f"data:{mime};base64,{base64.b64encode(rf.read()).decode('utf-8')}"
+                )
+        else:
+            b64_encoded_reference_audio = None
+        upload_name = Path(data.filename or f"audio{suffix}").name
+        response = await _transcribe_saved_path(path, upload_name, context)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    latency_ms = (time_ns() - start_time) / 1e6
+    response.update({"latency_ms": latency_ms})
+    response["b64_encoded_reference_audio"] = b64_encoded_reference_audio
+    return response
+
+
+""" AUDIO DIARIZATION """
+
+_AUDIO_UPLOAD_SUFFIXES = frozenset(
+    {
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".aac",
+        ".flac",
+        ".ogg",
+        ".opus",
+        ".aiff",
+        ".aif",
+        ".wma",
+    }
+)
+_VIDEO_UPLOAD_SUFFIXES = frozenset(
+    {
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".m4v",
+        ".wmv",
+        ".flv",
+        ".mpeg",
+        ".mpg",
+    }
+)
+
+
+def _upload_is_audio_for_diarize(
+    filename: Optional[str], content_type: Optional[str]
+) -> bool:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in _AUDIO_UPLOAD_SUFFIXES:
+        return True
+    if suffix in _VIDEO_UPLOAD_SUFFIXES:
+        return False
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("audio/"):
+        return True
+    if ct.startswith("video/"):
+        return False
+    return False
+
+
+def _diarize_known_speaker_extra_body(
+    context: GlobalContext,
+    encoded_reference_audio: Optional[str],
+) -> Optional[dict]:
+    if not encoded_reference_audio or not str(encoded_reference_audio).strip():
+        return None
+    return {
+        "known_speaker_names": [context.audio_diarization_known_speaker_name],
+        "known_speaker_references": [encoded_reference_audio],
+    }
+
+
+def _diarize_usage_tokens_dict(u: object) -> dict:
+    if u is None:
+        return {}
+    d = u if isinstance(u, dict) else u.model_dump()
+    if d.get("type") != "tokens":
+        return {}
+    return d
+
+
+def _diarize_token_cost(usage_dict: dict, context: GlobalContext) -> float:
+    u = usage_dict or {}
+    inp = int(u.get("input_tokens") or 0)
+    out = int(u.get("output_tokens") or 0)
+    return (
+        inp * context.audio_diarization_price_per_million_tokens_input
+        + out * context.audio_diarization_price_per_million_tokens_output
+    )
+
+
+def _diarize_one_mp3_path(
+    mp3_path: str,
+    upload_name: str,
+    context: GlobalContext,
+    client: OpenAI,
+    encoded_reference_audio: Optional[str],
+) -> TranscriptionDiarized:
+    model = context.audio_diarization_model or "gpt-4o-transcribe-diarize"
+    extra = _diarize_known_speaker_extra_body(context, encoded_reference_audio)
+    with open(mp3_path, "rb") as audio_f:
+        if extra:
+            result = client.audio.transcriptions.create(
+                model=model,
+                file=(upload_name, audio_f),
+                response_format="diarized_json",
+                chunking_strategy="auto",
+                extra_body=extra,
+            )
+        else:
+            result = client.audio.transcriptions.create(
+                model=model,
+                file=(upload_name, audio_f),
+                response_format="diarized_json",
+                chunking_strategy="auto",
+            )
+    if not isinstance(result, TranscriptionDiarized):
+        msg = "Expected diarized_json transcription response from OpenAI."
+        raise TypeError(msg)
+    return result
+
+
+def _merge_diarized_segments_from_chunks(
+    chunk_responses: list[TranscriptionDiarized],
+    time_offsets: list[float],
+) -> list[dict]:
+    merged: list[dict] = []
+    for idx, (resp, t0) in enumerate(zip(chunk_responses, time_offsets, strict=True)):
+        for seg in resp.segments:
+            sd = seg.model_dump()
+            merged.append(
+                {
+                    **sd,
+                    "start": float(sd["start"]) + t0,
+                    "end": float(sd["end"]) + t0,
+                    "speaker": f"{idx}:{sd.get('speaker', '')}",
+                }
+            )
+    return merged
+
+
+# TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
+
+# TODO: when diarizing The model cost needs to be calculated and returned in the response (using total aggregated tokens from all chunks for input and output tokens)
+
+async def transcribe_audio_diarize(
+    data: UploadFile,
+    context: GlobalContext,
+    encoded_reference_audio: Optional[str] = None,
+) -> dict:
+    """Diarize an uploaded video or audio file (chunked when audio exceeds whisper_max_bytes)."""
+    start_time = time_ns()
+    client = _openai_client_for_speech(context)
+    orig_name = data.filename or "upload.mp4"
+    suffix = Path(orig_name).suffix or ".mp4"
+    is_audio = _upload_is_audio_for_diarize(data.filename, data.content_type)
+    source_path = None
+    audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
+            data.file.seek(0)
+            temp_upload.write(data.file.read())
+            temp_upload.flush()
+            source_path = temp_upload.name
+
+        if is_audio:
+            if suffix.lower() == ".mp3":
+                audio_path = source_path
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_mp3:
+                    audio_path = temp_mp3.name
+                clip_in = AudioFileClip(source_path)
+                try:
+                    clip_in.write_audiofile(audio_path, codec="mp3", logger=None)
+                finally:
+                    clip_in.close()
+        else:
+            video = VideoFileClip(source_path)
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+                    audio_path = temp_audio.name
+                video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
+            finally:
+                video.close()
+
+        data.file.seek(0)
+        size_bytes = os.path.getsize(audio_path)
+        diarize_upload_name = (
+            Path(orig_name).name
+            if Path(orig_name).name.lower().endswith(".mp3")
+            else "extracted.mp3"
+        )
+
+        if size_bytes <= context.whisper_max_bytes:
+            response = _diarize_one_mp3_path(
+                audio_path,
+                diarize_upload_name,
+                context,
+                client,
+                encoded_reference_audio,
+            )
+            response_dict = response.model_dump()
+        else:
+            clip = AudioFileClip(audio_path)
+            try:
+                duration = float(clip.duration or 0.0)
+                n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
+                chunk_dur = duration / n
+                text_parts: list[str] = []
+                chunk_responses: list[TranscriptionDiarized] = []
+                offsets: list[float] = []
+                u_in = 0
+                u_out = 0
+                for i in range(n):
+                    t_off = i * chunk_dur
+                    t_end = duration if i == n - 1 else (i + 1) * chunk_dur
+                    sub = clip.subclipped(t_off, t_end)
+                    fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+                    os.close(fd)
+                    try:
+                        sub.write_audiofile(chunk_path, logger=None)
+                        resp = _diarize_one_mp3_path(
+                            chunk_path,
+                            f"chunk_{i}.mp3",
+                            context,
+                            client,
+                            encoded_reference_audio,
+                        )
+                        text_parts.append(resp.text)
+                        chunk_responses.append(resp)
+                        offsets.append(t_off)
+                        ud = _diarize_usage_tokens_dict(resp.usage)
+                        u_in += int(ud.get("input_tokens") or 0)
+                        u_out += int(ud.get("output_tokens") or 0)
+                    finally:
+                        sub.close()
+                        try:
+                            os.unlink(chunk_path)
+                        except OSError:
+                            pass
+                usage_merged = None
+                if u_in or u_out:
+                    usage_merged = {
+                        "type": "tokens",
+                        "input_tokens": u_in,
+                        "output_tokens": u_out,
+                        "total_tokens": u_in + u_out,
+                    }
+                merged_segments = _merge_diarized_segments_from_chunks(
+                    chunk_responses, offsets
+                )
+                response_dict = {
+                    "duration": duration,
+                    "segments": merged_segments,
+                    "task": "transcribe",
+                    "text": " ".join(text_parts),
+                    "usage": usage_merged,
+                    "diarization_chunk_count": n,
+                }
+            finally:
+                clip.close()
+
+        usage = response_dict.get("usage") or {}
+        if isinstance(usage, dict):
+            usage_d = usage
+        else:
+            usage_d = _diarize_usage_tokens_dict(usage)
+        response_dict["total_cost"] = _diarize_token_cost(usage_d, context)
+        if response_dict["total_cost"] == 0 and response_dict.get("duration"):
+            response_dict["total_cost"] = (
+                float(response_dict["duration"])
+                * context.audio_diarization_estimated_price_per_minute
+            )
+
+        model = context.audio_diarization_model or "gpt-4o-transcribe-diarize"
+        response_dict.update(
+            {"inference_type": "diarization", "model": model}
+        )
+        inp = usage_d.get("input_tokens")
+        out = usage_d.get("output_tokens")
+        tot = usage_d.get("total_tokens")
+        if tot is None and (inp is not None or out is not None):
+            tot = (inp or 0) + (out or 0)
+        response_dict.update(
+            {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "total_tokens": tot,
+            }
+        )
+
+        response_dict["latency_ms"] = (time_ns() - start_time) / 1e6
+        return response_dict
+    finally:
+        for pth in (source_path, audio_path):
+            if pth:
+                try:
+                    os.unlink(pth)
+                except OSError:
+                    pass
+

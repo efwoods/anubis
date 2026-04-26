@@ -16,6 +16,28 @@ from langchain_core.messages import SystemMessage
 
 from typing import Dict, Any
 import typing
+import types
+
+
+def _unwrap_type_hint(tp):
+    """Reduce Optional, PEP604 unions, and Annotated to the inner type for coercion."""
+    if tp is None:
+        return None
+    while True:
+        origin = typing.get_origin(tp)
+        args = typing.get_args(tp)
+        if origin is typing.Union or origin is types.UnionType:
+            non_none = [a for a in args if a is not type(None)]
+            if len(non_none) == 1:
+                tp = non_none[0]
+                continue
+            return tp
+        if origin is Annotated:
+            if not args:
+                return tp
+            tp = args[0]
+            continue
+        return tp
 
 
 @dataclass
@@ -173,6 +195,92 @@ class GlobalContext:
 
     """ </Llama Model> """
 
+    """ <Classification Model> """
+
+    classification_model: str = field(
+        default=None, metadata={"description": "Classification model name."}
+    )
+
+    classification_model_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of input tokens."},
+
+    classification_model_completion_cost: float = 0.0
+    # metadata={"description": "Completion token cost."},
+
+    classification_model_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "Base Url; used with structured output for classification."
+        },
+    )
+
+    classification_model_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "API Key; used with structured output for classification."
+        },
+    )
+
+    """ </Classification Model> """
+
+
+    """ <Audio Transcription & Diarization Model> """
+
+    openai_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "OpenAI API key for speech-to-text; env OPENAI_API_KEY. Falls back to llm_provider_api_key in code if unset."
+        },
+    )
+
+    whisper_max_bytes: int = field(
+        default=26214400,
+        metadata={
+            "description": "Max audio bytes per single STT request (25 MiB). Env WHISPER_MAX_BYTES."
+        },
+    )
+
+    chunk_source_bytes_target: int = field(
+        default=20971520,
+        metadata={
+            "description": "Target source bytes per segment when chunking long files. Env CHUNK_SOURCE_BYTES_TARGET."
+        },
+    )
+
+    reference_audio_clip_max_seconds: float = field(
+        default=10.0,
+        metadata={
+            "description": "Max seconds kept when truncating reference audio. Env REFERENCE_AUDIO_CLIP_MAX_SECONDS."
+        },
+    )
+
+    audio_transcription_model: str = field(
+        default=None, metadata={"description": "Audio transcription model name."}
+    )
+
+    audio_transcription_price_per_minute: float = 0.0
+
+    audio_diarization_estimated_price_per_minute: float = 0.0
+    audio_diarization_model: str = field(
+        default=None, metadata={"description": "Audio diarization model name."}
+    )
+
+    audio_diarization_price_per_million_tokens_input: float = 0.0
+    audio_diarization_price_per_million_tokens_output: float = 0.0
+    audio_diarization_context_window: int = field(
+        default=0,
+        metadata={"description": "Context window hint for diarization pricing or prompts."},
+    )
+
+    audio_diarization_known_speaker_name: str = field(
+        default="avatar",
+        metadata={
+            "description": "Speaker id passed as known_speaker_names[0] with reference audio. Env AUDIO_DIARIZATION_KNOWN_SPEAKER_NAME."
+        },
+    )
+
+    """ </Audio Transcription & Diarization Model> """
+
     dev: str = field(
         default=None,
         metadata={
@@ -270,27 +378,35 @@ class GlobalContext:
     )
 
     def __post_init__(self):
-        """Fetch env vars for attributes that were not passed as args."""
+        """Fetch env vars for attributes that were not passed as args; coerce int/float hints from str."""
         hints = typing.get_type_hints(self.__class__)
 
         for f in fields(self):
             if not f.init:
                 continue
 
+            field_type = hints.get(f.name)
+            scalar_type = _unwrap_type_hint(field_type)
+
             if getattr(self, f.name) == f.default:
                 env_val = os.environ.get(f.name.upper(), f.default)
 
                 if env_val is not None:
-                    field_type = hints.get(f.name)
-                    # Unwrap Optional[float] -> float
-                    origin = typing.get_origin(field_type)
-                    args = typing.get_args(field_type)
-                    if origin is typing.Union:
-                        field_type = next(
-                            (a for a in args if a is not type(None)), field_type
-                        )
-
-                    if field_type is float:
+                    if scalar_type is float:
                         env_val = float(env_val)
+                    elif scalar_type is int:
+                        env_val = int(env_val)
 
                 setattr(self, f.name, env_val)
+
+            val = getattr(self, f.name)
+            if scalar_type is float and isinstance(val, str) and val.strip() != "":
+                try:
+                    setattr(self, f.name, float(val))
+                except ValueError:
+                    pass
+            elif scalar_type is int and isinstance(val, str) and val.strip() != "":
+                try:
+                    setattr(self, f.name, int(val, 10))
+                except ValueError:
+                    pass

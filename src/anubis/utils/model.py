@@ -65,6 +65,16 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
         else:
             model = AsyncLlamaAPIClientWrapper(response_format=response_format)
         return model 
+
+    if response_format is not None:
+            model = ChatOpenAI(
+                model = context.classification_model,
+                base_url = context.classification_model_base_url,
+                temperature=0.1,
+                api_key = context.classification_model_api_key,
+            )
+            model = model.with_structured_output(schema=response_format)
+            return model
     
     if model_provider == "OPEN_AI":
         if response_format is None:
@@ -283,9 +293,9 @@ class AsyncLlamaAPIClientWrapper:
             }
         )
 
+        model = self.pydantic_model.model_validate_json(response.completion_message.content.text)
         formatted_messages_content_str = json.dumps(formatted_messages)
         token_usage = await calculate_token_usage_description_model(model_structured_output_response=model, input_str=formatted_messages_content_str)
-        model = self.pydantic_model.model_validate_json(response.completion_message.content.text)
 
         result = (model, ResponseMetadata(model_name=self.model_name, token_usage=token_usage))
         return result
@@ -301,6 +311,6 @@ class AsyncLlamaAPIClientWrapper:
               repetition_penalty=1,
           )
         # return AIMessage(content=response.completion_message.content.text)
-        result = (AIMessage(content=response.completion_message.content.text),ResponseMetadata(model_name=self.model_name, token_usage = TokenUsage(prompt_tokens=response.metrics.num_prompt_tokens, total_tokens=response.metrics.num_total_tokens, completion_tokens=response.metrics.num_completion_tokens)))
-        return response
+        result = (AIMessage(content=response.completion_message.content.text), ResponseMetadata(model_name=self.model_name, token_usage=TokenUsage(prompt_tokens=response.metrics.num_prompt_tokens, total_tokens=response.metrics.num_total_tokens, completion_tokens=response.metrics.num_completion_tokens)))
+        return result
      

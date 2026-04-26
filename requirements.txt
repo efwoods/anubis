@@ -44,3 +44,4 @@ stripe
 slack-sdk
 
 prometheus-client
+moviepy

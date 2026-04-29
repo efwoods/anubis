@@ -5,5 +5,18 @@
   "python.testing.pytestArgs": ["."],
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
-  "amazonQ.telemetry": false
+  "amazonQ.telemetry": false,
+  "sqltools.connections": [
+    {
+      "ssh": "Disabled",
+      "previewLimit": 50,
+      "server": "localhost",
+      "port": 5432,
+      "driver": "PostgreSQL",
+      "name": "nn-local",
+      "database": "postgres",
+      "username": "postgres",
+      "password": "fastdatagatE33"
+    }
+  ]
 }

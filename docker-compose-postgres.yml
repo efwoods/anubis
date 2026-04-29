@@ -1,0 +1,19 @@
+services:
+  postgres:
+    # LangGraph store search requires pgvector; vanilla postgres:16 has no $libdir/vector
+    # Must match cluster major version (your DB reports 16.x). pg17 image + PG16 data is invalid.
+    image: pgvector/pgvector:pg16
+    container_name: postgres16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - anubis_langgraph-data:/var/lib/postgresql/data
+
+volumes:
+  anubis_langgraph-data:
+    external: true

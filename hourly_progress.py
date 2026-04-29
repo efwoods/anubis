@@ -23,8 +23,6 @@ if __name__ == "__main__":
         API_KEY = args.NN_API_KEY
 
     progress_file_path = os.getcwd() + "/progress_1_hour.txt"
-    nn_url = 'https://api.neuralnexus.site/message'
-    # nn_url = 'http://localhost:8123/message'
 
     print(f"{progress_file_path}")
     subprocess.run(f"git diff HEAD > progress_1_hour.txt", shell=True, text=True)
@@ -35,7 +33,7 @@ if __name__ == "__main__":
         print("Reviewing progress...")
         system_message = """<INSTRUCTIONS>SPEAK USING YOUR PERSONALITY AND PERSONAL EXPERIENCE AS IF YOU MADE THESE CHANGES. YOU MADE THESE CHANGES. BE CLEAR, SUCCINCT, AND ACCURATE IN YOUR RESPONSES. ONLY REFER TO THE FOLLOWING INSTRUCTIONS.  Please describe what has been changed since the last commit from the following text and use your own style of writing. Write as if you made the code changes yourself and only reference any work that was actually listed as a change in the git diff. If there are no changes, indicate that there are no changes. Do not ask for follow up information as you are immediately posting an update. Do not talk about anything other than then changes to the code. Do not include information that was not listed in the git diff:</INSTRUCTIONS>Please describe what has been changed since the last commit from the following text:"""
     with open(progress_file_path, 'rb') as fp:
-        response = httpx.post(url=nn_url,
+        response = httpx.post(url="http://api.neuralnexus.site/message",
             headers={
               "API-KEY": API_KEY
             },
@@ -43,7 +41,7 @@ if __name__ == "__main__":
               "message": system_message,
             },
             files={"files": ("progress_1_hour.txt", fp, "text/plain")},
-            timeout=httpx.Timeout(None) # timeout in seconds
+            timeout=httpx.Timeout(120) # timeout in seconds
         )
         update_response = json.loads(response.content.decode('utf-8')).get("content")
         fp.close()

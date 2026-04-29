@@ -1,7 +1,7 @@
 {
   "python-envs.defaultEnvManager": "ms-python.python:venv",
   "python-envs.defaultPackageManager": "ms-python.python:pip",
-  "python.defaultInterpreterPath": ".venv/bin/python",
+  "python.defaultInterpreterPath": ".venv",
   "python.testing.pytestArgs": ["."],
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,

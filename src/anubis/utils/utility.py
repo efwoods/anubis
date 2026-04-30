@@ -25,6 +25,23 @@ from datetime import timezone
 from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
 from typing import Optional
 
+import math
+import shutil
+import tempfile
+from pathlib import Path
+from moviepy import AudioFileClip, VideoFileClip
+from time import time_ns
+from fastapi import UploadFile
+from openai import OpenAI
+from openai.types.audio.transcription_diarized import TranscriptionDiarized
+import base64
+
+import io
+from tempfile import SpooledTemporaryFile
+from PIL import Image
+from starlette.datastructures import Headers
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -329,348 +346,6 @@ async def chunk_long_messages(human_message_list, context) -> list:
 
 from typing import Optional
 
-async def summarize_messages(
-        messages, 
-        context, 
-        future_updated_system_message, 
-        future_updated_system_message_failsafe, 
-        system_message_instruction_single_message, 
-        query_l: Optional[list],
-        query_generation_mode: bool=True
-        ) -> list:
-    """
-    This function will accept a list of messages, 
-    retain messages according to the model context window length,
-    and create a summary in the system message prompt of the current conversation
-
-    Args:
-        messages (Sequence[HumanMessage | AIMessage | SystemMessage]): state['messages']
-        context (GlobalContext): environment variables
-        future_updated_system_message (str): system message instructions
-        future_updated_system_message_failsafe (str): system message instructions in the case that the system message instructions are too long
-        system_message_instruction_single_message (_type_): system message instructions for the case where there is a single message.
-    
-    Returns: list(SystemMessage, HumanMessage|AIMessage|ToolMessage)
-
-    """
-    logger.info("summarize_messages breakpoin")
-
-    if query_generation_mode:
-
-        if len(messages) == 1:
-            # It's the first user question. We will use the input directly to search.
-            human_input = get_message_text(messages[-1])
-
-            # Verify the human input is not too large for the model
-            if count_tokens_approximately(human_input) > (.8 * context.model_token_limit):
-                # chunk the message into a query
-                human_input = await chunk_long_messages(human_input, context)
-                # Summarize the long message into a single query
-                system_message = system_message_instruction_single_message
-                input = [SystemMessage(content=[{'type': 'text', 'text': system_message}]), HumanMessage(content=[{'type': 'text', 'text': human_input}])]
-                # TODO: response_metrics_aggregation
-                model = init_model(context)
-                response = model.ainvoke(input=input)
-
-
-                # Verify Successful Response
-                if response:
-                    try:
-                        assert(type(response) == AIMessage)
-                        human_input = getattr(response, "content", "")
-                        assert(human_input is not None)
-                        assert(human_input != "")
-                    except Exception as e:
-                        logger.warning(f"Error extracting content from summarization response of large single message in query generation.")    
-                else:
-                    logger.warning(f"No response while summarizing the chunked large single message. Using original chunked input.")
-
-            # system_message = system_message_instruction_single_message
-            # input = [SystemMessage(content=[{'type': 'text', 'text': system_message}]), HumanMessage(content=[{'type': 'text', 'text': human_input}])]
-            # model = init_model(context)
-            # response = await model.ainvoke(input=input)
-
-            logger.info(f"BREAKPOINT")
-
-            return {"queries": [human_input]}
-
-        else:
-
-            # Feel free to customize the prompt, model, and other logic!
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", context.query_system_prompt),
-                    ("placeholder", "{messages}"),
-                ]
-            )
-
-            message_value = await prompt.ainvoke(
-                {
-                    "messages": messages,
-                    "queries": "\n- ".join(query_l),
-                    "system_time": datetime.now(tz=timezone.utc).isoformat(),
-                },
-            )
-
-            original_system_message = ""
-
-            future_updated_system_message_instruction_length = count_tokens_approximately([SystemMessage(content=future_updated_system_message)])
-
-            if isinstance(message_value.messages[0], SystemMessage):
-                original_system_message = message_value.messages[0]
-                human_message_list = message_value.messages[1:]
-
-                original_system_message_token_length = count_tokens_approximately(message_value.messages[0])
-
-                max_tokens_minus_system_message_token_length = context.model_token_limit - original_system_message_token_length - future_updated_system_message_instruction_length
-            else:
-                human_message_list = message_value.messages
-                max_tokens_minus_system_message_token_length = context.model_token_limit - future_updated_system_message_instruction_length
-
-            # Attempt to trim messages to verify that messages need to be summarized
-            retained_messages = trim_messages(
-                messages=human_message_list, 
-                max_tokens=max_tokens_minus_system_message_token_length, 
-                token_counter=count_tokens_approximately, 
-                strategy="last", 
-                end_on=(HumanMessage)
-            )
-            # Identify if the messages need to be summarized
-            if len(retained_messages) == 0:
-                human_message_list = await chunk_long_messages(retained_messages, human_message_list)
-                # re-attempt to trim messages
-                retained_messages = trim_messages(
-                    messages = human_message_list, 
-                    max_tokens = max_tokens_minus_system_message_token_length, 
-                    token_counter=count_tokens_approximately,
-                    strategy="last",
-                    end_on=(HumanMessage)
-                )
-            assert(len(retained_messages != 0)) # messages length will be equal to or less than the length of the original message list because the messages have been chunked below the max token limit of the model;
-
-            if len(retained_messages) == len(human_message_list):
-                # no summary required; use the original message structure
-                # create a generated query
-                return message_value
-
-            else: # Messages need to be summarized
-                assert(len(retained_messages) > 0)
-                assert(len(retained_messages) != len(human_message_list))
-                # filter the retained messages and summarize the initial messages
-                retained_message_id = getattr(retained_messages[0], "id", "")
-                assert(retained_message_id is not None)
-                assert(retained_message_id != "")
-
-                # if not isinstance(retained_messages, list):
-                #     original_retained_messages_token_length = count_tokens_approximately([retained_messages])
-                # else:
-                #     original_retained_messages_token_length = count_tokens_approximately(retained_messages)
-
-                message_id_list = [message.id for message in human_message_list]
-                idx = message_id_list.index(retained_message_id) # find the index in the non-system message list
-
-                summarization_messages = human_message_list[:idx]
-
-                # TODO: response_metrics_aggregation
-                model = init_model(context=context) 
-
-                # Save the optional system message and the retained messages
-                if original_system_message != "":
-                    if type(retained_messages) == list:
-                        master_message_list = [original_system_message] + retained_messages
-                    else:
-                        master_message_list = [original_system_message] + [retained_messages]
-                else:
-                    if type(retained_messages) == list:
-                        master_message_list = retained_messages
-                    else:
-                        master_message_list = [retained_messages]
-
-                summary_prompt = ""
-                while len(summarization_messages) != len(retained_messages):
-                    # summarize the messages
-                    if summary_prompt == "":
-                        summary_prompt = "<Instructions>Please summarize the following messages:</Instructions>"
-                    else:
-                        summary_prompt = f"<Instructions> This is the current conversation summary to date. Please extend the summary prompt using the included messages. </Instructions>  {summary_prompt}. "
-                    summary_prompt_token_length = count_tokens_approximately([SystemMessage(content=summary_prompt)])
-
-                    if summary_prompt_token_length > context.model_token_limit*.8:
-                        # summarize the summary prompt
-                        input = [SystemMessage(content="<Instructions>Summarize the following message:</Instructions>"), HumanMessage(content=summary_prompt)]
-                        response = await model.ainvoke(input=input)
-                        if response:
-                            assert(type(response) is AIMessage)
-                            summary_prompt = getattr(response, "content", "")
-                        else:
-                            logger.warning(f"No response from the model; summarization prompt is greater than 80% of the length of the max token limit for the current model. Continuing with the current summarization prompt")
-                        summary_prompt_token_length = count_tokens_approximately([SystemMessage(content=summary_prompt)])
-
-                    max_token_minus_summary_prompt_length_during_message_summarization = context.model_token_limit - summary_prompt_token_length
-
-                    retained_messages = trim_messages(
-                        messages = summarization_messages, 
-                        max_tokens=max_token_minus_summary_prompt_length_during_message_summarization, 
-                        token_counter=count_tokens_approximately, 
-                        strategy="last", 
-                        end_on=(HumanMessage)
-                    )
-
-                    if len(retained_messages) == len(summarization_messages):
-                        # summarize all the remaining messages
-                        if type(retained_messages) == list:
-                            input = [SystemMessage(content=system_message)] + retained_messages
-                        else:
-                            input = [SystemMessage(content=system_message)] + [retained_messages]
-
-                        response = model.ainvoke(input=input)
-                        # Verify Successful Response
-                        if response:
-                            try:
-                                assert(type(response) == AIMessage)
-                                summary_prompt = getattr(response, "content", "")
-                                assert(summary_prompt is not None)
-                                assert(summary_prompt != "")
-
-                            except Exception as e:
-                                logger.warning(f"Error extracting content from summarization response during base case of message summary.")    
-                        else:
-                            logger.warning(f"No response while summarizing the chunked large single message. Continuing without message summary.")
-
-                            # continue; while loop will be broken; 
-                    elif len(retained_messages == 0):
-                        # identify large messages and use a text splitter to chunk the messages
-                        summarization_messages = await chunk_long_messages(summarization_messages, context)
-                        # re trim messages
-                        retained_messages = trim_messages(
-                            messages = summarization_messages, 
-                            max_tokens=max_token_minus_summary_prompt_length_during_message_summarization, 
-                            token_counter=count_tokens_approximately, 
-                            strategy="last", 
-                            end_on=(HumanMessage)
-                        )
-                        if len(retained_messages) == len(summarization_messages):
-                            # summarize the messages;  The messages no longer need to be trimmed
-                            if type(retained_messages) == list:
-                                input = [SystemMessage(content=system_message)] + retained_messages
-                            else:
-                                input = [SystemMessage(content=system_message)] + [retained_messages]
-
-                            response = model.ainvoke(input=input)
-
-                            # Verify Successful Response
-                            if response:
-                                try:
-                                    assert(type(response) == AIMessage)
-                                    summary_prompt = getattr(response, "content", "")
-                                    assert(summary_prompt is not None)
-                                    assert(summary_prompt != "")
-
-                                except Exception as e:
-                                    logger.warning(f"Error extracting content from summarization response during base case of message summary.")    
-                            else:
-                                logger.warning(f"No response while summarizing the chunked large single message. Continuing without message summary.")
-
-                            # continue; while loop will be broken; 
-
-                        else:
-                            assert(len(retained_messages) != 0)
-                            assert(len(retained_messages) < len(summarization_messages))
-                            message_id_list = [message.id for message in summarization_messages]
-                            if type(retained_messages, list):
-                                retained_message_id = getattr(retained_messages[0], "id", "")
-                            else:
-                                retained_message_id = getattr(retained_messages, "id", "")
-                            assert(retained_message_id != "")
-
-                            idx = message_id_list.index(retained_message_id) # find the index in the non-system message list
-
-                            # summarize the messages;  The messages no longer need to be trimmed
-                            if type(retained_messages) == list:
-                                input = [SystemMessage(content=system_message)] + retained_messages
-                            else:
-                                input = [SystemMessage(content=system_message)] + [retained_messages]
-
-                            response = model.ainvoke(input=input)
-
-                            # Verify Successful Response
-                            if response:
-                                try:
-                                    assert(type(response) == AIMessage)
-                                    summary_prompt = getattr(response, "content", "")
-                                    assert(summary_prompt is not None)
-                                    assert(summary_prompt != "")
-
-                                except Exception as e:
-                                    logger.warning(f"Error extracting content from summarization response during base case of message summary.")    
-                            else:
-                                logger.warning(f"No response while summarizing the chunked large single message. Continuing without message summary.")
-
-
-                            # update the summarization messages
-                            summarization_messages = summarization_messages[:idx]
-
-                            # update the retained_messages
-                            retained_messages = trim_messages(
-                                messages = summarization_messages, 
-                                max_tokens=max_token_minus_summary_prompt_length_during_message_summarization, 
-                                token_counter=count_tokens_approximately, 
-                                strategy="last", 
-                                end_on=(HumanMessage)
-                            )
-                    else:
-                        logger.warning(f"retained_messasges are non zero and greater than the list of the messages where they initialized. This is a logical error and impossible.")
-
-                # message is summarized
-                if summary_prompt != "":
-                    # update the system message with the summary_prompt
-                    summary_prompt = re.sub(r"<Instructions>.*?</Instructions>", future_updated_system_message, summary_prompt)
-
-                    if type(master_message_list[0]) == SystemMessage:
-                        original_system_message = master_message_list[0].content
-                        new_system_message = original_system_message + " \n " + summary_prompt
-                        master_message_list[0].content = new_system_message
-                    else:
-                        master_message_list.insert(0, SystemMessage(content=summary_prompt))
-                else:
-                    if type(master_message_list[0]) == SystemMessage:
-                        master_message_list[0].content=future_updated_system_message
-                    else:
-                        master_message_list.insert(0, SystemMessage(content=future_updated_system_message))
-
-                final_message_list_token_length = count_tokens_approximately(master_message_list)
-                if final_message_list_token_length > context.model_token_limit:
-                    system_message_token_length = count_tokens_approximately(master_message_list[0])
-                    human_message_token_length = final_message_list_token_length - system_message_token_length
-                    if system_message_token_length >= human_message_token_length:
-                        master_message_list[0].content=future_updated_system_message_failsafe
-                    else:
-                        messages_to_be_trimmed = master_message_list[1:]
-                        retained_messages = trim_messages(
-                            messages = messages_to_be_trimmed, 
-                            max_tokens = context.model_token_limit,
-                            token_counter=count_tokens_approximately,
-                            strategy="last",
-                            end_on=(HumanMessage, ToolMessage)
-                        )
-                        if len(retained_messages) == 0:
-                            messages_to_be_trimmed = await chunk_long_messages(messages_to_be_trimmed, context)
-                            retained_messages = trim_messages(
-                                messages = messages_to_be_trimmed, 
-                                max_tokens = context.model_token_limit,
-                                token_counter=count_tokens_approximately,
-                                strategy="last",
-                                end_on=(HumanMessage, ToolMessage)
-                            )
-
-                        system_message = master_message_list[0]
-                        if type(retained_messages) == list:
-                            master_message_list = [system_message] + retained_messages
-                        else:
-                            master_message_list = [system_message] = [retained_messages]
-    
-    return master_message_list
-
 
 """ YOUTUBE HELPER FUNCTIONS """
 import yt_dlp
@@ -806,3 +481,539 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
 
 #     print("\n--- Transcript Preview ---")
 #     print(text[:500])
+
+""" AUDIO TRANSCRIPTION """
+
+
+def _openai_client_for_speech(context: GlobalContext) -> OpenAI:
+    key = context.openai_api_key or context.llm_provider_api_key
+    if not key:
+        msg = "Set `openai_api_key` / OPENAI_API_KEY or `llm_provider_api_key` for speech APIs."
+        raise ValueError(msg)
+    return OpenAI(api_key=key)
+
+
+def _audio_mime_from_suffix(suffix: str) -> str:
+    s = (suffix or "").lower()
+    if s == ".mp3":
+        return "audio/mpeg"
+    if s in (".m4a", ".mp4", ".aac"):
+        return "audio/mp4"
+    if s == ".wav":
+        return "audio/wav"
+    if s == ".webm":
+        return "audio/webm"
+    return "audio/mp4"
+
+
+def _truncate_reference_audio_path_if_long(path: str, context: GlobalContext) -> str:
+    """If audio is longer than _REFERENCE_AUDIO_CLIP_MAX_S, keep the first segment and return a new .mp3 path."""
+    clip = AudioFileClip(path)
+    try:
+        duration = float(clip.duration or 0.0)
+        if duration <= context.reference_audio_clip_max_seconds:
+            return path
+        sub = clip.subclipped(0.0, context.reference_audio_clip_max_seconds)
+        fd, out_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            sub.write_audiofile(out_path, logger=None)
+        except Exception:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+        finally:
+            sub.close()
+    finally:
+        clip.close()
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return out_path
+
+
+# 1. Save the bytes to a temp file
+async def get_audio_duration_seconds(data: UploadFile) -> float:
+    with tempfile.NamedTemporaryFile(suffix=Path(data.filename).suffix, delete=True) as temp_audio:
+        data.file.seek(0)
+        temp_audio.write(data.file.read())
+        temp_audio.flush()
+
+        # 2. Load with MoviePy
+        with AudioFileClip(temp_audio.name) as clip:
+            duration_seconds = float(clip.duration or 0.0)
+        data.file.seek(0)
+        return duration_seconds
+
+
+def _transcribe_one_segment_path(
+    path: str,
+    upload_filename: str,
+    context: GlobalContext,
+    client: OpenAI,
+) -> dict:
+    start = time_ns()
+    with AudioFileClip(path) as clip:
+        duration_seconds = float(clip.duration or 0.0)
+    transcription_cost = duration_seconds * context.audio_transcription_price_per_minute
+    model = context.audio_transcription_model or "whisper-1"
+    with open(path, "rb") as audio_f:
+        content = client.audio.transcriptions.create(
+            file=(upload_filename, audio_f),
+            model=model,
+            response_format="text",
+        )
+    return {
+        "content": content,
+        "file_duration_s": duration_seconds,
+        "total_cost": transcription_cost,
+        "latency_ms": (time_ns() - start) / 1e6,
+        "model": model,
+        "inference_type": "transcription",
+    }
+
+
+async def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
+    """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit."""
+    start_time = time_ns()
+    size_bytes = os.path.getsize(path)
+    client = _openai_client_for_speech(context)
+
+    if size_bytes <= context.whisper_max_bytes:
+        seg = _transcribe_one_segment_path(path, upload_filename, context, client)
+        seg["latency_ms"] = (time_ns() - start_time) / 1e6
+        return seg
+
+    clip = AudioFileClip(path)
+    try:
+        duration = float(clip.duration or 0.0)
+        n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
+        chunk_dur = duration / n
+        parts: list[str] = []
+        total_cost = 0.0
+        inner_latency = 0.0
+        for i in range(n):
+            t0 = i * chunk_dur
+            t1 = duration if i == n - 1 else (i + 1) * chunk_dur
+            sub = clip.subclipped(t0, t1)
+            fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            try:
+                sub.write_audiofile(chunk_path, logger=None)
+                seg = _transcribe_one_segment_path(
+                    chunk_path, f"chunk_{i}.mp3", context, client
+                )
+                parts.append(seg["content"])
+                total_cost += seg["transcription_cost"]
+                inner_latency += seg["latency_ms"]
+            finally:
+                sub.close()
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+        return {
+            "content": " ".join(parts),
+            "file_duration_s": duration,
+            "total_cost": total_cost,
+            "latency_ms": inner_latency,
+            "whisper_chunk_count": n,
+            "model": context.audio_transcription_model, 
+            "inference_type": "transcription"
+        }
+    finally:
+        clip.close()
+
+
+async def transcribe_audio(data: UploadFile, context: GlobalContext) -> dict:
+    suffix = Path(data.filename or "audio.m4a").suffix or ".m4a"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        data.file.seek(0)
+        shutil.copyfileobj(data.file, tmp)
+        path = tmp.name
+    data.file.seek(0)
+    try:
+        name = Path(data.filename or f"audio{suffix}").name
+        return await _transcribe_saved_path(path, name, context)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+async def get_file_size_MB(data: UploadFile) -> float:
+    with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+        data.file.seek(0)
+        temp_file.write(data.file.read())
+        temp_file.flush()
+        size_MB = os.fstat(temp_file.fileno()).st_size / 1048576
+        return size_MB
+
+
+async def process_reference_audio(data: UploadFile, context: GlobalContext) -> dict:
+    start_time = time_ns()
+    suffix = Path(data.filename or "audio.m4a").suffix or ".m4a"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        data.file.seek(0)
+        shutil.copyfileobj(data.file, tmp)
+        path = tmp.name
+    data.file.seek(0)
+    path = _truncate_reference_audio_path_if_long(path, context)
+    mime = _audio_mime_from_suffix(Path(path).suffix)
+    try:
+        size_bytes = os.path.getsize(path)
+        if size_bytes <= context.whisper_max_bytes:
+            with open(path, "rb") as rf:
+                b64_encoded_reference_audio = (
+                    f"data:{mime};base64,{base64.b64encode(rf.read()).decode('utf-8')}"
+                )
+        else:
+            b64_encoded_reference_audio = None
+        upload_name = Path(data.filename or f"audio{suffix}").name
+        response = await _transcribe_saved_path(path, upload_name, context)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    latency_ms = (time_ns() - start_time) / 1e6
+    response.update({"latency_ms": latency_ms})
+    response["b64_encoded_reference_audio"] = b64_encoded_reference_audio
+    return response
+
+
+""" AUDIO DIARIZATION """
+
+_AUDIO_UPLOAD_SUFFIXES = frozenset(
+    {
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".aac",
+        ".flac",
+        ".ogg",
+        ".opus",
+        ".aiff",
+        ".aif",
+        ".wma",
+    }
+)
+_VIDEO_UPLOAD_SUFFIXES = frozenset(
+    {
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".m4v",
+        ".wmv",
+        ".flv",
+        ".mpeg",
+        ".mpg",
+    }
+)
+
+
+def _upload_is_audio_for_diarize(
+    filename: Optional[str], content_type: Optional[str]
+) -> bool:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in _AUDIO_UPLOAD_SUFFIXES:
+        return True
+    if suffix in _VIDEO_UPLOAD_SUFFIXES:
+        return False
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("audio/"):
+        return True
+    if ct.startswith("video/"):
+        return False
+    return False
+
+
+def _diarize_known_speaker_extra_body(
+    context: GlobalContext,
+    encoded_reference_audio: Optional[str],
+) -> Optional[dict]:
+    if not encoded_reference_audio or not str(encoded_reference_audio).strip():
+        return None
+    return {
+        "known_speaker_names": [context.audio_diarization_known_speaker_name],
+        "known_speaker_references": [encoded_reference_audio],
+    }
+
+
+def _diarize_usage_tokens_dict(u: object) -> dict:
+    if u is None:
+        return {}
+    d = u if isinstance(u, dict) else u.model_dump()
+    if d.get("type") != "tokens":
+        return {}
+    return d
+
+
+def _diarize_token_cost(usage_dict: dict, context: GlobalContext) -> float:
+    u = usage_dict or {}
+    inp = int(u.get("input_tokens") or 0)
+    out = int(u.get("output_tokens") or 0)
+    return (
+        inp * context.audio_diarization_price_per_million_tokens_input
+        + out * context.audio_diarization_price_per_million_tokens_output
+    )
+
+
+def _diarize_one_mp3_path(
+    mp3_path: str,
+    upload_name: str,
+    context: GlobalContext,
+    client: OpenAI,
+    encoded_reference_audio: Optional[str],
+) -> TranscriptionDiarized:
+    model = context.audio_diarization_model or "gpt-4o-transcribe-diarize"
+    extra = _diarize_known_speaker_extra_body(context, encoded_reference_audio)
+    with open(mp3_path, "rb") as audio_f:
+        if extra:
+            result = client.audio.transcriptions.create(
+                model=model,
+                file=(upload_name, audio_f),
+                response_format="diarized_json",
+                chunking_strategy="auto",
+                extra_body=extra,
+            )
+        else:
+            result = client.audio.transcriptions.create(
+                model=model,
+                file=(upload_name, audio_f),
+                response_format="diarized_json",
+                chunking_strategy="auto",
+            )
+    if not isinstance(result, TranscriptionDiarized):
+        msg = "Expected diarized_json transcription response from OpenAI."
+        raise TypeError(msg)
+    return result
+
+
+def _merge_diarized_segments_from_chunks(
+    chunk_responses: list[TranscriptionDiarized],
+    time_offsets: list[float],
+) -> list[dict]:
+    merged: list[dict] = []
+    for idx, (resp, t0) in enumerate(zip(chunk_responses, time_offsets, strict=True)):
+        for seg in resp.segments:
+            sd = seg.model_dump()
+            merged.append(
+                {
+                    **sd,
+                    "start": float(sd["start"]) + t0,
+                    "end": float(sd["end"]) + t0,
+                    "speaker": f"{idx}:{sd.get('speaker', '')}",
+                }
+            )
+    return merged
+
+
+# TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
+
+# TODO: when diarizing The model cost needs to be calculated and returned in the response (using total aggregated tokens from all chunks for input and output tokens)
+
+async def transcribe_audio_diarize(
+    data: UploadFile,
+    context: GlobalContext,
+    encoded_reference_audio: Optional[str] = None,
+) -> dict:
+    """Diarize an uploaded video or audio file (chunked when audio exceeds whisper_max_bytes)."""
+    start_time = time_ns()
+    client = _openai_client_for_speech(context)
+    orig_name = data.filename or "upload.mp4"
+    suffix = Path(orig_name).suffix or ".mp4"
+    is_audio = _upload_is_audio_for_diarize(data.filename, data.content_type)
+    source_path = None
+    audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
+            data.file.seek(0)
+            temp_upload.write(data.file.read())
+            temp_upload.flush()
+            source_path = temp_upload.name
+
+        if is_audio:
+            if suffix.lower() == ".mp3":
+                audio_path = source_path
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_mp3:
+                    audio_path = temp_mp3.name
+                clip_in = AudioFileClip(source_path)
+                try:
+                    clip_in.write_audiofile(audio_path, codec="mp3", logger=None)
+                finally:
+                    clip_in.close()
+        else:
+            video = VideoFileClip(source_path)
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+                    audio_path = temp_audio.name
+                video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
+            finally:
+                video.close()
+
+        data.file.seek(0)
+        size_bytes = os.path.getsize(audio_path)
+        diarize_upload_name = (
+            Path(orig_name).name
+            if Path(orig_name).name.lower().endswith(".mp3")
+            else "extracted.mp3"
+        )
+
+        if size_bytes <= context.whisper_max_bytes:
+            response = _diarize_one_mp3_path(
+                audio_path,
+                diarize_upload_name,
+                context,
+                client,
+                encoded_reference_audio,
+            )
+            response_dict = response.model_dump()
+        else:
+            clip = AudioFileClip(audio_path)
+            try:
+                duration = float(clip.duration or 0.0)
+                n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
+                chunk_dur = duration / n
+                text_parts: list[str] = []
+                chunk_responses: list[TranscriptionDiarized] = []
+                offsets: list[float] = []
+                u_in = 0
+                u_out = 0
+                for i in range(n):
+                    t_off = i * chunk_dur
+                    t_end = duration if i == n - 1 else (i + 1) * chunk_dur
+                    sub = clip.subclipped(t_off, t_end)
+                    fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+                    os.close(fd)
+                    try:
+                        sub.write_audiofile(chunk_path, logger=None)
+                        resp = _diarize_one_mp3_path(
+                            chunk_path,
+                            f"chunk_{i}.mp3",
+                            context,
+                            client,
+                            encoded_reference_audio,
+                        )
+                        text_parts.append(resp.text)
+                        chunk_responses.append(resp)
+                        offsets.append(t_off)
+                        ud = _diarize_usage_tokens_dict(resp.usage)
+                        u_in += int(ud.get("input_tokens") or 0)
+                        u_out += int(ud.get("output_tokens") or 0)
+                    finally:
+                        sub.close()
+                        try:
+                            os.unlink(chunk_path)
+                        except OSError:
+                            pass
+                usage_merged = None
+                if u_in or u_out:
+                    usage_merged = {
+                        "type": "tokens",
+                        "input_tokens": u_in,
+                        "output_tokens": u_out,
+                        "total_tokens": u_in + u_out,
+                    }
+                merged_segments = _merge_diarized_segments_from_chunks(
+                    chunk_responses, offsets
+                )
+                response_dict = {
+                    "duration": duration,
+                    "segments": merged_segments,
+                    "task": "transcribe",
+                    "text": " ".join(text_parts),
+                    "usage": usage_merged,
+                    "diarization_chunk_count": n,
+                }
+            finally:
+                clip.close()
+
+        usage = response_dict.get("usage") or {}
+        if isinstance(usage, dict):
+            usage_d = usage
+        else:
+            usage_d = _diarize_usage_tokens_dict(usage)
+        response_dict["total_cost"] = _diarize_token_cost(usage_d, context)
+        if response_dict["total_cost"] == 0 and response_dict.get("duration"):
+            response_dict["total_cost"] = (
+                float(response_dict["duration"])
+                * context.audio_diarization_estimated_price_per_minute
+            )
+
+        model = context.audio_diarization_model or "gpt-4o-transcribe-diarize"
+        response_dict.update(
+            {"inference_type": "diarization", "model": model}
+        )
+        inp = usage_d.get("input_tokens")
+        out = usage_d.get("output_tokens")
+        tot = usage_d.get("total_tokens")
+        if tot is None and (inp is not None or out is not None):
+            tot = (inp or 0) + (out or 0)
+        response_dict.update(
+            {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "total_tokens": tot,
+            }
+        )
+
+        response_dict["latency_ms"] = (time_ns() - start_time) / 1e6
+        return response_dict
+    finally:
+        for pth in (source_path, audio_path):
+            if pth:
+                try:
+                    os.unlink(pth)
+                except OSError:
+                    pass
+
+async def extract_base64_str_from_upload_image(img: UploadFile) -> str:
+    """Convert Upload file of image type to base64 encoded str
+    """
+    suffix = Path(img.filename).suffix
+    if suffix not in [".png", ".jpeg", ".jpg", ".webp"]:
+        raise ValueError("Unsupported file type. Only PNG, JPEG, JPG, and WEBP are allowed.")
+    img.file.seek(0)
+    base64_image = base64.b64encode(img.file.read()).decode('utf-8')
+    base64_str = f"data:image/{suffix.lstrip('.')};base64,{base64_image}"
+    return base64_str
+
+
+async def resize_uploadfile(uploadfile: UploadFile):
+
+    uploadfile.file.seek(0)  # important if already read
+    with Image.open(uploadfile.file) as original_img:
+        image = original_img.convert("RGB")
+        MAX_DIMENSION = 512
+        original_w, original_h = image.size
+        longest_side = max(original_w, original_h)
+        if longest_side > MAX_DIMENSION:
+            scale = MAX_DIMENSION / longest_side
+            resized_width = max(1, int(round(original_w * scale)))
+            resized_height = max(1, int(round(original_h * scale)))
+            image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+            # Re-encode resized image
+            out = io.BytesIO()
+            image.save(out, format="JPEG", quality=85, optimize=True)
+            resized_bytes = out.getvalue()
+            # Replace UploadFile's underlying file object
+            new_spooled = SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+            new_spooled.write(resized_bytes)
+            new_spooled.seek(0)
+            uploadfile.file = new_spooled
+            uploadfile.size = len(resized_bytes)
+            # Keep metadata aligned
+            headers = uploadfile.headers.mutablecopy()
+            headers['content-type'] = "image/jpeg"
+            uploadfile.headers = Headers(headers)
+
+    # Ensure downstream reads from start
+    uploadfile.file.seek(0)
+    return uploadfile

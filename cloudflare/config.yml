@@ -1,0 +1,7 @@
+tunnel: 980ecf10-3835-4226-a164-dc22d13b2dc9
+credentials-file: /home/user/.cloudflared/980ecf10-3835-4226-a164-dc22d13b2dc9.json
+
+ingress:
+  - hostname: api.neuralnexus.site
+    service: http://localhost:8124
+  - service: http_status:404

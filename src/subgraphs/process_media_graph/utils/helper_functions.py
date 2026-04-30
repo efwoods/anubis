@@ -62,13 +62,14 @@ def normal_chunking(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=separators,
-        length_function=len,  # Or count_tokens_approximately if you prefer
+        length_function=count_tokens_approximately,  # Or count_tokens_approximately if you prefer
         is_separator_regex=False,
     )
 
     # 3. Create the Documents
     # create_documents handles the string-to-Document conversion and metadata propagation
-    docs = text_splitter.create_documents(texts=[text_content], metadatas=[metadata])
+    texts = text_content if type(text_content) == list else text_content.splitlines()
+    docs = text_splitter.create_documents(texts=texts, metadatas=[metadata])
 
     return docs
 
@@ -361,10 +362,6 @@ for LangGraph-MongoDB vectorstore with harrier-oss-v1-270m embeddings (384 dimen
 from pydantic import BaseModel
 
 
-class SemanticChunkIndexList(BaseModel):
-    index: list[int]
-
-
 async def split_text_into_chunks(
     text_splitter: RecursiveCharacterTextSplitter,
     text_content: str,
@@ -422,8 +419,8 @@ async def process_text_media_item_target_for_vectorstore(
     media_item: Dict[str, Any],
     user_id: str,
     assistant_id: str,
-    chunk_size: int = 256,
-    chunk_overlap: int = 25,
+    chunk_size: int = 1024,
+    chunk_overlap: int = 150,
     separators: Optional[List[str]] = None,
     classification_metadata: Optional[dict] = None,
     use_semantic_chunks: bool = False,
@@ -471,326 +468,45 @@ async def process_text_media_item_target_for_vectorstore(
             logger.warning("Empty text content in media_item")
             return []
 
-        # Default separators optimized for semantic coherence
-        if separators is None:
-            separators = [
-                "\n\n",  # Paragraph breaks
-                "\n",  # Line breaks
-                ". ",  # Sentence endings
-                "? ",  # Question endings
-                "! ",  # Exclamation endings
-                "; ",  # Semicolons
-                ", ",  # Commas
-                " ",  # Spaces
-                "",  # Characters
-            ]
+        # NOTE: semantic chunking is intentionally disabled; all text chunking uses normal_chunking.
+        _ = use_semantic_chunks
+        all_documents = normal_chunking(
+            text_content=text_content,
+            metadata={},
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
 
-        token_text_content_length = count_tokens_approximately([text_content])
-        if token_text_content_length > chunk_size and use_semantic_chunks:
+        current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+        total_chunks = len(all_documents)
+        idx = 0
 
-            # Define meaningful chunks first
-
-            model_structured_output = init_model(
-                model_without_tools=False, response_format=SemanticChunkIndexList
+        for document in all_documents:
+            document.metadata.update(
+                {
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "created_at": current_timestamp,
+                    "processing_task_id": str(uuid4()),
+                    "source": source,
+                    "type": "text",
+                    "chunk_index": idx,
+                    "total_chunks": total_chunks,
+                    "filename": filename,
+                    "filename_uuid5": filename_uuid5,
+                    "document_id": str(uuid4()),
+                }
             )
-
-            SEMANTICALLY_CHUNK_TEXT_SYSTEM_PROMPT = """ 
-            <Role>
-            You are an expert at dividing text into semantically coherent sections.
-            </Role>
-
-            <Instructions> 
-            Given the text below, return ONLY a JSON list of integers representing the starting character indices where each new semantic chunk should begin.
-
-            - Determine the number of semantically meaningful chunks. Use separators, paragraph tabs, and indicators along with topic changes to determine the number of semantically meaningful chunks.
-            - Reasonable sections to split the text include distinct topics. 
-            - You are returning a list of integers
-            - Return a list of the text portions. 
-            - Attempt to create lists with the number of tokens less than {chunk_size} tokens with approximately 50  70 tokens in 280 characters if possible otherwise maintain the semantically meaningful chunk.
-            - The length of the number of characters in each chunk takes secondary precedence to chunks that are semantically meaningful and is an OPTIONAL requirement.
-            - Reasonable sections to split text are when there is a topic change.
-            - Chunks must be contiguous and cover the entire text without overlap or gap.
-            - Do not skip or repeat any content.
-            - Return exact original substrings when sliced with these indices.
-            - Do not paraphrase or change any wording.
-            - Return format: [0, 142, 378, 915, ...]  (last index may be len(text))
-            - Chunk boundaries MUST occur only immediately after one of these separators:
-              - "\\n\\n"
-              - "\\n"
-              - ". "
-              - "? "
-              - "! "
-              - "; "
-              - ", "
-              - " "
-            - Never split inside a word, number, quote, or mid-sentence.
-            - All chunks must contain complete thoughts/sentences when possible.
-            - Prefer semantic coherence (topic shift) over length.
-            </Instructions> 
-
-            <Rules>
-            - all chunks MUST contain complete sentences. Do dont start or end a chunk in the middle of a word
-            - Do not change any of the original text.
-            - Return all text that was originally sent.
-            - If there are no meaningful sections or portions, then DO NOT separate the text and only return a list containing a single item of the original text.
-            - Always return a list.
-            - Attempt to create lists with the number of characters less than {chunk_size} tokens with approximately 50 to 70 tokens in 280 characters if possible otherwise maintain the semantically meaningful chunk.
-            - The length of the number of characters in each chunk takes secondary precedence to chunks that are semantically meaningful and is an OPTIONAL requirement.
-            - Chunks must be contiguous and cover the entire text without overlap or gap.
-            - Do not skip or repeat any content.
-            - Return exact original substrings when sliced with these indices.
-            - Do not paraphrase or change any wording.
-            - Return format: [0, 142, 378, 915, ...]  (last index may be len(text))
-            - Chunk boundaries MUST occur only immediately after one of these separators:
-              - "\\n\\n"
-              - "\\n"
-              - ". "
-              - "? "
-              - "! "
-              - "; "
-              - ", "
-              - " "
-            - Never split inside a word, number, quote, or mid-sentence.
-            - All chunks must contain complete thoughts/sentences when possible.
-            - Prefer semantic coherence (topic shift) over length.
-
-            </Rules>
-
-            """
-
-            logger.warning(
-                f"THE CHUNKS ARE SEMANTICALLY MEANINGFUL BUT ARE LONGER THAN 500 CHARACTERS AND CONTAIN PARTS OF WORDS. THESE CHUNKS WILL BE CHUNKED AGAIN. THE INITIAL CHUNKING IS SEMANTICALLY MEANINGFUL"
-            )
-
-            formatted_system_prompt = SEMANTICALLY_CHUNK_TEXT_SYSTEM_PROMPT.format(
-                chunk_size=chunk_size
-            )
-
-            model_result = await model_structured_output.ainvoke(
-                [
-                    {"role": "system", "content": formatted_system_prompt},
-                    {"role": "user", "content": text_content},
-                ]
-            )
-
-            """ Parse semantic chunks using start and end indicators """
-
-            try:
-                starts = model_result.get("index", [])
-                assert isinstance(starts, list) and all(
-                    isinstance(i, int) for i in starts
-                )
-            except:
-                raise ValueError("LLM did not return value index list")
-
-            starts = sorted(set(starts))  # ensure the list of integers is sorted
-            if starts[0] != 0:
-                starts = [0] + starts
-
-            chunks = []
-            for i in range(len(starts)):
-                start = starts[i]
-                end = starts[i + 1] if i + 1 < len(starts) else len(text_content)
-                chunk = text_content[start:end]
-                chunks.append(chunk)
-
-            logger.info(
-                f"model_result breakpoint on semantic chunking of text: {chunks}"
-            )
-
-            # Initialize recursive text splitter
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                separators=separators,
-                length_function=count_tokens_approximately,
-                is_separator_regex=False,
-            )
-
-            if isinstance(chunks, list):
-                # Ensure the model has not altered the text in any way (length of text is the same before and after invocation)
-                text_total_text_length_of_semantic_chunks = 0
-
-                for chunk in chunks:
-                    text_total_text_length_of_semantic_chunks += len(chunk)
-
-                if text_total_text_length_of_semantic_chunks == text_content.__len__():
-                    # Create Document objects for each chunk
-                    all_documents = []
-                    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
-                    idx = 0
-
-                    for semantic_text_chunk in chunks:
-                        # Determine the length in tokens per semantic text chunk
-                        semantic_text_chunk_token_size = count_tokens_approximately(
-                            [semantic_text_chunk]
-                        )
-
-                        if semantic_text_chunk_token_size < chunk_size:
-                            """create documents of semantic chunks"""
-
-                            doc = Document(
-                                page_content=semantic_text_chunk,
-                                metadata={
-                                    "user_id": user_id,
-                                    "assistant_id": assistant_id,
-                                    "created_at": current_timestamp,
-                                    "processing_task_id": str(uuid4()),
-                                    "source": source,
-                                    "type": "text",
-                                    "chunk_index": idx,
-                                    "filename": filename,
-                                    "document_id": str(uuid4()),
-                                    "filename_uuid5": filename_uuid5,
-                                },
-                            )
-                            idx += 1
-                            doc.metadata.update(source_metadata)
-                            if classification_metadata is not None:
-                                doc.metadata.update(classification_metadata)
-                        else:
-                            # Split the semantic chunk into smaller chunks
-                            idx, documents = await split_text_into_chunks(
-                                text_splitter=text_splitter,
-                                text_content=semantic_text_chunk,
-                                source_metadata=source_metadata,
-                                source=source,
-                                user_id=user_id,
-                                assistant_id=assistant_id,
-                                classification_metadata=classification_metadata,
-                                idx=idx,
-                                filename=filename,
-                                document_id=str(uuid4()),
-                                filename_uuid5=filename_uuid5,
-                            )
-                            if not isinstance(
-                                documents, list
-                            ):  # Redundant type verification
-                                documents = [documents]
-                            all_documents.extend(documents)
-                else:
-                    logger.warning(
-                        f"Warning: Text content is not the same length as the total text length of the semantically meaninful chunks. Text has been altered. Chunking original text."
-                    )
-                    all_documents = []
-                    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
-                    idx = 0
-                    idx, documents = await split_text_into_chunks(
-                        text_splitter=text_splitter,
-                        text_content=text_content,
-                        source_metadata=source_metadata,
-                        source=source,
-                        user_id=user_id,
-                        assistant_id=assistant_id,
-                        classification_metadata=classification_metadata,
-                        idx=idx,
-                        filename=filename,
-                        document_id=str(uuid4()),
-                        filename_uuid5=filename_uuid5,
-                    )
-                    if not isinstance(documents, list):  # Redundant type verification
-                        documents = [documents]
-                    all_documents.extend(documents)
-            else:
-                logger.warning(
-                    f"Error: semantic model chunking result is not a list during 'process_text_media_item_target_for_vectorstore'. Chunking Original Text content."
-                )
-                all_documents = []
-                current_timestamp = datetime.now(tz=timezone.utc).isoformat()
-                idx = 0
-                idx, documents = await split_text_into_chunks(
-                    text_splitter=text_splitter,
-                    text_content=text_content,
-                    source_metadata=source_metadata,
-                    source=source,
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    classification_metadata=classification_metadata,
-                    idx=idx,
-                    filename=filename,
-                    document_id=str(uuid4()),
-                    filename_uuid5=filename_uuid5,
-                )
-                if not isinstance(documents, list):  # Redundant type verification
-                    documents = [documents]
-                all_documents.extend(documents)
-
-        else:
-            if token_text_content_length > chunk_size and media_type != "json":
-                logger.info(
-                    f"length of text context is greater than the chunk size therefore use semantic chunks was set to FALSE; CHUNKING TEXT NON-SEMANTICALLY"
-                )
-
-                # Initialize recursive text splitter
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    separators=separators,
-                    length_function=len,
-                    is_separator_regex=False,
-                )
-
-                all_documents = []
-                current_timestamp = datetime.now(tz=timezone.utc).isoformat()
-                idx = 0
-                idx, documents = await split_text_into_chunks(
-                    text_splitter=text_splitter,
-                    text_content=text_content,
-                    source_metadata=source_metadata,
-                    source=source,
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    classification_metadata=classification_metadata,
-                    idx=idx,
-                    filename=filename,
-                    document_id=str(uuid4()),
-                    filename_uuid5=filename_uuid5,
-                )
-                if not isinstance(documents, list):  # Redundant type verification
-                    documents = [documents]
-                all_documents.extend(documents)
-
-            else:
-                logger.info(
-                    f"use_semantic_chunks is False AND token_text_content_length is less than or equal to the chunk_size (256 tokens before truncation)"
-                )
-                idx = 0
-                text_chunk_token_size = count_tokens_approximately([text_content])
-                all_documents = []
-
-                # Redundant identification of chunk_size
-                if text_chunk_token_size <= chunk_size:
-                    """create document of single text chunk"""
-                    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
-
-                    doc = Document(
-                        page_content=text_content,
-                        metadata={
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "created_at": current_timestamp,
-                            "processing_task_id": str(uuid4()),
-                            "source": source,
-                            "type": "text",
-                            "chunk_index": idx,
-                            "filename": filename,
-                            "document_id": str(uuid4()),
-                            "filename_uuid5": filename_uuid5,
-                        },
-                    )
-                    idx += 1
-
-                    if classification_metadata is not None:
-                        doc.metadata.update(classification_metadata)
-                    docs = [doc]
-                    all_documents.extend(docs)
+            document.metadata.update(source_metadata)
+            if classification_metadata is not None:
+                document.metadata.update(classification_metadata)
+            idx += 1
 
         # Update the total chunks in the metadata:
-        result_of_document_metadata_update = [
+        _ = [
             document.metadata.update({"total_chunks": idx})
             for document in all_documents
         ]
-
         return all_documents
 
     except Exception as e:

@@ -10,8 +10,11 @@ from langgraph.runtime import Runtime
 from datetime import datetime, timezone
 from langchain_core.messages import SystemMessage
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+# Repo root: src/anubis/utils/nodes.py -> parents[3]
+_AGENT_DEBUG_LOG = Path(__file__).resolve().parents[3] / ".cursor" / "debug-eecee8.log"
 
 
 async def load_consciousness(
@@ -60,6 +63,28 @@ async def load_consciousness(
     if assistant_name is not None:
         state["assistant_state"].update({"assistant_name": assistant_name})
     else:
+        # #region agent log
+        try:
+            import json as _json
+            import time as _time
+
+            with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as _df:
+                _df.write(
+                    _json.dumps(
+                        {
+                            "sessionId": "eecee8",
+                            "hypothesisId": "H1",
+                            "location": "nodes.py:load_consciousness",
+                            "message": "before assistant identity asearch",
+                            "data": {"branch": "assistant_name_from_store"},
+                            "timestamp": int(_time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         assistant_possible_name = await runtime.store.asearch(
             (user_id, assistant_id, "identity"), query="name"
         )
@@ -82,6 +107,28 @@ async def load_consciousness(
     if user_name is not None:
         state["user_state"].update({"user_name": user_name})
     else:
+        # #region agent log
+        try:
+            import json as _json
+            import time as _time
+
+            with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as _df:
+                _df.write(
+                    _json.dumps(
+                        {
+                            "sessionId": "eecee8",
+                            "hypothesisId": "H1",
+                            "location": "nodes.py:load_consciousness",
+                            "message": "before user identity asearch",
+                            "data": {"branch": "user_name_from_store"},
+                            "timestamp": int(_time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         user_possible_name = await runtime.store.asearch(
             (assistant_id, user_id, "identity"), query="name"
         )

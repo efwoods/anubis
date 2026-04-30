@@ -36,6 +36,12 @@ from openai import OpenAI
 from openai.types.audio.transcription_diarized import TranscriptionDiarized
 import base64
 
+import io
+from tempfile import SpooledTemporaryFile
+from PIL import Image
+from starlette.datastructures import Headers
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -968,3 +974,46 @@ async def transcribe_audio_diarize(
                 except OSError:
                     pass
 
+async def extract_base64_str_from_upload_image(img: UploadFile) -> str:
+    """Convert Upload file of image type to base64 encoded str
+    """
+    suffix = Path(img.filename).suffix
+    if suffix not in [".png", ".jpeg", ".jpg", ".webp"]:
+        raise ValueError("Unsupported file type. Only PNG, JPEG, JPG, and WEBP are allowed.")
+    img.file.seek(0)
+    base64_image = base64.b64encode(img.file.read()).decode('utf-8')
+    base64_str = f"data:image/{suffix.lstrip('.')};base64,{base64_image}"
+    return base64_str
+
+
+async def resize_uploadfile(uploadfile: UploadFile):
+
+    uploadfile.file.seek(0)  # important if already read
+    with Image.open(uploadfile.file) as original_img:
+        image = original_img.convert("RGB")
+        MAX_DIMENSION = 512
+        original_w, original_h = image.size
+        longest_side = max(original_w, original_h)
+        if longest_side > MAX_DIMENSION:
+            scale = MAX_DIMENSION / longest_side
+            resized_width = max(1, int(round(original_w * scale)))
+            resized_height = max(1, int(round(original_h * scale)))
+            image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+            # Re-encode resized image
+            out = io.BytesIO()
+            image.save(out, format="JPEG", quality=85, optimize=True)
+            resized_bytes = out.getvalue()
+            # Replace UploadFile's underlying file object
+            new_spooled = SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+            new_spooled.write(resized_bytes)
+            new_spooled.seek(0)
+            uploadfile.file = new_spooled
+            uploadfile.size = len(resized_bytes)
+            # Keep metadata aligned
+            headers = uploadfile.headers.mutablecopy()
+            headers['content-type'] = "image/jpeg"
+            uploadfile.headers = Headers(headers)
+
+    # Ensure downstream reads from start
+    uploadfile.file.seek(0)
+    return uploadfile

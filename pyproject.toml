@@ -36,6 +36,7 @@ dependencies = [
     "openai>=2.24.0",
     "pandas>=2.3.3",
     "prometheus-client>=0.25.0",
+    "psycopg[binary]>=3.3.0",
     "psycopg-pool>=3.3.0",
     "pydantic>=2.12.5",
     "pytest>=9.0.2",

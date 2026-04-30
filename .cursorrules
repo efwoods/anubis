@@ -5,3 +5,7 @@
  
 src.anubis.utils.context.py
  whenever there is a standard environment variable for settings, that needs to be set in the env and dev env with uppercase and included in context in lowercase (following field format for strings with descriptions and int and floats with default values as per the other variables in context.py) and the context needs to be called at the top of the function and passed throughout nested calls to access environment variables.
+
+
+ When creating prompts, follow the best practices as defined here:
+ https://developers.openai.com/cookbook/examples/gpt-5/gpt-5_prompting_guide

@@ -198,6 +198,49 @@ Do not describe the first image if there is more than one image. Only use the re
 
 """
 
+MULTI_IMAGE_PROMPT = """
+<instruction_hierarchy>
+CRITICAL (must never be violated): Subordinate every other rule to these two constraints:
+(1) Identity: use earlier frames ONLY to decide which human in the SUBJECT frame is the same person.
+(2) Evidence: every descriptive claim must be grounded in pixels visible in the SUBJECT frame. Never describe, paraphrase, or "carry over" the look of an earlier frame.
+</instruction_hierarchy>
+
+<ROLE>
+You write a first-person description of exactly one matched individual—the one who corresponds to the person shown alone in the first (reference-only) frame—as they appear in the SUBJECT frame.
+</ROLE>
+
+<definitions>
+- REFERENCE frame(s): every image before the last one in the user message. Use them only for who-to-pick, not for what to describe.
+- SUBJECT frame: the last image in the user message. This is the only frame you may describe. If the user message contains exactly two images, the SUBJECT frame is "image 2". If there are more than two images, the SUBJECT frame is always the final image, not image 2.
+</definitions>
+
+<TARGETING_procedure>
+Before writing, mentally execute this checklist (do not print the checklist):
+1) In the SUBJECT frame, locate all people who could plausibly match the reference person (face, age, build, hair where visible).
+2) Pick the single best match. If no plausible match exists, output exactly: TARGET_NOT_VISIBLE
+3) Sanity check: if your draft could still be true if the SUBJECT frame were replaced by a blank crop of the reference portrait, you are leaking reference-only content—rewrite using only SUBJECT-frame evidence.
+</TARGETING_procedure>
+
+<anti_errors>
+- False positive (wrong person): when several people appear, you must match identity to the reference person, then describe only that person—not a partner, child, or bystander unless they are clearly the same individual as in the reference.
+- False negative (describing the reference): never output hair, clothing, pose, expression, lighting, or background that appear only in a REFERENCE frame. If the matched person in the SUBJECT frame is partly occluded, describe only what is visible there; do not fill gaps from the reference.
+- Ambiguity in groups (e.g. couple): use the reference to disambiguate which adult is the target, then describe that adult as seen in the SUBJECT frame (their outfit, pose, interaction with others in that frame).
+</anti_errors>
+
+<OUTPUT_RULES>
+- Describe only the matched target as visible in the SUBJECT frame.
+- Do not describe other people except as needed to state how the target interacts with them.
+- Do not describe scene/background except briefly when it clarifies the target's appearance or action in the SUBJECT frame.
+- First person only ("I/me/my"). Do not say "image", "photo", "frame", "reference", or ordinal labels like "image 1".
+- No invented details; stick to visible evidence in the SUBJECT frame.
+</OUTPUT_RULES>
+
+<QUALITY>
+Give concrete SUBJECT-frame attributes (face, hair, clothing, posture, expression) and cautious personality cues tied to visible behavior in that frame.
+</QUALITY>
+"""
+
+
 """ LLM AS A JUDGE QUALITY EVALUATIONS """
 
 EVALUATION_PROMPT_TEMPLATE = """

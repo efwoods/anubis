@@ -9,6 +9,8 @@ import logging
 logger = logging.getLogger(__name__)
 import base64
 from pathlib import Path
+import json
+import time
 
 from langchain_community.document_loaders import PyPDFLoader
 import tempfile, os
@@ -41,7 +43,28 @@ from langchain.tools import tool
 
 from langchain_core.runnables import RunnableConfig
 from src.anubis.utils.utility import extract_user_id_assistant_id
+from src.subgraphs.process_media_graph.utils.utility import extract_personality_from_image
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
+
+DEBUG_LOG_PATH = "/home/user/gh/anubis/.cursor/debug-eeabc1.log"
+DEBUG_SESSION_ID = "eeabc1"
+
+
+def _write_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
 
 
 
@@ -322,7 +345,14 @@ async def process_media_item_task(
                 image_data = media_item["data"]                
                 
                     
-                doc =  await extract_personality_from_image(image_data=image_data, store=store, user_id=user_id, assistant_id=assistant_id)
+                doc = await extract_personality_from_image(
+                    image_data=image_data,
+                    filename=filename,
+                    store=store,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    context=runtime.context,
+                )
                     # Filter valid Documents and add metadata
                 doc.metadata.update({
                     "user_id": user_id,
@@ -350,28 +380,41 @@ async def process_media_item_task(
                 if url.startswith("data:image"):
                     # Extract base64 data
                     image_data = url.split(",", 1)[1]
-                    
-                    doc =  await extract_personality_from_image(image_data)
-                    # Filter valid Documents and add metadata
-                doc.metadata.update({
-                    "user_id": user_id,
-                    "assistant_id": assistant_id, 
-                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                    "processing_task_id": str(uuid4()),
-                    "reference_image": reference_image,
-                    "filename": filename
-                })  
 
-                if reference_image:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id, "reference_image")
-                    metadata = doc.metadata
-                    page_content = doc.metadata.get("page_content", "")
-                    metadata.update({"page_content":page_content})
-                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "metadata": metadata})
-                    
-                docs = [doc]
-                return docs
+                    doc = await extract_personality_from_image(
+                        image_data=image_data,
+                        filename=filename,
+                        store=store,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        context=runtime.context,
+                    )
+                    doc.metadata.update({
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                        "processing_task_id": str(uuid4()),
+                        "reference_image": reference_image,
+                        "filename": filename,
+                    })
+
+                    if reference_image:
+                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
+                        namespace = (user_id, assistant_id, "reference_image")
+                        metadata = doc.metadata
+                        page_content = doc.metadata.get("page_content", "")
+                        metadata.update({"page_content": page_content})
+                        await store.aput(
+                            namespace,
+                            key=assistant_id,
+                            value={
+                                "reference_image_data": image_data,
+                                "metadata": metadata,
+                            },
+                        )
+
+                    docs = [doc]
+                    return docs
         
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5 
         # Handle large continuous text string if proprietary content; classify non-proprietary text content
@@ -467,9 +510,10 @@ async def process_media_item_task(
 
                     await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data})                   
 
-                text_content = await extract_text_from_audio(audio_data, user_id, assistant_id)
+                # TODO: Implement audio transcription
+                # text_content = await extract_text_from_audio(audio_data, user_id, assistant_id)
 
-                media_item['content'] = text_content
+                # media_item['content'] = text_content
 
                 documents = await process_text_to_document(media_item=media_item, user_id=user_id, assistant_id=assistant_id, metadata=metadata)
 
@@ -481,8 +525,8 @@ async def process_media_item_task(
                 if url.startswith("data:audio"):
                     # Extract base64 data
                     audio_data = url.split(",", 1)[1]
-
-                    doc = await extract_text_from_audio(audio_data)
+                    # TODO: Implement audio transcription
+                    # doc = await extract_text_from_audio(audio_data)
 
                     doc.metadata.update({
                         "user_id": user_id,
@@ -531,115 +575,6 @@ async def process_media_item_task(
         )]
         return documents
     return await tool.ainvoke(media_item["content"])
-
-async def extract_text_from_audio(audio_data: str, user_id: str, assistant_id: str) -> Document:#
-    """Extract text from audio using Hugging Face Whisper Large v3
-    reference audio is used if available.
-    text is diarized and the target is identified.
-    """
-    logger.info(f"needs reference audio from storage for speaker diarization (timestamps and who is speaking)")
-    import base64
-    import tempfile
-    import os
-    import asyncio
-    import aiofiles
-
-    logger.info(f"extract text from audio ENTRYPOINT")
-
-    # store
-
-    # Identify reference audio existence and extract reference audio 
-    """
-    {"reference_audio": {"reference_audio_data": data, "metadata": metadata}}
-    """
-
-    """ ANALYZE AUDIO """
-
-    # if reference_audio is not None:
-    logger.info(f"Identify the number of speakers in the audio")
-    logger.info(f"Identify if the target speaker is in the audio")
-    logger.info(f"Diarize the audio (timestamps of who is speaking when)")
-    # return text_content
-
-    pass
-
-async def extract_personality_from_image(
-    image_data: str, store: str, user_id: str, assistant_id: str) -> Document:
-    """Extract personality description from image using vision LLM."""
-    logger.info(f"needs reference image from storage for target identification (possibly object bounding box of the target)")
-    # base64_image = self._image_to_base64(image_source)
-    # base64_image = self.image_to_base64(image_path)
-
-    logger.info(f"extract_personality_from_image entrypoint")    
-    # Use reference image to help identify the person in the image.
-
-    from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
-    
-    # TODO: response_metrics_aggregation
-    model = init_image_description_model()
-
-    # use reference image if available to target individual
-    assistant_reference_image_identity_namespace = (user_id, assistant_id, "reference_image")
-    key=assistant_id
-    reference_image_item = await store.aget(assistant_reference_image_identity_namespace, key)
-    if reference_image_item and len(reference_image_item) != 0:
-        reference_image_data = getattr(reference_image_item,'value', {}).get("reference_image_data", None)
-
-    if reference_image_item and reference_image_data:
-        image_to_target_textual_description_payload = [
-                            {
-                                "type": "text",
-                                "text": (TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION),
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{reference_image_data}"
-                                },
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
-                                },
-                            },
-                        ]
-    else:
-
-        image_to_target_textual_description_payload = [
-                            {
-                                "type": "text",
-                                "text": (TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION),
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
-                                },
-                            },
-                        ]
-
-    input = {"messages": [{"role": "user", "content": image_to_target_textual_description_payload}]}
-    
-
-    response = await model.ainvoke(input=input['messages'])
-
-    logger.info(f"response: {response}")
-
-    if hasattr(response, 'content'):
-        contextual_description = response.content
-    else:
-        contextual_description = str(response)
-
-    logger.info(f"Extracted personality from image: {contextual_description[:100]}")
-
-    return Document(
-        page_content=contextual_description,
-        metadata={
-            "source": "vision_model", 
-            "type": "personality_extraction"
-        }
-    )
 
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     

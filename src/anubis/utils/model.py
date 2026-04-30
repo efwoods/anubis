@@ -189,37 +189,12 @@ def init_image_description_model():
     logger.info(f"model_name: {model_name}")
 
     # from langchain_openai import ChatOpenAI
-    model = ChatNVIDIA(
+    model = ChatOpenAI(
                 model = model_name,
+                base_url = base_url,
                 temperature=0.1,
-                top_p=0.1,
                 api_key = api_key,
             )
-    
-    # if model_provider == "TOGETHER":
-    #     model = ChatTogether(
-    #                 model = model_name,
-    #                 base_url = base_url,
-    #                 temperature=0.1,
-    #                 top_p=0.1,
-    #                 api_key = api_key,
-    #             )
-
-    # elif model_provider == "NVIDIA":
-    #         model = ChatNVIDIA(
-    #                     model = model_name,
-    #                     temperature=0.1,
-    #                     top_p=0.1,
-    #                     api_key = api_key,
-    #                 )
-    # elif model_provider == "META":
-    #     model = ChatOpenAI(
-    #                     model = model_name,
-    #                     base_url = base_url,
-    #                     temperature=0.1,
-    #                     top_p=0.1,
-    #                     api_key = api_key,
-    #                 )
     return model
 
 
@@ -236,8 +211,6 @@ async def calculate_token_usage_description_model(model_structured_output_respon
 
     token_usage = TokenUsage(prompt_tokens=input_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
     return token_usage
-
-
 
 class AsyncLlamaAPIClientWrapper:
     def __init__(self, response_format = None):

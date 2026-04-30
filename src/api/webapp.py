@@ -1191,46 +1191,6 @@ async def get_thread_messages(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
 
-
-@app.post("/test_update_avatar_identity_with_media")
-async def test_update_avatar_identity_with_media(
-    files: Optional[List[UploadFile]] = File(...),
-    url: Optional[str] = None,
-    assistant_id: str = None,
-    reference_audio: bool = False,
-    reference_image: bool = False,
-    proprietary_content: bool = False,
-    # current_user: dict = Depends(get_current_user),
-):
-    # Context user_id, assistant_id
-    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
-    """
-    Upload one or more media files for processing and indexing.
-    
-    - **files**: One or more files to process
-    - **user_id**: User identifier
-    - **assistant_id**: Assistant identifier
-    """
-    breakpoint()
-
-    media_files = []
-    for file in files:
-        content = await file.read()
-        media_files.append(
-            {
-                "filename": file.filename,
-                "content_type": file.content_type,
-                "content": content,
-                # "user_id": user_id,
-                "assistant_id": assistant_id,
-                "reference_audio": reference_audio,
-                "reference_image": reference_image,
-                "proprietary_content": proprietary_content,
-            }
-        )
-
-
-
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: Optional[List[UploadFile]] = File(...),

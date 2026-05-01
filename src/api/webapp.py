@@ -1322,15 +1322,6 @@ def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
     return mime
 
 
-async def validate_remote_image_url(url: str) -> str:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        header_ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
-        body = r.content[:8_000_000]
-    return validate_upload_image_bytes(header_ct, body)
-
-
 async def probe_remote_url_content_type(url: str) -> str:
     """Best-effort Content-Type for a remote URL (HEAD, then ranged GET + sniff)."""
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
@@ -1360,6 +1351,31 @@ async def require_url_content_type_prefix(url: str, prefix: str, label: str) -> 
         )
 
 
+MAX_REMOTE_URL_DOWNLOAD_BYTES = 25 * 1024 * 1024
+
+async def fetch_remote_url_bytes(
+    url: str,
+    max_bytes: int = MAX_REMOTE_URL_DOWNLOAD_BYTES,
+) -> tuple[bytes, str]:
+    """Download a URL and return (body, Content-Type without parameters)."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        body = r.content
+        if len(body) > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Remote resource exceeds maximum download size ({max_bytes} bytes)."
+                ),
+            )
+        header_ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        return body, header_ct or "application/octet-stream"
+
+def make_data_uri(mime: str, body: bytes) -> str:
+    """RFC 2397 data URI: ``data:<mime>;base64,<payload>``."""
+    return f"data:{mime};base64,{base64.b64encode(body).decode('ascii')}"
+
 @app.get("/avatar_reference_image")
 async def get_avatar_reference_image(
     assistant_id: str,
@@ -1380,7 +1396,6 @@ async def get_avatar_reference_image(
         {"reference_image_data": value.get("reference_image_data")}
     )
 
-
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: Annotated[Optional[List[UploadFile]], File()] = None,
@@ -1392,6 +1407,7 @@ async def update_avatar_identity_with_media(
 ):
     # Context user_id, assistant_id
     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
+    breakpoint()
     """
     Upload media for processing and indexing.
 
@@ -1494,6 +1510,7 @@ async def update_avatar_identity_with_media(
                         "assistant_id": assistant_id,
                         "reference_audio": False,
                         "reference_image": True,
+                        "base64_encoded_str": make_data_uri(mime, content),
                     }
                 )
             elif reference_audio:
@@ -1525,6 +1542,7 @@ async def update_avatar_identity_with_media(
                         "assistant_id": assistant_id,
                         "reference_audio": True,
                         "reference_image": False,
+                        "base64_encoded_str": make_data_uri(effective, content),
                     }
                 )
             else:
@@ -1543,6 +1561,7 @@ async def update_avatar_identity_with_media(
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(mime, content),
                         }
                     )
                 elif declared.startswith("audio/") or (
@@ -1569,6 +1588,7 @@ async def update_avatar_identity_with_media(
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(effective, content),
                         }
                     )
                 elif declared.startswith("video/"):
@@ -1581,6 +1601,7 @@ async def update_avatar_identity_with_media(
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(declared, content),
                         }
                     )
                 elif declared == "application/pdf":
@@ -1593,6 +1614,7 @@ async def update_avatar_identity_with_media(
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(declared, content),
                         }
                     )
                 elif declared in (
@@ -1610,6 +1632,7 @@ async def update_avatar_identity_with_media(
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(declared, content),
                         }
                     )
                 else:
@@ -1622,7 +1645,8 @@ async def update_avatar_identity_with_media(
             slug = _slug(url_clean)
 
             if reference_image:
-                img_mime = await validate_remote_image_url(url_clean)
+                body, header_ct = await fetch_remote_url_bytes(url_clean)
+                img_mime = validate_upload_image_bytes(header_ct, body)
                 media_files.append(
                     {
                         "filename": slug or "reference_image_from_url",
@@ -1633,13 +1657,20 @@ async def update_avatar_identity_with_media(
                         "assistant_id": assistant_id,
                         "reference_audio": False,
                         "reference_image": True,
+                        "base64_encoded_str": make_data_uri(img_mime, body),
                     }
                 )
             elif reference_audio:
                 await require_url_content_type_prefix(
                     url_clean, "audio/", "Reference audio"
                 )
-                audio_mime = await probe_remote_url_content_type(url_clean)
+                body, header_ct = await fetch_remote_url_bytes(url_clean)
+                sniff = _sniff_media_category_from_bytes(body[:512])
+                audio_mime = (
+                    header_ct
+                    if header_ct.startswith("audio/")
+                    else (sniff if sniff.startswith("audio/") else header_ct)
+                )
                 media_files.append(
                     {
                         "filename": slug or "reference_audio_from_url",
@@ -1650,12 +1681,14 @@ async def update_avatar_identity_with_media(
                         "assistant_id": assistant_id,
                         "reference_audio": True,
                         "reference_image": False,
+                        "base64_encoded_str": make_data_uri(audio_mime, body),
                     }
                 )
             else:
                 ct = await probe_remote_url_content_type(url_clean)
                 if ct.startswith("image/"):
-                    img_mime = await validate_remote_image_url(url_clean)
+                    body, header_ct = await fetch_remote_url_bytes(url_clean)
+                    img_mime = validate_upload_image_bytes(header_ct, body)
                     media_files.append(
                         {
                             "filename": slug or "remote_image",
@@ -1666,32 +1699,46 @@ async def update_avatar_identity_with_media(
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(img_mime, body),
                         }
                     )
                 elif ct.startswith("audio/"):
+                    body, header_ct = await fetch_remote_url_bytes(url_clean)
+                    sniff = _sniff_media_category_from_bytes(body[:512])
+                    audio_mime = (
+                        header_ct
+                        if header_ct.startswith("audio/")
+                        else (sniff if sniff.startswith("audio/") else ct)
+                    )
                     media_files.append(
                         {
                             "filename": slug or "remote_audio",
-                            "content_type": ct,
+                            "content_type": audio_mime,
                             "content": b"",
                             "audio_url": url_clean,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(audio_mime, body),
                         }
                     )
                 elif ct.startswith("video/"):
+                    body, header_ct = await fetch_remote_url_bytes(url_clean)
+                    video_mime = (
+                        header_ct if header_ct.startswith("video/") else ct
+                    )
                     media_files.append(
                         {
                             "filename": slug or "remote_video",
-                            "content_type": ct,
+                            "content_type": video_mime,
                             "content": b"",
                             "video_url": url_clean,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(video_mime, body),
                         }
                     )
                 elif ct.startswith("text/") or ct in (
@@ -1701,16 +1748,33 @@ async def update_avatar_identity_with_media(
                     "application/javascript",
                     "application/ld+json",
                 ):
+                    body, header_ct = await fetch_remote_url_bytes(url_clean)
+                    doc_mime = (
+                        header_ct
+                        if (
+                            header_ct.startswith("text/")
+                            or header_ct
+                            in (
+                                "application/json",
+                                "application/xml",
+                                "application/xhtml+xml",
+                                "application/javascript",
+                                "application/ld+json",
+                            )
+                        )
+                        else ct
+                    )
                     media_files.append(
                         {
                             "filename": slug or "remote_document",
-                            "content_type": ct,
+                            "content_type": doc_mime,
                             "content": b"",
                             "page_url": url_clean,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
+                            "base64_encoded_str": make_data_uri(doc_mime, body),
                         }
                     )
                 else:

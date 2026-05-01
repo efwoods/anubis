@@ -487,6 +487,7 @@ async def process_media_item_task(
             if reference_image:
                 namespace = (user_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
+                
                 await store.aput(
                     namespace,
                     key=assistant_id,

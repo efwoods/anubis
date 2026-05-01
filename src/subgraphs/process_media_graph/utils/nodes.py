@@ -49,6 +49,15 @@ from src.subgraphs.process_media_graph.utils.helper_functions import process_tex
 DEBUG_LOG_PATH = "/home/user/gh/anubis/.cursor/debug-eeabc1.log"
 DEBUG_SESSION_ID = "eeabc1"
 
+_ALLOWED_STILL_IMAGE_MIMES = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
+
+
+def _normalize_declared_image_mime(ct: str) -> str:
+    m = (ct or "").split(";")[0].strip().lower()
+    return "image/jpeg" if m == "image/jpg" else m
+
 
 def _write_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
     payload = {
@@ -80,7 +89,6 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
-    breakpoint()
     user_id, assistant_id = await extract_user_id_assistant_id(config)
 
     media_files = state.get('media_files', [])
@@ -104,26 +112,109 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
-            proprietary_content = file_data.get("proprietary_content") # This is a single body of text (scripture/menu/etc ... there is no single target, text only)
             
             logger.info(f"Processing file: {filename} ({content_type})")
+
+            image_url_remote = (file_data.get("image_url") or "").strip()
+            if image_url_remote:
+                mime = _normalize_declared_image_mime(content_type)
+                if mime not in _ALLOWED_STILL_IMAGE_MIMES:
+                    logger.warning(
+                        "Skipping remote image with disallowed MIME %s", mime
+                    )
+                    continue
+                media_list.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_url_remote},
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": mime,
+                        "size": 0,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "reference_image": reference_image,
+                    },
+                })
+                continue
+
+            audio_url_remote = (file_data.get("audio_url") or "").strip()
+            if audio_url_remote:
+                mime = content_type.split(";")[0].strip().lower()
+                if not mime.startswith("audio/"):
+                    logger.warning(
+                        "Skipping remote audio with non-audio MIME %s", mime
+                    )
+                    continue
+                media_list.append({
+                    "type": "audio",
+                    "audio_url": {"url": audio_url_remote},
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": mime,
+                        "size": 0,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "reference_audio": reference_audio,
+                    },
+                })
+                continue
+
+            video_url_remote = (file_data.get("video_url") or "").strip()
+            if video_url_remote:
+                mime = content_type.split(";")[0].strip().lower()
+                if not mime.startswith("video/"):
+                    logger.warning(
+                        "Skipping remote video with non-video MIME %s", mime
+                    )
+                    continue
+                media_list.append({
+                    "type": "video",
+                    "video_url": {"url": video_url_remote},
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": mime,
+                        "size": 0,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                    },
+                })
+                continue
+
+            page_url_remote = (file_data.get("page_url") or "").strip()
+            if page_url_remote:
+                mime = content_type.split(";")[0].strip().lower()
+                media_list.append({
+                    "type": "url",
+                    "url": page_url_remote,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": mime,
+                        "size": 0,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                    },
+                })
+                continue
             
             # Determine media type and convert to standardized format
             if content_type.startswith('image/'):
-                # Convert image to base64
-                # proprietary content creates reference documents from the images otherwise assumes image of source target individual
+                mime = _normalize_declared_image_mime(content_type)
+                if mime not in _ALLOWED_STILL_IMAGE_MIMES:
+                    logger.warning("Skipping image with disallowed MIME %s", mime)
+                    continue
+                # Full data URI string for storage and vision APIs (langgraph index uses document.kwargs.page_content)
                 base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                image_data_uri = f"data:{mime};base64,{base64_data}"
                 media_list.append({
                     "type": "image",
-                    "data": base64_data,
+                    "data": image_data_uri,
                     "metadata": {
                         "filename": filename,
-                        "content_type": content_type,
+                        "content_type": mime,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id, 
+                        "assistant_id": assistant_id,
                         "reference_image": reference_image,
-                        "proprietary_content": proprietary_content
                     }
                 })
             
@@ -175,8 +266,7 @@ async def process_uploaded_files_and_label_media_type(
                             "content_type": content_type,
                             "size": len(file_bytes),
                             "user_id": user_id,
-                            "assistant_id": assistant_id, 
-                            "proprietary_content": proprietary_content
+                            "assistant_id": assistant_id,
                         }
                     })
                 elif suffix == '.json' or suffix == '.jsonl':
@@ -190,8 +280,7 @@ async def process_uploaded_files_and_label_media_type(
                             "content_type": content_type,
                             "size": len(file_bytes),
                             "user_id": user_id,
-                            "assistant_id": assistant_id, 
-                            "proprietary_content": proprietary_content
+                            "assistant_id": assistant_id,
                         }
                     })
                 else: # handle markdown
@@ -204,8 +293,7 @@ async def process_uploaded_files_and_label_media_type(
                             "content_type": content_type,
                             "size": len(file_bytes),
                             "user_id": user_id,
-                            "assistant_id": assistant_id, 
-                            "proprietary_content": proprietary_content
+                            "assistant_id": assistant_id,
                         }
                     })
             
@@ -221,8 +309,7 @@ async def process_uploaded_files_and_label_media_type(
                         "content_type": content_type,
                         "size": len(file_bytes),
                         "user_id": user_id,
-                        "assistant_id": assistant_id, 
-                        "proprietary_content": proprietary_content
+                        "assistant_id": assistant_id,
                     }
                 })
             
@@ -264,7 +351,6 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     """
     
     logging.info(f"DETERMINE_MEDIA_TYPE NODE")
-    breakpoint()
     
     media_list = state.get('media_list', [])
 
@@ -336,94 +422,90 @@ async def process_media_item_task(
     logger.info(f"Processing file: {filename}")
 
     try:
-        # Handle base64 images
-        if media_type == "image":
-            reference_image = media_item['metadata']["reference_image"]
-            if "data" in media_item:
-                
-                # Base64 image
-                image_data = media_item["data"]                
-                
-                    
-                doc = await extract_personality_from_image(
-                    image_data=image_data,
-                    filename=filename,
-                    store=store,
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    context=runtime.context,
-                )
-                    # Filter valid Documents and add metadata
-                doc.metadata.update({
+        if media_type in ("image", "image_url"):
+            reference_image = metadata.get("reference_image", False)
+
+            vision_source: str = ""
+            stored_reference_string: str = ""
+
+            if media_type == "image_url":
+                url = (media_item.get("image_url") or {}).get("url", "").strip()
+                if not url:
+                    return [
+                        Document(
+                            page_content="[Empty image URL]",
+                            metadata={
+                                "status": "error",
+                                "error": "empty_url",
+                                "filename": filename,
+                            },
+                        )
+                    ]
+                vision_source = url
+                stored_reference_string = url
+            elif "data" in media_item:
+                vision_source = media_item["data"]
+                stored_reference_string = vision_source
+            elif "image_url" in media_item:
+                url = (media_item.get("image_url") or {}).get("url", "").strip()
+                vision_source = url
+                stored_reference_string = url
+            else:
+                return [
+                    Document(
+                        page_content="[Unsupported image payload]",
+                        metadata={
+                            "status": "error",
+                            "error": "missing_image_data",
+                            "filename": filename,
+                        },
+                    )
+                ]
+
+            doc = await extract_personality_from_image(
+                image_data=vision_source,
+                filename=filename,
+                store=store,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                context=runtime.context,
+            )
+            doc.metadata.update(
+                {
                     "user_id": user_id,
-                    "assistant_id": assistant_id, 
+                    "assistant_id": assistant_id,
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
                     "reference_image": reference_image,
                     "filename": filename,
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": False,
-                    "analysis_acceptable": True
-                }) 
+                    "analysis_acceptable": True,
+                }
+            )
 
-                if reference_image:
-                    logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                    namespace=(user_id, assistant_id, "reference_image")
-                    doc_json = doc.to_json()
-                    await store.aput(namespace, key=assistant_id, value={"reference_image_data": image_data, "document": doc_json})                    
-                docs = [doc]
-                return docs
-            
-            elif "image_url" in media_item:
-                # URL-based image
-                url = media_item["image_url"].get("url", "")
-                if url.startswith("data:image"):
-                    # Extract base64 data
-                    image_data = url.split(",", 1)[1]
+            if reference_image:
+                namespace = (user_id, assistant_id, "reference_image")
+                doc_json = doc.to_json()
+                await store.aput(
+                    namespace,
+                    key=assistant_id,
+                    value={
+                        "reference_image_data": stored_reference_string,
+                        "document": doc_json,
+                    },
+                )
+            return [doc]
 
-                    doc = await extract_personality_from_image(
-                        image_data=image_data,
-                        filename=filename,
-                        store=store,
-                        user_id=user_id,
-                        assistant_id=assistant_id,
-                        context=runtime.context,
-                    )
-                    doc.metadata.update({
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                        "processing_task_id": str(uuid4()),
-                        "reference_image": reference_image,
-                        "filename": filename,
-                    })
-
-                    if reference_image:
-                        logger.warning(f"STORE REFERENCE IMAGE HERE: presuming upsert")
-                        namespace = (user_id, assistant_id, "reference_image")
-                        metadata = doc.metadata
-                        page_content = doc.metadata.get("page_content", "")
-                        metadata.update({"page_content": page_content})
-                        await store.aput(
-                            namespace,
-                            key=assistant_id,
-                            value={
-                                "reference_image_data": image_data,
-                                "metadata": metadata,
-                            },
-                        )
-
-                    docs = [doc]
-                    return docs
-        
         # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5 
         # Handle large continuous text string if proprietary content; classify non-proprietary text content
         elif media_type == "text":
             documents = await process_text_to_document(
-                metadata=metadata, 
-                user_id=user_id, 
-                assistant_id=assistant_id, 
-                media_item=media_item)
+                metadata=metadata,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+            )
             return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             classification_metadata = {
@@ -458,7 +540,6 @@ async def process_media_item_task(
             return docs
         
         elif media_type == "pdf": # Presumes written in first person from the target source
-            logging.info("breakpoint")
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
                 tmp_file.write(media_item["bytes"])
                 tmp_path = tmp_file.name
@@ -494,68 +575,101 @@ async def process_media_item_task(
         elif media_type == "audio":
             """
             Detect the number of speakers
-            Audio needs to be diarized if reference audio is available; 
+            Audio needs to be diarized if reference audio is available;
             otherwise convert to text
             """
-            reference_audio = media_item['metadata']['reference_audio']
+            reference_audio = metadata.get("reference_audio", False)
             if "data" in media_item:
-                # Base64 audio
                 audio_data = media_item["data"]
 
                 if reference_audio:
-                    logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
-                    namespace=(user_id, assistant_id, "reference_audio")
+                    namespace = (user_id, assistant_id, "reference_audio")
+                    await store.aput(
+                        namespace,
+                        key=assistant_id,
+                        value={"reference_audio_data": audio_data},
+                    )
 
-                    doc_json = doc.to_json()
+                media_item_fwd = {
+                    **media_item,
+                    "content": media_item.get("content")
+                    or "[Audio upload; transcription pending]",
+                }
+                return await process_text_to_document(
+                    media_item=media_item_fwd,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    metadata=metadata,
+                )
 
-                    await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data})                   
-
-                # TODO: Implement audio transcription
-                # text_content = await extract_text_from_audio(audio_data, user_id, assistant_id)
-
-                # media_item['content'] = text_content
-
-                documents = await process_text_to_document(media_item=media_item, user_id=user_id, assistant_id=assistant_id, metadata=metadata)
-
-                return documents
-            
-            elif "audio_url" in media_item:
-                # URL-based audio
-                url = media_item["audio_url"].get("url", "")
+            if "audio_url" in media_item:
+                url = (media_item["audio_url"] or {}).get("url", "").strip()
+                if not url:
+                    return [
+                        Document(
+                            page_content="[Empty audio URL]",
+                            metadata={
+                                "status": "error",
+                                "filename": filename,
+                            },
+                        )
+                    ]
+                stored_ref = url
                 if url.startswith("data:audio"):
-                    # Extract base64 data
-                    audio_data = url.split(",", 1)[1]
-                    # TODO: Implement audio transcription
-                    # doc = await extract_text_from_audio(audio_data)
+                    stored_ref = url
 
-                    doc.metadata.update({
+                if reference_audio:
+                    namespace = (user_id, assistant_id, "reference_audio")
+                    await store.aput(
+                        namespace,
+                        key=assistant_id,
+                        value={"reference_audio_data": stored_ref},
+                    )
+
+                doc = Document(
+                    page_content=(
+                        "Reference audio from URL."
+                        if reference_audio
+                        else f"[Audio URL: {url}]"
+                    ),
+                    metadata={
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "created_at": datetime.now(tz=timezone.utc).isoformat(),
                         "processing_task_id": str(uuid4()),
                         "type": "audio",
                         "reference_audio": reference_audio,
-                        "filename": filename
-                    })
-                    if reference_audio:
-                        logger.warning(f"STORE REFERENCE AUDIO HERE: presuming upsert")
-                        namespace=(user_id, assistant_id, "reference_audio")
-                        metadata = doc.metadata
-                        page_content = doc.metadata.get("page_content", "")
-                        metadata.update({"page_content":page_content})
+                        "filename": filename,
+                        "vectorstore_acceptable": True,
+                        "adapter_acceptable": False,
+                        "analysis_acceptable": True,
+                    },
+                )
+                return [doc]
 
-                        await store.aput(namespace, key=assistant_id,value={"reference_audio_data": audio_data, "metadata": metadata})                   
-
-                docs = [doc]
-                return docs
-        
         # Handle video
         elif media_type == "video":
-            # TODO: Implement video processing
-            docs = [Document(
-                page_content="[Video processing not yet implemented]",
-                metadata={"type": "video", "status": "not_implemented"}
-            )]
+            if "video_url" in media_item:
+                vurl = (media_item["video_url"] or {}).get("url", "").strip()
+                return [
+                    Document(
+                        page_content=f"[Video URL: {vurl}]",
+                        metadata={
+                            "type": "video",
+                            "status": "not_implemented",
+                            "filename": filename,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "vectorstore_acceptable": False,
+                        },
+                    )
+                ]
+            docs = [
+                Document(
+                    page_content="[Video processing not yet implemented]",
+                    metadata={"type": "video", "status": "not_implemented"},
+                )
+            ]
             return docs
         
         else:
@@ -631,8 +745,12 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 
                 # Add media items
                 if item_type in ["image", "image_url", "audio", "video", "url"]:
-                    item["metadata"]['user_id'] = user_id
-                    item["metadata"]['assistant_id'] = assistant_id
+                    if "metadata" not in item or not isinstance(
+                        item.get("metadata"), dict
+                    ):
+                        item["metadata"] = {}
+                    item["metadata"]["user_id"] = user_id
+                    item["metadata"]["assistant_id"] = assistant_id
                     media_list.append(item)
                     # EACH ITEM NEEDS USER_ID AND ASSISTANT_ID FROM CONTEXT
                     # user_id

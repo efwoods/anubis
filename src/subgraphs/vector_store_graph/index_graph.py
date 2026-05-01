@@ -63,7 +63,6 @@ async def index_docs(
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
     logger.info(f"INDEXING DOCUMENTS")
-    breakpoint()
     
     updated_user_id, updated_assistant_id = await extract_user_id_assistant_id(config)
     
@@ -92,7 +91,7 @@ async def index_docs(
 
         logger.info(f"breakpoint after batch_index_documents_vectorstore")
 
-    return {"docs": "delete"}
+    return {"vectorstore_documents_to_be_indexed": "delete"}
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

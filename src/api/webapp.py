@@ -48,7 +48,7 @@ from langgraph.store.postgres import AsyncPostgresStore
 
 from langgraph.store.base import IndexConfig
 
-from typing import Optional
+from typing import Annotated, Optional
 from langgraph_sdk import get_client
 
 from src.anubis.graph import message_workflow, response_only_workflow
@@ -1191,58 +1191,534 @@ async def get_thread_messages(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
 
+
+ALLOWED_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+
+def normalize_declared_image_mime(ct: str) -> str:
+    ct = (ct or "").split(";")[0].strip().lower()
+    if ct == "image/jpg":
+        return "image/jpeg"
+    return ct
+
+
+def _sniff_media_category_from_bytes(chunk: bytes) -> Optional[str]:
+    """Infer image/audio/video/pdf from magic bytes when Content-Type is unhelpful."""
+    if not chunk:
+        return None
+    if chunk[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if chunk[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if chunk[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if chunk[:4] == b"RIFF" and len(chunk) >= 12 and chunk[8:12] == b"WEBP":
+        return "image/webp"
+    if chunk[:4] == b"%PDF":
+        return "application/pdf"
+    if chunk[:3] == b"ID3" or chunk[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if chunk[:4] == b"OggS":
+        return "audio/ogg"
+    if chunk[:4] == b"RIFF" and len(chunk) >= 12 and chunk[8:12] == b"WAVE":
+        return "audio/wav"
+    if chunk[:4] == b"\x1a\x45\xdf\xa3":
+        return "video/webm"
+    if len(chunk) >= 12 and chunk[4:8] == b"ftyp":
+        return "video/mp4"
+    return None
+
+
+def _gif_image_descriptor_count(data: bytes) -> int:
+    if len(data) < 13:
+        return 0
+    if data[:6] not in (b"GIF87a", b"GIF89a"):
+        return 0
+    packed = data[10]
+    i = 13
+    if packed & 0x80:
+        i += 3 * (1 << ((packed & 0x07) + 1))
+    count = 0
+    n = len(data)
+    while i < n:
+        tag = data[i]
+        if tag == 0x3B:
+            break
+        if tag == 0x21:
+            i += 1
+            if i >= n:
+                break
+            i += 1
+            while i < n:
+                bsize = data[i]
+                i += 1
+                if bsize == 0:
+                    break
+                i += bsize
+        elif tag == 0x2C:
+            count += 1
+            i += 1
+            if i + 8 > n:
+                break
+            i += 8
+            local = data[i - 1]
+            if local & 0x80:
+                i += 3 * (1 << ((local & 0x07) + 1))
+            if i >= n:
+                break
+            i += 1
+            while i < n:
+                bsize = data[i]
+                i += 1
+                if bsize == 0:
+                    break
+                i += bsize
+        else:
+            i += 1
+    return count
+
+
+def _gif_is_animated(data: bytes) -> bool:
+    return _gif_image_descriptor_count(data) > 1
+
+
+def _webp_is_animated(data: bytes) -> bool:
+    cap = min(len(data), 65536)
+    return b"ANMF" in data[:cap]
+
+
+def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
+    """Return normalized image MIME; raises HTTPException if not an allowed still image."""
+    mime = normalize_declared_image_mime(declared_mime)
+    sniff = _sniff_media_category_from_bytes(body[:512])
+    if mime in ("", "application/octet-stream"):
+        if sniff not in ALLOWED_IMAGE_MIMES:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not determine an allowed image type from the file or URL.",
+            )
+        mime = sniff
+    if mime not in ALLOWED_IMAGE_MIMES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Image type not allowed (got {mime!r}); "
+                "allowed: image/jpeg, image/png, image/gif (non-animated), image/webp."
+            ),
+        )
+    if sniff and normalize_declared_image_mime(sniff) != mime:
+        raise HTTPException(
+            status_code=400,
+            detail="Declared Content-Type does not match image file contents.",
+        )
+    if mime == "image/gif" and _gif_is_animated(body):
+        raise HTTPException(
+            status_code=400, detail="Animated GIF is not allowed; use a still frame."
+        )
+    if mime == "image/webp" and _webp_is_animated(body):
+        raise HTTPException(
+            status_code=400, detail="Animated WebP is not allowed; use a still image."
+        )
+    return mime
+
+
+async def validate_remote_image_url(url: str) -> str:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        header_ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        body = r.content[:8_000_000]
+    return validate_upload_image_bytes(header_ct, body)
+
+
+async def probe_remote_url_content_type(url: str) -> str:
+    """Best-effort Content-Type for a remote URL (HEAD, then ranged GET + sniff)."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        head_ct = ""
+        try:
+            head = await client.head(url)
+            head_ct = (head.headers.get("content-type") or "").split(";")[0].strip().lower()
+        except Exception:
+            pass
+        if head_ct and head_ct != "application/octet-stream":
+            return head_ct
+        resp = await client.get(url, headers={"Range": "bytes=0-511"})
+        resp.raise_for_status()
+        body_ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if body_ct and body_ct != "application/octet-stream":
+            return body_ct
+        sniffed = _sniff_media_category_from_bytes(resp.content[:512])
+        return sniffed or body_ct or "application/octet-stream"
+
+
+async def require_url_content_type_prefix(url: str, prefix: str, label: str) -> None:
+    ct = await probe_remote_url_content_type(url)
+    if not ct.startswith(prefix):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} URL must resolve to {prefix}* (got {ct!r}).",
+        )
+
+
+@app.get("/avatar_reference_image")
+async def get_avatar_reference_image(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return stored reference image data URI or image URL string for UI avatars."""
+    user_id = current_user["identities"][0]["user_id"]
+    store = app.state.store
+    namespace = (user_id, assistant_id, "reference_image")
+    item = await store.aget(namespace, assistant_id)
+    if item is None:
+        return JSONResponse({"reference_image_data": None})
+    if isinstance(item, dict):
+        value = item.get("value") or {}
+    else:
+        value = getattr(item, "value", None) or {}
+    return JSONResponse(
+        {"reference_image_data": value.get("reference_image_data")}
+    )
+
+
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
-    files: Optional[List[UploadFile]] = File(...),
-    url: Optional[str] = None,
-    assistant_id: str = None,
-    reference_audio: bool = False,
-    reference_image: bool = False,
-    proprietary_content: bool = False,
+    files: Annotated[Optional[List[UploadFile]], File()] = None,
+    url: Annotated[Optional[str], Form()] = None,
+    assistant_id: Annotated[Optional[str], Form()] = None,
+    reference_audio: Annotated[bool, Form()] = False,
+    reference_image: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
     logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
     """
-    Upload one or more media files for processing and indexing.
-    
-    - **files**: One or more files to process
-    - **user_id**: User identifier
-    - **assistant_id**: Assistant identifier
+    Upload media for processing and indexing.
+
+    Send **exactly one** of: a single file in ``files``, **or** a ``url`` (never both, never neither).
+
+    Images must use real MIME types: ``image/jpeg``, ``image/png``, ``image/gif`` (non-animated),
+    or ``image/webp`` (non-animated). Proprietary vs biographical classification is done inside
+    the processing pipeline via structured model output (no ``proprietary_content`` flag).
+
+    With **reference_image=true**, the file or URL must be an allowed still image.
+    With **reference_audio=true**, the file or URL must resolve to ``audio/*``.
     """
     try:
-
+        breakpoint()
         user_id = current_user["identities"][0]["user_id"]
+        if not assistant_id:
+            raise HTTPException(status_code=400, detail="assistant_id is required")
+
+        token = current_user["API_KEY"]
+        client = get_client(headers={"API-KEY": f"{token}"})
+        try:
+            assistant = await client.assistants.get(assistant_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Could not load assistant: {exc}"
+            ) from exc
+        assistant_meta = assistant.get("metadata") or {}
 
         config = {
             "configurable": {
                 "user_id": user_id,
                 "user_ctx": {"name": None, "description": None},
+                "assistant_id": assistant_id,
+                "assistant_ctx": {
+                    "name": assistant.get("name"),
+                    "description": assistant.get("description"),
+                    "assistant_id": assistant_id,
+                    "metadata": assistant_meta,
+                },
             }
         }
 
-        config["configurable"]["assistant_id"] = assistant_id
-        config["configurable"]["assistant_ctx"] = ({"name": None, "description": None},)
-        # Read all uploaded files
-        media_files = []
-        for file in files:
-            content = await file.read()
-            media_files.append(
-                {
-                    "filename": file.filename,
-                    "content_type": file.content_type,
-                    "content": content,
-                    "user_id": user_id,
-                    "assistant_id": assistant_id,
-                    "reference_audio": reference_audio,
-                    "reference_image": reference_image,
-                    "proprietary_content": proprietary_content,
-                }
+        upload_list = [f for f in (files or []) if f is not None]
+        non_empty_files = [
+            f for f in upload_list if (getattr(f, "filename", None) or "").strip()
+        ]
+        url_clean = (url or "").strip()
+
+        if url_clean and non_empty_files:
+            raise HTTPException(
+                status_code=400,
+                detail="Send either exactly one file or a url, not both.",
+            )
+        if not url_clean and not non_empty_files:
+            raise HTTPException(
+                status_code=400,
+                detail="Send exactly one file or a url.",
+            )
+        if not url_clean and len(non_empty_files) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Send exactly one file, or use the url field instead.",
             )
 
-        logger.info("breakpoint")
+        if reference_image and reference_audio:
+            raise HTTPException(
+                status_code=400,
+                detail="Use only one of reference_image or reference_audio.",
+            )
 
-        context = app.state.context
+        media_files: list = []
+
+        from urllib.parse import urlparse
+
+        def _slug(u: str) -> str:
+            path = urlparse(u).path or ""
+            return path.rsplit("/", 1)[-1] if path else "remote_media"
+
+        if non_empty_files:
+            uf = non_empty_files[0]
+            content = await uf.read()
+            raw_name = uf.filename or "upload"
+            declared = (uf.content_type or "application/octet-stream").split(";")[
+                0
+            ].strip().lower()
+
+            if reference_image:
+                if declared.startswith("audio/"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reference_image requires an image file, not audio.",
+                    )
+                mime = validate_upload_image_bytes(declared, content)
+                media_files.append(
+                    {
+                        "filename": raw_name,
+                        "content_type": mime,
+                        "content": content,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "reference_audio": False,
+                        "reference_image": True,
+                    }
+                )
+            elif reference_audio:
+                if declared.startswith("image/"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reference_audio requires an audio file, not an image.",
+                    )
+                sniff = _sniff_media_category_from_bytes(content[:512])
+                effective = declared
+                if declared == "application/octet-stream":
+                    if not sniff or not sniff.startswith("audio/"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Could not determine an audio type from the upload.",
+                        )
+                    effective = sniff
+                elif not declared.startswith("audio/"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reference_audio requires an audio Content-Type.",
+                    )
+                media_files.append(
+                    {
+                        "filename": raw_name,
+                        "content_type": effective,
+                        "content": content,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "reference_audio": True,
+                        "reference_image": False,
+                    }
+                )
+            else:
+                sniff = _sniff_media_category_from_bytes(content[:512])
+                if declared.startswith("image/") or (
+                    declared == "application/octet-stream"
+                    and sniff in ALLOWED_IMAGE_MIMES
+                ):
+                    mime = validate_upload_image_bytes(declared, content)
+                    media_files.append(
+                        {
+                            "filename": raw_name,
+                            "content_type": mime,
+                            "content": content,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif declared.startswith("audio/") or (
+                    declared == "application/octet-stream"
+                    and sniff
+                    and sniff.startswith("audio/")
+                ):
+                    effective = (
+                        declared
+                        if declared.startswith("audio/")
+                        else (sniff or declared)
+                    )
+                    if not effective.startswith("audio/"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Expected an audio upload.",
+                        )
+                    media_files.append(
+                        {
+                            "filename": raw_name,
+                            "content_type": effective,
+                            "content": content,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif declared.startswith("video/"):
+                    media_files.append(
+                        {
+                            "filename": raw_name,
+                            "content_type": declared,
+                            "content": content,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif declared == "application/pdf":
+                    media_files.append(
+                        {
+                            "filename": raw_name,
+                            "content_type": declared,
+                            "content": content,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif declared in (
+                    "text/plain",
+                    "application/json",
+                    "text/markdown",
+                    "application/octet-stream",
+                ) or declared.startswith("text/"):
+                    media_files.append(
+                        {
+                            "filename": raw_name,
+                            "content_type": declared,
+                            "content": content,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported upload Content-Type {declared!r}.",
+                    )
+
+        elif url_clean:
+            slug = _slug(url_clean)
+
+            if reference_image:
+                img_mime = await validate_remote_image_url(url_clean)
+                media_files.append(
+                    {
+                        "filename": slug or "reference_image_from_url",
+                        "content_type": img_mime,
+                        "content": b"",
+                        "image_url": url_clean,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "reference_audio": False,
+                        "reference_image": True,
+                    }
+                )
+            elif reference_audio:
+                await require_url_content_type_prefix(
+                    url_clean, "audio/", "Reference audio"
+                )
+                audio_mime = await probe_remote_url_content_type(url_clean)
+                media_files.append(
+                    {
+                        "filename": slug or "reference_audio_from_url",
+                        "content_type": audio_mime,
+                        "content": b"",
+                        "audio_url": url_clean,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "reference_audio": True,
+                        "reference_image": False,
+                    }
+                )
+            else:
+                ct = await probe_remote_url_content_type(url_clean)
+                if ct.startswith("image/"):
+                    img_mime = await validate_remote_image_url(url_clean)
+                    media_files.append(
+                        {
+                            "filename": slug or "remote_image",
+                            "content_type": img_mime,
+                            "content": b"",
+                            "image_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif ct.startswith("audio/"):
+                    media_files.append(
+                        {
+                            "filename": slug or "remote_audio",
+                            "content_type": ct,
+                            "content": b"",
+                            "audio_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif ct.startswith("video/"):
+                    media_files.append(
+                        {
+                            "filename": slug or "remote_video",
+                            "content_type": ct,
+                            "content": b"",
+                            "video_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                elif ct.startswith("text/") or ct in (
+                    "application/json",
+                    "application/xml",
+                    "application/xhtml+xml",
+                    "application/javascript",
+                    "application/ld+json",
+                ):
+                    media_files.append(
+                        {
+                            "filename": slug or "remote_document",
+                            "content_type": ct,
+                            "content": b"",
+                            "page_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                        }
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Could not map URL to a supported media type (Content-Type: {ct!r}).",
+                    )
+
         store = app.state.store
 
         # Import graph here to avoid circular imports
@@ -1258,35 +1734,23 @@ async def update_avatar_identity_with_media(
             "media_files": media_files,
         }
 
-        logger.info(f"breakpoint before process_media_graph")
-        result = await process_media_graph_api_endpoint.ainvoke(
+        await process_media_graph_api_endpoint.ainvoke(
             initial_state,
             config=config,
         )
 
-        # Extract indexed documents info
-        indexed_docs = result.get("vectorstore_documents_to_be_indexed", [])
-        if len(indexed_docs) == 0:
-            return HTTPException(
-                status_code=500,
-                detail={
-                    "files_processed": len(files),
-                    "documents_indexed": len(indexed_docs),
-                    "filenames": [f.filename for f in files],
-                    "message": "Error processing and indexing media",
-                },
-            )
-        else:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "files_processed": len(files),
-                    "documents_indexed": len(indexed_docs),
-                    "filenames": [f.filename for f in files],
-                    "message": "Media processed and indexed successfully",
-                },
-            )
+        # Indexing clears vectorstore_documents_to_be_indexed in final state; rely on exceptions for failures.
+        return JSONResponse(
+            status_code=200,
+            content={
+                "items_processed": len(media_files),
+                "filenames": [m.get("filename") for m in media_files],
+                "message": "Media processed and indexed successfully",
+            },
+        )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
 

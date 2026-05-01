@@ -1,6 +1,6 @@
-
 import logging
 from time import time_ns
+from typing import Optional
 
 from src.anubis.utils.prompts.system_prompts import (
     MULTI_IMAGE_PROMPT,

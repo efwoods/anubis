@@ -1395,7 +1395,8 @@ async def get_avatar_reference_image(
     return JSONResponse(
         {"reference_image_data": value.get("reference_image_data")}
     )
-
+    
+from typing import Optional
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: Annotated[Optional[List[UploadFile]], File()] = None,
@@ -1421,7 +1422,6 @@ async def update_avatar_identity_with_media(
     With **reference_audio=true**, the file or URL must resolve to ``audio/*``.
     """
     try:
-        breakpoint()
         user_id = current_user["identities"][0]["user_id"]
         if not assistant_id:
             raise HTTPException(status_code=400, detail="assistant_id is required")
@@ -1815,6 +1815,8 @@ async def update_avatar_identity_with_media(
 
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
 
@@ -1822,7 +1824,7 @@ async def update_avatar_identity_with_media(
 @app.get("/list_avatar_documents")
 async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
     token = current_user["API_KEY"]
-    langgraph_sdk_client = get_client(headers={"Authorization": f"{token}"})
+    langgraph_sdk_client = get_client(headers={"API-KEY": f"{token}"})
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]
@@ -1856,7 +1858,7 @@ async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
     token = current_user["API_KEY"]
-    langgraph_sdk_client = get_client(headers={"Authorization": f"{token}"})
+    langgraph_sdk_client = get_client(headers={"API-KEY": f"{token}"})
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]

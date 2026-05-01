@@ -1,9 +1,9 @@
 # Nodes for Identifying and Handling each media type 
 
-from typing import Dict
 from datetime import datetime, timezone
+from typing import Any, Dict
+
 from langchain_core.documents import Document
-from typing import Dict, Any
 from uuid import uuid4
 import logging
 logger = logging.getLogger(__name__)
@@ -57,6 +57,30 @@ _ALLOWED_STILL_IMAGE_MIMES = frozenset(
 def _normalize_declared_image_mime(ct: str) -> str:
     m = (ct or "").split(";")[0].strip().lower()
     return "image/jpeg" if m == "image/jpg" else m
+
+
+def _full_data_uri_from_media_dict(media: Dict[str, Any]) -> str:
+    """Full ``data:<mime>;base64,...`` string from webapp ``base64_encoded_str``."""
+    return (media.get("base64_encoded_str") or "").strip()
+
+
+def _decode_data_uri_base64_payload(data_uri: str) -> bytes:
+    """Decode the base64 segment of an RFC 2397 data URI."""
+    if not data_uri.startswith("data:") or "," not in data_uri:
+        raise ValueError("Expected a data URI with a base64 payload")
+    return base64.b64decode(data_uri.split(",", 1)[1])
+
+
+def _is_full_image_data_uri(value: str) -> bool:
+    """True if ``value`` is a complete ``data:image/...;base64,...`` string."""
+    normalized = (value or "").strip()
+    return normalized.startswith("data:image/") and ";base64," in normalized
+
+
+def _is_full_audio_data_uri(value: str) -> bool:
+    """True if ``value`` is a complete ``data:audio/...;base64,...`` string."""
+    normalized = (value or "").strip()
+    return normalized.startswith("data:audio/") and ";base64," in normalized
 
 
 def _write_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
@@ -115,6 +139,8 @@ async def process_uploaded_files_and_label_media_type(
             
             logger.info(f"Processing file: {filename} ({content_type})")
 
+            full_payload_uri = _full_data_uri_from_media_dict(file_data)
+
             image_url_remote = (file_data.get("image_url") or "").strip()
             if image_url_remote:
                 mime = _normalize_declared_image_mime(content_type)
@@ -123,7 +149,7 @@ async def process_uploaded_files_and_label_media_type(
                         "Skipping remote image with disallowed MIME %s", mime
                     )
                     continue
-                media_list.append({
+                entry: Dict[str, Any] = {
                     "type": "image_url",
                     "image_url": {"url": image_url_remote},
                     "metadata": {
@@ -134,7 +160,10 @@ async def process_uploaded_files_and_label_media_type(
                         "assistant_id": assistant_id,
                         "reference_image": reference_image,
                     },
-                })
+                }
+                if full_payload_uri:
+                    entry["base64_encoded_str"] = full_payload_uri
+                media_list.append(entry)
                 continue
 
             audio_url_remote = (file_data.get("audio_url") or "").strip()
@@ -145,7 +174,7 @@ async def process_uploaded_files_and_label_media_type(
                         "Skipping remote audio with non-audio MIME %s", mime
                     )
                     continue
-                media_list.append({
+                entry = {
                     "type": "audio",
                     "audio_url": {"url": audio_url_remote},
                     "metadata": {
@@ -156,7 +185,10 @@ async def process_uploaded_files_and_label_media_type(
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
                     },
-                })
+                }
+                if full_payload_uri:
+                    entry["base64_encoded_str"] = full_payload_uri
+                media_list.append(entry)
                 continue
 
             video_url_remote = (file_data.get("video_url") or "").strip()
@@ -167,7 +199,7 @@ async def process_uploaded_files_and_label_media_type(
                         "Skipping remote video with non-video MIME %s", mime
                     )
                     continue
-                media_list.append({
+                entry = {
                     "type": "video",
                     "video_url": {"url": video_url_remote},
                     "metadata": {
@@ -177,13 +209,16 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                     },
-                })
+                }
+                if full_payload_uri:
+                    entry["base64_encoded_str"] = full_payload_uri
+                media_list.append(entry)
                 continue
 
             page_url_remote = (file_data.get("page_url") or "").strip()
             if page_url_remote:
                 mime = content_type.split(";")[0].strip().lower()
-                media_list.append({
+                entry = {
                     "type": "url",
                     "url": page_url_remote,
                     "metadata": {
@@ -193,7 +228,10 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                     },
-                })
+                }
+                if full_payload_uri:
+                    entry["base64_encoded_str"] = full_payload_uri
+                media_list.append(entry)
                 continue
             
             # Determine media type and convert to standardized format
@@ -202,16 +240,25 @@ async def process_uploaded_files_and_label_media_type(
                 if mime not in _ALLOWED_STILL_IMAGE_MIMES:
                     logger.warning("Skipping image with disallowed MIME %s", mime)
                     continue
-                # Full data URI string for storage and vision APIs (langgraph index uses document.kwargs.page_content)
-                base64_data = base64.b64encode(file_bytes).decode('utf-8')
-                image_data_uri = f"data:{mime};base64,{base64_data}"
+                payload_uri = full_payload_uri
+                if not payload_uri:
+                    if not file_bytes:
+                        logger.warning(
+                            "Skipping image %s: no base64_encoded_str or bytes",
+                            filename,
+                        )
+                        continue
+                    payload_uri = (
+                        f"data:{mime};base64,"
+                        f"{base64.b64encode(file_bytes).decode('ascii')}"
+                    )
                 media_list.append({
                     "type": "image",
-                    "data": image_data_uri,
+                    "base64_encoded_str": payload_uri,
                     "metadata": {
                         "filename": filename,
                         "content_type": mime,
-                        "size": len(file_bytes),
+                        "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_image": reference_image,
@@ -219,15 +266,26 @@ async def process_uploaded_files_and_label_media_type(
                 })
             
             elif content_type.startswith('audio/'):
-                # Handle audio files
-                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                mime = content_type.split(";")[0].strip().lower()
+                payload_uri = full_payload_uri
+                if not payload_uri:
+                    if not file_bytes:
+                        logger.warning(
+                            "Skipping audio %s: no base64_encoded_str or bytes",
+                            filename,
+                        )
+                        continue
+                    payload_uri = (
+                        f"data:{mime};base64,"
+                        f"{base64.b64encode(file_bytes).decode('ascii')}"
+                    )
                 media_list.append({
                     "type": "audio",
-                    "data": base64_data,
+                    "base64_encoded_str": payload_uri,
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes),
+                        "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "assistant_id": assistant_id, 
                         "reference_audio": reference_audio                    
@@ -235,15 +293,26 @@ async def process_uploaded_files_and_label_media_type(
                 })
             
             elif content_type.startswith('video/'):
-                # Handle video files
-                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                mime = content_type.split(";")[0].strip().lower()
+                payload_uri = full_payload_uri
+                if not payload_uri:
+                    if not file_bytes:
+                        logger.warning(
+                            "Skipping video %s: no base64_encoded_str or bytes",
+                            filename,
+                        )
+                        continue
+                    payload_uri = (
+                        f"data:{mime};base64,"
+                        f"{base64.b64encode(file_bytes).decode('ascii')}"
+                    )
                 media_list.append({
                     "type": "video",
-                    "data": base64_data,
+                    "base64_encoded_str": payload_uri,
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes),
+                        "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                     }
@@ -255,59 +324,81 @@ async def process_uploaded_files_and_label_media_type(
             'text/markdown', 
             'application/octet-stream'
             ]:
-                # Handle text files
+                # Handle text files — prefer webapp base64_encoded_str (full data URI)
                 if suffix == '.txt':
-                    text_content = file_bytes.decode('utf-8')
+                    if full_payload_uri:
+                        text_content = _decode_data_uri_base64_payload(
+                            full_payload_uri
+                        ).decode("utf-8", errors="replace")
+                    else:
+                        text_content = file_bytes.decode('utf-8')
                     media_list.append({
                         "type": "text",
                         "content": text_content,
                         "metadata": {
                             "filename": filename,
                             "content_type": content_type,
-                            "size": len(file_bytes),
+                            "size": len(file_bytes or b""),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                         }
                     })
                 elif suffix == '.json' or suffix == '.jsonl':
-                    import json
-                    text_content = json.loads(file_bytes.decode('utf-8'))
+                    if full_payload_uri:
+                        raw = _decode_data_uri_base64_payload(
+                            full_payload_uri
+                        ).decode("utf-8")
+                        text_content = json.loads(raw)
+                    else:
+                        text_content = json.loads(file_bytes.decode('utf-8'))
                     media_list.append({
                         "type": "json",
                         "content": text_content,
                         "metadata": {
                             "filename": filename,
                             "content_type": content_type,
-                            "size": len(file_bytes),
+                            "size": len(file_bytes or b""),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                         }
                     })
                 else: # handle markdown
-                    text_content = file_bytes
+                    if full_payload_uri:
+                        text_content = _decode_data_uri_base64_payload(
+                            full_payload_uri
+                        )
+                    else:
+                        text_content = file_bytes
                     media_list.append({
                         "type": "text",
                         "content": text_content,
                         "metadata": {
                             "filename": filename,
                             "content_type": content_type,
-                            "size": len(file_bytes),
+                            "size": len(file_bytes or b""),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                         }
                     })
             
             elif content_type == 'application/pdf':
-                # Handle PDFs
-                base64_data = base64.b64encode(file_bytes).decode('utf-8')
+                if full_payload_uri:
+                    pdf_bytes = _decode_data_uri_base64_payload(full_payload_uri)
+                elif file_bytes:
+                    pdf_bytes = file_bytes
+                else:
+                    logger.warning(
+                        "Skipping PDF %s: no base64_encoded_str or bytes", filename
+                    )
+                    continue
                 media_list.append({
                     "type": "pdf",
-                    "data": base64_data,
-                    "bytes":file_bytes,
+                    "base64_encoded_str": full_payload_uri or "",
+                    "bytes": pdf_bytes,
                     "metadata": {
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(file_bytes),
+                        "size": len(pdf_bytes),
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                     }
@@ -336,8 +427,9 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     Exptected format:
     [
         {
-            "type": "MEDIA_TYPE", 
-            "data|text|indicator": "CONTENT OF MEDIA", 
+            "type": "MEDIA_TYPE",
+            "base64_encoded_str": "full data URI for binary media (when applicable)",
+            "content": "text / structured content for text and json types",
             "metadata":{
                 fields may include mime-type or the metadata may not exists at all
                 }
@@ -363,22 +455,41 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     logger.info(f"Processing {len(media_list)} media items")
 
     # Create tasks for parallel processing
-    all_documents = []
+    all_documents: list = []
+    processing_errors: list[str] = []
     for media_item in media_list:
         docs = await process_media_item_task(media_item, runtime, config, store)
-        
+
         for doc in docs:
             status = doc.metadata.get("status", "")
             if status == "error":
                 error = doc.metadata.get("error", "")
                 filename = doc.metadata.get("filename", "")
-                logger.warning(f"Error processing media: {filename} {error}")
+                processing_errors.append(f"{filename}: {error or 'unknown'}")
+                logger.warning(
+                    "Error processing media: %s %s", filename, error
+                )
             else:
                 all_documents.append(doc)
 
+    if processing_errors:
+        raise RuntimeError(
+            "Media processing failed: " + "; ".join(processing_errors)
+        )
+
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
-    vector_store_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("vectorstore_acceptable", False) == True]
+    vector_store_document_list_formatted = [
+        doc
+        for doc in all_documents
+        if doc.metadata.get("vectorstore_acceptable", False) is True
+    ]
+
+    if not vector_store_document_list_formatted:
+        raise RuntimeError(
+            "No vector-store documents were produced from the uploaded media "
+            "(nothing indexable after processing or classification)."
+        )
 
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
@@ -425,45 +536,59 @@ async def process_media_item_task(
         if media_type in ("image", "image_url"):
             reference_image = metadata.get("reference_image", False)
 
-            vision_source: str = ""
-            stored_reference_string: str = ""
+            full_uri = _full_data_uri_from_media_dict(media_item)
 
-            if media_type == "image_url":
-                url = (media_item.get("image_url") or {}).get("url", "").strip()
-                if not url:
+            if reference_image:
+                if not _is_full_image_data_uri(full_uri):
                     return [
                         Document(
-                            page_content="[Empty image URL]",
+                            page_content=(
+                                "[Reference image requires media_item.base64_encoded_str "
+                                "as the full data:image/...;base64,... string from upstream]"
+                            ),
                             metadata={
                                 "status": "error",
-                                "error": "empty_url",
+                                "error": "missing_reference_image_data_uri",
                                 "filename": filename,
                             },
                         )
                     ]
-                vision_source = url
-                stored_reference_string = url
-            elif "data" in media_item:
-                vision_source = media_item["data"]
-                stored_reference_string = vision_source
-            elif "image_url" in media_item:
-                url = (media_item.get("image_url") or {}).get("url", "").strip()
-                vision_source = url
-                stored_reference_string = url
+                image_source = full_uri
             else:
-                return [
-                    Document(
-                        page_content="[Unsupported image payload]",
-                        metadata={
-                            "status": "error",
-                            "error": "missing_image_data",
-                            "filename": filename,
-                        },
-                    )
-                ]
+                image_source = ""
+                if full_uri:
+                    image_source = full_uri
+                elif media_type == "image_url":
+                    url = (media_item.get("image_url") or {}).get("url", "").strip()
+                    if not url:
+                        return [
+                            Document(
+                                page_content="[Empty image URL]",
+                                metadata={
+                                    "status": "error",
+                                    "error": "empty_url",
+                                    "filename": filename,
+                                },
+                            )
+                        ]
+                    image_source = url
+                elif "image_url" in media_item:
+                    url = (media_item.get("image_url") or {}).get("url", "").strip()
+                    image_source = url
+                else:
+                    return [
+                        Document(
+                            page_content="[Unsupported image payload]",
+                            metadata={
+                                "status": "error",
+                                "error": "missing_image_data",
+                                "filename": filename,
+                            },
+                        )
+                    ]
 
             doc = await extract_personality_from_image(
-                image_data=vision_source,
+                image_data=image_source,
                 filename=filename,
                 store=store,
                 user_id=user_id,
@@ -487,12 +612,12 @@ async def process_media_item_task(
             if reference_image:
                 namespace = (user_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
-                
+
                 await store.aput(
                     namespace,
                     key=assistant_id,
                     value={
-                        "reference_image_data": stored_reference_string,
+                        "reference_image_data": full_uri,
                         "document": doc_json,
                     },
                 )
@@ -541,8 +666,24 @@ async def process_media_item_task(
             return docs
         
         elif media_type == "pdf": # Presumes written in first person from the target source
+            pdf_bytes = media_item.get("bytes")
+            if not pdf_bytes:
+                pdf_uri = _full_data_uri_from_media_dict(media_item)
+                if pdf_uri:
+                    pdf_bytes = _decode_data_uri_base64_payload(pdf_uri)
+            if not pdf_bytes:
+                return [
+                    Document(
+                        page_content="[PDF bytes missing]",
+                        metadata={
+                            "status": "error",
+                            "error": "missing_pdf_bytes",
+                            "filename": filename,
+                        },
+                    )
+                ]
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
-                tmp_file.write(media_item["bytes"])
+                tmp_file.write(pdf_bytes)
                 tmp_path = tmp_file.name
             loader = PyPDFLoader(tmp_path)
             docs = loader.load()
@@ -580,8 +721,24 @@ async def process_media_item_task(
             otherwise convert to text
             """
             reference_audio = metadata.get("reference_audio", False)
-            if "data" in media_item:
-                audio_data = media_item["data"]
+            audio_payload_uri = _full_data_uri_from_media_dict(media_item)
+            if audio_payload_uri:
+                if reference_audio and not _is_full_audio_data_uri(audio_payload_uri):
+                    return [
+                        Document(
+                            page_content=(
+                                "[Reference audio requires media_item.base64_encoded_str "
+                                "as the full data:audio/...;base64,... string from upstream]"
+                            ),
+                            metadata={
+                                "status": "error",
+                                "error": "invalid_reference_audio_data_uri",
+                                "filename": filename,
+                            },
+                        )
+                    ]
+
+                audio_data = audio_payload_uri
 
                 if reference_audio:
                     namespace = (user_id, assistant_id, "reference_audio")
@@ -615,11 +772,22 @@ async def process_media_item_task(
                             },
                         )
                     ]
-                stored_ref = url
-                if url.startswith("data:audio"):
-                    stored_ref = url
-
                 if reference_audio:
+                    if not _is_full_audio_data_uri(audio_payload_uri):
+                        return [
+                            Document(
+                                page_content=(
+                                    "[Reference audio requires media_item.base64_encoded_str "
+                                    "as the full data:audio/...;base64,... string from upstream]"
+                                ),
+                                metadata={
+                                    "status": "error",
+                                    "error": "missing_reference_audio_data_uri",
+                                    "filename": filename,
+                                },
+                            )
+                        ]
+                    stored_ref = audio_payload_uri
                     namespace = (user_id, assistant_id, "reference_audio")
                     await store.aput(
                         namespace,
@@ -665,6 +833,21 @@ async def process_media_item_task(
                         },
                     )
                 ]
+            inline_uri = _full_data_uri_from_media_dict(media_item)
+            if inline_uri:
+                return [
+                    Document(
+                        page_content="[Video processing not yet implemented]",
+                        metadata={
+                            "type": "video",
+                            "status": "not_implemented",
+                            "filename": filename,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "vectorstore_acceptable": False,
+                        },
+                    )
+                ]
             docs = [
                 Document(
                     page_content="[Video processing not yet implemented]",
@@ -689,7 +872,6 @@ async def process_media_item_task(
             metadata={"type": media_type, "status": "error", "error": str(e)}
         )]
         return documents
-    return await tool.ainvoke(media_item["content"])
 
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
@@ -746,13 +928,19 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 
                 # Add media items
                 if item_type in ["image", "image_url", "audio", "video", "url"]:
-                    if "metadata" not in item or not isinstance(
-                        item.get("metadata"), dict
+                    normalized = dict(item)
+                    legacy_payload = normalized.pop("data", None)
+                    if legacy_payload is not None and not (
+                        normalized.get("base64_encoded_str") or ""
+                    ).strip():
+                        normalized["base64_encoded_str"] = legacy_payload
+                    if "metadata" not in normalized or not isinstance(
+                        normalized.get("metadata"), dict
                     ):
-                        item["metadata"] = {}
-                    item["metadata"]["user_id"] = user_id
-                    item["metadata"]["assistant_id"] = assistant_id
-                    media_list.append(item)
+                        normalized["metadata"] = {}
+                    normalized["metadata"]["user_id"] = user_id
+                    normalized["metadata"]["assistant_id"] = assistant_id
+                    media_list.append(normalized)
                     # EACH ITEM NEEDS USER_ID AND ASSISTANT_ID FROM CONTEXT
                     # user_id
                     # assistant_id

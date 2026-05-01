@@ -63,7 +63,7 @@ async def index_docs(
         config (Optional[RunnableConfig]): Configuration for the indexing process.r
     """
     logger.info(f"INDEXING DOCUMENTS")
-    
+
     updated_user_id, updated_assistant_id = await extract_user_id_assistant_id(config)
     
     user_id = updated_user_id['user_id']

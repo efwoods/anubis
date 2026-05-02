@@ -1405,13 +1405,31 @@ def make_data_uri(mime: str, body: bytes) -> str:
 
 @app.get("/avatar_reference_image")
 async def get_avatar_reference_image(
+    request: Request,
     assistant_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
-    """Return stored reference image data URI or image URL string for UI avatars."""
-    user_id = current_user["identities"][0]["user_id"]
+    """Return stored reference image data URI or image URL string for UI avatars.
+
+    Lookup uses the assistant owner's store namespace so anonymous chatters see the
+    same portrait as ``load_consciousness`` (creator_id, assistant_id, reference_image).
+    """
     store = app.state.store
-    namespace = (user_id, assistant_id, "reference_image")
+    if request.headers.get("api-key") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
+    else:
+        langgraph_client_headers = {"API-KEY": app.state.context.anonymous_api_key}
+    try:
+        langgraph_client = get_client(headers=langgraph_client_headers)
+        assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not load assistant: {exc}"
+        ) from exc
+    creator_id = (assistant.get("metadata") or {}).get("user_id")
+    if not creator_id:
+        return JSONResponse({"reference_image_data": None})
+    namespace = (creator_id, assistant_id, "reference_image")
     item = await store.aget(namespace, assistant_id)
     if item is None:
         return JSONResponse({"reference_image_data": None})

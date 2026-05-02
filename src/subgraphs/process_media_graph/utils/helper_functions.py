@@ -85,8 +85,6 @@ async def process_text_to_document(
     """
     logger.info(f"Handling text in process media")
 
-    proprietary_content = metadata.get("proprietary_content", False)
-
     proprietary_content_classification_model = init_model(
         model_without_tools=False,
         response_format=ReferenceDocumentOrBiographicalConversationalInformation,

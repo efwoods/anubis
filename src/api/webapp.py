@@ -282,6 +282,15 @@ async def get_public_avatars(
             return [assistant_query.to_assistant() for assistant_query in data]
 
 
+def _assistant_without_metadata_if_public(assistant: dict[str, Any]) -> dict[str, Any]:
+    meta = assistant.get("metadata")
+    if isinstance(meta, dict):
+        pub = meta.get("is_public")
+        if pub is True or (isinstance(pub, str) and pub.lower() == "true"):
+            return {k: v for k, v in assistant.items() if k != "metadata"}
+    return assistant
+
+
 import debugpy
 
 if os.getenv("DEBUG", "false").lower() == "true":
@@ -645,7 +654,9 @@ async def list_user_avatars(
     logger.info("breakpoint")
     if not current_user:
         public_avatars_result = await get_public_avatars()
-        return public_avatars_result
+        return [
+            _assistant_without_metadata_if_public(a) for a in public_avatars_result
+        ]
     try:
         public_avatars_result = await get_public_avatars(
             user_id=current_user["identities"][0]["user_id"]
@@ -658,7 +669,10 @@ async def list_user_avatars(
         if len(response) > 0:
             avatar_list = response
             public_avatars_result.extend(avatar_list)  # public and private avatars
-        return JSONResponse(public_avatars_result, status_code=200)
+        sanitized = [
+            _assistant_without_metadata_if_public(a) for a in public_avatars_result
+        ]
+        return JSONResponse(sanitized, status_code=200)
     except Exception as e:
         error = f"Error in listing avatars: {e}"
         raise HTTPException(detail=error, status_code=500)

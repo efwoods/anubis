@@ -821,19 +821,24 @@ async def select_avatar(
             )
 
 
-async def process_files_for_message(files: Optional[List[UploadFile]] = None) -> tuple:
+async def process_files_for_message(
+    files: Optional[List[UploadFile]] = None,
+    message: str = "",
+) -> tuple:
     """Process uploaded files and return content for inclusion in messages.
 
     Returns:
-        tuple: (text_content, multimodal_content)
-        - text_content: str - concatenated text from text files
-        - multimodal_content: list or None - multimodal content for vision models
+        tuple: (text_content, multimodal_content, image_filenames)
+        - text_content: str - concatenated text from text files (non-image)
+        - multimodal_content: list or None - multimodal content (text + image blocks)
+        - image_filenames: filenames for each image block, in order
     """
     if not files:
-        return "", None
+        return "", None, []
 
     text_contents = []
     multimodal_parts = []
+    image_filenames: List[str] = []
     has_images = False
 
     for file in files:
@@ -850,6 +855,7 @@ async def process_files_for_message(files: Optional[List[UploadFile]] = None) ->
                 multimodal_parts.append(
                     {"type": "image_url", "image_url": {"url": image_url}}
                 )
+                image_filenames.append(filename)
                 has_images = True
                 text_contents.append(f"[Image: {filename}]")
 
@@ -908,26 +914,27 @@ async def process_files_for_message(files: Optional[List[UploadFile]] = None) ->
             logger.error(f"Error processing file {file.filename}: {e}")
             text_contents.append(f"[Error processing file: {file.filename}]")
 
-    # Combine text content
+    # Combine text content (file-derived only; caller message is merged below for images)
     combined_text = "\n\n".join(text_contents) if text_contents else ""
 
     # Return multimodal content if images are present
     if has_images:
-        # Create multimodal content with text and images
-        multimodal_content = [
-            {"type": "text", "text": combined_text}
-        ] + multimodal_parts
-        return combined_text, multimodal_content
+        text_segments = []
+        if (message or "").strip():
+            text_segments.append(message.strip())
+        if combined_text:
+            text_segments.append(combined_text)
+        full_text = "\n\n".join(text_segments)
+        multimodal_content = [{"type": "text", "text": full_text}] + multimodal_parts
+        return combined_text, multimodal_content, image_filenames
 
-    return combined_text, None
+    return combined_text, None, []
 
 
 @app.post("/message")
 async def message_selected_avatar(
     request: Request,
-    message: str = Form(
-        "Hey! Please tell me about yourself and what you can do for me."
-    ),
+    message: str = Form(""),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
@@ -936,8 +943,6 @@ async def message_selected_avatar(
     current_user: dict = Depends(get_current_user),
 ):
 
-    logger.info("breakpoint update")
-    breakpoint()
     langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
@@ -984,27 +989,33 @@ async def message_selected_avatar(
     graph = app.state.graph
 
     # Process any uploaded files
-    file_text_content, multimodal_content = await process_files_for_message(files)
+    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
+        files, message=message
+    )
 
     # Create the human message content
     if multimodal_content:
-        # Use multimodal content for vision models
-        human_message = HumanMessage(content=multimodal_content)
+        human_message = HumanMessage(
+            id=str(uuid4()),
+            content=multimodal_content,
+            additional_kwargs={"image_filenames": image_filenames},
+        )
     else:
         # Use text-only content
         if file_text_content:
-            human_message_content = message + "\n\n" + file_text_content
+            if (message or "").strip():
+                human_message_content = message.strip() + "\n\n" + file_text_content
+            else:
+                human_message_content = file_text_content
         else:
             human_message_content = message
-        human_message = HumanMessage(content=human_message_content)
+        human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
 
     result = await graph.ainvoke(
         input={"messages": [human_message]},
         config=config,
         context=app.state.context,
     )
-
-    logger.info(f"{result}")
 
     # Update most_recent_message
     langgraph_client = get_client(headers=langgraph_client_headers)
@@ -1036,9 +1047,7 @@ async def message_selected_avatar(
 async def message_avatar(
     request: Request,
     assistant_id: str,
-    message: str = Form(
-        "Hey! Please tell me about yourself and what you can do for me."
-    ),
+    message: str = Form(""),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
@@ -1047,8 +1056,6 @@ async def message_avatar(
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
 
-    logger.info("breakpoint")
-    breakpoint()
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1116,27 +1123,33 @@ async def message_avatar(
     graph = app.state.graph
 
     # Process any uploaded files
-    file_text_content, multimodal_content = await process_files_for_message(files)
+    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
+        files, message=message
+    )
 
     # Create the human message content
     if multimodal_content:
-        # Use multimodal content for vision models
-        human_message = HumanMessage(content=multimodal_content)
+        human_message = HumanMessage(
+            id=str(uuid4()),
+            content=multimodal_content,
+            additional_kwargs={"image_filenames": image_filenames},
+        )
     else:
         # Use text-only content
         if file_text_content:
-            human_message_content = message + "\n\n" + file_text_content
+            if (message or "").strip():
+                human_message_content = message.strip() + "\n\n" + file_text_content
+            else:
+                human_message_content = file_text_content
         else:
             human_message_content = message
-        human_message = HumanMessage(content=human_message_content)
+        human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
 
     result = await graph.ainvoke(
         input={"messages": [human_message]},
         config=config,
         context=app.state.context,
     )
-
-    logger.info(f"{result}")
 
     # Update most_recent_message
     if conversation_title != "":

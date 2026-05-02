@@ -57,7 +57,7 @@ from langgraph.prebuilt import ToolNode
 
 from pydantic import Field
 
-from src.anubis.utils.nodes import load_consciousness
+from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
 
 
 from src.anubis.utils.utility import (
@@ -350,10 +350,14 @@ response_only_workflow = StateGraph(
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
 response_only_workflow.add_node("chat", message_interface)
+response_only_workflow.add_node(
+    "resolve_human_message_images", resolve_human_message_images
+)
 response_only_workflow.add_node("anubis", response_graph)
 
 response_only_workflow.add_edge(START, "chat")
-response_only_workflow.add_edge("chat", "anubis")
+response_only_workflow.add_edge("chat", "resolve_human_message_images")
+response_only_workflow.add_edge("resolve_human_message_images", "anubis")
 response_only_workflow.add_edge("anubis", END)
 
 """ END OF REPSONSE ONLY FOR API ENDPOINT """
@@ -412,10 +416,14 @@ message_workflow = StateGraph(
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
+message_workflow.add_node(
+    "resolve_human_message_images", resolve_human_message_images
+)
 message_workflow.add_node("anubis", anubis)
 
 message_workflow.add_edge(START, "chat")
-message_workflow.add_edge("chat", "anubis")
+message_workflow.add_edge("chat", "resolve_human_message_images")
+message_workflow.add_edge("resolve_human_message_images", "anubis")
 message_workflow.add_edge("anubis", END)
 
 graph = message_workflow.compile()

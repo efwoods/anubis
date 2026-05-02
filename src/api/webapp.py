@@ -18,6 +18,7 @@ import httpx
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
 from langchain_core.messages import HumanMessage
+from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 from src.anubis.utils.context import GlobalContext
 from psycopg_pool import AsyncConnectionPool
 
@@ -78,6 +79,11 @@ import stripe
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Must match Form(default=...) on /message and /message/{assistant_id} for image-only uploads.
+_DEFAULT_MESSAGE_FORM_TEXT = (
+    "Hey! Please tell me about yourself and what you can do for me."
+)
 
 
 class MessagePayload(BaseModel):
@@ -821,20 +827,20 @@ async def select_avatar(
             )
 
 
-async def process_files_for_message(files: Optional[List[UploadFile]] = None) -> tuple:
-    """Process uploaded files and return content for inclusion in messages.
+async def process_files_for_message(
+    files: Optional[List[UploadFile]] = None,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Process uploaded files for message endpoints.
 
     Returns:
-        tuple: (text_content, multimodal_content)
-        - text_content: str - concatenated text from text files
-        - multimodal_content: list or None - multimodal content for vision models
+        (non_image_text, images) where images is a list of (data URL, filename) for
+        each uploaded image, in upload order.
     """
     if not files:
-        return "", None
+        return "", []
 
-    text_contents = []
-    multimodal_parts = []
-    has_images = False
+    text_contents: list[str] = []
+    images: list[tuple[str, str]] = []
 
     for file in files:
         try:
@@ -843,15 +849,9 @@ async def process_files_for_message(files: Optional[List[UploadFile]] = None) ->
             content_type = file.content_type or ""
 
             if content_type.startswith("image/"):
-                # Encode image as base64 for vision models
                 base64_image = base64.b64encode(content).decode("utf-8")
                 image_url = f"data:{content_type};base64,{base64_image}"
-
-                multimodal_parts.append(
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                )
-                has_images = True
-                text_contents.append(f"[Image: {filename}]")
+                images.append((image_url, filename))
 
             elif content_type.startswith("text/") or content_type == "application/pdf":
                 # Handle text files and PDFs
@@ -908,18 +908,50 @@ async def process_files_for_message(files: Optional[List[UploadFile]] = None) ->
             logger.error(f"Error processing file {file.filename}: {e}")
             text_contents.append(f"[Error processing file: {file.filename}]")
 
-    # Combine text content
     combined_text = "\n\n".join(text_contents) if text_contents else ""
+    return combined_text, images
 
-    # Return multimodal content if images are present
-    if has_images:
-        # Create multimodal content with text and images
-        multimodal_content = [
-            {"type": "text", "text": combined_text}
-        ] + multimodal_parts
-        return combined_text, multimodal_content
 
-    return combined_text, None
+async def build_text_message_with_image_descriptions(
+    message: str,
+    file_text_content: str,
+    images: list[tuple[str, str]],
+) -> str:
+    """Turn uploaded images into text via ImageDescriptionClass and merge with user text."""
+    image_blocks: list[str] = []
+    if images:
+        describer = ImageDescriptionClass()
+        for image_url, filename in images:
+            try:
+                meta = await describer.describe(image_url, filename)
+                image_blocks.append(f"[Image: {filename}]\n{meta['description']}")
+                model_name = meta.get("model_name") or "image_description"
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="prompt").inc(
+                    meta.get("input_tokens", 0)
+                )
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="completion").inc(
+                    meta.get("output_tokens", 0)
+                )
+                MODEL_COST_TOTAL.labels(model=model_name).inc(meta.get("total_cost", 0.0))
+            except Exception as e:
+                logger.exception("Image description failed for %s", filename)
+                image_blocks.append(
+                    f"[Image: {filename}]\n[Image could not be described: {e}]"
+                )
+
+    has_images = len(images) > 0
+    user_part = message.strip()
+    if has_images and user_part == _DEFAULT_MESSAGE_FORM_TEXT:
+        user_part = ""
+
+    sections: list[str] = []
+    if user_part:
+        sections.append(user_part)
+    if image_blocks:
+        sections.append("\n\n".join(image_blocks))
+    if file_text_content.strip():
+        sections.append(file_text_content.strip())
+    return "\n\n".join(sections)
 
 
 @app.post("/message")
@@ -937,7 +969,6 @@ async def message_selected_avatar(
 ):
 
     logger.info("breakpoint update")
-    breakpoint()
     langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
@@ -983,20 +1014,11 @@ async def message_selected_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    # Process any uploaded files
-    file_text_content, multimodal_content = await process_files_for_message(files)
-
-    # Create the human message content
-    if multimodal_content:
-        # Use multimodal content for vision models
-        human_message = HumanMessage(content=multimodal_content)
-    else:
-        # Use text-only content
-        if file_text_content:
-            human_message_content = message + "\n\n" + file_text_content
-        else:
-            human_message_content = message
-        human_message = HumanMessage(content=human_message_content)
+    file_text_content, images = await process_files_for_message(files)
+    human_message_content = await build_text_message_with_image_descriptions(
+        message, file_text_content, images
+    )
+    human_message = HumanMessage(content=human_message_content)
 
     result = await graph.ainvoke(
         input={"messages": [human_message]},
@@ -1048,7 +1070,6 @@ async def message_avatar(
 ):
 
     logger.info("breakpoint")
-    breakpoint()
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1115,20 +1136,11 @@ async def message_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    # Process any uploaded files
-    file_text_content, multimodal_content = await process_files_for_message(files)
-
-    # Create the human message content
-    if multimodal_content:
-        # Use multimodal content for vision models
-        human_message = HumanMessage(content=multimodal_content)
-    else:
-        # Use text-only content
-        if file_text_content:
-            human_message_content = message + "\n\n" + file_text_content
-        else:
-            human_message_content = message
-        human_message = HumanMessage(content=human_message_content)
+    file_text_content, images = await process_files_for_message(files)
+    human_message_content = await build_text_message_with_image_descriptions(
+        message, file_text_content, images
+    )
+    human_message = HumanMessage(content=human_message_content)
 
     result = await graph.ainvoke(
         input={"messages": [human_message]},

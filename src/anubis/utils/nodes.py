@@ -127,28 +127,6 @@ async def load_consciousness(
         # Coerce into document objects from Search Items
         assistant_identity = reduce_docs([], assistant_identity_document_items)
 
-        """ search for reference image description and append if existent """
-        assistent_reference_image_identity_namespace = (
-            creator_id,
-            assistant_id,
-            "reference_image",
-        )
-        key = assistant_id
-        reference_image_items = await runtime.store.aget(
-            assistent_reference_image_identity_namespace, key
-        )
-
-        reference_image_items_list: list = []
-        if reference_image_items is not None:
-            if isinstance(reference_image_items, (list, tuple)):
-                reference_image_items_list = list(reference_image_items)
-            else:
-                reference_image_items_list = [reference_image_items]
-
-        reference_image_doc = reduce_docs([], reference_image_items_list)
-
-        assistant_identity.extend(reference_image_doc)
-
         assistant_identity_memory_namespace = (
             creator_id,
             assistant_id,
@@ -162,6 +140,31 @@ async def load_consciousness(
 
     else:
         assistant_identity = state["assistant_identity_documents"]
+
+    """ Always merge assistant reference image (creator namespace), including when identity docs are cached """
+    assistent_reference_image_identity_namespace = (
+        creator_id,
+        assistant_id,
+        "reference_image",
+    )
+    reference_image_items = await runtime.store.aget(
+        assistent_reference_image_identity_namespace, assistant_id
+    )
+
+    reference_image_items_list: list = []
+    if reference_image_items is not None:
+        if isinstance(reference_image_items, (list, tuple)):
+            reference_image_items_list = list(reference_image_items)
+        else:
+            reference_image_items_list = [reference_image_items]
+
+    reference_image_doc = reduce_docs([], reference_image_items_list)
+    assistant_identity = [
+        d
+        for d in assistant_identity
+        if not (getattr(d, "metadata", None) or {}).get("reference_image")
+    ]
+    assistant_identity.extend(reference_image_doc)
 
     logger.info("breakpoint")
 

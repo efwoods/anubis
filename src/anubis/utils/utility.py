@@ -26,20 +26,16 @@ from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEX
 from typing import Optional
 
 import math
-import shutil
 import tempfile
 from pathlib import Path
 from moviepy import AudioFileClip, VideoFileClip
 from time import time_ns
-from fastapi import UploadFile
 from openai import OpenAI
 from openai.types.audio.transcription_diarized import TranscriptionDiarized
 import base64
 
 import io
-from tempfile import SpooledTemporaryFile
 from PIL import Image
-from starlette.datastructures import Headers
 
 
 logger = logging.getLogger(__name__)
@@ -535,17 +531,27 @@ def _truncate_reference_audio_path_if_long(path: str, context: GlobalContext) ->
     return out_path
 
 
+def _decode_base64_media_payload(payload: str) -> bytes:
+    """Decode raw base64 or an RFC 2397 ``data:*;base64,...`` string to bytes."""
+    s = (payload or "").strip()
+    if s.startswith("data:") and "," in s:
+        s = s.split(",", 1)[1].strip()
+    return base64.b64decode(s)
+
+
 # 1. Save the bytes to a temp file
-async def get_audio_duration_seconds(data: UploadFile) -> float:
-    with tempfile.NamedTemporaryFile(suffix=Path(data.filename).suffix, delete=True) as temp_audio:
-        data.file.seek(0)
-        temp_audio.write(data.file.read())
+async def get_audio_duration_seconds(
+    audio_base64: str, filename: Optional[str] = None
+) -> float:
+    raw = _decode_base64_media_payload(audio_base64)
+    suffix = Path(filename or "audio.m4a").suffix or ".m4a"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as temp_audio:
+        temp_audio.write(raw)
         temp_audio.flush()
 
         # 2. Load with MoviePy
         with AudioFileClip(temp_audio.name) as clip:
             duration_seconds = float(clip.duration or 0.0)
-        data.file.seek(0)
         return duration_seconds
 
 
@@ -628,15 +634,16 @@ async def _transcribe_saved_path(path: str, upload_filename: str, context: Globa
         clip.close()
 
 
-async def transcribe_audio(data: UploadFile, context: GlobalContext) -> dict:
-    suffix = Path(data.filename or "audio.m4a").suffix or ".m4a"
+async def transcribe_audio(
+    audio_base64: str, context: GlobalContext, filename: Optional[str] = None
+) -> dict:
+    raw = _decode_base64_media_payload(audio_base64)
+    suffix = Path(filename or "audio.m4a").suffix or ".m4a"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        data.file.seek(0)
-        shutil.copyfileobj(data.file, tmp)
+        tmp.write(raw)
         path = tmp.name
-    data.file.seek(0)
     try:
-        name = Path(data.filename or f"audio{suffix}").name
+        name = Path(filename or f"audio{suffix}").name
         return await _transcribe_saved_path(path, name, context)
     finally:
         try:
@@ -644,23 +651,20 @@ async def transcribe_audio(data: UploadFile, context: GlobalContext) -> dict:
         except OSError:
             pass
 
-async def get_file_size_MB(data: UploadFile) -> float:
-    with tempfile.NamedTemporaryFile(delete=True) as temp_file:
-        data.file.seek(0)
-        temp_file.write(data.file.read())
-        temp_file.flush()
-        size_MB = os.fstat(temp_file.fileno()).st_size / 1048576
-        return size_MB
+async def get_file_size_MB(audio_base64: str) -> float:
+    raw = _decode_base64_media_payload(audio_base64)
+    return len(raw) / 1048576
 
 
-async def process_reference_audio(data: UploadFile, context: GlobalContext) -> dict:
+async def process_reference_audio(
+    audio_base64: str, context: GlobalContext, filename: Optional[str] = None
+) -> dict:
     start_time = time_ns()
-    suffix = Path(data.filename or "audio.m4a").suffix or ".m4a"
+    raw = _decode_base64_media_payload(audio_base64)
+    suffix = Path(filename or "audio.m4a").suffix or ".m4a"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        data.file.seek(0)
-        shutil.copyfileobj(data.file, tmp)
+        tmp.write(raw)
         path = tmp.name
-    data.file.seek(0)
     path = _truncate_reference_audio_path_if_long(path, context)
     mime = _audio_mime_from_suffix(Path(path).suffix)
     try:
@@ -672,7 +676,7 @@ async def process_reference_audio(data: UploadFile, context: GlobalContext) -> d
                 )
         else:
             b64_encoded_reference_audio = None
-        upload_name = Path(data.filename or f"audio{suffix}").name
+        upload_name = Path(filename or f"audio{suffix}").name
         response = await _transcribe_saved_path(path, upload_name, context)
     finally:
         try:
@@ -819,22 +823,24 @@ def _merge_diarized_segments_from_chunks(
 # TODO: when diarizing The model cost needs to be calculated and returned in the response (using total aggregated tokens from all chunks for input and output tokens)
 
 async def transcribe_audio_diarize(
-    data: UploadFile,
+    media_base64: str,
     context: GlobalContext,
     encoded_reference_audio: Optional[str] = None,
+    filename: Optional[str] = None,
+    content_type: Optional[str] = None,
 ) -> dict:
-    """Diarize an uploaded video or audio file (chunked when audio exceeds whisper_max_bytes)."""
+    """Diarize video or audio from base64 (chunked when audio exceeds whisper_max_bytes)."""
     start_time = time_ns()
     client = _openai_client_for_speech(context)
-    orig_name = data.filename or "upload.mp4"
+    raw = _decode_base64_media_payload(media_base64)
+    orig_name = filename or "upload.mp4"
     suffix = Path(orig_name).suffix or ".mp4"
-    is_audio = _upload_is_audio_for_diarize(data.filename, data.content_type)
+    is_audio = _upload_is_audio_for_diarize(filename, content_type)
     source_path = None
     audio_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
-            data.file.seek(0)
-            temp_upload.write(data.file.read())
+            temp_upload.write(raw)
             temp_upload.flush()
             source_path = temp_upload.name
 
@@ -858,7 +864,6 @@ async def transcribe_audio_diarize(
             finally:
                 video.close()
 
-        data.file.seek(0)
         size_bytes = os.path.getsize(audio_path)
         diarize_upload_name = (
             Path(orig_name).name
@@ -974,46 +979,29 @@ async def transcribe_audio_diarize(
                 except OSError:
                     pass
 
-async def extract_base64_str_from_upload_image(img: UploadFile) -> str:
-    """Convert Upload file of image type to base64 encoded str
-    """
-    suffix = Path(img.filename).suffix
+async def extract_base64_str_from_image(image_base64: str, filename: str) -> str:
+    """Build a ``data:image/...;base64,...`` URI from raw or data-URI base64 input."""
+    suffix = Path(filename).suffix
     if suffix not in [".png", ".jpeg", ".jpg", ".webp"]:
         raise ValueError("Unsupported file type. Only PNG, JPEG, JPG, and WEBP are allowed.")
-    img.file.seek(0)
-    base64_image = base64.b64encode(img.file.read()).decode('utf-8')
-    base64_str = f"data:image/{suffix.lstrip('.')};base64,{base64_image}"
-    return base64_str
+    raw = _decode_base64_media_payload(image_base64)
+    base64_image = base64.b64encode(raw).decode("utf-8")
+    return f"data:image/{suffix.lstrip('.')};base64,{base64_image}"
 
 
-async def resize_uploadfile(uploadfile: UploadFile):
-
-    uploadfile.file.seek(0)  # important if already read
-    with Image.open(uploadfile.file) as original_img:
-        image = original_img.convert("RGB")
-        MAX_DIMENSION = 512
-        original_w, original_h = image.size
+async def resize_image_bytes(image_bytes: bytes) -> tuple[bytes, Optional[str]]:
+    """Downscale large images to JPEG. Returns ``(bytes, content_type)``; ``content_type`` is ``None`` when unchanged."""
+    with Image.open(io.BytesIO(image_bytes)) as original_img:
+        original_w, original_h = original_img.size
         longest_side = max(original_w, original_h)
-        if longest_side > MAX_DIMENSION:
-            scale = MAX_DIMENSION / longest_side
-            resized_width = max(1, int(round(original_w * scale)))
-            resized_height = max(1, int(round(original_h * scale)))
-            image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
-            # Re-encode resized image
-            out = io.BytesIO()
-            image.save(out, format="JPEG", quality=85, optimize=True)
-            resized_bytes = out.getvalue()
-            # Replace UploadFile's underlying file object
-            new_spooled = SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
-            new_spooled.write(resized_bytes)
-            new_spooled.seek(0)
-            uploadfile.file = new_spooled
-            uploadfile.size = len(resized_bytes)
-            # Keep metadata aligned
-            headers = uploadfile.headers.mutablecopy()
-            headers['content-type'] = "image/jpeg"
-            uploadfile.headers = Headers(headers)
-
-    # Ensure downstream reads from start
-    uploadfile.file.seek(0)
-    return uploadfile
+        MAX_DIMENSION = 512
+        if longest_side <= MAX_DIMENSION:
+            return image_bytes, None
+        image = original_img.convert("RGB")
+        scale = MAX_DIMENSION / longest_side
+        resized_width = max(1, int(round(original_w * scale)))
+        resized_height = max(1, int(round(original_h * scale)))
+        image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue(), "image/jpeg"

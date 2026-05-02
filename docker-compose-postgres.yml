@@ -12,8 +12,10 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - anubis_langgraph-data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
 
+# Named volume `anubis_langgraph-data` is created automatically on first `up`.
+# (Previously `external: true` required a pre-created volume and broke after volume removal.)
 volumes:
-  anubis_langgraph-data:
-    external: true
+  postgres_data:
+    name: anubis_langgraph-data

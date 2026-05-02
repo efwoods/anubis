@@ -314,9 +314,16 @@ async def lifespan(app: FastAPI):
     await app.state.pool.open()
     try:
         embed = "huggingface:" + app.state.context.embedding_model
-        field = ["document.kwargs.page_content"]
+        # IndexConfig key must be ``fields`` (plural). Using ``field`` is ignored and
+        # LangGraph falls back to embedding the entire JSON value ("$") — catastrophic
+        # when values include multi‑MB reference_image_data URIs on store.aput.
         store = AsyncPostgresStore(
-            app.state.pool, index=IndexConfig(dims=640, embed=embed, field=field)
+            app.state.pool,
+            index=IndexConfig(
+                dims=640,
+                embed=embed,
+                fields=["document.kwargs.page_content"],
+            ),
         )
         await store.setup()
         logger.info("Store setup complete")
@@ -464,7 +471,6 @@ async def create_avatar(
     # Include reference image, reference audio
 
     logger.info(f"breakpoint")
-
     context = app.state.context
 
     if current_user["identities"][0]["user_id"] == context.anonymous_user_id:
@@ -540,7 +546,6 @@ async def modify_avatar(
 ):
     # Avatar name changes also need to be applied to the db for consistent identities
     logger.info("breakpoint")
-
     if not assistant_id:
         raise HTTPException(
             detail="Supply assistant_id for the assistant to modify.", status_code=400
@@ -590,7 +595,6 @@ async def delete_avatar(
 ):
     # TODO: Delete avatar in database
     logger.info("breakpoint")
-
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
     client = get_client(headers={"API-KEY": f"{token}"})
@@ -627,10 +631,11 @@ async def delete_avatar(
 
 @app.get("/list_public_avatars")
 async def list_public_avatars(assistant_id: Optional[str] = None):
-    logger.info("breakpoint")
-    breakpoint()
     public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
-    return public_avatars_result
+    return [
+        {k: v for k, v in assistant.items() if k != "metadata"}
+        for assistant in public_avatars_result
+    ]
 
 
 @app.get("/list_user_avatars")
@@ -979,7 +984,11 @@ async def message_selected_avatar(
             human_message_content = message
         human_message = HumanMessage(content=human_message_content)
 
-    result = await graph.ainvoke(input={"messages": [human_message]}, config=config)
+    result = await graph.ainvoke(
+        input={"messages": [human_message]},
+        config=config,
+        context=app.state.context,
+    )
 
     logger.info(f"{result}")
 
@@ -1107,7 +1116,11 @@ async def message_avatar(
             human_message_content = message
         human_message = HumanMessage(content=human_message_content)
 
-    result = await graph.ainvoke(input={"messages": [human_message]}, config=config)
+    result = await graph.ainvoke(
+        input={"messages": [human_message]},
+        config=config,
+        context=app.state.context,
+    )
 
     logger.info(f"{result}")
 
@@ -1407,8 +1420,6 @@ async def update_avatar_identity_with_media(
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
-    logger.info(f"UPLOAD MEDIA ENDPOINT ENTRY")
-    breakpoint()
     """
     Upload media for processing and indexing.
 
@@ -1801,6 +1812,7 @@ async def update_avatar_identity_with_media(
         await process_media_graph_api_endpoint.ainvoke(
             initial_state,
             config=config,
+            context=app.state.context,
         )
 
         # Indexing clears vectorstore_documents_to_be_indexed in final state; rely on exceptions for failures.

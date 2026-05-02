@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 import base64
 from pathlib import Path
 import json
-import time
 
 from langchain_community.document_loaders import PyPDFLoader
 import tempfile, os
@@ -46,9 +45,6 @@ from src.anubis.utils.utility import extract_user_id_assistant_id
 from src.subgraphs.process_media_graph.utils.utility import extract_personality_from_image
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
 
-DEBUG_LOG_PATH = "/home/user/gh/anubis/.cursor/debug-eeabc1.log"
-DEBUG_SESSION_ID = "eeabc1"
-
 _ALLOWED_STILL_IMAGE_MIMES = frozenset(
     {"image/jpeg", "image/png", "image/gif", "image/webp"}
 )
@@ -83,24 +79,6 @@ def _is_full_audio_data_uri(value: str) -> bool:
     return normalized.startswith("data:audio/") and ";base64," in normalized
 
 
-def _write_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
-    payload = {
-        "sessionId": DEBUG_SESSION_ID,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
-    except Exception:
-        pass
-
-
-
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
@@ -113,6 +91,7 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
+    breakpoint()
     user_id, assistant_id = await extract_user_id_assistant_id(config)
 
     media_files = state.get('media_files', [])
@@ -443,7 +422,8 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     """
     
     logging.info(f"DETERMINE_MEDIA_TYPE NODE")
-    
+    breakpoint()
+
     media_list = state.get('media_list', [])
 
     if not media_list:
@@ -518,6 +498,7 @@ async def process_media_item_task(
     """Task: Convert a single media item to a Document"""
     
     logger.info(f"process_media_item_task entry")
+    breakpoint()
 
     media_type = media_item.get("type", "")
     
@@ -593,7 +574,7 @@ async def process_media_item_task(
                 store=store,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                context=runtime.context,
+                context = runtime.context
             )
             doc.metadata.update(
                 {

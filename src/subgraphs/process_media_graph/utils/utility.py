@@ -30,23 +30,13 @@ def _sniff_image_mime_from_bytes(chunk: bytes) -> Optional[str]:
         return "image/webp"
     return None
 
-
-def image_url_for_vision(image_ref: str) -> str:
-    """Normalize stored or raw image material into a URL the vision API accepts."""
-    r = (image_ref or "").strip()
-    if r.startswith("http://") or r.startswith("https://") or r.startswith("data:image"):
-        return r
-    return f"data:image/jpeg;base64,{r}"
-
-
 async def extract_personality_from_image(
     image_data: str,
     filename: str,
     store: BaseStore,
     user_id: str,
     assistant_id: str,
-    context: GlobalContext,
-    creator_id: Optional[str] = None,
+    context: GlobalContext = GlobalContext(),
 ) -> Document:
     start_time = time_ns()
     """Extract personality description from image using vision LLM."""
@@ -71,17 +61,14 @@ async def extract_personality_from_image(
             "reference_image_data", None
         )
 
-    target_url = image_url_for_vision(image_data)
-
     if reference_image_data:
-        ref_url = image_url_for_vision(reference_image_data)
         image_to_target_textual_description_payload = [
             SystemMessage(content=MULTI_IMAGE_PROMPT),
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": ref_url}},
-                    {"type": "image_url", "image_url": {"url": target_url}},
+                    {"type": "image_url", "image_url": {"url": reference_image_data}},
+                    {"type": "image_url", "image_url": {"url": image_data}},
                 ],
             },
         ]
@@ -92,7 +79,7 @@ async def extract_personality_from_image(
             ),
             {
                 "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": target_url}}],
+                "content": [{"type": "image_url", "image_url": {"url": image_data}}],
             },
         ]
 

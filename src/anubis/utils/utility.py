@@ -153,7 +153,7 @@ def format_docs(docs: list[Document] | None) -> str:
 import uuid
 from typing import Union, Any, Literal
 
-from langgraph.store.base import SearchItem
+from langgraph.store.base import SearchItem, Item
 
 def reduce_docs(
     existing: Sequence[Document] | None,
@@ -190,7 +190,7 @@ def reduce_docs(
                 )
             elif isinstance(item, dict):
                 coerced.append(Document(**item))
-            elif isinstance(item, SearchItem):
+            elif isinstance(item, SearchItem) or isinstance(item, Item):
                 logger.info("breakpoint")
                 page_content = getattr(item,'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
                 document_metadata = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})

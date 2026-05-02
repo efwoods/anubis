@@ -1895,9 +1895,7 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
         )
     results = {}
     namespace = (user_id, assistant_id)
-    all_namespaces = await langgraph_sdk_client.store.list_namespaces(
-        namespace, limit=1000000
-    )
+
     all_document_items = await langgraph_sdk_client.store.search_items(
         namespace, limit=1000000
     )
@@ -1914,8 +1912,15 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
-    token = current_user["API_KEY"]
-    langgraph_sdk_client = get_client(headers={"API-KEY": f"{token}"})
+
+    # Remove any special characters from the source document name
+    source_document_name = source_document_name.strip("\"")
+    source_document_name = source_document_name.strip("\`")
+    source_document_name = source_document_name.strip("\'")
+    source_document_name = source_document_name.strip("")
+
+    source_document_name = source_document_name.strip()
+
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]
@@ -1930,8 +1935,25 @@ async def delete_avatar_documents(
 
     pool = app.state.pool
 
-    SQL_STORE_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s"""
-    SQL_STORE_VECTOR_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
+    # LangGraph store: prefix = namespace tuple dot-joined (see langgraph/store/postgres/base.py).
+    # Match either chunk keys built from the filename prefix, or reference_* namespaces
+    # (reference_image, reference_audio, …) where the serialized LangChain Document holds the
+    # basename under value.document.kwargs.metadata.filename (same path as list_documents).
+    # Rows removed from store CASCADE-delete matching store_vectors embeddings.
+    SQL_DELETE_DOCUMENT_QUERY = """
+DELETE FROM store
+WHERE (
+    prefix = %s
+    OR prefix LIKE %s
+    OR prefix LIKE %s
+    OR prefix LIKE %s
+)
+OR (
+    prefix LIKE %s
+    AND value #>> '{document,kwargs,metadata,filename}' = %s
+)
+"""
+    total_deleted = 0
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -1940,15 +1962,23 @@ async def delete_avatar_documents(
                     f"{user_id}.{assistant_id}.{source_document_name}.%",
                     f"{user_id}.{assistant_id}.%.{source_document_name}",
                     f"{user_id}.{assistant_id}.%.{source_document_name}.%",
+                    f"{user_id}.{assistant_id}.reference_%",
+                    source_document_name,
                 )
-                await cur.execute(SQL_STORE_DELETE_QUERY, params)
-                await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
-
-        return JSONResponse(
-            content=f"Successfully deleted: {source_document_name}", status_code=200
-        )
-    except Exception as e:
+                await cur.execute(SQL_DELETE_DOCUMENT_QUERY, params)
+                total_deleted += cur.rowcount if cur.rowcount is not None else 0
+    except Exception:
         raise HTTPException(detail="Error deleting documents.", status_code=500)
+
+    if total_deleted == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stored rows matched document: {source_document_name}",
+        )
+
+    return JSONResponse(
+        content=f"Successfully deleted: {source_document_name}", status_code=200
+    )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,17 @@
-# alter embedding model in db
+# CURRENT PRIORITIES:
+
+
+# Integrate reference images from personal media and urls in the upload media endpoint
+
+# allow for images to be sent and discussed in chat with frontend 
+
+# Integrate reference audio from personal media and urls in the upload media endpoint
+
+#####
+
+
+# document refactor
+
 # collect token usage metrics
 
 # response evaluation loop with langsmith dataset from langsmith import RunEvalConfig(evaluators=["sentiment", "cot_qa","bleu", "rouge"], custom_evaluators=[RunEvalConfig.Criteria({"authenticity":"AUTHENTICITY_PROMPT (were these text written by the same author?)"}), eval_llm="gpt-5.4-nano"])
@@ -8,3 +21,9 @@
 
 # Clean semantic chunking (use defined context window with overlap in process documents to text)
 # clean conversation summaries
+
+# VERY IMPORTANT:
+# Reduce latency to less than 2 seconds
+# Latency Reduction
+
+

@@ -1,8 +1,22 @@
 {
   "python-envs.defaultEnvManager": "ms-python.python:venv",
   "python-envs.defaultPackageManager": "ms-python.python:pip",
-  "python.defaultInterpreterPath": ".venv/bin/python",
+  "python.defaultInterpreterPath": ".venv",
   "python.testing.pytestArgs": ["."],
   "python.testing.unittestEnabled": false,
-  "python.testing.pytestEnabled": true
+  "python.testing.pytestEnabled": true,
+  "amazonQ.telemetry": false,
+  "sqltools.connections": [
+    {
+      "ssh": "Disabled",
+      "previewLimit": 50,
+      "server": "localhost",
+      "port": 5432,
+      "driver": "PostgreSQL",
+      "name": "nn-local",
+      "database": "postgres",
+      "username": "postgres",
+      "password": "fastdatagatE33"
+    }
+  ]
 }

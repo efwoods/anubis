@@ -53,6 +53,23 @@
       "env": {
         "NN_API_KEY": "${env:NN_API_KEY}"
       }
+    },
+    {
+      "name": "Debug Studio Chat (Streamlit)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "${workspaceFolder}/frontend/studio_chat_app.py",
+        "--server.port=8501"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "NN_API_KEY": "${env:NN_API_KEY}"
+      }
     }
   ]
 }

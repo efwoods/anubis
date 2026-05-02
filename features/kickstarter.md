@@ -1,0 +1,18 @@
+# Kickstarter
+I had a friend growing up in high school who met an early end. Everyone at school went to her Facebook profile to leave messages after her passing. Her mom logged in to her profile and responded to the messages. Today, we have AI generative media and a plethora of social media content. I have been creating a platform to upload any content or share any story to recreate a personal presence of yourself - to create a digital soul to share of yourself with others for years to come. My avatar knows information about what I value, my personal history, and I have created a Pastor that uses the King James Bible for contextually relevant responses. I am looking for people to both back and beta test the current platform (neuralnexus.site, api.neuralnexus.site, ui.neuralnexus.site). There are many use cases, and I hope you join the digital afterlife, live long, and prosper.
+
+The main risks and challenges come from cost, quality (low quality or inappropriate use), and latency (slow responses).
+
+Scalable infrastructure requires about 500 / month. Without sufficient support for Redis Clusters, Databases, and Kubernetes Clusters, this will not scale to the general public in a useful means. Without this architecture, people will not be able to simultaneously use this platform. Now, I use the platform for custom git commits, and to save what I value in the most of myself based on my stories and personal media. If there aren't enough supporters or users of this application, the application will not grow in a useful sense to be used widespread by the public. 
+
+There is a risk of creating abusive, hate-speech content, or fraud. We are monitoring use and  uploaded media in alignment with terms and services to intercept and prohibit such use cases. 
+
+There is a tradeoff between cost and quality. There are five domains of quality that define the avatar: Relationships, knowledge, behavior, emotions, and sentence-structure (who you know, what you feel, what you know, how you behave, and how you talk). The more information you have (videos of dialogue between individuals, texts between two people, etc.) and the more funding, the higher the authenticity that can be created (creating fine-tuned adapters to write in your likeness with sufficient data). Sharing personal stories will create an avatar that has your information but does not perfectly match your likeness (does not exactly share your behaviors or perfectly match your word choice and sentence structure). With more media, we will be able to analyze more information and recreate a closer likeness of any person at the tradeoff of cost. 
+
+To address latency, we are working on tracing the requests, creating optimal, graph structures, and developing efficient code.
+
+Currently, everyone has access to public services such as Pastors, and I am hoping to onboard motivational speakers to share themselves in the future.
+
+I am allowing individuals to use their own personal media to create AI of their own likeness. They are able to share the likeness of themselves with the world, and create any real or fictional character for their own entertainment. You can create your own AI text of yourself now, and we are working on creating audio, text, images, video, and more in the future
+
+Any person owns their own data even from social media. They can request that data and use that data in any means. You can only share avatars of yourself with others.

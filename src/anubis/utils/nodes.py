@@ -10,6 +10,7 @@ from langgraph.runtime import Runtime
 from datetime import datetime, timezone
 from langchain_core.messages import SystemMessage
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,14 @@ async def load_consciousness(
             assistent_reference_image_identity_namespace, key
         )
 
-        reference_image_doc = reduce_docs([], reference_image_items)
+        reference_image_items_list: list = []
+        if reference_image_items is not None:
+            if isinstance(reference_image_items, (list, tuple)):
+                reference_image_items_list = list(reference_image_items)
+            else:
+                reference_image_items_list = [reference_image_items]
+
+        reference_image_doc = reduce_docs([], reference_image_items_list)
 
         assistant_identity.extend(reference_image_doc)
 

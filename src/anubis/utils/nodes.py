@@ -8,11 +8,113 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
 from datetime import datetime, timezone
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 import logging
 from pathlib import Path
 
+from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
+
 logger = logging.getLogger(__name__)
+
+
+def _image_url_from_content_block(block: dict) -> str | None:
+    """Resolve image URL from LangChain or OpenAI-style multimodal blocks."""
+    if not isinstance(block, dict):
+        return None
+    t = block.get("type")
+    if t == "input_image":
+        u = block.get("image_url")
+        return u if isinstance(u, str) else None
+    if t == "image_url":
+        iu = block.get("image_url")
+        if isinstance(iu, dict):
+            u = iu.get("url")
+            return u if isinstance(u, str) else None
+        if isinstance(iu, str):
+            return iu
+    return None
+
+
+def _text_from_content_block(block: dict) -> str | None:
+    if not isinstance(block, dict):
+        return None
+    t = block.get("type")
+    if t in ("text", "input_text"):
+        tx = block.get("text")
+        return tx if isinstance(tx, str) else None
+    return None
+
+
+async def resolve_human_message_images(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+):
+    """Replace multimodal HumanMessage (base64 image blocks) with plain text descriptions."""
+    msgs = state.get("messages") or []
+    if not msgs:
+        return {}
+    last = msgs[-1]
+    if not isinstance(last, HumanMessage):
+        return {}
+
+    content = last.content
+    if isinstance(content, str) or not isinstance(content, list):
+        return {}
+
+    has_image = any(
+        _image_url_from_content_block(b) for b in content if isinstance(b, dict)
+    )
+    if not has_image:
+        return {}
+
+    if not last.id:
+        logger.warning(
+            "resolve_human_message_images: HumanMessage missing id; skipping replacement"
+        )
+        return {}
+
+    filenames = (last.additional_kwargs or {}).get("image_filenames") or []
+    descriptor = ImageDescriptionClass()
+    img_index = 0
+    text_chunks: list[str] = []
+    image_sections: list[str] = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        url = _image_url_from_content_block(block)
+        if url:
+            fname = (
+                filenames[img_index]
+                if img_index < len(filenames)
+                else f"image_{img_index + 1}"
+            )
+            img_index += 1
+            try:
+                meta = await descriptor.describe(url, fname)
+                desc = (meta.get("description") or "").strip()
+            except Exception as exc:
+                logger.exception("Image describe failed for %s: %s", fname, exc)
+                desc = "[Image could not be described.]"
+            image_sections.append(f"[{fname}]\n{desc}")
+            continue
+        tx = _text_from_content_block(block)
+        if tx:
+            text_chunks.append(tx)
+
+    base_text = "\n\n".join(text_chunks).strip()
+    out_parts: list[str] = []
+    if base_text:
+        out_parts.append(base_text)
+    if image_sections:
+        out_parts.append("---\nImage descriptions:\n" + "\n\n".join(image_sections))
+    final_text = "\n\n".join(out_parts)
+
+    return {
+        "messages": [
+            RemoveMessage(id=last.id),
+            HumanMessage(content=final_text),
+        ]
+    }
 
 
 async def load_consciousness(

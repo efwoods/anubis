@@ -1,9 +1,19 @@
 # CURRENT PRIORITIES:
+# health data analysis
+
+# Test image urls
+# process upload images that are not reference images
+# process upload text documents that are autobiographical (needs facts extracted and re-written using LLM; facts must not change but the wording changes to prevent lawsuit: https://lexfridman.com/, https://www.hubermanlab.com/about, https://en.wikipedia.org/wiki/Lex_Fridman; extract facts and quote from wikis: https://fallout.fandom.com/wiki/Curie)
+# process upload text documents that are quotes/tweets: https://x.com/lexfridman
+# process upload text documents that are dialogues: https://www.youtube.com/watch?v=IvqRSEP_o-o
+# process upload text documents that are monologues: (monologue of target only: https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=4) (monologue with target followed by non-target monologue: https://www.youtube.com/watch?v=-tQwzhHjAVI&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=3)
+# process upload text documents that are multi-speaker with the target
+# process upload text documents that are multi-speaker that reference the target
+# process upload text documents that are multi-speaker that reference the target with the target direct quotes: (https://www.youtube.com/watch?v=Px_5Z0pPlPc&t=2s) autobiographical about the target with direct quotes and multi-speaker
 
 
-# Integrate reference images from personal media and urls in the upload media endpoint
+# Integrate reference images from urls in the upload media endpoint
 
-# allow for images to be sent and discussed in chat with frontend 
 
 # Integrate reference audio from personal media and urls in the upload media endpoint
 
@@ -27,3 +37,5 @@
 # Latency Reduction
 
 
+# process a link tree: https://linktr.ee/ev0ra?utm_source=linktree_profile_share&ltsid=217800c7-7f92-45dd-88f6-9f364d64275c
+# deep research agent: (https://docs.langchain.com/oss/python/deepagents/deep-research#build-a-deep-research-agent); https://github.com/langchain-ai/open_deep_research; https://academy.langchain.com/courses/take/deep-research-with-langgraph/texts/67644896-getting-set-up; https://github.com/langchain-ai/deep_research_from_scratch

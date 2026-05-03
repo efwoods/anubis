@@ -1619,10 +1619,12 @@ async def update_avatar_identity_with_media(
                 status_code=400, detail=f"Could not load assistant: {exc}"
             ) from exc
         assistant_meta = assistant.get("metadata") or {}
+        creator_id = assistant_meta.get("user_id") or user_id
 
         config = {
             "configurable": {
                 "user_id": user_id,
+                "creator_id": creator_id,
                 "user_ctx": {"name": None, "description": None},
                 "assistant_id": assistant_id,
                 "assistant_ctx": {
@@ -1969,7 +1971,8 @@ async def update_avatar_identity_with_media(
 
         store = app.state.store
 
-        # Import graph here to avoid circular imports
+        for entry in media_files:
+            entry.setdefault("creator_id", creator_id)
 
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
             workflow,
@@ -1977,7 +1980,6 @@ async def update_avatar_identity_with_media(
 
         process_media_graph_api_endpoint = workflow.compile(store=store)
 
-        # Prepare input state
         initial_state = {
             "media_files": media_files,
         }

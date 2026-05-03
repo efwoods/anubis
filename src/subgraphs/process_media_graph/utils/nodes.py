@@ -502,6 +502,7 @@ async def process_media_item_task(
 ) -> Document:
     """Task: Convert a single media item to a Document"""
     
+    breakpoint()
     logger.info(f"process_media_item_task entry")
 
     media_type = media_item.get("type", "")
@@ -602,9 +603,31 @@ async def process_media_item_task(
             )
 
             if reference_image:
+                
+                # I need a function to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
+                # the function should take in the reference image and the emotion and return a base64_encoded_str
+                # the function should be called for each emotion
+                # the base64_encoded_str is passed into the extract_personality_from_image function
+
+
+                # Use the reference image to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
+                # namespace is (creator_id, assistant_id, "identity")
+                # key is the assistant_id
+                # metadata contains "emotion" and "base64_encoded_str"
+                # page_content is the description of the image
+                # filename is the filename of the reference image with the emotion appended to the end with an underscore
+                # the description is created with extract_personality_from_image
+                # add "synthetic" True to the metadata
+                # add "content_type": "image/jpeg" to the metadata
+                # set as vectorstore_acceptable True, adapter_acceptable False, analysis_acceptable False
+                # append to the list of documents
+                # an api endpoint provides an endpoint to allow for the search of the store for metadata for "emotion", "content_type", and "synthetic" to display the images on load of the avatar once and caches all results then uses the results on emotion trigger.
+                # The frontend searches the metadata for "emotion", "content_type", and "synthetic" to display the images
+                
+                
                 namespace = (creator_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
-                # await store.adelete(namespace, key=assistant_id)
+                
                 await store.aput(
                     namespace,
                     key=assistant_id,
@@ -831,16 +854,8 @@ async def process_media_item_task(
                     )
                 ]
 
-            if reference_audio and audio_payload_uri:
-                ref_namespace = (creator_id, assistant_id, "reference_audio")
-                await store.aput(
-                    ref_namespace,
-                    key=assistant_id,
-                    value={"reference_audio_data": audio_payload_uri},
-                )
-
             transcript = ""
-            if audio_payload_uri:
+            if audio_payload_uri and not reference_audio: # Alter in the future to accept reference audio in the future if not the defined spoken phrase (if originating from a primary source of media)
                 try:
                     result = await transcribe_audio(
                         audio_base64=audio_payload_uri,
@@ -872,37 +887,46 @@ async def process_media_item_task(
                         "type": "audio",
                         "reference_audio": reference_audio,
                         "filename": filename,
-                        "namespace": "reference_audio" if reference_audio else "quote",
+                        "namespace": "reference_audio",
                         "vectorstore_acceptable": False,
                         "adapter_acceptable": False,
                         "analysis_acceptable": False,
                     },
                 )
-                return [doc]
+                documents = [doc]
+            else:
+                transcript_media_item = {
+                    "type": "text",
+                    "content": transcript,
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "creator_id": creator_id,
+                        "source": "audio_transcription",
+                        "reference_audio": reference_audio,
+                    },
+                }
 
-            transcript_media_item = {
-                "type": "text",
-                "content": transcript,
-                "metadata": {
-                    "filename": filename,
-                    "user_id": user_id,
-                    "assistant_id": assistant_id,
-                    "creator_id": creator_id,
-                    "source": "audio_transcription",
-                    "reference_audio": reference_audio,
-                },
-            }
+                documents = await process_text_to_document(
+                    metadata=transcript_media_item["metadata"],
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=transcript_media_item,
+                )
 
-            documents = await process_text_to_document(
-                metadata=transcript_media_item["metadata"],
-                user_id=user_id,
-                assistant_id=assistant_id,
-                media_item=transcript_media_item,
-            )
+                for d in documents:
+                    d.metadata.setdefault("creator_id", creator_id)
+                    d.metadata.setdefault("audio_filename", filename)
 
-            for d in documents:
-                d.metadata.setdefault("creator_id", creator_id)
-                d.metadata.setdefault("audio_filename", filename)
+            if reference_audio and audio_payload_uri:
+                ref_namespace = (creator_id, assistant_id, "reference_audio")
+                await store.aput(
+                    ref_namespace,
+                    key=assistant_id,
+                    value={"reference_audio_data": audio_payload_uri, "document": doc.to_json()},
+                )
+
             return documents
 
         # Handle video

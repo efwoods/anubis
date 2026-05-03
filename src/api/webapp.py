@@ -79,6 +79,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from urllib.parse import urlparse
+def _slug(u: str) -> str:
+    path = urlparse(u).path or ""
+    return path.rsplit("/", 1)[-1] if path else "remote_media"
+
 
 def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     """Pick the last AIMessage from a LangGraph ``updates`` chunk (any node)."""
@@ -1665,12 +1670,6 @@ async def update_avatar_identity_with_media(
             )
 
         media_files: list = []
-
-        from urllib.parse import urlparse
-
-        def _slug(u: str) -> str:
-            path = urlparse(u).path or ""
-            return path.rsplit("/", 1)[-1] if path else "remote_media"
 
         if non_empty_files:
             uf = non_empty_files[0]

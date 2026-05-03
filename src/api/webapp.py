@@ -1,4 +1,5 @@
 # src/anubis/webapp.py
+import json
 import os
 import re
 from typing import List
@@ -17,7 +18,7 @@ import httpx
 
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from src.anubis.utils.context import GlobalContext
 from psycopg_pool import AsyncConnectionPool
 
@@ -31,7 +32,6 @@ from uuid import uuid4
 import base64
 import tempfile
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import HumanMessage
 
 
 # Prometheus metrics
@@ -61,7 +61,7 @@ from src.security.auth import (
     get_current_user_or_anonymous_user,
 )
 
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from pydantic import BaseModel
 from typing import Any
@@ -78,6 +78,87 @@ import stripe
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
+    """Pick the last AIMessage from a LangGraph ``updates`` chunk (any node)."""
+    last_ai: AIMessage | None = None
+    for _node, v in payload.items():
+        if not isinstance(v, dict):
+            continue
+        msgs = v.get("messages")
+        if not msgs:
+            continue
+        tail = msgs[-1]
+        if isinstance(tail, AIMessage):
+            last_ai = tail
+    return last_ai
+
+
+async def message_graph_sse(
+    graph,
+    human_message: HumanMessage,
+    config: dict,
+    context: GlobalContext,
+    *,
+    thread_id: str,
+    user_id: str,
+    assistant_id: str,
+    conversation_title_value: str | None,
+    start_time_ns: int,
+    request_id: str,
+    langgraph_client_headers: dict,
+):
+    """Stream assistant tokens (SSE) then a final ``done`` event with full metadata."""
+    accumulated_chunks: list[str] = []
+    last_ai: AIMessage | None = None
+
+    async for item in graph.astream(
+        input={"messages": [human_message]},
+        config=config,
+        context=context,
+        stream_mode=["custom", "updates"],
+        subgraphs=True,
+    ):
+        if not isinstance(item, tuple) or len(item) != 3:
+            continue
+        _ns, mode, payload = item
+        if mode == "custom" and isinstance(payload, dict):
+            if payload.get("type") == "assistant_token":
+                accumulated_chunks.append(payload.get("text") or "")
+                yield f"data: {json.dumps(payload)}\n\n"
+        elif mode == "updates" and isinstance(payload, dict):
+            ai = _latest_ai_from_stream_update(payload)
+            if ai is not None:
+                last_ai = ai
+
+    thread_metadata = {
+        "thread_metadata": {
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "conversation_title": conversation_title_value,
+        },
+        "graph_id": "Anubis",
+    }
+    langgraph_client = get_client(headers=langgraph_client_headers)
+    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+
+    content = (
+        last_ai.content
+        if last_ai is not None
+        else "".join(accumulated_chunks)
+    )
+    done: dict = {
+        "type": "done",
+        "content": content,
+        "thread_id": thread_id,
+        "request_id": request_id,
+        "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
+    }
+    if last_ai is not None and getattr(last_ai, "response_metadata", None):
+        done["response_metadata"] = last_ai.response_metadata
+    yield f"data: {json.dumps(done, default=str)}\n\n"
 
 
 class MessagePayload(BaseModel):
@@ -940,6 +1021,7 @@ async def message_selected_avatar(
     conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = Form(None),
+    stream: bool = Form(True),
     current_user: dict = Depends(get_current_user),
 ):
 
@@ -1011,6 +1093,29 @@ async def message_selected_avatar(
             human_message_content = message
         human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
 
+    if stream:
+        return StreamingResponse(
+            message_graph_sse(
+                graph,
+                human_message,
+                config,
+                app.state.context,
+                thread_id=thread_id,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                conversation_title_value=conversation_title,
+                start_time_ns=start_time,
+                request_id=request.state.request_id,
+                langgraph_client_headers=langgraph_client_headers,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     result = await graph.ainvoke(
         input={"messages": [human_message]},
         config=config,
@@ -1053,6 +1158,7 @@ async def message_avatar(
     conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = Form(None),
+    stream: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
 
@@ -1145,6 +1251,33 @@ async def message_avatar(
             human_message_content = message
         human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
 
+    conversation_title_data = (
+        conversation_title if conversation_title != "" else thread_id
+    )
+
+    if stream:
+        return StreamingResponse(
+            message_graph_sse(
+                graph,
+                human_message,
+                config,
+                app.state.context,
+                thread_id=thread_id,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                conversation_title_value=conversation_title_data,
+                start_time_ns=start_time,
+                request_id=request.state.request_id,
+                langgraph_client_headers=langgraph_client_headers,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     result = await graph.ainvoke(
         input={"messages": [human_message]},
         config=config,
@@ -1152,11 +1285,6 @@ async def message_avatar(
     )
 
     # Update most_recent_message
-    if conversation_title != "":
-        conversation_title_data = conversation_title
-    else:
-        conversation_title_data = thread_id
-
     langgraph_client = get_client(headers=langgraph_client_headers)
     thread_metadata = {
         "thread_metadata": {

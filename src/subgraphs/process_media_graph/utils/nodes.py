@@ -476,12 +476,6 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
         if doc.metadata.get("vectorstore_acceptable", False) is True
     ]
 
-    if not vector_store_document_list_formatted:
-        raise RuntimeError(
-            "No vector-store documents were produced from the uploaded media "
-            "(nothing indexable after processing or classification)."
-        )
-
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
@@ -591,6 +585,7 @@ async def process_media_item_task(
                 user_id=creator_id,
                 assistant_id=assistant_id,
                 context=runtime.context,
+                reference_image=reference_image
             )
 
             doc.metadata.update(
@@ -609,6 +604,7 @@ async def process_media_item_task(
             if reference_image:
                 namespace = (creator_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
+                # await store.adelete(namespace, key=assistant_id)
                 await store.aput(
                     namespace,
                     key=assistant_id,

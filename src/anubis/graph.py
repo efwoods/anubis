@@ -333,6 +333,12 @@ async def respond(
     # avatar_response = response.get("messages", [])[-1]
     # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
 
+
+    from transformers import pipeline
+    classifier = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base")
+    sentiment = classifier(avatar_response.content)
+    avatar_response.response_metadata.update({"sentiment":{"emotion": sentiment[0]["label"], 'score': sentiment[0]["score"]}})
+
     result = {"messages": [avatar_response]}
 
     return result

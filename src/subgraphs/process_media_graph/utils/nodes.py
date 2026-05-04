@@ -1,7 +1,7 @@
 # Nodes for Identifying and Handling each media type 
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from langchain_core.documents import Document
 from uuid import uuid4
@@ -26,7 +26,14 @@ from src.anubis.utils.context import GlobalContext
 
 from langgraph.store.base import BaseStore
 
-from src.subgraphs.process_media_graph.utils.helper_functions import process_text_media_item_target_for_vectorstore
+from src.subgraphs.process_media_graph.utils.helper_functions import (
+    CLASSIFICATION_INPUT_CHAR_LIMIT,
+    process_text_media_item_target_for_vectorstore,
+)
+from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
+    ReferenceDocumentClassificationClass,
+)
+from src.anubis.utils.utility import transcribe_audio
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -91,7 +98,6 @@ async def process_uploaded_files_and_label_media_type(
     """
     
     logger.info(f"Process uploaded files NODE")
-    breakpoint()
     user_id, assistant_id = await extract_user_id_assistant_id(config)
 
     media_files = state.get('media_files', [])
@@ -106,13 +112,14 @@ async def process_uploaded_files_and_label_media_type(
     
     for file_data in media_files:
         try:
-            # Extract file info
+            file_start_idx = len(media_list)
             filename = file_data.get('filename', 'unknown')
             suffix = Path(filename).suffix
             content_type = file_data.get('content_type', '')
-            file_bytes = file_data.get('content')  # Raw bytes
+            file_bytes = file_data.get('content')
             user_id = file_data.get("user_id")
             assistant_id = file_data.get("assistant_id")
+            creator_id = file_data.get("creator_id") or user_id
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
             
@@ -386,16 +393,21 @@ async def process_uploaded_files_and_label_media_type(
             else:
                 logger.warning(f"Unsupported content type: {content_type}")
                 continue
-        
+
+            for added in media_list[file_start_idx:]:
+                meta = added.setdefault("metadata", {})
+                meta.setdefault("creator_id", creator_id)
+                added.setdefault("creator_id", creator_id)
+
         except Exception as e:
             logger.error(f"Error processing file {filename}: {e}")
             continue
     
     logger.info(f"Converted {len(media_list)} files to media format")
-    
+
     return {
         "media_list": media_list,
-        "media_files": []  # Clear after processing
+        "media_files": []
     }
 
 async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig) -> Dict[str, Any]:
@@ -422,7 +434,6 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     """
     
     logging.info(f"DETERMINE_MEDIA_TYPE NODE")
-    breakpoint()
 
     media_list = state.get('media_list', [])
 
@@ -465,12 +476,6 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
         if doc.metadata.get("vectorstore_acceptable", False) is True
     ]
 
-    if not vector_store_document_list_formatted:
-        raise RuntimeError(
-            "No vector-store documents were produced from the uploaded media "
-            "(nothing indexable after processing or classification)."
-        )
-
     # # Analysis list (needs a node)
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
@@ -497,18 +502,24 @@ async def process_media_item_task(
 ) -> Document:
     """Task: Convert a single media item to a Document"""
     
-    logger.info(f"process_media_item_task entry")
     breakpoint()
+    logger.info(f"process_media_item_task entry")
 
     media_type = media_item.get("type", "")
-    
+
     metadata = media_item.get("metadata", {})
 
     user_id = metadata.get("user_id", "")
     assistant_id = metadata.get("assistant_id", "")
+    creator_id = (
+        metadata.get("creator_id")
+        or (config.get("configurable", {}) or {}).get("creator_id")
+        or user_id
+    )
 
     logger.info(f"extracted user_id: {user_id}")
     logger.info(f"extracted assistant_id: {assistant_id}")
+    logger.info(f"extracted creator_id: {creator_id}")
 
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
@@ -572,28 +583,51 @@ async def process_media_item_task(
                 image_data=image_source,
                 filename=filename,
                 store=store,
-                user_id=user_id,
+                user_id=creator_id,
                 assistant_id=assistant_id,
-                context = runtime.context
+                context=runtime.context,
+                reference_image=reference_image
             )
+
             doc.metadata.update(
                 {
                     "user_id": user_id,
+                    "creator_id": creator_id,
                     "assistant_id": assistant_id,
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
                     "reference_image": reference_image,
                     "filename": filename,
-                    "vectorstore_acceptable": True,
-                    "adapter_acceptable": False,
                     "analysis_acceptable": True,
                 }
             )
 
             if reference_image:
-                namespace = (user_id, assistant_id, "reference_image")
-                doc_json = doc.to_json()
+                
+                # I need a function to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
+                # the function should take in the reference image and the emotion and return a base64_encoded_str
+                # the function should be called for each emotion
+                # the base64_encoded_str is passed into the extract_personality_from_image function
 
+
+                # Use the reference image to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
+                # namespace is (creator_id, assistant_id, "identity")
+                # key is the assistant_id
+                # metadata contains "emotion" and "base64_encoded_str"
+                # page_content is the description of the image
+                # filename is the filename of the reference image with the emotion appended to the end with an underscore
+                # the description is created with extract_personality_from_image
+                # add "synthetic" True to the metadata
+                # add "content_type": "image/jpeg" to the metadata
+                # set as vectorstore_acceptable True, adapter_acceptable False, analysis_acceptable False
+                # append to the list of documents
+                # an api endpoint provides an endpoint to allow for the search of the store for metadata for "emotion", "content_type", and "synthetic" to display the images on load of the avatar once and caches all results then uses the results on emotion trigger.
+                # The frontend searches the metadata for "emotion", "content_type", and "synthetic" to display the images
+                
+                
+                namespace = (creator_id, assistant_id, "reference_image")
+                doc_json = doc.to_json()
+                
                 await store.aput(
                     namespace,
                     key=assistant_id,
@@ -602,17 +636,91 @@ async def process_media_item_task(
                         "document": doc_json,
                     },
                 )
-            return [doc]
+                doc.metadata.update(
+                    {
+                        "namespace": "reference_image",
+                        "vectorstore_acceptable": False,
+                        "adapter_acceptable": False,
+                    }
+                )
+                return [doc]
 
-        # Handle text (Project Gutenberg; text files; list of media urls): https://claude.ai/chat/30c554c8-1386-4af2-9f19-f63b51942fc5 
-        # Handle large continuous text string if proprietary content; classify non-proprietary text content
+            description_text = (doc.page_content or "").strip()
+            if not description_text:
+                doc.metadata.update(
+                    {"namespace": "identity", "vectorstore_acceptable": False}
+                )
+                return [doc]
+
+            try:
+                reference_classifier = ReferenceDocumentClassificationClass()
+                reference_response = await reference_classifier.classify(
+                    description_text[:CLASSIFICATION_INPUT_CHAR_LIMIT]
+                )
+                is_menu_or_religious_text = bool(
+                    reference_response.get("is_menu_or_religious_text", False)
+                )
+                reference_reasoning = reference_response.get("reasoning", "")
+            except Exception as e:
+                logger.warning(
+                    "Image description reference classification failed: %s", e
+                )
+                is_menu_or_religious_text = False
+                reference_reasoning = ""
+
+            target_namespace = "document" if is_menu_or_religious_text else "identity"
+            classified_situation = (
+                "proprietary_content" if is_menu_or_religious_text else "image_identity"
+            )
+
+            description_media_item = {
+                "type": "text",
+                "content": description_text,
+                "metadata": {
+                    "filename": filename,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "creator_id": creator_id,
+                    "source": "image_description",
+                    "image_filename": filename,
+                },
+            }
+            classification_metadata = {
+                "classified_situation": classified_situation,
+                "reference_classification_reasoning": reference_reasoning,
+                "is_menu_or_religious_text": is_menu_or_religious_text,
+                "image_filename": filename,
+            }
+
+            documents = await process_text_media_item_target_for_vectorstore(
+                media_item=description_media_item,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                classification_metadata=classification_metadata,
+                use_semantic_chunks=False,
+                namespace=target_namespace,
+            )
+            for d in documents:
+                d.metadata.update(
+                    {
+                        "vectorstore_acceptable": True,
+                        "adapter_acceptable": False,
+                        "analysis_acceptable": True,
+                        "creator_id": creator_id,
+                    }
+                )
+            return documents
+
         elif media_type == "text":
+            metadata.setdefault("creator_id", creator_id)
             documents = await process_text_to_document(
                 metadata=metadata,
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
             )
+            for d in documents:
+                d.metadata.setdefault("creator_id", creator_id)
             return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             classification_metadata = {
@@ -646,7 +754,9 @@ async def process_media_item_task(
             )]
             return docs
         
-        elif media_type == "pdf": # Presumes written in first person from the target source
+        elif media_type == "pdf":
+            """Extract text from each PDF page and route it through process_text_to_document
+            so reference + content situation classifiers decide the namespace per page."""
             pdf_bytes = media_item.get("bytes")
             if not pdf_bytes:
                 pdf_uri = _full_data_uri_from_media_dict(media_item)
@@ -666,136 +776,158 @@ async def process_media_item_task(
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
                 tmp_file.write(pdf_bytes)
                 tmp_path = tmp_file.name
-            loader = PyPDFLoader(tmp_path)
-            docs = loader.load()
-            os.unlink(tmp_path)
-            document = docs[0]
-            # Process data for vectorstore; Identify content
-            classification_metadata = {
-                "classified_situation": "target pdf source document",
-                "classification_reasoning": "predefined classification"
-            }
-            final_documents = []
-            for temp_document in docs:
-                media_item['content'] = temp_document.page_content
-                documents = await process_text_media_item_target_for_vectorstore(
-                    media_item = media_item, 
-                    user_id = user_id, 
-                    assistant_id= assistant_id, 
-                    classification_metadata=classification_metadata,
-                    use_semantic_chunks=False,
-                )
+            try:
+                loader = PyPDFLoader(tmp_path)
+                pages = loader.load()
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
-                for document in documents:
-                    document.metadata.update({"vectorstore_acceptable":True})
-                    document.metadata.update({"namespace":"identity"})
-                    final_documents.append(document)
-            # Analysis Will be handled here with the appropriate model
+            final_documents: List[Document] = []
+            for page_idx, page_doc in enumerate(pages):
+                page_text = (page_doc.page_content or "").strip()
+                if not page_text:
+                    continue
+                page_media_item = {
+                    "type": "text",
+                    "content": page_text,
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "creator_id": creator_id,
+                        "source": "pdf_page",
+                        "pdf_page_index": page_idx,
+                    },
+                }
+                documents = await process_text_to_document(
+                    metadata=page_media_item["metadata"],
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=page_media_item,
+                )
+                for d in documents:
+                    d.metadata.setdefault("creator_id", creator_id)
+                    d.metadata.setdefault("pdf_page_index", page_idx)
+                final_documents.extend(documents)
 
             return final_documents
            
-        # Handle audio: https://claude.ai/chat/df5f518f-f846-4015-bb05-7adc6de96678
         elif media_type == "audio":
-            """
-            Detect the number of speakers
-            Audio needs to be diarized if reference audio is available;
-            otherwise convert to text
+            """Transcribe audio (no diarization) and route the transcript through the text pipeline.
+
+            Reference audio also persists the data URI under (creator_id, assistant_id, reference_audio)
+            so retrieval (load_consciousness) finds it, and its transcript (if any) is indexed too.
             """
             reference_audio = metadata.get("reference_audio", False)
             audio_payload_uri = _full_data_uri_from_media_dict(media_item)
-            if audio_payload_uri:
-                if reference_audio and not _is_full_audio_data_uri(audio_payload_uri):
-                    return [
-                        Document(
-                            page_content=(
-                                "[Reference audio requires media_item.base64_encoded_str "
-                                "as the full data:audio/...;base64,... string from upstream]"
-                            ),
-                            metadata={
-                                "status": "error",
-                                "error": "invalid_reference_audio_data_uri",
-                                "filename": filename,
-                            },
-                        )
-                    ]
+            audio_url = (media_item.get("audio_url") or {}).get("url", "").strip() if isinstance(
+                media_item.get("audio_url"), dict
+            ) else ""
 
-                audio_data = audio_payload_uri
-
-                if reference_audio:
-                    namespace = (user_id, assistant_id, "reference_audio")
-                    await store.aput(
-                        namespace,
-                        key=assistant_id,
-                        value={"reference_audio_data": audio_data},
+            if not audio_payload_uri and not audio_url:
+                return [
+                    Document(
+                        page_content="[Audio missing payload and URL]",
+                        metadata={
+                            "status": "error",
+                            "error": "missing_audio_payload",
+                            "filename": filename,
+                        },
                     )
+                ]
 
-                media_item_fwd = {
-                    **media_item,
-                    "content": media_item.get("content")
-                    or "[Audio upload; transcription pending]",
-                }
-                return await process_text_to_document(
-                    media_item=media_item_fwd,
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    metadata=metadata,
+            if reference_audio and audio_payload_uri and not _is_full_audio_data_uri(audio_payload_uri):
+                return [
+                    Document(
+                        page_content=(
+                            "[Reference audio requires media_item.base64_encoded_str "
+                            "as the full data:audio/...;base64,... string from upstream]"
+                        ),
+                        metadata={
+                            "status": "error",
+                            "error": "invalid_reference_audio_data_uri",
+                            "filename": filename,
+                        },
+                    )
+                ]
+
+            transcript = ""
+            if audio_payload_uri and not reference_audio: # Alter in the future to accept reference audio in the future if not the defined spoken phrase (if originating from a primary source of media)
+                try:
+                    result = await transcribe_audio(
+                        audio_base64=audio_payload_uri,
+                        context=runtime.context,
+                        filename=filename,
+                    )
+                    transcript = (result.get("content") or "").strip()
+                except Exception as e:
+                    logger.exception("Audio transcription failed for %s: %s", filename, e)
+                    transcript = ""
+            elif audio_url:
+                logger.info(
+                    "Audio URL transcription not yet supported; storing pointer only."
                 )
 
-            if "audio_url" in media_item:
-                url = (media_item["audio_url"] or {}).get("url", "").strip()
-                if not url:
-                    return [
-                        Document(
-                            page_content="[Empty audio URL]",
-                            metadata={
-                                "status": "error",
-                                "filename": filename,
-                            },
-                        )
-                    ]
-                if reference_audio:
-                    if not _is_full_audio_data_uri(audio_payload_uri):
-                        return [
-                            Document(
-                                page_content=(
-                                    "[Reference audio requires media_item.base64_encoded_str "
-                                    "as the full data:audio/...;base64,... string from upstream]"
-                                ),
-                                metadata={
-                                    "status": "error",
-                                    "error": "missing_reference_audio_data_uri",
-                                    "filename": filename,
-                                },
-                            )
-                        ]
-                    stored_ref = audio_payload_uri
-                    namespace = (user_id, assistant_id, "reference_audio")
-                    await store.aput(
-                        namespace,
-                        key=assistant_id,
-                        value={"reference_audio_data": stored_ref},
-                    )
-
+            if not transcript:
                 doc = Document(
                     page_content=(
-                        "Reference audio from URL."
+                        "Reference audio uploaded."
                         if reference_audio
-                        else f"[Audio URL: {url}]"
+                        else f"[Audio: {filename} — transcription unavailable]"
                     ),
                     metadata={
                         "user_id": user_id,
+                        "creator_id": creator_id,
                         "assistant_id": assistant_id,
                         "created_at": datetime.now(tz=timezone.utc).isoformat(),
                         "processing_task_id": str(uuid4()),
                         "type": "audio",
                         "reference_audio": reference_audio,
                         "filename": filename,
-                        "vectorstore_acceptable": True,
+                        "namespace": "reference_audio",
+                        "vectorstore_acceptable": False,
                         "adapter_acceptable": False,
-                        "analysis_acceptable": True,
+                        "analysis_acceptable": False,
                     },
                 )
-                return [doc]
+                documents = [doc]
+            else:
+                transcript_media_item = {
+                    "type": "text",
+                    "content": transcript,
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "creator_id": creator_id,
+                        "source": "audio_transcription",
+                        "reference_audio": reference_audio,
+                    },
+                }
+
+                documents = await process_text_to_document(
+                    metadata=transcript_media_item["metadata"],
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=transcript_media_item,
+                )
+
+                for d in documents:
+                    d.metadata.setdefault("creator_id", creator_id)
+                    d.metadata.setdefault("audio_filename", filename)
+
+            if reference_audio and audio_payload_uri:
+                ref_namespace = (creator_id, assistant_id, "reference_audio")
+                await store.aput(
+                    ref_namespace,
+                    key=assistant_id,
+                    value={"reference_audio_data": audio_payload_uri, "document": doc.to_json()},
+                )
+
+            return documents
 
         # Handle video
         elif media_type == "video":

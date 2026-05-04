@@ -122,13 +122,11 @@ async def batch_index_documents_vectorstore(
             if doc.metadata.get("filename") is not None
         ]
 
-        # Ensure each document has a unique key:
-        _ = [
-            doc.metadata.update({"document_id":str(uuid.uuid4())})
-            for doc in 
-            vectorstore_documents_to_be_indexed
-            if (doc.metadata.get("document_id") is None) or (type(doc.metadata.get("document_id", []) is not str))
-        ]
+        # Ensure each document has a unique key (str document_id):
+        for doc in vectorstore_documents_to_be_indexed:
+            existing = doc.metadata.get("document_id")
+            if not isinstance(existing, str) or not existing:
+                doc.metadata["document_id"] = str(uuid.uuid4())
 
         # acquire keys
         insert_document_keys = [
@@ -149,7 +147,6 @@ async def batch_index_documents_vectorstore(
         logger.info(f"breakpoint before aadd documents")
 
         # create upload namespaces
-        namespaces = [(user_id, assistant_id, "document", filename) for filename in filenames]
         batch_put_ops = [PutOp(namespace=(user_id, assistant_id, doc.metadata.get("namespace","document") , doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"document":doc.to_json()}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
 
         num_successful_batch_uploads = 0

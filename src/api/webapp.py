@@ -79,6 +79,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from urllib.parse import urlparse
+def _slug(u: str) -> str:
+    path = urlparse(u).path or ""
+    return path.rsplit("/", 1)[-1] if path else "remote_media"
+
 
 def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     """Pick the last AIMessage from a LangGraph ``updates`` chunk (any node)."""
@@ -1619,10 +1624,12 @@ async def update_avatar_identity_with_media(
                 status_code=400, detail=f"Could not load assistant: {exc}"
             ) from exc
         assistant_meta = assistant.get("metadata") or {}
+        creator_id = assistant_meta.get("user_id") or user_id
 
         config = {
             "configurable": {
                 "user_id": user_id,
+                "creator_id": creator_id,
                 "user_ctx": {"name": None, "description": None},
                 "assistant_id": assistant_id,
                 "assistant_ctx": {
@@ -1663,12 +1670,6 @@ async def update_avatar_identity_with_media(
             )
 
         media_files: list = []
-
-        from urllib.parse import urlparse
-
-        def _slug(u: str) -> str:
-            path = urlparse(u).path or ""
-            return path.rsplit("/", 1)[-1] if path else "remote_media"
 
         if non_empty_files:
             uf = non_empty_files[0]
@@ -1969,7 +1970,8 @@ async def update_avatar_identity_with_media(
 
         store = app.state.store
 
-        # Import graph here to avoid circular imports
+        for entry in media_files:
+            entry.setdefault("creator_id", creator_id)
 
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
             workflow,
@@ -1977,7 +1979,6 @@ async def update_avatar_identity_with_media(
 
         process_media_graph_api_endpoint = workflow.compile(store=store)
 
-        # Prepare input state
         initial_state = {
             "media_files": media_files,
         }

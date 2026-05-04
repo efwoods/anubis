@@ -1028,7 +1028,6 @@ async def message_selected_avatar(
     stream: bool = Form(True),
     current_user: dict = Depends(get_current_user),
 ):
-
     langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()

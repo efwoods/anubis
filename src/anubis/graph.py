@@ -38,8 +38,9 @@ logger = logging.getLogger(__name__)
 
 from langchain.agents import create_agent
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk
 from langgraph.runtime import Runtime
+from langgraph.config import get_stream_writer
 
 from src.anubis.utils.model import init_model
 from src.anubis.utils.state import GlobalState
@@ -57,7 +58,7 @@ from langgraph.prebuilt import ToolNode
 
 from pydantic import Field
 
-from src.anubis.utils.nodes import load_consciousness
+from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
 
 
 from src.anubis.utils.utility import (
@@ -91,6 +92,20 @@ identity_tools = [
 from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 
 """ NODES """
+
+
+def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
+    """Merge streamed chunks into a single AIMessage for graph state."""
+    if isinstance(full, AIMessage):
+        return full
+    return AIMessage(
+        content=full.content,
+        additional_kwargs=dict(full.additional_kwargs or {}),
+        response_metadata=dict(full.response_metadata or {}),
+        id=full.id,
+        tool_calls=list(full.tool_calls or []),
+        invalid_tool_calls=list(full.invalid_tool_calls or []),
+    )
 
 
 async def message_interface(
@@ -211,7 +226,11 @@ async def think(
     messages = state["system_message"] + state["messages"] + state["internal_thoughts"]
 
     # TODO: response_metrics_aggregation
-    response = await avatar_model_with_tools.ainvoke(input=messages)
+    merged: AIMessageChunk | AIMessage | None = None
+    async for chunk in avatar_model_with_tools.astream(messages):
+        merged = chunk if merged is None else merged + chunk
+    assert merged is not None
+    response = _coalesce_ai_message(merged)
     avatar_response_content = getattr(response, "content")
     logger.info(f"Avatar Model Response: {avatar_response_content}")
     return {"internal_thoughts": [response]}
@@ -296,7 +315,15 @@ async def respond(
 
     avatar_model = init_model(model_without_tools=False)
     # TODO: response_metrics_aggregation
-    avatar_response = await avatar_model.ainvoke(messages)
+    writer = get_stream_writer()
+    merged: AIMessageChunk | AIMessage | None = None
+    async for chunk in avatar_model.astream(messages):
+        merged = chunk if merged is None else merged + chunk
+        delta = chunk.content
+        if isinstance(delta, str) and delta:
+            writer({"type": "assistant_token", "text": delta})
+    assert merged is not None
+    avatar_response = _coalesce_ai_message(merged)
 
     # TODO: CALCULATE TOKEN USAGE response['response_metadata']
 
@@ -305,6 +332,12 @@ async def respond(
     # response = await avatar.ainvoke(input={"messages": messages})
     # avatar_response = response.get("messages", [])[-1]
     # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
+
+
+    from transformers import pipeline
+    classifier = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base")
+    sentiment = classifier(avatar_response.content)
+    avatar_response.response_metadata.update({"sentiment":{"emotion": sentiment[0]["label"], 'score': sentiment[0]["score"]}})
 
     result = {"messages": [avatar_response]}
 
@@ -350,10 +383,14 @@ response_only_workflow = StateGraph(
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
 response_only_workflow.add_node("chat", message_interface)
+response_only_workflow.add_node(
+    "resolve_human_message_images", resolve_human_message_images
+)
 response_only_workflow.add_node("anubis", response_graph)
 
 response_only_workflow.add_edge(START, "chat")
-response_only_workflow.add_edge("chat", "anubis")
+response_only_workflow.add_edge("chat", "resolve_human_message_images")
+response_only_workflow.add_edge("resolve_human_message_images", "anubis")
 response_only_workflow.add_edge("anubis", END)
 
 """ END OF REPSONSE ONLY FOR API ENDPOINT """
@@ -412,10 +449,14 @@ message_workflow = StateGraph(
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
+message_workflow.add_node(
+    "resolve_human_message_images", resolve_human_message_images
+)
 message_workflow.add_node("anubis", anubis)
 
 message_workflow.add_edge(START, "chat")
-message_workflow.add_edge("chat", "anubis")
+message_workflow.add_edge("chat", "resolve_human_message_images")
+message_workflow.add_edge("resolve_human_message_images", "anubis")
 message_workflow.add_edge("anubis", END)
 
 graph = message_workflow.compile()

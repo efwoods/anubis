@@ -1,4 +1,5 @@
 # src/anubis/webapp.py
+import json
 import os
 import re
 from typing import List
@@ -17,8 +18,7 @@ import httpx
 
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
-from langchain_core.messages import HumanMessage
-from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
+from langchain_core.messages import AIMessage, HumanMessage
 from src.anubis.utils.context import GlobalContext
 from psycopg_pool import AsyncConnectionPool
 
@@ -32,7 +32,6 @@ from uuid import uuid4
 import base64
 import tempfile
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import HumanMessage
 
 
 # Prometheus metrics
@@ -62,7 +61,7 @@ from src.security.auth import (
     get_current_user_or_anonymous_user,
 )
 
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from pydantic import BaseModel
 from typing import Any
@@ -80,10 +79,91 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Must match Form(default=...) on /message and /message/{assistant_id} for image-only uploads.
-_DEFAULT_MESSAGE_FORM_TEXT = (
-    "Hey! Please tell me about yourself and what you can do for me."
-)
+from urllib.parse import urlparse
+def _slug(u: str) -> str:
+    path = urlparse(u).path or ""
+    return path.rsplit("/", 1)[-1] if path else "remote_media"
+
+
+def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
+    """Pick the last AIMessage from a LangGraph ``updates`` chunk (any node)."""
+    last_ai: AIMessage | None = None
+    for _node, v in payload.items():
+        if not isinstance(v, dict):
+            continue
+        msgs = v.get("messages")
+        if not msgs:
+            continue
+        tail = msgs[-1]
+        if isinstance(tail, AIMessage):
+            last_ai = tail
+    return last_ai
+
+
+async def message_graph_sse(
+    graph,
+    human_message: HumanMessage,
+    config: dict,
+    context: GlobalContext,
+    *,
+    thread_id: str,
+    user_id: str,
+    assistant_id: str,
+    conversation_title_value: str | None,
+    start_time_ns: int,
+    request_id: str,
+    langgraph_client_headers: dict,
+):
+    """Stream assistant tokens (SSE) then a final ``done`` event with full metadata."""
+    accumulated_chunks: list[str] = []
+    last_ai: AIMessage | None = None
+
+    async for item in graph.astream(
+        input={"messages": [human_message]},
+        config=config,
+        context=context,
+        stream_mode=["custom", "updates"],
+        subgraphs=True,
+    ):
+        if not isinstance(item, tuple) or len(item) != 3:
+            continue
+        _ns, mode, payload = item
+        if mode == "custom" and isinstance(payload, dict):
+            if payload.get("type") == "assistant_token":
+                accumulated_chunks.append(payload.get("text") or "")
+                yield f"data: {json.dumps(payload)}\n\n"
+        elif mode == "updates" and isinstance(payload, dict):
+            ai = _latest_ai_from_stream_update(payload)
+            if ai is not None:
+                last_ai = ai
+
+    thread_metadata = {
+        "thread_metadata": {
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "conversation_title": conversation_title_value,
+        },
+        "graph_id": "Anubis",
+    }
+    langgraph_client = get_client(headers=langgraph_client_headers)
+    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+
+    content = (
+        last_ai.content
+        if last_ai is not None
+        else "".join(accumulated_chunks)
+    )
+    done: dict = {
+        "type": "done",
+        "content": content,
+        "thread_id": thread_id,
+        "request_id": request_id,
+        "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
+    }
+    if last_ai is not None and getattr(last_ai, "response_metadata", None):
+        done["response_metadata"] = last_ai.response_metadata
+    yield f"data: {json.dumps(done, default=str)}\n\n"
 
 
 class MessagePayload(BaseModel):
@@ -829,18 +909,23 @@ async def select_avatar(
 
 async def process_files_for_message(
     files: Optional[List[UploadFile]] = None,
-) -> tuple[str, list[tuple[str, str]]]:
-    """Process uploaded files for message endpoints.
+    message: str = "",
+) -> tuple:
+    """Process uploaded files and return content for inclusion in messages.
 
     Returns:
-        (non_image_text, images) where images is a list of (data URL, filename) for
-        each uploaded image, in upload order.
+        tuple: (text_content, multimodal_content, image_filenames)
+        - text_content: str - concatenated text from text files (non-image)
+        - multimodal_content: list or None - multimodal content (text + image blocks)
+        - image_filenames: filenames for each image block, in order
     """
     if not files:
-        return "", []
+        return "", None, []
 
-    text_contents: list[str] = []
-    images: list[tuple[str, str]] = []
+    text_contents = []
+    multimodal_parts = []
+    image_filenames: List[str] = []
+    has_images = False
 
     for file in files:
         try:
@@ -851,7 +936,13 @@ async def process_files_for_message(
             if content_type.startswith("image/"):
                 base64_image = base64.b64encode(content).decode("utf-8")
                 image_url = f"data:{content_type};base64,{base64_image}"
-                images.append((image_url, filename))
+
+                multimodal_parts.append(
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                )
+                image_filenames.append(filename)
+                has_images = True
+                text_contents.append(f"[Image: {filename}]")
 
             elif content_type.startswith("text/") or content_type == "application/pdf":
                 # Handle text files and PDFs
@@ -908,67 +999,36 @@ async def process_files_for_message(
             logger.error(f"Error processing file {file.filename}: {e}")
             text_contents.append(f"[Error processing file: {file.filename}]")
 
+    # Combine text content (file-derived only; caller message is merged below for images)
     combined_text = "\n\n".join(text_contents) if text_contents else ""
-    return combined_text, images
 
+    # Return multimodal content if images are present
+    if has_images:
+        text_segments = []
+        if (message or "").strip():
+            text_segments.append(message.strip())
+        if combined_text:
+            text_segments.append(combined_text)
+        full_text = "\n\n".join(text_segments)
+        multimodal_content = [{"type": "text", "text": full_text}] + multimodal_parts
+        return combined_text, multimodal_content, image_filenames
 
-async def build_text_message_with_image_descriptions(
-    message: str,
-    file_text_content: str,
-    images: list[tuple[str, str]],
-) -> str:
-    """Turn uploaded images into text via ImageDescriptionClass and merge with user text."""
-    image_blocks: list[str] = []
-    if images:
-        describer = ImageDescriptionClass()
-        for image_url, filename in images:
-            try:
-                meta = await describer.describe(image_url, filename)
-                image_blocks.append(f"[Image: {filename}]\n{meta['description']}")
-                model_name = meta.get("model_name") or "image_description"
-                MODEL_TOKENS_TOTAL.labels(model=model_name, type="prompt").inc(
-                    meta.get("input_tokens", 0)
-                )
-                MODEL_TOKENS_TOTAL.labels(model=model_name, type="completion").inc(
-                    meta.get("output_tokens", 0)
-                )
-                MODEL_COST_TOTAL.labels(model=model_name).inc(meta.get("total_cost", 0.0))
-            except Exception as e:
-                logger.exception("Image description failed for %s", filename)
-                image_blocks.append(
-                    f"[Image: {filename}]\n[Image could not be described: {e}]"
-                )
-
-    has_images = len(images) > 0
-    user_part = message.strip()
-    if has_images and user_part == _DEFAULT_MESSAGE_FORM_TEXT:
-        user_part = ""
-
-    sections: list[str] = []
-    if user_part:
-        sections.append(user_part)
-    if image_blocks:
-        sections.append("\n\n".join(image_blocks))
-    if file_text_content.strip():
-        sections.append(file_text_content.strip())
-    return "\n\n".join(sections)
+    return combined_text, None, []
 
 
 @app.post("/message")
 async def message_selected_avatar(
     request: Request,
-    message: str = Form(
-        "Hey! Please tell me about yourself and what you can do for me."
-    ),
+    message: str = Form(""),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = Form(None),
+    stream: bool = Form(True),
     current_user: dict = Depends(get_current_user),
 ):
 
-    logger.info("breakpoint update")
     langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
@@ -1014,19 +1074,57 @@ async def message_selected_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    file_text_content, images = await process_files_for_message(files)
-    human_message_content = await build_text_message_with_image_descriptions(
-        message, file_text_content, images
+    # Process any uploaded files
+    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
+        files, message=message
     )
-    human_message = HumanMessage(content=human_message_content)
+
+    # Create the human message content
+    if multimodal_content:
+        human_message = HumanMessage(
+            id=str(uuid4()),
+            content=multimodal_content,
+            additional_kwargs={"image_filenames": image_filenames},
+        )
+    else:
+        # Use text-only content
+        if file_text_content:
+            if (message or "").strip():
+                human_message_content = message.strip() + "\n\n" + file_text_content
+            else:
+                human_message_content = file_text_content
+        else:
+            human_message_content = message
+        human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
+
+    if stream:
+        return StreamingResponse(
+            message_graph_sse(
+                graph,
+                human_message,
+                config,
+                app.state.context,
+                thread_id=thread_id,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                conversation_title_value=conversation_title,
+                start_time_ns=start_time,
+                request_id=request.state.request_id,
+                langgraph_client_headers=langgraph_client_headers,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     result = await graph.ainvoke(
         input={"messages": [human_message]},
         config=config,
         context=app.state.context,
     )
-
-    logger.info(f"{result}")
 
     # Update most_recent_message
     langgraph_client = get_client(headers=langgraph_client_headers)
@@ -1058,18 +1156,16 @@ async def message_selected_avatar(
 async def message_avatar(
     request: Request,
     assistant_id: str,
-    message: str = Form(
-        "Hey! Please tell me about yourself and what you can do for me."
-    ),
+    message: str = Form(""),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = Form(None),
+    stream: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
 
-    logger.info("breakpoint")
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1136,11 +1232,55 @@ async def message_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    file_text_content, images = await process_files_for_message(files)
-    human_message_content = await build_text_message_with_image_descriptions(
-        message, file_text_content, images
+    # Process any uploaded files
+    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
+        files, message=message
     )
-    human_message = HumanMessage(content=human_message_content)
+
+    # Create the human message content
+    if multimodal_content:
+        human_message = HumanMessage(
+            id=str(uuid4()),
+            content=multimodal_content,
+            additional_kwargs={"image_filenames": image_filenames},
+        )
+    else:
+        # Use text-only content
+        if file_text_content:
+            if (message or "").strip():
+                human_message_content = message.strip() + "\n\n" + file_text_content
+            else:
+                human_message_content = file_text_content
+        else:
+            human_message_content = message
+        human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
+
+    conversation_title_data = (
+        conversation_title if conversation_title != "" else thread_id
+    )
+
+    if stream:
+        return StreamingResponse(
+            message_graph_sse(
+                graph,
+                human_message,
+                config,
+                app.state.context,
+                thread_id=thread_id,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                conversation_title_value=conversation_title_data,
+                start_time_ns=start_time,
+                request_id=request.state.request_id,
+                langgraph_client_headers=langgraph_client_headers,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     result = await graph.ainvoke(
         input={"messages": [human_message]},
@@ -1148,14 +1288,7 @@ async def message_avatar(
         context=app.state.context,
     )
 
-    logger.info(f"{result}")
-
     # Update most_recent_message
-    if conversation_title != "":
-        conversation_title_data = conversation_title
-    else:
-        conversation_title_data = thread_id
-
     langgraph_client = get_client(headers=langgraph_client_headers)
     thread_metadata = {
         "thread_metadata": {
@@ -1490,10 +1623,12 @@ async def update_avatar_identity_with_media(
                 status_code=400, detail=f"Could not load assistant: {exc}"
             ) from exc
         assistant_meta = assistant.get("metadata") or {}
+        creator_id = assistant_meta.get("user_id") or user_id
 
         config = {
             "configurable": {
                 "user_id": user_id,
+                "creator_id": creator_id,
                 "user_ctx": {"name": None, "description": None},
                 "assistant_id": assistant_id,
                 "assistant_ctx": {
@@ -1534,12 +1669,6 @@ async def update_avatar_identity_with_media(
             )
 
         media_files: list = []
-
-        from urllib.parse import urlparse
-
-        def _slug(u: str) -> str:
-            path = urlparse(u).path or ""
-            return path.rsplit("/", 1)[-1] if path else "remote_media"
 
         if non_empty_files:
             uf = non_empty_files[0]
@@ -1840,7 +1969,8 @@ async def update_avatar_identity_with_media(
 
         store = app.state.store
 
-        # Import graph here to avoid circular imports
+        for entry in media_files:
+            entry.setdefault("creator_id", creator_id)
 
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
             workflow,
@@ -1848,7 +1978,6 @@ async def update_avatar_identity_with_media(
 
         process_media_graph_api_endpoint = workflow.compile(store=store)
 
-        # Prepare input state
         initial_state = {
             "media_files": media_files,
         }
@@ -1894,9 +2023,7 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
         )
     results = {}
     namespace = (user_id, assistant_id)
-    all_namespaces = await langgraph_sdk_client.store.list_namespaces(
-        namespace, limit=1000000
-    )
+
     all_document_items = await langgraph_sdk_client.store.search_items(
         namespace, limit=1000000
     )
@@ -1913,8 +2040,15 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
-    token = current_user["API_KEY"]
-    langgraph_sdk_client = get_client(headers={"API-KEY": f"{token}"})
+
+    # Remove any special characters from the source document name
+    source_document_name = source_document_name.strip("\"")
+    source_document_name = source_document_name.strip("\`")
+    source_document_name = source_document_name.strip("\'")
+    source_document_name = source_document_name.strip("")
+
+    source_document_name = source_document_name.strip()
+
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]
@@ -1929,8 +2063,25 @@ async def delete_avatar_documents(
 
     pool = app.state.pool
 
-    SQL_STORE_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s"""
-    SQL_STORE_VECTOR_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
+    # LangGraph store: prefix = namespace tuple dot-joined (see langgraph/store/postgres/base.py).
+    # Match either chunk keys built from the filename prefix, or reference_* namespaces
+    # (reference_image, reference_audio, …) where the serialized LangChain Document holds the
+    # basename under value.document.kwargs.metadata.filename (same path as list_documents).
+    # Rows removed from store CASCADE-delete matching store_vectors embeddings.
+    SQL_DELETE_DOCUMENT_QUERY = """
+DELETE FROM store
+WHERE (
+    prefix = %s
+    OR prefix LIKE %s
+    OR prefix LIKE %s
+    OR prefix LIKE %s
+)
+OR (
+    prefix LIKE %s
+    AND value #>> '{document,kwargs,metadata,filename}' = %s
+)
+"""
+    total_deleted = 0
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -1939,15 +2090,23 @@ async def delete_avatar_documents(
                     f"{user_id}.{assistant_id}.{source_document_name}.%",
                     f"{user_id}.{assistant_id}.%.{source_document_name}",
                     f"{user_id}.{assistant_id}.%.{source_document_name}.%",
+                    f"{user_id}.{assistant_id}.reference_%",
+                    source_document_name,
                 )
-                await cur.execute(SQL_STORE_DELETE_QUERY, params)
-                await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
-
-        return JSONResponse(
-            content=f"Successfully deleted: {source_document_name}", status_code=200
-        )
-    except Exception as e:
+                await cur.execute(SQL_DELETE_DOCUMENT_QUERY, params)
+                total_deleted += cur.rowcount if cur.rowcount is not None else 0
+    except Exception:
         raise HTTPException(detail="Error deleting documents.", status_code=500)
+
+    if total_deleted == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stored rows matched document: {source_document_name}",
+        )
+
+    return JSONResponse(
+        content=f"Successfully deleted: {source_document_name}", status_code=200
+    )
 
 
 if __name__ == "__main__":

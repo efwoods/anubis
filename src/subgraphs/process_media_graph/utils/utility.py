@@ -32,6 +32,7 @@ def _sniff_image_mime_from_bytes(chunk: bytes) -> Optional[str]:
 
 async def extract_personality_from_image(
     image_data: str,
+    reference_image: bool,
     filename: str,
     store: BaseStore,
     user_id: str,
@@ -61,7 +62,7 @@ async def extract_personality_from_image(
             "reference_image_data", None
         )
 
-    if reference_image_data:
+    if reference_image_data and not reference_image:
         image_to_target_textual_description_payload = [
             SystemMessage(content=MULTI_IMAGE_PROMPT),
             {

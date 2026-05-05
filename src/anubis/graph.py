@@ -49,7 +49,8 @@ from src.anubis.utils.utility import format_docs
 
 from langgraph.store.base import BaseStore
 
-from langchain_core.messages.utils import trim_messages, count_tokens_approximately
+from src.anubis.utils.tokenizer import count_tokens
+
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware

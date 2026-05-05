@@ -1027,8 +1027,15 @@ async def message_selected_avatar(
     files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = Form(None),
     stream: bool = Form(True),
+    feedback: bool = Form(False),
+    like: bool = Form(False),
+    dislike: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
+    # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
+    # data-collection / preference-learning pipeline is intentionally deferred
+    # while the upload + evaluation pipeline ships first; the parameters exist
+    # now so the frontend can wire its UI without a breaking API change later.
     langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
@@ -1163,8 +1170,15 @@ async def message_avatar(
     files: Optional[List[UploadFile]] = File(None),
     thread_id: Optional[str] = Form(None),
     stream: bool = Form(True),
+    feedback: bool = Form(False),
+    like: bool = Form(False),
+    dislike: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
+    # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
+    # data-collection / preference-learning pipeline is intentionally deferred
+    # while the upload + evaluation pipeline ships first; the parameters exist
+    # now so the frontend can wire its UI without a breaking API change later.
 
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()

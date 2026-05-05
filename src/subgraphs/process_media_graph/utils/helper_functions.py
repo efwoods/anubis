@@ -6,12 +6,16 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
-from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.messages.utils import count_tokens
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
 from src.anubis.utils.classes.ContentSituationClassificationClass import (
     ContentSituationClassificationClass,
+)
+from src.anubis.utils.classes.FactRewriterClass import FactRewriterClass
+from src.anubis.utils.classes.FirstPersonRewriterClass import (
+    FirstPersonRewriterClass,
 )
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
@@ -54,7 +58,7 @@ def normal_chunking(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=separators,
-        length_function=count_tokens_approximately,
+        length_function=count_tokens,
         is_separator_regex=False,
     )
 
@@ -256,6 +260,7 @@ def _build_quote_documents_per_line(
                 "namespace": "quote",
                 "vectorstore_acceptable": True,
                 "adapter_acceptable": True,
+                "synthetic": False,
             },
         )
         doc.metadata.update(source_metadata)
@@ -266,6 +271,307 @@ def _build_quote_documents_per_line(
 
     for d in documents:
         d.metadata.update({"total_chunks": idx})
+
+    return documents
+
+
+async def _build_identity_documents_from_facts(
+    facts: List[dict],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+) -> List[Document]:
+    """Run FirstPersonRewriter over rewritten facts and emit identity Documents.
+
+    Each output Document is one first-person identity statement with full
+    provenance preserved in metadata: original_statement (verbatim source),
+    extracted_fact (atomic fact), rewritten_statement (lawsuit-safer
+    third-person phrasing), first_person_statement (final identity content),
+    source (filename or URL the fact came from), and
+    ``synthetic=True`` because an LLM produced the wording.
+
+    The identity-namespace embed field (``document.kwargs.page_content``) is
+    the first-person statement, so retrieval at chat time finds these as
+    primary self-knowledge of the avatar.
+    """
+    if not facts:
+        return []
+
+    rewritten_inputs: List[str] = [
+        (f.get("rewritten_statement") or "").strip() for f in facts
+    ]
+    rewriter = FirstPersonRewriterClass()
+    rewriter_response = await rewriter.rewrite(rewritten_inputs)
+    statements = rewriter_response.get("statements") or []
+
+    item_metadata = media_item.get("metadata", {}) or {}
+    filename = item_metadata.get("filename", "")
+    filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
+    source = item_metadata.get("source") or filename or "user_upload"
+    creator_id = item_metadata.get("creator_id") or user_id
+    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+
+    documents: List[Document] = []
+    for idx, fact in enumerate(facts):
+        if idx >= len(statements):
+            break
+        stmt = statements[idx] or {}
+        first_person = (stmt.get("first_person_statement") or "").strip()
+        if not first_person:
+            continue
+        doc = Document(
+            page_content=first_person,
+            metadata={
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "creator_id": creator_id,
+                "created_at": current_timestamp,
+                "processing_task_id": str(uuid4()),
+                "source": source,
+                "type": "text",
+                "filename": filename,
+                "filename_uuid5": filename_uuid5,
+                "document_id": str(uuid4()),
+                "namespace": "identity",
+                "vectorstore_acceptable": True,
+                "adapter_acceptable": False,
+                "analysis_acceptable": False,
+                "classified_situation": "biographical_facts",
+                "synthetic": True,
+                "original_statement": fact.get("original_statement", ""),
+                "extracted_fact": fact.get("extracted_fact", ""),
+                "rewritten_statement": fact.get("rewritten_statement", ""),
+                "first_person_statement": first_person,
+                "fact_evidence": fact.get("preserves_meaning_evidence", ""),
+                "first_person_evidence": stmt.get("preserves_meaning_evidence", ""),
+            },
+        )
+        documents.append(doc)
+    return documents
+
+
+async def _build_biographical_identity_documents(
+    text_content: str,
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str] = None,
+) -> List[Document]:
+    """Run FactRewriter then FirstPersonRewriter and emit identity Documents."""
+    extractor = FactRewriterClass()
+    fact_response = await extractor.extract(
+        input_str=_classification_slice(text_content),
+        target_name=target_name,
+    )
+    facts = fact_response.get("facts") or []
+    return await _build_identity_documents_from_facts(
+        facts,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        media_item=media_item,
+    )
+
+
+def _build_target_quote_documents_from_dialogue(
+    dialogue_segments: List[Dict[str, Any]],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str],
+) -> List[Document]:
+    """One Document per target turn in a diarized dialogue (verbatim)."""
+    item_metadata = media_item.get("metadata", {}) or {}
+    filename = item_metadata.get("filename", "")
+    filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
+    source = item_metadata.get("source") or filename or "user_upload"
+    creator_id = item_metadata.get("creator_id") or user_id
+    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+
+    documents: List[Document] = []
+    target_segments = [
+        seg for seg in dialogue_segments if seg.get("is_target") and (seg.get("text") or "").strip()
+    ]
+    total = len(target_segments)
+    for idx, seg in enumerate(target_segments):
+        text = (seg.get("text") or "").strip()
+        documents.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "creator_id": creator_id,
+                    "created_at": current_timestamp,
+                    "processing_task_id": str(uuid4()),
+                    "source": source,
+                    "type": "text",
+                    "chunk_index": idx,
+                    "total_chunks": total,
+                    "filename": filename,
+                    "filename_uuid5": filename_uuid5,
+                    "document_id": str(uuid4()),
+                    "namespace": "quote",
+                    "vectorstore_acceptable": True,
+                    "adapter_acceptable": True,
+                    "analysis_acceptable": True,
+                    "classified_situation": "dialogue",
+                    "synthetic": False,
+                    "speaker": seg.get("speaker"),
+                    "is_target": True,
+                    "target_name": target_name,
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                },
+            )
+        )
+    return documents
+
+
+def _build_adapter_dialogue_document(
+    dialogue_segments: List[Dict[str, Any]],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str],
+) -> Optional[Document]:
+    """One adapter-namespace Document holding the role-converted conversation."""
+    if not dialogue_segments:
+        return None
+
+    role_messages: List[Dict[str, str]] = []
+    for seg in dialogue_segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        role = "assistant" if seg.get("is_target") else "user"
+        if role_messages and role_messages[-1]["role"] == role:
+            role_messages[-1]["content"] = role_messages[-1]["content"] + "\n" + text
+        else:
+            role_messages.append({"role": role, "content": text})
+
+    if not any(m["role"] == "assistant" for m in role_messages):
+        return None
+
+    item_metadata = media_item.get("metadata", {}) or {}
+    filename = item_metadata.get("filename", "")
+    filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
+    source = item_metadata.get("source") or filename or "user_upload"
+    creator_id = item_metadata.get("creator_id") or user_id
+    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+
+    speakers_seen = sorted({seg.get("speaker") for seg in dialogue_segments if seg.get("speaker")})
+
+    return Document(
+        page_content=json.dumps({"messages": role_messages}, ensure_ascii=False),
+        metadata={
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "creator_id": creator_id,
+            "created_at": current_timestamp,
+            "processing_task_id": str(uuid4()),
+            "source": source,
+            "type": "adapter_conversation",
+            "filename": filename,
+            "filename_uuid5": filename_uuid5,
+            "document_id": str(uuid4()),
+            "namespace": "adapter",
+            "vectorstore_acceptable": False,
+            "adapter_acceptable": True,
+            "analysis_acceptable": False,
+            "classified_situation": "dialogue",
+            "synthetic": False,
+            "target_name": target_name,
+            "speakers": speakers_seen,
+            "messages": role_messages,
+        },
+    )
+
+
+async def process_dialogue_json_to_documents(
+    dialogue_payload: Dict[str, Any],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+) -> List[Document]:
+    """Convert a diarized dialogue JSON into Documents across three namespaces.
+
+    Outputs:
+      * Target quote Documents (one per target turn, verbatim) under
+        ``quote`` namespace with timestamps.
+      * One adapter conversation Document under ``adapter`` namespace
+        containing the full role-converted exchange (target → assistant,
+        others → user, consecutive same-role turns concatenated).
+      * Identity Documents under ``identity`` namespace, produced by scanning
+        the entire transcript for biographical facts about the target via
+        :class:`FactRewriterClass` + :class:`FirstPersonRewriterClass`. If
+        nothing is said about the target, no identity Documents are emitted.
+
+    ``dialogue_payload`` shape:
+        {
+            "segments": [
+                {"speaker": "<label>", "is_target": bool, "text": str,
+                 "start": float, "end": float},
+                ...
+            ],
+            "target_name": Optional[str],
+            "speakers": Optional[List[dict]],
+        }
+    """
+    segments: List[Dict[str, Any]] = list(
+        dialogue_payload.get("segments") or []
+    )
+    target_name = dialogue_payload.get("target_name")
+
+    documents: List[Document] = []
+
+    # Target turns under ``quote`` (verbatim).
+    documents.extend(
+        _build_target_quote_documents_from_dialogue(
+            segments,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            media_item=media_item,
+            target_name=target_name,
+        )
+    )
+
+    # Full role-converted dialogue under ``adapter``.
+    adapter_doc = _build_adapter_dialogue_document(
+        segments,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        media_item=media_item,
+        target_name=target_name,
+    )
+    if adapter_doc is not None:
+        documents.append(adapter_doc)
+
+    # Scan whole transcript for biographical facts about the target.
+    transcript_text = "\n".join(
+        f"{seg.get('speaker') or 'unknown'}: {(seg.get('text') or '').strip()}"
+        for seg in segments
+        if (seg.get("text") or "").strip()
+    )
+    if transcript_text.strip():
+        try:
+            identity_docs = await _build_biographical_identity_documents(
+                text_content=transcript_text,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+                target_name=target_name,
+            )
+            documents.extend(identity_docs)
+        except Exception as exc:
+            logger.warning(
+                "Biographical fact extraction over dialogue transcript failed: %s",
+                exc,
+            )
 
     return documents
 
@@ -282,9 +588,17 @@ async def process_text_to_document(
     Routing rules:
         * Reference (menu / holy text) -> ``document`` namespace, full chunked text.
         * Biographical/conversational -> ``ContentSituationClassification``:
-            - ``tweets_or_quotes`` -> one Document per line under ``quote``.
-            - ``monologue`` / ``presentation`` / ``dialogue`` -> chunk under ``quote``.
-            - ``biographical_facts`` -> chunk under ``identity``.
+            - ``biographical_facts`` -> FactRewriter then FirstPersonRewriter,
+              one identity Document per first-person statement with full
+              provenance metadata (original_statement, extracted_fact,
+              rewritten_statement, first_person_statement, synthetic=True).
+            - ``tweets_or_quotes`` -> one verbatim Document per line under
+              ``quote``.
+            - ``monologue`` / ``presentation`` -> verbatim chunked Document(s)
+              under ``quote``.
+            - ``dialogue`` -> caller is expected to supply diarized JSON via
+              :func:`process_dialogue_json_to_documents`. The text branch here
+              falls back to chunking under ``quote`` (best-effort).
         * ``namespace_hint`` overrides reference/biographical when supplied
           (e.g. predetermined identity content from images).
     """
@@ -354,6 +668,35 @@ async def process_text_to_document(
         target_namespace,
     )
 
+    # Biographical facts: extract atomic facts, lawsuit-safer rewrite, then
+    # convert to first person. Each first-person statement becomes one
+    # identity Document with full provenance preserved in metadata.
+    if classified_situation == "biographical_facts" and namespace_hint is None:
+        try:
+            documents = await _build_biographical_identity_documents(
+                text_content=text_content,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+                target_name=target_name,
+            )
+            for document in documents:
+                document.metadata.update(
+                    {
+                        "classification_reasoning": situation_reasoning,
+                        "reference_classification_reasoning": reference_reasoning,
+                        "is_menu_or_religious_text": False,
+                    }
+                )
+            return documents
+        except Exception as exc:
+            logger.warning(
+                "biographical_facts rewriter pipeline failed (%s); "
+                "falling back to chunked identity Documents",
+                exc,
+            )
+            # Fall through to chunked path so we still capture content.
+
     item_metadata = media_item.get("metadata", {}) or {}
     explicit_quotes_per_line = bool(item_metadata.get("quotes_per_line"))
     quotes_per_line_detected = (
@@ -390,6 +733,7 @@ async def process_text_to_document(
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": classified_situation
                     in ("monologue", "presentation", "tweets_or_quotes", "dialogue"),
+                    "synthetic": False
                 }
             )
 

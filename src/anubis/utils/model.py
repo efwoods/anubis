@@ -22,7 +22,7 @@ from typing import Literal
 from pydantic import BaseModel, field_validator, Field
 from typing import Optional
 
-from langchain_core.messages.utils import count_tokens_approximately
+from src.anubis.utils.tokenizer import count_tokens
 import json 
 
 # TODO: identify all model call token usage
@@ -199,14 +199,14 @@ def init_image_description_model():
 
 
 async def calculate_token_usage_description_model(model_structured_output_response: any, input_str: str):
-    from langchain_core.messages.utils import count_tokens_approximately
+    from src.anubis.utils.tokenizer import count_tokens    
     class TokenUsage(TypedDict):
         prompt_tokens: int
         total_tokens: int
         completion_tokens: int
 
-    input_tokens = count_tokens_approximately(input_str)
-    completion_tokens = sum([count_tokens_approximately(str(value)) for value in model_structured_output_response.model_dump().values()])
+    input_tokens = count_tokens(input_str)
+    completion_tokens = sum([count_tokens(str(value)) for value in model_structured_output_response.model_dump().values()])
     total_tokens = input_tokens + completion_tokens
 
     token_usage = TokenUsage(prompt_tokens=input_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
@@ -244,7 +244,7 @@ class AsyncLlamaAPIClientWrapper:
 
       if self.pydantic_model is not None:
           if self.pydantic_model.__name__ == "TextualSituationalAwareness":
-              approximate_message_length = count_tokens_approximately(formatted_messages[1]['content'])
+              approximate_message_length = count_tokens(formatted_messages[1]['content'])
               if approximate_message_length > 4000:
                   formatted_messages[1]['content'] = formatted_messages[1]['content'][:4000] # truncate messages for situational analysis classification
       

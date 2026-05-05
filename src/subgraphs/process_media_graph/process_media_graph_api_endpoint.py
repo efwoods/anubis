@@ -15,32 +15,39 @@ from src.anubis.utils.context import GlobalContext
 
 from src.subgraphs.process_media_graph.utils.nodes import (
     convert_media_list_to_text_document,
+    maybe_build_or_refresh_profile,
+    process_adapter_documents,
+    process_uploaded_files_and_label_media_type,
 )
 
 from src.subgraphs.vector_store_graph.index_graph import index_docs
-from src.subgraphs.process_media_graph.utils.nodes import process_uploaded_files_and_label_media_type
 
 # Define the Graph & Context
 workflow = StateGraph(
     state_schema=GlobalState, 
     context_schema=GlobalContext
 )
+
 # Add Nodes
 workflow.add_node("process_uploaded_files", process_uploaded_files_and_label_media_type)
 workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_text_document)
-# workflow.add_node("analyze_documents", analyze_documents)
-# workflow.add_node("process_adapter_documents", process_adapter_documents)
+workflow.add_node("process_adapter_documents", process_adapter_documents)
 workflow.add_node("index_docs", index_docs)
+workflow.add_node("maybe_build_or_refresh_profile", maybe_build_or_refresh_profile)
+
 # Define Edges
 workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
-# workflow.add_edge("convert_media_list_to_text_document", "analyze_documents")
-# workflow.add_edge("analyze_documents", "index_docs")
 
-# workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
-# workflow.add_edge("process_adapter_documents", "__end__")
-
+# After classification: write quote+identity into the vector store and write
+# adapter rows to disk in parallel branches, then build profiles once both
+# have settled.
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
+workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
+
+workflow.add_edge("index_docs", "maybe_build_or_refresh_profile")
+workflow.add_edge("process_adapter_documents", "maybe_build_or_refresh_profile")
+workflow.add_edge("maybe_build_or_refresh_profile", END)
 
 process_media_graph_api_endpoint = workflow.compile()
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"

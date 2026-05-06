@@ -310,7 +310,8 @@ async def process_uploaded_files_and_label_media_type(
                 'text/plain', 
             'application/json', 
             'text/markdown', 
-            'application/octet-stream'
+            'application/octet-stream', 
+            'text/csv'
             ]:
                 # Handle text files — prefer webapp base64_encoded_str (full data URI)
                 if suffix == '.txt':
@@ -724,6 +725,87 @@ async def process_media_item_task(
                 d.metadata.setdefault("creator_id", creator_id)
             return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
+            content = media_item.get('content')
+
+            # CSV preprocessing in webapp.py emits ``{"statements": [...]}``
+            # where each statement is the avatar-identity contract shape:
+            # ``{"messages": [{"role": "assistant", "content": "..."}],
+            #    "metadata": {"target": "...", "source": "..."}}``.
+            # Treat these as quote-namespace Documents so they feed both
+            # retrieval and adapter training, with per-statement target /
+            # source metadata flowing to each Document.
+            if (
+                isinstance(content, dict)
+                and isinstance(content.get("statements"), list)
+            ):
+                final_documents: List[Document] = []
+                base_metadata = dict(media_item.get('metadata') or {})
+                for statement in content["statements"]:
+                    if not isinstance(statement, dict):
+                        continue
+                    stmt_messages = statement.get("messages") or []
+                    stmt_meta_raw = statement.get("metadata") or {}
+                    statement_metadata = dict(base_metadata)
+                    statement_metadata.update(
+                        {k: v for k, v in stmt_meta_raw.items() if v is not None}
+                    )
+                    target_name = (
+                        stmt_meta_raw.get("target")
+                        or statement_metadata.get("target")
+                        or statement_metadata.get("target_name")
+                    )
+                    if target_name:
+                        statement_metadata["target_name"] = target_name
+                    source_label = (
+                        stmt_meta_raw.get("source")
+                        or statement_metadata.get("source")
+                        or statement_metadata.get("filename")
+                    )
+                    if source_label:
+                        statement_metadata["source"] = source_label
+
+                    classification_metadata = {
+                        "classified_situation": "tweets_or_quotes",
+                        "classification_reasoning": (
+                            "csv_preprocessed_avatar_identity_statements"
+                        ),
+                        "quotes_per_line": True,
+                        "target_name": target_name,
+                    }
+
+                    for message in stmt_messages:
+                        if not isinstance(message, dict):
+                            continue
+                        text = (message.get("content") or "").strip()
+                        if not text:
+                            continue
+                        statement_media_item = {
+                            "type": "json",
+                            "content": text,
+                            "metadata": statement_metadata,
+                        }
+                        documents = await process_text_media_item_target_for_vectorstore(
+                            media_item=statement_media_item,
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                            classification_metadata=classification_metadata,
+                            use_semantic_chunks=False,
+                            namespace="quote",
+                        )
+                        for document in documents:
+                            document.metadata.update(
+                                {
+                                    "vectorstore_acceptable": True,
+                                    "adapter_acceptable": True,
+                                    "analysis_acceptable": False,
+                                    "synthetic": False,
+                                    "creator_id": creator_id,
+                                }
+                            )
+                            final_documents.append(document)
+                return final_documents
+
+            # Existing single-conversation shape: ``{"messages": [...]}``
             classification_metadata = {
                 "classified_situation": "conversation_facts",
                 "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
@@ -733,17 +815,17 @@ async def process_media_item_task(
             for message in messages:
                 media_item['content'] = message['content']
                 documents = await process_text_media_item_target_for_vectorstore(
-                    media_item=media_item, 
-                    user_id=user_id, 
+                    media_item=media_item,
+                    user_id=user_id,
                     assistant_id=assistant_id,
                     classification_metadata=classification_metadata,
                     use_semantic_chunks=False
                 )
 
-                for document in documents: 
+                for document in documents:
                             document.metadata.update({"vectorstore_acceptable": True})
                             final_documents.append(document)
-                
+
             return final_documents
         # Handle URLs - YouTube subs/audio, articles, tweets, linktrees.
         elif media_type == "url":
@@ -1301,7 +1383,7 @@ async def process_adapter_documents(
         llm_single_turn_dataset,
     )
 
-    out_dir = Path("data") / (assistant_id or "unknown_assistant")
+    out_dir = Path("data") + "/" + (assistant_id or "unknown_assistant")
     out_dir.mkdir(parents=True, exist_ok=True)
     adapter_jsonl = out_dir / "adapter_training.jsonl"
     langsmith_jsonl = out_dir / "langsmith_eval_dataset.jsonl"
@@ -1407,7 +1489,7 @@ async def process_adapter_documents(
 # Profile build trigger node
 # ---------------------------------------------------------------------------
 
-async def maybe_build_or_refresh_profile(
+async def build_stylistic_fingerprint(
     state: GlobalState,
     runtime: Runtime[GlobalContext],
     config: RunnableConfig,
@@ -1421,7 +1503,7 @@ async def maybe_build_or_refresh_profile(
     delegates to them; the corpus is touched only here, never at evaluation
     time.
     """
-    logger.info("maybe_build_or_refresh_profile NODE")
+    logger.info("build_stylistic_fingerprint NODE")
     try:
         user_id, assistant_id = await extract_user_id_assistant_id(config)
     except Exception as exc:

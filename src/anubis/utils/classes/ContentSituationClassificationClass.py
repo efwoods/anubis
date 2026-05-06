@@ -1,7 +1,7 @@
 from src.anubis.utils.schema import ContentSituationClassification, CONTENT_SITUATION_CLASSIFICATION_SYSTEM_PROMPT
 from langchain_core.messages import HumanMessage, SystemMessage
 from src.anubis.utils.model import init_model
-from langchain_core.messages.utils import count_tokens
+from src.anubis.utils.tokenizer import count_tokens
 from time import time_ns
 import json
 from src.anubis.utils.context import GlobalContext

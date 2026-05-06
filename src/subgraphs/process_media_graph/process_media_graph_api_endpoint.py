@@ -15,7 +15,7 @@ from src.anubis.utils.context import GlobalContext
 
 from src.subgraphs.process_media_graph.utils.nodes import (
     convert_media_list_to_text_document,
-    maybe_build_or_refresh_profile,
+    build_stylistic_fingerprint,
     process_adapter_documents,
     process_uploaded_files_and_label_media_type,
 )
@@ -33,7 +33,7 @@ workflow.add_node("process_uploaded_files", process_uploaded_files_and_label_med
 workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_text_document)
 workflow.add_node("process_adapter_documents", process_adapter_documents)
 workflow.add_node("index_docs", index_docs)
-workflow.add_node("maybe_build_or_refresh_profile", maybe_build_or_refresh_profile)
+workflow.add_node("build_stylistic_fingerprint", build_stylistic_fingerprint)
 
 # Define Edges
 workflow.add_edge(START, "process_uploaded_files")
@@ -44,10 +44,15 @@ workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document
 # have settled.
 workflow.add_edge("convert_media_list_to_text_document", "index_docs")
 workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
+# workflow.add_edge("convert_media_list_to_text_document", "analyze_documents")
 
-workflow.add_edge("index_docs", "maybe_build_or_refresh_profile")
-workflow.add_edge("process_adapter_documents", "maybe_build_or_refresh_profile")
-workflow.add_edge("maybe_build_or_refresh_profile", END)
+# workflow.add_edge("index_docs", "build_stylistic_fingerprint")
+
+# workflow.add_edge("process_adapter_documents", "build_stylistic_fingerprint")
+# workflow.add_edge("build_stylistic_fingerprint", "analyze_documents")
+
+# workflow.add_edge("build_stylistic_fingerprint", END)
+workflow.add_edge("index_docs", END)
 
 process_media_graph_api_endpoint = workflow.compile()
 process_media_graph_api_endpoint.name = "process_media_graph_api_endpoint"

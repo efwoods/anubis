@@ -104,15 +104,6 @@ _PER_LINE_SYSTEM_PROMPT = (
     "('you', 'your'). Return only the question."
 )
 
-_LIST_SYSTEM_PROMPT = (
-    "Given this list of assistant responses, generate one user prompt per "
-    "response that the response would naturally answer. THERE MUST BE EXACTLY "
-    "ONE QUESTION FOR EACH RESPONSE AND THE QUESTION ORDER MUST MATCH THE "
-    "RESPONSE ORDER. The questions must be succinct, must NOT restate the "
-    "response, and must NOT add new facts."
-)
-
-
 async def generate_question_for_message(message_str: str) -> str:
     """Generate a single user prompt for a single assistant response.
 

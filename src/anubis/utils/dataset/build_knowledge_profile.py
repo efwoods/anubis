@@ -140,10 +140,10 @@ async def maybe_build_knowledge_profile(
                 "kind": "identity",
                 "synthetic": bool(meta.get("synthetic", True)),
                 "original_statement": meta.get("original_statement"),
-                "extracted_fact": meta.get("extracted_fact"),
                 "rewritten_statement": meta.get("rewritten_statement"),
                 "first_person_statement": meta.get("first_person_statement")
                 or item["page_content"],
+                "target_name": meta.get("target_name"),
                 "source": meta.get("original_source") or meta.get("source"),
                 "filename": meta.get("filename"),
                 "store_key": item.get("store_key"),

@@ -6,7 +6,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
-from langchain_core.messages.utils import count_tokens
+from src.anubis.utils.tokenizer import count_tokens
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
@@ -281,15 +281,20 @@ async def _build_identity_documents_from_facts(
     user_id: str,
     assistant_id: str,
     media_item: Dict[str, Any],
+    original_statement: str = "",
+    target_name: Optional[str] = None,
 ) -> List[Document]:
     """Run FirstPersonRewriter over rewritten facts and emit identity Documents.
 
     Each output Document is one first-person identity statement with full
-    provenance preserved in metadata: original_statement (verbatim source),
-    extracted_fact (atomic fact), rewritten_statement (lawsuit-safer
-    third-person phrasing), first_person_statement (final identity content),
-    source (filename or URL the fact came from), and
-    ``synthetic=True`` because an LLM produced the wording.
+    provenance preserved in metadata: original_statement (the verbatim
+    source text the fact rewriter saw — appended in code by
+    :class:`FactRewriterClass`), rewritten_statement (lawsuit-safer
+    third-person phrasing produced by the model), first_person_statement
+    (final identity content produced by :class:`FirstPersonRewriterClass`),
+    source (filename or URL the fact came from), target_name (caller hint
+    appended in code), and ``synthetic=True`` because an LLM produced the
+    wording.
 
     The identity-namespace embed field (``document.kwargs.page_content``) is
     the first-person statement, so retrieval at chat time finds these as
@@ -309,7 +314,6 @@ async def _build_identity_documents_from_facts(
     filename = item_metadata.get("filename", "")
     filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
     source = item_metadata.get("source") or filename or "user_upload"
-    creator_id = item_metadata.get("creator_id") or user_id
     current_timestamp = datetime.now(tz=timezone.utc).isoformat()
 
     documents: List[Document] = []
@@ -325,7 +329,6 @@ async def _build_identity_documents_from_facts(
             metadata={
                 "user_id": user_id,
                 "assistant_id": assistant_id,
-                "creator_id": creator_id,
                 "created_at": current_timestamp,
                 "processing_task_id": str(uuid4()),
                 "source": source,
@@ -339,12 +342,9 @@ async def _build_identity_documents_from_facts(
                 "analysis_acceptable": False,
                 "classified_situation": "biographical_facts",
                 "synthetic": True,
-                "original_statement": fact.get("original_statement", ""),
-                "extracted_fact": fact.get("extracted_fact", ""),
+                "original_statement": original_statement,
                 "rewritten_statement": fact.get("rewritten_statement", ""),
-                "first_person_statement": first_person,
-                "fact_evidence": fact.get("preserves_meaning_evidence", ""),
-                "first_person_evidence": stmt.get("preserves_meaning_evidence", ""),
+                "target_name": target_name,
             },
         )
         documents.append(doc)
@@ -371,6 +371,8 @@ async def _build_biographical_identity_documents(
         user_id=user_id,
         assistant_id=assistant_id,
         media_item=media_item,
+        original_statement=fact_response.get("original_statement", ""),
+        target_name=fact_response.get("target_name") or target_name,
     )
 
 

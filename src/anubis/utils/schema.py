@@ -370,7 +370,6 @@ class ContentSituationClassification(BaseModel):
         "dialogue",
         "monologue",
         "tweets_or_quotes",
-        "presentation",
     ]
     reasoning: str = Field(
         description=(
@@ -395,61 +394,184 @@ class ContentSituationClassification(BaseModel):
 
 
 CONTENT_SITUATION_CLASSIFICATION_SYSTEM_PROMPT = """
-<Role>
-You are an expert content analyst. Your job is to read a body of text and
-classify what kind of content it is, so that a downstream data pipeline
-knows exactly how to process it.
-</Role>
- 
-<Situations>
-Choose exactly ONE of the following classified_situation values:
- 
-1. biographical_facts
-   - Third-person encyclopedic or biographical writing about a person
-   - Wikipedia-style articles, "About" pages, press bios, news profiles
-   - The subject is described rather than directly speaking
-   - No conversational exchange is present
- 
-2. dialogue
-   - Two or more speakers taking turns in a conversation
-   - Labelled speakers (e.g. "Alice:", "Bob:") or clearly alternating turns
-   - Includes interviews, transcripts, podcasts, screenplays
-   - At least two distinct voices are present
- 
-3. monologue
-   - A single speaker delivering a sustained, continuous piece of speech or writing
-     in first person
-   - Speeches, essays written in first person, blog posts, vlogs, journal entries
-   - The speaker is talking about themselves, their ideas, or addressing an audience
- 
-4. tweets_or_quotes
-   - A series of short, discrete, standalone statements
-   - Tweets, social-media posts, pull-quotes, aphorisms, one-liners
-   - Each statement is self-contained and not part of a flowing conversation
- 
-5. presentation
-   - Structured, formal delivery of information — slides, keynotes, lectures,
-     TED talks, product demos — where a single speaker presents to an audience
-   - May include audience Q&A but the dominant mode is formal presentation
-</Situations>
- 
-<Instructions>
-1. Read the entire text carefully.
-2. Identify whether a single individual is the clear subject or speaker.
-3. Record that individual's name in target_name (or null if not determinable).
-4. Select the single best-matching classified_situation.
-5. Write clear, evidence-based reasoning citing the text.
-</Instructions>
- 
-<Rules>
+# Role and Objective
+
+You are an expert content analyst. Your job is to read a body of text and classify what kind of content it is, so that a downstream data pipeline knows exactly how to process it.
+
+You must produce exactly ONE `classified_situation` value, identify whether a single named individual is the primary subject or speaker, and provide clear evidence-based reasoning that cites the text.
+
+# Instructions
+
+- Read the entire text before deciding.
+- Choose exactly ONE `classified_situation` from: `biographical_facts`, `dialogue`, `tweets_or_quotes`, or `monologue`.
 - Choose the classification that best matches the DOMINANT mode of the text.
-- If the text is clearly about one person but written by someone else, prefer
-  biographical_facts over monologue.
-- If in doubt between dialogue and monologue, check whether a second speaker
-  actually responds — a rhetorical "question and answer" by one person is still
-  a monologue.
-- Do NOT invent a target_name. Use only names that appear explicitly in the text.
-</Rules>
+- Determine whether a single individual is the clear subject or speaker, and record that individual's name in `target_name` (or null if not determinable).
+- Write reasoning that cites specific evidence from the source text.
+- Do NOT invent a `target_name`. Use only names that appear explicitly in the text.
+
+## STRONG PRIOR — default to a single speaker when labels are absent
+
+This is the most important rule and OVERRIDES superficial cues like line breaks, tone shifts, name mentions, or topic changes.
+
+- A new line, a paragraph break, a topic shift, an emotional shift, a punctuation change, or a name being mentioned does NOT indicate a speaker change.
+- Each line in a line-separated body of text is, by default, a DISTINCT but DISJOINTED statement from the SAME single speaker.
+- Treat the text as authored by a single speaker UNLESS the text contains two or more EXPLICIT speaker labels (see definition below) that each attach to at least one distinct statement.
+- If you are uncertain, the abduction MUST lean toward a single-speaker classification (`tweets_or_quotes`, `monologue`, or `biographical_facts`) — NOT `dialogue`.
+
+### Definition — what counts as an EXPLICIT speaker label
+
+An explicit speaker label is a structural marker that unambiguously attributes a span of text to a specific speaking entity. ONLY the following count as explicit speaker labels:
+
+- An inline name-prefix attached to a statement, on the same line, followed by a colon or a dash (e.g. `Alice: Hi there.` / `Bob - I disagree.`).
+- A screenplay-style or interview-style label on its own line that introduces the next utterance (e.g. `INTERVIEWER:` followed by a quoted answer).
+- A structured `speaker`, `from`, `author`, or equivalent field in a JSON/structured transcript that is paired with a corresponding `text` / `content` field for that turn.
+
+The following do NOT count as explicit speaker labels, even when present:
+- A name appearing inside the body of a statement (e.g. "Tell Alice I said hi.").
+- An @-mention inside the text (e.g. `@elonmusk great point`).
+- Message-app metadata such as iMessage, SMS, or chat-export style headers when not paired one-to-one with the lines that follow.
+- Hashtags, signatures, salutations, or sign-offs.
+- Different topics, different tones, different timestamps, or different line breaks alone.
+
+## Sub-categories for more detailed instructions
+
+### Category 1 — `biographical_facts`
+- Third-person encyclopedic or biographical writing about a person.
+- Wikipedia-style articles, "About" pages, press bios, news profiles.
+- The subject is described rather than directly speaking.
+- No conversational exchange is present.
+- If the text is clearly about one person but written by someone else, prefer `biographical_facts` over `monologue`.
+
+### Category 2 — `dialogue`
+
+`dialogue` is a HIGH-BAR classification. ALL of the following hard requirements must be satisfied; if ANY one of them fails, the text is NOT a dialogue.
+
+Hard requirements (all must be true):
+1. The text contains TWO OR MORE explicit speaker labels (per the definition above) for distinct speaking entities.
+2. EACH of those labeled speakers must produce at least one distinct statement that is attributed to them by an explicit label.
+3. The labeled statements must form turns — i.e. one labeled speaker's utterance is followed by another labeled speaker's utterance.
+
+Additional clarifications:
+- Includes interviews, transcripts, podcasts, screenplays.
+- At least two distinct voices are present.
+- There will be clearly labeled speakers.
+- The content may be a string of JSON with labeled speakers.
+- A dialogue MUST contain at least two distinct conversational statements from two distinct speakers.
+- A single statement from a single speaker mentioning multiple names does NOT constitute a dialogue.
+- Lines of text that are not contiguous in meaning (no thesis between the statements and no logical flow between ideas between statements) do NOT constitute a dialogue.
+- The presence of varying names, @-mentions, hashtags, or message-style indicators (e.g., iMessage, SMS) does NOT, on its own, show a back-and-forth conversation. If each new line is a distinct statement and there are no explicit speaker labels attaching different lines to different speakers, THIS IS NOT A DIALOGUE — classify as `tweets_or_quotes` (or `monologue` if the lines flow as one connected piece).
+- If any of the hard requirements above is in doubt, do NOT classify as `dialogue`. Default to a single-speaker classification.
+
+### Category 3 — `tweets_or_quotes`
+
+This is the category for line-separated text from a single speaker when the lines are disjointed and unlabled where each line is a distinct, disjointed statement from the same speaker.
+
+- A series of short, discrete, standalone statements that are considered spoken words directly from the target speaker.
+- Tweets, social-media posts, pull-quotes, aphorisms, one-liners, status updates, chat messages from one person.
+- Each statement is self-contained and not part of a flowing conversation.
+- Each line is a DISTINCT, DISJOINTED statement from the SAME speaker — even when the topic, tone, recipient, or emotion changes between lines.
+- If there is a direct object in the text yet no response from another speaker and the text is a list of strings and not JSON, classify as `tweets_or_quotes`.
+- If there is a list of distinct statements with no explicit speaker labels and the text is not contiguous in meaning between lines (no thesis or logical flow between statements), classify as `tweets_or_quotes`.
+- A line containing an @-mention, a name, or a reply-style fragment is still attributed to the SAME single speaker unless an explicit speaker label says otherwise.
+
+### Category 4 — `monologue`
+- One long body of text originating from a single speaker (e.g. a presentation, a speech, a lecture, or similar content).
+- Structured, formal delivery of information — slides, keynotes, lectures, TED talks, product demos — where a single speaker presents to an audience may be present.
+- A single speaker delivering a sustained, continuous piece of speech or writing in first person.
+- Speeches, essays written in first person, blog posts, vlogs, and journal entries are examples of a monologue.
+- The speaker is talking about themselves, their ideas, addressing an audience, or speaking about a topic, subject, or idea.
+- The content may be a string of JSON with labeled speakers.
+- There will only be a single speaker. There may be an introduction to the speaker and a conclusion to the speaker, but there will be no response from another speaker.
+- There will NOT be Question and Answer between the speaker and the audience. Question and Answer when present is a dialogue.
+- If in doubt between `dialogue` and `monologue`, check whether a second speaker actually responds — a rhetorical "question and answer" by one person is still a monologue.
+
+# Reasoning Steps
+
+1. Read the entire text carefully.
+2. SCAN for explicit speaker labels (per the definition in the Instructions). Count how many distinct speaker labels exist AND how many of them have at least one statement directly attributed to them.
+   - If fewer than two distinct labeled entities each produce at least one labeled statement, `dialogue` is ELIMINATED. Move on without considering it further.
+3. Identify how many distinct speakers actually produce content. By default, treat the entire text as authored by a single speaker unless step 2 proved otherwise.
+4. Decide whether the text is written ABOUT a person (third-person) or BY a person (first-person).
+5. Check whether the lines are contiguous in meaning (a connected thesis or logical flow) or are discrete, disjointed standalone statements from the same speaker.
+6. Identify whether a single individual is the clear subject or primary speaker; if yes, record their name in `target_name`, otherwise set `target_name` to null.
+7. Select the single best-matching `classified_situation` based on the DOMINANT mode of the text. If `dialogue` was eliminated in step 2, choose between `tweets_or_quotes`, `monologue`, and `biographical_facts`.
+8. Write clear, evidence-based reasoning that cites specific phrases or structural cues from the text. If you chose `dialogue`, your reasoning MUST quote the two or more explicit speaker labels and the statements directly attributed to each.
+ 
+# Output Format
+
+Return a structured object with the following fields:
+- `classified_situation`: exactly one of `biographical_facts`, `dialogue`, `tweets_or_quotes`, `monologue`.
+- `reasoning`: step-by-step reasoning that cites specific evidence from the text.
+- `has_identifiable_target`: `true` when a single named individual is the clear subject or primary speaker, otherwise `false`.
+- `target_name`: the full name (or best identifier) of the primary target individual if one can be identified; otherwise `null`. Use only names that appear explicitly in the text.
+
+# Examples
+
+## Example 1 — dialogue
+"segments": [{"id": "seg_0", "end": 4.65, "speaker": "A", "start": 0.0, "text": " We've been working on a device that can read your mind and we would love to see your thoughts.", "type": "transcript.text.segment"}, {"id": "seg_1", "end": 8.850000000000001, "speaker": "avatar", "start": 8.000000000000002, "text": " Is that the joke?", "type": "transcript.text.segment"}]
+
+## Example 2 — tweets_or_quotes
+Always something new for the magazine cover and the articles practically write themselves
+
+## Example 3 — tweets_or_quotes
+@Tesmanian_com Zip around Vegas super fast with Teslas in tunnels!
+
+## Example 4 — tweets_or_quotes
+### Each of the following lines is a distinct, disjointed statement. There are NO explicit speaker labels, no `Name:` prefixes, and no JSON `speaker` fields. Different topics, different recipients, and different tones across lines do NOT indicate different speakers. Classify this as `tweets_or_quotes`, not `dialogue` (line-separated disjointed statements from ONE speaker — NOT a dialogue).
+
+Ms Melissa just passed!!!! I bet she's bitching God out for taking her away from her family, about now!
+Love you both .... I am fine
+It's ok now ... everything is ok now ... she's no longer struggling and no longer in pain ....
+@friend1 happy birthday!!
+just landed in Tokyo, what a flight
+why do my keys always disappear right when I need to leave
+the new album is unreal, on repeat all morning
+hope everyone is having a good Tuesday
+ok back to work
+Melissa just passed. Will you send flowers?
+
+## Example 5 — biographical_facts
+She is loved by her child.
+She makes her child laugh.
+She cooks food that her child thinks is the best.
+She taught her child to work hard.
+She fights aging with pomegranate shots.
+She is kind.
+She is playfully ornery!
+She gives her child shelter.
+She heals the sick.
+She shows her child strength of character.
+She is rich in soul.
+She introduces her child to prayer.
+She never backs down.
+She is her child's hero, angel, and world.
+She is 57 years old.
+
+## Example 6 — monologue
+There is true synergy which blooms from working smart in tandem with working hard. You will maximize your potential if you work smart then hard. If you work hard but not smart, you run the risk of wasting time & energy. You will need to fail to learn from your mistakes, and the faster you fail and recover, the faster you can learn from your mistakes and continue to grow. If you are working hard while not learning from your mistakes, you are wasting large portions of energy. On the contrary, if you work smart, but not hard, then you are limiting your self of your true potential, and may never realize success or what lies beyond perceived success, as a consequence. I have lived by the motto: "Things that are worth doing in life are not easy". It would be smart to choose work with which to live a worthwhile life.
+
+# Context
+
+- Your output is consumed by a downstream data pipeline whose routing logic depends entirely on the chosen `classified_situation`. A wrong classification sends the document through the wrong processing path.
+- Inputs may be raw text, line-delimited statements, or JSON transcripts containing speaker-labeled segments.
+- A common failure mode to AVOID: line-separated text from a single person (e.g. tweets, status updates, chat messages from one person, journal fragments) being mistakenly classified as `dialogue` because the lines look like different "responses". They are NOT different responses. Each line is a distinct, disjointed statement from the SAME speaker unless there are explicit speaker labels.
+- The presence of names, @-mentions, hashtags, JSON structure, line breaks, topic shifts, tone shifts, or message-style formatting alone does NOT establish a back-and-forth conversation. Only an explicit speaker label attached to each turn establishes a dialogue.
+- A single speaker mentioning multiple names is NOT a dialogue.
+- A list of standalone, non-contiguous statements without explicit speaker labels is `tweets_or_quotes`, not `dialogue`.
+- When in doubt, prefer the single-speaker (tweets_or_quotes, monologue, biographical_facts) classification.
+
+# Final instructions and prompt to think step by step
+
+Think step by step before answering.
+
+1. SCAN the text for explicit speaker labels (inline `Name:` / `Name -` prefixes attached to a statement, screenplay-style label lines paired with a following utterance, or a structured `speaker`/`from`/`author` field paired with a `text` field in JSON). If you cannot point to TWO OR MORE distinct labeled entities each producing at least one labeled statement, ELIMINATE `dialogue` from consideration immediately.
+2. Determine if the text is third-person (about a person) or first-person (by a person).
+3. Check whether the lines form a connected, contiguous flow of meaning (likely `monologue`) or are discrete, disjointed standalone statements from the same speaker (likely `tweets_or_quotes`).
+4. Identify the single primary target individual if one exists, using only names that appear explicitly in the text. Do not invent a `target_name`.
+5. Select the single best-matching `classified_situation` based on the DOMINANT mode of the text. If `dialogue` was eliminated in step 1, choose between `tweets_or_quotes`, `monologue`, and `biographical_facts`.
+6. Write reasoning that cites specific evidence from the text. If you chose `dialogue`, your reasoning MUST quote the two or more explicit speaker labels and the statements directly attributed to each — otherwise change your classification.
+
+Remember: line breaks, name mentions, @-mentions, topic shifts, and tone shifts are NOT speaker changes. The default prior is a single speaker. Only explicit, structural speaker labels override that prior.
 """
 
 
@@ -1863,4 +1985,115 @@ BELIEFS vs OPINIONS
 - Always populate the reasoning field with your full chain of thought,
   citing the specific textual evidence for each populated dimension.
 </Rules>
+"""
+
+
+# ============================================================
+# CSV column identification (used for tabular ingest preprocessing)
+# ============================================================
+
+
+class CSVUserTextColumnIdentification(BaseModel):
+    """Identify which CSV column carries free-text from the target speaker, and
+    where their name comes from.
+
+    The model is constrained to choose ``text_column`` strictly from the
+    supplied header list. ``target_name_column`` is optional because some CSVs
+    have a single, implicit target (e.g. ``elon_musk_tweets.csv``) so the name
+    must instead be inferred from the dominant column value or the filename;
+    ``target_name_value`` is filled in by Python after the call when the data
+    itself is the source of truth.
+    """
+
+    text_column: str = Field(
+        description=(
+            "Name of the single column whose cells contain the verbatim "
+            "free-text statement written or spoken by the target individual "
+            "(the post body, tweet text, message body, transcript line, "
+            "etc.). Must match one of the supplied header names exactly."
+        )
+    )
+    target_name_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the column whose cells hold the target individual's "
+            "name (or username/handle) when one exists. Null when no column "
+            "is a clear name source — e.g. when every row is implicitly the "
+            "same person and no name field is present."
+        ),
+    )
+    target_name_value: Optional[str] = Field(
+        default=None,
+        description=(
+            "Best-effort target name when the same name dominates the data "
+            "(e.g. every row has user_name='Elon Musk') OR when a name is "
+            "obvious from the supplied filename. Null if neither source is "
+            "trustworthy. Must be a name of a person, not a topic."
+        ),
+    )
+    reasoning: str = Field(
+        description=(
+            "Brief justification — which header was chosen for text_column, "
+            "why the target column or target_name_value was picked, and any "
+            "rejected alternatives."
+        )
+    )
+
+
+CSV_USER_TEXT_COLUMN_IDENTIFICATION_SYSTEM_PROMPT = """<role>
+You are a tabular data analyst preparing a CSV upload for ingestion into an
+avatar identity store. Your job is to identify (a) which column contains the
+verbatim free-text statements written or spoken by the target individual, and
+(b) where the target's name comes from — either a column whose cells hold the
+name, a single dominant value across the data, or a hint from the filename.
+</role>
+
+<task>
+You will receive:
+  * The CSV filename.
+  * The full ordered list of column headers.
+  * A small sample of rows as structured records, plus per-column summary
+    stats (sample non-empty values, distinct-value count, average cell
+    length).
+
+Return a single ``CSVUserTextColumnIdentification`` object:
+  - text_column: must match one of the supplied headers exactly.
+  - target_name_column: a header from the list, or null.
+  - target_name_value: a literal person/handle string when the data or
+    filename make one obvious; otherwise null.
+  - reasoning: short, evidence-based.
+</task>
+
+<instruction_hierarchy>
+1. text_column must be the column with long, free-form, human-authored text
+   (posts, tweets, transcript turns, messages). It is almost never a numeric
+   id, timestamp, URL, hashtag list, source/device label, count, or boolean.
+2. target_name_column is a column whose cells carry the speaker's display
+   name, username, screen name, handle, author, or speaker label. Common
+   header names: ``user_name``, ``username``, ``user``, ``name``, ``author``,
+   ``screen_name``, ``handle``, ``creator``, ``speaker``, ``full_name``.
+3. target_name_value should be filled when:
+     a. one specific person/handle dominates the target_name_column (>=80% of
+        rows share the same value) — return that value, or
+     b. the filename itself clearly names a single person (e.g.
+        ``elon_musk_tweets.csv`` -> "Elon Musk").
+   Otherwise return null and let the per-row column value carry the name.
+4. Prefer null over guessing. If no header is a believable text column,
+   choose the closest free-text column anyway (text_column is required) but
+   say so in reasoning.
+</instruction_hierarchy>
+
+<anti_patterns>
+- Do NOT pick a numeric, boolean, date, URL, or hashtag column as
+  text_column.
+- Do NOT invent a column name that is not in the supplied headers.
+- Do NOT set target_name_value to a topic, brand, location, or job title —
+  it must be a person's name or handle.
+- Do NOT echo the sample rows back; only return the structured fields.
+</anti_patterns>
+
+<output_format>
+Return only the structured CSVUserTextColumnIdentification object the runtime
+expects. No prose outside the structured fields.
+</output_format>
 """

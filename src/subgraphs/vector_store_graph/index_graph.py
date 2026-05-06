@@ -78,9 +78,6 @@ async def index_docs(
 
     docs = state['vectorstore_documents_to_be_indexed']
 
-    for doc in docs:
-        doc.metadata.setdefault("creator_id", creator_id)
-
     filenames = [doc.metadata.get("filename") for doc in docs]
     try:
         assert(len(filenames) == len(docs))

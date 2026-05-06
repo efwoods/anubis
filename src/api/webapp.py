@@ -1,4 +1,44 @@
 # src/anubis/webapp.py
+# region debug log
+import time as _dbg_time
+import json as _dbg_json
+import os as _dbg_os
+
+_DBG_T0 = _dbg_time.perf_counter()
+_DBG_LAST = _DBG_T0
+_DBG_LOG_PATH = _dbg_os.path.join(
+    _dbg_os.path.dirname(_dbg_os.path.dirname(_dbg_os.path.dirname(_dbg_os.path.abspath(__file__)))),
+    ".cursor",
+    "debug-4c0691.log",
+)
+
+
+def _dbg_log(message: str, hypothesisId: str = "", **data) -> None:
+    global _DBG_LAST
+    now = _dbg_time.perf_counter()
+    delta_ms = round((now - _DBG_LAST) * 1000, 1)
+    total_ms = round((now - _DBG_T0) * 1000, 1)
+    _DBG_LAST = now
+    payload = {
+        "sessionId": "4c0691",
+        "runId": data.pop("runId", "startup"),
+        "hypothesisId": hypothesisId,
+        "location": "src/api/webapp.py",
+        "message": message,
+        "data": {**data, "delta_ms": delta_ms, "total_ms": total_ms},
+        "timestamp": int(_dbg_time.time() * 1000),
+    }
+    try:
+        _dbg_os.makedirs(_dbg_os.path.dirname(_DBG_LOG_PATH), exist_ok=True)
+        with open(_DBG_LOG_PATH, "a") as _f:
+            _f.write(_dbg_json.dumps(payload) + "\n")
+    except Exception:
+        pass
+
+
+_dbg_log("module_import_begin", hypothesisId="B/C", phase="import")
+# endregion
+
 import json
 import os
 import re
@@ -31,7 +71,15 @@ from uuid import uuid4
 
 import base64
 import tempfile
+
+# region debug log
+_dbg_log("after_baseline_imports", hypothesisId="F", phase="import")
+# endregion
 from langchain_community.document_loaders import PyPDFLoader
+
+# region debug log
+_dbg_log("after_langchain_community_pypdf", hypothesisId="F", phase="import")
+# endregion
 
 
 # Prometheus metrics
@@ -52,6 +100,10 @@ from typing import Annotated, Optional
 from langgraph_sdk import get_client
 
 from src.anubis.graph import message_workflow, response_only_workflow
+
+# region debug log
+_dbg_log("after_anubis_graph_import", hypothesisId="B", phase="import")
+# endregion
 from src.security.auth import security_route
 from src.security.auth import get_current_user
 from src.security.auth import update_assistant_config
@@ -390,11 +442,23 @@ async def lifespan(app: FastAPI):
     global context
     global store_context_manager
 
+    # region debug log
+    _dbg_log("lifespan_begin", hypothesisId="H", phase="lifespan")
+    # endregion
+
     # Initialize context / context
     app.state.context = GlobalContext()
+
+    # region debug log
+    _dbg_log("after_GlobalContext_instantiate", hypothesisId="G", phase="lifespan")
+    # endregion
     app.state.httpx_client = httpx.AsyncClient()
     app.state.stripe = stripe
     app.state.stripe.api_key = app.state.context.stripe_secret_key
+
+    # region debug log
+    _dbg_log("after_context_httpx_stripe_init", phase="lifespan")
+    # endregion
 
     async_postgres_store_uri = app.state.context.async_postgres_store_uri
     logger.warning(f"app.state.context.dev: {app.state.context.dev}")
@@ -420,7 +484,14 @@ async def lifespan(app: FastAPI):
                 fields=["document.kwargs.page_content"],
             ),
         )
+
+        # region debug log
+        _dbg_log("after_AsyncPostgresStore_construct", hypothesisId="A", phase="lifespan")
+        # endregion
         await store.setup()
+        # region debug log
+        _dbg_log("after_store_setup", hypothesisId="A/D", phase="lifespan")
+        # endregion
         logger.info("Store setup complete")
         app.state.store = store
         checkpointer = AsyncPostgresSaver(app.state.pool)
@@ -440,6 +511,9 @@ async def lifespan(app: FastAPI):
         await pool.close()
 
 
+# region debug log
+_dbg_log("module_imports_complete", hypothesisId="H", phase="import")
+# endregion
 app = FastAPI(
     title="Neural Nexus API",
     description="LangGraph-based API",
@@ -1562,6 +1636,339 @@ def make_data_uri(mime: str, body: bytes) -> str:
     """RFC 2397 data URI: ``data:<mime>;base64,<payload>``."""
     return f"data:{mime};base64,{base64.b64encode(body).decode('ascii')}"
 
+
+# ---------------------------------------------------------------------------
+# CSV ingest preprocessing
+#
+# Tabular uploads are converted at the API edge into a JSON ``statements``
+# document so the rest of the pipeline only ever has to handle media types it
+# already knows about. Each CSV row becomes one statement with the shape
+# requested by the avatar-identity ingest contract:
+#
+#     {
+#         "messages": [{"role": "assistant", "content": "<row text>"}],
+#         "metadata": {"target": "<name>", "source": "<filename>"}
+#     }
+#
+# The text column and target name are picked once per upload by
+# ``CSVUserTextColumnIdentificationClass`` (model-driven, schema-constrained).
+# Detection happens HERE so the process_media graph never sees raw CSV bytes.
+# ---------------------------------------------------------------------------
+
+
+_CSV_MIME_HINTS = frozenset(
+    {
+        "text/csv",
+        "application/csv",
+        "application/vnd.ms-excel",
+        "application/x-csv",
+    }
+)
+_CSV_NAME_HINT_RE = re.compile(r"\b(user[_-]?name|user|name|author|screen[_-]?name|"
+                               r"handle|username|creator|speaker|full[_-]?name)\b",
+                               re.IGNORECASE)
+_CSV_BOOLEAN_VALUES = frozenset({"true", "false", "yes", "no", "0", "1"})
+_CSV_PREVIEW_ROW_LIMIT = 8
+_CSV_STATS_SAMPLE_VALUES = 3
+
+
+def _is_csv_upload(filename: str, content_type: str) -> bool:
+    """True when the upload looks like a CSV by MIME type or filename."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in _CSV_MIME_HINTS:
+        return True
+    name = (filename or "").strip().lower()
+    return name.endswith(".csv") or name.endswith(".tsv")
+
+
+def _decode_csv_bytes(raw: bytes) -> str:
+    """Decode CSV bytes preferring UTF-8, falling back to latin-1 then replace.
+
+    BOM is stripped because ``csv.reader`` treats it as part of the first
+    header otherwise.
+    """
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _parse_csv_to_rows(raw: bytes, filename: str) -> tuple[list[str], list[dict]]:
+    """Return ``(headers, rows)`` from CSV bytes.
+
+    Uses ``csv.Sniffer`` for delimiter detection (handles ``,`` and ``\\t``
+    files), falls back to comma when sniffing fails on tiny / malformed
+    samples. ``rows`` is a list of OrderedDicts keyed by header.
+    """
+    import csv as _csv
+    from io import StringIO
+
+    text = _decode_csv_bytes(raw)
+    if not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV upload {filename!r} is empty.",
+        )
+
+    sample = text[:8192]
+    dialect: Any
+    try:
+        dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
+    except _csv.Error:
+        dialect = _csv.excel
+        if filename.lower().endswith(".tsv"):
+            dialect = _csv.excel_tab
+
+    reader = _csv.DictReader(StringIO(text), dialect=dialect)
+    headers = list(reader.fieldnames or [])
+    if not headers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV upload {filename!r} has no header row.",
+        )
+    rows: list[dict] = []
+    for row in reader:
+        rows.append({h: (row.get(h) if row.get(h) is not None else "") for h in headers})
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV upload {filename!r} has no data rows.",
+        )
+    return headers, rows
+
+
+def _looks_numeric(value: str) -> bool:
+    v = value.strip()
+    if not v:
+        return False
+    try:
+        float(v.replace(",", ""))
+        return True
+    except ValueError:
+        return False
+
+
+def _build_csv_column_stats(
+    headers: list[str], rows: list[dict]
+) -> dict[str, dict[str, Any]]:
+    """Per-column summary used as model context for column identification."""
+    stats: dict[str, dict[str, Any]] = {}
+    total = len(rows)
+    for header in headers:
+        values = [str(r.get(header) or "").strip() for r in rows]
+        non_empty = [v for v in values if v]
+        non_empty_count = len(non_empty)
+        if non_empty_count == 0:
+            stats[header] = {
+                "non_empty_count": 0,
+                "non_empty_ratio": 0.0,
+                "avg_len": 0.0,
+                "max_len": 0,
+                "distinct_count": 0,
+                "distinct_ratio": 0.0,
+                "looks_numeric": False,
+                "looks_boolean": False,
+                "name_hint": bool(_CSV_NAME_HINT_RE.search(header or "")),
+                "sample_values": [],
+            }
+            continue
+        avg_len = sum(len(v) for v in non_empty) / non_empty_count
+        max_len = max(len(v) for v in non_empty)
+        distinct = sorted(set(non_empty), key=non_empty.index)
+        distinct_count = len(distinct)
+        looks_numeric = (
+            sum(1 for v in non_empty if _looks_numeric(v)) / non_empty_count
+        ) >= 0.9
+        looks_boolean = (
+            sum(1 for v in non_empty if v.lower() in _CSV_BOOLEAN_VALUES)
+            / non_empty_count
+        ) >= 0.9
+        stats[header] = {
+            "non_empty_count": non_empty_count,
+            "non_empty_ratio": non_empty_count / total if total else 0.0,
+            "avg_len": round(avg_len, 2),
+            "max_len": max_len,
+            "distinct_count": distinct_count,
+            "distinct_ratio": distinct_count / non_empty_count,
+            "looks_numeric": looks_numeric,
+            "looks_boolean": looks_boolean,
+            "name_hint": bool(_CSV_NAME_HINT_RE.search(header or "")),
+            "sample_values": distinct[:_CSV_STATS_SAMPLE_VALUES],
+        }
+    return stats
+
+
+def _csv_dominant_value(values: list[str]) -> tuple[Optional[str], float]:
+    """Return the dominant non-empty value and its share of non-empty rows."""
+    cleaned = [v for v in (s.strip() for s in values) if v]
+    if not cleaned:
+        return None, 0.0
+    counts: dict[str, int] = {}
+    for v in cleaned:
+        counts[v] = counts.get(v, 0) + 1
+    top_value, top_count = max(counts.items(), key=lambda kv: kv[1])
+    return top_value, top_count / len(cleaned)
+
+
+def _filename_target_hint(filename: str) -> str:
+    """Title-case a filename stem when it looks like a person's name slug."""
+    stem = (filename or "").rsplit(".", 1)[0]
+    stem = re.sub(r"[_\-]+", " ", stem).strip()
+    if not stem:
+        return ""
+    parts = [p for p in stem.split() if p and p.isalpha()]
+    if 1 <= len(parts) <= 4:
+        return " ".join(p.capitalize() for p in parts)
+    return ""
+
+
+async def _csv_to_statements_payload(
+    *, raw: bytes, source_filename: str
+) -> dict[str, Any]:
+    """Convert CSV bytes into the avatar-identity statements JSON document.
+
+    Output shape passed downstream to the JSON media handler:
+
+        {
+            "statements": [
+                {
+                    "messages": [{"role": "assistant", "content": "<text>"}],
+                    "metadata": {"target": "<name>", "source": "<filename>"}
+                },
+                ...
+            ],
+            "metadata": {
+                "target": "<dominant target name or null>",
+                "source": "<source_filename>",
+                "csv_text_column": "<column>",
+                "csv_target_column": "<column or null>",
+                "csv_row_count": <int>,
+                "csv_classifier_reasoning": "<llm reasoning>"
+            }
+        }
+    """
+    from src.anubis.utils.classes.CSVUserTextColumnIdentificationClass import (
+        CSVUserTextColumnIdentificationClass,
+    )
+
+    headers, rows = _parse_csv_to_rows(raw, source_filename)
+    column_stats = _build_csv_column_stats(headers, rows)
+
+    sample_rows = rows[:_CSV_PREVIEW_ROW_LIMIT]
+    classifier = CSVUserTextColumnIdentificationClass()
+    classifier_response = await classifier.classify(
+        filename=source_filename,
+        headers=headers,
+        sample_rows=sample_rows,
+        column_stats=column_stats,
+    )
+
+    text_column: str = classifier_response.get("text_column") or ""
+    if text_column not in headers:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Could not identify a text column in {source_filename!r}; "
+                "the CSV does not appear to contain a free-text column."
+            ),
+        )
+
+    target_column: Optional[str] = classifier_response.get("target_name_column")
+    target_name_value: Optional[str] = classifier_response.get("target_name_value")
+
+    dominant_target: Optional[str] = None
+    if target_column and target_column in headers:
+        candidate, share = _csv_dominant_value(
+            [str(r.get(target_column) or "") for r in rows]
+        )
+        if candidate and share >= 0.8:
+            dominant_target = candidate
+
+    if not target_name_value:
+        target_name_value = dominant_target or _filename_target_hint(source_filename)
+
+    statements: list[dict[str, Any]] = []
+    for row in rows:
+        text = str(row.get(text_column) or "").strip()
+        if not text:
+            continue
+        if target_column and target_column in headers:
+            row_target = str(row.get(target_column) or "").strip() or target_name_value
+        else:
+            row_target = target_name_value
+        statements.append(
+            {
+                "messages": [{"role": "assistant", "content": text}],
+                "metadata": {
+                    "target": row_target or None,
+                    "source": source_filename,
+                },
+            }
+        )
+
+    if not statements:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"CSV {source_filename!r} produced no non-empty rows in "
+                f"column {text_column!r}."
+            ),
+        )
+
+    return {
+        "statements": statements,
+        "metadata": {
+            "target": target_name_value or None,
+            "source": source_filename,
+            "csv_text_column": text_column,
+            "csv_target_column": target_column,
+            "csv_row_count": len(statements),
+            "csv_classifier_reasoning": classifier_response.get("reasoning", ""),
+        },
+    }
+
+
+def _build_csv_statements_media_entry(
+    *,
+    payload: dict[str, Any],
+    source_filename: str,
+    user_id: str,
+    assistant_id: str,
+    creator_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Render the CSV preprocessing payload as a JSON-typed media_files entry.
+
+    The downstream process_media_graph already routes ``application/json``
+    files with a ``.json`` suffix through the JSON handler in
+    ``process_media_graph/utils/nodes.py``, which now understands the
+    ``{"statements": [...]}`` shape produced by CSV preprocessing.
+    """
+    statements_blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    synthetic_filename = (
+        f"{source_filename.rsplit('.', 1)[0] or 'upload'}.statements.json"
+    )
+    metadata = payload.get("metadata") or {}
+    return {
+        "filename": synthetic_filename,
+        "content_type": "application/json",
+        "content": statements_blob,
+        "user_id": user_id,
+        "assistant_id": assistant_id,
+        "creator_id": creator_id or user_id,
+        "reference_audio": False,
+        "reference_image": False,
+        "base64_encoded_str": make_data_uri("application/json", statements_blob),
+        "csv_source_filename": source_filename,
+        "csv_target_name": metadata.get("target"),
+        "csv_text_column": metadata.get("csv_text_column"),
+        "csv_target_column": metadata.get("csv_target_column"),
+        "csv_row_count": metadata.get("csv_row_count"),
+    }
+
 @app.get("/avatar_reference_image")
 async def get_avatar_reference_image(
     request: Request,
@@ -1688,17 +2095,32 @@ async def update_avatar_identity_with_media(
             uf = non_empty_files[0]
             content = await uf.read()
             raw_name = uf.filename or "upload"
-            declared = (uf.content_type or "application/octet-stream").split(";")[
+            mime_type = (uf.content_type or "application/octet-stream").split(";")[
                 0
             ].strip().lower()
 
-            if reference_image:
-                if declared.startswith("audio/"):
+            if not reference_image and not reference_audio and _is_csv_upload(
+                raw_name, mime_type
+            ):
+                csv_payload = await _csv_to_statements_payload(
+                    raw=content, source_filename=raw_name
+                )
+                media_files.append(
+                    _build_csv_statements_media_entry(
+                        payload=csv_payload,
+                        source_filename=raw_name,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        creator_id=creator_id,
+                    )
+                )
+            elif reference_image:
+                if mime_type.startswith("audio/"):
                     raise HTTPException(
                         status_code=400,
                         detail="reference_image requires an image file, not audio.",
                     )
-                mime = validate_upload_image_bytes(declared, content)
+                mime = validate_upload_image_bytes(mime_type, content)
                 media_files.append(
                     {
                         "filename": raw_name,
@@ -1712,21 +2134,21 @@ async def update_avatar_identity_with_media(
                     }
                 )
             elif reference_audio:
-                if declared.startswith("image/"):
+                if mime_type.startswith("image/"):
                     raise HTTPException(
                         status_code=400,
                         detail="reference_audio requires an audio file, not an image.",
                     )
                 sniff = _sniff_media_category_from_bytes(content[:512])
-                effective = declared
-                if declared == "application/octet-stream":
+                effective = mime_type
+                if mime_type == "application/octet-stream":
                     if not sniff or not sniff.startswith("audio/"):
                         raise HTTPException(
                             status_code=400,
                             detail="Could not determine an audio type from the upload.",
                         )
                     effective = sniff
-                elif not declared.startswith("audio/"):
+                elif not mime_type.startswith("audio/"):
                     raise HTTPException(
                         status_code=400,
                         detail="reference_audio requires an audio Content-Type.",
@@ -1745,11 +2167,11 @@ async def update_avatar_identity_with_media(
                 )
             else:
                 sniff = _sniff_media_category_from_bytes(content[:512])
-                if declared.startswith("image/") or (
-                    declared == "application/octet-stream"
+                if mime_type.startswith("image/") or (
+                    mime_type == "application/octet-stream"
                     and sniff in ALLOWED_IMAGE_MIMES
                 ):
-                    mime = validate_upload_image_bytes(declared, content)
+                    mime = validate_upload_image_bytes(mime_type, content)
                     media_files.append(
                         {
                             "filename": raw_name,
@@ -1762,15 +2184,15 @@ async def update_avatar_identity_with_media(
                             "base64_encoded_str": make_data_uri(mime, content),
                         }
                     )
-                elif declared.startswith("audio/") or (
-                    declared == "application/octet-stream"
+                elif mime_type.startswith("audio/") or (
+                    mime_type == "application/octet-stream"
                     and sniff
                     and sniff.startswith("audio/")
                 ):
                     effective = (
-                        declared
-                        if declared.startswith("audio/")
-                        else (sniff or declared)
+                        mime_type
+                        if mime_type.startswith("audio/")
+                        else (sniff or mime_type)
                     )
                     if not effective.startswith("audio/"):
                         raise HTTPException(
@@ -1789,54 +2211,54 @@ async def update_avatar_identity_with_media(
                             "base64_encoded_str": make_data_uri(effective, content),
                         }
                     )
-                elif declared.startswith("video/"):
+                elif mime_type.startswith("video/"):
                     media_files.append(
                         {
                             "filename": raw_name,
-                            "content_type": declared,
+                            "content_type": mime_type,
                             "content": content,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
-                            "base64_encoded_str": make_data_uri(declared, content),
+                            "base64_encoded_str": make_data_uri(mime_type, content),
                         }
                     )
-                elif declared == "application/pdf":
+                elif mime_type == "application/pdf":
                     media_files.append(
                         {
                             "filename": raw_name,
-                            "content_type": declared,
+                            "content_type": mime_type,
                             "content": content,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
-                            "base64_encoded_str": make_data_uri(declared, content),
+                            "base64_encoded_str": make_data_uri(mime_type, content),
                         }
                     )
-                elif declared in (
+                elif mime_type in (
                     "text/plain",
                     "application/json",
                     "text/markdown",
                     "application/octet-stream",
-                ) or declared.startswith("text/"):
+                ) or mime_type.startswith("text/"):
                     media_files.append(
                         {
                             "filename": raw_name,
-                            "content_type": declared,
+                            "content_type": mime_type,
                             "content": content,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_audio": False,
                             "reference_image": False,
-                            "base64_encoded_str": make_data_uri(declared, content),
+                            "base64_encoded_str": make_data_uri(mime_type, content),
                         }
                     )
                 else:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Unsupported upload Content-Type {declared!r}.",
+                        detail=f"Unsupported upload Content-Type {mime_type!r}.",
                     )
 
         elif url_clean:
@@ -1884,7 +2306,24 @@ async def update_avatar_identity_with_media(
                 )
             else:
                 ct = await probe_remote_url_content_type(url_clean)
-                if ct.startswith("image/"):
+                if _is_csv_upload(slug or url_clean, ct):
+                    body, _header_ct = await fetch_remote_url_bytes(url_clean)
+                    csv_filename = slug if slug.endswith((".csv", ".tsv")) else (
+                        f"{slug or 'remote_table'}.csv"
+                    )
+                    csv_payload = await _csv_to_statements_payload(
+                        raw=body, source_filename=csv_filename
+                    )
+                    media_files.append(
+                        _build_csv_statements_media_entry(
+                            payload=csv_payload,
+                            source_filename=csv_filename,
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                            creator_id=creator_id,
+                        )
+                    )
+                elif ct.startswith("image/"):
                     body, header_ct = await fetch_remote_url_bytes(url_clean)
                     img_mime = validate_upload_image_bytes(header_ct, body)
                     media_files.append(
@@ -1982,6 +2421,69 @@ async def update_avatar_identity_with_media(
                     )
 
         store = app.state.store
+
+        # Refuse to re-process a file whose name already exists in this avatar's
+        # store namespace. The store layout ((creator_id, assistant_id, <category>))
+        # mirrors what /list_avatar_documents exposes; existing filenames are read
+        # from value.document.kwargs.metadata.filename. Duplicate uploads must be
+        # gated behind an explicit prior call to DELETE /delete_avatar_document so
+        # the operator confirms the destructive action and avoids duplicate index
+        # rows for the same source.
+        incoming_filenames: list[str] = [
+            (entry.get("filename") or "").strip() for entry in media_files
+        ]
+        incoming_filenames = [name for name in incoming_filenames if name]
+
+        if incoming_filenames:
+            try:
+                existing_items = await store.asearch(
+                    (creator_id, assistant_id), limit=1_000_000
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Could not verify whether this filename already exists "
+                        f"for the avatar: {exc}"
+                    ),
+                ) from exc
+
+            existing_filenames: set[str] = set()
+            for item in existing_items or []:
+                value = getattr(item, "value", None)
+                if value is None and isinstance(item, dict):
+                    value = item.get("value")
+                if not isinstance(value, dict):
+                    continue
+                document = value.get("document")
+                if not isinstance(document, dict):
+                    continue
+                kwargs_blob = document.get("kwargs")
+                if not isinstance(kwargs_blob, dict):
+                    continue
+                metadata = kwargs_blob.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                stored_filename = metadata.get("filename")
+                if isinstance(stored_filename, str) and stored_filename.strip():
+                    existing_filenames.add(stored_filename.strip())
+
+            duplicates = sorted(
+                {name for name in incoming_filenames if name in existing_filenames}
+            )
+            if duplicates:
+                duplicates_str = ", ".join(duplicates)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Filename already exists for this avatar and will not be "
+                        f"re-processed: {duplicates_str}. To upload a new version, "
+                        "first remove the existing file by calling "
+                        "DELETE /delete_avatar_document?source_document_name="
+                        "<filename> for each duplicate filename, then retry this "
+                        "request."
+                    ),
+                )
 
         for entry in media_files:
             entry.setdefault("creator_id", creator_id)

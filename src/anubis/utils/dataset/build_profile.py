@@ -87,7 +87,7 @@ async def maybe_build_stylistic_profile(
 
     Returns the (possibly newly written) profile dict, or ``None`` if a
     build was skipped. Callers can ignore the return value; this helper
-    exists primarily for the LangGraph node ``maybe_build_or_refresh_profile``.
+    exists primarily for the LangGraph node ``build_stylistic_fingerprint``.
     """
     if not creator_id or not assistant_id:
         logger.info("Skipping stylistic profile: missing creator/assistant id")

@@ -11,6 +11,10 @@ items the existing ``process_media_item_task`` can handle:
   media item per link (those re-enter this class on the next pass).
 * Tweet URL    → fetch with ``WebBaseLoader`` and tag with
   ``quotes_per_line=True`` so each line becomes one ``quote`` Document.
+* Instagram URL → fetch with ``WebBaseLoader`` and return as a single
+  complete-document text item (``quotes_per_line=False``).
+* Twitch URL   → fetch with ``WebBaseLoader`` and return as a single
+  complete-document text item (``quotes_per_line=False``).
 * Generic article URL → fetch with ``WebBaseLoader`` and return as plain text.
 
 Per workspace ``.cursorrules`` we surface env-var validation by instantiating
@@ -39,10 +43,16 @@ logger = logging.getLogger(__name__)
 _YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"})
 _TWITTER_HOSTS = frozenset({"twitter.com", "www.twitter.com", "x.com", "www.x.com", "mobile.twitter.com"})
 _LINKTREE_HOSTS = frozenset({"linktr.ee", "www.linktr.ee"})
+_INSTAGRAM_HOSTS = frozenset(
+    {"instagram.com", "www.instagram.com", "m.instagram.com"}
+)
+_TWITCH_HOSTS = frozenset(
+    {"twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"}
+)
 
 
 def _classify_url(url: str) -> str:
-    """Return a routing label: youtube / twitter / linktree / article."""
+    """Return a routing label: youtube / twitter / linktree / instagram / twitch / article."""
     try:
         host = (urlparse(url).hostname or "").lower()
     except Exception:
@@ -53,6 +63,10 @@ def _classify_url(url: str) -> str:
         return "twitter"
     if host in _LINKTREE_HOSTS:
         return "linktree"
+    if host in _INSTAGRAM_HOSTS:
+        return "instagram"
+    if host in _TWITCH_HOSTS:
+        return "twitch"
     return "article"
 
 
@@ -94,6 +108,16 @@ class URLDocumentLoaderClass:
                     assistant_id,
                     creator_id,
                     quotes_per_line=True,
+                    url_kind="twitter",
+                )
+            if kind in ("instagram", "twitch"):
+                return await self._load_article(
+                    url,
+                    user_id,
+                    assistant_id,
+                    creator_id,
+                    quotes_per_line=False,
+                    url_kind=kind,
                 )
             return await self._load_article(
                 url,
@@ -101,6 +125,7 @@ class URLDocumentLoaderClass:
                 assistant_id,
                 creator_id,
                 quotes_per_line=False,
+                url_kind="article",
             )
         except Exception as exc:  # pragma: no cover - logged for the operator
             logger.exception("URLDocumentLoaderClass.load failed for %s: %s", url, exc)
@@ -128,8 +153,15 @@ class URLDocumentLoaderClass:
         creator_id: Optional[str],
         *,
         quotes_per_line: bool,
+        url_kind: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch a generic article URL via ``WebBaseLoader``."""
+        """Fetch a generic article URL via ``WebBaseLoader``.
+
+        ``url_kind`` lets the caller tag the produced media item with the
+        original routing label (``twitter``, ``instagram``, ``twitch``,
+        ``article``). When omitted, falls back to the legacy behavior of
+        ``twitter`` for ``quotes_per_line=True`` and ``article`` otherwise.
+        """
         try:
             from langchain_community.document_loaders import WebBaseLoader
 
@@ -145,6 +177,9 @@ class URLDocumentLoaderClass:
         if not content:
             return []
 
+        resolved_url_kind = url_kind or (
+            "twitter" if quotes_per_line else "article"
+        )
         return [
             {
                 "type": "text",
@@ -156,7 +191,7 @@ class URLDocumentLoaderClass:
                     "assistant_id": assistant_id,
                     "creator_id": creator_id,
                     "quotes_per_line": quotes_per_line,
-                    "url_kind": "twitter" if quotes_per_line else "article",
+                    "url_kind": resolved_url_kind,
                 },
             }
         ]

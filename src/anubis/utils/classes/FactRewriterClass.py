@@ -3,10 +3,13 @@
 Pipeline shape:
 1. Caller passes a chunk of biographical/conversational text plus an optional
    ``target_name`` hint.
-2. The class returns a list of ``ExtractedFact`` objects, each with the
-   verbatim ``original_statement`` from the source, an atomic
-   ``extracted_fact``, a lawsuit-safer ``rewritten_statement``, and a short
-   evidence justification used by the audit trail metadata.
+2. The model returns a list of ``ExtractedFact`` objects, each carrying ONLY
+   a lawsuit-safer ``rewritten_statement``. Nothing else is asked of the model
+   so the structured-output schema stays minimal.
+3. AFTER the model call, the class wraps the response in a
+   ``RewrittenFactsWithProvenance`` container that appends the verbatim
+   ``original_statement`` (the caller's ``input_str``) and the ``target_name``
+   so provenance is added by Python and never invented by the model.
 
 Routing wired into ``process_text_to_document``:
 * ``classified_situation == "biographical_facts"`` → run this class, then run
@@ -22,7 +25,7 @@ from time import time_ns
 from typing import List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.messages.utils import count_tokens
+from src.anubis.utils.tokenizer import count_tokens
 from pydantic import BaseModel, Field
 
 from src.anubis.utils.context import GlobalContext
@@ -31,20 +34,38 @@ from src.anubis.utils.prompts.fact_rewriter_prompt import (
     FACT_REWRITER_SYSTEM_PROMPT,
 )
 
-
 class ExtractedFact(BaseModel):
-    """One atomic fact about the target with full provenance."""
+    """One atomic fact extracted from biographical source text — model output.
+
+    A single fact extracted from the source text. Given the source text, rewrite the statement. Do not exclude any facts. Inlude all information of the source text in the rewritten statement. Do not create any new facts. Do not change the meaning of the statement.
+    """
 
     rewritten_statement: str = Field(
         description=(
-            "Lawsuit-safer rephrasing of the original statement. Preserves "
-            "every fact, materially changes wording and sentence structure."
+            "A rephrasing of the original statement. A single fact extracted from the source text. Given the source text, rewrite the statement. Do not exclude any facts. Inlude all information of the source text in the rewritten statement. Do not create any new facts. Do not change the meaning of the statement. Preserves every fact, materially changes wording and sentence structure."
         )
     )
 
 
 class ExtractedAndRewrittenFacts(BaseModel):
-    """Container for the structured-output response."""
+    """Structured-output schema the LLM is constrained to return.
+
+    What it represents
+        The complete shape of one model reply: a list of
+        :class:`ExtractedFact` items, each with only a
+        ``rewritten_statement``. 
+
+    How it is used
+        * Passed to :func:`init_model` as ``response_format`` in
+          :method:`FactRewriterClass.__init__`, which forces the OpenAI-
+          compatible client to validate the model reply against this
+          schema.
+        * Returned by ``model.ainvoke`` inside
+          :method:`FactRewriterClass.extract`; its ``facts`` list is then
+          forwarded into a :class:`RewrittenFactsWithProvenance` so the
+          downstream pipeline gets both the rewrites and the verbatim
+          source text in a single object.
+    """
 
     facts: List[ExtractedFact] = Field(
         default_factory=list,
@@ -54,7 +75,32 @@ class ExtractedAndRewrittenFacts(BaseModel):
         ),
     )
 
+class RewrittenFactsWithProvenance(BaseModel):
+    """Post-call container produced by :class:`FactRewriterClass`.
 
+    Built by Python AFTER the model returns, so provenance is verbatim and
+    cannot be invented by the LLM. ``original_statement`` is the caller's
+    ``input_str`` and ``target_name`` is the caller-supplied target hint.
+    """
+
+    facts: List[ExtractedFact] = Field(
+        default_factory=list,
+        description="The model's lawsuit-safer rewrites, untouched.",
+    )
+    original_statement: str = Field(
+        description=(
+            "Verbatim source text the model was given. Appended in code "
+            "after the model call to preserve provenance for downstream "
+            "metadata."
+        ),
+    )
+    target_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the individual the facts are about. Appended in code "
+            "after the model call from the caller-supplied hint."
+        ),
+    )
 class FactRewriterClass:
     """Extract atomic facts and produce lawsuit-safer rewrites of source text."""
 
@@ -73,8 +119,11 @@ class FactRewriterClass:
     ) -> dict:
         """Extract atomic facts about ``target_name`` from ``input_str``.
 
-        Returns the ``ExtractedAndRewrittenFacts`` model dump augmented with
-        token / cost / latency metadata so the caller can record it.
+        Returns the dump of a :class:`RewrittenFactsWithProvenance` (built in
+        code AFTER the model call from the model's
+        :class:`ExtractedAndRewrittenFacts` plus the caller-supplied
+        ``input_str`` and ``target_name``) augmented with token / cost /
+        latency metadata so the caller can record it.
         """
         start_time = time_ns()
 
@@ -86,10 +135,16 @@ class FactRewriterClass:
         input_tokens = (
             count_tokens(framing) + self.system_prompt_tokens
         )
-        messages = [self.system_message, human_message]
+        messages = [SystemMessage(content=self.system_message), HumanMessage(content=human_message)]
 
         response = await self.model.ainvoke(messages)
-        response_dict = response.model_dump()
+
+        provenanced = RewrittenFactsWithProvenance(
+            facts=list(response.facts or []),
+            original_statement=input_str,
+            target_name=target_name,
+        )
+        response_dict = provenanced.model_dump()
 
         output_tokens = count_tokens(json.dumps(response_dict))
         total_tokens = input_tokens + output_tokens

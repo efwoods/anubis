@@ -11,8 +11,9 @@ logger = logging.getLogger(__name__)
 
 from langgraph.graph import StateGraph, START, END
 
-
-from src.subgraphs.vector_store_graph.retrieval_graph import retrieval_graph
+# NOTE: ``retrieval_graph`` was imported here but never referenced in this module.
+# Runtime logs showed ``from ... retrieval_graph import retrieval_graph`` alone took
+# ~13 s per cold webapp worker because ``retrieval_graph`` pulls heavy retrieval deps.
 
 from dotenv import load_dotenv
 
@@ -36,13 +37,17 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-from langchain.agents import create_agent
+# NOTE: ``langchain.agents.create_agent`` and ``SummarizationMiddleware`` were
+# imported here and below but never referenced in this file (the only
+# ``create_agent(...)`` site is commented out at ~line 313).  Removed to skip the
+# eager ``langchain.agents`` package load on every cold start.
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk
 from langgraph.runtime import Runtime
 from langgraph.config import get_stream_writer
 
 from src.anubis.utils.model import init_model
+
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.utility import format_docs
@@ -52,8 +57,6 @@ from langgraph.store.base import BaseStore
 from src.anubis.utils.tokenizer import count_tokens
 
 
-from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.graph import MessagesState
 from langgraph.prebuilt import ToolNode
 
@@ -241,9 +244,6 @@ process_thoughts = ToolNode(
     messages_key="internal_thoughts", tools=identity_tools, handle_tool_errors=True
 )
 
-from langchain.tools import ToolRuntime
-
-
 async def considering(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> Literal["process_thoughts", "respond"]:
@@ -255,44 +255,6 @@ async def considering(
         return "respond"
 
 
-# async def process_thoughts(state: GlobalState, config: RunnableConfig, runtime:Runtime
-# [GlobalContext]) -> GlobalState:
-#     avatar_accessible_tools_dict = {
-#         "learn_information_about_the_user": learn_information_about_the_user,
-#         "update_self_identity_mem_from_user_txt":update_self_identity_mem_from_user_txt,
-#         "recall_memories":recall_memories,
-#         "create_episodic_memory": create_episodic_memory,
-#         "test_update": test_update,
-#         "test_update_second":test_update_second
-#         }
-
-#     # avatar_accessible_tool_names = avatar_accessible_tools_dict.keys()
-
-#     message = state['internal_thoughts'][-1]
-#     logger.info(f"breakpoint")
-#     thoughts = []
-
-#     for tool_call in message.tool_calls:
-#             if tool_call['name'] in avatar_accessible_tools_dict:
-#                 tool = avatar_accessible_tools_dict[tool_call['name']]
-#                 tool_call_id = tool_call.get('id')
-#                 tool_runtime = ToolRuntime(
-#                     state=state,
-#                     config=config,
-#                     context=runtime.context,
-#                     store=runtime.store,
-#                     tool_call_id = tool_call_id,
-#                     stream_writer=runtime.stream_writer
-#                     )
-#                 logger.warning(f"tool_call: {tool_call}")
-#                 tool_call["args"].update({"runtime":tool_runtime})
-
-#                 logger.info("process_thoughts breakpoint")
-#                 thought = await tool.ainvoke(
-#                     tool_call['args'],
-#                 )
-#                 return thought
-# thoughts.append(thought)
 
 
 async def respond(

@@ -71,7 +71,7 @@ async def index_docs(
 
     docs = state['vectorstore_documents_to_be_indexed']
 
-    filenames = [doc.metadata.get("filename") for doc in docs]
+    filenames = [doc.metadata.get("namespace_filename") for doc in docs]
     try:
         assert(len(filenames) == len(docs))
     except AssertionError as e:

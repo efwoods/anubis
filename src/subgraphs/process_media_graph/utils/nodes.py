@@ -1,5 +1,6 @@
 # Nodes for Identifying and Handling each media type 
 
+from curses import napms
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -123,7 +124,8 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
-            
+            namespace_filename = file_data.get("namespace_filename")
+        
             logger.info(f"Processing file: {filename} ({content_type})")
 
             full_payload_uri = _full_data_uri_from_media_dict(file_data)
@@ -146,6 +148,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_image": reference_image,
+                        "namespace_filename": namespace_filename,
                     },
                 }
                 if full_payload_uri:
@@ -171,6 +174,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
+                        "namespace_filename": namespace_filename,
                     },
                 }
                 if full_payload_uri:
@@ -195,6 +199,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": 0,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "namespace_filename": namespace_filename,
                     },
                 }
                 if full_payload_uri:
@@ -214,6 +219,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": 0,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "namespace_filename": namespace_filename,
                     },
                 }
                 if full_payload_uri:
@@ -249,6 +255,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_image": reference_image,
+                        "namespace_filename": namespace_filename,
                     }
                 })
             
@@ -275,7 +282,8 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "assistant_id": assistant_id, 
-                        "reference_audio": reference_audio                    
+                        "reference_audio": reference_audio,
+                        "namespace_filename": namespace_filename
                     }
                 })
             
@@ -302,6 +310,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "namespace_filename": namespace_filename
                     }
                 })
             
@@ -329,6 +338,7 @@ async def process_uploaded_files_and_label_media_type(
                             "size": len(file_bytes or b""),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename
                         }
                     })
                 elif suffix == '.json' or suffix == '.jsonl':
@@ -348,6 +358,7 @@ async def process_uploaded_files_and_label_media_type(
                             "size": len(file_bytes or b""),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename
                         }
                     })
                 else: # handle markdown
@@ -366,6 +377,7 @@ async def process_uploaded_files_and_label_media_type(
                             "size": len(file_bytes or b""),
                             "user_id": user_id,
                             "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename
                         }
                     })
             
@@ -389,6 +401,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(pdf_bytes),
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "namespace_filename": namespace_filename
                     }
                 })
             
@@ -406,6 +419,98 @@ async def process_uploaded_files_and_label_media_type(
         "media_list": media_list,
         "media_files": []
     }
+
+
+# Metadata keys only used for queue routing; omitted from ``additional_metadata`` for scaffolds.
+_ANALYSIS_QUEUE_METADATA_KEYS = frozenset(
+    {
+        "analysis_scaffolds",
+        "analysis_job_kind",
+        "analysis_acceptable",
+        "vectorstore_acceptable",
+        "adapter_acceptable",
+    }
+)
+
+
+def _metadata_for_analysis_outputs(doc: Document) -> Dict[str, Any]:
+    return {
+        k: v
+        for k, v in (doc.metadata or {}).items()
+        if k not in _ANALYSIS_QUEUE_METADATA_KEYS
+    }
+
+
+async def _analysis_scaffold_ocean(doc: Document) -> List[Document]:
+    from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
+
+    text = (doc.page_content or "").strip()
+    if not text:
+        return []
+    meta = _metadata_for_analysis_outputs(doc)
+    meta.setdefault("vectorstore_acceptable", True)
+    return await perform_ocean_analysis(
+        HumanMessage(content=text),
+        additional_metadata=meta,
+    )
+
+
+# Extend with additional keyed scaffolds (emotion, relational graphs, etc.).
+ANALYSIS_SCAFFOLD_RUNNERS: Dict[str, Any] = {
+    "ocean": _analysis_scaffold_ocean,
+}
+
+
+async def analyze_documents(
+    state: GlobalState,
+    runtime: Runtime[GlobalContext],
+    config: RunnableConfig,
+    store: BaseStore,
+) -> Dict[str, Any]:
+    """Run registered analysis scaffolds on queued documents; merge vector-bound results."""
+    queue: List[Document] = list(
+        state.get(
+            "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant",
+        )
+        or []
+    )
+    if not queue:
+        logger.info("analyze_documents: empty queue; skipping")
+        return {}
+
+    out: List[Document] = []
+    for doc in queue:
+        scaffolds = doc.metadata.get("analysis_scaffolds")
+        if not scaffolds:
+            scaffolds = ["ocean"]
+        for name in scaffolds:
+            runner = ANALYSIS_SCAFFOLD_RUNNERS.get(name)
+            if runner is None:
+                logger.warning(
+                    "analyze_documents: unknown scaffold %r (filename=%s); skipping",
+                    name,
+                    doc.metadata.get("filename", ""),
+                )
+                continue
+            try:
+                produced = await runner(doc)
+                if produced:
+                    out.extend(produced)
+            except Exception as exc:
+                logger.warning(
+                    "analyze_documents: scaffold %r failed: %s; continuing",
+                    name,
+                    exc,
+                )
+
+    existing_vs: List[Document] = list(
+        state.get("vectorstore_documents_to_be_indexed") or []
+    )
+    return {
+        "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete",
+        "vectorstore_documents_to_be_indexed": existing_vs + out,
+    }
+
 
 async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig) -> Dict[str, Any]:
     """ 
@@ -513,6 +618,9 @@ async def process_media_item_task(
 
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
+    namespace_filename = metadata.get("namespace_filename")
+    if not namespace_filename:
+        raise Exception(f"namespace_filename is required for media item: {media_item}")
 
     try:
         if media_type in ("image", "image_url"):
@@ -588,6 +696,7 @@ async def process_media_item_task(
                     "reference_image": reference_image,
                     "filename": filename,
                     "analysis_acceptable": True,
+                    "namespace_filename": namespace_filename, 
                 }
             )
 
@@ -630,6 +739,7 @@ async def process_media_item_task(
                         "namespace": "reference_image",
                         "vectorstore_acceptable": False,
                         "adapter_acceptable": False,
+                        "namespace_filename": namespace_filename,
                     }
                 )
                 return [doc]
@@ -694,6 +804,7 @@ async def process_media_item_task(
                         "vectorstore_acceptable": True,
                         "adapter_acceptable": False,
                         "analysis_acceptable": True,
+                        "namespace_filename": namespace_filename,
                     }
                 )
             return documents
@@ -781,6 +892,7 @@ async def process_media_item_task(
                                     "adapter_acceptable": True,
                                     "analysis_acceptable": False,
                                     "synthetic": False,
+                                    "namespace_filename": namespace_filename,
                                 }
                             )
                             final_documents.append(document)
@@ -804,7 +916,7 @@ async def process_media_item_task(
                 )
 
                 for document in documents:
-                            document.metadata.update({"vectorstore_acceptable": True})
+                            document.metadata.update({"vectorstore_acceptable": True, "namespace_filename": namespace_filename})
                             final_documents.append(document)
 
             return final_documents
@@ -820,6 +932,7 @@ async def process_media_item_task(
                             "status": "error",
                             "error": "empty_url",
                             "filename": filename,
+                            "namespace_filename": namespace_filename,
                         },
                     )
                 ]
@@ -848,6 +961,7 @@ async def process_media_item_task(
                 # children come back as ``type="url"`` so they pass back
                 # through this branch.
                 try:
+                    item["metadata"]["namespace_filename"] = namespace_filename
                     child_docs = await process_media_item_task(
                         item, runtime, config, store
                     )
@@ -909,6 +1023,7 @@ async def process_media_item_task(
                         "assistant_id": assistant_id,
                         "source": "pdf_page",
                         "pdf_page_index": page_idx,
+                        "namespace_filename": namespace_filename,
                     },
                 }
                 documents = await process_text_to_document(
@@ -919,6 +1034,7 @@ async def process_media_item_task(
                 )
                 for d in documents:
                     d.metadata.setdefault("pdf_page_index", page_idx)
+                    d.metadata["namespace_filename"]=namespace_filename
                 final_documents.extend(documents)
 
             return final_documents
@@ -966,6 +1082,7 @@ async def process_media_item_task(
                             "status": "error",
                             "error": "invalid_reference_audio_data_uri",
                             "filename": filename,
+                            "namespace_filename": namespace_filename,
                         },
                     )
                 ]
@@ -990,6 +1107,7 @@ async def process_media_item_task(
                         "vectorstore_acceptable": False,
                         "adapter_acceptable": False,
                         "analysis_acceptable": False,
+                        "namespace_filename": namespace_filename,
                     },
                 )
                 if payload_uri:
@@ -1124,6 +1242,7 @@ async def process_media_item_task(
                     )
                     for d in documents:
                         d.metadata.setdefault("audio_filename", filename)
+                        d.metadata["namespace_filename"]=namespace_filename
                     if documents:
                         return documents
                 # Diarized but no target turn detected - treat the whole
@@ -1150,6 +1269,7 @@ async def process_media_item_task(
                     )
                     for d in documents:
                         d.metadata.setdefault("audio_filename", filename)
+                        d.metadata["namespace_filename"]=namespace_filename
                     return documents
 
             # ---------------------------------------------------------------
@@ -1181,6 +1301,7 @@ async def process_media_item_task(
                             "filename": filename,
                             "vectorstore_acceptable": False,
                             "status": "transcription_unavailable",
+                            "namespace_filename": namespace_filename,
                         },
                     )
                 ]
@@ -1195,6 +1316,7 @@ async def process_media_item_task(
                     "source": (
                         metadata.get("source") or filename or f"{media_type}_transcription"
                     ),
+                    "namespace_filename": namespace_filename,
                 },
             }
             documents = await process_text_to_document(
@@ -1205,13 +1327,14 @@ async def process_media_item_task(
             )
             for d in documents:
                 d.metadata.setdefault("audio_filename", filename)
+                d.metadata["namespace_filename"]=namespace_filename
             return documents
         
         else:
             logger.warning(f"Unsupported media type: {media_type}")
             docs = [Document(
                 page_content=f"[Unsupported media type: {media_type}]",
-                metadata={"type": media_type, "status": "unsupported"}
+                metadata={"type": media_type, "status": "unsupported", "namespace_filename": namespace_filename}
             )]
             return docs
     
@@ -1351,10 +1474,10 @@ async def process_adapter_documents(
         llm_single_turn_dataset,
     )
 
-    out_dir = Path("data") + "/" + (assistant_id or "unknown_assistant")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    adapter_jsonl = out_dir / "adapter_training.jsonl"
-    langsmith_jsonl = out_dir / "langsmith_eval_dataset.jsonl"
+    out_dir = os.path.join("data", assistant_id)
+    os.makedirs(out_dir, exist_ok=True)
+    adapter_jsonl = os.path.join(out_dir, "adapter_training.jsonl")
+    langsmith_jsonl = os.path.join(out_dir, "langsmith_eval_dataset.jsonl")
 
     adapter_rows_total: List[Dict[str, Any]] = []
     langsmith_rows_total: List[Dict[str, Any]] = []
@@ -1429,7 +1552,7 @@ async def process_adapter_documents(
     # 3) Persist to disk (append-only JSONL).
     # ------------------------------------------------------------------
     if adapter_rows_total:
-        with adapter_jsonl.open("a", encoding="utf-8") as fh:
+        with open(adapter_jsonl, "a", encoding="utf-8") as fh:
             for row in adapter_rows_total:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         logger.info(
@@ -1439,7 +1562,7 @@ async def process_adapter_documents(
         )
 
     if langsmith_rows_total:
-        with langsmith_jsonl.open("a", encoding="utf-8") as fh:
+        with open(langsmith_jsonl, "a", encoding="utf-8") as fh:
             for row in langsmith_rows_total:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         logger.info(

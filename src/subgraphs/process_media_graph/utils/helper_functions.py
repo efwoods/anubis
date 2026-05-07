@@ -5,11 +5,9 @@ from typing import Any, Dict, List, Optional
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
 from src.anubis.utils.tokenizer import count_tokens
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
 from src.anubis.utils.classes.ContentSituationClassificationClass import (
     ContentSituationClassificationClass,
 )
@@ -219,6 +217,43 @@ def _is_quotes_per_line_text(text: str) -> bool:
         if len(s) <= 280 or s.endswith(terminators):
             discrete += 1
     return (discrete / len(non_empty)) >= 0.7
+
+
+def _build_full_text_analysis_queue_document(
+    *,
+    text_content: str,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    namespace_filename: str,
+    classified_situation: str,
+) -> Document:
+    """Single queued Document whose page_content is the full source text for analysis nodes.
+
+    Vector and adapter branches ignore this row (flags off); the analysis node runs
+    configured scaffolds (e.g. OCEAN) once per upload instead of per chunk.
+    """
+    base_metadata = media_item.get("metadata", {}) or {}
+    return Document(
+        page_content=text_content,
+        metadata={
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+            "source": base_metadata.get("source", "user_upload"),
+            "type": "text",
+            "filename": base_metadata.get("filename", ""),
+            "namespace_filename": namespace_filename,
+            "namespace": "identity",
+            "analysis_acceptable": True,
+            "vectorstore_acceptable": False,
+            "adapter_acceptable": False,
+            "analysis_job_kind": "full_text",
+            "analysis_scaffolds": ["ocean"],
+            "classified_situation": classified_situation,
+            "synthetic": False,
+        },
+    )
 
 
 def _build_quote_documents_per_line(
@@ -592,7 +627,7 @@ async def process_text_to_document(
               rewritten_statement, first_person_statement, synthetic=True).
             - ``tweets_or_quotes`` -> one verbatim Document per line under
               ``quote``.
-            - ``monologue`` / ``presentation`` -> verbatim chunked Document(s)
+            - ``monologue`` -> verbatim chunked Document(s)
               under ``quote``.
             - ``dialogue`` -> caller is expected to supply diarized JSON via
               :func:`process_dialogue_json_to_documents`. The text branch here
@@ -606,6 +641,7 @@ async def process_text_to_document(
         media_item.get("content", "")
     )
     classification_input = _classification_slice(text_content)
+    namespace_filename = media_item.get("metadata", {}).get("namespace_filename", "")
 
     if not text_content.strip():
         logger.warning("Empty text content in media_item; returning no documents")
@@ -634,7 +670,7 @@ async def process_text_to_document(
             namespace=namespace_hint or "document",
         )
         for document in documents:
-            document.metadata.update({"vectorstore_acceptable": True})
+            document.metadata.update({"vectorstore_acceptable": True, "namespace_filename": namespace_filename})
         return documents
 
     situation_classifier = ContentSituationClassificationClass()
@@ -684,6 +720,7 @@ async def process_text_to_document(
                         "classification_reasoning": situation_reasoning,
                         "reference_classification_reasoning": reference_reasoning,
                         "is_menu_or_religious_text": False,
+                        "namespace_filename": namespace_filename,
                     }
                 )
             return documents
@@ -716,6 +753,7 @@ async def process_text_to_document(
             media_item=media_item,
             classification_metadata=classification_metadata,
         )
+
     else:
         documents = await process_text_media_item_target_for_vectorstore(
             media_item=media_item,
@@ -730,32 +768,24 @@ async def process_text_to_document(
                 {
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": classified_situation
-                    in ("monologue", "presentation", "tweets_or_quotes", "dialogue"),
-                    "synthetic": False
+                    in ("monologue","tweets_or_quotes", "dialogue"),
+                    "synthetic": False,
+                    "namespace_filename": namespace_filename,
                 }
             )
 
     if classified_situation in ("monologue", "presentation", "tweets_or_quotes"):
-        try:
-            analysis_metadata = {
-                "user_id": user_id,
-                "assistant_id": assistant_id,
-                "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                "source": (media_item.get("metadata", {}) or {}).get(
-                    "source", "user_upload"
-                ),
-                "type": "text",
-                "filename": (media_item.get("metadata", {}) or {}).get("filename", ""),
-                "namespace": "identity",
-                "analysis_acceptable": True,
-                "vectorstore_acceptable": True,
-            }
-            analysis_documents = await perform_ocean_analysis(
-                human_message=HumanMessage(content=text_content),
-                additional_metadata=analysis_metadata,
+        documents.append(
+            _build_full_text_analysis_queue_document(
+                text_content=text_content,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+                namespace_filename=namespace_filename,
+                classified_situation=classified_situation,
             )
-            documents.extend(analysis_documents or [])
-        except Exception as e:
-            logger.warning("OCEAN analysis failed; continuing without it: %s", e)
+        )
 
+    for document in documents:
+        document.metadata.update({"namespace_filename": namespace_filename})
     return documents

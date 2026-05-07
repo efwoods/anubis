@@ -14,6 +14,7 @@ from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 
 from src.subgraphs.process_media_graph.utils.nodes import (
+    analyze_documents,
     convert_media_list_to_text_document,
     build_stylistic_fingerprint,
     process_adapter_documents,
@@ -30,6 +31,7 @@ workflow = StateGraph(
 
 # Add Nodes
 workflow.add_node("process_uploaded_files", process_uploaded_files_and_label_media_type)
+workflow.add_node("analyze_documents", analyze_documents)
 workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_text_document)
 workflow.add_node("process_adapter_documents", process_adapter_documents)
 workflow.add_node("index_docs", index_docs)
@@ -39,12 +41,11 @@ workflow.add_node("build_stylistic_fingerprint", build_stylistic_fingerprint)
 workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
 
-# After classification: write quote+identity into the vector store and write
-# adapter rows to disk in parallel branches, then build profiles once both
-# have settled.
-workflow.add_edge("convert_media_list_to_text_document", "index_docs")
+# After classification: adapter rows and full-text analysis feed the vector store;
+# analysis runs before indexing so trait Documents merge into the same index batch.
+workflow.add_edge("convert_media_list_to_text_document", "analyze_documents")
 workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
-# workflow.add_edge("convert_media_list_to_text_document", "analyze_documents")
+workflow.add_edge("analyze_documents", "index_docs")
 
 # workflow.add_edge("index_docs", "build_stylistic_fingerprint")
 

@@ -23,8 +23,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 """ OCEAN ANALYSIS """
-from typing import Optional
-async def perform_ocean_analysis(human_message: HumanMessage, additional_metadata = Optional[dict]):
+from typing import Any, Optional
+
+async def perform_ocean_analysis(
+    human_message: HumanMessage,
+    additional_metadata: Optional[dict[str, Any]] = None,
+):
     """  This function ingests a human message containing 
     content to analyze and returns a list of documents 
     containing the five results of the analysis."""
@@ -71,7 +75,8 @@ async def perform_ocean_analysis(human_message: HumanMessage, additional_metadat
     Document(page_content=neuroticism_ocean_analysis_results.neuroticism_description, metadata={"trait": "neuroticism", "score": neuroticism_ocean_analysis_results.neuroticism, "reasons":neuroticism_ocean_analysis_results.neuroticism_reasons_and_examples, "processing_task_id": str(uuid4()), "document_id": str(uuid4()) }, id=str(uuid4()))]
 
     if additional_metadata:
-        [doc.metadata.update(metadata=additional_metadata) for doc in results]
+        for doc in results:
+            doc.metadata.update(additional_metadata)
 
     return results
 

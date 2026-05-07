@@ -304,8 +304,7 @@ def patched_pipeline():
             new=_stub_situation_classify,
         ),
         patch(
-            "src.subgraphs.process_media_graph.utils.helper_functions."
-            "perform_ocean_analysis",
+            "src.anubis.utils.analysis.analysis_methods.perform_ocean_analysis",
             side_effect=_stub_perform_ocean_analysis,
         ),
         patch(

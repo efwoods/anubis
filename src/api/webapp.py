@@ -1,43 +1,4 @@
 # src/anubis/webapp.py
-# region debug log
-import time as _dbg_time
-import json as _dbg_json
-import os as _dbg_os
-
-_DBG_T0 = _dbg_time.perf_counter()
-_DBG_LAST = _DBG_T0
-_DBG_LOG_PATH = _dbg_os.path.join(
-    _dbg_os.path.dirname(_dbg_os.path.dirname(_dbg_os.path.dirname(_dbg_os.path.abspath(__file__)))),
-    ".cursor",
-    "debug-4c0691.log",
-)
-
-
-def _dbg_log(message: str, hypothesisId: str = "", **data) -> None:
-    global _DBG_LAST
-    now = _dbg_time.perf_counter()
-    delta_ms = round((now - _DBG_LAST) * 1000, 1)
-    total_ms = round((now - _DBG_T0) * 1000, 1)
-    _DBG_LAST = now
-    payload = {
-        "sessionId": "4c0691",
-        "runId": data.pop("runId", "startup"),
-        "hypothesisId": hypothesisId,
-        "location": "src/api/webapp.py",
-        "message": message,
-        "data": {**data, "delta_ms": delta_ms, "total_ms": total_ms},
-        "timestamp": int(_dbg_time.time() * 1000),
-    }
-    try:
-        _dbg_os.makedirs(_dbg_os.path.dirname(_DBG_LOG_PATH), exist_ok=True)
-        with open(_DBG_LOG_PATH, "a") as _f:
-            _f.write(_dbg_json.dumps(payload) + "\n")
-    except Exception:
-        pass
-
-
-_dbg_log("module_import_begin", hypothesisId="B/C", phase="import")
-# endregion
 
 import json
 import os
@@ -72,14 +33,10 @@ from uuid import uuid4
 import base64
 import tempfile
 
-# region debug log
-_dbg_log("after_baseline_imports", hypothesisId="F", phase="import")
-# endregion
-from langchain_community.document_loaders import PyPDFLoader
-
-# region debug log
-_dbg_log("after_langchain_community_pypdf", hypothesisId="F", phase="import")
-# endregion
+# NOTE: ``PyPDFLoader`` is imported lazily inside ``process_files_for_message``
+# (the only call site) — eager import of ``langchain_community`` adds ~7.3 s to
+# every cold start because the umbrella package eagerly registers many
+# integrations. The first PDF upload pays the import cost once.
 
 
 # Prometheus metrics
@@ -101,9 +58,6 @@ from langgraph_sdk import get_client
 
 from src.anubis.graph import message_workflow, response_only_workflow
 
-# region debug log
-_dbg_log("after_anubis_graph_import", hypothesisId="B", phase="import")
-# endregion
 from src.security.auth import security_route
 from src.security.auth import get_current_user
 from src.security.auth import update_assistant_config
@@ -131,10 +85,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from urllib.parse import urlparse
-def _slug(u: str) -> str:
-    path = urlparse(u).path or ""
-    return path.rsplit("/", 1)[-1] if path else "remote_media"
+from uuid import uuid5, NAMESPACE_URL
+
+def _namespace_safe_formatted_filename(u: str) -> str:
+    formatted_name = str(uuid5(NAMESPACE_URL, u))
+    return formatted_name
 
 
 def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
@@ -442,23 +397,11 @@ async def lifespan(app: FastAPI):
     global context
     global store_context_manager
 
-    # region debug log
-    _dbg_log("lifespan_begin", hypothesisId="H", phase="lifespan")
-    # endregion
-
     # Initialize context / context
     app.state.context = GlobalContext()
-
-    # region debug log
-    _dbg_log("after_GlobalContext_instantiate", hypothesisId="G", phase="lifespan")
-    # endregion
     app.state.httpx_client = httpx.AsyncClient()
     app.state.stripe = stripe
     app.state.stripe.api_key = app.state.context.stripe_secret_key
-
-    # region debug log
-    _dbg_log("after_context_httpx_stripe_init", phase="lifespan")
-    # endregion
 
     async_postgres_store_uri = app.state.context.async_postgres_store_uri
     logger.warning(f"app.state.context.dev: {app.state.context.dev}")
@@ -485,13 +428,7 @@ async def lifespan(app: FastAPI):
             ),
         )
 
-        # region debug log
-        _dbg_log("after_AsyncPostgresStore_construct", hypothesisId="A", phase="lifespan")
-        # endregion
         await store.setup()
-        # region debug log
-        _dbg_log("after_store_setup", hypothesisId="A/D", phase="lifespan")
-        # endregion
         logger.info("Store setup complete")
         app.state.store = store
         checkpointer = AsyncPostgresSaver(app.state.pool)
@@ -510,10 +447,6 @@ async def lifespan(app: FastAPI):
     finally:
         await pool.close()
 
-
-# region debug log
-_dbg_log("module_imports_complete", hypothesisId="H", phase="import")
-# endregion
 app = FastAPI(
     title="Neural Nexus API",
     description="LangGraph-based API",
@@ -1024,6 +957,10 @@ async def process_files_for_message(
                 # Handle text files and PDFs
                 if content_type == "application/pdf":
                     try:
+                        from langchain_community.document_loaders import (
+                            PyPDFLoader,
+                        )
+
                         with tempfile.NamedTemporaryFile(
                             delete=False, suffix=".pdf"
                         ) as temp_pdf:
@@ -1816,7 +1753,7 @@ def _csv_dominant_value(values: list[str]) -> tuple[Optional[str], float]:
 
 
 def _filename_target_hint(filename: str) -> str:
-    """Title-case a filename stem when it looks like a person's name slug."""
+    """Title-case a filename stem when it looks like a person's name namespace_safe_formatted_filename."""
     stem = (filename or "").rsplit(".", 1)[0]
     stem = re.sub(r"[_\-]+", " ", stem).strip()
     if not stem:
@@ -1948,12 +1885,10 @@ def _build_csv_statements_media_entry(
     ``{"statements": [...]}`` shape produced by CSV preprocessing.
     """
     statements_blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    synthetic_filename = (
-        f"{source_filename.rsplit('.', 1)[0] or 'upload'}.statements.json"
-    )
+
     metadata = payload.get("metadata") or {}
     return {
-        "filename": synthetic_filename,
+        "filename": source_filename,
         "content_type": "application/json",
         "content": statements_blob,
         "user_id": user_id,
@@ -1961,11 +1896,11 @@ def _build_csv_statements_media_entry(
         "reference_audio": False,
         "reference_image": False,
         "base64_encoded_str": make_data_uri("application/json", statements_blob),
-        "csv_source_filename": source_filename,
         "csv_target_name": metadata.get("target"),
         "csv_text_column": metadata.get("csv_text_column"),
         "csv_target_column": metadata.get("csv_target_column"),
         "csv_row_count": metadata.get("csv_row_count"),
+        "namespace_filename": source_filename if not "." in source_filename else _namespace_safe_formatted_filename(source_filename),
     }
 
 @app.get("/avatar_reference_image")
@@ -2108,7 +2043,7 @@ async def update_avatar_identity_with_media(
         if non_empty_files:
             uf = non_empty_files[0]
             content = await uf.read()
-            raw_name = uf.filename or "upload"
+            raw_name = uf.filename
             mime_type = (uf.content_type or "application/octet-stream").split(";")[
                 0
             ].strip().lower()
@@ -2144,6 +2079,7 @@ async def update_avatar_identity_with_media(
                         "reference_audio": False,
                         "reference_image": True,
                         "base64_encoded_str": make_data_uri(mime, content),
+                        "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                     }
                 )
             elif reference_audio:
@@ -2176,6 +2112,7 @@ async def update_avatar_identity_with_media(
                         "reference_audio": True,
                         "reference_image": False,
                         "base64_encoded_str": make_data_uri(effective, content),
+                        "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                     }
                 )
             else:
@@ -2195,6 +2132,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(mime, content),
+                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                         }
                     )
                 elif mime_type.startswith("audio/") or (
@@ -2222,6 +2160,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(effective, content),
+                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                         }
                     )
                 elif mime_type.startswith("video/"):
@@ -2235,6 +2174,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(mime_type, content),
+                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                         }
                     )
                 elif mime_type == "application/pdf":
@@ -2248,6 +2188,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(mime_type, content),
+                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                         }
                     )
                 elif mime_type in (
@@ -2266,6 +2207,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(mime_type, content),
+                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
                         }
                     )
                 else:
@@ -2275,14 +2217,14 @@ async def update_avatar_identity_with_media(
                     )
 
         elif url_clean:
-            slug = _slug(url_clean)
+            namespace_safe_formatted_filename = _namespace_safe_formatted_filename(url_clean)
 
             if reference_image:
                 body, header_ct = await fetch_remote_url_bytes(url_clean)
                 img_mime = validate_upload_image_bytes(header_ct, body)
                 media_files.append(
                     {
-                        "filename": slug or "reference_image_from_url",
+                        "filename": url_clean,
                         "content_type": img_mime,
                         "content": b"",
                         "image_url": url_clean,
@@ -2291,6 +2233,7 @@ async def update_avatar_identity_with_media(
                         "reference_audio": False,
                         "reference_image": True,
                         "base64_encoded_str": make_data_uri(img_mime, body),
+                        "namespace_filename": namespace_safe_formatted_filename if not "." in namespace_safe_formatted_filename else _namespace_safe_formatted_filename(namespace_safe_formatted_filename),
                     }
                 )
             elif reference_audio:
@@ -2306,7 +2249,7 @@ async def update_avatar_identity_with_media(
                 )
                 media_files.append(
                     {
-                        "filename": slug or "reference_audio_from_url",
+                        "filename": url_clean,
                         "content_type": audio_mime,
                         "content": b"",
                         "audio_url": url_clean,
@@ -2315,14 +2258,15 @@ async def update_avatar_identity_with_media(
                         "reference_audio": True,
                         "reference_image": False,
                         "base64_encoded_str": make_data_uri(audio_mime, body),
+                        "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
                     }
                 )
             else:
                 ct = await probe_remote_url_content_type(url_clean)
-                if _is_csv_upload(slug or url_clean, ct):
+                if _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
                     body, _header_ct = await fetch_remote_url_bytes(url_clean)
-                    csv_filename = slug if slug.endswith((".csv", ".tsv")) else (
-                        f"{slug or 'remote_table'}.csv"
+                    csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
+                        f"{namespace_safe_formatted_filename or 'remote_table'}.csv"
                     )
                     csv_payload = await _csv_to_statements_payload(
                         raw=body, source_filename=csv_filename
@@ -2340,7 +2284,7 @@ async def update_avatar_identity_with_media(
                     img_mime = validate_upload_image_bytes(header_ct, body)
                     media_files.append(
                         {
-                            "filename": slug or "remote_image",
+                            "filename": url_clean,
                             "content_type": img_mime,
                             "content": b"",
                             "image_url": url_clean,
@@ -2349,6 +2293,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(img_mime, body),
+                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
                         }
                     )
                 elif ct.startswith("audio/"):
@@ -2361,7 +2306,7 @@ async def update_avatar_identity_with_media(
                     )
                     media_files.append(
                         {
-                            "filename": slug or "remote_audio",
+                            "filename": url_clean,
                             "content_type": audio_mime,
                             "content": b"",
                             "audio_url": url_clean,
@@ -2370,6 +2315,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(audio_mime, body),
+                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
                         }
                     )
                 elif ct.startswith("video/"):
@@ -2379,7 +2325,7 @@ async def update_avatar_identity_with_media(
                     )
                     media_files.append(
                         {
-                            "filename": slug or "remote_video",
+                            "filename": url_clean,
                             "content_type": video_mime,
                             "content": b"",
                             "video_url": url_clean,
@@ -2388,6 +2334,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(video_mime, body),
+                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
                         }
                     )
                 elif ct.startswith("text/") or ct in (
@@ -2415,7 +2362,7 @@ async def update_avatar_identity_with_media(
                     )
                     media_files.append(
                         {
-                            "filename": slug or "remote_document",
+                            "filename": url_clean,
                             "content_type": doc_mime,
                             "content": b"",
                             "page_url": url_clean,
@@ -2424,6 +2371,7 @@ async def update_avatar_identity_with_media(
                             "reference_audio": False,
                             "reference_image": False,
                             "base64_encoded_str": make_data_uri(doc_mime, body),
+                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
                         }
                     )
                 else:
@@ -2442,7 +2390,7 @@ async def update_avatar_identity_with_media(
         # the operator confirms the destructive action and avoids duplicate index
         # rows for the same source.
         incoming_filenames: list[str] = [
-            (entry.get("filename") or "").strip() for entry in media_files
+            (entry.get("namespace_filename") or "").strip() for entry in media_files
         ]
         incoming_filenames = [name for name in incoming_filenames if name]
 
@@ -2476,7 +2424,7 @@ async def update_avatar_identity_with_media(
                 metadata = kwargs_blob.get("metadata")
                 if not isinstance(metadata, dict):
                     continue
-                stored_filename = metadata.get("filename")
+                stored_filename = metadata.get("namespace_filename")
                 if isinstance(stored_filename, str) and stored_filename.strip():
                     existing_filenames.add(stored_filename.strip())
 
@@ -2484,7 +2432,8 @@ async def update_avatar_identity_with_media(
                 {name for name in incoming_filenames if name in existing_filenames}
             )
             if duplicates:
-                duplicates_str = ", ".join(duplicates)
+                media_files_duplicates = [media_file.get("filename") for media_file in media_files if media_file.get("namespace_filename") in duplicates]
+                duplicates_str = ", ".join(media_files_duplicates)
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -2556,7 +2505,9 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
         item["value"]["document"]["kwargs"]["metadata"].get("filename", None)
         for item in all_document_items["items"]
     ]
+
     uploaded_documents = [item for item in set(uploaded_documents) if item is not None]
+    # convert uuid5 to string for convenience
     results["uploaded_documents"] = uploaded_documents
     return results
 
@@ -2566,14 +2517,12 @@ async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
 
-    # Remove any special characters from the source document name
-    source_document_name = source_document_name.strip("\"")
-    source_document_name = source_document_name.strip("\`")
-    source_document_name = source_document_name.strip("\'")
-    source_document_name = source_document_name.strip("")
-
-    source_document_name = source_document_name.strip()
-
+    # Strip surrounding whitespace and stray quote/backtick characters in any order.
+    # A single strip() with the full char set handles cases like '    "Mom.m4a"\n'
+    # where chained single-char strips would short-circuit on the first non-matching end char.
+    source_document_name = source_document_name.strip(" \t\n\r\"'`")
+    if "." in source_document_name:
+        source_document_name = _namespace_safe_formatted_filename(source_document_name)
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]

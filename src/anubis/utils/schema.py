@@ -1683,100 +1683,6 @@ relationships of the target individual from the text.
 
 
 # ─────────────────────────────────────────────────────────────
-# 17. SECRETS
-# ─────────────────────────────────────────────────────────────
-
-
-class SecretsExtraction(BaseModel):
-    value: Optional[List[str]] = Field(
-        description=(
-            "Information the target holds privately and does not wish to expose "
-            "or share with others, revealed only through trust or confidential "
-            "disclosure. Each item is a concise statement of the secret or "
-            "category of concealed information, "
-            "e.g. 'Conceals a past failure that contradicts their public narrative.'"
-        )
-    )
-    evidence: Optional[str] = Field(
-        description=(
-            "Passages — including omissions, deflections, contradictions, or "
-            "confidential disclosures — that hint at or reveal withheld information."
-        )
-    )
-    confidence: ConfidenceLevel = Field(
-        description=(
-            "Confidence in the secret attribution. "
-            "high = explicitly disclosed in confidence; "
-            "medium = strongly implied by contradiction or avoidance; "
-            "low = speculative inference."
-        )
-    )
-    reasoning: str = Field(
-        description=(
-            "Detailed explanation of how the secret was detected — whether through "
-            "direct confidential disclosure, behavioural contradiction, omission, "
-            "evasion, or indirect reference."
-        )
-    )
-
-
-SECRETS_EXTRACTION_SYSTEM_PROMPT = """
-<Role>
-You are an expert in subtext analysis, narrative psychology, and confidential
-disclosure patterns. Your task is to identify information that the target
-individual holds privately — things they conceal, withhold, or share only
-under conditions of deep trust — as revealed by the provided text.
-</Role>
- 
-<WhatCountsAsASecret>
-A secret is any of the following:
-  1. Information the target EXPLICITLY discloses as private, confidential,
-     or shared only with trusted individuals.
-  2. Information the target ACTIVELY conceals, deflects from, or contradicts
-     when it is raised — the concealment itself is evidence.
-  3. A past event, belief, identity, or action that is INCONSISTENT with the
-     target's public persona and appears to be deliberately suppressed.
-  4. A desire, fear, or opinion the target expresses ONLY in private contexts
-     or to specific trusted individuals, as contrasted with their public
-     statements.
-</WhatCountsAsASecret>
- 
-<Instructions>
-1. Read the text for explicit confidential disclosures ("I've never told
-   anyone this…", "between us…", "I don't talk about this publicly…").
-2. Look for CONTRADICTIONS between stated public identity and private behaviour
-   or off-the-record statements — the gap is often where secrets live.
-3. Notice topics the target AVOIDS, deflects, laughs off, or answers
-   incompletely when directly asked.
-4. Note OMISSIONS — things that would logically be mentioned but are not.
-5. For each secret or category of concealed information, write a concise
-   one-sentence entry.
-6. Record the textual evidence (including the absence or evasion) in the
-   evidence field.
-7. Rate confidence carefully:
-     high   = target explicitly disclosed this as private/secret
-     medium = strong contradiction or deliberate avoidance pattern
-     low    = speculative inference from limited signals
-</Instructions>
- 
-<Rules>
-- Do NOT fabricate secrets. Every entry must be grounded in textual signals.
-- A secret does not have to be shameful — it may simply be private (e.g.
-  a deeply held aspiration not shared publicly).
-- Distinguish secrets the target is aware they are keeping from information
-  the target appears unconsciously to suppress (note the distinction in
-  reasoning).
-- Do not conflate privacy with deception — a person may keep secrets without
-  being dishonest.
-- If no secrets or confidential disclosures are detectable, set value to null
-  and explain in reasoning.
-- Respect the sensitivity of this field: describe the category or nature of
-  the secret rather than sensationalising it.
-</Rules>
-"""
-
-
-# ─────────────────────────────────────────────────────────────
 # Master registry — maps dimension name → (model class, system prompt)
 # Canonical order matches GeneralCharacteristicExtraction field order.
 # Useful for iterating all analyses programmatically.
@@ -1798,7 +1704,6 @@ CHARACTERISTIC_EXTRACTORS: dict[str, tuple[type[BaseModel], str]] = {
     "problems": (ProblemsExtraction, PROBLEMS_EXTRACTION_SYSTEM_PROMPT),
     "flaws": (FlawsExtraction, FLAWS_EXTRACTION_SYSTEM_PROMPT),
     "strengths": (StrengthsExtraction, STRENGTHS_EXTRACTION_SYSTEM_PROMPT),
-    "secrets": (SecretsExtraction, SECRETS_EXTRACTION_SYSTEM_PROMPT),
     "relationships": (RelationshipsExtraction, RELATIONSHIPS_EXTRACTION_SYSTEM_PROMPT),
 }
 
@@ -1878,13 +1783,6 @@ class GeneralCharacteristicExtraction(BaseModel):
             "or what is best about the individual."
         )
     )
-    secrets: Optional[List[str]] = Field(
-        description=(
-            "Information held privately by the individual that they do not wish to "
-            "expose or share with others unless they trust and confidently confide "
-            "in someone."
-        )
-    )
     relationships: Optional[List[RelationshipEntry]] = Field(
         description="Named individuals and the nature of their relationship to the target."
     )
@@ -1925,11 +1823,6 @@ the target individual across the following dimensions:
   flaws         – Acknowledged or implied weaknesses and contradictions.
   strengths     – The features the individual excels at; their best qualities
                   and what they are best at doing or what is best about them.
-  secrets       – Information held privately that the individual does not wish
-                  to expose or share with others unless they trust and
-                  confidently confide in someone. Detected through explicit
-                  confidential disclosure, contradiction between public and
-                  private behaviour, deliberate avoidance, or notable omission.
   relationships – Named individuals and the nature of their connection to the
                   target, including relationship type, dynamic, and the target's
                   emotional orientation toward them.
@@ -1957,15 +1850,6 @@ WANTS vs NEEDS vs GOALS
   needs  = deeper psychological or material requirements ("needs belonging").
   goals  = long-term, strategic ambitions ("build a lasting institution").
  
-SECRETS
-  A secret is any information the target:
-    (a) explicitly discloses as private or confidential,
-    (b) actively conceals, deflects from, or contradicts,
-    (c) omits in contexts where it would logically be mentioned, or
-    (d) expresses only in private/trusted contexts vs public statements.
-  Rate confidence: high = explicit private disclosure; medium = strong
-  contradiction or avoidance pattern; low = speculative inference.
- 
 BELIEFS vs OPINIONS
   beliefs  = foundational convictions about how the world is or should be.
   opinions = specific, situated positions on concrete topics or events.
@@ -1980,8 +1864,6 @@ BELIEFS vs OPINIONS
   note the conflict in your reasoning.
 - Keep list items concise (one sentence each where possible).
 - relationships entries must name a real person mentioned in the text.
-- For secrets, describe the category or nature of the withheld information
-  rather than sensationalising it.
 - Always populate the reasoning field with your full chain of thought,
   citing the specific textual evidence for each populated dimension.
 </Rules>

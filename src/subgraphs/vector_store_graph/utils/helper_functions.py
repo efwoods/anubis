@@ -116,10 +116,10 @@ async def batch_index_documents_vectorstore(
 
          # Delete documents with the same filename in the metadata
         filenames = [
-            doc.metadata.get("filename") 
+            doc.metadata.get("namespace_filename") 
             for doc in 
             vectorstore_documents_to_be_indexed
-            if doc.metadata.get("filename") is not None
+            if doc.metadata.get("namespace_filename") is not None
         ]
 
         # Ensure each document has a unique key (str document_id):
@@ -147,7 +147,7 @@ async def batch_index_documents_vectorstore(
         logger.info(f"breakpoint before aadd documents")
 
         # create upload namespaces
-        batch_put_ops = [PutOp(namespace=(user_id, assistant_id, doc.metadata.get("namespace","document") , doc.metadata.get("filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"document":doc.to_json()}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
+        batch_put_ops = [PutOp(namespace=(user_id, assistant_id, doc.metadata.get("namespace","document") , doc.metadata.get("namespace_filename", f"{user_id}'_'{assistant_id}'_document_unknown_filename'")), key=key, value={"document":doc.to_json()}) for key, doc in zip(insert_document_keys, vectorstore_documents_to_be_indexed)]
 
         num_successful_batch_uploads = 0
         total_documents_to_be_indexed = len(batch_put_ops)

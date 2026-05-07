@@ -647,12 +647,14 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
 
 # TODO: TEXT WEBPAGE URL IDENTITY UPDATER
 # TODO: TEST CONFIGURATION & STORE CAPABILITY
-from langchain_openai import ChatOpenAI
+# NOTE: ``ChatOpenAI`` was imported here but never referenced — removed to avoid a
+# ~1-2 s eager ``langchain_openai`` load on every cold start.  ``UnstructuredLoader``
+# is imported lazily inside ``update_identity_via_text_content_url`` (the only call
+# site) to keep ``langchain_unstructured`` off the cold-start path.  ``Document`` is
+# already imported at the top of this module.
 from src.anubis.utils.prompts.system_prompts import FACT_FORMATTING_STRING_PROMPT
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from uuid import uuid4, uuid5, NAMESPACE_URL
-from langchain_unstructured import UnstructuredLoader
-from langchain_core.documents import Document
 
 @tool
 async def update_identity_via_text_content_url(
@@ -706,7 +708,9 @@ async def update_identity_via_text_content_url(
     filename_uuid5 = uuid5(NAMESPACE_URL, url)
  
     namespace = (user_id, assistant_id, "identity", filename_uuid5)
-    
+
+    from langchain_unstructured import UnstructuredLoader
+
     loader = UnstructuredLoader(web_url=url)
     docs = loader.load()
  

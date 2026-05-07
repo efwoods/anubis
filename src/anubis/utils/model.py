@@ -7,15 +7,18 @@ from src.anubis.utils.context import GlobalContext
 from typing import Optional
 
 from pydantic import BaseModel
-from langchain_together import ChatTogether
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from langchain_openai import ChatOpenAI
+
+# NOTE: ``ChatTogether``, ``ChatNVIDIA``, ``ChatOpenAI``, and ``AsyncLlamaAPIClient``
+# are imported lazily inside the branches that use them.  Eagerly importing all four
+# at module scope adds ~3-4 s to every cold start of any module that transitively
+# imports model.py (notably retrieval_graph.py and graph.py).  Each provider's SDK
+# is only needed for its own ``model_provider`` branch, so the chosen provider pays
+# its import cost on the first model call; the other three SDKs are never loaded.
 
 from typing import TypedDict
 
 
 
-from llama_api_client import AsyncLlamaAPIClient
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from typing import List, Any
 from typing import Literal
@@ -67,6 +70,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
         return model 
 
     if response_format is not None:
+            from langchain_openai import ChatOpenAI
+
             model = ChatOpenAI(
                 model = context.classification_model,
                 base_url = context.classification_model_base_url,
@@ -77,6 +82,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             return model
     
     if model_provider == "OPEN_AI":
+        from langchain_openai import ChatOpenAI
+
         if response_format is None:
             model = ChatOpenAI(
                         model = model_name,
@@ -102,6 +109,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             model = model.with_structured_output(schema=response_format)
 
     if model_provider == "TOGETHER":
+        from langchain_together import ChatTogether
+
         if response_format is None:
             model = ChatTogether(
                         model = model_name,
@@ -126,6 +135,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             )
             model = model.with_structured_output(schema=response_format)
     elif model_provider == "NVIDIA":
+        from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
         if response_format is None:
                 model = ChatNVIDIA(
                             model = model_name,
@@ -148,6 +159,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
             )
             model = model.with_structured_output(schema=response_format)
     elif model_provider == "META":
+        from langchain_openai import ChatOpenAI
+
         if response_format is None:
             model = ChatOpenAI(
                             model = model_name,
@@ -176,6 +189,8 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
     return model
 
 def init_image_description_model():
+    from langchain_openai import ChatOpenAI
+
     context = GlobalContext()
     model_name = context.image_model
     base_url = context.image_model_base_url
@@ -188,7 +203,6 @@ def init_image_description_model():
     logger.info(f"base_url: {base_url}")
     logger.info(f"model_name: {model_name}")
 
-    # from langchain_openai import ChatOpenAI
     model = ChatOpenAI(
                 model = model_name,
                 base_url = base_url,
@@ -226,6 +240,8 @@ class AsyncLlamaAPIClientWrapper:
       or returns an AI message with token usage metadata
       if no pydantic model is accepted
       """
+      from llama_api_client import AsyncLlamaAPIClient
+
       client = AsyncLlamaAPIClient(api_key=self.llama_api_key)
       class LlamaMessage(BaseModel):
           role: Literal["human","user", "system", "assistant"] = Field(validation_alias="type")

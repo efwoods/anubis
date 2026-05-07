@@ -2,8 +2,7 @@
 
 """ CSV """
 
-from langchain_core.messages.utils import count_tokens_approximately
-
+from src.anubis.utils.tokenizer import count_tokens
 from pathlib import Path
 import sys
 import os
@@ -20,7 +19,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from pydantic import BaseModel
 from typing import List, Literal
-from langchain_core.messages.utils import count_tokens_approximately
+from src.anubis.utils.tokenizer import count_tokens
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from pathlib import Path
 

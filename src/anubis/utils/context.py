@@ -281,6 +281,35 @@ class GlobalContext:
 
     """ </Audio Transcription & Diarization Model> """
 
+    """ <Stylistic + Knowledge Profile thresholds> """
+
+    min_quotes_for_profile: int = field(
+        default=20,
+        metadata={
+            "description": "Minimum number of quote-namespace Documents required to build the stylistic profile. Env MIN_QUOTES_FOR_PROFILE."
+        },
+    )
+    profile_refresh_threshold: int = field(
+        default=20,
+        metadata={
+            "description": "Minimum number of new quote Documents added since the last build to trigger a profile refresh. Env PROFILE_REFRESH_THRESHOLD."
+        },
+    )
+    min_identity_docs_for_knowledge_profile: int = field(
+        default=10,
+        metadata={
+            "description": "Minimum number of identity-namespace Documents required to build the knowledge profile. Env MIN_IDENTITY_DOCS_FOR_KNOWLEDGE_PROFILE."
+        },
+    )
+    knowledge_profile_top_k: int = field(
+        default=8,
+        metadata={
+            "description": "Top-K bounded retrieval for the knowledge evaluator's atomic-fact index. Env KNOWLEDGE_PROFILE_TOP_K."
+        },
+    )
+
+    """ </Stylistic + Knowledge Profile thresholds> """
+
     dev: str = field(
         default=None,
         metadata={

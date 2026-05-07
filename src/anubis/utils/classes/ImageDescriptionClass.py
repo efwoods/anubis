@@ -11,12 +11,11 @@ class ImageDescriptionClass:
     """Vision model call for plain-text image descriptions and usage metadata."""
 
     def __init__(self):
-        context = GlobalContext()
         self.model = init_image_description_model()
         self.system_message = SystemMessage(content=DESCRIBE_IMAGE_PROMPT)
-        self.model_name = context.image_model
-        self.model_input_token_cost = float(context.image_model_prompt_cost)
-        self.model_output_token_cost = float(context.image_model_completion_cost)
+        self.model_name = "gpt-5.4-nano"
+        self.model_input_token_cost = 0.0000002
+        self.model_output_token_cost = 0.00000125
         self.model_inference_type = "image_description"
 
     async def describe(self, image_data: str, filename: str) -> dict:

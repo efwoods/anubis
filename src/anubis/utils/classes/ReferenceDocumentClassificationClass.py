@@ -2,8 +2,7 @@ import json
 from time import time_ns
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.messages.utils import count_tokens_approximately
-
+from src.anubis.utils.tokenizer import count_tokens
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.model import init_model
 from src.anubis.utils.schema import (
@@ -16,36 +15,29 @@ class ReferenceDocumentClassificationClass:
     """Structured reference vs biographical classification (menus, holy texts, etc.)."""
 
     def __init__(self):
-        context = GlobalContext()
         self.model = init_model(
             response_format=ReferenceDocumentOrBiographicalConversationalInformation
         )
         self.system_message = SystemMessage(
             content=REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION
         )
-        self.system_prompt_tokens = count_tokens_approximately(
-            REFERENCE_DOCUMENT_OR_BIOGRAPHICAL_CONVERSATIONAL_INFORMATION
-        )
-        self.model_name = context.classification_model
-        self.model_input_token_cost_per_million = float(
-            context.classification_model_prompt_cost
-        )
-        self.model_output_token_cost_per_million = float(
-            context.classification_model_completion_cost
-        )
+        self.system_prompt_tokens = 1541
+        self.model_name = 'gpt-5-nano'
+        self.model_input_token_cost_per_million = 0.00000005
+        self.model_output_token_cost_per_million = 0.0000004
         self.model_inference_type = "reference_document_structured_output"
 
     async def classify(self, input_str: str):
         start_time = time_ns()
         human_message = HumanMessage(content=input_str)
         input_tokens = (
-            count_tokens_approximately(input_str) + self.system_prompt_tokens
+            count_tokens(input_str) + self.system_prompt_tokens
         )
         messages = [self.system_message, human_message]
         response = await self.model.ainvoke(messages)
         response_dict = response.model_dump()
 
-        output_tokens = count_tokens_approximately(json.dumps(response_dict))
+        output_tokens = count_tokens(json.dumps(response_dict))
         total_tokens = input_tokens + output_tokens
 
         total_cost = (

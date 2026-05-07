@@ -7,7 +7,7 @@ from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage
 
-from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.anubis.utils.model import init_model
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
@@ -15,6 +15,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.anubis.utils.context import GlobalContext
 
 from langgraph.store.base import BaseStore
+
+
+from src.anubis.utils.tokenizer import count_tokens
 
 import logging
 import re
@@ -325,7 +328,7 @@ async def chunk_long_messages(human_message_list, context) -> list:
     # Chunk Long Messages
     chunked_message_list = []
     for message in human_message_list:
-        message_token_len = count_tokens_approximately([message])
+        message_token_len = count_tokens([message])
     if message_token_len > context.model_token_limit:
         text_chunks = text_splitter.split_text(getattr(message, "text", ""))
         message = [HumanMessage(content=[{'type':'text', 'text':chunk}]) for chunk in text_chunks]

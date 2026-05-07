@@ -32,7 +32,8 @@ class SearchQuery(BaseModel):
 
 from langgraph.runtime import Runtime
 
-from langchain_core.messages.utils import (trim_messages, count_tokens_approximately)
+from src.anubis.utils.tokenizer import count_tokens
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.anubis.utils.model import init_model

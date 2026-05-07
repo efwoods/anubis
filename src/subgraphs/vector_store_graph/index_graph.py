@@ -69,26 +69,16 @@ async def index_docs(
     user_id = updated_user_id['user_id']
     assistant_id = updated_assistant_id['assistant_id']
 
-    configurable = config.get("configurable", {}) or {}
-    creator_id = (
-        configurable.get("creator_id")
-        or (configurable.get("assistant_ctx", {}) or {}).get("metadata", {}).get("user_id")
-        or user_id
-    )
-
     docs = state['vectorstore_documents_to_be_indexed']
 
-    for doc in docs:
-        doc.metadata.setdefault("creator_id", creator_id)
-
-    filenames = [doc.metadata.get("filename") for doc in docs]
+    filenames = [doc.metadata.get("namespace_filename") for doc in docs]
     try:
         assert(len(filenames) == len(docs))
     except AssertionError as e:
         logger.warning(f"Missing {len(docs) - len(filenames)} filenames on documents")
 
     if len(filenames) > 0:
-        result = await batch_index_documents_vectorstore(store, creator_id, assistant_id, docs, BATCH_SIZE=1000)
+        result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
 
         try:
             assert(result['success'] == True)

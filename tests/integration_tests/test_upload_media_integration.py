@@ -50,8 +50,7 @@ from src.anubis.utils.nodes import load_consciousness
 
 DATA_DIR = PROJECT_ROOT / "data" / "mom"
 
-USER_ID = "test-user-uploader"
-CREATOR_ID = "test-creator-mom-avatar"
+USER_ID = "test-creator-mom-avatar"
 ASSISTANT_ID = "test-assistant-mom"
 
 
@@ -76,14 +75,13 @@ def _build_config() -> RunnableConfig:
     return RunnableConfig(
         configurable={
             "user_id": USER_ID,
-            "creator_id": CREATOR_ID,
             "assistant_id": ASSISTANT_ID,
             "user_ctx": {"name": "TestUser", "description": None},
             "assistant_ctx": {
                 "name": "Mom",
                 "description": "Mom avatar (test).",
                 "assistant_id": ASSISTANT_ID,
-                "metadata": {"user_id": CREATOR_ID},
+                "metadata": {"user_id": USER_ID},
             },
         }
     )
@@ -94,7 +92,7 @@ def _build_context() -> GlobalContext:
     return GlobalContext(
         assistant_ctx=AssistantContext(
             name="Mom",
-            metadata={"user_id": CREATOR_ID, "assistant_id": ASSISTANT_ID},
+            metadata={"user_id": USER_ID, "assistant_id": ASSISTANT_ID},
         ),
         user_ctx=UserContext(name="TestUser"),
     )
@@ -113,7 +111,6 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "content_type": "image/jpeg",
             "content": ref_img_bytes,
             "user_id": USER_ID,
-            "creator_id": CREATOR_ID,
             "assistant_id": ASSISTANT_ID,
             "reference_audio": False,
             "reference_image": True,
@@ -130,7 +127,6 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "content_type": "image/png",
             "content": other_img_bytes,
             "user_id": USER_ID,
-            "creator_id": CREATOR_ID,
             "assistant_id": ASSISTANT_ID,
             "reference_audio": False,
             "reference_image": False,
@@ -147,7 +143,6 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "content_type": "audio/mp4",
             "content": ref_audio_bytes,
             "user_id": USER_ID,
-            "creator_id": CREATOR_ID,
             "assistant_id": ASSISTANT_ID,
             "reference_audio": True,
             "reference_image": False,
@@ -164,7 +159,6 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "content_type": "text/plain",
             "content": quotes_bytes,
             "user_id": USER_ID,
-            "creator_id": CREATOR_ID,
             "assistant_id": ASSISTANT_ID,
             "reference_audio": False,
             "reference_image": False,
@@ -310,8 +304,7 @@ def patched_pipeline():
             new=_stub_situation_classify,
         ),
         patch(
-            "src.subgraphs.process_media_graph.utils.helper_functions."
-            "perform_ocean_analysis",
+            "src.anubis.utils.analysis.analysis_methods.perform_ocean_analysis",
             side_effect=_stub_perform_ocean_analysis,
         ),
         patch(
@@ -372,25 +365,25 @@ async def test_upload_media_pipeline_then_load_consciousness(patched_pipeline):
         context=context,
     )
 
-    # ---- Verify reference image stored under (creator_id, assistant_id, "reference_image") ----
-    ref_image_namespace = (CREATOR_ID, ASSISTANT_ID, "reference_image")
+    # ---- Verify reference image stored under (user_id, assistant_id, "reference_image") ----
+    ref_image_namespace = (USER_ID, ASSISTANT_ID, "reference_image")
     ref_image_item = await store.aget(ref_image_namespace, ASSISTANT_ID)
     assert ref_image_item is not None, (
-        "Reference image was not persisted under the creator namespace."
+        "Reference image was not persisted under the avatar-owner namespace."
     )
     ref_value = getattr(ref_image_item, "value", {}) or {}
     assert "reference_image_data" in ref_value
     assert ref_value["reference_image_data"].startswith("data:image/")
 
-    # ---- Verify reference audio stored under (creator_id, assistant_id, "reference_audio") ----
-    ref_audio_namespace = (CREATOR_ID, ASSISTANT_ID, "reference_audio")
+    # ---- Verify reference audio stored under (user_id, assistant_id, "reference_audio") ----
+    ref_audio_namespace = (USER_ID, ASSISTANT_ID, "reference_audio")
     ref_audio_item = await store.aget(ref_audio_namespace, ASSISTANT_ID)
     assert ref_audio_item is not None, "Reference audio not persisted."
     ref_audio_value = getattr(ref_audio_item, "value", {}) or {}
     assert ref_audio_value["reference_audio_data"].startswith("data:audio/")
 
     # ---- Verify quote namespace contains documents from text quotes AND audio transcript ----
-    quote_namespace = (CREATOR_ID, ASSISTANT_ID, "quote")
+    quote_namespace = (USER_ID, ASSISTANT_ID, "quote")
     quote_items = await store.asearch(quote_namespace, limit=10000)
     assert len(quote_items) > 0, "No documents indexed in quote namespace."
     quote_filenames = {
@@ -428,7 +421,7 @@ async def test_upload_media_pipeline_then_load_consciousness(patched_pipeline):
     )
 
     # ---- Verify identity namespace contains the non-reference image description ----
-    identity_namespace = (CREATOR_ID, ASSISTANT_ID, "identity")
+    identity_namespace = (USER_ID, ASSISTANT_ID, "identity")
     identity_items = await store.asearch(identity_namespace, limit=10000)
     identity_filenames = {
         (getattr(item, "value", {}) or {})
@@ -509,7 +502,6 @@ async def test_upload_media_text_only_quotes_per_line_namespace(patched_pipeline
             "content_type": "text/plain",
             "content": quotes_bytes,
             "user_id": USER_ID,
-            "creator_id": CREATOR_ID,
             "assistant_id": ASSISTANT_ID,
             "reference_audio": False,
             "reference_image": False,
@@ -527,7 +519,7 @@ async def test_upload_media_text_only_quotes_per_line_namespace(patched_pipeline
     )
 
     quote_items = await store.asearch(
-        (CREATOR_ID, ASSISTANT_ID, "quote"), limit=10000
+        (USER_ID, ASSISTANT_ID, "quote"), limit=10000
     )
     assert quote_items, "Mom quotes did not land in the quote namespace."
 

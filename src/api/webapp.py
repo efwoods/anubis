@@ -917,7 +917,7 @@ async def select_avatar(
                 provider_encoded_user_id = quote(current_user["user_id"], safe="")
 
                 hashed_api_key = current_user["app_metadata"]["api_key"]
-                update_assistant_result = await update_assistant_config(
+                _ = await update_assistant_config(
                     hashed_api_key=hashed_api_key,
                     provider_encoded_user_id=provider_encoded_user_id,
                     assistant_config=assistant_config,
@@ -952,6 +952,7 @@ async def select_avatar(
                                 "assistant_ctx": {
                                     "name": assistant.get("name", None),
                                     "description": assistant.get("description", None),
+                                    "metadata": assistant.get("metadata", {}),
                                 },
                                 "assistant_id": assistant.get("assistant_id", None),
                             }

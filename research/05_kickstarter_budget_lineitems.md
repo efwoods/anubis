@@ -201,3 +201,4 @@ Suggested category labels (rename to match what the sheet already uses):
 > conversation), including their share of hosting, model inference,
 > embeddings, and observability. Heavier usage (multiple conversations/day)
 > scales linearly with the same per-message cost.
+

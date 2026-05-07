@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 async def run_evaluation(
     *,
     candidate_text: str,
-    creator_id: str,
+    user_id: str,
     assistant_id: str,
     store,
     reference_text: Optional[str] = None,
@@ -50,7 +50,7 @@ async def run_evaluation(
     ----------
     candidate_text:
         The model output to evaluate.
-    creator_id, assistant_id:
+    user_id, assistant_id:
         Identify the avatar whose stored profiles should be used.
     store:
         ``BaseStore`` instance from the LangGraph runtime.
@@ -66,10 +66,10 @@ async def run_evaluation(
     ctx = context or GlobalContext()
 
     stylistic_profile = await load_stylistic_profile(
-        creator_id=creator_id, assistant_id=assistant_id, store=store
+        user_id=user_id, assistant_id=assistant_id, store=store
     )
     knowledge_profile = await load_knowledge_profile(
-        creator_id=creator_id, assistant_id=assistant_id, store=store
+        user_id=user_id, assistant_id=assistant_id, store=store
     )
 
     authenticity_report = evaluate_authenticity_against_profile(
@@ -85,7 +85,7 @@ async def run_evaluation(
         try:
             knowledge_report = await evaluate_knowledge(
                 candidate_text=candidate_text,
-                creator_id=creator_id,
+                user_id=user_id,
                 assistant_id=assistant_id,
                 store=store,
                 context=ctx,
@@ -111,7 +111,7 @@ async def run_evaluation(
         }
 
     return {
-        "creator_id": creator_id,
+        "user_id": user_id,
         "assistant_id": assistant_id,
         "candidate_text_excerpt": (candidate_text or "")[:500],
         "stylistic_profile_built": stylistic_profile is not None,

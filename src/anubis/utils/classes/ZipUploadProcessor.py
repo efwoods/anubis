@@ -6,21 +6,12 @@ to label image/audio/video/text/json/pdf payloads.
 
 Identity-write rule:
     This class is consumed by the ``update_avatar_identity_with_media``
-    flow. By rule, on that endpoint the ``user_id`` and the ``creator_id``
-    are always the same person — only the assistant's original "parent" /
-    creator may write identity material into the avatar's vectorstore.
-
-    ``creator_id`` is therefore not a separate parameter on :method:`expand`.
-    Each produced media-file dict has ``creator_id == user_id``.
-
-    The reason for keeping ``creator_id`` on the dicts at all (instead of
-    just relying on ``user_id``) is the read side: at chat time
-    ``load_consciousness`` uses ``creator_id`` to (a) load the known facts
-    that the creator stored in the vectorstore so a non-creator chatting
-    with the avatar still sees them, and (b) prevent the avatar from
-    learning new facts about itself during conversation when the speaker is
-    not the original creator. The two ids only diverge on the read side; on
-    the write side handled here they are equal.
+    flow. The endpoint enforces that only the avatar's original "parent" /
+    creator may write identity material into the avatar's vectorstore by
+    verifying the requesting ``user_id`` matches the assistant's owner
+    before any media leaves the endpoint. Every produced media-file dict
+    therefore carries that creator's ``user_id``; nothing else is needed
+    to scope the store namespace correctly downstream.
 """
 
 import io

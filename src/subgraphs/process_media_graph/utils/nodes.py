@@ -121,7 +121,6 @@ async def process_uploaded_files_and_label_media_type(
             file_bytes = file_data.get('content')
             user_id = file_data.get("user_id")
             assistant_id = file_data.get("assistant_id")
-            creator_id = file_data.get("creator_id") or user_id
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
             
@@ -397,11 +396,6 @@ async def process_uploaded_files_and_label_media_type(
                 logger.warning(f"Unsupported content type: {content_type}")
                 continue
 
-            for added in media_list[file_start_idx:]:
-                meta = added.setdefault("metadata", {})
-                meta.setdefault("creator_id", creator_id)
-                added.setdefault("creator_id", creator_id)
-
         except Exception as e:
             logger.error(f"Error processing file {filename}: {e}")
             continue
@@ -513,15 +507,9 @@ async def process_media_item_task(
 
     user_id = metadata.get("user_id", "")
     assistant_id = metadata.get("assistant_id", "")
-    creator_id = (
-        metadata.get("creator_id")
-        or (config.get("configurable", {}) or {}).get("creator_id")
-        or user_id
-    )
 
     logger.info(f"extracted user_id: {user_id}")
     logger.info(f"extracted assistant_id: {assistant_id}")
-    logger.info(f"extracted creator_id: {creator_id}")
 
     filename = media_item['metadata']['filename']
     logger.info(f"Processing file: {filename}")
@@ -585,7 +573,7 @@ async def process_media_item_task(
                 image_data=image_source,
                 filename=filename,
                 store=store,
-                user_id=creator_id,
+                user_id=user_id,
                 assistant_id=assistant_id,
                 context=runtime.context,
                 reference_image=reference_image
@@ -594,7 +582,6 @@ async def process_media_item_task(
             doc.metadata.update(
                 {
                     "user_id": user_id,
-                    "creator_id": creator_id,
                     "assistant_id": assistant_id,
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
                     "processing_task_id": str(uuid4()),
@@ -613,7 +600,7 @@ async def process_media_item_task(
 
 
                 # Use the reference image to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
-                # namespace is (creator_id, assistant_id, "identity")
+                # namespace is (user_id, assistant_id, "identity")
                 # key is the assistant_id
                 # metadata contains "emotion" and "base64_encoded_str"
                 # page_content is the description of the image
@@ -627,7 +614,7 @@ async def process_media_item_task(
                 # The frontend searches the metadata for "emotion", "content_type", and "synthetic" to display the images
                 
                 
-                namespace = (creator_id, assistant_id, "reference_image")
+                namespace = (user_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
                 
                 await store.aput(
@@ -682,7 +669,6 @@ async def process_media_item_task(
                     "filename": filename,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "creator_id": creator_id,
                     "source": "image_description",
                     "image_filename": filename,
                 },
@@ -708,21 +694,17 @@ async def process_media_item_task(
                         "vectorstore_acceptable": True,
                         "adapter_acceptable": False,
                         "analysis_acceptable": True,
-                        "creator_id": creator_id,
                     }
                 )
             return documents
 
         elif media_type == "text":
-            metadata.setdefault("creator_id", creator_id)
             documents = await process_text_to_document(
                 metadata=metadata,
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
             )
-            for d in documents:
-                d.metadata.setdefault("creator_id", creator_id)
             return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             content = media_item.get('content')
@@ -799,7 +781,6 @@ async def process_media_item_task(
                                     "adapter_acceptable": True,
                                     "analysis_acceptable": False,
                                     "synthetic": False,
-                                    "creator_id": creator_id,
                                 }
                             )
                             final_documents.append(document)
@@ -847,7 +828,6 @@ async def process_media_item_task(
                 url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                creator_id=creator_id,
             )
             if not expanded_items:
                 return [
@@ -863,10 +843,10 @@ async def process_media_item_task(
                 ]
             collected: List[Document] = []
             for item in expanded_items:
-                # Each expanded item already has user_id / assistant_id /
-                # creator_id baked into its metadata; recurse into the same
-                # task. Linktree children come back as ``type="url"`` so they
-                # pass back through this branch.
+                # Each expanded item already has user_id / assistant_id baked
+                # into its metadata; recurse into the same task. Linktree
+                # children come back as ``type="url"`` so they pass back
+                # through this branch.
                 try:
                     child_docs = await process_media_item_task(
                         item, runtime, config, store
@@ -927,7 +907,6 @@ async def process_media_item_task(
                         "filename": filename,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
-                        "creator_id": creator_id,
                         "source": "pdf_page",
                         "pdf_page_index": page_idx,
                     },
@@ -939,7 +918,6 @@ async def process_media_item_task(
                     media_item=page_media_item,
                 )
                 for d in documents:
-                    d.metadata.setdefault("creator_id", creator_id)
                     d.metadata.setdefault("pdf_page_index", page_idx)
                 final_documents.extend(documents)
 
@@ -952,7 +930,7 @@ async def process_media_item_task(
 
             Reference audio is a special case: we never run the diarizer on
             it (the goal is to anchor a known speaker for *future* uploads).
-            We persist the reference audio URI under ``(creator_id, assistant_id,
+            We persist the reference audio URI under ``(user_id, assistant_id,
             "reference_audio")`` so the next non-reference upload can use it.
             """
             reference_audio = metadata.get("reference_audio", False)
@@ -997,12 +975,11 @@ async def process_media_item_task(
             # uploads. Do not diarize the reference itself.
             # ---------------------------------------------------------------
             if media_type == "audio" and reference_audio:
-                ref_namespace = (creator_id, assistant_id, "reference_audio")
+                ref_namespace = (user_id, assistant_id, "reference_audio")
                 doc = Document(
                     page_content="Reference audio uploaded.",
                     metadata={
                         "user_id": user_id,
-                        "creator_id": creator_id,
                         "assistant_id": assistant_id,
                         "created_at": datetime.now(tz=timezone.utc).isoformat(),
                         "processing_task_id": str(uuid4()),
@@ -1033,7 +1010,7 @@ async def process_media_item_task(
             encoded_reference_audio = None
             try:
                 ref_item = await store.aget(
-                    (creator_id, assistant_id, "reference_audio"), assistant_id
+                    (user_id, assistant_id, "reference_audio"), assistant_id
                 )
                 if ref_item is not None:
                     encoded_reference_audio = (
@@ -1058,7 +1035,6 @@ async def process_media_item_task(
                         page_content=f"[{media_type.capitalize()} URL pointer: {audio_url or video_url}]",
                         metadata={
                             "user_id": user_id,
-                            "creator_id": creator_id,
                             "assistant_id": assistant_id,
                             "created_at": datetime.now(tz=timezone.utc).isoformat(),
                             "type": media_type,
@@ -1134,7 +1110,6 @@ async def process_media_item_task(
                             "filename": filename,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
-                            "creator_id": creator_id,
                             "source": (
                                 metadata.get("source") or filename or f"{media_type}_upload"
                             ),
@@ -1162,7 +1137,6 @@ async def process_media_item_task(
                             "filename": filename,
                             "user_id": user_id,
                             "assistant_id": assistant_id,
-                            "creator_id": creator_id,
                             "source": (
                                 metadata.get("source") or filename or f"{media_type}_transcription"
                             ),
@@ -1201,7 +1175,6 @@ async def process_media_item_task(
                         page_content=f"[{media_type.capitalize()} transcription unavailable]",
                         metadata={
                             "user_id": user_id,
-                            "creator_id": creator_id,
                             "assistant_id": assistant_id,
                             "created_at": datetime.now(tz=timezone.utc).isoformat(),
                             "type": media_type,
@@ -1219,7 +1192,6 @@ async def process_media_item_task(
                     "filename": filename,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "creator_id": creator_id,
                     "source": (
                         metadata.get("source") or filename or f"{media_type}_transcription"
                     ),
@@ -1349,7 +1321,7 @@ async def process_adapter_documents(
       already a ``{"messages": [...]}`` JSON blob produced by
       :func:`process_dialogue_json_to_documents`. We append it to
       ``data/<assistant_id>/adapter_training.jsonl`` as-is and write the
-      same row to the LangGraph store under ``(creator_id, assistant_id,
+      same row to the LangGraph store under ``(user_id, assistant_id,
       "adapter")`` so retrieval can later use it.
 
     * Quote Documents (``namespace == "quote"``, ``adapter_acceptable=True``):
@@ -1372,10 +1344,6 @@ async def process_adapter_documents(
         return {}
 
     user_id, assistant_id = await extract_user_id_assistant_id(config)
-    creator_id = (
-        (config.get("configurable", {}) or {}).get("creator_id")
-        or user_id
-    )
 
     # Lazy import so optional helpers don't slow the graph cold start.
     from src.anubis.utils.dataset.formatting import (
@@ -1406,7 +1374,7 @@ async def process_adapter_documents(
             continue
         adapter_rows_total.append(payload)
         try:
-            ns = (creator_id, assistant_id, "adapter")
+            ns = (user_id, assistant_id, "adapter")
             await store.aput(
                 ns,
                 key=str(d.metadata.get("document_id") or uuid4()),
@@ -1509,10 +1477,6 @@ async def build_stylistic_fingerprint(
     except Exception as exc:
         logger.warning("Could not resolve user/assistant id: %s", exc)
         return {}
-    creator_id = (
-        (config.get("configurable", {}) or {}).get("creator_id")
-        or user_id
-    )
 
     from src.anubis.utils.dataset.build_profile import maybe_build_stylistic_profile
     from src.anubis.utils.dataset.build_knowledge_profile import (
@@ -1521,7 +1485,7 @@ async def build_stylistic_fingerprint(
 
     try:
         await maybe_build_stylistic_profile(
-            creator_id=creator_id,
+            user_id=user_id,
             assistant_id=assistant_id,
             store=store,
             context=runtime.context,
@@ -1531,7 +1495,7 @@ async def build_stylistic_fingerprint(
 
     try:
         await maybe_build_knowledge_profile(
-            creator_id=creator_id,
+            user_id=user_id,
             assistant_id=assistant_id,
             store=store,
             context=runtime.context,

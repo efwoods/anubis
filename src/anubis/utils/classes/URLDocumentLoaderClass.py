@@ -83,7 +83,6 @@ class URLDocumentLoaderClass:
         *,
         user_id: Optional[str] = None,
         assistant_id: Optional[str] = None,
-        creator_id: Optional[str] = None,
         expect_multispeaker: bool = False,
     ) -> List[Dict[str, Any]]:
         """Expand ``url`` into media items consumable by ``process_media_item_task``."""
@@ -95,18 +94,17 @@ class URLDocumentLoaderClass:
         try:
             if kind == "youtube":
                 return await self._load_youtube(
-                    url, user_id, assistant_id, creator_id, expect_multispeaker
+                    url, user_id, assistant_id, expect_multispeaker
                 )
             if kind == "linktree":
                 return await self._load_linktree(
-                    url, user_id, assistant_id, creator_id
+                    url, user_id, assistant_id
                 )
             if kind == "twitter":
                 return await self._load_article(
                     url,
                     user_id,
                     assistant_id,
-                    creator_id,
                     quotes_per_line=True,
                     url_kind="twitter",
                 )
@@ -115,7 +113,6 @@ class URLDocumentLoaderClass:
                     url,
                     user_id,
                     assistant_id,
-                    creator_id,
                     quotes_per_line=False,
                     url_kind=kind,
                 )
@@ -123,7 +120,6 @@ class URLDocumentLoaderClass:
                 url,
                 user_id,
                 assistant_id,
-                creator_id,
                 quotes_per_line=False,
                 url_kind="article",
             )
@@ -138,7 +134,6 @@ class URLDocumentLoaderClass:
                         "source": url,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
-                        "creator_id": creator_id,
                         "status": "error",
                         "error": str(exc),
                     },
@@ -150,7 +145,6 @@ class URLDocumentLoaderClass:
         url: str,
         user_id: Optional[str],
         assistant_id: Optional[str],
-        creator_id: Optional[str],
         *,
         quotes_per_line: bool,
         url_kind: Optional[str] = None,
@@ -189,7 +183,6 @@ class URLDocumentLoaderClass:
                     "source": url,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "creator_id": creator_id,
                     "quotes_per_line": quotes_per_line,
                     "url_kind": resolved_url_kind,
                 },
@@ -201,7 +194,6 @@ class URLDocumentLoaderClass:
         url: str,
         user_id: Optional[str],
         assistant_id: Optional[str],
-        creator_id: Optional[str],
     ) -> List[Dict[str, Any]]:
         """Fetch a Linktree page and return one ``type="url"`` item per outbound link."""
         try:
@@ -243,7 +235,6 @@ class URLDocumentLoaderClass:
                         "source": link,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
-                        "creator_id": creator_id,
                         "url_kind": "linktree_child",
                         "linktree_root": url,
                     },
@@ -256,7 +247,6 @@ class URLDocumentLoaderClass:
         url: str,
         user_id: Optional[str],
         assistant_id: Optional[str],
-        creator_id: Optional[str],
         expect_multispeaker: bool,
     ) -> List[Dict[str, Any]]:
         """Subtitles fast-path; otherwise download audio for diarization."""
@@ -276,7 +266,6 @@ class URLDocumentLoaderClass:
                                 "source": url,
                                 "user_id": user_id,
                                 "assistant_id": assistant_id,
-                                "creator_id": creator_id,
                                 "url_kind": "youtube_subs",
                             },
                         }
@@ -305,7 +294,6 @@ class URLDocumentLoaderClass:
                     "source": url,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "creator_id": creator_id,
                     "url_kind": "youtube_audio",
                 },
             }

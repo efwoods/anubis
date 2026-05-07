@@ -132,7 +132,7 @@ async def process_text_media_item_target_for_vectorstore(
     """Chunk text/string content into Documents tagged with the desired namespace.
 
     The ``namespace`` arg sets ``metadata['namespace']`` on every produced chunk so the
-    indexer can place it under ``(creator_id, assistant_id, namespace, filename)``.
+    indexer can place it under ``(user_id, assistant_id, namespace, filename)``.
     """
 
     logger.info("process_text_media_item_target_for_vectorstore entrypoint")
@@ -389,7 +389,6 @@ def _build_target_quote_documents_from_dialogue(
     filename = item_metadata.get("filename", "")
     filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
     source = item_metadata.get("source") or filename or "user_upload"
-    creator_id = item_metadata.get("creator_id") or user_id
     current_timestamp = datetime.now(tz=timezone.utc).isoformat()
 
     documents: List[Document] = []
@@ -405,7 +404,6 @@ def _build_target_quote_documents_from_dialogue(
                 metadata={
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "creator_id": creator_id,
                     "created_at": current_timestamp,
                     "processing_task_id": str(uuid4()),
                     "source": source,
@@ -462,7 +460,6 @@ def _build_adapter_dialogue_document(
     filename = item_metadata.get("filename", "")
     filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
     source = item_metadata.get("source") or filename or "user_upload"
-    creator_id = item_metadata.get("creator_id") or user_id
     current_timestamp = datetime.now(tz=timezone.utc).isoformat()
 
     speakers_seen = sorted({seg.get("speaker") for seg in dialogue_segments if seg.get("speaker")})
@@ -472,7 +469,6 @@ def _build_adapter_dialogue_document(
         metadata={
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "creator_id": creator_id,
             "created_at": current_timestamp,
             "processing_task_id": str(uuid4()),
             "source": source,

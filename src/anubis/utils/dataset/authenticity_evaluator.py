@@ -176,7 +176,7 @@ def evaluate_authenticity_against_profile(
 async def evaluate_authenticity(
     *,
     candidate_text: str,
-    creator_id: str,
+    user_id: str,
     assistant_id: str,
     store,
 ) -> Dict[str, Any]:
@@ -184,6 +184,6 @@ async def evaluate_authenticity(
     from src.anubis.utils.dataset.build_profile import load_stylistic_profile
 
     profile: Optional[Dict[str, Any]] = await load_stylistic_profile(
-        creator_id=creator_id, assistant_id=assistant_id, store=store
+        user_id=user_id, assistant_id=assistant_id, store=store
     )
     return evaluate_authenticity_against_profile(candidate_text, profile or {})

@@ -14,9 +14,9 @@ draw on. We populate it from two sources:
   claim is supported either by a stated identity fact or by something the
   avatar literally said.
 
-The profile is stored at namespace ``(creator_id, assistant_id,
+The profile is stored at namespace ``(user_id, assistant_id,
 "knowledge_profile")`` and individual fact rows are also written under
-``(creator_id, assistant_id, "knowledge_profile_index")`` so the LangGraph
+``(user_id, assistant_id, "knowledge_profile_index")`` so the LangGraph
 store's vector backend can serve bounded ``asearch`` queries during
 evaluation.
 """
@@ -40,9 +40,9 @@ KNOWLEDGE_PROFILE_KEY = "profile"
 
 
 async def _enumerate_namespace(
-    creator_id: str, assistant_id: str, namespace_tag: str, store: BaseStore
+    user_id: str, assistant_id: str, namespace_tag: str, store: BaseStore
 ) -> List[Dict[str, Any]]:
-    namespace = (creator_id, assistant_id, namespace_tag)
+    namespace = (user_id, assistant_id, namespace_tag)
     try:
         items = await store.asearch(namespace, query="*", limit=10000)
     except Exception as exc:
@@ -72,20 +72,20 @@ async def _enumerate_namespace(
 
 async def maybe_build_knowledge_profile(
     *,
-    creator_id: str,
+    user_id: str,
     assistant_id: str,
     store: BaseStore,
     context: GlobalContext,
 ) -> Optional[Dict[str, Any]]:
     """Build / refresh the atomic-fact index if thresholds are met."""
-    if not creator_id or not assistant_id:
+    if not user_id or not assistant_id:
         return None
 
     identity_items = await _enumerate_namespace(
-        creator_id, assistant_id, "identity", store
+        user_id, assistant_id, "identity", store
     )
     quote_items = await _enumerate_namespace(
-        creator_id, assistant_id, "quote", store
+        user_id, assistant_id, "quote", store
     )
 
     if len(identity_items) < int(context.min_identity_docs_for_knowledge_profile or 0):
@@ -97,12 +97,12 @@ async def maybe_build_knowledge_profile(
         return None
 
     profile_namespace = (
-        creator_id,
+        user_id,
         assistant_id,
         KNOWLEDGE_PROFILE_NAMESPACE_TAG,
     )
     index_namespace = (
-        creator_id,
+        user_id,
         assistant_id,
         KNOWLEDGE_PROFILE_INDEX_TAG,
     )
@@ -195,7 +195,7 @@ async def maybe_build_knowledge_profile(
 
     logger.info(
         "Knowledge profile written for %s/%s (n_identity=%d n_quote=%d)",
-        creator_id,
+        user_id,
         assistant_id,
         len(identity_items),
         len(quote_items),
@@ -204,11 +204,11 @@ async def maybe_build_knowledge_profile(
 
 
 async def load_knowledge_profile(
-    *, creator_id: str, assistant_id: str, store: BaseStore
+    *, user_id: str, assistant_id: str, store: BaseStore
 ) -> Optional[Dict[str, Any]]:
     """Read-only fetch used by the knowledge evaluator."""
     profile_namespace = (
-        creator_id,
+        user_id,
         assistant_id,
         KNOWLEDGE_PROFILE_NAMESPACE_TAG,
     )

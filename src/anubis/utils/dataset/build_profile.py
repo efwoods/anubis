@@ -8,7 +8,7 @@ Threshold rules:
   the last time the profile was built (recorded in the profile metadata as
   ``built_with_document_count``).
 
-The profile is stored at namespace ``(creator_id, assistant_id,
+The profile is stored at namespace ``(user_id, assistant_id,
 "stylistic_profile")`` under key ``"profile"``. Evaluators MUST load this
 profile once per evaluation pass and never re-process the corpus.
 """
@@ -32,7 +32,7 @@ STYLISTIC_PROFILE_KEY = "profile"
 
 
 async def _enumerate_quote_texts(
-    creator_id: str, assistant_id: str, store: BaseStore
+    user_id: str, assistant_id: str, store: BaseStore
 ) -> List[str]:
     """Return the raw page_content of every quote-namespace Document.
 
@@ -41,7 +41,7 @@ async def _enumerate_quote_texts(
     return all items. Stores that ignore unsupported queries simply return
     everything in the namespace, which is what we want here.
     """
-    namespace = (creator_id, assistant_id, "quote")
+    namespace = (user_id, assistant_id, "quote")
     try:
         items = await store.asearch(namespace, query="*", limit=10000)
     except Exception as exc:
@@ -61,9 +61,9 @@ async def _enumerate_quote_texts(
 
 
 async def _load_existing_profile(
-    creator_id: str, assistant_id: str, store: BaseStore
+    user_id: str, assistant_id: str, store: BaseStore
 ) -> Optional[Dict[str, Any]]:
-    namespace = (creator_id, assistant_id, STYLISTIC_PROFILE_NAMESPACE_TAG)
+    namespace = (user_id, assistant_id, STYLISTIC_PROFILE_NAMESPACE_TAG)
     try:
         item = await store.aget(namespace, STYLISTIC_PROFILE_KEY)
     except Exception:
@@ -78,7 +78,7 @@ async def _load_existing_profile(
 
 async def maybe_build_stylistic_profile(
     *,
-    creator_id: str,
+    user_id: str,
     assistant_id: str,
     store: BaseStore,
     context: GlobalContext,
@@ -89,11 +89,11 @@ async def maybe_build_stylistic_profile(
     build was skipped. Callers can ignore the return value; this helper
     exists primarily for the LangGraph node ``build_stylistic_fingerprint``.
     """
-    if not creator_id or not assistant_id:
-        logger.info("Skipping stylistic profile: missing creator/assistant id")
+    if not user_id or not assistant_id:
+        logger.info("Skipping stylistic profile: missing user/assistant id")
         return None
 
-    quotes = await _enumerate_quote_texts(creator_id, assistant_id, store)
+    quotes = await _enumerate_quote_texts(user_id, assistant_id, store)
     if len(quotes) < int(context.min_quotes_for_profile or 0):
         logger.info(
             "Stylistic profile build skipped: %d quotes < min_quotes_for_profile=%s",
@@ -102,7 +102,7 @@ async def maybe_build_stylistic_profile(
         )
         return None
 
-    existing = await _load_existing_profile(creator_id, assistant_id, store)
+    existing = await _load_existing_profile(user_id, assistant_id, store)
     if existing is not None:
         last_count = int(existing.get("built_with_document_count", 0) or 0)
         delta = len(quotes) - last_count
@@ -122,11 +122,11 @@ async def maybe_build_stylistic_profile(
     profile["built_with_document_count"] = len(quotes)
     profile["built_at"] = datetime.now(tz=timezone.utc).isoformat()
 
-    namespace = (creator_id, assistant_id, STYLISTIC_PROFILE_NAMESPACE_TAG)
+    namespace = (user_id, assistant_id, STYLISTIC_PROFILE_NAMESPACE_TAG)
     await store.aput(namespace, key=STYLISTIC_PROFILE_KEY, value=profile)
     logger.info(
         "Stylistic profile written for %s/%s (n=%d quotes)",
-        creator_id,
+        user_id,
         assistant_id,
         len(quotes),
     )
@@ -134,7 +134,7 @@ async def maybe_build_stylistic_profile(
 
 
 async def load_stylistic_profile(
-    *, creator_id: str, assistant_id: str, store: BaseStore
+    *, user_id: str, assistant_id: str, store: BaseStore
 ) -> Optional[Dict[str, Any]]:
     """Read-only fetch used by the authenticity evaluator."""
-    return await _load_existing_profile(creator_id, assistant_id, store)
+    return await _load_existing_profile(user_id, assistant_id, store)

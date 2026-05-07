@@ -1938,7 +1938,6 @@ def _build_csv_statements_media_entry(
     source_filename: str,
     user_id: str,
     assistant_id: str,
-    creator_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Render the CSV preprocessing payload as a JSON-typed media_files entry.
 
@@ -1958,7 +1957,6 @@ def _build_csv_statements_media_entry(
         "content": statements_blob,
         "user_id": user_id,
         "assistant_id": assistant_id,
-        "creator_id": creator_id or user_id,
         "reference_audio": False,
         "reference_image": False,
         "base64_encoded_str": make_data_uri("application/json", statements_blob),
@@ -1978,7 +1976,7 @@ async def get_avatar_reference_image(
     """Return stored reference image data URI or image URL string for UI avatars.
 
     Lookup uses the assistant owner's store namespace so anonymous chatters see the
-    same portrait as ``load_consciousness`` (creator_id, assistant_id, reference_image).
+    same portrait that the chat-time consciousness loader reads.
     """
     store = app.state.store
     if request.headers.get("api-key") != "":
@@ -1992,10 +1990,10 @@ async def get_avatar_reference_image(
         raise HTTPException(
             status_code=400, detail=f"Could not load assistant: {exc}"
         ) from exc
-    creator_id = (assistant.get("metadata") or {}).get("user_id")
-    if not creator_id:
+    assistant_owner_user_id = (assistant.get("metadata") or {}).get("user_id")
+    if not assistant_owner_user_id:
         return JSONResponse({"reference_image_data": None})
-    namespace = (creator_id, assistant_id, "reference_image")
+    namespace = (assistant_owner_user_id, assistant_id, "reference_image")
     item = await store.aget(namespace, assistant_id)
     if item is None:
         return JSONResponse({"reference_image_data": None})
@@ -2044,12 +2042,27 @@ async def update_avatar_identity_with_media(
                 status_code=400, detail=f"Could not load assistant: {exc}"
             ) from exc
         assistant_meta = assistant.get("metadata") or {}
-        creator_id = assistant_meta.get("user_id") or user_id
+        creator_id = assistant_meta.get("user_id")
+        if not creator_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Assistant metadata is missing the creator's user_id; "
+                    "cannot verify upload permissions."
+                ),
+            )
+        if user_id != creator_id:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Only the creator of this avatar may upload media for it. "
+                    "The signed-in user is not the assistant's creator."
+                ),
+            )
 
         config = {
             "configurable": {
                 "user_id": user_id,
-                "creator_id": creator_id,
                 "user_ctx": {"name": None, "description": None},
                 "assistant_id": assistant_id,
                 "assistant_ctx": {
@@ -2111,7 +2124,6 @@ async def update_avatar_identity_with_media(
                         source_filename=raw_name,
                         user_id=user_id,
                         assistant_id=assistant_id,
-                        creator_id=creator_id,
                     )
                 )
             elif reference_image:
@@ -2320,7 +2332,6 @@ async def update_avatar_identity_with_media(
                             source_filename=csv_filename,
                             user_id=user_id,
                             assistant_id=assistant_id,
-                            creator_id=creator_id,
                         )
                     )
                 elif ct.startswith("image/"):
@@ -2423,7 +2434,7 @@ async def update_avatar_identity_with_media(
         store = app.state.store
 
         # Refuse to re-process a file whose name already exists in this avatar's
-        # store namespace. The store layout ((creator_id, assistant_id, <category>))
+        # store namespace. The store layout ((user_id, assistant_id, <category>))
         # mirrors what /list_avatar_documents exposes; existing filenames are read
         # from value.document.kwargs.metadata.filename. Duplicate uploads must be
         # gated behind an explicit prior call to DELETE /delete_avatar_document so
@@ -2437,7 +2448,7 @@ async def update_avatar_identity_with_media(
         if incoming_filenames:
             try:
                 existing_items = await store.asearch(
-                    (creator_id, assistant_id), limit=1_000_000
+                    (user_id, assistant_id), limit=1_000_000
                 )
             except Exception as exc:
                 raise HTTPException(
@@ -2484,9 +2495,6 @@ async def update_avatar_identity_with_media(
                         "request."
                     ),
                 )
-
-        for entry in media_files:
-            entry.setdefault("creator_id", creator_id)
 
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
             workflow,

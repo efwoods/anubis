@@ -117,12 +117,12 @@ async def _judge_support(
 async def _retrieve_facts_for_query(
     *,
     query: str,
-    creator_id: str,
+    user_id: str,
     assistant_id: str,
     store,
     top_k: int,
 ) -> List[Dict[str, Any]]:
-    namespace = (creator_id, assistant_id, "knowledge_profile_index")
+    namespace = (user_id, assistant_id, "knowledge_profile_index")
     try:
         items = await store.asearch(namespace, query=query, limit=top_k)
     except Exception as exc:
@@ -146,7 +146,7 @@ async def _retrieve_facts_for_query(
 async def evaluate_knowledge(
     *,
     candidate_text: str,
-    creator_id: str,
+    user_id: str,
     assistant_id: str,
     store,
     context: Optional[GlobalContext] = None,
@@ -162,7 +162,7 @@ async def evaluate_knowledge(
     for claim_obj in claims:
         retrieved = await _retrieve_facts_for_query(
             query=claim_obj.claim,
-            creator_id=creator_id,
+            user_id=user_id,
             assistant_id=assistant_id,
             store=store,
             top_k=top_k,

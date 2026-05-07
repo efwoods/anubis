@@ -396,9 +396,9 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     logger.info(f"learn_information about user breakpoint")
 
     # Verify the current user is the creator and responsible for the identity of the avatar
-    creator_id = runtime.config['configurable']['assistant_ctx']['metadata']['user_id']
+    assistant_owner_user_id = runtime.config['configurable']['assistant_ctx']['metadata']['user_id']
     user_id = runtime.config['configurable']['user_id']
-    if creator_id != user_id:
+    if assistant_owner_user_id != user_id:
         tool_call_id = runtime.tool_call_id
         update = {"internal_thoughts": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
         return Command(update=update)
@@ -408,7 +408,9 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # Memory of the Identity of the assistant presented as text from the user.
-    assistant_memory_namespace = (creator_id, assistant_id, 'identity_memory')
+    # Post-guard, user_id is the assistant's owner, so writes land in the same
+    # namespace the consciousness loader reads from.
+    assistant_memory_namespace = (user_id, assistant_id, 'identity_memory')
 
     # VERIFY FACT DOES NOT ALREADY EXIST in memories
     

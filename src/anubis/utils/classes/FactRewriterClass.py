@@ -107,7 +107,6 @@ class FactRewriterClass:
     def __init__(self):
         self.model = init_model(response_format=ExtractedAndRewrittenFacts)
         self.system_prompt = FACT_REWRITER_SYSTEM_PROMPT
-        self.system_message = SystemMessage(content=FACT_REWRITER_SYSTEM_PROMPT)
         self.system_prompt_tokens = 846
         self.model_name = "gpt-5.4-nano"
         self.model_input_token_cost_per_million = 0.00000005
@@ -127,15 +126,14 @@ class FactRewriterClass:
         """
         start_time = time_ns()
 
-        framing = (
-            f"TARGET: {target_name}\n\n" if target_name else ""
-        ) + "SOURCE TEXT:\n\n" + input_str
-
-        human_message = HumanMessage(content=framing)
+        if target_name: 
+            target_name_tokens = count_tokens(target_name) 
+        else: 
+            target_name_tokens = 0
         input_tokens = (
-            count_tokens(framing) + self.system_prompt_tokens
+            count_tokens(input_str) + self.system_prompt_tokens + 3*target_name_tokens
         )
-        messages = [SystemMessage(content=self.system_message), HumanMessage(content=human_message)]
+        messages = [SystemMessage(content=self.system_prompt.format(target_name=target_name)), HumanMessage(content=input_str)]
 
         response = await self.model.ainvoke(messages)
 

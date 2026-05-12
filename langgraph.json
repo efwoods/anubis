@@ -7,7 +7,7 @@
   "store": {
     "index": {
       "dims": 640,
-      "embed": "huggingface:sentence-transformers/harrier-oss-v1-270m",
+      "embed": "huggingface:microsoft/harrier-oss-v1-270m",
       "fields": ["document.kwargs.page_content"]
     }
   },

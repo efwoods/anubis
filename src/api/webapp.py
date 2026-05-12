@@ -56,7 +56,8 @@ from langgraph.store.base import IndexConfig
 from typing import Annotated, Optional
 from langgraph_sdk import get_client
 
-from src.anubis.graph import message_workflow, response_only_workflow
+from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
+from src.anubis.graph import message_workflow
 
 from src.security.auth import security_route
 from src.security.auth import get_current_user
@@ -399,6 +400,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize context / context
     app.state.context = GlobalContext()
+    ensure_huggingface_models_cached(app.state.context)
     app.state.httpx_client = httpx.AsyncClient()
     app.state.stripe = stripe
     app.state.stripe.api_key = app.state.context.stripe_secret_key
@@ -437,11 +439,6 @@ async def lifespan(app: FastAPI):
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
-        app.state.response_only_graph = response_only_workflow.compile(
-            store=store, checkpointer=checkpointer
-        )
-        app.state.response_only_graph.name = "Anubis"
-        app.state.graph.name = "Anubis"
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
@@ -2517,10 +2514,9 @@ async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
 
-    # Strip surrounding whitespace and stray quote/backtick characters in any order.
-    # A single strip() with the full char set handles cases like '    "Mom.m4a"\n'
-    # where chained single-char strips would short-circuit on the first non-matching end char.
-    source_document_name = source_document_name.strip(" \t\n\r\"'`")
+    # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
+    # leaving only the filename or already-derived namespace id.
+    source_document_name = source_document_name.strip(" \t\n\r\"'`(),[]")
     if "." in source_document_name:
         source_document_name = _namespace_safe_formatted_filename(source_document_name)
     user_id = current_user["identities"][0]["user_id"]
@@ -2552,7 +2548,7 @@ WHERE (
 )
 OR (
     prefix LIKE %s
-    AND value #>> '{document,kwargs,metadata,filename}' = %s
+    AND value #>> '{document,kwargs,metadata,namespace_filename}' = %s
 )
 """
     total_deleted = 0

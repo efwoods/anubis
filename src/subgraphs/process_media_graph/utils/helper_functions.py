@@ -218,10 +218,6 @@ def _is_quotes_per_line_text(text: str) -> bool:
             discrete += 1
     return (discrete / len(non_empty)) >= 0.7
 
-
-
-
-
 def _build_quote_documents_per_line(
     text_content: str,
     user_id: str,

@@ -368,8 +368,8 @@ async def process_uploaded_files_and_label_media_type(
                         )
                     else:
                         text_content = file_bytes
-                    media_list.append({
-                        "type": "text",
+                    media_list.append({ # if content_type is application_json, then the type needs to be json
+                        "type": content_type.split("/")[-1] if content_type.split("/")[-1] != "" else "text",
                         "content": text_content,
                         "metadata": {
                             "filename": filename,
@@ -827,6 +827,9 @@ async def process_media_item_task(
             # Treat these as quote-namespace Documents so they feed both
             # retrieval and adapter training, with per-statement target /
             # source metadata flowing to each Document.
+            if isinstance(content, bytes): 
+                content = json.loads(content)
+
             if (
                 isinstance(content, dict)
                 and isinstance(content.get("statements"), list)
@@ -890,7 +893,8 @@ async def process_media_item_task(
                                 {
                                     "vectorstore_acceptable": True,
                                     "adapter_acceptable": True,
-                                    "analysis_acceptable": False,
+                                    "analysis_acceptable": True,
+                                    "adapter_formatted": False,
                                     "synthetic": False,
                                     "namespace_filename": namespace_filename,
                                 }

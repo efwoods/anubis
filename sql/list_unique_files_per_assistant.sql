@@ -11,10 +11,12 @@ SELECT DISTINCT ON (
         value->'document'->'kwargs'->'metadata'->>'filename_uuid5',
         value->'document'->'kwargs'->'metadata'->>'document_id'
     ) AS file_key,
+    prefix,
     value->'document'->'kwargs'->'metadata'->>'filename' AS filename,
     value->'document'->'kwargs'->'metadata'->>'namespace' AS namespace,
     value->'document'->'kwargs'->'metadata'->>'document_id' AS document_id,
     value->'document'->'kwargs'->'metadata'->>'filename_uuid5' AS filename_uuid5
+    
 FROM store
 WHERE value->'document'->'kwargs'->'metadata'->>'assistant_id' = :assistant_id
   AND COALESCE(

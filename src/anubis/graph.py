@@ -50,6 +50,10 @@ from src.anubis.utils.model import init_model
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.huggingface_prefetch import (
+    GO_EMOTIONS_MODEL_ID,
+    ensure_huggingface_models_cached,
+)
 from src.anubis.utils.utility import format_docs
 
 from langgraph.store.base import BaseStore
@@ -93,10 +97,11 @@ identity_tools = [
     create_episodic_memory,
 ]
 
+from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
+
 from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 
 """ NODES """
-
 
 def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
     """Merge streamed chunks into a single AIMessage for graph state."""
@@ -109,6 +114,24 @@ def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
         id=full.id,
         tool_calls=list(full.tool_calls or []),
         invalid_tool_calls=list(full.invalid_tool_calls or []),
+    )
+
+
+def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
+    """Mutate ``avatar_response.response_metadata`` with Go Emotions classifier output."""
+    from transformers import pipeline
+
+    classifier = pipeline("text-classification", model=GO_EMOTIONS_MODEL_ID)
+    sentiment = classifier(avatar_response.content)
+    avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
+    avatar_response.response_metadata.update(
+        {
+            "sentiment": {
+                "base_emotion": EMOTION_MAPPING[sentiment[0]["label"]],
+                "emotion": sentiment[0]["label"],
+                "score": sentiment[0]["score"],
+            }
+        }
     )
 
 
@@ -230,15 +253,24 @@ async def think(
     messages = state["system_message"] + state["messages"] + state["internal_thoughts"]
 
     # TODO: response_metrics_aggregation
+    writer = get_stream_writer()
     merged: AIMessageChunk | AIMessage | None = None
     async for chunk in avatar_model_with_tools.astream(messages):
         merged = chunk if merged is None else merged + chunk
+        # Stream only while the running merge has no tool calls, so tool turns do not
+        # emit assistant_token events meant for the final user-visible reply.
+        if not (getattr(merged, "tool_calls", None) or []):
+            delta = chunk.content
+            if isinstance(delta, str) and delta:
+                writer({"type": "assistant_token", "text": delta})
     assert merged is not None
     response = _coalesce_ai_message(merged)
     avatar_response_content = getattr(response, "content")
     logger.info(f"Avatar Model Response: {avatar_response_content}")
-    return {"internal_thoughts": [response]}
-
+    if response.tool_calls:
+        return {"internal_thoughts": [response]}
+    _attach_go_emotions_metadata(response)
+    return {"internal_thoughts": [response], "messages": [response]}
 
 process_thoughts = ToolNode(
     messages_key="internal_thoughts", tools=identity_tools, handle_tool_errors=True
@@ -246,117 +278,17 @@ process_thoughts = ToolNode(
 
 async def considering(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
-) -> Literal["process_thoughts", "respond"]:
+) -> Literal["process_thoughts", "__end__"]:
     recent_thought = state["internal_thoughts"][-1]
     if recent_thought.tool_calls:
-        for tool_call in recent_thought.tool_calls:
-            return "process_thoughts"
-    else:
-        return "respond"
-
-
-
-
-async def respond(
-    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
-):
-    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
-
-    """ CREATE MODEL """
-
-    """ Agent Implementation """
-    # avatar_model = init_model(
-    #     context = runtime.context,
-    # )
-
-    # avatar = create_agent(model=avatar_model, tools=[
-    #         ],
-    #         state_schema=GlobalState,
-    #         )
-
-    messages = state["system_message"] + state["messages"]
-
-    avatar_model = init_model(model_without_tools=False)
-    # TODO: response_metrics_aggregation
-    writer = get_stream_writer()
-    merged: AIMessageChunk | AIMessage | None = None
-    async for chunk in avatar_model.astream(messages):
-        merged = chunk if merged is None else merged + chunk
-        delta = chunk.content
-        if isinstance(delta, str) and delta:
-            writer({"type": "assistant_token", "text": delta})
-    assert merged is not None
-    avatar_response = _coalesce_ai_message(merged)
-
-    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
-
-    logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
-
-    # response = await avatar.ainvoke(input={"messages": messages})
-    # avatar_response = response.get("messages", [])[-1]
-    # logger.info(f"Avatar RESPONSE: {getattr(avatar_response, 'content')}")
-
-
-    from transformers import pipeline
-    classifier = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base")
-    sentiment = classifier(avatar_response.content)
-    avatar_response.response_metadata.update({"sentiment":{"emotion": sentiment[0]["label"], 'score': sentiment[0]["score"]}})
-
-    result = {"messages": [avatar_response]}
-
-    return result
-
+        return "process_thoughts"
+    return END
 
 # async def evaluate_response_quality()
 
 # async def update_response_metadata()
 
 """ GRAPH """
-
-
-""" RESPONSE ONLY FOR API ENDPOINT """
-
-# Build minimal graph: START -> agent -> END
-response_only_subgraph_workflow = StateGraph(
-    state_schema=GlobalState,
-    input_schema=GlobalState,
-    output_schema=MessagesState,
-    context_schema=GlobalContext,
-)
-
-""" RESPONSE ONLY WORKFLOW NODES """
-
-response_only_subgraph_workflow.add_node("load_consciousness", load_consciousness)
-response_only_subgraph_workflow.add_node("respond", respond)
-
-""" RESPONSE ONLY WORKFLOW EDGES """
-
-response_only_subgraph_workflow.add_edge(START, "load_consciousness")
-response_only_subgraph_workflow.add_edge("load_consciousness", "respond")
-response_only_subgraph_workflow.add_edge("respond", END)
-
-response_graph = response_only_subgraph_workflow.compile()
-
-response_only_workflow = StateGraph(
-    state_schema=GlobalState,
-    input_schema=MessagesState,
-    output_schema=MessagesState,
-    context_schema=GlobalContext,
-)
-
-# workflow.add_edge("terms_and_services_content_moderation", END)
-response_only_workflow.add_node("chat", message_interface)
-response_only_workflow.add_node(
-    "resolve_human_message_images", resolve_human_message_images
-)
-response_only_workflow.add_node("anubis", response_graph)
-
-response_only_workflow.add_edge(START, "chat")
-response_only_workflow.add_edge("chat", "resolve_human_message_images")
-response_only_workflow.add_edge("resolve_human_message_images", "anubis")
-response_only_workflow.add_edge("anubis", END)
-
-""" END OF REPSONSE ONLY FOR API ENDPOINT """
 
 # Build minimal graph: START -> agent -> END
 anubis_workflow = StateGraph(
@@ -373,7 +305,6 @@ anubis_workflow = StateGraph(
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("think", think)
 anubis_workflow.add_node("process_thoughts", process_thoughts)
-anubis_workflow.add_node("respond", respond)
 
 # workflow.add_node("evaluate_response_quality", evaluate_response_quality)
 
@@ -385,21 +316,18 @@ anubis_workflow.add_edge(START, "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "think")
 
 anubis_workflow.add_conditional_edges(
-    "think", considering, {"process_thoughts": "process_thoughts", "respond": "respond"}
+    "think", considering, {"process_thoughts": "process_thoughts", END: END}
 )
 anubis_workflow.add_edge("process_thoughts", "load_consciousness")
 # anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
-anubis_workflow.add_edge("respond", END)
 
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
-
 
 # COERCION
 # workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', END:"evaluate_response_quality"})
 # workflow.add_edge("evaluate_response_quality", "update_response_metadata")
 # workflow.add_edge("terms_and_services_content_moderation", "update_response_metadata")
 # workflow.add_edge("update_response_metadata", END)
-
 
 anubis = anubis_workflow.compile()
 
@@ -425,5 +353,7 @@ message_workflow.add_edge("anubis", END)
 graph = message_workflow.compile()
 
 graph.name = "Anubis"
+
+ensure_huggingface_models_cached(GlobalContext())
 
 __all__ = ["graph"]

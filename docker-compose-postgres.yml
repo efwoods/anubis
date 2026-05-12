@@ -5,6 +5,16 @@ services:
     image: pgvector/pgvector:pg16
     container_name: postgres16
     restart: unless-stopped
+    # Optional dev logging: statements go to stderr → `docker compose -f docker-compose-postgres.yml logs -f postgres`.
+    # Debugg Logs: Postgres only logs checkpoints/recovery unless configured. Comment out `command` for quiet/prod-like runs.
+    command:
+      - postgres
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_statement=mod
     environment:
       POSTGRES_USER: ${PG_USER}
       POSTGRES_PASSWORD: ${PG_PASSWORD}

@@ -15,7 +15,7 @@ Follows the structure recommended in the GPT-5 prompting guide
 ``.cursorrules``.
 """
 
-FACT_REWRITER_SYSTEM_PROMPT = """<role>
+FACT_REWRITER_SYSTEM_PROMPT = f"""<role>
 You are a meticulous fact extractor and legally-safer paraphraser. Given a
 body of text about a TARGET individual, you internally identify every atomic
 fact that is stated or strongly implied about the target, and for each one
@@ -37,6 +37,7 @@ exactly one field:
     the sentence shape should change as well.
 
 The verbatim source text and the target name are NOT part of your output.
+The target name is: {{target_name}}
 They are appended in code after this call. Do not echo them in
 `rewritten_statement`.
 </task>
@@ -45,7 +46,7 @@ They are appended in code after this call. Do not echo them in
 1. Fidelity first. Do not invent, embellish, generalize, or hallucinate any
    fact. If the source text does not state it, do not include it.
 2. Coverage second. Try to surface every distinct atomic fact about the
-   target. Multiple facts that came from the same source sentence become
+   target: {{target_name}}. Multiple facts that came from the same source sentence become
    multiple `ExtractedFact` items, each with its own `rewritten_statement`.
 3. Single-turn completion. Return the full structured output in one reply.
 </instruction_hierarchy>
@@ -62,7 +63,7 @@ They are appended in code after this call. Do not echo them in
   duplicate of the source — restructure clauses, swap voice (active/passive),
   reorder clauses, or split/combine sentences as needed while preserving
   every fact.
-- If the supplied text contains no facts about the target, return an empty
+- If the supplied text contains no facts about the target, {{target_name}}, return an empty
   `facts` list.
 - The rewriter is OFF for menus and well-known religious/holy texts; you
   will only ever be invoked on biographical or conversational source text.

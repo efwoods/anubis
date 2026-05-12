@@ -218,44 +218,6 @@ def _is_quotes_per_line_text(text: str) -> bool:
             discrete += 1
     return (discrete / len(non_empty)) >= 0.7
 
-
-def _build_full_text_analysis_queue_document(
-    *,
-    text_content: str,
-    user_id: str,
-    assistant_id: str,
-    media_item: Dict[str, Any],
-    namespace_filename: str,
-    classified_situation: str,
-) -> Document:
-    """Single queued Document whose page_content is the full source text for analysis nodes.
-
-    Vector and adapter branches ignore this row (flags off); the analysis node runs
-    configured scaffolds (e.g. OCEAN) once per upload instead of per chunk.
-    """
-    base_metadata = media_item.get("metadata", {}) or {}
-    return Document(
-        page_content=text_content,
-        metadata={
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "created_at": datetime.now(tz=timezone.utc).isoformat(),
-            "source": base_metadata.get("source", "user_upload"),
-            "type": "text",
-            "filename": base_metadata.get("filename", ""),
-            "namespace_filename": namespace_filename,
-            "namespace": "identity",
-            "analysis_acceptable": True,
-            "vectorstore_acceptable": False,
-            "adapter_acceptable": False,
-            "analysis_job_kind": "full_text",
-            "analysis_scaffolds": ["ocean"],
-            "classified_situation": classified_situation,
-            "synthetic": False,
-        },
-    )
-
-
 def _build_quote_documents_per_line(
     text_content: str,
     user_id: str,
@@ -691,10 +653,12 @@ async def process_text_to_document(
         target_namespace = namespace_hint
     elif classified_situation == "biographical_facts":
         target_namespace = "identity"
-    elif classified_situation in ("tweets_or_quotes", "monologue", "presentation", "dialogue"):
+    elif classified_situation in ("tweets_or_quotes", "monologue"):
         target_namespace = "quote"
+    elif classified_situation == "dialogue":
+        target_namespace = "dialogue"
     else:
-        target_namespace = "quote"
+        target_namespace = "document"
 
     logger.info(
         "ContentSituationClassification: %s -> namespace=%s",
@@ -714,6 +678,13 @@ async def process_text_to_document(
                 media_item=media_item,
                 target_name=target_name,
             )
+            # Expected metadata: 
+            # analysis_acceptable: True
+            # namespace: identity (statements in first person about the target)
+            # Analysis acceptable: True
+            # adapter_acceptable: False (not creating synthetic prompt questions)
+            # synthetic: True (identified facts with structured llm and rewrote the facts to first person)
+            # classified_situation: biographical_facts
             for document in documents:
                 document.metadata.update(
                     {
@@ -732,6 +703,7 @@ async def process_text_to_document(
             )
             # Fall through to chunked path so we still capture content.
 
+    # Handle quotes-per-line text document 
     item_metadata = media_item.get("metadata", {}) or {}
     explicit_quotes_per_line = bool(item_metadata.get("quotes_per_line"))
     quotes_per_line_detected = (
@@ -746,6 +718,7 @@ async def process_text_to_document(
             quotes_per_line_detected,
         )
         classification_metadata["quotes_per_line"] = True
+        # presume the target is the only person for each line in the text content if the text is not labeled and only a single line of text per line (one statement per line)
         documents = _build_quote_documents_per_line(
             text_content=text_content,
             user_id=user_id,
@@ -753,8 +726,17 @@ async def process_text_to_document(
             media_item=media_item,
             classification_metadata=classification_metadata,
         )
+        # Expected metadata (treated same as quotes below in next classified situation; only target information): 
+        # vectorstore_acceptable: True
+        # adapter_acceptable: True
+        # adapter_formatted: False
+        # analysis_acceptable: True
+        # synthetic: False
+        # namespace_filename: namespace_filename
+        # namespace: quote
 
-    else:
+    elif classified_situation in ("monologue", "tweets_or_quotes"):
+        # Monologue or tweets or quotes -> quote namespace
         documents = await process_text_media_item_target_for_vectorstore(
             media_item=media_item,
             user_id=user_id,
@@ -768,23 +750,35 @@ async def process_text_to_document(
                 {
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": classified_situation
-                    in ("monologue","tweets_or_quotes", "dialogue"),
+                    in ("monologue","tweets_or_quotes"),
+                    "adapter_formatted": False, # will be processed to create prompt synthetic questions for the adapter namespace
+                    "analysis_acceptable": True,
+                    "synthetic": False,
+                    "namespace_filename": namespace_filename, # identity namespace
+                }
+            )
+
+    elif classified_situation == "dialogue":
+        # TODO: Verify and test
+        # Dialogue -> dialogue namespace
+        # This will need to create quotes documents of what the target said
+        # This will need to create the entire conversation document for the adapter namespace
+        documents = await process_dialogue_json_to_documents(
+            dialogue_payload=media_item,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            media_item=media_item,
+        )
+        for document in documents:
+            document.metadata.update(
+                {
+                    "vectorstore_acceptable": True,
+                    "adapter_acceptable": True,
+                    "adapter_formatted": False,
                     "synthetic": False,
                     "namespace_filename": namespace_filename,
                 }
             )
-
-    if classified_situation in ("monologue", "presentation", "tweets_or_quotes"):
-        documents.append(
-            _build_full_text_analysis_queue_document(
-                text_content=text_content,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                media_item=media_item,
-                namespace_filename=namespace_filename,
-                classified_situation=classified_situation,
-            )
-        )
 
     for document in documents:
         document.metadata.update({"namespace_filename": namespace_filename})

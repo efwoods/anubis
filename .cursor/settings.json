@@ -1,0 +1,7 @@
+{
+  "plugins": {
+    "auth0": {
+      "enabled": true
+    }
+  }
+}

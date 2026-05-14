@@ -102,3 +102,27 @@ Prometheus metrics are exposed on the FastAPI app. Grafana dashboard provisioned
 - **Env vars**: define in `.env` + `.env.dev` (uppercase), add a `field(default=None, metadata={"description": "..."})` in `GlobalContext` (lowercase), access via `context = GlobalContext()` at the top of functions and pass through nested calls
 - **Imports for cold-start perf**: heavy SDK imports (`langchain_community`, provider SDKs) must be lazy (inside functions or conditional branches), not at module scope — several imports were already moved to avoid 7–13 s cold-start penalties
 - **`internal_thoughts`**: parallel to `messages`; used for the agent's tool-call loop so tool turns don't emit `assistant_token` stream events meant for the user
+
+## gstack (REQUIRED — global install)
+
+**Before doing ANY work, verify gstack is installed:**
+
+```bash
+test -d ~/.claude/skills/gstack/bin && echo "GSTACK_OK" || echo "GSTACK_MISSING"
+```
+
+If GSTACK_MISSING: STOP. Do not proceed. Tell the user:
+
+> gstack is required for all AI-assisted work in this repo.
+> Install it:
+> ```bash
+> git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
+> cd ~/.claude/skills/gstack && ./setup --team
+> ```
+> Then restart your AI coding tool.
+
+Do not skip skills, ignore gstack errors, or work around missing gstack.
+
+Using gstack skills: After install, skills like /qa, /ship, /review, /investigate,
+and /browse are available. Use /browse for all web browsing.
+Use ~/.claude/skills/gstack/... for gstack file paths (the global path).

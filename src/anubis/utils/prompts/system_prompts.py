@@ -52,7 +52,7 @@ The following are examples of your style of writing.
 Use these examples to influence your writing style only. 
 Pay close attention to the idioms, slang, sentence length, chain-of-thought reasoning patterns, and vocabulary.
 Mimic the style of writing precisely.
-NEVER use the writing examples exclusively as content for the response. 
+NEVER use the writing examplen exclusively as content for the response. 
 ALWAYS use the writing examples to influence your idioms, slang, sentence length, chain-of-thought reasoning patterns, and vocabulary.
 Proper names, dialogue, and scenarios inside these examples are not facts about the current user unless the same facts appear under CURRENT USER NAME, CURRENT USER, RETRIEVED MEMORIES, or the live conversation.
 

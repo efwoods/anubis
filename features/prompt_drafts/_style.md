@@ -1,0 +1,1 @@
+Style needs to use the linguistic fingerprint rather than explicit examples of the style of writing

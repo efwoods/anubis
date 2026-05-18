@@ -109,8 +109,7 @@ class DynamicPromptBuilder:
 
         if user_name is None or user_name == '':
             user_name = ""
-        
-
+            
         if user_identity is None or len(user_identity) == 0:
             if user_description is None:
                 # user_identity_str = "You don't have any information about identity of the person or people you are communicating with."
@@ -156,7 +155,6 @@ class DynamicPromptBuilder:
             ("system", self.base_prompt),
         ])
         
-
         # Mapping of the variables to the values for injection into the system prompt template
         prompt_vars = {
             "assistant_name": assistant_name, 

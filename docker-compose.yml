@@ -10,7 +10,7 @@ services:
     redis:
         image: redis:7-alpine
         ports:
-            - "6379:6379"
+            - "${REDIS_PORT:-6379}:${REDIS_PORT:-6379}"
         command: redis-server --appendonly yes
         volumes:
             - redis-data:/data
@@ -28,8 +28,8 @@ services:
             - 168.83.129.16
             - 8.8.8.8
         ports:
-            - "8123:8000"
-            - "5678:5678"
+            - "${PORT:-8123}:${PORT:-8123}"
+            - "${DEBUG_PORT:-5678}:${DEBUG_PORT:-5678}"
         extra_hosts:
             - "host.docker.internal:host-gateway"
         healthcheck:

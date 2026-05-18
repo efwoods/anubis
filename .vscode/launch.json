@@ -27,6 +27,22 @@
       "justMyCode": false
     },
     {
+      "name": "WORKTREE: Attach to Docker LangGraph Server",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 9008
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/deps/anubis"
+        }
+      ],
+      "justMyCode": false
+    },
+    {
       "name": "Attach to Memory LangGraph Server",
       "type": "debugpy",
       "request": "attach",
@@ -70,6 +86,22 @@
       "env": {
         "NN_API_KEY": "${env:NN_API_KEY}"
       }
+    },
+    {
+      "name": "Attach to Docker LangGraph Server",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 9008
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "/deps/anubis"
+        }
+      ],
+      "justMyCode": false
     }
   ]
 }

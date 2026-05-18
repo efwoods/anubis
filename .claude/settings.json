@@ -11,5 +11,9 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "allow": ["Bash(*)", "Edit", "Write", "Read", "WebFetch(*)", "MCP(*)"],
+    "deny": []
   }
 }

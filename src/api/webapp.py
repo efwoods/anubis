@@ -2541,7 +2541,7 @@ async def delete_avatar_documents(
 
     pool = app.state.pool
 
-    # LangGraph store: prefix = namespace tuple dot-joined (see langgraph/store/postgres/base.py).
+    # LangGraph store: prefix = namespace tuple dot-joined.
     # Match either chunk keys built from the filename prefix, or reference_* namespaces
     # (reference_image, reference_audio, …) where the serialized LangChain Document holds the
     # basename under value.document.kwargs.metadata.filename (same path as list_documents).

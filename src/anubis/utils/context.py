@@ -317,8 +317,6 @@ class GlobalContext:
         },
     )
 
-    debug: str = field(default=None, metadata={"description": "debugging available"})
-
     huggingface_token: str = field(
         default=None, metadata={"description": "Token to use huggingface models"}
     )

@@ -51,7 +51,7 @@ from langchain.tools import tool
 
 
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.utility import extract_user_id_assistant_id
+from src.anubis.utils.utility import extract_user_id_assistant_id, transcribe_video
 from src.subgraphs.process_media_graph.utils.utility import extract_personality_from_image
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
 
@@ -309,6 +309,7 @@ async def process_uploaded_files_and_label_media_type(
                         "content_type": content_type,
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
+                        "reference_audio": reference_audio,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -1093,12 +1094,30 @@ async def process_media_item_task(
 
             # ---------------------------------------------------------------
             # Reference-audio: persist for known-speaker labelling on later
-            # uploads. Do not diarize the reference itself.
+            # uploads. Do not diarize the reference itself. Will be the same text spoken for most people.
             # ---------------------------------------------------------------
-            if media_type == "audio" and reference_audio:
+            if (media_type == "audio" or media_type == "video") and reference_audio:
+                all_documents: List[Document] = []
+                if media_type == "audio":
+                    """ transcribe reference audio """
+                    transcription_dict = await transcribe_audio(
+                        audio_base64=payload_uri,
+                        context=runtime.context,
+                        filename=filename,
+                    )
+                else:
+                    """ transcribe reference video """
+                    transcription_dict = await transcribe_video(
+                        video_base64=payload_uri,
+                        context=runtime.context,
+                        filename=filename,
+                    )
+                
+                transcription_text = transcription_dict.get("content", "")
+                
                 ref_namespace = (user_id, assistant_id, "reference_audio")
                 doc = Document(
-                    page_content="Reference audio uploaded.",
+                    page_content=transcription_text,
                     metadata={
                         "user_id": user_id,
                         "assistant_id": assistant_id,
@@ -1123,7 +1142,31 @@ async def process_media_item_task(
                             "document": doc.to_json(),
                         },
                     )
-                return [doc]
+                all_documents.append(doc)
+
+                """ Compare the approximate embedding of the transcription to the reference audio embedding """     
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer(runtime.context.embedding_model)
+                embedding = model.encode(transcription_text)
+                REFERENCE_AUDIO_SENTENCE = "The quick fox jumped over the brown lazy dog."
+                REFERENCE_AUDIO_EMBEDDING = model.encode(REFERENCE_AUDIO_SENTENCE)
+
+                similarity = model.similarity(embedding, REFERENCE_AUDIO_EMBEDDING)
+                if similarity < 0.80:
+                    logger.info(f"Transcription text is dissimilar to the reference audio text. Similarity: {similarity}")
+                    media_item_transcription = media_item.copy()
+                    media_item_transcription["content"] = transcription_text
+
+                    documents = await process_text_to_document(
+                        metadata=metadata,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        media_item=media_item_transcription,
+                    )
+                    all_documents.extend(documents)
+
+                # return the document
+                return all_documents
 
             # ---------------------------------------------------------------
             # Pull the stored reference audio (if any) so the diarizer can
@@ -1214,7 +1257,7 @@ async def process_media_item_task(
                             "text": seg_text,
                             "start": seg.get("start"),
                             "end": seg.get("end"),
-                            "is_target": bool(is_target),
+                            "is_target": bool(is_target) or bool(reference_audio),
                         }
                     )
 

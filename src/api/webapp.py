@@ -2102,10 +2102,10 @@ async def update_avatar_identity_with_media(
                             detail="Could not determine an audio type from the upload.",
                         )
                     effective = sniff
-                elif not mime_type.startswith("audio/"):
+                elif not mime_type.startswith("audio/") and not mime_type.startswith("video/"):
                     raise HTTPException(
                         status_code=400,
-                        detail="reference_audio requires an audio Content-Type.",
+                        detail="reference_audio requires an audio or video Content-Type.",
                     )
                 media_files.append(
                     {
@@ -2439,17 +2439,21 @@ async def update_avatar_identity_with_media(
             if duplicates:
                 media_files_duplicates = [media_file.get("filename") for media_file in media_files if media_file.get("namespace_filename") in duplicates]
                 duplicates_str = ", ".join(media_files_duplicates)
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Filename already exists for this avatar and will not be "
-                        f"re-processed: {duplicates_str}. To upload a new version, "
-                        "first remove the existing file by calling "
-                        "DELETE /delete_avatar_document?source_document_name="
-                        "<filename> for each duplicate filename, then retry this "
-                        "request."
-                    ),
-                )
+                
+                for duplicate in media_files_duplicates:
+                    delete_avatar_documents(duplicate, current_user)
+
+                # raise HTTPException(
+                #     status_code=409,
+                #     detail=(
+                #         "Filename already exists for this avatar and will not be "
+                #         f"re-processed: {duplicates_str}. To upload a new version, "
+                #         "first remove the existing file by calling "
+                #         "DELETE /delete_avatar_document?source_document_name="
+                #         "<filename> for each duplicate filename, then retry this "
+                #         "request."
+                #     ),
+                # )
 
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
             workflow,

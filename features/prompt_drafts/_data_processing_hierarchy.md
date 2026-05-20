@@ -1,9 +1,35 @@
 
-tweets and quotesx
+
+# Reference audio
+## Monologue
+- [x] reference audio upload from audio file
+- [ ] reference audio upload from audio url
+
+- [ ] audio to text using reference audio from file
+- [ ] audio to text using reference audio from url
+
+- [x] reference audio upload from video file
+- [ ] reference audio upload from video url
+
+- [ ] video to audio to text using reference audio from file
+- [ ] video to to text using reference audio from url: 
+  - [ ] monologue (into labeled json from url): https://www.youtube.com/watch?v=ia8lBT0MBT0
+  - [ ] presentation (into labled json from url): https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=5
+
+## Dialogue
+
+- [ ] audio to text using reference audio from file
+- [ ] audio to text using reference audio from url
+
+- [ ] video to audio to text using reference audio from file
+- [ ] video to to text using reference audio from url
+
+
+tweets and quotes
     labeled json of quotes
     labeled json of tweets
-monologue (into labeled json from url): https://www.youtube.com/watch?v=ia8lBT0MBT0
-presentation (into labled json from url): https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=5
+
+
 biographical and quotes: https://fallout.fandom.com/wiki/Curie
 
 
@@ -39,15 +65,29 @@ dialogue json
 
 """# Diarization prerequisite"""
 
-# process upload text documents that are dialogues: https://www.youtube.com/watch?v=IvqRSEP_o-o
+## process upload text documents that are dialogues: 
 
-# process upload text documents that are monologues: (monologue of target only: https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=4) (monologue with target followed by non-target monologue: https://www.youtube.com/watch?v=-tQwzhHjAVI&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=3)
+https://www.youtube.com/watch?v=IvqRSEP_o-o
 
-# process upload text documents that are multi-speaker with the target: (target: Lex Fridman: https://www.youtube.com/watch?v=hLZ6PACCBy8)
+## process upload text documents that are monologues: (monologue of target only:)
 
-# process upload text documents that are multi-speaker that reference the target: (target: Grant Imahara: https://www.youtube.com/watch?v=xRHFylOgeJA)
+https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=4 
 
-# process upload text documents that are multi-speaker that reference the target with the target direct quotes: (https://www.youtube.com/watch?v=Px_5Z0pPlPc&t=2s) autobiographical about the target with direct quotes and multi-speaker
+## monologue with target followed by non-target: 
+
+https://www.youtube.com/watch?v=-tQwzhHjAVI&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=3
+
+## process upload text documents that are multi-speaker with the target: (target: Lex Fridman: )
+
+https://www.youtube.com/watch?v=hLZ6PACCBy8
+
+## process upload text documents that are multi-speaker that reference the target: (target: Grant Imahara: )
+
+https://www.youtube.com/watch?v=xRHFylOgeJA
+
+## process upload text documents that are multi-speaker that reference the target with the target direct quotes: (autobiographical about the target with direct quotes and multi-speaker)
+    =https://www.youtube.com/watch?v=Px_5Z0pPlPc&t=2s
+
 
 """ # Multi-file type bulk upload """
 # process a zip file of information

@@ -770,7 +770,6 @@ def _diarize_token_cost(usage_dict: dict, context: GlobalContext) -> float:
         + out * context.audio_diarization_price_per_million_tokens_output
     )
 
-
 def _diarize_one_mp3_path(
     mp3_path: str,
     upload_name: str,
@@ -820,6 +819,40 @@ def _merge_diarized_segments_from_chunks(
             )
     return merged
 
+async def transcribe_video(
+    video_base64: str,
+    context: GlobalContext,
+    filename: Optional[str] = None,
+) -> dict:
+    raw = _decode_base64_media_payload(video_base64)
+    orig_name = filename or "upload.mp4"
+    suffix = Path(orig_name).suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
+        temp_upload.write(raw)
+        temp_upload.flush()
+        source_path = temp_upload.name
+
+        video = VideoFileClip(source_path)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+                audio_path = temp_audio.name
+            video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
+        finally:
+            video.close()
+
+        size_bytes = os.path.getsize(audio_path)
+        diarize_upload_name = (
+            Path(orig_name).name
+            if Path(orig_name).name.lower().endswith(".mp3")
+            else "extracted.mp3"
+        )
+        
+        with open(audio_path, "rb") as audio_f:
+            b64_encoded_reference_audio = (
+                f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
+            )
+            response = await transcribe_audio(b64_encoded_reference_audio, context, diarize_upload_name)
+        return response
 
 # TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
 

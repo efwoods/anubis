@@ -1055,6 +1055,19 @@ async def process_media_item_task(
             "reference_audio")`` so the next non-reference upload can use it.
             """
             reference_audio = metadata.get("reference_audio", False)
+            if not reference_audio:
+                reference_namespace = (user_id, assistant_id, "reference_audio")
+                ref_item = await store.aget(reference_namespace, key=assistant_id)
+                if not ref_item and not reference_audio:
+                    return Document(
+                        page_content=f"{media_type.capitalize()} missing reference audio reference audio is required for audio and video distillation to text.",
+                        metadata={
+                            "status": "error",
+                            "error": f"missing_{media_type}_reference_audio",
+                            "filename": filename,
+                        },
+                    )
+
             payload_uri = _full_data_uri_from_media_dict(media_item)
             audio_url = ""
             if isinstance(media_item.get("audio_url"), dict):
@@ -1097,6 +1110,7 @@ async def process_media_item_task(
             # uploads. Do not diarize the reference itself. Will be the same text spoken for most people.
             # ---------------------------------------------------------------
             if (media_type == "audio" or media_type == "video") and reference_audio:
+                # Create 9 second reference clip:
                 all_documents: List[Document] = []
                 if media_type == "audio":
                     """ transcribe reference audio """
@@ -1113,6 +1127,8 @@ async def process_media_item_task(
                         filename=filename,
                     )
                 
+                # Update the payload_uri to the preprocessed audio base64 (now mp3 codec)
+                payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
                 transcription_text = transcription_dict.get("content", "")
                 
                 ref_namespace = (user_id, assistant_id, "reference_audio")

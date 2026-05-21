@@ -7,7 +7,7 @@ authors = [
 ]
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "anyio>=4.12.1",
     "auth0-fastapi-api>=1.0.0b6",
@@ -56,6 +56,16 @@ dependencies = [
     "supabase>=2.28.3",
     "yt-dlp>=2026.3.17",
     "tiktoken>=0.12.0",
+    "torchaudio>=2.11.0",
+    "librosa>=0.11.0",
+    "torch>=2.12.0",
+    "torchcodec>=0.12.0",
+    # deepfilterlib (the Rust extension behind deepfilternet) only ships wheels
+    # for cp38-cp311. The Docker runtime is cp311 (wheel installs cleanly); on a
+    # 3.12+ host there is no wheel and no cargo, so it is scoped out there. The
+    # `df` import in preprocess_audio is lazy, so the host venv is unaffected
+    # unless the enhancement path is exercised locally.
+    "deepfilternet>=0.5.6; python_version < '3.12'",
 ]
 
 [project.optional-dependencies]

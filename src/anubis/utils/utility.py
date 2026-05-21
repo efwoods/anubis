@@ -40,9 +40,7 @@ import base64
 import io
 from PIL import Image
 
-
 logger = logging.getLogger(__name__)
-
 
 from pydantic import BaseModel
 class SearchQuery(BaseModel):
@@ -638,16 +636,31 @@ async def _transcribe_saved_path(path: str, upload_filename: str, context: Globa
 
 
 async def transcribe_audio(
-    audio_base64: str, context: GlobalContext, filename: Optional[str] = None
+    audio_base64: str, context: GlobalContext, filename: Optional[str] = None, 
+    reference_audio: bool = False,
+    max_duration_seconds: Optional[float] = 9.0,
 ) -> dict:
+
+    # Remove noise and isolate the vocals; if reference audio, truncate to 9 seconds:
+    preprocessed_audio = await preprocess_audio(audio_base64, truncate_only=False, reference_audio=reference_audio, max_duration_seconds=max_duration_seconds)
+    audio_base64 = preprocessed_audio["audio_base64"]
+
     raw = _decode_base64_media_payload(audio_base64)
-    suffix = Path(filename or "audio.m4a").suffix or ".m4a"
+    
+    # Update preprocessed filename to mp3 codec
+    suffix = ".mp3" # mp3 after preprocessing to mp3 codec
+
+    filename = Path(filename).stem + ".mp3"
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(raw)
         path = tmp.name
     try:
         name = Path(filename or f"audio{suffix}").name
-        return await _transcribe_saved_path(path, name, context)
+        result = await _transcribe_saved_path(path, name, context)
+        result['audio_base64_preprocessed'] = audio_base64
+        return result
+
     finally:
         try:
             os.unlink(path)
@@ -659,37 +672,252 @@ async def get_file_size_MB(audio_base64: str) -> float:
     return len(raw) / 1048576
 
 
-async def process_reference_audio(
-    audio_base64: str, context: GlobalContext, filename: Optional[str] = None
-) -> dict:
-    start_time = time_ns()
-    raw = _decode_base64_media_payload(audio_base64)
-    suffix = Path(filename or "audio.m4a").suffix or ".m4a"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(raw)
-        path = tmp.name
-    path = _truncate_reference_audio_path_if_long(path, context)
-    mime = _audio_mime_from_suffix(Path(path).suffix)
-    try:
-        size_bytes = os.path.getsize(path)
-        if size_bytes <= context.whisper_max_bytes:
-            with open(path, "rb") as rf:
-                b64_encoded_reference_audio = (
-                    f"data:{mime};base64,{base64.b64encode(rf.read()).decode('utf-8')}"
-                )
+_DF_COMPAT_READY = False
+
+
+def _prepare_deepfilternet() -> None:
+    """Make DeepFilterNet 0.5.6 importable and usable under this stack.
+
+    DeepFilterNet 0.5.6 (the last release) predates two breaking changes in our
+    environment; both are patched here, idempotently and without touching
+    ``os.environ`` (the API server is concurrent):
+
+    * ``df.io`` does ``from torchaudio.backend.common import AudioMetaData`` at
+      import time, but torchaudio >= 2.x removed that module (audio I/O moved to
+      torchcodec). We register a minimal stand-in so ``import df`` succeeds; we
+      never call df's torchaudio-based loader/saver — audio I/O is done here.
+
+    * ``df.config`` resolves every option from ``os.environ[OPTION.upper()]``
+      before its own ``.ini``. Anubis sets ``MODEL`` (e.g. ``gpt-5.4-nano``), so
+      DeepFilterNet's ``MODEL`` key gets hijacked and it tries to
+      ``import df.gpt-5``. We swap ``Config.__call__`` for an env-free variant so
+      it reads the bundled DeepFilterNet3 config instead.
+    """
+    global _DF_COMPAT_READY
+    if _DF_COMPAT_READY:
+        return
+
+    import sys
+    import types
+
+    if "torchaudio.backend.common" not in sys.modules:
+        backend_mod = types.ModuleType("torchaudio.backend")
+        common_mod = types.ModuleType("torchaudio.backend.common")
+
+        class AudioMetaData:  # minimal stand-in for the removed torchaudio class
+            def __init__(
+                self,
+                sample_rate: int = 0,
+                num_frames: int = 0,
+                num_channels: int = 0,
+                bits_per_sample: int = 0,
+                encoding: str = "UNKNOWN",
+            ) -> None:
+                self.sample_rate = sample_rate
+                self.num_frames = num_frames
+                self.num_channels = num_channels
+                self.bits_per_sample = bits_per_sample
+                self.encoding = encoding
+
+        common_mod.AudioMetaData = AudioMetaData  # type: ignore[attr-defined]
+        backend_mod.common = common_mod  # type: ignore[attr-defined]
+        sys.modules.setdefault("torchaudio.backend", backend_mod)
+        sys.modules["torchaudio.backend.common"] = common_mod
+
+    from df.config import Config
+
+    def _call_no_env(self, option, default=None, cast=str, save=True, section=None):
+        # Mirrors df.config.Config.__call__ minus the leading os.environ branch.
+        section = self.DEFAULT_SECTION if section is None else section
+        if self.parser is None:
+            raise ValueError("No configuration loaded")
+        if not self.parser.has_section(section.lower()):
+            self.parser.add_section(section.lower())
+        if self.parser.has_option(section, option):
+            value = self.parser.get(section, option)
+        elif self.parser.has_option(section.lower(), option):
+            value = self.parser.get(section.lower(), option)
+        elif self.parser.has_option(self.DEFAULT_SECTION, option):
+            value = self.parser.get(self.DEFAULT_SECTION, option)
+        elif default is None:
+            raise ValueError(f"Value {option} not found.")
+        elif not self.allow_defaults and save:
+            raise ValueError(f"Value '{option}' not found in config (defaults not allowed).")
         else:
-            b64_encoded_reference_audio = None
-        upload_name = Path(filename or f"audio{suffix}").name
-        response = await _transcribe_saved_path(path, upload_name, context)
+            value = default
+            if save:
+                self.set(option, value, cast, section)
+        return self.cast(value, cast)
+
+    Config.__call__ = _call_no_env  # type: ignore[assignment]
+    _DF_COMPAT_READY = True
+
+
+async def preprocess_audio(
+    audio_base64: str,
+    truncate_only: bool,
+    reference_audio: bool,
+    filename: Optional[str] = None,
+    max_duration_seconds: Optional[float] = 9.0,
+) -> dict:
+    """Preprocess audio and return an MP3 ``data:`` URI.
+
+    Modes:
+      * ``truncate_only=True``: skip enhancement and energy detection; keep the
+        first ``max_duration_seconds`` of the input as-is.
+
+      * ``truncate_only=False``: run ``DeepFilterNet`` speech enhancement (at its
+        native 48 kHz) to suppress background noise and isolate the voice. If
+        ``reference_audio=True`` and the cleaned audio is longer than
+        ``max_duration_seconds``, select the contiguous window of that length
+        with the greatest short-time energy. If ``reference_audio=False`` the
+        cleaned audio is returned without further trimming.
+
+    When ``context.dev == "TRUE"`` the final MP3 is also written to
+    ``tempfile.gettempdir()`` for inspection; the path is returned under
+    ``saved_dev_path``.
+
+    The ``truncate_only`` path uses only ``moviepy`` (already loaded at module
+    import). ``torch``, ``numpy``, ``librosa``, ``soundfile``, and the
+    DeepFilterNet ``df`` package are imported lazily inside the enhancement
+    branch and are not paid for on the fast path.
+    """
+    raw = _decode_base64_media_payload(audio_base64)
+    in_suffix = Path(filename or "audio.mp3").suffix or ".mp3"
+    max_seconds = float(max_duration_seconds or 9.0)
+
+    src_path: Optional[str] = None
+    wav_path: Optional[str] = None
+    out_mp3_path: Optional[str] = None
+    saved_dev_path: Optional[str] = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=in_suffix, delete=False) as tmp_in:
+            tmp_in.write(raw)
+            tmp_in.flush()
+            src_path = tmp_in.name
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+            out_mp3_path = tmp_mp3.name
+
+        sample_rate: Optional[int] = None
+
+        if truncate_only:
+            clip = AudioFileClip(src_path)
+            try:
+                full_duration = float(clip.duration or 0.0)
+                if full_duration > max_seconds:
+                    sub = clip.subclipped(0, max_seconds)
+                    duration_seconds = max_seconds
+                else:
+                    sub = clip
+                    duration_seconds = full_duration
+                try:
+                    sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+                finally:
+                    if sub is not clip:
+                        sub.close()
+                fps = getattr(clip, "fps", None)
+                sample_rate = int(fps) if fps else None
+            finally:
+                clip.close()
+        else:
+            import numpy as np
+            import torch
+            import librosa
+            import soundfile as sf
+
+            # DeepFilterNet: purpose-built speech enhancement (removes background
+            # noise while preserving the voice). Runs comfortably on CPU at its
+            # native 48 kHz. _prepare_deepfilternet patches two 0.5.6/torchaudio
+            # incompatibilities before the import; see that helper for details.
+            _prepare_deepfilternet()
+            from df.enhance import enhance, init_df
+
+            model, df_state, _ = init_df()
+            sample_rate = df_state.sr()
+            logger.info(f"preprocess_audio DeepFilterNet sr: {sample_rate}")
+
+            # df's own loader needs the removed torchaudio I/O API, so load and
+            # resample to the model rate ourselves. Decode with ffmpeg (moviepy)
+            # rather than librosa: libsndfile can't read m4a/aac/mov containers,
+            # so librosa would fall back to the deprecated audioread path, which
+            # also risks truncating the decode. DeepFilterNet enhances a single
+            # channel; collapse to mono on the way in.
+            in_clip = AudioFileClip(src_path)
+            try:
+                samples = in_clip.to_soundarray(fps=sample_rate)
+            finally:
+                in_clip.close()
+            if samples.ndim == 2:
+                samples = samples.mean(axis=1)
+            mono = np.ascontiguousarray(samples, dtype=np.float32)
+            audio = torch.from_numpy(mono).unsqueeze(0)
+            with torch.no_grad():
+                enhanced = enhance(model, df_state, audio).cpu()  # [1, samples], denoised
+            waveform = enhanced.squeeze(0).numpy().astype(np.float32)
+
+            duration_seconds = waveform.shape[-1] / float(sample_rate)
+
+            if reference_audio and duration_seconds > max_seconds:
+                frame_length = 2048
+                hop_length = 512
+                rms = librosa.feature.rms(
+                    y=waveform, frame_length=frame_length, hop_length=hop_length
+                )[0]
+                window_frames = max(1, int(round((max_seconds * sample_rate) / hop_length)))
+                if window_frames < len(rms):
+                    # Sliding-window energy via cumulative sum on rms^2.
+                    energy = rms.astype(np.float64) ** 2
+                    csum = np.concatenate(([0.0], np.cumsum(energy)))
+                    window_sums = csum[window_frames:] - csum[:-window_frames]
+                    start_frame = int(np.argmax(window_sums))
+                    start_sample = start_frame * hop_length
+                    end_sample = min(
+                        start_sample + int(round(max_seconds * sample_rate)),
+                        waveform.shape[-1],
+                    )
+                    waveform = waveform[start_sample:end_sample]
+
+            duration_seconds = waveform.shape[-1] / float(sample_rate)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+                wav_path = tmp_wav.name
+            sf.write(wav_path, waveform, int(sample_rate))
+            clip = AudioFileClip(wav_path)
+            try:
+                clip.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+            finally:
+                clip.close()
+
+        with open(out_mp3_path, "rb") as mp3_f:
+            mp3_bytes = mp3_f.read()
+        out_b64 = f"data:audio/mp3;base64,{base64.b64encode(mp3_bytes).decode('utf-8')}"
+
+        # Dev Testing: uncomment to save the preprocessed audio to a file
+
+        # stem = Path(filename or "audio").stem or "audio"
+        # tag = "truncated" if truncate_only else ("ref" if reference_audio else "vocals")
+        # dev_name = f"preprocess_{tag}_{stem}_{time_ns()}.mp3"
+        # saved_file_path = str(Path(tempfile.gettempdir()) / dev_name)
+        # with open(saved_file_path, "wb") as f:
+        #     f.write(mp3_bytes)
+        # logger.info(f"preprocess_audio dev artifact saved: {saved_file_path}")
+
+        return {
+            "audio_base64": out_b64,
+            "duration_seconds": duration_seconds,
+            "sample_rate": int(sample_rate) if sample_rate else None,
+            "reference_audio": reference_audio,
+            "truncate_only": truncate_only,
+        }
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    latency_ms = (time_ns() - start_time) / 1e6
-    response.update({"latency_ms": latency_ms})
-    response["b64_encoded_reference_audio"] = b64_encoded_reference_audio
-    return response
+        for p in (src_path, wav_path, out_mp3_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
 """ AUDIO DIARIZATION """
@@ -823,6 +1051,8 @@ async def transcribe_video(
     video_base64: str,
     context: GlobalContext,
     filename: Optional[str] = None,
+    reference_audio: bool = False,
+    max_duration_seconds: Optional[float] = 9.0,
 ) -> dict:
     raw = _decode_base64_media_payload(video_base64)
     orig_name = filename or "upload.mp4"
@@ -842,16 +1072,14 @@ async def transcribe_video(
 
         size_bytes = os.path.getsize(audio_path)
         diarize_upload_name = (
-            Path(orig_name).name
-            if Path(orig_name).name.lower().endswith(".mp3")
-            else "extracted.mp3"
+            Path(orig_name).stem + ".mp3"
         )
         
         with open(audio_path, "rb") as audio_f:
             b64_encoded_reference_audio = (
                 f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
             )
-            response = await transcribe_audio(b64_encoded_reference_audio, context, diarize_upload_name)
+            response = await transcribe_audio(b64_encoded_reference_audio, context, diarize_upload_name, reference_audio=reference_audio, max_duration_seconds=max_duration_seconds)
         return response
 
 # TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
@@ -868,43 +1096,48 @@ async def transcribe_audio_diarize(
     """Diarize video or audio from base64 (chunked when audio exceeds whisper_max_bytes)."""
     start_time = time_ns()
     client = _openai_client_for_speech(context)
-    raw = _decode_base64_media_payload(media_base64)
+    
     orig_name = filename or "upload.mp4"
     suffix = Path(orig_name).suffix or ".mp4"
     is_audio = _upload_is_audio_for_diarize(filename, content_type)
-    source_path = None
-    audio_path = None
-    try:
+
+    # Preprocess audio or video to isolate the vocals:
+    if is_audio:
+        preprocessed_audio = await preprocess_audio(media_base64, truncate_only=False, reference_audio=False)
+    else:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
+            raw = _decode_base64_media_payload(media_base64)
             temp_upload.write(raw)
             temp_upload.flush()
             source_path = temp_upload.name
 
-        if is_audio:
-            if suffix.lower() == ".mp3":
-                audio_path = source_path
-            else:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_mp3:
-                    audio_path = temp_mp3.name
-                clip_in = AudioFileClip(source_path)
-                try:
-                    clip_in.write_audiofile(audio_path, codec="mp3", logger=None)
-                finally:
-                    clip_in.close()
-        else:
-            video = VideoFileClip(source_path)
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
-                    audio_path = temp_audio.name
-                video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
-            finally:
-                video.close()
+        video = VideoFileClip(source_path)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+                audio_path = temp_audio.name
+            video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
+        finally:
+            video.close()
+            os.unlink(source_path)
 
-        size_bytes = os.path.getsize(audio_path)
+        with open(audio_path, "rb") as audio_f:
+            b64_encoded_reference_audio = (
+                f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
+            )
+            preprocessed_audio = await preprocess_audio(b64_encoded_reference_audio, truncate_only=False, reference_audio=False)
+
+    raw = _decode_base64_media_payload(preprocessed_audio['audio_base64'])
+    os.unlink(audio_path) # Non preprocessed audio
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+        temp_audio.write(raw)
+        temp_audio.flush()
+        audio_path = temp_audio.name # Preprocessed audio
+    
+    try:
+        size_bytes = len(raw)
         diarize_upload_name = (
-            Path(orig_name).name
-            if Path(orig_name).name.lower().endswith(".mp3")
-            else "extracted.mp3"
+            Path(orig_name).stem + ".mp3" # Preprocessed audio codec
         )
 
         if size_bytes <= context.whisper_max_bytes:

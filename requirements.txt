@@ -48,3 +48,11 @@ moviepy
 streamlit>=1.35.0
 requests>=2.31.0
 tiktoken
+
+# Audio Processing
+torchaudio
+# demucs
+deepfilternet
+librosa
+torch
+torchcodec

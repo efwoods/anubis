@@ -3,7 +3,7 @@
 # Reference audio
 ## Monologue
 - [x] reference audio upload from audio file
-- [ ] reference audio upload from audio url
+- [ ] reference audio upload from audio url: https://open.spotify.com/track/51rfRCiUSvxXlCSCfIztBy?si=02d45e2d9f2e4c7c
 
 - [ ] audio to text using reference audio from file
 - [ ] audio to text using reference audio from url
@@ -28,7 +28,6 @@
 tweets and quotes
     labeled json of quotes
     labeled json of tweets
-
 
 biographical and quotes: https://fallout.fandom.com/wiki/Curie
 

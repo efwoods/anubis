@@ -2441,7 +2441,12 @@ async def update_avatar_identity_with_media(
                 duplicates_str = ", ".join(media_files_duplicates)
                 
                 for duplicate in media_files_duplicates:
-                    delete_avatar_documents(duplicate, current_user)
+                    delete_result = await delete_avatar_documents(duplicate, current_user)
+                    if delete_result.status_code != 200:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Error deleting duplicate file: {delete_result.detail}"
+                        )
 
                 # raise HTTPException(
                 #     status_code=409,

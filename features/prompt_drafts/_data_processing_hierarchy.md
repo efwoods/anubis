@@ -11,8 +11,8 @@
 - [x] reference audio upload from video file
 - [ ] reference audio upload from video url
 
-- [ ] video to audio to text using reference audio from file
-- [ ] video to to text using reference audio from url: 
+- [x] video to audio to text using reference audio from file
+- [ ] video to audio to text using reference audio from url: 
   - [ ] monologue (into labeled json from url): https://www.youtube.com/watch?v=ia8lBT0MBT0
   - [ ] presentation (into labled json from url): https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=5
 

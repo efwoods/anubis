@@ -50,9 +50,8 @@ requests>=2.31.0
 tiktoken
 
 # Audio Processing
-torchaudio
-# demucs
-deepfilternet
+# Using noisereduce for speech enhancement at the moment.
+# demucs / deepfilternet disabled for now.
+noisereduce
 librosa
-torch
-torchcodec
+soundfile

@@ -371,6 +371,49 @@ async def _build_biographical_identity_documents(
     )
 
 
+def coalesce_segments_by_speaker(
+    segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge consecutive same-speaker segments into single alternating turns.
+
+    Walks ``segments`` in order; while the next segment shares the current
+    turn's ``speaker`` label its ``text`` is concatenated into the current
+    turn, ``end`` is extended to the later segment's end, and ``is_target`` is
+    OR-ed. A change of speaker label closes the current turn and opens a new
+    one. The result is an alternating-speaker list of turns, each carrying
+    ``speaker``, ``text``, ``start``, ``end`` and ``is_target``.
+
+    Idempotent: re-running over an already-coalesced list yields an equivalent
+    list, so callers may safely coalesce defensively.
+    """
+    turns: List[Dict[str, Any]] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = str(seg.get("speaker") or "unknown")
+        if turns and turns[-1]["speaker"] == speaker:
+            prev = turns[-1]
+            prev["text"] = f"{prev['text']} {text}".strip()
+            prev["end"] = seg.get("end", prev.get("end"))
+            prev["is_target"] = bool(prev.get("is_target")) or bool(
+                seg.get("is_target")
+            )
+        else:
+            turns.append(
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                    "is_target": bool(seg.get("is_target")),
+                }
+            )
+    return turns
+
+
 def _build_target_quote_documents_from_dialogue(
     dialogue_segments: List[Dict[str, Any]],
     *,
@@ -379,20 +422,38 @@ def _build_target_quote_documents_from_dialogue(
     media_item: Dict[str, Any],
     target_name: Optional[str],
 ) -> List[Document]:
-    """One Document per target turn in a diarized dialogue (verbatim)."""
+    """One Document per target turn in a diarized dialogue (verbatim).
+
+    Target turns are pre-tagged ``classified_situation="tweets_or_quotes"`` and
+    are NOT re-run through the content classifier. Each carries an
+    ``adapter_prompt`` metadata field holding the text of the immediately
+    preceding non-target turn (the "prerequisite/prompting" statement) when one
+    exists, else ``None`` so the adapter builder falls back to a synthetic
+    prompt. ``dialogue_segments`` must be the FULL ordered turn list (not just
+    the target turns) so the predecessor can be resolved.
+    """
     item_metadata = media_item.get("metadata", {}) or {}
     filename = item_metadata.get("filename", "")
     filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
     source = item_metadata.get("source") or filename or "user_upload"
     current_timestamp = datetime.now(tz=timezone.utc).isoformat()
 
-    documents: List[Document] = []
-    target_segments = [
-        seg for seg in dialogue_segments if seg.get("is_target") and (seg.get("text") or "").strip()
+    target_indices = [
+        i
+        for i, seg in enumerate(dialogue_segments)
+        if seg.get("is_target") and (seg.get("text") or "").strip()
     ]
-    total = len(target_segments)
-    for idx, seg in enumerate(target_segments):
+    total = len(target_indices)
+
+    documents: List[Document] = []
+    for chunk_idx, seg_idx in enumerate(target_indices):
+        seg = dialogue_segments[seg_idx]
         text = (seg.get("text") or "").strip()
+        adapter_prompt: Optional[str] = None
+        if seg_idx > 0:
+            prev = dialogue_segments[seg_idx - 1]
+            if not prev.get("is_target"):
+                adapter_prompt = (prev.get("text") or "").strip() or None
         documents.append(
             Document(
                 page_content=text,
@@ -403,7 +464,7 @@ def _build_target_quote_documents_from_dialogue(
                     "processing_task_id": str(uuid4()),
                     "source": source,
                     "type": "text",
-                    "chunk_index": idx,
+                    "chunk_index": chunk_idx,
                     "total_chunks": total,
                     "filename": filename,
                     "filename_uuid5": filename_uuid5,
@@ -411,12 +472,14 @@ def _build_target_quote_documents_from_dialogue(
                     "namespace": "quote",
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": True,
+                    "adapter_formatted": False,
                     "analysis_acceptable": True,
-                    "classified_situation": "dialogue",
+                    "classified_situation": "tweets_or_quotes",
                     "synthetic": False,
                     "speaker": seg.get("speaker"),
                     "is_target": True,
                     "target_name": target_name,
+                    "adapter_prompt": adapter_prompt,
                     "start": seg.get("start"),
                     "end": seg.get("end"),
                 },
@@ -515,14 +578,17 @@ async def process_dialogue_json_to_documents(
             "speakers": Optional[List[dict]],
         }
     """
-    segments: List[Dict[str, Any]] = list(
-        dialogue_payload.get("segments") or []
+    # Coalesce defensively so the helper is correct whether callers pass raw
+    # diarizer segments or already-coalesced turns (idempotent).
+    segments: List[Dict[str, Any]] = coalesce_segments_by_speaker(
+        list(dialogue_payload.get("segments") or [])
     )
     target_name = dialogue_payload.get("target_name")
 
     documents: List[Document] = []
 
-    # Target turns under ``quote`` (verbatim).
+    # Target turns under ``quote`` (verbatim), each carrying its preceding
+    # non-target turn as ``adapter_prompt``.
     documents.extend(
         _build_target_quote_documents_from_dialogue(
             segments,
@@ -544,16 +610,19 @@ async def process_dialogue_json_to_documents(
     if adapter_doc is not None:
         documents.append(adapter_doc)
 
-    # Scan whole transcript for biographical facts about the target.
-    transcript_text = "\n".join(
+    # Biographical facts about the target are extracted ONLY from non-target
+    # turns. FactRewriter returns nothing when a non-target speaker says
+    # nothing about the target, so no identity Document is created in that case
+    # and non-target speech never lands in the quote namespace.
+    nontarget_text = "\n".join(
         f"{seg.get('speaker') or 'unknown'}: {(seg.get('text') or '').strip()}"
         for seg in segments
-        if (seg.get("text") or "").strip()
+        if (seg.get("text") or "").strip() and not seg.get("is_target")
     )
-    if transcript_text.strip():
+    if nontarget_text.strip():
         try:
             identity_docs = await _build_biographical_identity_documents(
-                text_content=transcript_text,
+                text_content=nontarget_text,
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
@@ -562,10 +631,57 @@ async def process_dialogue_json_to_documents(
             documents.extend(identity_docs)
         except Exception as exc:
             logger.warning(
-                "Biographical fact extraction over dialogue transcript failed: %s",
+                "Biographical fact extraction over non-target turns failed: %s",
                 exc,
             )
 
+    return documents
+
+
+async def process_nontarget_text_to_identity_documents(
+    text_content: str,
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str] = None,
+) -> List[Document]:
+    """Treat non-target speech as biographical source about the target.
+
+    Used for the single-speaker path when the lone speaker is NOT the target
+    (and as the diarization-failure fallback for unidentified audio). Runs the
+    FactRewriter -> FirstPersonRewriter pipeline and emits one ``identity``
+    Document per first-person fact about the target. Returns ``[]`` when the
+    speaker says nothing about the target, so non-target content never becomes
+    a quote and produces no document when it carries no facts about the target.
+
+    This deliberately bypasses :func:`process_text_to_document` (whose
+    classifier keys on grammatical form, not speaker identity, and would route
+    first-person non-target speech into the ``quote`` namespace).
+    """
+    if not (text_content or "").strip():
+        return []
+
+    namespace_filename = media_item.get("metadata", {}).get(
+        "namespace_filename", ""
+    )
+    try:
+        documents = await _build_biographical_identity_documents(
+            text_content=text_content,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            media_item=media_item,
+            target_name=target_name,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Non-target biographical extraction failed (%s); no documents emitted",
+            exc,
+        )
+        return []
+
+    for document in documents:
+        document.metadata.update({"namespace_filename": namespace_filename})
     return documents
 
 

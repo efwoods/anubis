@@ -672,115 +672,43 @@ async def get_file_size_MB(audio_base64: str) -> float:
     return len(raw) / 1048576
 
 
-_DF_COMPAT_READY = False
-
-
-def _prepare_deepfilternet() -> None:
-    """Make DeepFilterNet 0.5.6 importable and usable under this stack.
-
-    DeepFilterNet 0.5.6 (the last release) predates two breaking changes in our
-    environment; both are patched here, idempotently and without touching
-    ``os.environ`` (the API server is concurrent):
-
-    * ``df.io`` does ``from torchaudio.backend.common import AudioMetaData`` at
-      import time, but torchaudio >= 2.x removed that module (audio I/O moved to
-      torchcodec). We register a minimal stand-in so ``import df`` succeeds; we
-      never call df's torchaudio-based loader/saver — audio I/O is done here.
-
-    * ``df.config`` resolves every option from ``os.environ[OPTION.upper()]``
-      before its own ``.ini``. Anubis sets ``MODEL`` (e.g. ``gpt-5.4-nano``), so
-      DeepFilterNet's ``MODEL`` key gets hijacked and it tries to
-      ``import df.gpt-5``. We swap ``Config.__call__`` for an env-free variant so
-      it reads the bundled DeepFilterNet3 config instead.
-    """
-    global _DF_COMPAT_READY
-    if _DF_COMPAT_READY:
-        return
-
-    import sys
-    import types
-
-    if "torchaudio.backend.common" not in sys.modules:
-        backend_mod = types.ModuleType("torchaudio.backend")
-        common_mod = types.ModuleType("torchaudio.backend.common")
-
-        class AudioMetaData:  # minimal stand-in for the removed torchaudio class
-            def __init__(
-                self,
-                sample_rate: int = 0,
-                num_frames: int = 0,
-                num_channels: int = 0,
-                bits_per_sample: int = 0,
-                encoding: str = "UNKNOWN",
-            ) -> None:
-                self.sample_rate = sample_rate
-                self.num_frames = num_frames
-                self.num_channels = num_channels
-                self.bits_per_sample = bits_per_sample
-                self.encoding = encoding
-
-        common_mod.AudioMetaData = AudioMetaData  # type: ignore[attr-defined]
-        backend_mod.common = common_mod  # type: ignore[attr-defined]
-        sys.modules.setdefault("torchaudio.backend", backend_mod)
-        sys.modules["torchaudio.backend.common"] = common_mod
-
-    from df.config import Config
-
-    def _call_no_env(self, option, default=None, cast=str, save=True, section=None):
-        # Mirrors df.config.Config.__call__ minus the leading os.environ branch.
-        section = self.DEFAULT_SECTION if section is None else section
-        if self.parser is None:
-            raise ValueError("No configuration loaded")
-        if not self.parser.has_section(section.lower()):
-            self.parser.add_section(section.lower())
-        if self.parser.has_option(section, option):
-            value = self.parser.get(section, option)
-        elif self.parser.has_option(section.lower(), option):
-            value = self.parser.get(section.lower(), option)
-        elif self.parser.has_option(self.DEFAULT_SECTION, option):
-            value = self.parser.get(self.DEFAULT_SECTION, option)
-        elif default is None:
-            raise ValueError(f"Value {option} not found.")
-        elif not self.allow_defaults and save:
-            raise ValueError(f"Value '{option}' not found in config (defaults not allowed).")
-        else:
-            value = default
-            if save:
-                self.set(option, value, cast, section)
-        return self.cast(value, cast)
-
-    Config.__call__ = _call_no_env  # type: ignore[assignment]
-    _DF_COMPAT_READY = True
-
-
 async def preprocess_audio(
     audio_base64: str,
     truncate_only: bool,
     reference_audio: bool,
     filename: Optional[str] = None,
     max_duration_seconds: Optional[float] = 9.0,
+    enhance_vocals_and_remove_noise: Optional[bool] = False,
 ) -> dict:
     """Preprocess audio and return an MP3 ``data:`` URI.
+
+
+    Enhance vocals and remove noise:
+    - noisereduce: spectral-gating noise reduction (suppresses background
+      noise while preserving the voice).
 
     Modes:
       * ``truncate_only=True``: skip enhancement and energy detection; keep the
         first ``max_duration_seconds`` of the input as-is.
 
-      * ``truncate_only=False``: run ``DeepFilterNet`` speech enhancement (at its
-        native 48 kHz) to suppress background noise and isolate the voice. If
+      * ``truncate_only=False``: run ``noisereduce`` spectral-gating noise
+        reduction to suppress background noise and isolate the voice. If
         ``reference_audio=True`` and the cleaned audio is longer than
         ``max_duration_seconds``, select the contiguous window of that length
         with the greatest short-time energy. If ``reference_audio=False`` the
         cleaned audio is returned without further trimming.
+
+    Input is expected to be MP3 (preprocessed audio) and the output is always
+    re-encoded to MP3.
 
     When ``context.dev == "TRUE"`` the final MP3 is also written to
     ``tempfile.gettempdir()`` for inspection; the path is returned under
     ``saved_dev_path``.
 
     The ``truncate_only`` path uses only ``moviepy`` (already loaded at module
-    import). ``torch``, ``numpy``, ``librosa``, ``soundfile``, and the
-    DeepFilterNet ``df`` package are imported lazily inside the enhancement
-    branch and are not paid for on the fast path.
+    import). ``numpy``, ``noisereduce``, ``librosa``, and ``soundfile`` are
+    imported lazily inside the enhancement branch and are not paid for on the
+    fast path.
     """
     raw = _decode_base64_media_payload(audio_base64)
     in_suffix = Path(filename or "audio.mp3").suffix or ".mp3"
@@ -822,41 +750,36 @@ async def preprocess_audio(
             finally:
                 clip.close()
         else:
-            import numpy as np
-            import torch
             import librosa
+            import noisereduce as nr
+            import numpy as np
             import soundfile as sf
 
-            # DeepFilterNet: purpose-built speech enhancement (removes background
-            # noise while preserving the voice). Runs comfortably on CPU at its
-            # native 48 kHz. _prepare_deepfilternet patches two 0.5.6/torchaudio
-            # incompatibilities before the import; see that helper for details.
-            _prepare_deepfilternet()
-            from df.enhance import enhance, init_df
-
-            model, df_state, _ = init_df()
-            sample_rate = df_state.sr()
-            logger.info(f"preprocess_audio DeepFilterNet sr: {sample_rate}")
-
-            # df's own loader needs the removed torchaudio I/O API, so load and
-            # resample to the model rate ourselves. Decode with ffmpeg (moviepy)
-            # rather than librosa: libsndfile can't read m4a/aac/mov containers,
-            # so librosa would fall back to the deprecated audioread path, which
-            # also risks truncating the decode. DeepFilterNet enhances a single
-            # channel; collapse to mono on the way in.
+            # noisereduce: spectral-gating noise reduction (suppresses background
+            # noise while preserving the voice). Decode the input MP3 to a mono
+            # float waveform with ffmpeg (moviepy) — libsndfile/librosa can't
+            # reliably decode compressed containers — then re-encode the cleaned
+            # audio back to MP3. moviepy is already loaded; numpy/noisereduce/
+            # librosa/soundfile are imported lazily so the truncate-only path
+            # doesn't pay for them.
             in_clip = AudioFileClip(src_path)
             try:
+                sample_rate = int(in_clip.fps or 44100)
                 samples = in_clip.to_soundarray(fps=sample_rate)
             finally:
                 in_clip.close()
             if samples.ndim == 2:
                 samples = samples.mean(axis=1)
             mono = np.ascontiguousarray(samples, dtype=np.float32)
-            audio = torch.from_numpy(mono).unsqueeze(0)
-            with torch.no_grad():
-                enhanced = enhance(model, df_state, audio).cpu()  # [1, samples], denoised
-            waveform = enhanced.squeeze(0).numpy().astype(np.float32)
 
+            # Enhance vocals and remove noise
+            if enhance_vocals_and_remove_noise:
+                logger.info(f"preprocess_audio noisereduce sr: {sample_rate}")
+                waveform = nr.reduce_noise(y=mono, sr=sample_rate).astype(np.float32)
+            else: 
+                waveform = mono
+
+            # Identify the longest window of audio that contains potential speech
             duration_seconds = waveform.shape[-1] / float(sample_rate)
 
             if reference_audio and duration_seconds > max_seconds:
@@ -881,6 +804,7 @@ async def preprocess_audio(
 
             duration_seconds = waveform.shape[-1] / float(sample_rate)
 
+            # Create MP3 Codec
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
                 wav_path = tmp_wav.name
             sf.write(wav_path, waveform, int(sample_rate))
@@ -890,6 +814,7 @@ async def preprocess_audio(
             finally:
                 clip.close()
 
+        # Create base64 encoded MP3
         with open(out_mp3_path, "rb") as mp3_f:
             mp3_bytes = mp3_f.read()
         out_b64 = f"data:audio/mp3;base64,{base64.b64encode(mp3_bytes).decode('utf-8')}"
@@ -1127,7 +1052,8 @@ async def transcribe_audio_diarize(
             preprocessed_audio = await preprocess_audio(b64_encoded_reference_audio, truncate_only=False, reference_audio=False)
 
     raw = _decode_base64_media_payload(preprocessed_audio['audio_base64'])
-    os.unlink(audio_path) # Non preprocessed audio
+    if not is_audio:
+        os.unlink(audio_path) # Non preprocessed audio from video
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
         temp_audio.write(raw)

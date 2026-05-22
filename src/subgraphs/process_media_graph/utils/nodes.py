@@ -1246,7 +1246,6 @@ async def process_media_item_task(
                         },
                     )
                 ]
-
             try:
                 diar_response = await transcribe_audio_diarize(
                     media_base64=payload_uri,

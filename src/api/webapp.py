@@ -2201,7 +2201,9 @@ async def update_avatar_identity_with_media(
                     "application/json",
                     "text/markdown",
                     "application/octet-stream",
-                ) or mime_type.startswith("text/"):
+                ) or mime_type.startswith("text/") or (
+                    raw_name or ""
+                ).lower().endswith(".log"):
                     media_files.append(
                         {
                             "filename": raw_name,

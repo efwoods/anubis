@@ -122,7 +122,7 @@ def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
     from transformers import pipeline
 
     classifier = pipeline("text-classification", model=GO_EMOTIONS_MODEL_ID)
-    sentiment = classifier(avatar_response.content)
+    sentiment = classifier(avatar_response.content, truncation=True, max_length=512)
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
     avatar_response.response_metadata.update(
         {

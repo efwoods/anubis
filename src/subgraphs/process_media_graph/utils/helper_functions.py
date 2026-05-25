@@ -62,10 +62,10 @@ def normal_chunking(
 
     if isinstance(text_content, list):
         texts = text_content
-    elif isinstance(text_content, str):
-        texts = [text_content]
     else:
-        texts = [str(text_content)]
+        texts = [text_content]
+    
+    texts = list(set([text.strip() for text in texts if text.strip()]))
 
     docs = text_splitter.create_documents(texts=texts, metadatas=[metadata])
     return docs
@@ -122,7 +122,6 @@ async def process_text_media_item_target_for_vectorstore(
     assistant_id: str,
     chunk_size: int = 1024,
     chunk_overlap: int = 150,
-    separators: Optional[List[str]] = None,
     classification_metadata: Optional[dict] = None,
     use_semantic_chunks: bool = False,
     namespace: str = "document",
@@ -227,6 +226,9 @@ def _build_quote_documents_per_line(
 ) -> List[Document]:
     """One Document per non-empty line under the ``quote`` namespace."""
     lines = text_content.splitlines()
+
+    # Unique non-empty lines
+    lines = list(set([line for line in lines if line.strip()]))
     filename = media_item.get("metadata", {}).get("filename", "")
     filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
     source_metadata = media_item.get("metadata", {}) or {}
@@ -237,12 +239,8 @@ def _build_quote_documents_per_line(
     current_timestamp = datetime.now(tz=timezone.utc).isoformat()
 
     for line in lines:
-        text = line.strip()
-        if not text:
-            continue
-
         doc = Document(
-            page_content=text,
+            page_content=line,
             metadata={
                 "user_id": user_id,
                 "assistant_id": assistant_id,

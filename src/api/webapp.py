@@ -84,6 +84,10 @@ import stripe
 
 import logging
 
+from dotenv import load_dotenv
+load_dotenv()
+
+
 logger = logging.getLogger(__name__)
 
 from uuid import uuid5, NAMESPACE_URL
@@ -387,8 +391,11 @@ def _assistant_without_metadata_if_public(assistant: dict[str, Any]) -> dict[str
 
 import debugpy
 
-if os.getenv("DEBUG", "false").lower() == "true":
-    debugpy.listen(("0.0.0.0", 5678))
+logger.info(f"DEBUG_PORT: {os.getenv('DEBUG_PORT', 5678)}")
+logger.info(f"DEV: {os.getenv('DEV', 'false')}")
+
+if os.getenv("DEV", "false").lower() == "true":
+    debugpy.listen(("0.0.0.0", int(os.getenv("DEBUG_PORT", 5678))))
 
 
 @asynccontextmanager
@@ -1188,7 +1195,8 @@ async def message_avatar(
     # while the upload + evaluation pipeline ships first; the parameters exist
     # now so the frontend can wire its UI without a breaking API change later.
 
-    # allow for select avatar in query and anonymous user for a dedicated endpoint
+    # allow for select avatar in query and anonymous user for a dedicated endpoint\
+    logger.warning(f"stream:{stream}")
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:

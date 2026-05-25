@@ -27,22 +27,6 @@
       "justMyCode": false
     },
     {
-      "name": "Attach to Memory LangGraph Server",
-      "type": "debugpy",
-      "request": "attach",
-      "connect": {
-        "host": "localhost",
-        "port": 5687
-      },
-      "pathMappings": [
-        {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "/deps/anubis"
-        }
-      ],
-      "justMyCode": false
-    },
-    {
       "name": "Debug hourly_progress.py",
       "type": "debugpy",
       "request": "launch",

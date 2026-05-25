@@ -1,3 +1,3 @@
-@src/api/webapp.py @frontend @src/anubis/utils/utility.py I need to process reference audio. I need the option to record 10 seconds of reference audio reading (The quick brown fox jumped over the lazy dog) or another sentence that is best suited to capture the variance in the vocal spectrum of an individual (streamlit record audio with prompt or upload an audio file & webapp upload audio file in upload_avatar media). 
+@src/api/webapp.py @frontend @src/anubis/utils/utility.py I need to process reference audio. I need the option to record 10 seconds of reference audio reading (The quick fox jumped over the brown lazy dog) or another sentence that is best suited to capture the variance in the vocal spectrum of an individual (streamlit record audio with prompt or upload an audio file to the update_avatar_identity_with_media api endpoint)
 
 # FP on reference audio with 3gp format video; verify audio vs noise separation using model

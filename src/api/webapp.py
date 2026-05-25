@@ -1985,7 +1985,7 @@ async def update_avatar_identity_with_media(
         assistant_meta = assistant.get("metadata") or {}
         creator_id = assistant_meta.get("user_id")
         if not creator_id:
-            raise HTTPException(
+            raise HTTPException(  
                 status_code=400,
                 detail=(
                     "Assistant metadata is missing the creator's user_id; "

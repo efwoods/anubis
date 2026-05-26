@@ -8,6 +8,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 import logging
 from pathlib import Path
@@ -15,6 +16,23 @@ from pathlib import Path
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_user_timezone(tz_name: str | None):
+    """Resolve a client-supplied IANA timezone name to a ``tzinfo``.
+
+    The frontend sends the browser's IANA zone (e.g. ``"America/New_York"`` from
+    ``st.context.timezone``) so the system clock injected into the prompt reflects
+    the user's local time regardless of where the server runs. Falls back to UTC
+    when the value is missing or not a recognized zone.
+    """
+    if not tz_name:
+        return timezone.utc
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning("Unknown user timezone %r; falling back to UTC", tz_name)
+        return timezone.utc
 
 
 def _image_url_from_content_block(block: dict) -> str | None:
@@ -351,7 +369,10 @@ async def load_consciousness(
 
     prompt_builder = DynamicPromptBuilder()
 
-    system_time = datetime.now(tz=timezone.utc).isoformat()
+    # Localize the injected clock to the querying user's timezone (sent by the
+    # client as an IANA name in config["configurable"]["user_timezone"]); UTC if absent.
+    user_timezone = config.get("configurable", {}).get("user_timezone")
+    system_time = datetime.now(tz=_resolve_user_timezone(user_timezone)).isoformat()
 
     # assistant_identity = state['assistant_state'].get('assistant_identity', [])
     assistant_name = state["assistant_state"].get("assistant_name", "")
@@ -380,6 +401,15 @@ async def load_consciousness(
     logger.info(f"state['messages']: {state['messages']}")
 
     system_message_str = populated_identity_template.messages[0].content
+
+
+    # Dev-only: dump the created system prompt to a file with real newlines
+    # (logger.info shows escaped "\n"; writing the str directly yields newlines).
+    if getattr(runtime, "context", None) and runtime.context.dev == "TRUE":
+        dev_prompt_path = Path("system_prompt.txt")
+        dev_prompt_path.write_text(system_message_str, encoding="utf-8")
+        logger.info(f"dev system prompt written to: {dev_prompt_path.resolve()}")
+
 
     input_update = {
         "user_identity_documents": user_identity,

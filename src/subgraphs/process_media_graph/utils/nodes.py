@@ -227,6 +227,30 @@ async def process_uploaded_files_and_label_media_type(
                 media_list.append(entry)
                 continue
             
+            # Log files are captured verbatim as a single reference document
+            # (no classification, no chunking), regardless of the declared
+            # content type the client sent for the ``.log`` upload.
+            if suffix.lower() == '.log':
+                if full_payload_uri:
+                    log_text = _decode_data_uri_base64_payload(
+                        full_payload_uri
+                    ).decode("utf-8", errors="replace")
+                else:
+                    log_text = (file_bytes or b"").decode("utf-8", errors="replace")
+                media_list.append({
+                    "type": "log",
+                    "content": log_text,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes or b""),
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "namespace_filename": namespace_filename
+                    }
+                })
+                continue
+
             # Determine media type and convert to standardized format
             if content_type.startswith('image/'):
                 mime = _normalize_declared_image_mime(content_type)
@@ -331,6 +355,25 @@ async def process_uploaded_files_and_label_media_type(
                         text_content = file_bytes.decode('utf-8')
                     media_list.append({
                         "type": "text",
+                        "content": text_content,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename
+                        }
+                    })
+                elif suffix == '.log':
+                    if full_payload_uri:
+                        text_content = _decode_data_uri_base64_payload(
+                            full_payload_uri
+                        ).decode("utf-8", errors="replace")
+                    else:
+                        text_content = file_bytes.decode('utf-8', errors="replace")
+                    media_list.append({
+                        "type": "log",
                         "content": text_content,
                         "metadata": {
                             "filename": filename,
@@ -816,6 +859,35 @@ async def process_media_item_task(
                 assistant_id=assistant_id,
                 media_item=media_item,
             )
+            return documents
+        elif media_type == "log":
+            # .log files bypass the content-situation classifier and are
+            # token-aware chunked straight into the ``document`` namespace.
+            classification_metadata = {
+                "classified_situation": "log_file",
+                "classification_reasoning": (
+                    "log files bypass classification and are chunked directly"
+                ),
+                "is_menu_or_religious_text": False,
+            }
+            documents = await process_text_media_item_target_for_vectorstore(
+                media_item=media_item,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                classification_metadata=classification_metadata,
+                use_semantic_chunks=False,
+                namespace="document",
+            )
+            for document in documents:
+                document.metadata.update(
+                    {
+                        "vectorstore_acceptable": True,
+                        "adapter_acceptable": False,
+                        "analysis_acceptable": False,
+                        "synthetic": False,
+                        "namespace_filename": namespace_filename,
+                    }
+                )
             return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             content = media_item.get('content')

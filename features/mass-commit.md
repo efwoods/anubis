@@ -1,0 +1,1 @@
+mass commit need to upload the run for the day to the avatar after updating the run.

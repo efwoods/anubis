@@ -1046,6 +1046,7 @@ async def message_selected_avatar(
     feedback: bool = Form(False),
     like: bool = Form(False),
     dislike: bool = Form(False),
+    user_timezone: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1093,6 +1094,8 @@ async def message_selected_avatar(
     # update with user information
     config_update["configurable"]["thread_id"] = thread_id
     config["configurable"].update(config_update["configurable"])
+    # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
+    config["configurable"]["user_timezone"] = user_timezone
 
     # store = app.state.store
     graph = app.state.graph
@@ -1189,6 +1192,7 @@ async def message_avatar(
     feedback: bool = Form(False),
     like: bool = Form(False),
     dislike: bool = Form(False),
+    user_timezone: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1259,6 +1263,8 @@ async def message_avatar(
     # update with user information
     config_update["configurable"]["thread_id"] = thread_id
     config["configurable"].update(config_update["configurable"])
+    # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
+    config["configurable"]["user_timezone"] = user_timezone
 
     # store = app.state.store
     graph = app.state.graph

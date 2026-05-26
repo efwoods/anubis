@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTENT_TYPES: Dict[str, str] = {
     ".txt": "text/plain",
+    ".log": "text/plain",
     ".md": "text/markdown",
     ".markdown": "text/markdown",
     ".json": "application/json",

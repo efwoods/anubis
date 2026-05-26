@@ -82,3 +82,7 @@ langgraph-api-prod-1  | 2026-05-19T16:01:31.889070Z [info     ] breakpoint after
 langgraph-api-prod-1  | 2026-05-19T16:01:31.890987Z [info     ] POST /update_avatar_identity_with_media 200 215831ms [langgraph_api.server] api_revision=67d6599 api_variant=licensed error_detail=None langgraph_api_version=0.8.3 latency_ms=215831 method=POST path=/update_avatar_identity_with_media path_params={} proto=1.1 query_string= req_header={} res_header={} response_size_bytes=127 route="APIRoute(path='/update_avatar_identity_with_media', name='update_avatar_identity_with_media', methods=['POST'])" run_id=None status=200 thread_name=MainThread ttfb_ms=215831.0
 
 
+
+# BUGS
+## LOGS ARE NOT BEING CHUNKED AND ARE TOO LONG FOR A RESPONSE FROM THE SYSTEM PROMPT
+## err.lg is not showing on /list_avatar_documents yet was uploaded

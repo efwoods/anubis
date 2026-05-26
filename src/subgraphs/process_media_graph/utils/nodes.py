@@ -365,6 +365,25 @@ async def process_uploaded_files_and_label_media_type(
                             "namespace_filename": namespace_filename
                         }
                     })
+                elif suffix == '.log':
+                    if full_payload_uri:
+                        text_content = _decode_data_uri_base64_payload(
+                            full_payload_uri
+                        ).decode("utf-8", errors="replace")
+                    else:
+                        text_content = file_bytes.decode('utf-8', errors="replace")
+                    media_list.append({
+                        "type": "log",
+                        "content": text_content,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename
+                        }
+                    })
                 elif suffix == '.json' or suffix == '.jsonl':
                     if full_payload_uri:
                         raw = _decode_data_uri_base64_payload(
@@ -842,52 +861,34 @@ async def process_media_item_task(
             )
             return documents
         elif media_type == "log":
-            # Reference log: index the whole file verbatim. No structured-output
-            # classification and no chunking — page_content is the entire log
-            # text, stored under the ``document`` namespace.
-            content = media_item.get("content", "")
-            if isinstance(content, bytes):
-                log_text = content.decode("utf-8", errors="replace")
-            else:
-                log_text = str(content)
-
-            if not log_text.strip():
-                return [
-                    Document(
-                        page_content="[Empty log file]",
-                        metadata={
-                            "status": "error",
-                            "error": "empty_log_file",
-                            "filename": filename,
-                            "namespace_filename": namespace_filename,
-                        },
-                    )
-                ]
-
-            return [
-                Document(
-                    page_content=log_text,
-                    metadata={
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                        "processing_task_id": str(uuid4()),
-                        "document_id": str(uuid4()),
-                        "source": metadata.get("source", "user_upload"),
-                        "type": "log",
-                        "chunk_index": 0,
-                        "total_chunks": 1,
-                        "filename": filename,
-                        "namespace_filename": namespace_filename,
-                        "namespace": "document",
-                        "classified_situation": "proprietary_content",
-                        "is_menu_or_religious_text": False,
+            # .log files bypass the content-situation classifier and are
+            # token-aware chunked straight into the ``document`` namespace.
+            classification_metadata = {
+                "classified_situation": "log_file",
+                "classification_reasoning": (
+                    "log files bypass classification and are chunked directly"
+                ),
+                "is_menu_or_religious_text": False,
+            }
+            documents = await process_text_media_item_target_for_vectorstore(
+                media_item=media_item,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                classification_metadata=classification_metadata,
+                use_semantic_chunks=False,
+                namespace="document",
+            )
+            for document in documents:
+                document.metadata.update(
+                    {
                         "vectorstore_acceptable": True,
                         "adapter_acceptable": False,
                         "analysis_acceptable": False,
-                    },
+                        "synthetic": False,
+                        "namespace_filename": namespace_filename,
+                    }
                 )
-            ]
+            return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             content = media_item.get('content')
 

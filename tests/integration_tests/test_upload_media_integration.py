@@ -535,3 +535,128 @@ async def test_upload_media_text_only_quotes_per_line_namespace(patched_pipeline
     assert len(set(chunk_indices)) == len(chunk_indices), (
         "Quote-per-line documents should have unique chunk indices."
     )
+
+
+# ---------------------------------------------------------------------------
+# .log upload: verbatim, single Document, document namespace, no classification
+# ---------------------------------------------------------------------------
+
+_SAMPLE_LOG = (
+    "2026-05-25 14:55:20 [f-log] running: ./hourly_progress.py -c -a <AVATAR_ID>\n"
+    "Reviewing progress...\n"
+    "Traceback (most recent call last):\n"
+    '  File "./hourly_progress.py", line 57, in <module>\n'
+    "    raise Exception(\n"
+    "Exception: Neural Nexus request failed (500): Internal Server Error\n"
+    "2026-05-25 14:56:03 [f-log] FAILED (exit 1)\n"
+)
+
+
+def _document_namespace_items(store, namespace_filename: str):
+    items = []
+    for item in store.search((USER_ID, ASSISTANT_ID), limit=1_000_000):
+        meta = (
+            (getattr(item, "value", {}) or {})
+            .get("document", {})
+            .get("kwargs", {})
+            .get("metadata", {})
+        )
+        if (
+            meta.get("namespace") == "document"
+            and meta.get("namespace_filename") == namespace_filename
+        ):
+            items.append(item)
+    return items
+
+
+def _build_log_media_files(content_type: str) -> List[Dict[str, Any]]:
+    log_bytes = _SAMPLE_LOG.encode("utf-8")
+    return [
+        {
+            "filename": "hourly_progress.log",
+            "content_type": content_type,
+            "content": log_bytes,
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "reference_audio": False,
+            "reference_image": False,
+            "base64_encoded_str": _make_data_uri(content_type, log_bytes),
+            "namespace_filename": "hourly_progress.log",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_type", ["text/plain", "application/octet-stream", "application/x-log"]
+)
+async def test_upload_log_file_indexed_verbatim_to_document_namespace(content_type):
+    """A ``.log`` upload is stored verbatim as one Document under ``document``.
+
+    No classifiers are patched here: the ``.log`` path must not invoke any
+    structured-output classification. The whole file is the Document
+    ``page_content``; the same flow runs regardless of the declared MIME type.
+    """
+    store = InMemoryStore()
+    context = _build_context()
+    config = _build_config()
+    media_files = _build_log_media_files(content_type)
+
+    from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
+        workflow,
+    )
+
+    process_media_graph = workflow.compile(store=store)
+    await process_media_graph.ainvoke(
+        {"media_files": media_files}, config=config, context=context
+    )
+
+    items = _document_namespace_items(store, "hourly_progress.log")
+    assert len(items) == 1, (
+        f"Expected exactly one verbatim log Document, got {len(items)} "
+        f"(content_type={content_type})."
+    )
+
+    doc = (getattr(items[0], "value", {}) or {})["document"]["kwargs"]
+    assert doc["page_content"] == _SAMPLE_LOG, (
+        "Log Document page_content should be the full file text, unchunked."
+    )
+    meta = doc["metadata"]
+    assert meta["filename"] == "hourly_progress.log"
+    assert meta["type"] == "log"
+    assert meta["namespace"] == "document"
+    assert meta["classified_situation"] == "proprietary_content"
+    assert meta["total_chunks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_empty_log_file_raises(  # noqa: D401
+):
+    """An empty/whitespace ``.log`` upload fails rather than indexing nothing."""
+    store = InMemoryStore()
+    context = _build_context()
+    config = _build_config()
+    blank_bytes = b"   \n\t\n"
+    media_files = [
+        {
+            "filename": "blank.log",
+            "content_type": "text/plain",
+            "content": blank_bytes,
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "reference_audio": False,
+            "reference_image": False,
+            "base64_encoded_str": _make_data_uri("text/plain", blank_bytes),
+            "namespace_filename": "blank.log",
+        }
+    ]
+
+    from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
+        workflow,
+    )
+
+    process_media_graph = workflow.compile(store=store)
+    with pytest.raises(Exception):
+        await process_media_graph.ainvoke(
+            {"media_files": media_files}, config=config, context=context
+        )

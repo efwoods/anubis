@@ -69,7 +69,11 @@ async def index_docs(
     user_id = updated_user_id['user_id']
     assistant_id = updated_assistant_id['assistant_id']
 
-    docs = state['vectorstore_documents_to_be_indexed']
+    docs = state.get('vectorstore_documents_to_be_indexed') or []
+
+    if not docs:
+        logger.info("No documents to index; skipping batch indexing")
+        return {"vectorstore_documents_to_be_indexed": "delete"}
 
     filenames = [doc.metadata.get("namespace_filename") for doc in docs]
     try:

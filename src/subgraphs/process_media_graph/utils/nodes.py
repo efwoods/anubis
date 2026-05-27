@@ -344,6 +344,25 @@ async def process_uploaded_files_and_label_media_type(
                             "namespace_filename": namespace_filename
                         }
                     })
+                elif suffix == '.log':
+                    if full_payload_uri:
+                        text_content = _decode_data_uri_base64_payload(
+                            full_payload_uri
+                        ).decode("utf-8", errors="replace")
+                    else:
+                        text_content = file_bytes.decode('utf-8', errors="replace")
+                    media_list.append({
+                        "type": "log",
+                        "content": text_content,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename
+                        }
+                    })
                 elif suffix == '.json' or suffix == '.jsonl':
                     if full_payload_uri:
                         raw = _decode_data_uri_base64_payload(
@@ -604,8 +623,8 @@ async def process_media_item_task(
     runtime: Runtime[GlobalContext], 
     config: RunnableConfig,
     store: BaseStore
-) -> Document:
-    """Task: Convert a single media item to a Document"""
+) -> List[Document]:
+    """Task: Convert a single media item to a list of Documents"""
     
     logger.info(f"process_media_item_task entry")
 
@@ -819,6 +838,35 @@ async def process_media_item_task(
                 assistant_id=assistant_id,
                 media_item=media_item,
             )
+            return documents
+        elif media_type == "log":
+            # .log files bypass the content-situation classifier and are
+            # token-aware chunked straight into the ``document`` namespace.
+            classification_metadata = {
+                "classified_situation": "log_file",
+                "classification_reasoning": (
+                    "log files bypass classification and are chunked directly"
+                ),
+                "is_menu_or_religious_text": False,
+            }
+            documents = await process_text_media_item_target_for_vectorstore(
+                media_item=media_item,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                classification_metadata=classification_metadata,
+                use_semantic_chunks=False,
+                namespace="document",
+            )
+            for document in documents:
+                document.metadata.update(
+                    {
+                        "vectorstore_acceptable": True,
+                        "adapter_acceptable": False,
+                        "analysis_acceptable": False,
+                        "synthetic": False,
+                        "namespace_filename": namespace_filename,
+                    }
+                )
             return documents
         elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
             content = media_item.get('content')
@@ -1061,14 +1109,16 @@ async def process_media_item_task(
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
                 if not ref_item and not reference_audio:
-                    return Document(
-                        page_content=f"{media_type.capitalize()} missing reference audio reference audio is required for audio and video distillation to text.",
-                        metadata={
-                            "status": "error",
-                            "error": f"missing_{media_type}_reference_audio",
-                            "filename": filename,
-                        },
-                    )
+                    return [
+                        Document(
+                            page_content=f"{media_type.capitalize()} missing reference audio reference audio is required for audio and video distillation to text.",
+                            metadata={
+                                "status": "error",
+                                "error": f"missing_{media_type}_reference_audio",
+                                "filename": filename,
+                            },
+                        )
+                    ]
 
             payload_uri = _full_data_uri_from_media_dict(media_item)
             audio_url = ""
@@ -1308,6 +1358,28 @@ async def process_media_item_task(
             turns = coalesce_segments_by_speaker(normalized_segments)
             distinct_speakers = {t["speaker"] for t in turns}
 
+            # Lone-speaker promotion. If the diarizer returned exactly one
+            # speaker and we supplied a stored reference audio (i.e. the user
+            # previously registered their voice), the lone speaker is the
+            # target — even if the diarizer's label didn't literally contain
+            # ``target_speaker_label``. The reference audio is the only voice
+            # we have a sample of; if there's one speaker on this upload and
+            # we anchored them via known_speaker_references, the upload IS the
+            # target. This rescues the case where the diarizer ignores or
+            # mangles the provided ``known_speaker_names`` label.
+            if (
+                len(distinct_speakers) == 1
+                and encoded_reference_audio is not None
+                and turns
+                and not turns[0].get("is_target")
+            ):
+                logger.info(
+                    "Lone speaker %r promoted to target via stored reference audio",
+                    turns[0].get("speaker"),
+                )
+                for t in turns:
+                    t["is_target"] = True
+
             if len(distinct_speakers) > 1:
                 # Multiple speakers -> full dialogue processing. Outputs:
                 # multi-turn adapter conversation, per-target quote Documents
@@ -1432,7 +1504,14 @@ async def process_media_item_task(
                     "namespace_filename": namespace_filename,
                 },
             }
-            if reference_audio:
+            # Treat as target speech when this IS the reference upload OR
+            # when the user has previously registered a reference audio
+            # (single-speaker uploads after registration are presumed to be
+            # the target — same rationale as the lone-speaker promotion in
+            # the diarized-segments branch above). The non-target identity-
+            # facts path only kicks in for unidentified-speaker uploads with
+            # no stored reference audio.
+            if reference_audio or encoded_reference_audio is not None:
                 documents = await process_text_to_document(
                     metadata=transcript_media_item["metadata"],
                     user_id=user_id,

@@ -277,6 +277,7 @@ async def _build_identity_documents_from_facts(
     assistant_id: str,
     media_item: Dict[str, Any],
     original_statement: str = "",
+    concise_context_summary: str = "",
     target_name: Optional[str] = None,
 ) -> List[Document]:
     """Run FirstPersonRewriter over rewritten facts and emit identity Documents.
@@ -302,7 +303,7 @@ async def _build_identity_documents_from_facts(
         (f.get("rewritten_statement") or "").strip() for f in facts
     ]
     rewriter = FirstPersonRewriterClass()
-    rewriter_response = await rewriter.rewrite(rewritten_inputs)
+    rewriter_response = await rewriter.rewrite(rewritten_inputs, concise_context_summary=concise_context_summary)
     statements = rewriter_response.get("statements") or []
 
     item_metadata = media_item.get("metadata", {}) or {}
@@ -316,7 +317,10 @@ async def _build_identity_documents_from_facts(
         if idx >= len(statements):
             break
         stmt = statements[idx] or {}
-        first_person = (stmt.get("first_person_statement") or "").strip()
+        first_person = (stmt.get("first_person_statement") or "").strip() 
+        if first_person != "":
+            first_person = "<FACT_CONTEXT_AND_FACT>" + " <FACT_CONTEXT>" + (concise_context_summary.strip()) + "</FACT_CONTEXT>" + "<FACT>" + first_person + "</FACT>" + "</FACT_CONTEXT_AND_FACT>"
+
         if not first_person:
             continue
         doc = Document(
@@ -339,6 +343,7 @@ async def _build_identity_documents_from_facts(
                 "synthetic": True,
                 "original_statement": original_statement,
                 "rewritten_statement": fact.get("rewritten_statement", ""),
+                "concise_context_summary": concise_context_summary,
                 "target_name": target_name,
             },
         )
@@ -368,6 +373,7 @@ async def _build_biographical_identity_documents(
         media_item=media_item,
         original_statement=fact_response.get("original_statement", ""),
         target_name=fact_response.get("target_name") or target_name,
+        concise_context_summary = fact_response.get("concise_context_summary", "")
     )
 
 

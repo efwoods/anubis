@@ -1027,6 +1027,8 @@ async def transcribe_audio_diarize(
     is_audio = _upload_is_audio_for_diarize(filename, content_type)
 
     # Preprocess audio or video to isolate the vocals:
+    source_path = None
+    audio_path = None
     if is_audio:
         preprocessed_audio = await preprocess_audio(media_base64, truncate_only=False, reference_audio=False)
     else:

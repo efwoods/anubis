@@ -70,8 +70,34 @@ from src.security.auth import (
 
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator
 from typing import Any
+
+
+def _drop_empty_file_fields(value: Any) -> Any:
+    """Normalize the multipart ``files`` field so an absent upload is treated as
+    "no files" instead of raising a 422.
+
+    Swagger UI (and some HTTP clients) submit an *empty* file field as a form
+    value of ``""`` rather than omitting it. FastAPI then receives ``[""]`` and,
+    while validating each element against ``UploadFile``, fails with
+    ``Expected UploadFile, received: <class 'str'>`` before the endpoint body
+    ever runs. Stripping the stray string(s) here turns that into an empty list.
+    """
+    if isinstance(value, list):
+        return [item for item in value if not isinstance(item, str)]
+    if isinstance(value, str):
+        return []
+    return value
+
+
+# Reusable annotation for optional multipart file uploads. Use this instead of
+# ``Optional[List[UploadFile]] = File(None)`` so empty file fields don't 422.
+OptionalUploadFiles = Annotated[
+    Optional[List[UploadFile]],
+    BeforeValidator(_drop_empty_file_fields),
+    File(),
+]
 
 from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
@@ -920,7 +946,7 @@ async def select_avatar(
 
 
 async def process_files_for_message(
-    files: Optional[List[UploadFile]] = None,
+    files: OptionalUploadFiles = None,
     message: str = "",
 ) -> tuple:
     """Process uploaded files and return content for inclusion in messages.
@@ -1040,7 +1066,7 @@ async def message_selected_avatar(
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),
+    files: OptionalUploadFiles = None,
     thread_id: Optional[str] = Form(None),
     stream: bool = Form(True),
     feedback: bool = Form(False),
@@ -1183,7 +1209,7 @@ async def message_avatar(
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),
+    files: OptionalUploadFiles = None,
     thread_id: Optional[str] = Form(None),
     stream: bool = Form(True),
     feedback: bool = Form(False),
@@ -1197,6 +1223,7 @@ async def message_avatar(
     # now so the frontend can wire its UI without a breaking API change later.
 
     # allow for select avatar in query and anonymous user for a dedicated endpoint\
+    breakpoint
     logger.warning(f"stream:{stream}")
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1949,7 +1976,7 @@ async def get_avatar_reference_image(
 from typing import Optional
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
-    files: Annotated[Optional[List[UploadFile]], File()] = None,
+    files: OptionalUploadFiles = None,
     url: Annotated[Optional[str], Form()] = None,
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,

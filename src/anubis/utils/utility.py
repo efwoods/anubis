@@ -28,7 +28,9 @@ from datetime import timezone
 from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
 from typing import Optional
 
+import asyncio
 import math
+import subprocess
 import tempfile
 from pathlib import Path
 from moviepy import AudioFileClip, VideoFileClip
@@ -1376,52 +1378,87 @@ async def transcribe_audio_diarize(
             )
             response_dict = response.model_dump()
         else:
-            # Probe duration with a short-lived clip, then close it before
-            # the chunk loop. Each chunk opens its OWN AudioFileClip so that
-            # closing one subclip cannot release a reader shared with later
-            # iterations (MoviePy 2.x reuses the parent's ffmpeg process for
-            # subclips; closing a subclip can null the parent's ``proc``,
-            # which surfaces as ``'NoneType' object has no attribute
-            # 'stdout'`` on the next ``write_audiofile``).
+            # Probe duration with a one-shot AudioFileClip, then close it.
+            # Slicing uses ffmpeg ``-c copy`` (stream copy, no re-encode) so
+            # each chunk file is produced in well under a second regardless
+            # of input size — no MoviePy reader is held across chunks, which
+            # also sidesteps the MoviePy 2.x shared-reader bug that closes
+            # the parent's ffmpeg process when a subclip is closed.
             with AudioFileClip(audio_path) as probe:
                 duration = float(probe.duration or 0.0)
             n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
             chunk_dur = duration / n
-            text_parts: list[str] = []
-            chunk_responses: list[TranscriptionDiarized] = []
+
+            chunk_paths: list[str] = []
             offsets: list[float] = []
-            u_in = 0
-            u_out = 0
             for i in range(n):
                 t_off = i * chunk_dur
                 t_end = duration if i == n - 1 else (i + 1) * chunk_dur
                 fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
                 os.close(fd)
-                try:
-                    with AudioFileClip(audio_path) as chunk_clip:
-                        sub = chunk_clip.subclipped(t_off, t_end)
-                        try:
-                            sub.write_audiofile(chunk_path, logger=None)
-                        finally:
-                            sub.close()
-                    resp = _diarize_one_mp3_path(
+                # ``-ss`` before ``-i`` does fast (input) seek; with ``-c
+                # copy`` ffmpeg snaps to the nearest mp3 frame boundary,
+                # which is acceptable for diarization-chunk granularity.
+                # ``-loglevel error`` suppresses progress chatter.
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        f"{t_off}",
+                        "-to",
+                        f"{t_end}",
+                        "-i",
+                        audio_path,
+                        "-c",
+                        "copy",
                         chunk_path,
-                        f"chunk_{i}.mp3",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                chunk_paths.append(chunk_path)
+                offsets.append(t_off)
+
+            try:
+                # POST all chunk diarizations to OpenAI concurrently. The
+                # SDK call is synchronous so we hop each one to a thread.
+                async def _diarize_chunk_async(
+                    idx: int, path: str
+                ) -> TranscriptionDiarized:
+                    return await asyncio.to_thread(
+                        _diarize_one_mp3_path,
+                        path,
+                        f"chunk_{idx}.mp3",
                         context,
                         client,
                         encoded_reference_audio,
                     )
-                    text_parts.append(resp.text)
-                    chunk_responses.append(resp)
-                    offsets.append(t_off)
-                    ud = _diarize_usage_tokens_dict(resp.usage)
-                    u_in += int(ud.get("input_tokens") or 0)
-                    u_out += int(ud.get("output_tokens") or 0)
-                finally:
+
+                chunk_responses = list(
+                    await asyncio.gather(
+                        *[
+                            _diarize_chunk_async(i, p)
+                            for i, p in enumerate(chunk_paths)
+                        ]
+                    )
+                )
+            finally:
+                for path in chunk_paths:
                     try:
-                        os.unlink(chunk_path)
+                        os.unlink(path)
                     except OSError:
                         pass
+
+            text_parts = [resp.text for resp in chunk_responses]
+            u_in = 0
+            u_out = 0
+            for resp in chunk_responses:
+                ud = _diarize_usage_tokens_dict(resp.usage)
+                u_in += int(ud.get("input_tokens") or 0)
+                u_out += int(ud.get("output_tokens") or 0)
             usage_merged = None
             if u_in or u_out:
                 usage_merged = {

@@ -1,1 +1,0 @@
-# I need to have the indexing into the vectorstore database be full sentence chunks that are not truncated by the embedding model of 386 dimensions

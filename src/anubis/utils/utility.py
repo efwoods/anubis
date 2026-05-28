@@ -576,7 +576,7 @@ def _transcribe_one_segment_path(
             response_format="text",
         )
     return {
-        "content": content,
+        "text": content,
         "file_duration_s": duration_seconds,
         "total_cost": transcription_cost,
         "latency_ms": (time_ns() - start) / 1e6,
@@ -615,7 +615,7 @@ async def _transcribe_saved_path(path: str, upload_filename: str, context: Globa
                 seg = _transcribe_one_segment_path(
                     chunk_path, f"chunk_{i}.mp3", context, client
                 )
-                parts.append(seg["content"])
+                parts.append(seg["text"])
                 total_cost += seg["total_cost"]
                 inner_latency += seg["latency_ms"]
             finally:
@@ -625,12 +625,12 @@ async def _transcribe_saved_path(path: str, upload_filename: str, context: Globa
                 except OSError:
                     pass
         return {
-            "content": " ".join(parts),
+            "text": " ".join(parts),
             "file_duration_s": duration,
             "total_cost": total_cost,
             "latency_ms": inner_latency,
             "whisper_chunk_count": n,
-            "model": context.audio_transcription_model, 
+            "model": context.audio_transcription_model,
             "inference_type": "transcription"
         }
     finally:
@@ -1127,11 +1127,11 @@ async def isolate_dominant_speaker_audio_b64(
     Returns:
         ``{"audio_base64_preprocessed": <data URI>,
            "duration": <seconds of the clip>,
-           "content": <transcript text of the clip>}``
+           "text": <transcript text of the clip>}``
 
-    The ``audio_base64_preprocessed``, ``duration``, and ``content`` always
-    describe the same audio. There is no separate ``text`` field — content is
-    the transcript of what is in the encoded clip.
+    The ``audio_base64_preprocessed``, ``duration``, and ``text`` always
+    describe the same audio. ``text`` matches the OpenAI transcription API's
+    key and is the transcript of what is in the encoded clip.
 
     Selection cascade (after filtering to text-bearing segments and picking
     the speaker with the largest total speech time, tie-break by first-seen
@@ -1145,7 +1145,7 @@ async def isolate_dominant_speaker_audio_b64(
       is the sum of segment durations.
 
     Falls back to ``{"audio_base64_preprocessed": <input>, "duration": None,
-    "content": ""}`` on decode failure, diarization failure, single-speaker
+    "text": ""}`` on decode failure, diarization failure, single-speaker
     input, no text-bearing segments, or combined target speech < 1 s.
     """
     target_clip_max_s = float(
@@ -1158,7 +1158,7 @@ async def isolate_dominant_speaker_audio_b64(
         return {
             "audio_base64_preprocessed": audio_base64,
             "duration": None,
-            "content": "",
+            "text": "",
         }
 
     work_path: Optional[str] = None
@@ -1283,7 +1283,7 @@ async def isolate_dominant_speaker_audio_b64(
         return {
             "audio_base64_preprocessed": final_audio_b64,
             "duration": clip_duration,
-            "content": clip_content,
+            "text": clip_content,
         }
 
     finally:

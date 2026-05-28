@@ -255,7 +255,7 @@ async def _stub_situation_classify(self, input_str: str) -> Dict[str, Any]:
 
 async def _stub_transcribe_audio(audio_base64, context, filename=None):
     return {
-        "content": (
+        "text": (
             "Hi sweetie, this is Mom. I love you and I am proud of you. "
             "Remember to eat your vegetables and call me when you can."
         ),

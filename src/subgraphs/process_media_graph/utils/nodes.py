@@ -1192,10 +1192,10 @@ async def process_media_item_task(
 
                 # The helper returns a coherent triple: the encoded mp3 of the
                 # dominant speaker's clip, its duration, and the transcript
-                # text that matches that clip. There is no separate ``text``
-                # field — ``content`` IS the clip's transcript.
+                # ``text`` that matches that clip (same key as the OpenAI
+                # transcription API and ``transcribe_audio_diarize``).
                 ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
-                transcription_text = transcription_dict.get("content") or ""
+                transcription_text = transcription_dict.get("text") or ""
                 
                 ref_namespace = (user_id, assistant_id, "reference_audio")
                 doc = Document(
@@ -1233,34 +1233,34 @@ async def process_media_item_task(
                 REFERENCE_AUDIO_EMBEDDING = model.encode(REFERENCE_AUDIO_SENTENCE)
                 similarity = model.similarity(embedding, REFERENCE_AUDIO_EMBEDDING)
                 if similarity < 0.80:
-                    logger.info(f"Transcription text is dissimilar to the reference audio text. Similarity: {similarity}")
-                    media_item_transcription = media_item.copy()
-                    if media_type == "audio":
-                        full_transcription = await transcribe_audio(
-                            audio_base64=payload_uri,
-                            context=runtime.context,
-                            filename=filename,
-                            reference_audio=False,
-                        )
-                        transcription_text = full_transcription.get("content", "")
-                    else:
-                        full_transcription = await transcribe_video(
-                            video_base64=payload_uri,
-                            context=runtime.context,
-                            filename=filename,
-                            reference_audio=False,
-                        )
-                        transcription_text = full_transcription.get("content", "")
-                    media_item_transcription["content"] = transcription_text
-                    documents = await process_text_to_document(
-                        metadata=metadata,
-                        user_id=user_id,
-                        assistant_id=assistant_id,
-                        media_item=media_item_transcription,
+                    # The reference upload is not the calibration sentence, so it
+                    # carries real content. Re-process the ORIGINAL audio as a
+                    # fresh, non-reference upload by re-entering this task with
+                    # reference_audio=False. That path pulls the reference clip we
+                    # just stored (for known-speaker labelling), diarizes the full
+                    # audio, identifies speakers, and routes multi-speaker dialogue
+                    # / target monologue / non-target biographical facts exactly
+                    # like any other audio document — including adapter + langsmith
+                    # dataset rows downstream.
+                    logger.info(
+                        "Reference audio dissimilar to calibration sentence (similarity=%s); processing full content as a non-reference upload",
+                        similarity,
                     )
-                    all_documents.extend(documents)
+                    content_media_item = {
+                        "type": "audio",
+                        "base64_encoded_str": audio_uri,
+                        "metadata": {
+                            **metadata,
+                            "reference_audio": False,
+                            "content_type": "audio/mp3",
+                        },
+                    }
+                    content_documents = await process_media_item_task(
+                        content_media_item, runtime, config, store
+                    )
+                    all_documents.extend(content_documents)
 
-                # return the document
+                # return the reference document plus any content documents
                 return all_documents
 
             # ---------------------------------------------------------------
@@ -1475,7 +1475,7 @@ async def process_media_item_task(
                     context=runtime.context,
                     filename=filename,
                 )
-                fallback_text = (fallback.get("content") or "").strip()
+                fallback_text = (fallback.get("text") or "").strip()
             except Exception as e:
                 logger.exception(
                     "Fallback transcription failed for %s: %s", filename, e

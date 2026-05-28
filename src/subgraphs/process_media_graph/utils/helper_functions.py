@@ -616,30 +616,41 @@ async def process_dialogue_json_to_documents(
     if adapter_doc is not None:
         documents.append(adapter_doc)
 
-    # Biographical facts about the target are extracted ONLY from non-target
-    # turns. FactRewriter returns nothing when a non-target speaker says
-    # nothing about the target, so no identity Document is created in that case
-    # and non-target speech never lands in the quote namespace.
-    nontarget_text = "\n".join(
-        f"{seg.get('speaker') or 'unknown'}: {(seg.get('text') or '').strip()}"
-        for seg in segments
-        if (seg.get("text") or "").strip() and not seg.get("is_target")
-    )
-    if nontarget_text.strip():
+    # Biographical facts about the target are extracted from each non-target
+    # statement individually so per-speaker attribution is preserved on the
+    # resulting identity Documents. FactRewriter returns nothing when a
+    # non-target statement says nothing about the target, so empty statements
+    # produce no Documents and non-target speech never lands in the quote
+    # namespace.
+    for seg in segments:
+        if seg.get("is_target"):
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker_label = seg.get("speaker") or "unknown"
         try:
-            identity_docs = await _build_biographical_identity_documents(
-                text_content=nontarget_text,
+            statement_docs = await _build_biographical_identity_documents(
+                text_content=text,
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
                 target_name=target_name,
             )
-            documents.extend(identity_docs)
         except Exception as exc:
             logger.warning(
-                "Biographical fact extraction over non-target turns failed: %s",
+                "Biographical fact extraction over non-target statement (speaker=%s) failed: %s",
+                speaker_label,
                 exc,
             )
+            continue
+        for doc in statement_docs:
+            doc.metadata["speaker"] = speaker_label
+            if seg.get("start") is not None:
+                doc.metadata["start"] = seg.get("start")
+            if seg.get("end") is not None:
+                doc.metadata["end"] = seg.get("end")
+        documents.extend(statement_docs)
 
     return documents
 

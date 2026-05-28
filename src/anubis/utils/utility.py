@@ -614,7 +614,7 @@ async def _transcribe_saved_path(path: str, upload_filename: str, context: Globa
                     chunk_path, f"chunk_{i}.mp3", context, client
                 )
                 parts.append(seg["content"])
-                total_cost += seg["transcription_cost"]
+                total_cost += seg["total_cost"]
                 inner_latency += seg["latency_ms"]
             finally:
                 sub.close()
@@ -671,7 +671,6 @@ async def get_file_size_MB(audio_base64: str) -> float:
     raw = _decode_base64_media_payload(audio_base64)
     return len(raw) / 1048576
 
-
 async def preprocess_audio(
     audio_base64: str,
     truncate_only: bool,
@@ -681,8 +680,6 @@ async def preprocess_audio(
     enhance_vocals_and_remove_noise: Optional[bool] = False,
 ) -> dict:
     """Preprocess audio and return an MP3 ``data:`` URI.
-
-
     Enhance vocals and remove noise:
     - noisereduce: spectral-gating noise reduction (suppresses background
       noise while preserving the voice).
@@ -710,6 +707,11 @@ async def preprocess_audio(
     imported lazily inside the enhancement branch and are not paid for on the
     fast path.
     """
+# TODO: This function needs to separate the noise removal and the energy estimation of the audio file. The largest energy in the audio file may contain noise or multiple speakers. This requires VAD afterwards. This function will only perform the following: ensure the format is mp3, the noise is optionally removed and voice enhanced, and the entire duration is clipped to max seconds.
+# 
+# 
+#  Either implement custom VAD in a separate function after this or transcribe all the audio, truncate using the VAD from the diarization in combination with energy analysis (transcription must match the segment that is truncated for reference)
+
     raw = _decode_base64_media_payload(audio_base64)
     in_suffix = Path(filename or "audio.mp3").suffix or ".mp3"
     max_seconds = float(max_duration_seconds or 9.0)
@@ -720,6 +722,7 @@ async def preprocess_audio(
     saved_dev_path: Optional[str] = None
 
     try:
+        # Convert to mp3 codec and truncate reference audio to max length
         with tempfile.NamedTemporaryFile(suffix=in_suffix, delete=False) as tmp_in:
             tmp_in.write(raw)
             tmp_in.flush()
@@ -730,89 +733,89 @@ async def preprocess_audio(
 
         sample_rate: Optional[int] = None
 
-        if truncate_only:
-            clip = AudioFileClip(src_path)
+        clip = AudioFileClip(src_path)
+        try:
+            full_duration = float(clip.duration or 0.0)
+            
+            if reference_audio and truncate_only and full_duration > max_seconds:
+                sub = clip.subclipped(0, max_seconds)
+                duration_seconds = max_seconds
+            else:
+                sub = clip
+                duration_seconds = full_duration
             try:
-                full_duration = float(clip.duration or 0.0)
-                if full_duration > max_seconds:
-                    sub = clip.subclipped(0, max_seconds)
-                    duration_seconds = max_seconds
-                else:
-                    sub = clip
-                    duration_seconds = full_duration
-                try:
-                    sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
-                finally:
-                    if sub is not clip:
-                        sub.close()
-                fps = getattr(clip, "fps", None)
-                sample_rate = int(fps) if fps else None
+                sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
             finally:
-                clip.close()
-        else:
-            import librosa
-            import noisereduce as nr
-            import numpy as np
-            import soundfile as sf
+                if sub is not clip:
+                    sub.close()
+            fps = getattr(clip, "fps", None)
+            sample_rate = int(fps) if fps else None
+        finally:
+            clip.close()
+        # else: # Noise reduction and ENERGY clipping
+        #     import librosa
+        #     import noisereduce as nr
+        #     import numpy as np
+        #     import soundfile as sf
 
-            # noisereduce: spectral-gating noise reduction (suppresses background
-            # noise while preserving the voice). Decode the input MP3 to a mono
-            # float waveform with ffmpeg (moviepy) — libsndfile/librosa can't
-            # reliably decode compressed containers — then re-encode the cleaned
-            # audio back to MP3. moviepy is already loaded; numpy/noisereduce/
-            # librosa/soundfile are imported lazily so the truncate-only path
-            # doesn't pay for them.
-            in_clip = AudioFileClip(src_path)
-            try:
-                sample_rate = int(in_clip.fps or 44100)
-                samples = in_clip.to_soundarray(fps=sample_rate)
-            finally:
-                in_clip.close()
-            if samples.ndim == 2:
-                samples = samples.mean(axis=1)
-            mono = np.ascontiguousarray(samples, dtype=np.float32)
+        #     # noisereduce: spectral-gating noise reduction (suppresses background
+        #     # noise while preserving the voice). Decode the input MP3 to a mono
+        #     # float waveform with ffmpeg (moviepy) — libsndfile/librosa can't
+        #     # reliably decode compressed containers — then re-encode the cleaned
+        #     # audio back to MP3. moviepy is already loaded; numpy/noisereduce/
+        #     # librosa/soundfile are imported lazily so the truncate-only path
+        #     # doesn't pay for them.
+        #     in_clip = AudioFileClip(src_path)
+        #     try:
+        #         sample_rate = int(in_clip.fps or 44100)
+        #         samples = in_clip.to_soundarray(fps=sample_rate)
+        #     finally:
+        #         in_clip.close()
+        #     if samples.ndim == 2:
+        #         samples = samples.mean(axis=1)
+        #     mono = np.ascontiguousarray(samples, dtype=np.float32)
 
-            # Enhance vocals and remove noise
-            if enhance_vocals_and_remove_noise:
-                logger.info(f"preprocess_audio noisereduce sr: {sample_rate}")
-                waveform = nr.reduce_noise(y=mono, sr=sample_rate).astype(np.float32)
-            else: 
-                waveform = mono
+        #     # Enhance vocals and remove noise
+        #     if enhance_vocals_and_remove_noise:
+        #         logger.info(f"preprocess_audio noisereduce sr: {sample_rate}")
+        #         waveform = nr.reduce_noise(y=mono, sr=sample_rate).astype(np.float32)
+        #     else: 
+        #         waveform = mono
 
-            # Identify the longest window of audio that contains potential speech
-            duration_seconds = waveform.shape[-1] / float(sample_rate)
+        #     # Identify the longest window of audio that contains potential speech
+        #     duration_seconds = waveform.shape[-1] / float(sample_rate)
 
-            if reference_audio and duration_seconds > max_seconds:
-                frame_length = 2048
-                hop_length = 512
-                rms = librosa.feature.rms(
-                    y=waveform, frame_length=frame_length, hop_length=hop_length
-                )[0]
-                window_frames = max(1, int(round((max_seconds * sample_rate) / hop_length)))
-                if window_frames < len(rms):
-                    # Sliding-window energy via cumulative sum on rms^2.
-                    energy = rms.astype(np.float64) ** 2
-                    csum = np.concatenate(([0.0], np.cumsum(energy)))
-                    window_sums = csum[window_frames:] - csum[:-window_frames]
-                    start_frame = int(np.argmax(window_sums))
-                    start_sample = start_frame * hop_length
-                    end_sample = min(
-                        start_sample + int(round(max_seconds * sample_rate)),
-                        waveform.shape[-1],
-                    )
-                    waveform = waveform[start_sample:end_sample]
+        #     if reference_audio and duration_seconds > max_seconds:
+        #         frame_length = 2048
+        #         hop_length = 512
+        #         rms = librosa.feature.rms(
+        #             y=waveform, frame_length=frame_length, hop_length=hop_length
+        #         )[0]
+        #         window_frames = max(1, int(round((max_seconds * sample_rate) / hop_length)))
+        #         if window_frames < len(rms):
+        #             # Sliding-window energy via cumulative sum on rms^2.
+        #             energy = rms.astype(np.float64) ** 2
+        #             csum = np.concatenate(([0.0], np.cumsum(energy)))
+        #             window_sums = csum[window_frames:] - csum[:-window_frames]
+        #             start_frame = int(np.argmax(window_sums))
+        #             start_sample = start_frame * hop_length
+        #             end_sample = min(
+        #                 start_sample + int(round(max_seconds * sample_rate)),
+        #                 waveform.shape[-1],
+        #             )
+        #             waveform = waveform[start_sample:end_sample]
 
-            duration_seconds = waveform.shape[-1] / float(sample_rate)
+        #     duration_seconds = waveform.shape[-1] / float(sample_rate)
 
-            # Create MP3 Codec
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-                wav_path = tmp_wav.name
-            sf.write(wav_path, waveform, int(sample_rate))
-            clip = AudioFileClip(wav_path)
-            try:
-                clip.write_audiofile(out_mp3_path, codec="mp3", logger=None)
-            finally:
-                clip.close()
+        #     # Create MP3 Codec
+        #     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+        #         wav_path = tmp_wav.name
+        #     sf.write(wav_path, waveform, int(sample_rate))
+        #     clip = AudioFileClip(wav_path)
+        #     try:
+        #         clip.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+        #     finally:
+        #         clip.close()
 
         # Create base64 encoded MP3
         with open(out_mp3_path, "rb") as mp3_f:
@@ -958,6 +961,19 @@ def _merge_diarized_segments_from_chunks(
     chunk_responses: list[TranscriptionDiarized],
     time_offsets: list[float],
 ) -> list[dict]:
+    """Flatten chunked diarization responses onto the original timeline.
+
+    Segment timestamps are shifted by each chunk's start offset so they
+    reference the source audio. Speaker labels are kept verbatim — the
+    diarizer assigns labels per call, so the same raw label (e.g.
+    ``speaker_0``) across chunks usually refers to the most-prominent voice
+    in each chunk and is therefore the same person for interview-style
+    content. Callers that need strict cross-chunk speaker identity should
+    pass an ``encoded_reference_audio`` to ``transcribe_audio_diarize`` so
+    the diarizer labels the target with the known-speaker name (e.g.
+    ``"avatar"``) in every chunk. The ``chunk_idx`` field is kept on each
+    segment for diagnostic / debugging use.
+    """
     merged: list[dict] = []
     for idx, (resp, t0) in enumerate(zip(chunk_responses, time_offsets, strict=True)):
         for seg in resp.segments:
@@ -967,25 +983,32 @@ def _merge_diarized_segments_from_chunks(
                     **sd,
                     "start": float(sd["start"]) + t0,
                     "end": float(sd["end"]) + t0,
-                    "speaker": f"{idx}:{sd.get('speaker', '')}",
+                    "speaker": str(sd.get("speaker") or "unknown"),
+                    "chunk_idx": idx,
                 }
             )
     return merged
 
-async def transcribe_video(
-    video_base64: str,
-    context: GlobalContext,
-    filename: Optional[str] = None,
-    reference_audio: bool = False,
-    max_duration_seconds: Optional[float] = 9.0,
-) -> dict:
+def extract_video_audio_b64(
+    video_base64: str, filename: Optional[str] = None
+) -> tuple[str, str]:
+    """Extract a video's audio track as an mp3 data URI.
+
+    Returns ``(data_uri, mp3_filename)`` where ``mp3_filename`` is the
+    original filename's stem with an ``.mp3`` suffix (defaults to
+    ``upload.mp3``). Caller is responsible for the returned URI; the
+    intermediate files are cleaned up here.
+    """
     raw = _decode_base64_media_payload(video_base64)
     orig_name = filename or "upload.mp4"
-    suffix = Path(orig_name).suffix or ".mp4"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
-        temp_upload.write(raw)
-        temp_upload.flush()
-        source_path = temp_upload.name
+    src_suffix = Path(orig_name).suffix or ".mp4"
+    source_path: Optional[str] = None
+    audio_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=src_suffix, delete=False) as temp_upload:
+            temp_upload.write(raw)
+            temp_upload.flush()
+            source_path = temp_upload.name
 
         video = VideoFileClip(source_path)
         try:
@@ -995,21 +1018,280 @@ async def transcribe_video(
         finally:
             video.close()
 
-        size_bytes = os.path.getsize(audio_path)
-        diarize_upload_name = (
-            Path(orig_name).stem + ".mp3"
-        )
-        
         with open(audio_path, "rb") as audio_f:
-            b64_encoded_reference_audio = (
-                f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
+            data_uri = (
+                "data:audio/mp3;base64,"
+                + base64.b64encode(audio_f.read()).decode("utf-8")
             )
-            response = await transcribe_audio(b64_encoded_reference_audio, context, diarize_upload_name, reference_audio=reference_audio, max_duration_seconds=max_duration_seconds)
-        return response
+        return data_uri, Path(orig_name).stem + ".mp3"
+    finally:
+        for pth in (source_path, audio_path):
+            if pth:
+                try:
+                    os.unlink(pth)
+                except OSError:
+                    pass
+
+
+async def transcribe_video(
+    video_base64: str,
+    context: GlobalContext,
+    filename: Optional[str] = None,
+    reference_audio: bool = False,
+    max_duration_seconds: Optional[float] = 9.0,
+) -> dict:
+    audio_uri, audio_name = extract_video_audio_b64(video_base64, filename)
+    return await transcribe_audio(
+        audio_uri,
+        context,
+        audio_name,
+        reference_audio=reference_audio,
+        max_duration_seconds=max_duration_seconds,
+    )
 
 # TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
 
 # TODO: when diarizing The model cost needs to be calculated and returned in the response (using total aggregated tokens from all chunks for input and output tokens)
+
+
+def _select_dominant_speaker_segments(
+    diarized_segments: list,
+    *,
+    short_fallback_s: float = 1.0,
+) -> Optional[tuple[str, list[dict], dict[str, float], float]]:
+    """Pure selection logic: filter text-bearing segments, pick the speaker
+    with the largest total speech time, return that speaker's segments.
+
+    Returns ``(target_speaker, target_segments, totals, target_total_seconds)``
+    or ``None`` when the input has no text-bearing segments, only one speaker,
+    or the dominant speaker's combined speech is shorter than
+    ``short_fallback_s``. Tie-break for the dominant pick is first-seen label.
+    """
+    speech_segs: list[dict] = []
+    for seg in diarized_segments:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(seg.get("start"))
+            end = float(seg.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        speaker = str(seg.get("speaker") or "unknown")
+        speech_segs.append(
+            {"speaker": speaker, "start": start, "end": end, "text": text}
+        )
+
+    if not speech_segs:
+        return None
+
+    totals: dict[str, float] = {}
+    first_seen: list[str] = []
+    for seg in speech_segs:
+        spk = seg["speaker"]
+        if spk not in totals:
+            totals[spk] = 0.0
+            first_seen.append(spk)
+        totals[spk] += seg["end"] - seg["start"]
+
+    if len(totals) == 1:
+        return None
+
+    target_speaker = sorted(
+        first_seen, key=lambda s: (-totals[s], first_seen.index(s))
+    )[0]
+    target_segs = [s for s in speech_segs if s["speaker"] == target_speaker]
+    target_total = sum(s["end"] - s["start"] for s in target_segs)
+    if target_total < short_fallback_s:
+        return None
+    return target_speaker, target_segs, totals, target_total
+
+
+async def isolate_dominant_speaker_audio_b64(
+    audio_base64: str,
+    context: GlobalContext,
+    *,
+    filename: Optional[str] = None,
+    content_type: Optional[str] = None,
+    reference_audio: Optional[bool] = False,
+) -> dict:
+    """Diarize input audio, pick the dominant speech-bearing speaker, and
+    return a coherent triple describing the produced clip.
+
+    Returns:
+        ``{"audio_base64_preprocessed": <data URI>,
+           "duration": <seconds of the clip>,
+           "content": <transcript text of the clip>}``
+
+    The ``audio_base64_preprocessed``, ``duration``, and ``content`` always
+    describe the same audio. There is no separate ``text`` field — content is
+    the transcript of what is in the encoded clip.
+
+    Selection cascade (after filtering to text-bearing segments and picking
+    the speaker with the largest total speech time, tie-break by first-seen
+    label):
+
+    * ``reference_audio=True``: take the single longest contiguous target
+      segment, capped at ``context.reference_audio_clip_max_seconds`` (~9 s).
+      ``content`` is that segment's transcript; ``duration`` is its length.
+    * ``reference_audio=False``: concatenate all target segments in order
+      with short fades. ``content`` is the joined transcripts; ``duration``
+      is the sum of segment durations.
+
+    Falls back to ``{"audio_base64_preprocessed": <input>, "duration": None,
+    "content": ""}`` on decode failure, diarization failure, single-speaker
+    input, no text-bearing segments, or combined target speech < 1 s.
+    """
+    target_clip_max_s = float(
+        getattr(context, "reference_audio_clip_max_seconds", None) or 9.0
+    )
+    short_fallback_s = 1.0
+    fade_s = 0.025
+
+    def _fallback() -> dict:
+        return {
+            "audio_base64_preprocessed": audio_base64,
+            "duration": None,
+            "content": "",
+        }
+
+    work_path: Optional[str] = None
+    output_path: Optional[str] = None
+    try:
+        # Materialize the input so the cropping step has a real AudioFileClip
+        # source. Diarizer timestamps refer to the preprocessed audio, which
+        # preserves wall-clock timing (preprocess_audio does not time-shift),
+        # so the same timestamps are valid against the raw input.
+        try:
+            raw = _decode_base64_media_payload(audio_base64)
+        except Exception as exc:
+            logger.warning(
+                "isolate_dominant_speaker_audio_b64: cannot decode input (%s); returning fallback",
+                exc,
+            )
+            return _fallback()
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(raw)
+            work_path = tmp.name
+
+        try:
+            diar = await transcribe_audio_diarize(
+                media_base64=audio_base64,
+                context=context,
+                encoded_reference_audio=None,
+                filename=filename,
+                content_type=content_type,
+                reference_audio=reference_audio,
+            )
+        except Exception as exc:
+            logger.warning(
+                "isolate_dominant_speaker_audio_b64: diarization failed (%s); returning fallback",
+                exc,
+            )
+            return _fallback()
+
+        selection = _select_dominant_speaker_segments(
+            (diar or {}).get("segments") or [],
+            short_fallback_s=short_fallback_s,
+        )
+        if selection is None:
+            logger.info(
+                "isolate_dominant_speaker_audio_b64: no usable diarization (single speaker / no text / target < 1 s); returning fallback"
+            )
+            return _fallback()
+        target_speaker, target_segs, totals, target_total = selection
+        logger.info(
+            "isolate_dominant_speaker_audio_b64: dominant speaker=%r totals=%s",
+            target_speaker,
+            {k: round(v, 2) for k, v in totals.items()},
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_out:
+            output_path = tmp_out.name
+
+        clip_for_crop = AudioFileClip(work_path)
+        try:
+            if reference_audio:
+                # Reference clip: single longest contiguous target segment,
+                # capped at reference_audio_clip_max_seconds.
+                longest = max(target_segs, key=lambda s: s["end"] - s["start"])
+                seg_start = float(longest["start"])
+                seg_end = float(longest["end"])
+                if (seg_end - seg_start) > target_clip_max_s:
+                    seg_end = seg_start + target_clip_max_s
+                sub = clip_for_crop.subclipped(seg_start, seg_end)
+                try:
+                    sub.write_audiofile(output_path, codec="mp3", logger=None)
+                finally:
+                    sub.close()
+                clip_duration = float(seg_end - seg_start)
+                clip_content = (longest.get("text") or "").strip()
+                logger.info(
+                    "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
+                    longest["end"] - longest["start"],
+                    clip_duration,
+                )
+            else:
+                # Non-reference: concatenate all target segments with short
+                # fades, capturing the full target transcript.
+                from moviepy.audio.AudioClip import concatenate_audioclips
+                from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
+
+                subs = []
+                try:
+                    for seg in target_segs:
+                        seg_dur = seg["end"] - seg["start"]
+                        sub = clip_for_crop.subclipped(seg["start"], seg["end"])
+                        f = min(fade_s, seg_dur / 4)
+                        if f > 0:
+                            sub = sub.with_effects([AudioFadeIn(f), AudioFadeOut(f)])
+                        subs.append(sub)
+                    glued = concatenate_audioclips(subs)
+                    try:
+                        glued.write_audiofile(output_path, codec="mp3", logger=None)
+                    finally:
+                        glued.close()
+                finally:
+                    for s in subs:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                clip_duration = float(target_total)
+                clip_content = " ".join(
+                    (s.get("text") or "").strip() for s in target_segs
+                ).strip()
+                logger.info(
+                    "isolate_dominant_speaker_audio_b64[nonref]: concatenated %d target segments (%.2fs)",
+                    len(target_segs),
+                    target_total,
+                )
+        finally:
+            clip_for_crop.close()
+
+        with open(output_path, "rb") as fh:
+            final_audio_b64 = (
+                "data:audio/mp3;base64,"
+                + base64.b64encode(fh.read()).decode("utf-8")
+            )
+        return {
+            "audio_base64_preprocessed": final_audio_b64,
+            "duration": clip_duration,
+            "content": clip_content,
+        }
+
+    finally:
+        for pth in (work_path, output_path):
+            if pth:
+                try:
+                    os.unlink(pth)
+                except OSError:
+                    pass
+
 
 async def transcribe_audio_diarize(
     media_base64: str,
@@ -1017,6 +1299,7 @@ async def transcribe_audio_diarize(
     encoded_reference_audio: Optional[str] = None,
     filename: Optional[str] = None,
     content_type: Optional[str] = None,
+    reference_audio: Optional[bool] = False
 ) -> dict:
     """Diarize video or audio from base64 (chunked when audio exceeds whisper_max_bytes)."""
     start_time = time_ns()
@@ -1026,11 +1309,22 @@ async def transcribe_audio_diarize(
     suffix = Path(orig_name).suffix or ".mp4"
     is_audio = _upload_is_audio_for_diarize(filename, content_type)
 
-    # Preprocess audio or video to isolate the vocals:
+    # Preprocess audio or video — pass through without truncation. The
+    # diarizer needs to see the full clip; inputs that exceed
+    # ``whisper_max_bytes`` are sliced into chunks below and diarized in
+    # sequence with timestamps aggregated onto the original timeline. The
+    # ``reference_audio`` parameter on this function is informational and
+    # does not gate preprocessing (``preprocess_audio``'s
+    # ``reference_audio=True`` would truncate the input to a few seconds,
+    # which would defeat full-clip diarization).
     source_path = None
     audio_path = None
     if is_audio:
-        preprocessed_audio = await preprocess_audio(media_base64, truncate_only=False, reference_audio=False)
+        preprocessed_audio = await preprocess_audio(
+            media_base64,
+            truncate_only=False,
+            reference_audio=False,
+        )
     else:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_upload:
             raw = _decode_base64_media_payload(media_base64)
@@ -1051,7 +1345,11 @@ async def transcribe_audio_diarize(
             b64_encoded_reference_audio = (
                 f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
             )
-            preprocessed_audio = await preprocess_audio(b64_encoded_reference_audio, truncate_only=False, reference_audio=False)
+            preprocessed_audio = await preprocess_audio(
+                b64_encoded_reference_audio,
+                truncate_only=False,
+                reference_audio=False,
+            )
 
     raw = _decode_base64_media_payload(preprocessed_audio['audio_base64'])
     if not is_audio:
@@ -1078,64 +1376,71 @@ async def transcribe_audio_diarize(
             )
             response_dict = response.model_dump()
         else:
-            clip = AudioFileClip(audio_path)
-            try:
-                duration = float(clip.duration or 0.0)
-                n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
-                chunk_dur = duration / n
-                text_parts: list[str] = []
-                chunk_responses: list[TranscriptionDiarized] = []
-                offsets: list[float] = []
-                u_in = 0
-                u_out = 0
-                for i in range(n):
-                    t_off = i * chunk_dur
-                    t_end = duration if i == n - 1 else (i + 1) * chunk_dur
-                    sub = clip.subclipped(t_off, t_end)
-                    fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
-                    os.close(fd)
-                    try:
-                        sub.write_audiofile(chunk_path, logger=None)
-                        resp = _diarize_one_mp3_path(
-                            chunk_path,
-                            f"chunk_{i}.mp3",
-                            context,
-                            client,
-                            encoded_reference_audio,
-                        )
-                        text_parts.append(resp.text)
-                        chunk_responses.append(resp)
-                        offsets.append(t_off)
-                        ud = _diarize_usage_tokens_dict(resp.usage)
-                        u_in += int(ud.get("input_tokens") or 0)
-                        u_out += int(ud.get("output_tokens") or 0)
-                    finally:
-                        sub.close()
+            # Probe duration with a short-lived clip, then close it before
+            # the chunk loop. Each chunk opens its OWN AudioFileClip so that
+            # closing one subclip cannot release a reader shared with later
+            # iterations (MoviePy 2.x reuses the parent's ffmpeg process for
+            # subclips; closing a subclip can null the parent's ``proc``,
+            # which surfaces as ``'NoneType' object has no attribute
+            # 'stdout'`` on the next ``write_audiofile``).
+            with AudioFileClip(audio_path) as probe:
+                duration = float(probe.duration or 0.0)
+            n = max(2, math.ceil(size_bytes / context.chunk_source_bytes_target))
+            chunk_dur = duration / n
+            text_parts: list[str] = []
+            chunk_responses: list[TranscriptionDiarized] = []
+            offsets: list[float] = []
+            u_in = 0
+            u_out = 0
+            for i in range(n):
+                t_off = i * chunk_dur
+                t_end = duration if i == n - 1 else (i + 1) * chunk_dur
+                fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd)
+                try:
+                    with AudioFileClip(audio_path) as chunk_clip:
+                        sub = chunk_clip.subclipped(t_off, t_end)
                         try:
-                            os.unlink(chunk_path)
-                        except OSError:
-                            pass
-                usage_merged = None
-                if u_in or u_out:
-                    usage_merged = {
-                        "type": "tokens",
-                        "input_tokens": u_in,
-                        "output_tokens": u_out,
-                        "total_tokens": u_in + u_out,
-                    }
-                merged_segments = _merge_diarized_segments_from_chunks(
-                    chunk_responses, offsets
-                )
-                response_dict = {
-                    "duration": duration,
-                    "segments": merged_segments,
-                    "task": "transcribe",
-                    "text": " ".join(text_parts),
-                    "usage": usage_merged,
-                    "diarization_chunk_count": n,
+                            sub.write_audiofile(chunk_path, logger=None)
+                        finally:
+                            sub.close()
+                    resp = _diarize_one_mp3_path(
+                        chunk_path,
+                        f"chunk_{i}.mp3",
+                        context,
+                        client,
+                        encoded_reference_audio,
+                    )
+                    text_parts.append(resp.text)
+                    chunk_responses.append(resp)
+                    offsets.append(t_off)
+                    ud = _diarize_usage_tokens_dict(resp.usage)
+                    u_in += int(ud.get("input_tokens") or 0)
+                    u_out += int(ud.get("output_tokens") or 0)
+                finally:
+                    try:
+                        os.unlink(chunk_path)
+                    except OSError:
+                        pass
+            usage_merged = None
+            if u_in or u_out:
+                usage_merged = {
+                    "type": "tokens",
+                    "input_tokens": u_in,
+                    "output_tokens": u_out,
+                    "total_tokens": u_in + u_out,
                 }
-            finally:
-                clip.close()
+            merged_segments = _merge_diarized_segments_from_chunks(
+                chunk_responses, offsets
+            )
+            response_dict = {
+                "duration": duration,
+                "segments": merged_segments,
+                "task": "transcribe",
+                "text": " ".join(text_parts),
+                "usage": usage_merged,
+                "diarization_chunk_count": n,
+            }
 
         usage = response_dict.get("usage") or {}
         if isinstance(usage, dict):
@@ -1167,6 +1472,7 @@ async def transcribe_audio_diarize(
         )
 
         response_dict["latency_ms"] = (time_ns() - start_time) / 1e6
+        response_dict['encoded_audio_base64'] = preprocessed_audio['audio_base64']
         return response_dict
     finally:
         for pth in (source_path, audio_path):

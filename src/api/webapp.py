@@ -1581,6 +1581,18 @@ async def require_url_content_type_prefix(url: str, prefix: str, label: str) -> 
         )
 
 
+def _is_youtube_url(url: str) -> bool:
+    """Recognize URLs whose Content-Type is HTML but whose payload is video/audio."""
+    from src.anubis.utils.classes.URLDocumentLoaderClass import _YOUTUBE_HOSTS
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in _YOUTUBE_HOSTS
+
+
 MAX_REMOTE_URL_DOWNLOAD_BYTES = 25 * 1024 * 1024
 
 async def fetch_remote_url_bytes(
@@ -2269,33 +2281,85 @@ async def update_avatar_identity_with_media(
                     }
                 )
             elif reference_audio:
-                await require_url_content_type_prefix(
-                    url_clean, "audio/", "Reference audio"
-                )
-                body, header_ct = await fetch_remote_url_bytes(url_clean)
-                sniff = _sniff_media_category_from_bytes(body[:512])
-                audio_mime = (
-                    header_ct
-                    if header_ct.startswith("audio/")
-                    else (sniff if sniff.startswith("audio/") else header_ct)
-                )
-                media_files.append(
-                    {
-                        "filename": url_clean,
-                        "content_type": audio_mime,
-                        "content": b"",
-                        "audio_url": url_clean,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_audio": True,
-                        "reference_image": False,
-                        "base64_encoded_str": make_data_uri(audio_mime, body),
-                        "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                    }
-                )
+                # YouTube watch pages report Content-Type: text/html. Bypass the
+                # audio/* guard for those by pulling the audio track via yt_dlp.
+                if _is_youtube_url(url_clean):
+                    from src.anubis.utils.classes.URLDocumentLoaderClass import (
+                        _download_youtube_audio_b64,
+                    )
+
+                    audio_data_uri, _suffix = await _download_youtube_audio_b64(
+                        url_clean
+                    )
+                    if not audio_data_uri:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Could not extract audio from YouTube URL.",
+                        )
+                    media_files.append(
+                        {
+                            "filename": url_clean,
+                            "content_type": "audio/mp3",
+                            "content": b"",
+                            "audio_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": True,
+                            "reference_image": False,
+                            "base64_encoded_str": audio_data_uri,
+                            "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+                        }
+                    )
+                else:
+                    await require_url_content_type_prefix(
+                        url_clean, "audio/", "Reference audio"
+                    )
+                    body, header_ct = await fetch_remote_url_bytes(url_clean)
+                    sniff = _sniff_media_category_from_bytes(body[:512])
+                    audio_mime = (
+                        header_ct
+                        if header_ct.startswith("audio/")
+                        else (sniff if sniff.startswith("audio/") else header_ct)
+                    )
+                    media_files.append(
+                        {
+                            "filename": url_clean,
+                            "content_type": audio_mime,
+                            "content": b"",
+                            "audio_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": True,
+                            "reference_image": False,
+                            "base64_encoded_str": make_data_uri(audio_mime, body),
+                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                        }
+                    )
             else:
-                ct = await probe_remote_url_content_type(url_clean)
-                if _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
+                # YouTube URLs probe as text/html but their payload is video/audio.
+                # Route them directly to the URL pipeline so URLDocumentLoaderClass
+                # can pull subtitles or audio via yt_dlp without us first
+                # downloading the HTML page.
+                if _is_youtube_url(url_clean):
+                    media_files.append(
+                        {
+                            "filename": url_clean,
+                            "content_type": "text/html",
+                            "content": b"",
+                            "page_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                            "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+                        }
+                    )
+                    ct = ""  # skip the per-Content-Type branches below
+                else:
+                    ct = await probe_remote_url_content_type(url_clean)
+                if not ct:
+                    pass
+                elif _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
                     body, _header_ct = await fetch_remote_url_bytes(url_clean)
                     csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
                         f"{namespace_safe_formatted_filename or 'remote_table'}.csv"

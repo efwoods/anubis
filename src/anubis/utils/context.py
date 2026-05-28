@@ -254,6 +254,13 @@ class GlobalContext:
         },
     )
 
+    reference_audio_diarize_max_seconds: int = field(
+        default=180,
+        metadata={
+            "description": "Cap on audio length fed to dominant-speaker diarization for reference uploads, in seconds. Keeps the input to a single non-chunked diarizer call so speaker labels stay unified. Env REFERENCE_AUDIO_DIARIZE_MAX_SECONDS."
+        },
+    )
+
     audio_transcription_model: str = field(
         default=None, metadata={"description": "Audio transcription model name."}
     )

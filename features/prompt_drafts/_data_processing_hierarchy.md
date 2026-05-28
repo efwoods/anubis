@@ -5,16 +5,18 @@
 - [x] reference audio upload from audio file
 - [ ] reference audio upload from audio url: https://open.spotify.com/track/51rfRCiUSvxXlCSCfIztBy?si=02d45e2d9f2e4c7c
 
-- [ ] audio to text using reference audio from file
+- [x] audio to text using reference audio from file
 - [ ] audio to text using reference audio from url
 
 - [x] reference audio upload from video file
-- [ ] reference audio upload from video url
+- [x] reference audio upload from video url
 
 - [ ] video to audio to text using reference audio from url: 
 - [x] video to audio to text using reference audio from file
   - [ ] monologue (into labeled json from url): https://www.youtube.com/watch?v=ia8lBT0MBT0
   - [ ] presentation (into labled json from url): https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=5
+- [ ] monologue_data:https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=6
+- [ ] monologue_data with non-speaker after target, speaker who also presents a monologue: https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=5
 
 ## Dialogue
 

@@ -38,7 +38,12 @@ from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
 )
 from src.anubis.utils.classes.URLDocumentLoaderClass import URLDocumentLoaderClass
-from src.anubis.utils.utility import transcribe_audio, transcribe_audio_diarize
+from src.anubis.utils.utility import (
+    transcribe_audio,
+    transcribe_audio_diarize,
+    isolate_dominant_speaker_audio_b64,
+    extract_video_audio_b64,
+)
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -1162,28 +1167,35 @@ async def process_media_item_task(
             # uploads. Do not diarize the reference itself. Will be the same text spoken for most people.
             # ---------------------------------------------------------------
             if (media_type == "audio" or media_type == "video") and reference_audio:
-                # Create 9 second reference clip:
+                # Reference clip pipeline: extract a single-speaker, speech-bearing
+                # mp3 (the dominant speaker by total speech time across diarized,
+                # text-bearing segments), then run the existing ``transcribe_audio``
+                # heuristics (denoise + highest-RMS N-second window) over that
+                # target-only track. Video first extracts the audio track so both
+                # branches share the same code path.
                 all_documents: List[Document] = []
-                if media_type == "audio":
-                    """ transcribe reference audio """
-                    transcription_dict = await transcribe_audio(
-                        audio_base64=payload_uri,
-                        context=runtime.context,
-                        filename=filename,
-                        reference_audio=reference_audio,
+                if media_type == "video":
+                    audio_uri, audio_name = extract_video_audio_b64(
+                        payload_uri, filename
                     )
                 else:
-                    """ transcribe reference video """
-                    transcription_dict = await transcribe_video(
-                        video_base64=payload_uri,
-                        context=runtime.context,
-                        filename=filename,
-                        reference_audio=reference_audio,
-                    )
-                
-                # Update the payload_uri to the preprocessed audio base64 (now mp3 codec)
+                    audio_uri = payload_uri
+                    audio_name = filename
+
+                transcription_dict = await isolate_dominant_speaker_audio_b64(
+                    audio_uri,
+                    context=runtime.context,
+                    filename=audio_name,
+                    content_type="audio/mp3",
+                    reference_audio=reference_audio
+                )
+
+                # The helper returns a coherent triple: the encoded mp3 of the
+                # dominant speaker's clip, its duration, and the transcript
+                # text that matches that clip. There is no separate ``text``
+                # field — ``content`` IS the clip's transcript.
                 ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
-                transcription_text = transcription_dict.get("content", "")
+                transcription_text = transcription_dict.get("content") or ""
                 
                 ref_namespace = (user_id, assistant_id, "reference_audio")
                 doc = Document(
@@ -1203,29 +1215,26 @@ async def process_media_item_task(
                         "namespace_filename": namespace_filename,
                     },
                 )
-                if ref_payload_uri:
-                    await store.aput(
-                        ref_namespace,
-                        key=assistant_id,
-                        value={
-                            "reference_audio_data": ref_payload_uri,
-                            "document": doc.to_json(),
-                        },
-                    )
+                await store.aput(
+                    ref_namespace,
+                    key=assistant_id,
+                    value={
+                        "reference_audio_data": ref_payload_uri,
+                        "document": doc.to_json(),
+                    },
+                )
                 all_documents.append(doc)
 
-                """ Compare the approximate embedding of the transcription to the reference audio embedding """     
+                """ Compare the approximate embedding of the transcription to the reference audio embedding """
                 from sentence_transformers import SentenceTransformer
                 model = SentenceTransformer(runtime.context.embedding_model)
                 embedding = model.encode(transcription_text)
                 REFERENCE_AUDIO_SENTENCE = "The quick fox jumped over the brown lazy dog."
                 REFERENCE_AUDIO_EMBEDDING = model.encode(REFERENCE_AUDIO_SENTENCE)
-
                 similarity = model.similarity(embedding, REFERENCE_AUDIO_EMBEDDING)
                 if similarity < 0.80:
                     logger.info(f"Transcription text is dissimilar to the reference audio text. Similarity: {similarity}")
                     media_item_transcription = media_item.copy()
-
                     if media_type == "audio":
                         full_transcription = await transcribe_audio(
                             audio_base64=payload_uri,
@@ -1243,7 +1252,6 @@ async def process_media_item_task(
                         )
                         transcription_text = full_transcription.get("content", "")
                     media_item_transcription["content"] = transcription_text
-
                     documents = await process_text_to_document(
                         metadata=metadata,
                         user_id=user_id,

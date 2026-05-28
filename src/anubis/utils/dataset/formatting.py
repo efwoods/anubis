@@ -14,7 +14,7 @@ them concurrently with ``asyncio.gather``.
 """
 
 import asyncio
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
@@ -139,11 +139,16 @@ async def create_question_list(str_messages_list: List[str]) -> List[str]:
 async def build_adapter_and_langsmith_for_quotes(
     quotes: List[str],
     dataset_source_filename: str,
+    prompts: Optional[List[Optional[str]]] = None,
 ) -> Tuple[List[dict], List[dict]]:
     """Build adapter single-turn rows and LangSmith examples from a quote list.
 
-    Each quote is paired with a synthetic user prompt produced by
-    :func:`generate_question_for_message`. A single contiguous monologue or
+    Each quote is paired with a user prompt. When ``prompts[i]`` carries a
+    real, non-empty prerequisite statement (e.g. the preceding non-target turn
+    in a diarized dialogue), it is used verbatim as the question; otherwise a
+    synthetic user prompt is produced by :func:`generate_question_for_message`.
+    Passing ``prompts=None`` (the default) synthesizes a question for every
+    quote, preserving the original behavior. A single contiguous monologue or
     presentation chunk is supported by passing it as ``[chunk_text]``.
 
     Returns ``(adapter_rows, langsmith_rows)`` where ``adapter_rows`` is a list
@@ -153,7 +158,23 @@ async def build_adapter_and_langsmith_for_quotes(
     if not quotes:
         return [], []
 
-    questions = await create_question_list(quotes)
+    if prompts is None:
+        prompts = [None] * len(quotes)
+    elif len(prompts) < len(quotes):
+        prompts = list(prompts) + [None] * (len(quotes) - len(prompts))
+
+    # Synthesize a question only where no real prompt was supplied.
+    missing_idx = [
+        i for i in range(len(quotes)) if not (prompts[i] or "").strip()
+    ]
+    synthetic_for_missing = await create_question_list(
+        [quotes[i] for i in missing_idx]
+    )
+    synth_iter = iter(synthetic_for_missing)
+    questions: List[str] = []
+    for i in range(len(quotes)):
+        real = (prompts[i] or "").strip()
+        questions.append(real if real else next(synth_iter))
 
     adapter_rows = await llm_single_turn_dataset(
         question_list=questions, answer_list=quotes
@@ -164,3 +185,49 @@ async def build_adapter_and_langsmith_for_quotes(
         dataset_source_filename=dataset_source_filename,
     )
     return adapter_rows, langsmith_rows
+
+
+async def build_langsmith_for_conversation(
+    messages: List[dict],
+    dataset_source_filename: str,
+) -> List[dict]:
+    """Derive LangSmith ``(question, answer)`` pairs from a role-converted chat.
+
+    ``messages`` is the role-converted conversation produced for adapter
+    training (``[{"role": "user"|"assistant", "content": str}, ...]``). Each
+    assistant turn becomes one example whose question is the immediately
+    preceding user turn; when an assistant turn has no preceding user turn the
+    question is synthesized via :func:`generate_question_for_message`.
+    """
+    question_list: List[str] = []
+    answer_list: List[str] = []
+    pending_question: Optional[str] = None
+    for msg in messages:
+        role = msg.get("role")
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            pending_question = content
+        elif role == "assistant":
+            question_list.append(pending_question or "")
+            answer_list.append(content)
+            pending_question = None
+
+    if not answer_list:
+        return []
+
+    # Synthesize where the assistant led with no preceding user turn.
+    missing_idx = [i for i, q in enumerate(question_list) if not q.strip()]
+    if missing_idx:
+        synth = await create_question_list(
+            [answer_list[i] for i in missing_idx]
+        )
+        for j, i in enumerate(missing_idx):
+            question_list[i] = synth[j]
+
+    return await langsmith_dataset(
+        question_list=question_list,
+        answer_list=answer_list,
+        dataset_source_filename=dataset_source_filename,
+    )

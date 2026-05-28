@@ -402,14 +402,12 @@ async def load_consciousness(
 
     system_message_str = populated_identity_template.messages[0].content
 
-
     # Dev-only: dump the created system prompt to a file with real newlines
     # (logger.info shows escaped "\n"; writing the str directly yields newlines).
     if getattr(runtime, "context", None) and runtime.context.dev == "TRUE":
         dev_prompt_path = Path("system_prompt.txt")
         dev_prompt_path.write_text(system_message_str, encoding="utf-8")
         logger.info(f"dev system prompt written to: {dev_prompt_path.resolve()}")
-
 
     input_update = {
         "user_identity_documents": user_identity,

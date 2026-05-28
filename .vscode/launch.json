@@ -16,7 +16,11 @@
       "request": "attach",
       "connect": {
         "host": "localhost",
+<<<<<<< HEAD
         "port": 9031
+=======
+        "port": 9011
+>>>>>>> f-diarization
       },
       "pathMappings": [
         {

@@ -417,7 +417,6 @@ async def load_consciousness(
         dev_prompt_path.write_text(system_message_str, encoding="utf-8")
         logger.info(f"dev system prompt written to: {dev_prompt_path.resolve()}")
 
-
     input_update = {
         "user_identity_documents": user_identity,
         "assistant_identity_documents": assistant_identity,

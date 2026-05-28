@@ -30,9 +30,23 @@ from pydantic import BaseModel, Field
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.model import init_model
+from src.anubis.utils.prompts.concise_context_summary_prompt import (
+    CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT,
+)
 from src.anubis.utils.prompts.fact_rewriter_prompt import (
     FACT_REWRITER_SYSTEM_PROMPT,
 )
+
+
+
+class ConciseContextOfTheSourceOfFacts(BaseModel): 
+    """        
+    Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct. 
+    """
+
+    concise_context_summary: str = Field(
+        description=("Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct.")
+    )
 
 class ExtractedFact(BaseModel):
     """One atomic fact extracted from biographical source text — model output.
@@ -42,9 +56,10 @@ class ExtractedFact(BaseModel):
 
     rewritten_statement: str = Field(
         description=(
-            "A rephrasing of the original statement. A single fact extracted from the source text. Given the source text, rewrite the statement. Do not exclude any facts. Inlude all information of the source text in the rewritten statement. Do not create any new facts. Do not change the meaning of the statement. Preserves every fact, materially changes wording and sentence structure."
+            "A rephrasing of the original statement. A single fact extracted from the source text. Given the source text, rewrite the statement. Do not exclude any facts. Inlude all information of the source text in the rewritten statement. Do not create any new facts. Do not change the meaning of the statement. Preserves every fact, materially changes wording and sentence structure. Paraphrases the original fact."
         )
     )
+
 
 
 class ExtractedAndRewrittenFacts(BaseModel):
@@ -94,6 +109,11 @@ class RewrittenFactsWithProvenance(BaseModel):
             "metadata."
         ),
     )
+    concise_context_summary: str = Field(
+        description = (
+            "Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct. "
+        )
+    )
     target_name: Optional[str] = Field(
         default=None,
         description=(
@@ -137,10 +157,28 @@ class FactRewriterClass:
 
         response = await self.model.ainvoke(messages)
 
+        # Build the concise context summary that grounds each extracted fact
+        # in the modality and broad subject of the source text. Modality
+        # fidelity (dream vs. memory vs. hypothetical) is the critical
+        # property — see CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT for the
+        # anti-pattern guardrails.
+        summary_model = init_model(
+            response_format=ConciseContextOfTheSourceOfFacts
+        )
+        summary_messages = [
+            SystemMessage(content=CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT.format(target_name=target_name)),
+            HumanMessage(content=input_str),
+        ]
+        concise_context_summary_response = await summary_model.ainvoke(
+            summary_messages
+        )
+
+
         provenanced = RewrittenFactsWithProvenance(
             facts=list(response.facts or []),
             original_statement=input_str,
             target_name=target_name,
+            concise_context_summary = concise_context_summary_response.concise_context_summary
         )
         response_dict = provenanced.model_dump()
 

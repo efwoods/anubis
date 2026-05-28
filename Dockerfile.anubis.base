@@ -1,5 +1,21 @@
 FROM langchain/langgraph-api:3.11-wolfi
 
+# -- System dependencies (cached layer; placed before ADD so source changes don't invalidate it) --
+# Native shared libs required at runtime by the audio stack (torch, torchaudio,
+# torchcodec, librosa, deepfilternet). All five ship as pip wheels but dlopen
+# these system libraries:
+#   * ffmpeg-7  - FFmpeg 7.1 CLI (used by moviepy) and, as transitive
+#                 deps, the libav* shared libs (libavcodec.so.61, libavutil.so.59,
+#                 ...) that torchcodec and torchaudio dlopen. The Chainguard repo
+#                 no longer ships a separate "ffmpeg-libs"; the ffmpeg-N package
+#                 pulls in the matching libav* packages itself. Pinning the major
+#                 version (7 -> libavutil.so.59) keeps the libav ABI inside the
+#                 range torchcodec supports (FFmpeg 4-8 -> libavutil.so.56-60).
+#   * libsndfile - backend for the `soundfile` package used by librosa.
+#   * libgomp    - GNU OpenMP runtime used by numba (a librosa dep) and as a
+#                  fallback for PyTorch's threading.
+RUN apk add --no-cache ffmpeg-7 libsndfile libgomp
+
 # -- Adding local package . --
 ADD . /deps/anubis
 # -- End of local package . --

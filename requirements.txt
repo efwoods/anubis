@@ -49,3 +49,10 @@ streamlit>=1.35.0
 requests>=2.31.0
 tiktoken
 tzdata
+
+# Audio Processing
+# Using noisereduce for speech enhancement at the moment.
+# demucs / deepfilternet disabled for now.
+noisereduce
+librosa
+soundfile

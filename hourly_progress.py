@@ -51,7 +51,7 @@ if __name__ == "__main__":
               "stream": "false",
             },
             files={"files": ("progress_1_hour.txt", fp, "text/plain")},
-            timeout=httpx.Timeout(120) # timeout in seconds
+            timeout=None
         )
         if response.status_code != 200:
             raise Exception(

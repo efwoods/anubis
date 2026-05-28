@@ -70,8 +70,34 @@ from src.security.auth import (
 
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator
 from typing import Any
+
+
+def _drop_empty_file_fields(value: Any) -> Any:
+    """Normalize the multipart ``files`` field so an absent upload is treated as
+    "no files" instead of raising a 422.
+
+    Swagger UI (and some HTTP clients) submit an *empty* file field as a form
+    value of ``""`` rather than omitting it. FastAPI then receives ``[""]`` and,
+    while validating each element against ``UploadFile``, fails with
+    ``Expected UploadFile, received: <class 'str'>`` before the endpoint body
+    ever runs. Stripping the stray string(s) here turns that into an empty list.
+    """
+    if isinstance(value, list):
+        return [item for item in value if not isinstance(item, str)]
+    if isinstance(value, str):
+        return []
+    return value
+
+
+# Reusable annotation for optional multipart file uploads. Use this instead of
+# ``Optional[List[UploadFile]] = File(None)`` so empty file fields don't 422.
+OptionalUploadFiles = Annotated[
+    Optional[List[UploadFile]],
+    BeforeValidator(_drop_empty_file_fields),
+    File(),
+]
 
 from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
@@ -920,7 +946,7 @@ async def select_avatar(
 
 
 async def process_files_for_message(
-    files: Optional[List[UploadFile]] = None,
+    files: OptionalUploadFiles = None,
     message: str = "",
 ) -> tuple:
     """Process uploaded files and return content for inclusion in messages.
@@ -1040,7 +1066,7 @@ async def message_selected_avatar(
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),
+    files: OptionalUploadFiles = None,
     thread_id: Optional[str] = Form(None),
     stream: bool = Form(True),
     feedback: bool = Form(False),
@@ -1186,7 +1212,7 @@ async def message_avatar(
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     conversation_title: Optional[str] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),
+    files: OptionalUploadFiles = None,
     thread_id: Optional[str] = Form(None),
     stream: bool = Form(True),
     feedback: bool = Form(False),
@@ -1201,6 +1227,7 @@ async def message_avatar(
     # now so the frontend can wire its UI without a breaking API change later.
 
     # allow for select avatar in query and anonymous user for a dedicated endpoint\
+    breakpoint
     logger.warning(f"stream:{stream}")
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1558,6 +1585,18 @@ async def require_url_content_type_prefix(url: str, prefix: str, label: str) -> 
             status_code=400,
             detail=f"{label} URL must resolve to {prefix}* (got {ct!r}).",
         )
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Recognize URLs whose Content-Type is HTML but whose payload is video/audio."""
+    from src.anubis.utils.classes.URLDocumentLoaderClass import _YOUTUBE_HOSTS
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in _YOUTUBE_HOSTS
 
 
 MAX_REMOTE_URL_DOWNLOAD_BYTES = 25 * 1024 * 1024
@@ -1955,7 +1994,7 @@ async def get_avatar_reference_image(
 from typing import Optional
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
-    files: Annotated[Optional[List[UploadFile]], File()] = None,
+    files: OptionalUploadFiles = None,
     url: Annotated[Optional[str], Form()] = None,
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
@@ -1991,7 +2030,7 @@ async def update_avatar_identity_with_media(
         assistant_meta = assistant.get("metadata") or {}
         creator_id = assistant_meta.get("user_id")
         if not creator_id:
-            raise HTTPException(
+            raise HTTPException(  
                 status_code=400,
                 detail=(
                     "Assistant metadata is missing the creator's user_id; "
@@ -2108,10 +2147,10 @@ async def update_avatar_identity_with_media(
                             detail="Could not determine an audio type from the upload.",
                         )
                     effective = sniff
-                elif not mime_type.startswith("audio/"):
+                elif not mime_type.startswith("audio/") and not mime_type.startswith("video/"):
                     raise HTTPException(
                         status_code=400,
-                        detail="reference_audio requires an audio Content-Type.",
+                        detail="reference_audio requires an audio or video Content-Type.",
                     )
                 media_files.append(
                     {
@@ -2250,33 +2289,85 @@ async def update_avatar_identity_with_media(
                     }
                 )
             elif reference_audio:
-                await require_url_content_type_prefix(
-                    url_clean, "audio/", "Reference audio"
-                )
-                body, header_ct = await fetch_remote_url_bytes(url_clean)
-                sniff = _sniff_media_category_from_bytes(body[:512])
-                audio_mime = (
-                    header_ct
-                    if header_ct.startswith("audio/")
-                    else (sniff if sniff.startswith("audio/") else header_ct)
-                )
-                media_files.append(
-                    {
-                        "filename": url_clean,
-                        "content_type": audio_mime,
-                        "content": b"",
-                        "audio_url": url_clean,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_audio": True,
-                        "reference_image": False,
-                        "base64_encoded_str": make_data_uri(audio_mime, body),
-                        "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                    }
-                )
+                # YouTube watch pages report Content-Type: text/html. Bypass the
+                # audio/* guard for those by pulling the audio track via yt_dlp.
+                if _is_youtube_url(url_clean):
+                    from src.anubis.utils.classes.URLDocumentLoaderClass import (
+                        _download_youtube_audio_b64,
+                    )
+
+                    audio_data_uri, _suffix = await _download_youtube_audio_b64(
+                        url_clean
+                    )
+                    if not audio_data_uri:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Could not extract audio from YouTube URL.",
+                        )
+                    media_files.append(
+                        {
+                            "filename": url_clean,
+                            "content_type": "audio/mp3",
+                            "content": b"",
+                            "audio_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": True,
+                            "reference_image": False,
+                            "base64_encoded_str": audio_data_uri,
+                            "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+                        }
+                    )
+                else:
+                    await require_url_content_type_prefix(
+                        url_clean, "audio/", "Reference audio"
+                    )
+                    body, header_ct = await fetch_remote_url_bytes(url_clean)
+                    sniff = _sniff_media_category_from_bytes(body[:512])
+                    audio_mime = (
+                        header_ct
+                        if header_ct.startswith("audio/")
+                        else (sniff if sniff.startswith("audio/") else header_ct)
+                    )
+                    media_files.append(
+                        {
+                            "filename": url_clean,
+                            "content_type": audio_mime,
+                            "content": b"",
+                            "audio_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": True,
+                            "reference_image": False,
+                            "base64_encoded_str": make_data_uri(audio_mime, body),
+                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                        }
+                    )
             else:
-                ct = await probe_remote_url_content_type(url_clean)
-                if _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
+                # YouTube URLs probe as text/html but their payload is video/audio.
+                # Route them directly to the URL pipeline so URLDocumentLoaderClass
+                # can pull subtitles or audio via yt_dlp without us first
+                # downloading the HTML page.
+                if _is_youtube_url(url_clean):
+                    media_files.append(
+                        {
+                            "filename": url_clean,
+                            "content_type": "text/html",
+                            "content": b"",
+                            "page_url": url_clean,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": False,
+                            "reference_image": False,
+                            "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+                        }
+                    )
+                    ct = ""  # skip the per-Content-Type branches below
+                else:
+                    ct = await probe_remote_url_content_type(url_clean)
+                if not ct:
+                    pass
+                elif _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
                     body, _header_ct = await fetch_remote_url_bytes(url_clean)
                     csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
                         f"{namespace_safe_formatted_filename or 'remote_table'}.csv"
@@ -2447,17 +2538,26 @@ async def update_avatar_identity_with_media(
             if duplicates:
                 media_files_duplicates = [media_file.get("filename") for media_file in media_files if media_file.get("namespace_filename") in duplicates]
                 duplicates_str = ", ".join(media_files_duplicates)
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Filename already exists for this avatar and will not be "
-                        f"re-processed: {duplicates_str}. To upload a new version, "
-                        "first remove the existing file by calling "
-                        "DELETE /delete_avatar_document?source_document_name="
-                        "<filename> for each duplicate filename, then retry this "
-                        "request."
-                    ),
-                )
+                
+                for duplicate in media_files_duplicates:
+                    delete_result = await delete_avatar_documents(duplicate, current_user)
+                    if delete_result.status_code != 200:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Error deleting duplicate file: {delete_result.detail}"
+                        )
+
+                # raise HTTPException(
+                #     status_code=409,
+                #     detail=(
+                #         "Filename already exists for this avatar and will not be "
+                #         f"re-processed: {duplicates_str}. To upload a new version, "
+                #         "first remove the existing file by calling "
+                #         "DELETE /delete_avatar_document?source_document_name="
+                #         "<filename> for each duplicate filename, then retry this "
+                #         "request."
+                #     ),
+                # )
 
         from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
             workflow,
@@ -2549,7 +2649,7 @@ async def delete_avatar_documents(
 
     pool = app.state.pool
 
-    # LangGraph store: prefix = namespace tuple dot-joined (see langgraph/store/postgres/base.py).
+    # LangGraph store: prefix = namespace tuple dot-joined.
     # Match either chunk keys built from the filename prefix, or reference_* namespaces
     # (reference_image, reference_audio, …) where the serialized LangChain Document holds the
     # basename under value.document.kwargs.metadata.filename (same path as list_documents).

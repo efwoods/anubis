@@ -125,36 +125,76 @@ class FirstPersonRewriterClass:
     never confuse facts across statements or batch-process them.
     """
 
+    # Sentinel substituted into the prompt when the caller passes an empty
+    # context summary. The prompt's <escape_hatches> tells the model to
+    # default to literal modality in this case, but we still want a
+    # human-readable placeholder rather than a blank section.
+    _EMPTY_CONTEXT_PLACEHOLDER = (
+        "(no context summary provided; treat the source as literal "
+        "modality and apply no modality wrap.)"
+    )
+
     def __init__(self):
         self.model = init_model(response_format=FirstPersonStatement)
-        self.system_prompt = FIRST_PERSON_REWRITER_SYSTEM_PROMPT
-        self.system_message = SystemMessage(
-            content=FIRST_PERSON_REWRITER_SYSTEM_PROMPT
-        )
-        self.system_prompt_tokens = 748
+        self.system_prompt_template = FIRST_PERSON_REWRITER_SYSTEM_PROMPT
+        self.system_prompt_tokens = 2300
         self.model_name = "gpt-5.4-nano"
         self.model_input_token_cost_per_million = 0.00000005
         self.model_output_token_cost_per_million = 0.0000004
         self.model_inference_type = "first_person_rewriter_structured_output"
 
-    async def _rewrite_one(self, statement: str) -> FirstPersonStatement:
+    def _build_system_message(
+        self, concise_context_summary: str
+    ) -> SystemMessage:
+        """Format the prompt template with the per-call context summary.
+
+        A new ``SystemMessage`` is built per ``rewrite()`` call (not per
+        statement, since the context is shared across the batch) so we
+        never mutate shared instance state. Concurrent ``rewrite()``
+        calls from different requests therefore cannot race on the
+        system message contents.
+        """
+        summary = (concise_context_summary or "").strip()
+        if not summary:
+            summary = self._EMPTY_CONTEXT_PLACEHOLDER
+        formatted_prompt = self.system_prompt_template.format(
+            concise_context_summary=summary
+        )
+        return SystemMessage(content=formatted_prompt)
+
+    async def _rewrite_one(
+        self, statement: str, system_message: SystemMessage
+    ) -> FirstPersonStatement:
         """One model call: system prompt + human message of a single statement."""
         human_message = HumanMessage(content=statement)
-        return await self.model.ainvoke([self.system_message, human_message])
+        return await self.model.ainvoke([system_message, human_message])
 
-    async def rewrite(self, statements: List[str]) -> dict:
+    async def rewrite(
+        self,
+        statements: List[str],
+        concise_context_summary: str = "",
+    ) -> dict:
         """Rewrite each third-person statement into first person, in parallel.
 
         Fans out one model call per statement via :func:`asyncio.gather`.
         Each call's input is exactly ``[system_message, HumanMessage(stmt)]``
-        — never a batch framing. After all calls return, each output is
-        paired with its originating input to form a
-        :class:`FirstPersonStatementWithProvenance`, all collected inside a
-        :class:`FirstPersonStatementsWithProvenance` container. The dump is
-        augmented with aggregated token / cost / latency metadata so the
-        caller can record it.
+        — never a batch framing. The ``concise_context_summary`` is
+        formatted into the system prompt once per ``rewrite()`` call (it
+        is shared across the batch since all facts came from the same
+        source text). The model uses it to detect the source modality
+        (dream / memory / imagined / wished / literal) and to apply the
+        matching first-person modality wrap; see
+        :data:`FIRST_PERSON_REWRITER_SYSTEM_PROMPT` for the rules.
+
+        After all calls return, each output is paired with its
+        originating input to form a
+        :class:`FirstPersonStatementWithProvenance`, all collected
+        inside a :class:`FirstPersonStatementsWithProvenance` container.
+        The dump is augmented with aggregated token / cost / latency
+        metadata so the caller can record it.
         """
         start_time = time_ns()
+        system_message = self._build_system_message(concise_context_summary)
 
         cleaned_statements: List[str] = [
             (s or "").strip() for s in (statements or [])
@@ -175,7 +215,10 @@ class FirstPersonRewriterClass:
             }
 
         model_outputs: List[FirstPersonStatement] = await asyncio.gather(
-            *[self._rewrite_one(s) for s in cleaned_statements]
+            *[
+                self._rewrite_one(s, system_message)
+                for s in cleaned_statements
+            ]
         )
 
         provenanced_statements: List[FirstPersonStatementWithProvenance] = []

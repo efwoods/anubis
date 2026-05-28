@@ -29,14 +29,21 @@ from langgraph.store.base import BaseStore
 
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
+    coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
+    process_nontarget_text_to_identity_documents,
     process_text_media_item_target_for_vectorstore,
 )
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
 )
 from src.anubis.utils.classes.URLDocumentLoaderClass import URLDocumentLoaderClass
-from src.anubis.utils.utility import transcribe_audio, transcribe_audio_diarize
+from src.anubis.utils.utility import (
+    transcribe_audio,
+    transcribe_audio_diarize,
+    isolate_dominant_speaker_audio_b64,
+    extract_video_audio_b64,
+)
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -51,7 +58,7 @@ from langchain.tools import tool
 
 
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.utility import extract_user_id_assistant_id
+from src.anubis.utils.utility import extract_user_id_assistant_id, transcribe_video
 from src.subgraphs.process_media_graph.utils.utility import extract_personality_from_image
 from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
 
@@ -333,6 +340,7 @@ async def process_uploaded_files_and_label_media_type(
                         "content_type": content_type,
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
+                        "reference_audio": reference_audio,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -644,8 +652,8 @@ async def process_media_item_task(
     runtime: Runtime[GlobalContext], 
     config: RunnableConfig,
     store: BaseStore
-) -> Document:
-    """Task: Convert a single media item to a Document"""
+) -> List[Document]:
+    """Task: Convert a single media item to a list of Documents"""
     
     logger.info(f"process_media_item_task entry")
 
@@ -1126,6 +1134,21 @@ async def process_media_item_task(
             "reference_audio")`` so the next non-reference upload can use it.
             """
             reference_audio = metadata.get("reference_audio", False)
+            if not reference_audio:
+                reference_namespace = (user_id, assistant_id, "reference_audio")
+                ref_item = await store.aget(reference_namespace, key=assistant_id)
+                if not ref_item and not reference_audio:
+                    return [
+                        Document(
+                            page_content=f"{media_type.capitalize()} missing reference audio reference audio is required for audio and video distillation to text.",
+                            metadata={
+                                "status": "error",
+                                "error": f"missing_{media_type}_reference_audio",
+                                "filename": filename,
+                            },
+                        )
+                    ]
+
             payload_uri = _full_data_uri_from_media_dict(media_item)
             audio_url = ""
             if isinstance(media_item.get("audio_url"), dict):
@@ -1165,12 +1188,42 @@ async def process_media_item_task(
 
             # ---------------------------------------------------------------
             # Reference-audio: persist for known-speaker labelling on later
-            # uploads. Do not diarize the reference itself.
+            # uploads. Do not diarize the reference itself. Will be the same text spoken for most people.
             # ---------------------------------------------------------------
-            if media_type == "audio" and reference_audio:
+            if (media_type == "audio" or media_type == "video") and reference_audio:
+                # Reference clip pipeline: extract a single-speaker, speech-bearing
+                # mp3 (the dominant speaker by total speech time across diarized,
+                # text-bearing segments), then run the existing ``transcribe_audio``
+                # heuristics (denoise + highest-RMS N-second window) over that
+                # target-only track. Video first extracts the audio track so both
+                # branches share the same code path.
+                all_documents: List[Document] = []
+                if media_type == "video":
+                    audio_uri, audio_name = extract_video_audio_b64(
+                        payload_uri, filename
+                    )
+                else:
+                    audio_uri = payload_uri
+                    audio_name = filename
+
+                transcription_dict = await isolate_dominant_speaker_audio_b64(
+                    audio_uri,
+                    context=runtime.context,
+                    filename=audio_name,
+                    content_type="audio/mp3",
+                    reference_audio=reference_audio
+                )
+
+                # The helper returns a coherent triple: the encoded mp3 of the
+                # dominant speaker's clip, its duration, and the transcript
+                # ``text`` that matches that clip (same key as the OpenAI
+                # transcription API and ``transcribe_audio_diarize``).
+                ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
+                transcription_text = transcription_dict.get("text") or ""
+                
                 ref_namespace = (user_id, assistant_id, "reference_audio")
                 doc = Document(
-                    page_content="Reference audio uploaded.",
+                    page_content=transcription_text,
                     metadata={
                         "user_id": user_id,
                         "assistant_id": assistant_id,
@@ -1186,16 +1239,53 @@ async def process_media_item_task(
                         "namespace_filename": namespace_filename,
                     },
                 )
-                if payload_uri:
-                    await store.aput(
-                        ref_namespace,
-                        key=assistant_id,
-                        value={
-                            "reference_audio_data": payload_uri,
-                            "document": doc.to_json(),
-                        },
+                await store.aput(
+                    ref_namespace,
+                    key=assistant_id,
+                    value={
+                        "reference_audio_data": ref_payload_uri,
+                        "document": doc.to_json(),
+                    },
+                )
+                all_documents.append(doc)
+
+                """ Compare the approximate embedding of the transcription to the reference audio embedding """
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer(runtime.context.embedding_model)
+                embedding = model.encode(transcription_text)
+                REFERENCE_AUDIO_SENTENCE = "The quick fox jumped over the brown lazy dog."
+                REFERENCE_AUDIO_EMBEDDING = model.encode(REFERENCE_AUDIO_SENTENCE)
+                similarity = model.similarity(embedding, REFERENCE_AUDIO_EMBEDDING)
+                if similarity < 0.80:
+                    # The reference upload is not the calibration sentence, so it
+                    # carries real content. Re-process the ORIGINAL audio as a
+                    # fresh, non-reference upload by re-entering this task with
+                    # reference_audio=False. That path pulls the reference clip we
+                    # just stored (for known-speaker labelling), diarizes the full
+                    # audio, identifies speakers, and routes multi-speaker dialogue
+                    # / target monologue / non-target biographical facts exactly
+                    # like any other audio document — including adapter + langsmith
+                    # dataset rows downstream.
+                    logger.info(
+                        "Reference audio dissimilar to calibration sentence (similarity=%s); processing full content as a non-reference upload",
+                        similarity,
                     )
-                return [doc]
+                    content_media_item = {
+                        "type": "audio",
+                        "base64_encoded_str": audio_uri,
+                        "metadata": {
+                            **metadata,
+                            "reference_audio": False,
+                            "content_type": "audio/mp3",
+                        },
+                    }
+                    content_documents = await process_media_item_task(
+                        content_media_item, runtime, config, store
+                    )
+                    all_documents.extend(content_documents)
+
+                # return the reference document plus any content documents
+                return all_documents
 
             # ---------------------------------------------------------------
             # Pull the stored reference audio (if any) so the diarizer can
@@ -1238,7 +1328,6 @@ async def process_media_item_task(
                         },
                     )
                 ]
-
             try:
                 diar_response = await transcribe_audio_diarize(
                     media_base64=payload_uri,
@@ -1260,97 +1349,149 @@ async def process_media_item_task(
             )
 
             # ---------------------------------------------------------------
-            # If diarization succeeded with usable segments, route as dialogue
-            # so target turns become quote Documents, the role-converted
-            # conversation lands in the adapter namespace, and biographical
-            # facts about the target are extracted from the whole transcript.
+            # Normalize diarizer segments, then coalesce consecutive
+            # same-speaker segments into alternating turns. The number of
+            # DISTINCT speaker labels decides the routing:
+            #   * >1 speaker  -> full dialogue processing (quote turns +
+            #     role-converted adapter conversation + biographical facts
+            #     about the target from non-target turns).
+            #   * 1 speaker   -> gate on is_target. The target's own speech is
+            #     classified (monologue/tweets) into the quote namespace via
+            #     process_text_to_document; a non-target lone speaker only ever
+            #     yields biographical facts about the target (and nothing when
+            #     they say nothing about the target).
+            #   * 0 usable    -> transcribe once and apply the same is_target
+            #     (reference-upload) gate.
             # ---------------------------------------------------------------
             segments_raw = (diar_response or {}).get("segments") or []
-            if segments_raw:
-                normalized_segments: List[Dict[str, Any]] = []
-                for seg in segments_raw:
-                    if not isinstance(seg, dict):
-                        continue
-                    seg_text = (seg.get("text") or "").strip()
-                    if not seg_text:
-                        continue
-                    speaker_label = seg.get("speaker") or "unknown"
-                    is_target = (
-                        encoded_reference_audio is not None
-                        and target_speaker_label is not None
-                        and target_speaker_label.lower() in str(speaker_label).lower()
-                    )
-                    normalized_segments.append(
-                        {
-                            "speaker": str(speaker_label),
-                            "text": seg_text,
-                            "start": seg.get("start"),
-                            "end": seg.get("end"),
-                            "is_target": bool(is_target),
-                        }
-                    )
+            normalized_segments: List[Dict[str, Any]] = []
+            for seg in segments_raw:
+                if not isinstance(seg, dict):
+                    continue
+                seg_text = (seg.get("text") or "").strip()
+                if not seg_text:
+                    continue
+                speaker_label = seg.get("speaker") or "unknown"
+                is_target = (
+                    encoded_reference_audio is not None
+                    and target_speaker_label is not None
+                    and target_speaker_label.lower() in str(speaker_label).lower()
+                )
+                normalized_segments.append(
+                    {
+                        "speaker": str(speaker_label),
+                        "text": seg_text,
+                        "start": seg.get("start"),
+                        "end": seg.get("end"),
+                        "is_target": bool(is_target) or bool(reference_audio),
+                    }
+                )
 
-                if normalized_segments and any(
-                    seg["is_target"] for seg in normalized_segments
-                ):
-                    dialogue_payload = {
-                        "segments": normalized_segments,
-                        "target_name": target_speaker_label,
-                    }
-                    dialogue_media_item = {
-                        "type": "dialogue",
-                        "content": diar_response.get("text", ""),
-                        "metadata": {
-                            "filename": filename,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "source": (
-                                metadata.get("source") or filename or f"{media_type}_upload"
-                            ),
-                            "diarization_model": diar_response.get("model"),
-                        },
-                    }
-                    documents = await process_dialogue_json_to_documents(
-                        dialogue_payload=dialogue_payload,
-                        user_id=user_id,
-                        assistant_id=assistant_id,
-                        media_item=dialogue_media_item,
-                    )
-                    for d in documents:
-                        d.metadata.setdefault("audio_filename", filename)
-                        d.metadata["namespace_filename"]=namespace_filename
-                    if documents:
-                        return documents
-                # Diarized but no target turn detected - treat the whole
-                # transcript as a monologue under quote.
-                full_text = (diar_response or {}).get("text", "")
-                if full_text.strip():
-                    transcript_media_item = {
-                        "type": "text",
-                        "content": full_text,
-                        "metadata": {
-                            "filename": filename,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "source": (
-                                metadata.get("source") or filename or f"{media_type}_transcription"
-                            ),
-                        },
-                    }
+            turns = coalesce_segments_by_speaker(normalized_segments)
+            distinct_speakers = {t["speaker"] for t in turns}
+
+            # Lone-speaker promotion. If the diarizer returned exactly one
+            # speaker and we supplied a stored reference audio (i.e. the user
+            # previously registered their voice), the lone speaker is the
+            # target — even if the diarizer's label didn't literally contain
+            # ``target_speaker_label``. The reference audio is the only voice
+            # we have a sample of; if there's one speaker on this upload and
+            # we anchored them via known_speaker_references, the upload IS the
+            # target. This rescues the case where the diarizer ignores or
+            # mangles the provided ``known_speaker_names`` label.
+            if (
+                len(distinct_speakers) == 1
+                and encoded_reference_audio is not None
+                and turns
+                and not turns[0].get("is_target")
+            ):
+                logger.info(
+                    "Lone speaker %r promoted to target via stored reference audio",
+                    turns[0].get("speaker"),
+                )
+                for t in turns:
+                    t["is_target"] = True
+
+            if len(distinct_speakers) > 1:
+                # Multiple speakers -> full dialogue processing. Outputs:
+                # multi-turn adapter conversation, per-target quote Documents
+                # (each carrying its preceding non-target turn as the prompt),
+                # and biographical facts about the target from non-target turns.
+                dialogue_payload = {
+                    "segments": turns,
+                    "target_name": target_speaker_label,
+                }
+                dialogue_media_item = {
+                    "type": "dialogue",
+                    "content": (diar_response or {}).get("text", ""),
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "source": (
+                            metadata.get("source") or filename or f"{media_type}_upload"
+                        ),
+                        "diarization_model": (diar_response or {}).get("model"),
+                        "namespace_filename": namespace_filename,
+                    },
+                }
+                documents = await process_dialogue_json_to_documents(
+                    dialogue_payload=dialogue_payload,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=dialogue_media_item,
+                )
+                for d in documents:
+                    d.metadata.setdefault("audio_filename", filename)
+                    d.metadata["namespace_filename"] = namespace_filename
+                return documents
+
+            if len(distinct_speakers) == 1:
+                # Single speaker -> gate on whether it is the target.
+                turn = turns[0]
+                single_media_item = {
+                    "type": "text",
+                    "content": turn["text"],
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "source": (
+                            metadata.get("source") or filename or f"{media_type}_transcription"
+                        ),
+                        "namespace_filename": namespace_filename,
+                    },
+                }
+                if turn["is_target"]:
+                    # The avatar's own speech: classify (monologue/tweets) into
+                    # the quote namespace via the shared text classifier.
                     documents = await process_text_to_document(
-                        metadata=transcript_media_item["metadata"],
+                        metadata=single_media_item["metadata"],
                         user_id=user_id,
                         assistant_id=assistant_id,
-                        media_item=transcript_media_item,
+                        media_item=single_media_item,
                     )
-                    for d in documents:
-                        d.metadata.setdefault("audio_filename", filename)
-                        d.metadata["namespace_filename"]=namespace_filename
-                    return documents
+                else:
+                    # A non-target lone speaker: only biographical facts about
+                    # the target, never quotes; no document if nothing is said
+                    # about the target.
+                    documents = await process_nontarget_text_to_identity_documents(
+                        text_content=turn["text"],
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        media_item=single_media_item,
+                        target_name=target_speaker_label,
+                    )
+                for d in documents:
+                    d.metadata.setdefault("audio_filename", filename)
+                    d.metadata["namespace_filename"] = namespace_filename
+                return documents
 
             # ---------------------------------------------------------------
-            # Fallback: no diarized output - try plain transcription so
-            # something still lands in the namespaces. Treat as monologue.
+            # No usable diarized segments: transcribe once and apply the same
+            # is_target gate. Only a reference-audio upload (this upload IS the
+            # target sample) is treated as the target; otherwise the speaker is
+            # unidentified and yields biographical facts only.
             # ---------------------------------------------------------------
             try:
                 fallback = await transcribe_audio(
@@ -1358,7 +1499,7 @@ async def process_media_item_task(
                     context=runtime.context,
                     filename=filename,
                 )
-                fallback_text = (fallback.get("content") or "").strip()
+                fallback_text = (fallback.get("text") or "").strip()
             except Exception as e:
                 logger.exception(
                     "Fallback transcription failed for %s: %s", filename, e
@@ -1395,15 +1536,31 @@ async def process_media_item_task(
                     "namespace_filename": namespace_filename,
                 },
             }
-            documents = await process_text_to_document(
-                metadata=transcript_media_item["metadata"],
-                user_id=user_id,
-                assistant_id=assistant_id,
-                media_item=transcript_media_item,
-            )
+            # Treat as target speech when this IS the reference upload OR
+            # when the user has previously registered a reference audio
+            # (single-speaker uploads after registration are presumed to be
+            # the target — same rationale as the lone-speaker promotion in
+            # the diarized-segments branch above). The non-target identity-
+            # facts path only kicks in for unidentified-speaker uploads with
+            # no stored reference audio.
+            if reference_audio or encoded_reference_audio is not None:
+                documents = await process_text_to_document(
+                    metadata=transcript_media_item["metadata"],
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=transcript_media_item,
+                )
+            else:
+                documents = await process_nontarget_text_to_identity_documents(
+                    text_content=fallback_text,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=transcript_media_item,
+                    target_name=target_speaker_label,
+                )
             for d in documents:
                 d.metadata.setdefault("audio_filename", filename)
-                d.metadata["namespace_filename"]=namespace_filename
+                d.metadata["namespace_filename"] = namespace_filename
             return documents
         
         else:
@@ -1547,6 +1704,7 @@ async def process_adapter_documents(
     # Lazy import so optional helpers don't slow the graph cold start.
     from src.anubis.utils.dataset.formatting import (
         build_adapter_and_langsmith_for_quotes,
+        build_langsmith_for_conversation,
         llm_single_turn_dataset,
     )
 
@@ -1569,9 +1727,30 @@ async def process_adapter_documents(
             payload = json.loads(d.page_content)
         except Exception:
             payload = {"messages": d.metadata.get("messages") or []}
-        if not payload.get("messages"):
+        messages = payload.get("messages") or []
+        if not messages:
             continue
+        # (1) Multi-turn conversation row for adapter training (pass-through).
         adapter_rows_total.append(payload)
+        # (3) Conversation-level LangSmith Q&A pairs derived from the same
+        #     role-converted messages.
+        try:
+            conv_source = (
+                d.metadata.get("filename")
+                or d.metadata.get("source")
+                or "unknown"
+            )
+            conversation_langsmith_rows = await build_langsmith_for_conversation(
+                messages=messages,
+                dataset_source_filename=conv_source,
+            )
+            langsmith_rows_total.extend(conversation_langsmith_rows)
+        except Exception as exc:
+            logger.warning(
+                "Conversation LangSmith build failed for %s: %s",
+                d.metadata.get("filename", ""),
+                exc,
+            )
         try:
             ns = (user_id, assistant_id, "adapter")
             await store.aput(
@@ -1606,10 +1785,15 @@ async def process_adapter_documents(
 
     for source_key, docs_for_source in grouped.items():
         quotes = [d.page_content.strip() for d in docs_for_source]
+        # Use the real preceding non-target turn as the prompt when present
+        # (carried as ``adapter_prompt`` by diarized target quotes); otherwise
+        # the builder synthesizes a question per quote.
+        prompts = [d.metadata.get("adapter_prompt") for d in docs_for_source]
         try:
             adapter_rows, langsmith_rows = await build_adapter_and_langsmith_for_quotes(
                 quotes=quotes,
                 dataset_source_filename=source_key,
+                prompts=prompts,
             )
         except Exception as exc:
             logger.exception(

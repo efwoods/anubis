@@ -24,12 +24,16 @@ streamlit run frontend/studio_chat_app.py
 ### Build & Deploy
 
 ```bash
-# Build Docker image
-./dockerbuild.sh                        # docker build -t evdev3/anubis-langgraph-api:latest .
+# Two-stage Docker build (see dockerbuild.sh):
+#   1. anubis-base:latest        from Dockerfile.anubis.base — FFmpeg + native audio libs + full dep install
+#   2. evdev3/anubis-langgraph-api:latest  from Dockerfile — refreshes source on base, installs only changed deps
+./dockerbuild.sh
 
 # Run production stack (Prometheus + Grafana included)
 ./dcrp.sh                              # docker compose -f docker-compose-prod.yml down && up
 ```
+
+Dependencies are managed with **uv** (`uv.lock` is the lockfile; Docker installs via `uv pip install --system`). The runtime base image is `langchain/langgraph-api:3.11-wolfi` — Python **3.11**. The audio stack (librosa, soundfile, moviepy, torch/torchaudio) dlopens native system libs that the base layer installs via `apk`: `ffmpeg-7`, `libsndfile`, `libgomp`. Any new native-dependent package must have a wheel compatible with Python 3.11/wolfi.
 
 ### Testing & Linting
 
@@ -84,13 +88,21 @@ Three namespaces are used by identity tools (`src/anubis/utils/tools/identity/id
 | `process_media_graph/` | Classify and convert uploaded media (audio → transcript/diarize, images → description, PDF/URL/CSV/JSON → Documents) |
 | `email/` | Email response generation |
 
+### Audio & diarization pipeline (`src/anubis/utils/utility.py`)
+
+Speech APIs **always use the OpenAI client** (`_openai_client_for_speech`), independent of `MODEL_PROVIDER` — they need `OPENAI_API_KEY` (falls back to `llm_provider_api_key`).
+- **Transcription** (`transcribe_audio`): OpenAI `whisper-1` (`audio_transcription_model`). Files larger than `whisper_max_bytes` (25 MiB) are split into segments and transcribed in chunks, then stitched.
+- **Diarization** (`transcribe_audio_diarize`): OpenAI `gpt-4o-transcribe-diarize` with `response_format="diarized_json"`. A **reference audio clip** of the target speaker is passed via `known_speaker_names` (`audio_diarization_known_speaker_name`) so the target's turns are labeled. Reference audio is truncated to `reference_audio_diarize_max_seconds` to stay within a **single non-chunked diarizer call**, keeping speaker labels unified across the timeline; `isolate_dominant_speaker_audio_b64` extracts the dominant speaker for grounding.
+- **Preprocessing**: `noisereduce` (spectral-gating) + `librosa`/`soundfile`; `demucs`/`deepfilternet` paths exist but are currently disabled. `extract_video_audio_b64` pulls audio out of uploaded video via moviepy.
+- All audio env vars live under the "Audio Transcription & Diarization Model" block in `context.py` (pricing, model names, byte/second caps).
+
 ### API (`src/api/webapp.py`)
 
 FastAPI app with SSE streaming on `POST /message/{assistant_id}`. Configured as the LangGraph HTTP app in `langgraph.json`. Authentication via Supabase JWT + Auth0 (`src/security/auth.py`); Stripe for subscription checks.
 
 ### Model initialization (`src/anubis/utils/model.py`)
 
-`init_model()` dispatches to provider-specific SDK imports lazily (Together, NVIDIA, OpenAI-compatible, Llama) based on `MODEL_PROVIDER` env var. All model providers must be configured via `GlobalContext` fields.
+`init_model()` dispatches to provider-specific SDK imports lazily based on the `MODEL_PROVIDER` env var — accepted values are `OPEN_AI`, `TOGETHER`, `NVIDIA`, `META` (Llama, via the OpenAI-compatible endpoint). All model providers must be configured via `GlobalContext` fields. Note speech (transcription/diarization) bypasses this and always uses OpenAI directly.
 
 ### Observability
 

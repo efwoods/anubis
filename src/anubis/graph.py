@@ -58,15 +58,17 @@ from src.anubis.utils.utility import format_docs
 
 from langgraph.store.base import BaseStore
 
-from src.anubis.utils.tokenizer import count_tokens
-
 
 from langgraph.graph import MessagesState
 from langgraph.prebuilt import ToolNode
 
 from pydantic import Field
 
-from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
+from src.anubis.utils.nodes import (
+    load_consciousness,
+    resolve_human_message_images,
+    ensure_context_fits_budget,
+)
 
 
 from src.anubis.utils.utility import (
@@ -303,6 +305,7 @@ anubis_workflow = StateGraph(
 # workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
 
 anubis_workflow.add_node("load_consciousness", load_consciousness)
+anubis_workflow.add_node("ensure_context_fits_budget", ensure_context_fits_budget)
 anubis_workflow.add_node("think", think)
 anubis_workflow.add_node("process_thoughts", process_thoughts)
 
@@ -313,7 +316,8 @@ anubis_workflow.add_node("process_thoughts", process_thoughts)
 """ ANUBIS WORKFLOW EDGES """
 
 anubis_workflow.add_edge(START, "load_consciousness")
-anubis_workflow.add_edge("load_consciousness", "think")
+anubis_workflow.add_edge("load_consciousness", "ensure_context_fits_budget")
+anubis_workflow.add_edge("ensure_context_fits_budget", "think")
 
 anubis_workflow.add_conditional_edges(
     "think", considering, {"process_thoughts": "process_thoughts", END: END}

@@ -14,6 +14,10 @@ import logging
 from pathlib import Path
 
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
+from src.anubis.utils.context_compression import (
+    ensure_context_fits_budget_impl,
+    truncate_string_to_token_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +142,8 @@ async def resolve_human_message_images(
 async def load_consciousness(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
+    context = runtime.context if getattr(runtime, "context", None) is not None else GlobalContext()
+
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
 
@@ -301,7 +307,9 @@ async def load_consciousness(
 
     assistant_memory_namespace = (user_id, assistant_id, "memory")
     retrieved_memories_items = await runtime.store.asearch(
-        assistant_memory_namespace, query=query, limit=1000
+        assistant_memory_namespace,
+        query=query,
+        limit=context.memory_retrieval_max_items,
     )
 
     # Coerce into document objects from Search Items
@@ -401,6 +409,11 @@ async def load_consciousness(
     logger.info(f"state['messages']: {state['messages']}")
 
     system_message_str = populated_identity_template.messages[0].content
+    if not isinstance(system_message_str, str):
+        system_message_str = str(system_message_str)
+    system_message_str = truncate_string_to_token_limit(
+        system_message_str, context.system_prompt_max_tokens
+    )
 
     # Dev-only: dump the created system prompt to a file with real newlines
     # (logger.info shows escaped "\n"; writing the str directly yields newlines).
@@ -420,3 +433,20 @@ async def load_consciousness(
     }
 
     return input_update
+
+
+async def ensure_context_fits_budget(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+):
+    """Shrink prompt components when system + messages + internal thoughts exceed the model budget."""
+    context = (
+        runtime.context
+        if getattr(runtime, "context", None) is not None
+        else GlobalContext()
+    )
+    system_messages = list(state.get("system_message") or [])
+    messages = list(state.get("messages") or [])
+    internal = list(state.get("internal_thoughts") or [])
+    return await ensure_context_fits_budget_impl(
+        system_messages, messages, internal, context
+    )

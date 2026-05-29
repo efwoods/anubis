@@ -353,9 +353,51 @@ class GlobalContext:
     )
 
     model_token_limit: int = field(
-        default=128000,
+        default=400000,
         metadata={
-            "description": "number of acceptable tokens in a request to the current llm in thousands of tokens."
+            "description": "Maximum context window for the primary inference model, in tokens (absolute count, not thousands)."
+        },
+    )
+
+    context_completion_reserve_tokens: int = field(
+        default=65536,
+        metadata={
+            "description": "Tokens reserved for model completion, tool outputs, and overhead when budgeting prompt size."
+        },
+    )
+
+    conversation_verbatim_tail_messages: int = field(
+        default=24,
+        metadata={
+            "description": "Number of most recent chat messages to keep verbatim before rolling summarization."
+        },
+    )
+
+    context_summarization_max_chunks: int = field(
+        default=32,
+        metadata={
+            "description": "Maximum number of text chunks processed per map-reduce summarization pass."
+        },
+    )
+
+    map_reduce_chunk_max_tokens: int = field(
+        default=120000,
+        metadata={
+            "description": "Maximum tokens per chunk when map-reducing a single oversized user message."
+        },
+    )
+
+    system_prompt_max_tokens: int = field(
+        default=120000,
+        metadata={
+            "description": "Upper bound on token count for the assembled identity/system prompt before truncation."
+        },
+    )
+
+    memory_retrieval_max_items: int = field(
+        default=200,
+        metadata={
+            "description": "Maximum episodic memory items retrieved from the store per turn (caps store search)."
         },
     )
 

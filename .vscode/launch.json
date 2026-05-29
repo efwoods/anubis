@@ -16,27 +16,7 @@
       "request": "attach",
       "connect": {
         "host": "localhost",
-<<<<<<< Updated upstream
         "port": 9031
-=======
-        "port": 9001
-      },
-      "pathMappings": [
-        {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "/deps/anubis"
-        }
-      ],
-      "justMyCode": false
-    },
-    {
-      "name": "Attach to Memory LangGraph Server",
-      "type": "debugpy",
-      "request": "attach",
-      "connect": {
-        "host": "localhost",
-        "port": 5687
->>>>>>> Stashed changes
       },
       "pathMappings": [
         {

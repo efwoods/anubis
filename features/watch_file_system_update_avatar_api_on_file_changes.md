@@ -1,0 +1,1 @@
+watch google cloud drive and icloud drive and local ubuntu os for local file changes and updates and allow for pre-determined steps to upload to the api to update the avatar identity with media (record iphone videos -> store to the cloud -> upload to process media pipeline where I am the target avatar)

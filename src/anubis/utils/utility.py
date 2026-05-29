@@ -1148,8 +1148,15 @@ async def isolate_dominant_speaker_audio_b64(
     "text": ""}`` on decode failure, diarization failure, single-speaker
     input, no text-bearing segments, or combined target speech < 1 s.
     """
-    target_clip_max_s = float(
-        getattr(context, "reference_audio_clip_max_seconds", None) or 9.0
+    # OpenAI's diarizer rejects ``known_speaker_references`` whose duration is
+    # not strictly between 1.2 s and 10.0 s. Keep a margin inside both bounds:
+    # mp3 frame padding can nudge a clip a few ms past the requested length, so
+    # capping at exactly 10.0 s can still produce a >10.0 s file and a 400.
+    _OPENAI_REF_MIN_S = 1.3
+    _OPENAI_REF_MAX_S = 9.5
+    target_clip_max_s = min(
+        float(getattr(context, "reference_audio_clip_max_seconds", None) or 9.0),
+        _OPENAI_REF_MAX_S,
     )
     short_fallback_s = 1.0
     fade_s = 0.025
@@ -1225,6 +1232,15 @@ async def isolate_dominant_speaker_audio_b64(
                 seg_end = float(longest["end"])
                 if (seg_end - seg_start) > target_clip_max_s:
                     seg_end = seg_start + target_clip_max_s
+                # Floor the clip at OpenAI's 1.2 s minimum: if the longest
+                # contiguous target segment is too short, widen the window into
+                # the surrounding audio (it still centers on the target) rather
+                # than emit a sub-1.2 s reference the diarizer will reject.
+                clip_total = float(clip_for_crop.duration or 0.0)
+                if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
+                    seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
+                    if (seg_end - seg_start) < _OPENAI_REF_MIN_S:
+                        seg_start = max(0.0, seg_end - _OPENAI_REF_MIN_S)
                 sub = clip_for_crop.subclipped(seg_start, seg_end)
                 try:
                     sub.write_audiofile(output_path, codec="mp3", logger=None)

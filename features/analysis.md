@@ -1,1 +1,3 @@
-implement analysis with structured output for features as part of updating the identity whenever media is used to update the identity.
+analyze data using a model with structured output for latent features of the target. 
+
+Update the identity using feedback and stored user preferences from the conversation

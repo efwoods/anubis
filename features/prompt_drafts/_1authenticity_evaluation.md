@@ -2,6 +2,19 @@
 I need to evaluate the authenticity of created responses against a ground truth dataset if available:
 
 
+#### evaluating authenticity of responses
+https://claude.ai/chat/f8db5236-d6b5-4100-a677-71503c453576
+https://github.com/langchain-ai/langsmith-cookbook/tree/main
+https://docs.langchain.com/langsmith/manage-datasets-programmatically#create-a-dataset-from-a-csv-file
+https://academy.langchain.com/courses/take/building-reliable-agents/multimedia/72899245-getting-set-up-python-text
+https://github.com/langchain-ai/lca-reliable-agents
+
+
+https://github.com/langchain-ai/intro-to-langsmith/tree/main/notebooks/module_0
+https://academy.langchain.com/courses/take/intro-to-langsmith/texts/60631030-module-0-resources
+
+####
+
 Testing & Evaluation
 
 Test and benchmark your LLM systems using methods in these evaluation recipes:
@@ -68,3 +81,31 @@ https://github.com/langchain-ai/langsmith-cookbook/blob/main/feedback-examples/r
 https://github.com/langchain-ai/langsmith-cookbook/blob/main/feedback-examples/algorithmic-feedback/algorithmic_feedback.ipynb 
 https://github.com/langchain-ai/langsmith-cookbook/blob/main/testing-examples/agent_steps/evaluating_agents.ipynb 
 https://github.com/langchain-ai/langsmith-cookbook/tree/main 
+
+
+create a stylistic profile of authenticity (dissimilarity from chatgpt). ChatGPT has its own voice and style of writing. I need to measure how different all avatar generated text is from sample styles of writing of chatgpt in addition to measuring the similarity of the ground truth data (initially, there will be NO ground truth data; the metric will be how dissimilar from base chatgpt is the data)
+
+the style scale sample metrics:
+CHATGPT -------- AVATAR -------- ACTUAL PRIMARY SOURCE OF WRITING FROM THE REAL PERSON
+
+I want to make certain the style of writing is as far right on the above scale and at least non-left. There are two metrics:
+dissimilarity from base language model (I will need to procure an adaquet example dataset)
+similarity to the ACTUAL PRIMARY SOURCE OF WRITING FROM THE REAL PERSON (this dataset may not always exist)
+
+# Claude prompt
+I need to create a linguistic profile and measure the authenticity of the generated responses (dissimilarity to whatever base model is being used and similarity to any of the ground truth 
+  examples that exist; also include all other metrics as detailed in these plans; synthsize all plans together along with all reference materials here in this document): 
+
+
+# Evaluation Measurement Plans
+~/.claude/plans/features-given-the-sparkling-valiant.md
+~/.claude/plans/hazy-snacking-treasure.md
+
+
+# Psycho Analysis Plans (analysis and stylistic fingerprint and analysis pipeline)
+~/.claude/plans/serene-stargazing-sutherland.md 
+
+
+
+# One off feature/modification: There is a prompt injection in the system prompt for examples of writing style that need to be the metrics defined from the linguistic profile rather than the actual examples 
+Style needs to use the linguistic fingerprint rather than explicit examples of the style of writing

@@ -1,6 +1,6 @@
 I need to collect the following information after every api request of the /message endpoints:
 
-
+- aggregate model token use, cost, and latency
 
 total tokens 
 

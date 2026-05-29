@@ -13,6 +13,7 @@ SELECT
     value->'document'->'kwargs'->'metadata'->>'total_chunks' AS total_chunks,
     value->'document'->'kwargs'->>'page_content' AS page_content,
     prefix,
+    value->'document'->'kwargs'->>'metadata' AS metadata,
     key
 FROM store
 WHERE value->'document'->'kwargs'->'metadata'->>'assistant_id' = :assistant_id

@@ -39,3 +39,6 @@ The assistant is determined by the URL: ?assistant_id=<your-id>
 This bug occured then did not occur.
 
 On load, the initial conversation is not started (there is no conversation open and a new conversation must be created). The share conversation button is sharing the api key. The api key must not be shared, seen, or alterable if the share url has been used to share conversations. 
+
+
+# Copy Edit Paste Feedback buttons

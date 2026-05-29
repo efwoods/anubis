@@ -51,7 +51,6 @@ memory: these are created during messaging conversation. They include surprising
 
 identity_memory: these are created during messaging conversation and are secondary source information (the user told me that I am this attribute or have this quality).
 
-
 I will be creating three avatars.
 
 Pastor using @data/bible to be labled as proprietary content and stored in the document namespace

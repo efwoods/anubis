@@ -1186,6 +1186,13 @@ async def process_media_item_task(
                     )
                 ]
 
+            # Accumulates every document produced for this upload. For a
+            # reference upload it first holds the stored reference document,
+            # then the body below extends it with the documents produced by
+            # diarizing the original payload_uri. For a normal upload it starts
+            # empty and the body extends it before the final return.
+            all_documents: List[Document] = []
+
             # ---------------------------------------------------------------
             # Reference-audio: persist for known-speaker labelling on later
             # uploads. Do not diarize the reference itself. Will be the same text spoken for most people.
@@ -1197,7 +1204,6 @@ async def process_media_item_task(
                 # heuristics (denoise + highest-RMS N-second window) over that
                 # target-only track. Video first extracts the audio track so both
                 # branches share the same code path.
-                all_documents: List[Document] = []
                 if media_type == "video":
                     audio_uri, audio_name = extract_video_audio_b64(
                         payload_uri, filename
@@ -1220,7 +1226,8 @@ async def process_media_item_task(
                 # transcription API and ``transcribe_audio_diarize``).
                 ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
                 transcription_text = transcription_dict.get("text") or ""
-                
+                ref_duration = transcription_dict.get("duration")
+
                 ref_namespace = (user_id, assistant_id, "reference_audio")
                 doc = Document(
                     page_content=transcription_text,
@@ -1231,6 +1238,7 @@ async def process_media_item_task(
                         "processing_task_id": str(uuid4()),
                         "type": "audio",
                         "reference_audio": True,
+                        "duration": ref_duration,
                         "filename": filename,
                         "namespace": "reference_audio",
                         "vectorstore_acceptable": False,
@@ -1256,36 +1264,32 @@ async def process_media_item_task(
                 REFERENCE_AUDIO_SENTENCE = "The quick fox jumped over the brown lazy dog."
                 REFERENCE_AUDIO_EMBEDDING = model.encode(REFERENCE_AUDIO_SENTENCE)
                 similarity = model.similarity(embedding, REFERENCE_AUDIO_EMBEDDING)
-                if similarity < 0.80:
-                    # The reference upload is not the calibration sentence, so it
-                    # carries real content. Re-process the ORIGINAL audio as a
-                    # fresh, non-reference upload by re-entering this task with
-                    # reference_audio=False. That path pulls the reference clip we
-                    # just stored (for known-speaker labelling), diarizes the full
-                    # audio, identifies speakers, and routes multi-speaker dialogue
-                    # / target monologue / non-target biographical facts exactly
-                    # like any other audio document — including adapter + langsmith
-                    # dataset rows downstream.
+                if similarity >= 0.80:
+                    # The reference upload IS the calibration sentence, so it
+                    # carries no real content beyond the voice sample. We've
+                    # already stored the reference clip for known-speaker
+                    # labelling, so we're done: return just the reference doc.
                     logger.info(
-                        "Reference audio dissimilar to calibration sentence (similarity=%s); processing full content as a non-reference upload",
+                        "Reference audio matches calibration sentence (similarity=%s); skipping content processing",
                         similarity,
                     )
-                    content_media_item = {
-                        "type": "audio",
-                        "base64_encoded_str": audio_uri,
-                        "metadata": {
-                            **metadata,
-                            "reference_audio": False,
-                            "content_type": "audio/mp3",
-                        },
-                    }
-                    content_documents = await process_media_item_task(
-                        content_media_item, runtime, config, store
-                    )
-                    all_documents.extend(content_documents)
+                    return all_documents
 
-                # return the reference document plus any content documents
-                return all_documents
+                # Dissimilar -> the reference upload carries real content. Treat
+                # the original audio as a normal (non-reference) upload from
+                # here on: flip the flag so the diarization body below pulls the
+                # reference clip we just stored (for known-speaker labelling),
+                # diarizes the full payload_uri, identifies speakers, and routes
+                # multi-speaker dialogue / target monologue / non-target
+                # biographical facts exactly like any other audio document
+                # rather than blanket-labelling every segment as the target.
+                # The body extends ``all_documents`` (already holding the
+                # reference doc) and returns it.
+                logger.info(
+                    "Reference audio dissimilar to calibration sentence (similarity=%s); diarizing original payload as a non-reference upload",
+                    similarity,
+                )
+                reference_audio = False
 
             # ---------------------------------------------------------------
             # Pull the stored reference audio (if any) so the diarizer can
@@ -1314,7 +1318,7 @@ async def process_media_item_task(
                     media_type,
                     filename,
                 )
-                return [
+                all_documents.append(
                     Document(
                         page_content=f"[{media_type.capitalize()} URL pointer: {audio_url or video_url}]",
                         metadata={
@@ -1327,7 +1331,8 @@ async def process_media_item_task(
                             "status": "url_only_no_bytes",
                         },
                     )
-                ]
+                )
+                return all_documents
             try:
                 diar_response = await transcribe_audio_diarize(
                     media_base64=payload_uri,
@@ -1444,7 +1449,8 @@ async def process_media_item_task(
                 for d in documents:
                     d.metadata.setdefault("audio_filename", filename)
                     d.metadata["namespace_filename"] = namespace_filename
-                return documents
+                all_documents.extend(documents)
+                return all_documents
 
             if len(distinct_speakers) == 1:
                 # Single speaker -> gate on whether it is the target.
@@ -1485,7 +1491,8 @@ async def process_media_item_task(
                 for d in documents:
                     d.metadata.setdefault("audio_filename", filename)
                     d.metadata["namespace_filename"] = namespace_filename
-                return documents
+                all_documents.extend(documents)
+                return all_documents
 
             # ---------------------------------------------------------------
             # No usable diarized segments: transcribe once and apply the same
@@ -1507,7 +1514,7 @@ async def process_media_item_task(
                 fallback_text = ""
 
             if not fallback_text:
-                return [
+                all_documents.append(
                     Document(
                         page_content=f"[{media_type.capitalize()} transcription unavailable]",
                         metadata={
@@ -1521,7 +1528,8 @@ async def process_media_item_task(
                             "namespace_filename": namespace_filename,
                         },
                     )
-                ]
+                )
+                return all_documents
 
             transcript_media_item = {
                 "type": "text",
@@ -1561,8 +1569,9 @@ async def process_media_item_task(
             for d in documents:
                 d.metadata.setdefault("audio_filename", filename)
                 d.metadata["namespace_filename"] = namespace_filename
-            return documents
-        
+            all_documents.extend(documents)
+            return all_documents
+
         else:
             logger.warning(f"Unsupported media type: {media_type}")
             docs = [Document(

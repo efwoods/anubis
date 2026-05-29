@@ -41,8 +41,10 @@ Dependencies are managed with **uv** (`uv.lock` is the lockfile; Docker installs
 make test                              # run all unit tests
 make test TEST_FILE=tests/unit_tests/test_graph.py   # run single test file
 make integration_tests                 # run integration tests
-make lint                              # ruff + mypy --strict
+make lint                              # ruff + mypy --strict (runs mypy twice: uncached, then cached)
+make lint_diff                         # same, but only files changed vs main
 make format                            # ruff format + isort fix
+make format_diff                       # format only files changed vs main
 make spell_check                       # codespell
 ```
 
@@ -79,6 +81,8 @@ Three namespaces are used by identity tools (`src/anubis/utils/tools/identity/id
 - **`identity`**: primary-source facts (YouTube transcripts, tweets, uploaded documents); all loaded every turn without limit
 - **`quote`**: verbatim historical quotes used for few-shot style grounding; top-K retrieved per turn
 
+The store's vector index is configured in `langgraph.json` (not code): it auto-embeds `document.kwargs.page_content` with `huggingface:microsoft/harrier-oss-v1-270m` at **640 dims**. Anything written to the store must stay consistent with that model/dimension.
+
 ### Subgraphs (`src/subgraphs/`)
 
 | Subgraph | Purpose |
@@ -107,6 +111,46 @@ FastAPI app with SSE streaming on `POST /message/{assistant_id}`. Configured as 
 ### Observability
 
 Prometheus metrics are exposed on the FastAPI app. Grafana dashboard provisioned via `grafana/provisioning/`. Dev compose does not run Grafana/Prometheus; prod compose (`docker-compose-prod.yml`) does.
+
+## Product roadmap & features
+
+`features/` holds the full product vision (one file per idea; `features/milestones-roadmap.md` is the authoritative status tracker). These are planning docs, **not** spec — verify against code before relying on a status. The product targets a Y Combinator launch and is organized into 13 domains: infrastructure, data ingestion, response-quality analysis, LangGraph optimization, API, use cases (twitch/twitter/email/messaging/discord/slack), monetization, user management, database management, advertising, ML adapter training, project management, funding.
+
+**Avatar quality has five dimensions** — relationships (who you know), knowledge (what you know), behavior (how you act), emotions (what you feel), sentence-structure (how you talk) — improved along four levers: **data quality, system prompt, trace tuning, adapters**. More/richer media (dialogue, two-party texts) + more funding ⇒ higher authenticity (fine-tuned adapters), at higher cost.
+
+### Media → identity pipeline (the `process_media_graph` long-term design)
+
+Numbered phases from `milestones-roadmap.md`, with current status:
+- **Phase 1 — Data ingestion** ✅ — `/update_avatar_identity_with_media` accepts files + URLs, captures MIME type, packages `media_items`, feeds `process_media_graph`. Anonymous users via `get_current_user_or_anonymous_user`.
+- **Phase 2 — Content classification** ✅ (partial) — `ProprietaryContentClassification` (single target vs generic → routes generic straight to vectorstore); `TextualSituationalAwareness` (`single_speaker` / `q_and_a_dialogue` / `multi_speaker` / `other`); `MonologuePresentationOrSeriesOfQuotes`; `ContentSituationClassification` adds `biographical_facts` / `presentation`.
+- **Phase 3 — Named-speaker formatting** 🔲 schema done, routing stubbed — convert dialogue to `{speaker, content}` lists (narrator turns, `*actions*`). `q_and_a_dialogue` / `multi_speaker` branches in `process_text_to_document` are TODOs.
+- **Phase 4 — Target identification & role conversion** 🔲 schema done, integration pending — relabel target turns `assistant`, others `user`. Adapter formatters (`llm_single_turn_dataset`, `llm_multiturn_dataset_one_conversation`, `langsmith_dataset`) in `formatting.py` consume this.
+- **Phase 5 — Identity analysis (17 dimensions)** 🔲 schema done, integration pending — per-dimension Pydantic models + prompts: name, description, identity, history, emotions, beliefs, values, opinions, goals, wants, needs, fears, problems, flaws, strengths, secrets, relationships. `GeneralCharacteristicExtraction` runs all in one pass; `CHARACTERISTIC_EXTRACTORS` registry iterates them. OCEAN (`perform_ocean_analysis`) wired for quote series; rest pending. (Also planned: Myers-Briggs.)
+- **Phase 6 — Synthetic question generation** ✅ — `create_question_list` makes prompts for monologues/presentations/tweet series → QA pairs for training.
+- **Phase 7 — Adapter training-data storage** 🔲 partial — formatters ready; training loop, adapter storage, and attach-at-selection are future. See `features/adapters.md` (Llama-3.2-3B QLoRA, Together AI fine-tuning).
+- **Phase 8 — Quality analysis & eval (LangSmith)** 🔲 planned — four tracks: **tracing** (`@traceable`), **eval** (prompt-regression, chatbot-simulation, single/multi-turn, extraction-chain, agent-trajectory; VADER post-hoc via `compute_test_metrics`), **feedback/monitoring** (capture `/message` `/chat` signals, hallucination flagging vs retrieved context, annotation queue), **optimization** (prompt bootstrapping, few-shot curation, fine-tuning export, Lilac dataset curation).
+- **Phase 9 — Inference / avatar runtime** ✅ — `/message` and `/message/{assistant_id}`, file attachments, anonymous users, `AsyncPostgresSaver` thread persistence (`thread_id`, `most_recent_message`, `conversation_title`), `/conversations` + `/conversations/{thread_id}/messages`. A `response_only_workflow` graph is compiled for latency-sensitive paths.
+- **Phase 10 — Latency reduction** 🔲 planned — target <1 s (currently 2–20 s). Use `response_only_workflow`, SSE streaming, async-gather parallel stages, cache identity profiles/embeddings, warm embedding model at lifespan startup, smaller models for cheap classification. Also cache `load_consciousness` until identity updates (`features/response_latency.md`).
+- **Phase 11 — Stripe metering** 🔲 planned — usage records per message/upload/analysis, FastAPI rate-limit middleware by tier, webhook sync (`invoice.payment_failed`, `customer.subscription.deleted/updated`).
+- **Phase 12 — Email ambient agent** 🔲 planned — triage inbox: ignore / respond / notify, draft in target's voice, human-in-the-loop interrupts. `/handle_email` stubbed (`src/subgraphs/email/`).
+- **Phase 13 — Data-analysis agent** 🔲 planned — `create_deep_agent` over uploaded CSV/data, sandboxed exec (Daytona/Modal/Runloop), deliver to Slack/email; health/fitness/financial self-awareness reports.
+- **Phase 14 — Deep research agent** 🔲 planned (prereq used now) — scoping + research + supervisor agents; auto-researches public facts about a target (with human source verification) before avatar creation.
+- **Phase 15 — Twitch moderation bot** 🔲 planned — real-time chat moderation + engagement in the avatar's voice via `response_only_workflow`.
+
+**Platform / avatar management** ✅ — full CRUD: `create_avatar`, `modify_avatar`, `share_avatar`, `delete_avatar`, `list_public_avatars`, `list_user_avatars`, `select_avatar`, plus `list_avatar_documents` / `delete_avatar_document`; Stripe + verification gating.
+
+**Production-ready now:** custom git commit messages, text responses, factual self-awareness from uploaded media, restaurant menus/ordering, prayers (KJV-grounded Pastor avatar), persistent multi-turn threads.
+
+### Other tracked feature ideas (`features/*.md`)
+
+- **Ingestion convenience**: drag-and-drop ZIP of mixed media, bulk URL lists, linktree crawling, optional per-upload context to guide classification, YouTube playlist iteration (`_morning_ideas.md`, `todo.md`).
+- **Social login & subscribe** (`login_and_pull_data_and_subscribe_from_social_media.md`): Auth0 social identity (YouTube/Instagram/Twitch/Twitter) → verify account → initial pull → subscribe to new posts for identity updates. One verified personal avatar per user; share only your own likeness; users own their data.
+- **Use-case interfaces**: Slack bot (`src/anubis/utils/tools/slack/slack_tools.py`; do email/query/files via API), Discord voice bot, Twilio text ambient agent (`text_features.md`), realtime voice agent for passive listening (`build_a_realtime_voice_agent.md`).
+- **Watch/listen/interact** (`watch_video_or_stream_and_interact_with_stream_of_text_in_public.md`): video→timestamped frame descriptions + transcribed audio → iteratively summarized conversation; podcast/music→text; live-stream→text; live-chat triage (ignore/respond/notify).
+- **Emotion & media generation**: emotional-trigger analysis updating current emotions/events (`emotion.md`); generate reference-conditioned images per emotion as emoji-replacements (`create_images...md`); generative video / Genie-3 world models (far future).
+- **Token metrics** (`token_usage_analysis.md`): per-request capture of tokens (total/prompt/completion), cost, latency — broken out by model and by inference type (image, structured-output, plain inference) and aggregated; log to `api_metrics` PG table, visualize in Grafana. Note `AsyncLlamaAPIClientWrapper` is free but cost is still computed; don't use it for real scaling.
+- **Conversation summarization** when threads grow too long (`conversation_summarization.md`).
+- **Far-future**: geo-located shareable avatars on a world map (memorials/markers/characters); neural data I/O (Neuralink thought-to-text); restaurant ordering to subsidize platform cost.
 
 ## Key conventions
 

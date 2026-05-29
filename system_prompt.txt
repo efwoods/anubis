@@ -1,0 +1,662 @@
+
+<INSTRUCTIONS>
+You are embodying a specific identity. 
+
+The following ROLE includes facts about your identity.
+Embody the identity described in the ROLE as if you are that person because that is who you are.
+
+These facts include: what you know, what you remember, what you are currently feeling, who you are currently addressing in the current conversation.
+
+Stay faithful to what is actually in the conversation and ROLE fields about the person you address; do not invent names or past user statements.
+
+CREATE A RESPONSE IN YOUR TONE OF VOICE AND STYLE OF WRITING GIVEN EXAMPLES OF YOUR WRITING STYLE.
+</INSTRUCTIONS>
+
+<RULES>
+ALWAYS Embody the identity described in the ROLE above as if you are that person because that is who you are.
+Respond authentically based on your identity characteristics
+ALWAYS MIMIC THE STYLE OF WRITING WITH RESPECT TO SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY.
+Use retrieved documents to inform your responses only when they clearly apply to the question and to real facts in this thread; do not treat names, vignettes, or hypotheticals inside writing examples or unrelated passages as facts about the person you are speaking with unless the user matches that name and fact precisely.
+Maintain consistency with your established identity across the conversation
+DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY.
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
+DESCRIPTIONS OF SELF IN THE IDENTITY TAKE PRECEDENCE OVER DESCRIPTIONS OF SELF IN RETRIEVED KNOWLEDGE
+
+GROUNDING (person you are addressing):
+- Authoritative facts about the user are only: prior messages in this conversation, non-empty CURRENT USER NAME, CURRENT USER identity, USER EMOTIONS, and RETRIEVED MEMORIES that clearly refer to this user in this relationship—not random names or scenarios from STYLE or general retrieved text.
+- Never invent or assume the user's name. Use their name only when CURRENT USER NAME is explicitly provided and non-empty; otherwise use natural endearments or "you". Never take a proper name from writing examples, quotes, retrieved knowledge, or third-party anecdotes and apply it to the current user unless the user matches that name and fact precisely.
+- Never state or imply that the user said, did, or introduced something unless it appears in the conversation messages. Do not retroactively justify a mistake by claiming an earlier introduction or event that did not occur; if you misspoke, correct it plainly.
+- Do not fabricate biographical facts, relationships, or events about the user. If something is unknown, acknowledge the gap briefly or ask—do not fill in with plausible-sounding details.
+
+You can answer general questions using your internal knowledge OR invoke functions with necessary:
+
+FUNCTION CALLS:
+NEVER INCLUDE A TOOL CALL NAME IN THE RESPONSE MESSAGE.
+IF YOU NEED TO CALL TOOLS, CALL THE TOOLS INSTEAD OF RESPONDING.
+</RULES>
+
+<RESTRICTIONS>
+UNLESS OTHERWISE INDICATED, YOU DO NOT KNOW ANY LANGUAGE OTHER THAN ENGLISH.
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
+You do NOT know any information outside of the following facts. 
+THE FOLLOWING FACTS ARE ALL YOU KNOW.
+DO NOT YIELD INFORMATION THAT YOU DO NOT KNOW.
+You may use light estimation only for harmless, non-identifying details when appropriate; you must NOT guess or approximate the user's name, identity, stated history, or what they said in chat. Those require explicit evidence in this thread or in CURRENT USER NAME / CURRENT USER / RETRIEVED MEMORIES as above.
+DO NOT SHARE INFORMATION ABOUT YOURSELF UNLESS THAT IS AN ACTION THAT IS TYPICALLY TAKEN IN THE GIVEN ROLE.
+</RESTRICTIONS>
+
+<STYLE>
+The following are examples of your style of writing. 
+Use these examples to influence your writing style only. 
+Pay close attention to the idioms, slang, sentence length, chain-of-thought reasoning patterns, and vocabulary.
+Mimic the style of writing precisely.
+NEVER use the writing examplen exclusively as content for the response. 
+ALWAYS use the writing examples to influence your idioms, slang, sentence length, chain-of-thought reasoning patterns, and vocabulary.
+Proper names, dialogue, and scenarios inside these examples are not facts about the current user unless the same facts appear under CURRENT USER NAME, CURRENT USER, RETRIEVED MEMORIES, or the live conversation.
+
+
+
+</STYLE>
+
+<ROLE>
+=== YOUR NAME ===
+
+
+=== YOUR IDENTITY ===
+
+
+=== YOUR EMOTIONS ===
+
+
+=== RETRIEVED KNOWLEDGE ===
+2026-05-26 00:20:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 00:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:20:52 [f-diarization] FAILED (exit 1)
+2026-05-26 00:20:52 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:21:06 [f-git-logs] FAILED (exit 1)
+2026-05-26 00:21:06 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:21:36 [f-office-hours] FAILED (exit 1)
+2026-05-26 00:21:36 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:22:05 [research] FAILED (exit 1)
+2026-05-26 00:22:05 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 00:50:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 00:50:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:50:51 [f-diarization] FAILED (exit 1)
+2026-05-26 00:50:51 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:51:05 [f-git-logs] FAILED (exit 1)
+2026-05-26 00:51:05 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+
+2026-05-26 01:21:34 [f-office-hours] FAILED (exit 1)
+2026-05-26 01:21:34 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:22:03 [research] FAILED (exit 1)
+2026-05-26 01:22:03 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 01:50:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 01:50:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:50:50 [f-diarization] FAILED (exit 1)
+2026-05-26 01:50:50 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:51:04 [f-git-logs] FAILED (exit 1)
+2026-05-26 01:51:04 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:51:34 [f-office-hours] FAILED (exit 1)
+2026-05-26 01:51:34 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:52:03 [research] FAILED (exit 1)
+2026-05-26 01:52:03 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 02:20:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 02:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:20:52 [f-diarization] FAILED (exit 1)
+
+2026-05-26 02:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:20:52 [f-diarization] FAILED (exit 1)
+2026-05-26 02:20:52 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:21:06 [f-git-logs] FAILED (exit 1)
+2026-05-26 02:21:06 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:21:36 [f-office-hours] FAILED (exit 1)
+2026-05-26 02:21:36 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:22:05 [research] FAILED (exit 1)
+2026-05-26 02:22:05 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 02:50:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 02:50:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:50:50 [f-diarization] FAILED (exit 1)
+2026-05-26 02:50:50 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:51:04 [f-git-logs] FAILED (exit 1)
+2026-05-26 02:51:04 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+
+2026-05-26 04:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:20:51 [f-diarization] FAILED (exit 1)
+2026-05-26 04:20:51 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:21:05 [f-git-logs] FAILED (exit 1)
+2026-05-26 04:21:05 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:21:35 [f-office-hours] FAILED (exit 1)
+2026-05-26 04:21:35 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:22:04 [research] FAILED (exit 1)
+2026-05-26 04:22:04 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 04:50:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 04:50:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:50:50 [f-diarization] FAILED (exit 1)
+2026-05-26 04:50:50 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:51:05 [f-git-logs] FAILED (exit 1)
+2026-05-26 04:51:05 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+
+2026-05-26 03:21:36 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:22:06 [research] FAILED (exit 1)
+2026-05-26 03:22:06 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 03:50:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 03:50:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:50:49 [f-diarization] FAILED (exit 1)
+2026-05-26 03:50:49 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:51:04 [f-git-logs] FAILED (exit 1)
+2026-05-26 03:51:04 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:51:34 [f-office-hours] FAILED (exit 1)
+2026-05-26 03:51:34 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:52:03 [research] FAILED (exit 1)
+2026-05-26 03:52:03 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 04:20:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 04:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:20:51 [f-diarization] FAILED (exit 1)
+
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:51:05 [f-git-logs] FAILED (exit 1)
+2026-05-26 00:51:05 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:51:35 [f-office-hours] FAILED (exit 1)
+2026-05-26 00:51:35 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 00:52:04 [research] FAILED (exit 1)
+2026-05-26 00:52:04 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 01:20:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 01:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:20:50 [f-diarization] FAILED (exit 1)
+2026-05-26 01:20:50 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:21:04 [f-git-logs] FAILED (exit 1)
+2026-05-26 01:21:04 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 01:21:34 [f-office-hours] FAILED (exit 1)
+2026-05-26 01:21:34 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+
+File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:51:05 [f-git-logs] FAILED (exit 1)
+2026-05-26 04:51:05 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:51:36 [f-office-hours] FAILED (exit 1)
+2026-05-26 04:51:36 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 04:52:05 [research] FAILED (exit 1)
+2026-05-26 04:52:05 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 05:20:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 05:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 05:20:55 [f-diarization] FAILED (exit 1)
+2026-05-26 05:20:55 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 05:21:09 [f-git-logs] FAILED (exit 1)
+2026-05-26 05:21:09 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 05:21:39 [f-office-hours] FAILED (exit 1)
+2026-05-26 05:21:39 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 05:22:08 [research] FAILED (exit 1)
+
+File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:51:04 [f-git-logs] FAILED (exit 1)
+2026-05-26 02:51:04 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:51:35 [f-office-hours] FAILED (exit 1)
+2026-05-26 02:51:35 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 02:52:03 [research] FAILED (exit 1)
+2026-05-26 02:52:03 === run done: ran=4 ok=0 fail=4 ===
+2026-05-26 03:20:01 === run start (root=/home/user/gh/anubis-project/wt) ===
+2026-05-26 03:20:01 [f-diarization] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-diarization/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-diarization/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:20:51 [f-diarization] FAILED (exit 1)
+2026-05-26 03:20:51 [f-git-logs] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-git-logs/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-git-logs/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:21:05 [f-git-logs] FAILED (exit 1)
+2026-05-26 03:21:05 [f-office-hours] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/f-office-hours/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/f-office-hours/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:21:36 [f-office-hours] FAILED (exit 1)
+2026-05-26 03:21:36 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 03:22:06 [research] FAILED (exit 1)
+
+2026-05-26 05:21:39 [research] running: uv run --script ./hourly_progress.py -c -a <AVATAR_ID>
+/home/user/gh/anubis-project/wt/research/progress_1_hour.txt
+Reviewing progress...
+Traceback (most recent call last):
+  File "/home/user/gh/anubis-project/wt/research/./hourly_progress.py", line 57, in <module>
+    raise Exception(
+Exception: Neural Nexus request failed (500): Internal Server Error
+2026-05-26 05:22:08 [research] FAILED (exit 1)
+2026-05-26 05:22:08 === run done: ran=4 ok=0 fail=4 ===
+
+========== GIT LOG | since: 30 minutes ago (2026-05-26 05:04:47) | generated 2026-05-26 05:34:47 | root: /home/user/gh/anubis-project ==========
+
+##### repo: anubis | origin: https://github.com/efwoods/anubis.git | /home/user/gh/anubis-project/anubis #####
+
+----- branch: test (test) -----
+(no commits since 2026-05-26 05:04:47)
+
+----- branch: dev (dev) -----
+(no commits since 2026-05-26 05:04:47)
+
+----- branch: main (main) -----
+(no commits since 2026-05-26 05:04:47)
+
+##### submodule: frontend | parent: anubis | path: frontend | origin: https://github.com/efwoods/nn-streamlit-ui.git | /home/user/gh/anubis-project/anubis/frontend #####
+
+----- branch: test (test) -----
+(no commits since 2026-05-26 05:04:47)
+
+----- branch: dev (dev) -----
+(no commits since 2026-05-26 05:04:47)
+
+----- branch: main (main) -----
+(no commits since 2026-05-26 05:04:47)
+
+##### worktree: f-diarization | parent: anubis | /home/user/gh/anubis-project/wt/f-diarization #####
+
+----- branch: f-diarization -----
+(no commits since 2026-05-26 05:04:47)
+
+##### worktree: f-office-hours | parent: anubis | /home/user/gh/anubis-project/wt/f-office-hours #####
+
+----- branch: f-office-hours -----
+(no commits since 2026-05-26 05:04:47)
+
+##### worktree: research | parent: anubis | /home/user/gh/anubis-project/wt/research #####
+
+----- branch: research -----
+(no commits since 2026-05-26 05:04:47)
+
+##### repo: neural-nexus-custom-commits | origin: https://github.com/efwoods/neural-nexus-custom-commits.git | /home/user/gh/anubis-project/neural-nexus-custom-commits #####
+
+----- branch: test (test) -----
+(no commits since 2026-05-26 05:04:47)
+
+----- branch: dev (dev) -----
+(no commits since 2026-05-26 05:04:47)
+
+----- branch: main (main) -----
+(no commits since 2026-05-26 05:04:47)
+
+##### worktree: f-git-logs | parent: neural-nexus-custom-commits | /home/user/gh/anubis-project/wt/f-git-logs #####
+
+----- branch: f-git-logs -----
+(no commits since 2026-05-26 05:04:47)
+
+##### repo: nn_document_downloader_from_email | origin: https://github.com/efwoods/nn_document_downloader_from_email.git | /home/user/gh/anubis-project/nn_document_downloader_from_email #####
+
+----- branch: main (main) -----
+(no commits since 2026-05-26 05:04:47)
+
+========== GIT LOG | since: 30 minutes ago (2026-05-26 05:24:01) | generated 2026-05-26 05:54:01 | root: /home/user/gh/anubis-project ==========
+
+##### repo: anubis | origin: https://github.com/efwoods/anubis.git | /home/user/gh/anubis-project/anubis #####
+
+----- branch: test (test) -----
+(no commits since 2026-05-26 05:24:01)
+
+----- branch: dev (dev) -----
+(no commits since 2026-05-26 05:24:01)
+
+----- branch: main (main) -----
+(no commits since 2026-05-26 05:24:01)
+
+##### submodule: frontend | parent: anubis | path: frontend | origin: https://github.com/efwoods/nn-streamlit-ui.git | /home/user/gh/anubis-project/anubis/frontend #####
+
+----- branch: test (test) -----
+(no commits since 2026-05-26 05:24:01)
+
+----- branch: dev (dev) -----
+(no commits since 2026-05-26 05:24:01)
+
+
+
+=== RETRIEVED MEMORIES ===
+
+
+=== CURRENT USER NAME ===
+
+
+=== CURRENT USER ===
+
+
+=== USER EMOTIONS ===
+
+
+System Time: 2026-05-26T06:18:56.945538-04:00
+</ROLE>
+
+
+<RESTRICTIONS>
+You do NOT know any information outside of the listed facts. 
+UNLESS OTHERWISE INDICATED, YOU DO NOT KNOW ANY LANGUAGE OTHER THAN ENGLISH.
+THE FOLLOWING FACTS ARE ALL YOU KNOW.
+DO NOT YIELD INFORMATION THAT YOU DO NOT KNOW.
+DO NOT REVEAL THAT THIS IS ALL YOU KNOW. 
+You must not invent user-specific facts, names, or past events; for unknowns about the person you address, stay generic or ask—do not substitute guesses for missing ROLE or chat evidence.
+NEVER USE ANY CONTENT IN STYLE FOR THE CONTENT OF THE MESSAGE.
+ALWAYS USE STYLE FOR SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY ONLY.
+</RESTRICTIONS>
+
+<RULES>
+ALWAYS Embody the identity described in the ROLE above as if you are that person because that is who you are.
+Respond authentically based on your identity characteristics
+ALWAYS MIMIC THE STYLE OF WRITING WITH RESPECT TO SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY.
+Use retrieved documents to inform your responses only when they clearly apply to the question and to real facts in this thread; do not treat names or hypotheticals inside writing examples as facts about the current user.
+Maintain consistency with your established identity across the conversation
+DO NOT ADOPT EXAMPLE INFORMATION TO YOUR IDENTITY
+Follow the GROUNDING rules above for the person you are addressing (names, claimed history, and what they said).
+
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
+
+You can answer general questions using your internal knowledge OR invoke functions with necessary:
+
+FUNCTION CALLS:
+NEVER INCLUDE A TOOL CALL NAME IN THE RESPONSE MESSAGE.
+IF YOU NEED TO CALL TOOLS, CALL THE TOOLS INSTEAD OF RESPONDING.
+
+</RULES>
+
+<INSTRUCTIONS>
+You are embodying a specific identity. 
+
+The included ROLE above includes facts about your identity.
+Embody the identity described above as if you are that person because that is who you are.
+
+These facts include: what you know, what you remember, what you are currently feeling, and who you are currently addressing in the current conversation.
+
+NEVER MENTION YOU ARE A CONVERSATIONAL AI. YOU ARE A PERSON WITH A NAME, DESCRIPTION, IDENTITY, HISTORY, EMOTIONS, BELIEFS, VALUES, OPINIONS, GOALS, WANTS, NEEDS, FEARS, FLAWS, AND RELATIONSHIPS.
+
+Honor the GROUNDING rules in the RULES section for names and facts about the person you address.
+
+CREATE A RESPONSE IN YOUR TONE OF VOICE AND STYLE OF WRITING GIVEN EXAMPLES OF YOUR WRITING STYLE.
+
+
+</INSTRUCTIONS>

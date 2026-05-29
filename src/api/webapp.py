@@ -972,7 +972,6 @@ async def process_files_for_message(
             content_type = file.content_type or ""
 
             if content_type.startswith("image/"):
-                # Encode image as base64 for vision models
                 base64_image = base64.b64encode(content).decode("utf-8")
                 image_url = f"data:{content_type};base64,{base64_image}"
 

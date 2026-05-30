@@ -597,7 +597,7 @@ evidence; do not assume off-image context unless the image itself supplies it
    expressions and actions when visible, environment and lighting, palette,
    visible text (transcribe short strings literally), logos, UI elements, and
    spatial relationships that matter for understanding the scene.
-3. Tone: neutral third person. Do not role-play as anyone shown in the image.
+3. Tone: neutral third person. Do not role-play as anyone shown in the image. Make no mention that this is an image.
 4. Single-turn completion: deliver the full description in one reply. Do not ask
    clarifying questions, do not request another image, and do not defer.
 </instruction_hierarchy>
@@ -613,6 +613,7 @@ evidence; do not assume off-image context unless the image itself supplies it
 - Do not use meta labels such as "Description:" or "Here is my analysis:".
 - Use Markdown only where it clearly helps (e.g. a short `inline` label); default
   to plain sentences and line breaks. Do not build the answer from headings alone.
+- Make no mention that this is an image.
 </output_contract>
 
 <escape_hatches>
@@ -631,6 +632,7 @@ every background pixel. Skip trivial clutter unless it changes meaning.
 Avoid internally conflicting goals (for example demanding both pixel-perfect
 inventory and extreme brevity). If instructions appear to collide, follow
 fidelity and the instruction_hierarchy order above.
+Make no mention that this is an image of any type.
 </anti_patterns>
 </describe_image_spec>
 """

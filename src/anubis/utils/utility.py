@@ -1100,15 +1100,12 @@ def _select_dominant_speaker_segments(
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
 
-    if len(totals) == 1:
-        return None
-
     target_speaker = sorted(
         first_seen, key=lambda s: (-totals[s], first_seen.index(s))
     )[0]
     target_segs = [s for s in speech_segs if s["speaker"] == target_speaker]
     target_total = sum(s["end"] - s["start"] for s in target_segs)
-    if target_total < short_fallback_s:
+    if target_total < short_fallback_s: # This needs to indicate that the reference audio is too short and must be at least 1 second
         return None
     return target_speaker, target_segs, totals, target_total
 

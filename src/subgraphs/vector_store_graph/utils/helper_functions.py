@@ -12,6 +12,29 @@ from datetime import datetime
 from dateutil import parser
 from uuid import NAMESPACE_URL, uuid5
 
+from langgraph.config import get_stream_writer
+
+
+def _emit_index_progress(batch_num: int, total_batches: int, indexed: int, total: int) -> None:
+    """Emit an indexing ``media_progress`` event for the background-job SSE stream.
+
+    Safe no-op outside a streaming context (e.g. plain ``ainvoke``).
+    """
+    try:
+        writer = get_stream_writer()
+        writer(
+            {
+                "type": "media_progress",
+                "stage": "indexing",
+                "current": batch_num,
+                "total": total_batches,
+                "documents_indexed": indexed,
+                "documents_total": total,
+            }
+        )
+    except Exception:  # pragma: no cover - progress must never break indexing
+        pass
+
 # Convert string timestamps to datetime objects
 def parse_datetime(dt_value):
     if isinstance(dt_value, datetime):
@@ -141,7 +164,54 @@ async def batch_index_documents_vectorstore(
             logger.warning(f"Assertion error: number of document keys, documents, and document filenames are not equal during document batch indexing:\n {e}")
             
 
-        # Files do not need to be deleted; deleting writes "None" to value; put will overwrite with new value
+        # Replace-by-filename at commit time. Each document is keyed by a random
+        # document_id (above), so a re-run would otherwise append duplicate rows.
+        # Remove any existing rows for the incoming namespace_filename(s) here —
+        # immediately before inserting the new set — rather than deleting up
+        # front in the request handler. This way a crash during media processing
+        # never destroys the prior version: the old documents are only removed at
+        # the moment the new ones are written. Idempotent on the deterministic
+        # namespace_filename (uuid5), so resumed/re-run items overwrite cleanly.
+        incoming_filenames = {f for f in filenames if f}
+        if incoming_filenames:
+            try:
+                existing_items = await store.asearch(
+                    (user_id, assistant_id), limit=1_000_000
+                )
+            except Exception as e:
+                logger.warning(
+                    "replace-by-filename search failed (continuing without delete): %s",
+                    e,
+                )
+                existing_items = []
+
+            to_delete: list[tuple] = []
+            for item in existing_items or []:
+                value = getattr(item, "value", None)
+                if not isinstance(value, dict):
+                    continue
+                document = value.get("document")
+                kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
+                metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+                stored_filename = (
+                    metadata.get("namespace_filename") if isinstance(metadata, dict) else None
+                )
+                if isinstance(stored_filename, str) and stored_filename in incoming_filenames:
+                    to_delete.append((item.namespace, item.key))
+
+            for ns, key in to_delete:
+                try:
+                    await store.adelete(namespace=ns, key=key)
+                except Exception as e:
+                    logger.warning(
+                        "replace-by-filename delete failed for %s/%s: %s", ns, key, e
+                    )
+            if to_delete:
+                logger.info(
+                    "Replaced %d existing row(s) for %d filename(s) before indexing",
+                    len(to_delete),
+                    len(incoming_filenames),
+                )
 
         # Upload the new documents into the vector store
         logger.info(f"breakpoint before aadd documents")
@@ -163,11 +233,12 @@ async def batch_index_documents_vectorstore(
                 await store.abatch(batch)
 
                 progress = min(i + BATCH_SIZE, total_documents_to_be_indexed)
-                
+
                 logger.info(f"Batch {batch_num}/{total_batches}: {progress}/{total_documents_to_be_indexed}")
+                _emit_index_progress(batch_num, total_batches, progress, total_documents_to_be_indexed)
 
                 num_successful_batch_uploads += len(batch)
-                
+
             except Exception as e:
                 logger.info(f"Error in batch {batch_num}: {str(e)}. Attempting Retry.")
                 # Handle the error with a retry

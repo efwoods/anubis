@@ -2,7 +2,8 @@
   "$schema": "https://raw.githubusercontent.com/langchain-ai/langgraph/main/libs/cli/langgraph/schemas/config.schema.json",
   "dependencies": ["."],
   "graphs": {
-    "Anubis": "./src/anubis/graph.py:graph"
+    "Anubis": "./src/anubis/graph.py:graph",
+    "process_media": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:workflow"
   },
   "store": {
     "index": {

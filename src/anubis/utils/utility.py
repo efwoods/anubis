@@ -1100,9 +1100,6 @@ def _select_dominant_speaker_segments(
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
 
-    if len(totals) == 1:
-        return None
-
     target_speaker = sorted(
         first_seen, key=lambda s: (-totals[s], first_seen.index(s))
     )[0]
@@ -1385,7 +1382,11 @@ async def transcribe_audio_diarize(
         )
 
         if size_bytes <= context.whisper_max_bytes:
-            response = _diarize_one_mp3_path(
+            # The diarizer SDK call is synchronous; hop it to a thread so it
+            # doesn't block the event loop (which also serves the media-job
+            # progress SSE endpoint). Mirrors the chunked path below.
+            response = await asyncio.to_thread(
+                _diarize_one_mp3_path,
                 audio_path,
                 diarize_upload_name,
                 context,

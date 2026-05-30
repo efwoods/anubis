@@ -30,7 +30,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -51,13 +51,27 @@ _TWITCH_HOSTS = frozenset(
 )
 
 
+def _is_youtube_playlist_url(parsed) -> bool:
+    """A pure playlist (``/playlist?list=...``) or any YouTube URL carrying a
+    ``list=`` query param but no single ``v=`` video — those enumerate. A
+    ``watch?v=X&list=Y`` URL stays a single video."""
+    path = (parsed.path or "").lower()
+    query = parse_qs(parsed.query or "")
+    if "playlist" in path:
+        return True
+    return "list" in query and "v" not in query
+
+
 def _classify_url(url: str) -> str:
-    """Return a routing label: youtube / twitter / linktree / instagram / twitch / article."""
+    """Return a routing label: youtube_playlist / youtube / twitter / linktree / instagram / twitch / article."""
     try:
-        host = (urlparse(url).hostname or "").lower()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
     except Exception:
         return "article"
     if host in _YOUTUBE_HOSTS:
+        if _is_youtube_playlist_url(parsed):
+            return "youtube_playlist"
         return "youtube"
     if host in _TWITTER_HOSTS:
         return "twitter"
@@ -92,6 +106,10 @@ class URLDocumentLoaderClass:
 
         kind = _classify_url(url)
         try:
+            if kind == "youtube_playlist":
+                return await self._load_youtube_playlist(
+                    url, user_id, assistant_id
+                )
             if kind == "youtube":
                 return await self._load_youtube(
                     url, user_id, assistant_id, expect_multispeaker
@@ -242,6 +260,49 @@ class URLDocumentLoaderClass:
             )
         return media_items
 
+    async def _load_youtube_playlist(
+        self,
+        url: str,
+        user_id: Optional[str],
+        assistant_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Enumerate every video in a YouTube playlist (no cap).
+
+        Returns one ``type="url"`` watch item per entry; each re-enters this
+        class on the next pass and flows through the single-video YouTube path
+        (subtitles fast-path, else audio + diarization)."""
+        entries = await _extract_playlist_entries(url)
+        if not entries:
+            logger.warning("YouTube playlist produced no entries: %s", url)
+            return []
+
+        media_items: List[Dict[str, Any]] = []
+        for entry in entries:
+            video_id = entry.get("id")
+            watch_url = entry.get("url") or (
+                f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+            )
+            if not watch_url:
+                continue
+            media_items.append(
+                {
+                    "type": "url",
+                    "url": watch_url,
+                    "metadata": {
+                        "filename": watch_url,
+                        "source": watch_url,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "url_kind": "youtube_playlist_entry",
+                        "playlist_url": url,
+                    },
+                }
+            )
+        logger.info(
+            "Expanded YouTube playlist %s into %d videos", url, len(media_items)
+        )
+        return media_items
+
     async def _load_youtube(
         self,
         url: str,
@@ -332,6 +393,35 @@ async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
         return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
     except Exception:
         return text
+
+
+async def _extract_playlist_entries(url: str) -> List[Dict[str, Any]]:
+    """Return the flat list of entries (``{id, url, ...}``) for a YouTube playlist."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _extract_playlist_entries_sync, url)
+
+
+def _extract_playlist_entries_sync(url: str) -> List[Dict[str, Any]]:
+    """Sync helper: flat-extract playlist entries via ``yt_dlp`` (no download)."""
+    import yt_dlp  # local import: heavy module
+
+    ydl_opts = {
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # pragma: no cover - logged for the operator
+        logger.exception("yt_dlp playlist extraction failed for %s: %s", url, exc)
+        return []
+
+    entries = (info or {}).get("entries") or []
+    # Drop unavailable/private entries that yt_dlp returns as ``None``.
+    return [e for e in entries if isinstance(e, dict)]
 
 
 async def _download_youtube_audio_b64(url: str) -> tuple[str, str]:

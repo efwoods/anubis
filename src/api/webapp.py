@@ -1,5 +1,6 @@
 # src/anubis/webapp.py
 
+import asyncio
 import json
 import os
 import re
@@ -66,6 +67,13 @@ from src.security.auth import check_subscription_status
 
 from src.security.auth import (
     get_current_user_or_anonymous_user,
+)
+
+from src.api.media_jobs import (
+    MediaJob,
+    create_job,
+    get_job,
+    run_media_job,
 )
 
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -466,6 +474,8 @@ async def lifespan(app: FastAPI):
         await store.setup()
         logger.info("Store setup complete")
         app.state.store = store
+        # Registry for background media-processing jobs (see src/api/media_jobs.py).
+        app.state.media_jobs = {}
         checkpointer = AsyncPostgresSaver(app.state.pool)
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
@@ -2536,52 +2546,41 @@ async def update_avatar_identity_with_media(
                 {name for name in incoming_filenames if name in existing_filenames}
             )
             if duplicates:
-                media_files_duplicates = [media_file.get("filename") for media_file in media_files if media_file.get("namespace_filename") in duplicates]
-                duplicates_str = ", ".join(media_files_duplicates)
-                
-                for duplicate in media_files_duplicates:
-                    delete_result = await delete_avatar_documents(duplicate, current_user)
-                    if delete_result.status_code != 200:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=f"Error deleting duplicate file: {delete_result.detail}"
-                        )
+                # Indexing now replaces rows by namespace_filename at commit time
+                # (see batch_index_documents_vectorstore), so re-uploads overwrite
+                # safely. The previous destructive up-front delete was removed:
+                # a crash after it but before reindexing lost the prior version
+                # with nothing to show for it.
+                logger.info(
+                    "Existing rows for these filenames will be replaced at index time: %s",
+                    duplicates,
+                )
 
-                # raise HTTPException(
-                #     status_code=409,
-                #     detail=(
-                #         "Filename already exists for this avatar and will not be "
-                #         f"re-processed: {duplicates_str}. To upload a new version, "
-                #         "first remove the existing file by calling "
-                #         "DELETE /delete_avatar_document?source_document_name="
-                #         "<filename> for each duplicate filename, then retry this "
-                #         "request."
-                #     ),
-                # )
-
-        from src.subgraphs.process_media_graph.process_media_graph_api_endpoint import (
-            workflow,
+        # Media processing (diarization, PDFs, YouTube playlists, indexing) can run
+        # well past the request timeout, so start it as a background job and return
+        # immediately. Progress is streamed via GET /media_job/{job_id}/progress.
+        # Bytes were already read into ``media_files`` above, and ``store`` /
+        # ``context`` are long-lived app resources, so the task is safe after return.
+        job = create_job(app.state.media_jobs, user_id, assistant_id)
+        job.task = asyncio.create_task(
+            run_media_job(
+                job,
+                media_files,
+                config,
+                store,
+                app.state.context,
+            )
         )
 
-        process_media_graph_api_endpoint = workflow.compile(store=store)
-
-        initial_state = {
-            "media_files": media_files,
-        }
-
-        await process_media_graph_api_endpoint.ainvoke(
-            initial_state,
-            config=config,
-            context=app.state.context,
-        )
-
-        # Indexing clears vectorstore_documents_to_be_indexed in final state; rely on exceptions for failures.
         return JSONResponse(
-            status_code=200,
+            status_code=202,
             content={
-                "items_processed": len(media_files),
+                "job_id": job.job_id,
+                "status": job.status,
+                "progress_url": f"/media_job/{job.job_id}/progress",
+                "items_accepted": len(media_files),
                 "filenames": [m.get("filename") for m in media_files],
-                "message": "Media processed and indexed successfully",
+                "message": "Media processing started",
             },
         )
 
@@ -2591,6 +2590,86 @@ async def update_avatar_identity_with_media(
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
+
+
+@app.get("/media_job/{job_id}/progress")
+async def media_job_progress(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Stream progress (SSE) for a background media job started by
+    ``/update_avatar_identity_with_media``.
+
+    Replays any buffered ``media_progress`` events, then streams live ones with
+    periodic keep-alive comments, ending with a ``done`` event carrying the final
+    status and result (or error).
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    job: Optional[MediaJob] = get_job(app.state.media_jobs, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job_id")
+    if job.user_id != user_id:
+        raise HTTPException(
+            status_code=403, detail="This job belongs to another user."
+        )
+
+    def _with_timing(payload: dict) -> dict:
+        """Return a copy of ``payload`` stamped with the job's start time and the
+        wall-clock seconds elapsed since processing began, so every SSE ``data:``
+        frame carries timing. ``started_at`` is epoch seconds (set when the job
+        flipped to running); fall back to ``created_at`` if it hasn't yet."""
+        started = job.started_at or job.created_at
+        return {
+            **payload,
+            "started_at": job.started_at,
+            "elapsed_seconds": round(time_ns() / 1_000_000_000 - started, 3),
+        }
+
+    async def event_stream(job: MediaJob):
+        yield f"data: {json.dumps(_with_timing({'type': 'status', 'status': job.status}), default=str)}\n\n"
+        last_index = 0
+        while True:
+            # Drain everything appended since we last yielded.
+            while last_index < len(job.events):
+                yield f"data: {json.dumps(_with_timing(job.events[last_index]), default=str)}\n\n"
+                last_index += 1
+
+            if job.done.is_set() and last_index >= len(job.events):
+                break
+
+            # Clear-then-recheck guards against a wakeup lost between the length
+            # check above and the wait below.
+            job._updated.clear()
+            if last_index < len(job.events) or job.done.is_set():
+                continue
+            try:
+                await asyncio.wait_for(job._updated.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                # Keep the connection alive AND report timing so clients can show
+                # how long the current stage has been running.
+                yield f"data: {json.dumps(_with_timing({'type': 'keep_alive'}), default=str)}\n\n"
+
+        done = _with_timing(
+            {
+                "type": "done",
+                "status": job.status,
+                "result": job.result,
+                "error": job.error,
+                "finished_at": job.finished_at,
+                "duration_seconds": job.duration_seconds,
+            }
+        )
+        yield f"data: {json.dumps(done, default=str)}\n\n"
+
+    return StreamingResponse(
+        event_stream(job),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/list_avatar_documents")

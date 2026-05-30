@@ -16,7 +16,11 @@
       "request": "attach",
       "connect": {
         "host": "localhost",
+<<<<<<< HEAD
         "port": 5678
+=======
+        "port": 9501
+>>>>>>> f-playlist
       },
       "pathMappings": [
         {

@@ -1,5 +1,6 @@
 # Nodes for Identifying and Handling each media type 
 
+import asyncio
 from curses import napms
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -26,6 +27,19 @@ from src.anubis.utils.context import GlobalContext
 # from langgraph.config import get_store
 
 from langgraph.store.base import BaseStore
+from langgraph.config import get_stream_writer
+
+
+def _emit_media_progress(stage: str, **fields: Any) -> None:
+    """Emit a ``media_progress`` custom event for the background-job SSE stream.
+
+    Safe no-op when not running under a streaming context (e.g. plain ``ainvoke``).
+    """
+    try:
+        writer = get_stream_writer()
+        writer({"type": "media_progress", "stage": stage, **fields})
+    except Exception:  # pragma: no cover - progress must never break processing
+        pass
 
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
@@ -465,6 +479,7 @@ async def process_uploaded_files_and_label_media_type(
             continue
     
     logger.info(f"Converted {len(media_list)} files to media format")
+    _emit_media_progress("labeling", total=len(media_list))
 
     return {
         "media_list": media_list,
@@ -597,11 +612,20 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
         }
 
     logger.info(f"Processing {len(media_list)} media items")
+    total_items = len(media_list)
+    _emit_media_progress("converting_started", total=total_items)
 
     # Create tasks for parallel processing
     all_documents: list = []
     processing_errors: list[str] = []
-    for media_item in media_list:
+    for index, media_item in enumerate(media_list):
+        _emit_media_progress(
+            "converting",
+            current=index + 1,
+            total=total_items,
+            filename=media_item.get("metadata", {}).get("filename")
+            or media_item.get("filename"),
+        )
         docs = await process_media_item_task(media_item, runtime, config, store)
 
         for doc in docs:
@@ -1039,11 +1063,19 @@ async def process_media_item_task(
                     )
                 ]
             collected: List[Document] = []
-            for item in expanded_items:
+            total_children = len(expanded_items)
+            _emit_media_progress("expanding", url=url, total=total_children)
+            for child_index, item in enumerate(expanded_items):
                 # Each expanded item already has user_id / assistant_id baked
                 # into its metadata; recurse into the same task. Linktree
-                # children come back as ``type="url"`` so they pass back
-                # through this branch.
+                # children and YouTube playlist entries come back as
+                # ``type="url"`` so they pass back through this branch.
+                _emit_media_progress(
+                    "converting_child",
+                    current=child_index + 1,
+                    total=total_children,
+                    filename=item.get("metadata", {}).get("filename") or url,
+                )
                 try:
                     item["metadata"]["namespace_filename"] = namespace_filename
                     child_docs = await process_media_item_task(
@@ -1258,12 +1290,20 @@ async def process_media_item_task(
                 all_documents.append(doc)
 
                 """ Compare the approximate embedding of the transcription to the reference audio embedding """
-                from sentence_transformers import SentenceTransformer
-                model = SentenceTransformer(runtime.context.embedding_model)
-                embedding = model.encode(transcription_text)
-                REFERENCE_AUDIO_SENTENCE = "The quick fox jumped over the brown lazy dog."
-                REFERENCE_AUDIO_EMBEDDING = model.encode(REFERENCE_AUDIO_SENTENCE)
-                similarity = model.similarity(embedding, REFERENCE_AUDIO_EMBEDDING)
+                # Run the synchronous SentenceTransformer load + encode + similarity
+                # off the event loop: it is CPU/GPU-bound and would otherwise freeze
+                # the single asyncio loop, starving the media-job SSE stream and any
+                # concurrent request (e.g. the progress endpoint's auth call).
+                def _compute_reference_similarity() -> Any:
+                    from sentence_transformers import SentenceTransformer
+
+                    model = SentenceTransformer(runtime.context.embedding_model)
+                    embedding = model.encode(transcription_text)
+                    reference_audio_sentence = "The quick fox jumped over the brown lazy dog."
+                    reference_audio_embedding = model.encode(reference_audio_sentence)
+                    return model.similarity(embedding, reference_audio_embedding)
+
+                similarity = await asyncio.to_thread(_compute_reference_similarity)
                 if similarity >= 0.80:
                     # The reference upload IS the calibration sentence, so it
                     # carries no real content beyond the voice sample. We've

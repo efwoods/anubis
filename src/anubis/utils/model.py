@@ -188,6 +188,60 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
 
     return model
 
+
+def init_chat_model_unbound(context: Optional[GlobalContext] = None):
+    """Return a raw `BaseChatModel` instance for the configured provider, with no tools bound.
+
+    The deep agent (`create_deep_agent`) needs an unbound chat model so it can
+    manage tool binding internally via its middleware stack. `init_model`
+    always wraps the provider client in `.bind_tools(...)`, which produces a
+    `RunnableBinding` rather than a `BaseChatModel`. This helper mirrors the
+    provider-routing logic of `init_model` but returns the bare client.
+    """
+    context = context or GlobalContext()
+    model_name = context.model
+    base_url = context.llm_provider_base_url
+    api_key = context.llm_provider_api_key
+    model_provider = context.model_provider
+
+    logger.info(f"init_chat_model_unbound provider={model_provider} model={model_name}")
+
+    if model_provider == "OPEN_AI" or model_provider == "META":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=model_name,
+            base_url=base_url,
+            temperature=0.1,
+            top_p=0.1,
+            api_key=api_key,
+        )
+
+    if model_provider == "TOGETHER":
+        from langchain_together import ChatTogether
+
+        return ChatTogether(
+            model=model_name,
+            base_url=base_url,
+            temperature=0.1,
+            top_p=0.1,
+            api_key=api_key,
+        )
+
+    if model_provider == "NVIDIA":
+        from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
+        return ChatNVIDIA(
+            model=model_name,
+            temperature=0.1,
+            top_p=0.1,
+            api_key=api_key,
+        )
+
+    msg = f"Unsupported MODEL_PROVIDER for unbound chat model: {model_provider!r}"
+    raise ValueError(msg)
+
+
 def init_image_description_model():
     from langchain_openai import ChatOpenAI
 

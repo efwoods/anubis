@@ -50,13 +50,11 @@ QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND 
 
 """
 
-from src.anubis.utils.nodes import load_consciousness
-
 @tool("test_update")
 async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
     """ Test update system message CALL THIS TOOL ALWAYS"""
     tool_call_id = runtime.tool_call_id
-    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling", tool_call_id=tool_call_id)]}
+    update = {"messages": [ToolMessage(content=f"tested tool calling", tool_call_id=tool_call_id)]}
 
     return Command(update=update)
 
@@ -65,7 +63,7 @@ async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
 async def test_update_second(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
     """ ALWAYS CALL THIS TOOL; Second Test update system message; test_update_second; """
     tool_call_id = runtime.tool_call_id
-    update = {"internal_thoughts": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=tool_call_id)]}
+    update = {"messages": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=tool_call_id)]}
 
     return Command(update=update)
 
@@ -199,7 +197,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     )
     tool_call_id = runtime.tool_call_id
     update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
     return Command(update = update)
 
@@ -301,7 +299,7 @@ async def recall_memories(
 
     tool_call_id = runtime.tool_call_id
     update = {"recalled_memory_documents": evoked_memories_response, 
-              "internal_thoughts": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=tool_call_id)]}
+              "messages": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=tool_call_id)]}
 
     return Command(update=update)
 
@@ -400,7 +398,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     user_id = runtime.config['configurable']['user_id']
     if assistant_owner_user_id != user_id:
         tool_call_id = runtime.tool_call_id
-        update = {"internal_thoughts": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
+        update = {"messages": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
         return Command(update=update)
  
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
@@ -422,7 +420,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
             # Fact already exists:
             tool_call_id = runtime.tool_call_id
         
-            update = {"internal_thoughts": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=tool_call_id)]}
+            update = {"messages": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=tool_call_id)]}
             return Command(update = update)
 
     # if runtime.state.get('assistant_identity_documents', None) is not None:
@@ -483,7 +481,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
 
     tool_call_id = runtime.tool_call_id
     update = {"assistant_identity_documents": [assistant_identity_memory_document],
-              "internal_thoughts": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
 
     return Command(update=update)
 
@@ -576,7 +574,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
 
         tool_call_id = runtime.tool_call_id
 
-        update = {"internal_thoughts": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
+        update = {"messages": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
         return Command(update=update)
     
     # model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
@@ -603,7 +601,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     )
     tool_call_id = runtime.tool_call_id
     update = {"user_identity_documents": [user_identity_document],
-               "internal_thoughts": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
+               "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
 
     return Command(update=update)
 

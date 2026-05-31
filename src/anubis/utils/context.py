@@ -317,6 +317,31 @@ class GlobalContext:
 
     """ </Stylistic + Knowledge Profile thresholds> """
 
+    """ <Deep Agent (think node) tuning> """
+
+    deep_agent_summarization_max_tokens: int = field(
+        default=120000,
+        metadata={
+            "description": "Token threshold above which SummarizationMiddleware compacts the deep agent's message history. Env DEEP_AGENT_SUMMARIZATION_MAX_TOKENS."
+        },
+    )
+
+    deep_agent_summarization_keep_last_n_messages: int = field(
+        default=20,
+        metadata={
+            "description": "Number of most-recent messages preserved verbatim when SummarizationMiddleware compacts the deep agent's history. Env DEEP_AGENT_SUMMARIZATION_KEEP_LAST_N_MESSAGES."
+        },
+    )
+
+    deep_agent_recursion_limit: int = field(
+        default=50,
+        metadata={
+            "description": "LangGraph recursion limit for the deep agent's inner tool-call loop invoked by the think node. Env DEEP_AGENT_RECURSION_LIMIT."
+        },
+    )
+
+    """ </Deep Agent (think node) tuning> """
+
     dev: str = field(
         default=None,
         metadata={

@@ -17,6 +17,27 @@ from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 
 logger = logging.getLogger(__name__)
 
+# ``nodes.py`` → ``utils`` → ``anubis`` → ``src`` → repo root
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DEV_SYSTEM_PROMPT_PATH = _PROJECT_ROOT / "system_prompt.txt"
+
+
+def _global_context_from_runtime(runtime) -> GlobalContext:
+    """Resolve ``GlobalContext`` from a LangGraph or tool runtime."""
+    ctx = getattr(runtime, "context", None)
+    if isinstance(ctx, GlobalContext):
+        return ctx
+    return GlobalContext()
+
+
+def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
+    """Dump the built system prompt when ``DEV=TRUE`` (dev-only debugging aid)."""
+    context = _global_context_from_runtime(runtime)
+    if context.dev != "TRUE":
+        return
+    _DEV_SYSTEM_PROMPT_PATH.write_text(system_message_str, encoding="utf-8")
+    logger.info("dev system prompt written to: %s", _DEV_SYSTEM_PROMPT_PATH)
+
 
 def _resolve_user_timezone(tz_name: str | None):
     """Resolve a client-supplied IANA timezone name to a ``tzinfo``.
@@ -135,9 +156,22 @@ async def resolve_human_message_images(
     }
 
 
-async def load_consciousness(
-    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
-):
+async def _build_consciousness_system_message_update(
+    state, config: RunnableConfig, runtime: Runtime[GlobalContext]
+) -> dict:
+    """Pure helper that rebuilds the avatar's system prompt + identity doc snapshots.
+
+    Returns a dict with the same shape the ``load_consciousness`` node has always
+    produced (``system_message`` pinned to a fixed UUID, ``user_identity_documents``,
+    ``assistant_identity_documents``). The pinned ID lets ``add_messages`` replace
+    rather than append, which is what gives the deep agent middleware a single
+    "latest prompt" slot to read from on every LLM call.
+
+    Accepts a generic ``state`` mapping so it can be called from both the outer
+    LangGraph node (operates on ``GlobalState``) and the in-agent
+    ``load_consciousness`` tool (operates on ``AvatarDeepAgentState``); both
+    schemas expose the same keys this helper reads.
+    """
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
 
@@ -220,46 +254,31 @@ async def load_consciousness(
     if user_description is not None:
         state["user_state"].update({"user_description": user_description})
 
-    """ Load User Identity documents """
+    """ Load User Identity documents (always from store — checkpoint cache is not authoritative). """
 
-    if len(state["user_identity_documents"]) == 0:
-        user_identity_namespace = (assistant_id, user_id, "identity")
-
-        user_identity_document_items = await runtime.store.asearch(
-            user_identity_namespace
-        )
-
-        # Coerce into document objects from Search Items
-        user_identity = reduce_docs([], user_identity_document_items)
-    else:
-        user_identity = state["user_identity_documents"]
+    user_identity_namespace = (assistant_id, user_id, "identity")
+    user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
+    user_identity = reduce_docs([], user_identity_document_items)
 
     """ Load Assistant Identity documents """
     creator_id = config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
 
-    if len(state["assistant_identity_documents"]) == 0:
-        assistant_identity_namespace = (creator_id, assistant_id, "identity")
+    assistant_identity_namespace = (creator_id, assistant_id, "identity")
+    assistant_identity_document_items = await runtime.store.asearch(
+        assistant_identity_namespace
+    )
+    assistant_identity = reduce_docs([], assistant_identity_document_items)
 
-        assistant_identity_document_items = await runtime.store.asearch(
-            assistant_identity_namespace
-        )
-
-        # Coerce into document objects from Search Items
-        assistant_identity = reduce_docs([], assistant_identity_document_items)
-
-        assistant_identity_memory_namespace = (
-            creator_id,
-            assistant_id,
-            "identity_memory",
-        )
-        retrieved_identity_memories_items = await runtime.store.asearch(
-            assistant_identity_memory_namespace, limit=1000
-        )
-        retrieved_identity_memories = reduce_docs([], retrieved_identity_memories_items)
-        assistant_identity.extend(retrieved_identity_memories)
-
-    else:
-        assistant_identity = state["assistant_identity_documents"]
+    assistant_identity_memory_namespace = (
+        creator_id,
+        assistant_id,
+        "identity_memory",
+    )
+    retrieved_identity_memories_items = await runtime.store.asearch(
+        assistant_identity_memory_namespace, limit=1000
+    )
+    retrieved_identity_memories = reduce_docs([], retrieved_identity_memories_items)
+    assistant_identity.extend(retrieved_identity_memories)
 
     """ Always merge assistant reference image (creator namespace), including when identity docs are cached """
     assistent_reference_image_identity_namespace = (
@@ -410,16 +429,12 @@ async def load_consciousness(
     system_message_str = populated_identity_template.messages[0].content
 
 
-    # Dev-only: dump the created system prompt to a file with real newlines
-    # (logger.info shows escaped "\n"; writing the str directly yields newlines).
-    if getattr(runtime, "context", None) and runtime.context.dev == "TRUE":
-        dev_prompt_path = Path("system_prompt.txt")
-        dev_prompt_path.write_text(system_message_str, encoding="utf-8")
-        logger.info(f"dev system prompt written to: {dev_prompt_path.resolve()}")
+    _write_dev_system_prompt(system_message_str, runtime)
 
     input_update = {
         "user_identity_documents": user_identity,
         "assistant_identity_documents": assistant_identity,
+        "recalled_memory_documents": retrieved_memories,
         "system_message": [
             SystemMessage(
                 content=system_message_str, id="00000000-0000-0000-0000-0000000000000"
@@ -428,3 +443,15 @@ async def load_consciousness(
     }
 
     return input_update
+
+
+async def load_consciousness(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+):
+    """Outer-graph node wrapper around :func:`_build_consciousness_system_message_update`.
+
+    Thin shim — all logic lives in the helper so the in-agent
+    ``load_consciousness`` tool can share the exact same prompt-building path
+    without duplicating the store reads.
+    """
+    return await _build_consciousness_system_message_update(state, config, runtime)

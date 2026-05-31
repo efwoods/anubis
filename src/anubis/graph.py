@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 # imported here and below but never referenced in this file (the only
 # ``create_agent(...)`` site is commented out at ~line 313).  Removed to skip the
 # eager ``langchain.agents`` package load on every cold start.
+from typing import Any
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk
 from langgraph.runtime import Runtime
@@ -56,49 +58,11 @@ from src.anubis.utils.huggingface_prefetch import (
 )
 from src.anubis.utils.utility import format_docs
 
-from langgraph.store.base import BaseStore
-
-from src.anubis.utils.tokenizer import count_tokens
-
-
 from langgraph.graph import MessagesState
-from langgraph.prebuilt import ToolNode
-
-from pydantic import Field
 
 from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
-
-
-from src.anubis.utils.utility import (
-    reduce_docs,
-)
-
-from src.anubis.utils.tools.identity.identity_tools import (
-    learn_information_about_the_user,
-    update_self_identity_mem_from_user_txt,
-    # learn_information_about_yourself_through_images,
-    # learn_information_about_yourself_through_tweets,
-    # learn_information_about_yourself_through_youtube_videos,
-    # learn_new_facts,
-    # retrieve_knowledge,
-    recall_memories,
-    create_episodic_memory,
-)
-
-identity_tools = [
-    learn_information_about_the_user,
-    update_self_identity_mem_from_user_txt,
-    # learn_information_about_yourself_through_images,
-    # learn_information_about_yourself_through_tweets,
-    # learn_information_about_yourself_through_youtube_videos,
-    # learn_new_facts,
-    # retrieve_knowledge,
-    recall_memories,
-    create_episodic_memory,
-]
-
+from src.anubis.utils.deep_agent import build_avatar_deep_agent
 from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
-
 from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 
 """ NODES """
@@ -238,59 +202,138 @@ async def terms_and_services_content_moderation(
 async def think(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
-    """Build a model, agent, and dynamic system prompt to load the identity of the assistant into the assistant's current state of consciousness"""
+    """Drive the avatar's deep agent and stream only the final user-visible reply.
 
-    """ CREATE MODEL """
+    Replaces the old single-LLM-call ``think`` node + ``process_thoughts``
+    tool loop. The deep agent (see ``build_avatar_deep_agent``) owns its
+    own internal loop: think → tool calls → tools execute → (optional
+    synthetic ``load_consciousness`` refresh) → think → ... until the
+    model emits an ``AIMessage`` with no tool calls.
 
-    # model invocation
-    # TODO: response_metrics_aggregation
-    avatar_model_with_tools = init_model(
-        context=runtime.context,
-        tools=identity_tools,
-    )
+    Streaming contract: same as the legacy node. ``assistant_token``
+    events are emitted only for token chunks belonging to an LLM call
+    that ultimately produces zero tool calls — i.e. the final reply.
+    Token chunks for tool-planning LLM calls are silently dropped.
 
-    # logger.info(f"breakpoint")
-    messages = state["system_message"] + state["messages"] + state["internal_thoughts"]
+    Returns:
+        Outer-graph state delta with:
 
-    # TODO: response_metrics_aggregation
+        - ``messages``: single final ``AIMessage`` (Go Emotions sentiment
+          metadata attached).
+        - ``internal_thoughts``: every intermediate ``AIMessage`` /
+          ``ToolMessage`` the deep agent produced, for auditing.
+        - ``system_message`` / identity-doc snapshots forwarded from the
+          deep agent's final state so the outer state stays in sync.
+    """
+    deep_agent = build_avatar_deep_agent(runtime.context)
+
+    deep_agent_input = {
+        "messages": list(state["messages"]),
+        "system_message": list(state.get("system_message") or []),
+        "user_identity_documents": list(state.get("user_identity_documents") or []),
+        "assistant_identity_documents": list(
+            state.get("assistant_identity_documents") or []
+        ),
+        "recalled_memory_documents": list(
+            state.get("recalled_memory_documents") or []
+        ),
+        "user_state": state["user_state"],
+        "assistant_state": state["assistant_state"],
+        "internal_thoughts": [],
+    }
+    input_messages_count = len(deep_agent_input["messages"])
+
     writer = get_stream_writer()
-    merged: AIMessageChunk | AIMessage | None = None
-    async for chunk in avatar_model_with_tools.astream(messages):
-        merged = chunk if merged is None else merged + chunk
-        # Stream only while the running merge has no tool calls, so tool turns do not
-        # emit assistant_token events meant for the final user-visible reply.
-        if not (getattr(merged, "tool_calls", None) or []):
-            delta = chunk.content
-            if isinstance(delta, str) and delta:
-                writer({"type": "assistant_token", "text": delta})
-    assert merged is not None
-    response = _coalesce_ai_message(merged)
-    avatar_response_content = getattr(response, "content")
-    logger.info(f"Avatar Model Response: {avatar_response_content}")
-    if response.tool_calls:
-        return {"internal_thoughts": [response]}
-    _attach_go_emotions_metadata(response)
-    return {"internal_thoughts": [response], "messages": [response]}
+    # Per-LLM-call streaming buffers keyed by `run_id`. We emit tokens
+    # incrementally as long as the running merged chunk shows no
+    # tool_calls — once one appears, we know this call is a tool-planning
+    # turn and silently drop the rest. Same heuristic the legacy node used,
+    # applied independently to each LLM call in the deep agent's loop.
+    stream_buffers: dict[str, dict[str, Any]] = {}
+    final_output: dict[str, Any] | None = None
 
-process_thoughts = ToolNode(
-    messages_key="internal_thoughts", tools=identity_tools, handle_tool_errors=True
-)
+    async for event in deep_agent.astream_events(
+        deep_agent_input,
+        config=config,
+        context=runtime.context,
+        version="v2",
+    ):
+        ev_name = event.get("event")
+        if ev_name == "on_chat_model_stream":
+            run_id = event.get("run_id")
+            chunk = event["data"].get("chunk")
+            if chunk is None or run_id is None:
+                continue
+            buf = stream_buffers.setdefault(
+                run_id, {"merged": None, "streamed_text": False}
+            )
+            merged_prev = buf["merged"]
+            buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
+            if not (getattr(buf["merged"], "tool_calls", None) or []):
+                delta = chunk.content
+                if isinstance(delta, str) and delta:
+                    writer({"type": "assistant_token", "text": delta})
+                    buf["streamed_text"] = True
+        elif ev_name == "on_chat_model_end":
+            stream_buffers.pop(event.get("run_id"), None)
+        elif ev_name == "on_chain_end":
+            # Capture the outermost graph's terminal output. The deep
+            # agent's compiled graph is the chain we're streaming; its
+            # final on_chain_end event carries the resulting state.
+            data = event.get("data") or {}
+            output = data.get("output")
+            if isinstance(output, dict) and "messages" in output:
+                final_output = output
 
-async def considering(
-    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
-) -> Literal["process_thoughts", "__end__"]:
-    recent_thought = state["internal_thoughts"][-1]
-    if recent_thought.tool_calls:
-        return "process_thoughts"
-    return END
+    if final_output is None:
+        logger.warning(
+            "Deep agent produced no final output; returning empty state delta."
+        )
+        return {}
 
-# async def evaluate_response_quality()
+    all_messages = list(final_output.get("messages") or [])
+    new_messages = all_messages[input_messages_count:]
+    if not new_messages:
+        logger.warning(
+            "Deep agent produced no new messages; returning empty state delta."
+        )
+        return {}
 
-# async def update_response_metadata()
+    final_message = new_messages[-1]
+    intermediate = new_messages[:-1]
+
+    if isinstance(final_message, AIMessage) and not final_message.tool_calls:
+        _attach_go_emotions_metadata(final_message)
+        logger.info(
+            "Avatar Model Response: %s", getattr(final_message, "content", "")
+        )
+    else:
+        logger.warning(
+            "Deep agent final message is not a clean AIMessage; type=%s tool_calls=%s",
+            type(final_message).__name__,
+            getattr(final_message, "tool_calls", None),
+        )
+
+    update: dict[str, Any] = {
+        "messages": [final_message],
+        "internal_thoughts": [*intermediate, final_message],
+    }
+
+    for key in (
+        "system_message",
+        "user_identity_documents",
+        "assistant_identity_documents",
+        "recalled_memory_documents",
+    ):
+        if key in final_output and final_output[key] is not None:
+            update[key] = final_output[key]
+
+    return update
+
 
 """ GRAPH """
 
-# Build minimal graph: START -> agent -> END
+# Build minimal graph: START -> load_consciousness -> think -> END
 anubis_workflow = StateGraph(
     state_schema=GlobalState,
     input_schema=GlobalState,
@@ -300,26 +343,14 @@ anubis_workflow = StateGraph(
 
 """ ANUBIS WORKFLOW NODES """
 
-# workflow.add_node("terms_and_services_content_moderation", terms_and_services_content_moderation)
-
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("think", think)
-anubis_workflow.add_node("process_thoughts", process_thoughts)
-
-# workflow.add_node("evaluate_response_quality", evaluate_response_quality)
-
-# workflow.add_node("update_response_metadata", update_response_metadata)
 
 """ ANUBIS WORKFLOW EDGES """
 
 anubis_workflow.add_edge(START, "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "think")
-
-anubis_workflow.add_conditional_edges(
-    "think", considering, {"process_thoughts": "process_thoughts", END: END}
-)
-anubis_workflow.add_edge("process_thoughts", "load_consciousness")
-# anubis_workflow.add_edge("avatar_tool_node", "load_consciousness")
+anubis_workflow.add_edge("think", END)
 
 # workflow.add_edge("chat", "terms_and_services_content_moderation")
 

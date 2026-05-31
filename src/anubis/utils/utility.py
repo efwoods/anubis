@@ -1100,8 +1100,7 @@ def _select_dominant_speaker_segments(
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
 
-    if len(totals) == 1:
-        return None
+
 
     target_speaker = sorted(
         first_seen, key=lambda s: (-totals[s], first_seen.index(s))

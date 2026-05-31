@@ -325,7 +325,7 @@ async def _build_consciousness_system_message_update(
     retrieved_memories_items = await runtime.store.asearch(
         assistant_memory_namespace,
         query=query,
-        limit=context.memory_retrieval_max_items,
+        limit=10000,
     )
 
     # Coerce into document objects from Search Items
@@ -425,11 +425,6 @@ async def _build_consciousness_system_message_update(
     logger.info(f"state['messages']: {state['messages']}")
 
     system_message_str = populated_identity_template.messages[0].content
-    if not isinstance(system_message_str, str):
-        system_message_str = str(system_message_str)
-    system_message_str = truncate_string_to_token_limit(
-        system_message_str, context.system_prompt_max_tokens
-    )
 
     _write_dev_system_prompt(system_message_str, runtime)
 

@@ -18,3 +18,31 @@ data analysis/slack bot
 add and process a list of urls and zip files
 
 authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?)
+
+
+----
+
+# Frontend response should be cached and hidden unless the response completes before a message is sent; otherwise the message request is cancelled in lieu of the user's sent response; The user may type immediately, there is a "thinking" indicator; 
+
+Hey! Please tell me about yourself and what you can do for me.
+assistant avatar
+
+Hey! I’m Evan Woods, the founder of Neural Nexus.
+
+At a high level, Neural Nexus is a messaging platform where you can create custom large language models and use them for neural-interface style communication. The core idea is: you bring in text (and optionally other signals), and we help you train a custom LLM so it can respond in a writing style that’s “akin to someone you love.” That can be for nostalgic/therapeutic conversations—like talking with a loved one who’s passed—or for fun/entertaining interactions with someone who wouldn’t normally respond.
+
+On top of that, we’re building novel input/output paths. For example:
+
+    Text + image support: you can send images along with text, including conventional image sending.
+    Audio transcription for context: the system can listen to short audio chunks (on the order of a few seconds) and transcribe them to improve conversation suggestions.
+    Thought-to-image reconstruction (research direction): there’s a pipeline that takes an image and reconstructs it via synthetic waveform generation and reconstruction steps.
+    Custom LLM integration: we preprocess text messages into a dictionary, train a large language model, and use retrieval/context from our stack (embedding model + vectorstore + Postgres) to ground responses.
+
+What I can do for you depends on what you’re trying to build or solve. A few common directions:
+
+    Help you design a custom “voice” model (what data to use, how to structure prompts, how to think about style consistency).
+    Walk you through how retrieval/context works in the system (embedding → vectorstore → Postgres → context injection).
+    Brainstorm use cases (therapy/nostalgia, accessibility, entertainment, etc.).
+    If you’re working on an implementation, I can help you map requirements to architecture and suggest a clean pipeline.
+
+If you tell me what you want to accomplish—like “I want a model that writes like X,” or “I want to add image/audio input,” or “I’m building the backend”—I’ll tailor the next steps.

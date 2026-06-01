@@ -196,7 +196,9 @@ async def batch_index_documents_vectorstore(
                 stored_filename = (
                     metadata.get("namespace_filename") if isinstance(metadata, dict) else None
                 )
-                if isinstance(stored_filename, str) and stored_filename in incoming_filenames:
+                is_reference_audio = metadata.get("reference_audio", False)
+                is_reference_image = metadata.get("reference_image", False)
+                if isinstance(stored_filename, str) and stored_filename in incoming_filenames and not (is_reference_audio or is_reference_image):
                     to_delete.append((item.namespace, item.key))
 
             for ns, key in to_delete:

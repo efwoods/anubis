@@ -83,6 +83,6 @@ langgraph-api-prod-1  | 2026-05-19T16:01:31.890987Z [info     ] POST /update_ava
 
 
 
-# BUGS
-## LOGS ARE NOT BEING CHUNKED AND ARE TOO LONG FOR A RESPONSE FROM THE SYSTEM PROMPT
-## err.lg is not showing on /list_avatar_documents yet was uploaded
+# javascript is required for url uploads:
+Test: 
+https://eportfolio.mygreatlearning.com/evan-woods

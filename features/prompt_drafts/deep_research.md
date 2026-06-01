@@ -1,3 +1,5 @@
+https://docs.langchain.com/oss/python/deepagents/deep-research
+
 given a name of an entity, curate a list of information about the entity and extract information from the sources for identity creation (vectorstore loading, analysis, adapter creation)
 https://academy.langchain.com/courses/deep-research-with-langgraph
 https://github.com/langchain-ai/deep_research_from_scratch

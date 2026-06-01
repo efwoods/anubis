@@ -18,3 +18,5 @@ data analysis/slack bot
 add and process a list of urls and zip files
 
 authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?)
+
+STREAMLIT: USE FACIAL RECOGNITION/VOICE RECOGNITION FOR LOGIN RATHER THAN TRADITIONAL EMAIL SYSTEMS (PERMISSION IS GRANTED FROM THE WEBSITE TO USE CAMERA AND MIC; THERE IS AN AVATAR THAT COMMUNICATES PRIVACY AND TERMS OF SERVICE;  A REFERENCE IMAGE IS CAPTURED, REFERENCE AUDIO IS CAPTURED; THIS IS USED IN LIEU FOR LOGIN and signup)

@@ -328,7 +328,7 @@ import os
 import re
 
 
-async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: str = ".") -> str:
+async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: Optional[str] = None) -> str:
     """
     Download transcript/subtitles from a YouTube video.
 
@@ -336,30 +336,42 @@ async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True
         url: YouTube video URL
         lang: Language code (e.g., 'en', 'es', 'fr')
         auto_subs: Fall back to auto-generated subtitles if manual not found
-        output_dir: Directory to save files
+        output_dir: Directory to save files. Defaults to a fresh temp dir per call
+            so concurrent downloads never pick up each other's ``.vtt`` files.
 
     Returns:
         Path to the downloaded subtitle file
     """
+    # Each call gets an isolated directory: the batch pipeline downloads many
+    # videos in parallel, and the previous "write to '.' then grab the first
+    # *.vtt" approach raced (one video's transcript shadowing another's).
+    out_dir = output_dir or tempfile.mkdtemp(prefix="yt_subs_")
+
     ydl_opts = {
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": auto_subs,
         "subtitleslangs": [lang],
         "subtitlesformat": "vtt",
-        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "no_warnings": False,
     }
 
-    async with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get("title", "video")
+    # yt_dlp.YoutubeDL is a *synchronous* context manager and extract_info blocks,
+    # so run it off the event loop in a worker thread (the same pattern used by
+    # the audio-download and playlist-extraction paths).
+    def _extract() -> str:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "video")
 
-    # Find the downloaded .vtt file
-    for f in os.listdir(output_dir):
+    title = await asyncio.to_thread(_extract)
+
+    # Find the downloaded .vtt file in this call's own directory.
+    for f in os.listdir(out_dir):
         if f.endswith(".vtt"):
-            return os.path.join(output_dir, f)
+            return os.path.join(out_dir, f)
 
     raise FileNotFoundError(f"No subtitle file found for '{title}'. "
                             "Try listing available languages first.")
@@ -417,7 +429,7 @@ def list_available_subtitles(url: str) -> dict:
 
 
 # This needs to be in-memory rather than using file storage
-def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
+async def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
     """
     High-level function: download + parse transcript, return plain text.
 
@@ -430,7 +442,7 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
         Transcript as a plain text string
     """
     print(f"Downloading subtitles for: {url}")
-    vtt_path = download_transcript(url, lang=lang)
+    vtt_path = await download_transcript(url, lang=lang)
 
     print(f"Parsing: {vtt_path}")
     transcript = parse_vtt(vtt_path)

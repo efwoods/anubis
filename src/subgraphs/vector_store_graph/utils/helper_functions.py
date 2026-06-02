@@ -196,8 +196,27 @@ async def batch_index_documents_vectorstore(
                 stored_filename = (
                     metadata.get("namespace_filename") if isinstance(metadata, dict) else None
                 )
-                if isinstance(stored_filename, str) and stored_filename in incoming_filenames:
-                    to_delete.append((item.namespace, item.key))
+                if not (isinstance(stored_filename, str) and stored_filename in incoming_filenames):
+                    continue
+                # Never sweep away reference assets here. A reference image/audio
+                # clip deliberately carries the *source file's* namespace_filename,
+                # so a dissimilar reference upload (whose own content is also indexed
+                # under that filename) would otherwise delete its own reference clip.
+                # Reference assets live in dedicated namespaces and are removed only
+                # by an explicit delete or a new reference upload.
+                item_ns = getattr(item, "namespace", None) or ()
+                ns_category = item_ns[2] if len(item_ns) >= 3 else None
+                is_reference = (
+                    ns_category in ("reference_audio", "reference_image")
+                    or (isinstance(metadata, dict)
+                        and (metadata.get("reference_audio")
+                             or metadata.get("reference_image")
+                             or metadata.get("namespace")
+                             in ("reference_audio", "reference_image")))
+                )
+                if is_reference:
+                    continue
+                to_delete.append((item.namespace, item.key))
 
             for ns, key in to_delete:
                 try:

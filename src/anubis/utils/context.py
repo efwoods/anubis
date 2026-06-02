@@ -261,6 +261,13 @@ class GlobalContext:
         },
     )
 
+    media_processing_concurrency: int = field(
+        default=5,
+        metadata={
+            "description": "Max media items converted in parallel inside process_media_graph (bounds OpenAI diarization / yt_dlp fan-out so a large playlist or batch upload does not exhaust rate limits or memory). Env MEDIA_PROCESSING_CONCURRENCY."
+        },
+    )
+
     audio_transcription_model: str = field(
         default=None, metadata={"description": "Audio transcription model name."}
     )

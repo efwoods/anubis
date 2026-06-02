@@ -71,9 +71,11 @@ from src.security.auth import (
 
 from src.api.media_jobs import (
     MediaJob,
-    create_job,
+    create_child_job,
+    create_master_job,
     get_job,
-    run_media_job,
+    request_cancel,
+    run_batch_media_job,
 )
 
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -2001,10 +2003,551 @@ async def get_avatar_reference_image(
     )
     
 from typing import Optional
+
+
+_MANIFEST_TEXT_MIMES = frozenset(
+    {"text/plain", "text/markdown", "application/octet-stream"}
+)
+
+
+def _looks_like_manifest_candidate(filename: str, mime_type: str) -> bool:
+    """True for uploads that could be a newline-delimited URL list (.txt/.md).
+
+    CSVs are handled separately and excluded by the caller. Octet-stream is
+    allowed because browsers often send .txt/.md that way.
+    """
+    name = (filename or "").lower()
+    return (
+        mime_type in _MANIFEST_TEXT_MIMES
+        or mime_type.startswith("text/")
+        or name.endswith(".txt")
+        or name.endswith(".md")
+    )
+
+
+def _extract_manifest_urls(raw: bytes) -> List[str]:
+    """Pull the http(s) URLs out of a text/markdown manifest.
+
+    A line counts only if, stripped, it is *itself* a single URL — name/header
+    lines (e.g. ``Gracie Abrams``) and prose are ignored, so the same parser
+    handles a pure list (``confirmed_search_results_list.txt``) and a
+    name+URL playlist list. Returns ``[]`` when no bare-URL line is present, in
+    which case the caller ingests the file as an ordinary text document.
+    Order is preserved and duplicates dropped.
+    """
+    from urllib.parse import urlparse
+
+    text = raw.decode("utf-8", errors="replace")
+    seen: set[str] = set()
+    urls: List[str] = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#"):
+            continue
+        # Markdown bullets / numbering before a bare URL: strip common prefixes.
+        candidate = candidate.lstrip("-*•").strip()
+        try:
+            parsed = urlparse(candidate)
+        except Exception:
+            continue
+        if parsed.scheme in ("http", "https") and parsed.netloc and " " not in candidate:
+            if candidate not in seen:
+                seen.add(candidate)
+                urls.append(candidate)
+    return urls
+
+
+def _collect_input_urls(raw_url_field: Any) -> List[str]:
+    """Flatten the ``url`` form field into an ordered, de-duplicated list of URLs.
+
+    The field may arrive as a single string or as repeated ``url=`` form fields
+    (FastAPI gives us ``list[str]``), and each value may itself hold several URLs
+    pasted one-per-line (or whitespace-separated). Non-URL tokens — e.g. a name
+    line above a playlist link — are ignored, mirroring ``_extract_manifest_urls``
+    so the same paste works in the field or in an uploaded manifest. Order is
+    preserved and duplicates dropped.
+    """
+    from urllib.parse import urlparse
+
+    if raw_url_field is None:
+        values: List[str] = []
+    elif isinstance(raw_url_field, str):
+        values = [raw_url_field]
+    else:
+        values = [v for v in raw_url_field if isinstance(v, str)]
+
+    seen: set[str] = set()
+    urls: List[str] = []
+    for value in values:
+        for token in re.split(r"\s+", value or ""):
+            candidate = token.strip().strip("<>\"'").lstrip("-*•").strip()
+            if not candidate:
+                continue
+            try:
+                parsed = urlparse(candidate)
+            except Exception:
+                continue
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                if candidate not in seen:
+                    seen.add(candidate)
+                    urls.append(candidate)
+    return urls
+
+
+def _lightweight_url_media_entry(
+    url_clean: str, *, user_id: str, assistant_id: str
+) -> dict:
+    """A generic ``page_url`` entry for bulk URLs — no upfront content-type probe.
+
+    The media graph's ``URLDocumentLoaderClass`` classifies and expands it
+    (youtube/playlist/twitter/instagram/twitch/linktree/article). Used for every
+    URL in a multi-input or manifest request so the endpoint can return 202 fast
+    instead of probing hundreds of URLs serially.
+    """
+    return {
+        "filename": url_clean,
+        "content_type": "text/html",
+        "content": b"",
+        "page_url": url_clean,
+        "user_id": user_id,
+        "assistant_id": assistant_id,
+        "reference_audio": False,
+        "reference_image": False,
+        "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+    }
+
+
+async def _build_media_entries_for_file(
+    raw_name: str,
+    content: bytes,
+    mime_type: str,
+    *,
+    reference_image: bool,
+    reference_audio: bool,
+    user_id: str,
+    assistant_id: str,
+) -> list:
+    """Build the ``media_files`` entries for a single uploaded file.
+
+    Extracted verbatim from the original single-file branch so it can run per
+    file in a multi-file request. Raises ``HTTPException`` on unsupported types.
+    """
+    entries: list = []
+    if not reference_image and not reference_audio and _is_csv_upload(
+        raw_name, mime_type
+    ):
+        csv_payload = await _csv_to_statements_payload(
+            raw=content, source_filename=raw_name
+        )
+        entries.append(
+            _build_csv_statements_media_entry(
+                payload=csv_payload,
+                source_filename=raw_name,
+                user_id=user_id,
+                assistant_id=assistant_id,
+            )
+        )
+    elif reference_image:
+        if mime_type.startswith("audio/"):
+            raise HTTPException(
+                status_code=400,
+                detail="reference_image requires an image file, not audio.",
+            )
+        mime = validate_upload_image_bytes(mime_type, content)
+        entries.append(
+            {
+                "filename": raw_name,
+                "content_type": mime,
+                "content": content,
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "reference_audio": False,
+                "reference_image": True,
+                "base64_encoded_str": make_data_uri(mime, content),
+                "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+            }
+        )
+    elif reference_audio:
+        if mime_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail="reference_audio requires an audio file, not an image.",
+            )
+        sniff = _sniff_media_category_from_bytes(content[:512])
+        effective = mime_type
+        if mime_type == "application/octet-stream":
+            if not sniff or not sniff.startswith("audio/"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not determine an audio type from the upload.",
+                )
+            effective = sniff
+        elif not mime_type.startswith("audio/") and not mime_type.startswith("video/"):
+            raise HTTPException(
+                status_code=400,
+                detail="reference_audio requires an audio or video Content-Type.",
+            )
+        entries.append(
+            {
+                "filename": raw_name,
+                "content_type": effective,
+                "content": content,
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "reference_audio": True,
+                "reference_image": False,
+                "base64_encoded_str": make_data_uri(effective, content),
+                "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+            }
+        )
+    else:
+        sniff = _sniff_media_category_from_bytes(content[:512])
+        if mime_type.startswith("image/") or (
+            mime_type == "application/octet-stream"
+            and sniff in ALLOWED_IMAGE_MIMES
+        ):
+            mime = validate_upload_image_bytes(mime_type, content)
+            entries.append(
+                {
+                    "filename": raw_name,
+                    "content_type": mime,
+                    "content": content,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(mime, content),
+                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                }
+            )
+        elif mime_type.startswith("audio/") or (
+            mime_type == "application/octet-stream"
+            and sniff
+            and sniff.startswith("audio/")
+        ):
+            effective = (
+                mime_type
+                if mime_type.startswith("audio/")
+                else (sniff or mime_type)
+            )
+            if not effective.startswith("audio/"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Expected an audio upload.",
+                )
+            entries.append(
+                {
+                    "filename": raw_name,
+                    "content_type": effective,
+                    "content": content,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(effective, content),
+                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                }
+            )
+        elif mime_type.startswith("video/"):
+            entries.append(
+                {
+                    "filename": raw_name,
+                    "content_type": mime_type,
+                    "content": content,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(mime_type, content),
+                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                }
+            )
+        elif mime_type == "application/pdf":
+            entries.append(
+                {
+                    "filename": raw_name,
+                    "content_type": mime_type,
+                    "content": content,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(mime_type, content),
+                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                }
+            )
+        elif mime_type in (
+            "text/plain",
+            "application/json",
+            "text/markdown",
+            "application/octet-stream",
+        ) or mime_type.startswith("text/") or (
+            raw_name or ""
+        ).lower().endswith(".log"):
+            entries.append(
+                {
+                    "filename": raw_name,
+                    "content_type": mime_type,
+                    "content": content,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(mime_type, content),
+                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported upload Content-Type {mime_type!r}.",
+            )
+    return entries
+
+
+async def _build_media_entries_for_url(
+    url_clean: str,
+    *,
+    reference_image: bool,
+    reference_audio: bool,
+    user_id: str,
+    assistant_id: str,
+    rich: bool,
+) -> list:
+    """Build the ``media_files`` entries for a single URL.
+
+    ``rich=True`` runs the original per-URL content-type probing path (handles
+    direct image/audio/video/csv URLs and reference flags) — used for a lone URL
+    request. ``rich=False`` returns one lightweight ``page_url`` entry that the
+    media graph classifies, avoiding an upfront probe per URL in bulk requests.
+    """
+    if not rich:
+        return [
+            _lightweight_url_media_entry(
+                url_clean, user_id=user_id, assistant_id=assistant_id
+            )
+        ]
+
+    entries: list = []
+    namespace_safe_formatted_filename = _namespace_safe_formatted_filename(url_clean)
+
+    if reference_image:
+        body, header_ct = await fetch_remote_url_bytes(url_clean)
+        img_mime = validate_upload_image_bytes(header_ct, body)
+        entries.append(
+            {
+                "filename": url_clean,
+                "content_type": img_mime,
+                "content": b"",
+                "image_url": url_clean,
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "reference_audio": False,
+                "reference_image": True,
+                "base64_encoded_str": make_data_uri(img_mime, body),
+                "namespace_filename": namespace_safe_formatted_filename if not "." in namespace_safe_formatted_filename else _namespace_safe_formatted_filename(namespace_safe_formatted_filename),
+            }
+        )
+    elif reference_audio:
+        # YouTube watch pages report Content-Type: text/html. Bypass the
+        # audio/* guard for those by pulling the audio track via yt_dlp.
+        if _is_youtube_url(url_clean):
+            from src.anubis.utils.classes.URLDocumentLoaderClass import (
+                _download_youtube_audio_b64,
+            )
+
+            audio_data_uri, _suffix = await _download_youtube_audio_b64(url_clean)
+            if not audio_data_uri:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not extract audio from YouTube URL.",
+                )
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": "audio/mp3",
+                    "content": b"",
+                    "audio_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": True,
+                    "reference_image": False,
+                    "base64_encoded_str": audio_data_uri,
+                    "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+        else:
+            await require_url_content_type_prefix(
+                url_clean, "audio/", "Reference audio"
+            )
+            body, header_ct = await fetch_remote_url_bytes(url_clean)
+            sniff = _sniff_media_category_from_bytes(body[:512])
+            audio_mime = (
+                header_ct
+                if header_ct.startswith("audio/")
+                else (sniff if sniff.startswith("audio/") else header_ct)
+            )
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": audio_mime,
+                    "content": b"",
+                    "audio_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": True,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(audio_mime, body),
+                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+    else:
+        # YouTube URLs probe as text/html but their payload is video/audio.
+        # Route them directly to the URL pipeline so URLDocumentLoaderClass
+        # can pull subtitles or audio via yt_dlp without us first
+        # downloading the HTML page.
+        if _is_youtube_url(url_clean):
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": "text/html",
+                    "content": b"",
+                    "page_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "namespace_filename": _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+            ct = ""  # skip the per-Content-Type branches below
+        else:
+            ct = await probe_remote_url_content_type(url_clean)
+        if not ct:
+            pass
+        elif _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
+            body, _header_ct = await fetch_remote_url_bytes(url_clean)
+            csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
+                f"{namespace_safe_formatted_filename or 'remote_table'}.csv"
+            )
+            csv_payload = await _csv_to_statements_payload(
+                raw=body, source_filename=csv_filename
+            )
+            entries.append(
+                _build_csv_statements_media_entry(
+                    payload=csv_payload,
+                    source_filename=csv_filename,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                )
+            )
+        elif ct.startswith("image/"):
+            body, header_ct = await fetch_remote_url_bytes(url_clean)
+            img_mime = validate_upload_image_bytes(header_ct, body)
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": img_mime,
+                    "content": b"",
+                    "image_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(img_mime, body),
+                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+        elif ct.startswith("audio/"):
+            body, header_ct = await fetch_remote_url_bytes(url_clean)
+            sniff = _sniff_media_category_from_bytes(body[:512])
+            audio_mime = (
+                header_ct
+                if header_ct.startswith("audio/")
+                else (sniff if sniff.startswith("audio/") else ct)
+            )
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": audio_mime,
+                    "content": b"",
+                    "audio_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(audio_mime, body),
+                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+        elif ct.startswith("video/"):
+            body, header_ct = await fetch_remote_url_bytes(url_clean)
+            video_mime = (
+                header_ct if header_ct.startswith("video/") else ct
+            )
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": video_mime,
+                    "content": b"",
+                    "video_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(video_mime, body),
+                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+        elif ct.startswith("text/") or ct in (
+            "application/json",
+            "application/xml",
+            "application/xhtml+xml",
+            "application/javascript",
+            "application/ld+json",
+        ):
+            body, header_ct = await fetch_remote_url_bytes(url_clean)
+            doc_mime = (
+                header_ct
+                if (
+                    header_ct.startswith("text/")
+                    or header_ct
+                    in (
+                        "application/json",
+                        "application/xml",
+                        "application/xhtml+xml",
+                        "application/javascript",
+                        "application/ld+json",
+                    )
+                )
+                else ct
+            )
+            entries.append(
+                {
+                    "filename": url_clean,
+                    "content_type": doc_mime,
+                    "content": b"",
+                    "page_url": url_clean,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(doc_mime, body),
+                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not map URL to a supported media type (Content-Type: {ct!r}).",
+            )
+    return entries
+
+
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: OptionalUploadFiles = None,
-    url: Annotated[Optional[str], Form()] = None,
+    url: Annotated[Optional[List[str]], Form()] = None,
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
@@ -2014,14 +2557,26 @@ async def update_avatar_identity_with_media(
     """
     Upload media for processing and indexing.
 
-    Send **exactly one** of: a single file in ``files``, **or** a ``url`` (never both, never neither).
+    Accepts **any mix** of files and URLs in a single request — multiple files in
+    ``files`` and/or one or more URLs in ``url`` (repeated ``url=`` fields and/or
+    several URLs pasted one-per-line into a single field both work). A ``.txt`` /
+    ``.md`` file whose lines are bare URLs is treated as a **manifest**: its URLs
+    are expanded and processed individually (name/header lines are ignored), so a
+    saved list like ``confirmed_search_results_list.txt`` works the same as pasting
+    the URLs. A YouTube **playlist** URL expands into its videos inside the media
+    graph. Every item is processed in parallel (bounded by
+    ``media_processing_concurrency``); items whose key already exists for this
+    avatar (see ``/list_avatar_documents``) are **skipped**, so re-uploading a
+    large playlist only processes new entries. The endpoint returns ``202`` with a
+    ``job_id`` immediately; progress streams from ``GET /media_job/{job_id}/progress``.
 
     Images must use real MIME types: ``image/jpeg``, ``image/png``, ``image/gif`` (non-animated),
     or ``image/webp`` (non-animated). Proprietary vs biographical classification is done inside
     the processing pipeline via structured model output (no ``proprietary_content`` flag).
 
-    With **reference_image=true**, the file or URL must be an allowed still image.
-    With **reference_audio=true**, the file or URL must resolve to ``audio/*``.
+    With **reference_image=true** or **reference_audio=true** the request must carry
+    **exactly one** file or URL (a reference clip/image is a single item): the file
+    or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
     """
     try:
         user_id = current_user["identities"][0]["user_id"]
@@ -2073,512 +2628,255 @@ async def update_avatar_identity_with_media(
         non_empty_files = [
             f for f in upload_list if (getattr(f, "filename", None) or "").strip()
         ]
-        url_clean = (url or "").strip()
+        # ``url`` may arrive as one field, repeated ``url=`` fields, or several URLs
+        # pasted one-per-line into a single field. Flatten to an ordered,
+        # de-duplicated list of bare URLs (name/header lines ignored).
+        input_urls = _collect_input_urls(url)
 
-        if url_clean and non_empty_files:
+        if not non_empty_files and not input_urls:
             raise HTTPException(
                 status_code=400,
-                detail="Send either exactly one file or a url, not both.",
+                detail="Send at least one file or url.",
             )
-        if not url_clean and not non_empty_files:
-            raise HTTPException(
-                status_code=400,
-                detail="Send exactly one file or a url.",
-            )
-        if not url_clean and len(non_empty_files) != 1:
-            raise HTTPException(
-                status_code=400,
-                detail="Send exactly one file, or use the url field instead.",
-            )
-
         if reference_image and reference_audio:
             raise HTTPException(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
             )
 
+        reference_mode = reference_image or reference_audio
+        if reference_mode and (len(non_empty_files) + len(input_urls)) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "reference_image/reference_audio requires exactly one file or "
+                    "url (a reference clip or image is a single item)."
+                ),
+            )
+
         media_files: list = []
 
-        if non_empty_files:
-            uf = non_empty_files[0]
-            content = await uf.read()
-            raw_name = uf.filename
-            mime_type = (uf.content_type or "application/octet-stream").split(";")[
-                0
-            ].strip().lower()
-
-            if not reference_image and not reference_audio and _is_csv_upload(
-                raw_name, mime_type
-            ):
-                csv_payload = await _csv_to_statements_payload(
-                    raw=content, source_filename=raw_name
-                )
-                media_files.append(
-                    _build_csv_statements_media_entry(
-                        payload=csv_payload,
-                        source_filename=raw_name,
+        if reference_mode:
+            # Exactly one input (guarded above). No manifest expansion in reference
+            # mode — a reference must be a single image/audio item.
+            if non_empty_files:
+                uf = non_empty_files[0]
+                content = await uf.read()
+                mime_type = (uf.content_type or "application/octet-stream").split(
+                    ";"
+                )[0].strip().lower()
+                media_files.extend(
+                    await _build_media_entries_for_file(
+                        uf.filename,
+                        content,
+                        mime_type,
+                        reference_image=reference_image,
+                        reference_audio=reference_audio,
                         user_id=user_id,
                         assistant_id=assistant_id,
                     )
                 )
-            elif reference_image:
-                if mime_type.startswith("audio/"):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="reference_image requires an image file, not audio.",
-                    )
-                mime = validate_upload_image_bytes(mime_type, content)
-                media_files.append(
-                    {
-                        "filename": raw_name,
-                        "content_type": mime,
-                        "content": content,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_audio": False,
-                        "reference_image": True,
-                        "base64_encoded_str": make_data_uri(mime, content),
-                        "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                    }
-                )
-            elif reference_audio:
-                if mime_type.startswith("image/"):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="reference_audio requires an audio file, not an image.",
-                    )
-                sniff = _sniff_media_category_from_bytes(content[:512])
-                effective = mime_type
-                if mime_type == "application/octet-stream":
-                    if not sniff or not sniff.startswith("audio/"):
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Could not determine an audio type from the upload.",
-                        )
-                    effective = sniff
-                elif not mime_type.startswith("audio/") and not mime_type.startswith("video/"):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="reference_audio requires an audio or video Content-Type.",
-                    )
-                media_files.append(
-                    {
-                        "filename": raw_name,
-                        "content_type": effective,
-                        "content": content,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_audio": True,
-                        "reference_image": False,
-                        "base64_encoded_str": make_data_uri(effective, content),
-                        "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                    }
-                )
             else:
-                sniff = _sniff_media_category_from_bytes(content[:512])
-                if mime_type.startswith("image/") or (
-                    mime_type == "application/octet-stream"
-                    and sniff in ALLOWED_IMAGE_MIMES
-                ):
-                    mime = validate_upload_image_bytes(mime_type, content)
-                    media_files.append(
-                        {
-                            "filename": raw_name,
-                            "content_type": mime,
-                            "content": content,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(mime, content),
-                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                        }
+                media_files.extend(
+                    await _build_media_entries_for_url(
+                        input_urls[0],
+                        reference_image=reference_image,
+                        reference_audio=reference_audio,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        rich=True,
                     )
-                elif mime_type.startswith("audio/") or (
-                    mime_type == "application/octet-stream"
-                    and sniff
-                    and sniff.startswith("audio/")
-                ):
-                    effective = (
-                        mime_type
-                        if mime_type.startswith("audio/")
-                        else (sniff or mime_type)
-                    )
-                    if not effective.startswith("audio/"):
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Expected an audio upload.",
-                        )
-                    media_files.append(
-                        {
-                            "filename": raw_name,
-                            "content_type": effective,
-                            "content": content,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(effective, content),
-                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                        }
-                    )
-                elif mime_type.startswith("video/"):
-                    media_files.append(
-                        {
-                            "filename": raw_name,
-                            "content_type": mime_type,
-                            "content": content,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(mime_type, content),
-                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                        }
-                    )
-                elif mime_type == "application/pdf":
-                    media_files.append(
-                        {
-                            "filename": raw_name,
-                            "content_type": mime_type,
-                            "content": content,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(mime_type, content),
-                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                        }
-                    )
-                elif mime_type in (
-                    "text/plain",
-                    "application/json",
-                    "text/markdown",
-                    "application/octet-stream",
-                ) or mime_type.startswith("text/") or (
-                    raw_name or ""
-                ).lower().endswith(".log"):
-                    media_files.append(
-                        {
-                            "filename": raw_name,
-                            "content_type": mime_type,
-                            "content": content,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(mime_type, content),
-                            "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
-                        }
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unsupported upload Content-Type {mime_type!r}.",
-                    )
-
-        elif url_clean:
-            namespace_safe_formatted_filename = _namespace_safe_formatted_filename(url_clean)
-
-            if reference_image:
-                body, header_ct = await fetch_remote_url_bytes(url_clean)
-                img_mime = validate_upload_image_bytes(header_ct, body)
-                media_files.append(
-                    {
-                        "filename": url_clean,
-                        "content_type": img_mime,
-                        "content": b"",
-                        "image_url": url_clean,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_audio": False,
-                        "reference_image": True,
-                        "base64_encoded_str": make_data_uri(img_mime, body),
-                        "namespace_filename": namespace_safe_formatted_filename if not "." in namespace_safe_formatted_filename else _namespace_safe_formatted_filename(namespace_safe_formatted_filename),
-                    }
                 )
-            elif reference_audio:
-                # YouTube watch pages report Content-Type: text/html. Bypass the
-                # audio/* guard for those by pulling the audio track via yt_dlp.
-                if _is_youtube_url(url_clean):
-                    from src.anubis.utils.classes.URLDocumentLoaderClass import (
-                        _download_youtube_audio_b64,
-                    )
-
-                    audio_data_uri, _suffix = await _download_youtube_audio_b64(
-                        url_clean
-                    )
-                    if not audio_data_uri:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Could not extract audio from YouTube URL.",
-                        )
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": "audio/mp3",
-                            "content": b"",
-                            "audio_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": True,
-                            "reference_image": False,
-                            "base64_encoded_str": audio_data_uri,
-                            "namespace_filename": _namespace_safe_formatted_filename(url_clean),
-                        }
-                    )
-                else:
-                    await require_url_content_type_prefix(
-                        url_clean, "audio/", "Reference audio"
-                    )
-                    body, header_ct = await fetch_remote_url_bytes(url_clean)
-                    sniff = _sniff_media_category_from_bytes(body[:512])
-                    audio_mime = (
-                        header_ct
-                        if header_ct.startswith("audio/")
-                        else (sniff if sniff.startswith("audio/") else header_ct)
-                    )
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": audio_mime,
-                            "content": b"",
-                            "audio_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": True,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(audio_mime, body),
-                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                        }
-                    )
-            else:
-                # YouTube URLs probe as text/html but their payload is video/audio.
-                # Route them directly to the URL pipeline so URLDocumentLoaderClass
-                # can pull subtitles or audio via yt_dlp without us first
-                # downloading the HTML page.
-                if _is_youtube_url(url_clean):
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": "text/html",
-                            "content": b"",
-                            "page_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "namespace_filename": _namespace_safe_formatted_filename(url_clean),
-                        }
-                    )
-                    ct = ""  # skip the per-Content-Type branches below
-                else:
-                    ct = await probe_remote_url_content_type(url_clean)
-                if not ct:
-                    pass
-                elif _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
-                    body, _header_ct = await fetch_remote_url_bytes(url_clean)
-                    csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
-                        f"{namespace_safe_formatted_filename or 'remote_table'}.csv"
-                    )
-                    csv_payload = await _csv_to_statements_payload(
-                        raw=body, source_filename=csv_filename
-                    )
-                    media_files.append(
-                        _build_csv_statements_media_entry(
-                            payload=csv_payload,
-                            source_filename=csv_filename,
-                            user_id=user_id,
-                            assistant_id=assistant_id,
-                        )
-                    )
-                elif ct.startswith("image/"):
-                    body, header_ct = await fetch_remote_url_bytes(url_clean)
-                    img_mime = validate_upload_image_bytes(header_ct, body)
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": img_mime,
-                            "content": b"",
-                            "image_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(img_mime, body),
-                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                        }
-                    )
-                elif ct.startswith("audio/"):
-                    body, header_ct = await fetch_remote_url_bytes(url_clean)
-                    sniff = _sniff_media_category_from_bytes(body[:512])
-                    audio_mime = (
-                        header_ct
-                        if header_ct.startswith("audio/")
-                        else (sniff if sniff.startswith("audio/") else ct)
-                    )
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": audio_mime,
-                            "content": b"",
-                            "audio_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(audio_mime, body),
-                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                        }
-                    )
-                elif ct.startswith("video/"):
-                    body, header_ct = await fetch_remote_url_bytes(url_clean)
-                    video_mime = (
-                        header_ct if header_ct.startswith("video/") else ct
-                    )
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": video_mime,
-                            "content": b"",
-                            "video_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(video_mime, body),
-                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                        }
-                    )
-                elif ct.startswith("text/") or ct in (
-                    "application/json",
-                    "application/xml",
-                    "application/xhtml+xml",
-                    "application/javascript",
-                    "application/ld+json",
+        else:
+            # General path: build entries for every file (expanding any URL-manifest
+            # .txt/.md into its URLs) and every URL. A lone file/URL keeps the rich
+            # single-item path (direct image/audio/video/csv links + content
+            # probing); anything larger defers URL classification/expansion to the
+            # media graph so the endpoint returns 202 fast instead of probing
+            # hundreds of URLs serially. Each item is processed in parallel there.
+            file_entries: list = []
+            manifest_urls: list[str] = []
+            for uf in non_empty_files:
+                content = await uf.read()
+                raw_name = uf.filename
+                mime_type = (uf.content_type or "application/octet-stream").split(
+                    ";"
+                )[0].strip().lower()
+                # A .txt/.md (non-CSV) whose lines are bare URLs is a manifest:
+                # expand it into URLs instead of ingesting it as a text document.
+                if not _is_csv_upload(raw_name, mime_type) and (
+                    _looks_like_manifest_candidate(raw_name, mime_type)
                 ):
-                    body, header_ct = await fetch_remote_url_bytes(url_clean)
-                    doc_mime = (
-                        header_ct
-                        if (
-                            header_ct.startswith("text/")
-                            or header_ct
-                            in (
-                                "application/json",
-                                "application/xml",
-                                "application/xhtml+xml",
-                                "application/javascript",
-                                "application/ld+json",
-                            )
-                        )
-                        else ct
+                    extracted = _extract_manifest_urls(content)
+                    if extracted:
+                        manifest_urls.extend(extracted)
+                        continue
+                file_entries.extend(
+                    await _build_media_entries_for_file(
+                        raw_name,
+                        content,
+                        mime_type,
+                        reference_image=False,
+                        reference_audio=False,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
                     )
-                    media_files.append(
-                        {
-                            "filename": url_clean,
-                            "content_type": doc_mime,
-                            "content": b"",
-                            "page_url": url_clean,
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "reference_audio": False,
-                            "reference_image": False,
-                            "base64_encoded_str": make_data_uri(doc_mime, body),
-                            "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
-                        }
+                )
+
+            # Merge explicit + manifest URLs, de-duplicated, order preserved.
+            all_urls: list[str] = []
+            seen_urls: set[str] = set()
+            for u in (*input_urls, *manifest_urls):
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    all_urls.append(u)
+
+            # Probe each URL up front only for a single lone URL; bulk requests use
+            # lightweight entries the media graph classifies and expands.
+            rich_urls = len(file_entries) == 0 and len(all_urls) == 1
+            url_entries: list = []
+            for u in all_urls:
+                url_entries.extend(
+                    await _build_media_entries_for_url(
+                        u,
+                        reference_image=False,
+                        reference_audio=False,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        rich=rich_urls,
                     )
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Could not map URL to a supported media type (Content-Type: {ct!r}).",
-                    )
+                )
+
+            media_files = [*file_entries, *url_entries]
+
+        if not media_files:
+            raise HTTPException(
+                status_code=400,
+                detail="No processable media found in the request.",
+            )
 
         store = app.state.store
 
-        # Refuse to re-process a file whose name already exists in this avatar's
-        # store namespace. The store layout ((user_id, assistant_id, <category>))
-        # mirrors what /list_avatar_documents exposes; existing filenames are read
-        # from value.document.kwargs.metadata.filename. Duplicate uploads must be
-        # gated behind an explicit prior call to DELETE /delete_avatar_document so
-        # the operator confirms the destructive action and avoids duplicate index
-        # rows for the same source.
-        incoming_filenames: list[str] = [
-            (entry.get("namespace_filename") or "").strip() for entry in media_files
-        ]
-        incoming_filenames = [name for name in incoming_filenames if name]
-
-        if incoming_filenames:
-            try:
-                existing_items = await store.asearch(
-                    (user_id, assistant_id), limit=1_000_000
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "Could not verify whether this filename already exists "
-                        f"for the avatar: {exc}"
-                    ),
-                ) from exc
-
-            existing_filenames: set[str] = set()
-            for item in existing_items or []:
-                value = getattr(item, "value", None)
-                if value is None and isinstance(item, dict):
-                    value = item.get("value")
-                if not isinstance(value, dict):
-                    continue
-                document = value.get("document")
-                if not isinstance(document, dict):
-                    continue
-                kwargs_blob = document.get("kwargs")
-                if not isinstance(kwargs_blob, dict):
-                    continue
-                metadata = kwargs_blob.get("metadata")
-                if not isinstance(metadata, dict):
-                    continue
-                stored_filename = metadata.get("namespace_filename")
-                if isinstance(stored_filename, str) and stored_filename.strip():
-                    existing_filenames.add(stored_filename.strip())
-
-            duplicates = sorted(
-                {name for name in incoming_filenames if name in existing_filenames}
+        # Collect every namespace_filename already indexed for this avatar. The
+        # store layout ((user_id, assistant_id, <category>)) mirrors what
+        # /list_avatar_documents exposes; keys are read from
+        # value.document.kwargs.metadata.namespace_filename. This set is handed to
+        # the media graph, which skips any incoming item — or expanded playlist /
+        # linktree child — whose key is already present, so re-uploading a large
+        # playlist only processes new entries (the user's "skip what's already
+        # uploaded" requirement). To refresh an existing item, delete it first via
+        # DELETE /delete_avatar_document, then re-upload.
+        try:
+            existing_items = await store.asearch(
+                (user_id, assistant_id), limit=1_000_000
             )
-            if duplicates:
-                # Indexing now replaces rows by namespace_filename at commit time
-                # (see batch_index_documents_vectorstore), so re-uploads overwrite
-                # safely. The previous destructive up-front delete was removed:
-                # a crash after it but before reindexing lost the prior version
-                # with nothing to show for it.
-                logger.info(
-                    "Existing rows for these filenames will be replaced at index time: %s",
-                    duplicates,
-                )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Could not read this avatar's existing media to skip "
+                    f"already-indexed items: {exc}"
+                ),
+            ) from exc
+
+        existing_namespaces: set[str] = set()
+        for item in existing_items or []:
+            value = getattr(item, "value", None)
+            if value is None and isinstance(item, dict):
+                value = item.get("value")
+            if not isinstance(value, dict):
+                continue
+            document = value.get("document")
+            if not isinstance(document, dict):
+                continue
+            kwargs_blob = document.get("kwargs")
+            if not isinstance(kwargs_blob, dict):
+                continue
+            metadata = kwargs_blob.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            stored_filename = metadata.get("namespace_filename")
+            if isinstance(stored_filename, str) and stored_filename.strip():
+                existing_namespaces.add(stored_filename.strip())
+
+        incoming_filenames = [
+            name
+            for name in (
+                (entry.get("namespace_filename") or "").strip()
+                for entry in media_files
+            )
+            if name
+        ]
+        already_indexed = sorted(
+            {name for name in incoming_filenames if name in existing_namespaces}
+        )
+        if already_indexed:
+            logger.info(
+                "Skipping %d top-level item(s) already indexed for this avatar: %s",
+                len(already_indexed),
+                already_indexed,
+            )
 
         # Media processing (diarization, PDFs, YouTube playlists, indexing) can run
         # well past the request timeout, so start it as a background job and return
-        # immediately. Progress is streamed via GET /media_job/{job_id}/progress.
-        # Bytes were already read into ``media_files`` above, and ``store`` /
-        # ``context`` are long-lived app resources, so the task is safe after return.
-        job = create_job(app.state.media_jobs, user_id, assistant_id)
-        job.task = asyncio.create_task(
-            run_media_job(
-                job,
-                media_files,
+        # immediately. Each top-level item gets its own child job (its own progress
+        # stream + independently cancellable); a master job aggregates them and is
+        # the handle to cancel the whole batch. Progress is streamed via
+        # GET /media_job/{job_id}/progress for either id; cancel via
+        # POST /media_job/{job_id}/cancel. Bytes are already in ``media_files`` and
+        # ``store`` / ``context`` are long-lived app resources, so the task is safe
+        # after return. ``existing_namespaces`` lets the graph skip already-indexed
+        # items and the children that expand from playlists/linktrees.
+        registry = app.state.media_jobs
+        master = create_master_job(registry, user_id, assistant_id)
+
+        items: list = []
+        item_descriptors: list = []
+        for media_file in media_files:
+            child = create_child_job(
+                registry,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                parent_id=master.job_id,
+                filename=media_file.get("filename"),
+                namespace_filename=media_file.get("namespace_filename"),
+            )
+            master.child_ids.append(child.job_id)
+            items.append({"child": child, "media_file": media_file})
+            item_descriptors.append(
+                {
+                    "job_id": child.job_id,
+                    "filename": child.filename,
+                    "status": child.status,
+                    "progress_url": f"/media_job/{child.job_id}/progress",
+                    "cancel_url": f"/media_job/{child.job_id}/cancel",
+                }
+            )
+
+        master.task = asyncio.create_task(
+            run_batch_media_job(
+                master,
+                items,
                 config,
                 store,
                 app.state.context,
+                concurrency=max(
+                    1, app.state.context.media_processing_concurrency
+                ),
+                existing_namespaces=sorted(existing_namespaces),
             )
         )
 
         return JSONResponse(
             status_code=202,
             content={
-                "job_id": job.job_id,
-                "status": job.status,
-                "progress_url": f"/media_job/{job.job_id}/progress",
+                "job_id": master.job_id,
+                "status": master.status,
+                "progress_url": f"/media_job/{master.job_id}/progress",
+                "cancel_url": f"/media_job/{master.job_id}/cancel",
                 "items_accepted": len(media_files),
                 "filenames": [m.get("filename") for m in media_files],
+                "items": item_descriptors,
                 "message": "Media processing started",
             },
         )
@@ -2671,10 +2969,115 @@ async def media_job_progress(
     )
 
 
+async def _rollback_media_job_rows(
+    *,
+    user_id: str,
+    assistant_id: Optional[str],
+    item_job_ids: Optional[List[str]] = None,
+    master_job_id: Optional[str] = None,
+    namespace_filenames: Optional[List[str]] = None,
+) -> int:
+    """Best-effort delete of store rows a cancelled job/item already indexed.
+
+    Documents are stamped with ``master_job_id`` / ``item_job_id`` at conversion
+    time (see convert_media_list_to_text_document), so a cancel deletes exactly the
+    rows that run wrote — including expanded playlist/linktree children whose
+    ``namespace_filename`` differs from the top-level item. ``namespace_filenames``
+    is an extra fallback for the top-level item key. Store rows removed CASCADE the
+    matching store_vectors embeddings. Returns the number of rows deleted; never
+    raises — rollback is best-effort ("attempt to delete").
+    """
+    if not assistant_id:
+        return 0
+    prefix_like = f"{user_id}.{assistant_id}.%"
+    pool = app.state.pool
+    total_deleted = 0
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                if master_job_id:
+                    await cur.execute(
+                        "DELETE FROM store WHERE prefix LIKE %s AND "
+                        "value #>> '{document,kwargs,metadata,master_job_id}' = %s",
+                        (prefix_like, master_job_id),
+                    )
+                    total_deleted += cur.rowcount or 0
+                for item_job_id in item_job_ids or []:
+                    await cur.execute(
+                        "DELETE FROM store WHERE prefix LIKE %s AND "
+                        "value #>> '{document,kwargs,metadata,item_job_id}' = %s",
+                        (prefix_like, item_job_id),
+                    )
+                    total_deleted += cur.rowcount or 0
+                for namespace_filename in namespace_filenames or []:
+                    if not namespace_filename:
+                        continue
+                    await cur.execute(
+                        "DELETE FROM store WHERE prefix LIKE %s AND "
+                        "value #>> '{document,kwargs,metadata,namespace_filename}' = %s",
+                        (prefix_like, namespace_filename),
+                    )
+                    total_deleted += cur.rowcount or 0
+    except Exception as exc:  # noqa: BLE001 - rollback is best-effort
+        logger.warning("Rollback for cancelled media job failed: %s", exc)
+    return total_deleted
+
+
+@app.post("/media_job/{job_id}/cancel")
+async def cancel_media_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Cancel a background media job and roll back what it already wrote.
+
+    Send a **child** ``job_id`` to cancel one document: its processing stops and any
+    store rows it already indexed are deleted (rolled back), leaving the rest of the
+    batch running. Send the **master** ``job_id`` to do the same for the whole batch.
+    Rollback is best-effort — typically a cancel lands before indexing completes, so
+    there may be nothing to delete.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    registry = app.state.media_jobs
+    job: Optional[MediaJob] = get_job(registry, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job_id")
+    if job.user_id != user_id:
+        raise HTTPException(
+            status_code=403, detail="This job belongs to another user."
+        )
+
+    # Flag + cancel the running task(s); returns the affected child jobs.
+    targets = request_cancel(registry, job)
+
+    deleted = await _rollback_media_job_rows(
+        user_id=user_id,
+        assistant_id=job.assistant_id,
+        master_job_id=job.job_id if job.is_master else None,
+        item_job_ids=[c.job_id for c in targets],
+        namespace_filenames=[c.namespace_filename for c in targets],
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "job_id": job.job_id,
+            "scope": "batch" if job.is_master else "item",
+            "status": "cancelled",
+            "cancelled_items": [
+                {"job_id": c.job_id, "filename": c.filename} for c in targets
+            ],
+            "rows_rolled_back": deleted,
+            "message": (
+                "Batch cancelled; processing stopped and indexed rows rolled back."
+                if job.is_master
+                else "Item cancelled; processing stopped and indexed rows rolled back."
+            ),
+        },
+    )
+
+
 @app.get("/list_avatar_documents")
 async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
-    token = current_user["API_KEY"]
-    langgraph_sdk_client = get_client(headers={"API-KEY": f"{token}"})
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]
@@ -2686,21 +3089,35 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
         raise HTTPException(
             detail="Please select an avatar before continuing.", status_code=400
         )
-    results = {}
-    namespace = (user_id, assistant_id)
 
-    all_document_items = await langgraph_sdk_client.store.search_items(
-        namespace, limit=1000000
-    )
-    uploaded_documents = [
-        item["value"]["document"]["kwargs"]["metadata"].get("filename", None)
-        for item in all_document_items["items"]
-    ]
+    # Read the avatar's store namespace in-process via app.state.store rather than
+    # the LangGraph SDK HTTP client. The HTTP round-trip ConnectTimeouts while a
+    # long media job is occupying the API process; this same in-process path is
+    # what the upload endpoint's dedup uses.
+    store = app.state.store
+    try:
+        all_document_items = await store.asearch((user_id, assistant_id), limit=1_000_000)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read this avatar's documents: {exc}",
+        ) from exc
 
-    uploaded_documents = [item for item in set(uploaded_documents) if item is not None]
-    # convert uuid5 to string for convenience
-    results["uploaded_documents"] = uploaded_documents
-    return results
+    uploaded_documents: set[str] = set()
+    for item in all_document_items or []:
+        value = getattr(item, "value", None)
+        if value is None and isinstance(item, dict):
+            value = item.get("value")
+        if not isinstance(value, dict):
+            continue
+        document = value.get("document")
+        kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
+        metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+        filename = metadata.get("filename") if isinstance(metadata, dict) else None
+        if isinstance(filename, str) and filename:
+            uploaded_documents.add(filename)
+
+    return {"uploaded_documents": sorted(uploaded_documents)}
 
 
 @app.delete("/delete_avatar_document")

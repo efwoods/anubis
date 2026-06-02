@@ -242,6 +242,12 @@ class GlobalState(TypedDict):
 
     media_files: Optional[List[Dict[str, Any]]]  # Raw uploaded files
 
+    # namespace_filename values already present in this avatar's store. Items whose
+    # namespace_filename is in this set are skipped during conversion (top-level and
+    # expanded playlist/linktree children alike) so re-uploads don't reprocess
+    # hundreds of already-indexed files. Populated by the upload endpoint.
+    existing_namespaces: Optional[List[str]]
+
     media_list: Annotated[
         List[Dict], operator.add
     ]  # media is moved into the task list and overwritten on message send from the chat message interface

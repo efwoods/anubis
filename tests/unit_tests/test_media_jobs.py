@@ -2,9 +2,12 @@
 
 Covers the deterministic, offline pieces:
 
-* ``run_media_job`` — forwards ``media_progress`` custom events into the job
-  buffer and records the final result; failures land on the job, not raised.
-* ``MediaJob`` registry helpers — create/get and finish semantics.
+* ``run_single_item_job`` — forwards ``media_progress`` custom events into both the
+  child's buffer and the master's aggregate buffer, and records the final result;
+  failures land on the job, not raised.
+* ``run_batch_media_job`` — runs one child per item under a shared limiter and
+  aggregates per-item status into the master.
+* ``MediaJob`` registry helpers — create master/child, get, finish, and cancel.
 * ``_classify_url`` — playlist vs single-video YouTube routing.
 
 The ``process_media`` graph's ``astream`` is replaced with a fake async stream
@@ -17,10 +20,13 @@ import src.subgraphs.process_media_graph.process_media_graph_api_endpoint as pme
 from src.anubis.utils.classes.URLDocumentLoaderClass import _classify_url
 from src.api.media_jobs import (
     MediaJob,
-    create_job,
+    create_child_job,
+    create_master_job,
     finish_job,
     get_job,
-    run_media_job,
+    request_cancel,
+    run_batch_media_job,
+    run_single_item_job,
 )
 
 
@@ -42,61 +48,156 @@ class _FakeCompiled:
         )
 
 
+class _FakeErrorCompiled:
+    """Emits an item_error + converting_complete(indexed=0): a total item failure
+    the graph swallows (partial success) rather than raising."""
+
+    async def astream(self, _input, *, config, context, stream_mode, subgraphs):
+        yield (("ns",), "custom", {"type": "media_progress", "stage": "converting", "current": 1, "total": 1})
+        yield (
+            ("ns",),
+            "custom",
+            {"type": "media_progress", "stage": "item_error", "filename": "v.mp4", "error": "missing_audio_reference_audio"},
+        )
+        yield (
+            ("ns",),
+            "custom",
+            {"type": "media_progress", "stage": "converting_complete", "total": 1, "skipped": 0, "errors": 1, "indexed": 0},
+        )
+
+
 class _FakeWorkflow:
-    def __init__(self, compiled: _FakeCompiled):
+    def __init__(self, compiled):
         self._compiled = compiled
 
     def compile(self, store=None):
         return self._compiled
 
 
+def _master_and_child(registry, filename="clip.mp3"):
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    child = create_child_job(
+        registry,
+        user_id="u1",
+        assistant_id="a1",
+        parent_id=master.job_id,
+        filename=filename,
+        namespace_filename=f"ns::{filename}",
+    )
+    master.child_ids.append(child.job_id)
+    return master, child
+
+
 @pytest.mark.asyncio
-async def test_run_media_job_records_progress_and_result(monkeypatch):
+async def test_run_single_item_job_records_progress_and_result(monkeypatch):
     monkeypatch.setattr(pme, "workflow", _FakeWorkflow(_FakeCompiled()))
 
     registry: dict[str, MediaJob] = {}
-    job = create_job(registry, user_id="u1", assistant_id="a1")
-    media_files = [{"filename": "clip.mp3"}]
+    master, child = _master_and_child(registry)
 
-    await run_media_job(job, media_files, config={}, store=None, context=None)
+    await run_single_item_job(
+        child, master, {"filename": "clip.mp3"}, config={"configurable": {}},
+        store=None, context=None,
+    )
 
-    assert job.status == "completed"
-    assert job.done.is_set()
-    assert job.result == {
-        "items_processed": 1,
-        "filenames": ["clip.mp3"],
-        "message": "Media processed and indexed successfully",
-    }
-    stages = [e["stage"] for e in job.events]
-    assert stages == ["labeling", "indexing"]  # only media_progress events buffered
+    assert child.status == "completed"
+    assert child.done.is_set()
+    assert child.result["filename"] == "clip.mp3"
+    # Only media_progress events are buffered, in order, on the child...
+    assert [e["stage"] for e in child.events] == ["labeling", "indexing"]
+    # ...and mirrored onto the master, attributed to the item.
+    assert [e["stage"] for e in master.events] == ["labeling", "indexing"]
+    assert all(e["item_job_id"] == child.job_id for e in master.events)
 
 
 @pytest.mark.asyncio
-async def test_run_media_job_captures_failure(monkeypatch):
+async def test_run_single_item_job_captures_failure(monkeypatch):
     boom = RuntimeError("conversion blew up")
     monkeypatch.setattr(pme, "workflow", _FakeWorkflow(_FakeCompiled(raise_exc=boom)))
 
     registry: dict[str, MediaJob] = {}
-    job = create_job(registry, user_id="u1", assistant_id="a1")
+    master, child = _master_and_child(registry, filename="x")
 
     # Must not raise — failures surface via the job, not the caller.
-    await run_media_job(job, [{"filename": "x"}], config={}, store=None, context=None)
+    await run_single_item_job(
+        child, master, {"filename": "x"}, config={"configurable": {}},
+        store=None, context=None,
+    )
 
-    assert job.status == "error"
-    assert job.done.is_set()
-    assert "conversion blew up" in (job.error or "")
+    assert child.status == "error"
+    assert child.done.is_set()
+    assert "conversion blew up" in (child.error or "")
 
 
-def test_registry_create_get_and_finish():
+@pytest.mark.asyncio
+async def test_run_single_item_job_marks_swallowed_error(monkeypatch):
+    # The graph reports a total item failure via item_error / converting_complete
+    # (indexed=0) without raising; the child must end as "error", not "completed".
+    monkeypatch.setattr(pme, "workflow", _FakeWorkflow(_FakeErrorCompiled()))
+
     registry: dict[str, MediaJob] = {}
-    job = create_job(registry, user_id="u1", assistant_id="a1")
+    master, child = _master_and_child(registry, filename="v.mp4")
 
-    assert get_job(registry, job.job_id) is job
+    await run_single_item_job(
+        child, master, {"filename": "v.mp4"}, config={"configurable": {}},
+        store=None, context=None,
+    )
+
+    assert child.status == "error"
+    assert "missing_audio_reference_audio" in (child.error or "")
+
+
+@pytest.mark.asyncio
+async def test_run_batch_media_job_aggregates_children(monkeypatch):
+    monkeypatch.setattr(pme, "workflow", _FakeWorkflow(_FakeCompiled()))
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    items = []
+    for name in ("a.mp3", "b.mp3"):
+        child = create_child_job(
+            registry,
+            user_id="u1",
+            assistant_id="a1",
+            parent_id=master.job_id,
+            filename=name,
+            namespace_filename=f"ns::{name}",
+        )
+        master.child_ids.append(child.job_id)
+        items.append({"child": child, "media_file": {"filename": name}})
+
+    await run_batch_media_job(
+        master, items, config={"configurable": {}}, store=None, context=None,
+        concurrency=5,
+    )
+
+    assert master.status == "completed"
+    assert master.done.is_set()
+    assert master.result["items_total"] == 2
+    assert master.result["items_completed"] == 2
+    assert all(spec["child"].status == "completed" for spec in items)
+
+
+def test_registry_create_get_finish_and_cancel():
+    registry: dict[str, MediaJob] = {}
+    master, child = _master_and_child(registry)
+
+    assert get_job(registry, master.job_id) is master
+    assert get_job(registry, child.job_id) is child
     assert get_job(registry, "missing") is None
 
-    finish_job(job, result={"ok": True})
-    assert job.status == "completed"
-    assert job.done.is_set()
+    # Cancelling the master flags the master and returns its child(ren).
+    targets = request_cancel(registry, master)
+    assert master.cancelled is True
+    assert [t.job_id for t in targets] == [child.job_id]
+    assert child.cancelled is True
+
+    finish_job(child, cancelled=True)
+    assert child.status == "cancelled"
+    assert child.done.is_set()
+    # finish_job is idempotent once a job is done.
+    finish_job(child, result={"ok": True})
+    assert child.status == "cancelled"
 
 
 @pytest.mark.parametrize(

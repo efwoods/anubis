@@ -53,7 +53,6 @@ from src.anubis.utils.model import init_model
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.huggingface_prefetch import (
-    GO_EMOTIONS_MODEL_ID,
     ensure_huggingface_models_cached,
 )
 from src.anubis.utils.utility import format_docs
@@ -83,20 +82,13 @@ def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
 
 def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
     """Mutate ``avatar_response.response_metadata`` with Go Emotions classifier output."""
-    from transformers import pipeline
+    from src.anubis.utils.emotion_classifier import classify_go_emotions
 
-    classifier = pipeline("text-classification", model=GO_EMOTIONS_MODEL_ID)
-    sentiment = classifier(avatar_response.content, truncation=True, max_length=512)
+    sentiment = classify_go_emotions(avatar_response.content)
+    if sentiment is None:
+        return
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
-    avatar_response.response_metadata.update(
-        {
-            "sentiment": {
-                "base_emotion": EMOTION_MAPPING[sentiment[0]["label"]],
-                "emotion": sentiment[0]["label"],
-                "score": sentiment[0]["score"],
-            }
-        }
-    )
+    avatar_response.response_metadata.update({"sentiment": sentiment})
 
 
 async def message_interface(

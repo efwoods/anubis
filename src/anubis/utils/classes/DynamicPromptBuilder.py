@@ -61,6 +61,7 @@ class DynamicPromptBuilder:
         # user_context: Optional[Dict[str, Any]] = None,
         retrieved_knowledge: Optional[List[Document]] = None,
         retrieved_memories: Optional[List[Document]] = None,
+        analyzed_traits: Optional[List[Document]] = None,
         direct_quotes: Optional[List[Document]] = None,
         user_name: Optional[str] = None,
         user_description: Optional[str] = None,
@@ -138,6 +139,14 @@ class DynamicPromptBuilder:
         else:
             retrieved_memories_str = "\n\n".join([doc.page_content for doc in retrieved_memories])
 
+        # Build analyzed latent traits (analysis namespace findings relevant to
+        # the current conversation: beliefs, emotions/triggers, relationships,
+        # OCEAN, etc.)
+        if analyzed_traits is None or len(analyzed_traits) == 0:
+            analyzed_traits_str = ""
+        else:
+            analyzed_traits_str = "\n\n".join([doc.page_content for doc in analyzed_traits])
+
         if assistant_emotions is None:
             # assistant_emotions_str = "Unaware of current emotions of self."
             assistant_emotions_str = ""
@@ -162,6 +171,7 @@ class DynamicPromptBuilder:
             "assistant_emotions": assistant_emotions_str,
             "retrieved_knowledge": retrieved_knowledge_str,
             "retrieved_memories": retrieved_memories_str,
+            "analyzed_traits": analyzed_traits_str,
             "direct_quotes": direct_quotes_str,
             "user_name": user_name, 
             "user_identity": user_identity_str,

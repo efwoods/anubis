@@ -2577,6 +2577,12 @@ async def update_avatar_identity_with_media(
             )
         )
 
+        # Media now runs as a background job, so per-file indexing failures can
+        # no longer be reported synchronously here. The failed-file logic that
+        # fixed the silent-success bug lives in ``run_media_job``: it captures
+        # ``failed_to_index_files`` from the graph and surfaces it on the job
+        # result, delivered to clients via the SSE ``done`` event on
+        # ``/media_job/{job_id}/progress``.
         return JSONResponse(
             status_code=202,
             content={
@@ -2713,7 +2719,7 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
-
+    
     # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
     # leaving only the filename or already-derived namespace id.
     source_document_name = source_document_name.strip(" \t\n\r\"'`(),[]")
@@ -2777,7 +2783,6 @@ OR (
     return JSONResponse(
         content=f"Successfully deleted: {source_document_name}", status_code=200
     )
-
 
 if __name__ == "__main__":
     import uvicorn

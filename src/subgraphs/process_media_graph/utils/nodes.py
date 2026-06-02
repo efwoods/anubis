@@ -2,6 +2,7 @@
 
 import asyncio
 from curses import napms
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -486,54 +487,27 @@ async def process_uploaded_files_and_label_media_type(
         "media_files": []
     }
 
-
-# Metadata keys only used for queue routing; omitted from ``additional_metadata`` for scaffolds.
-_ANALYSIS_QUEUE_METADATA_KEYS = frozenset(
-    {
-        "analysis_scaffolds",
-        "analysis_job_kind",
-        "analysis_acceptable",
-        "vectorstore_acceptable",
-        "adapter_acceptable",
-    }
-)
-
-
-def _metadata_for_analysis_outputs(doc: Document) -> Dict[str, Any]:
-    return {
-        k: v
-        for k, v in (doc.metadata or {}).items()
-        if k not in _ANALYSIS_QUEUE_METADATA_KEYS
-    }
-
-
-async def _analysis_scaffold_ocean(doc: Document) -> List[Document]:
-    from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
-
-    text = (doc.page_content or "").strip()
-    if not text:
-        return []
-    meta = _metadata_for_analysis_outputs(doc)
-    meta.setdefault("vectorstore_acceptable", True)
-    return await perform_ocean_analysis(
-        HumanMessage(content=text),
-        additional_metadata=meta,
-    )
-
-
-# Extend with additional keyed scaffolds (emotion, relational graphs, etc.).
-ANALYSIS_SCAFFOLD_RUNNERS: Dict[str, Any] = {
-    "ocean": _analysis_scaffold_ocean,
-}
-
-
 async def analyze_documents(
     state: GlobalState,
     runtime: Runtime[GlobalContext],
     config: RunnableConfig,
     store: BaseStore,
 ) -> Dict[str, Any]:
-    """Run registered analysis scaffolds on queued documents; merge vector-bound results."""
+    """Fan registered analyzers out over queued docs in parallel; merge results.
+
+    For every ``analysis_acceptable`` Document, run each applicable analyzer
+    from :data:`ANALYSIS_SCAFFOLD_RUNNERS`. The default analyzer set is the
+    full registry; a Document narrows it by listing analyzer keys in
+    ``metadata["analysis_scaffolds"]``. Every analyzer produces
+    ``analysis``-namespace Documents which are merged into the vector-store
+    index batch so ``index_docs`` persists them alongside the source docs.
+
+    To add a feature, register one analyzer in
+    ``src/anubis/utils/analysis/analysis_methods.py`` — no change is needed
+    here.
+    """
+    from src.anubis.utils.analysis.analysis_methods import ANALYSIS_SCAFFOLD_RUNNERS
+
     queue: List[Document] = list(
         state.get(
             "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant",
@@ -544,37 +518,62 @@ async def analyze_documents(
         logger.info("analyze_documents: empty queue; skipping")
         return {}
 
-    out: List[Document] = []
+    # Build (label, coroutine) pairs across docs × analyzers, then run them all
+    # concurrently in a single gather.
+    labels: List[str] = []
+    coros = []
     for doc in queue:
-        scaffolds = doc.metadata.get("analysis_scaffolds")
-        if not scaffolds:
-            scaffolds = ["ocean"]
+        scaffolds = doc.metadata.get("analysis_scaffolds") or list(
+            ANALYSIS_SCAFFOLD_RUNNERS.keys()
+        )
         for name in scaffolds:
             runner = ANALYSIS_SCAFFOLD_RUNNERS.get(name)
             if runner is None:
                 logger.warning(
-                    "analyze_documents: unknown scaffold %r (filename=%s); skipping",
+                    "analyze_documents: unknown analyzer %r (filename=%s); skipping",
                     name,
                     doc.metadata.get("filename", ""),
                 )
                 continue
-            try:
-                produced = await runner(doc)
-                if produced:
-                    out.extend(produced)
-            except Exception as exc:
-                logger.warning(
-                    "analyze_documents: scaffold %r failed: %s; continuing",
-                    name,
-                    exc,
-                )
+            labels.append(name)
+            coros.append(runner(doc))
 
-    existing_vs: List[Document] = list(
-        state.get("vectorstore_documents_to_be_indexed") or []
-    )
+    analyzed_documents: List[Document] = []
+    if coros:
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for name, result in zip(labels, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "analyze_documents: analyzer %r failed: %s; continuing",
+                    name,
+                    result,
+                )
+                continue
+            if result:
+                analyzed_documents.extend(result)
+
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _adl(
+            "analyze_documents:return",
+            {
+                "queue_len": len(queue),
+                "analyzed_documents_len": len(analyzed_documents),
+                "sample_doc_id": (
+                    (analyzed_documents[0].metadata or {}).get("document_id")
+                    if analyzed_documents else None
+                ),
+            },
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
+
     return {
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete",
-        "vectorstore_documents_to_be_indexed": existing_vs + out,
+        "vectorstore_documents_to_be_indexed": analyzed_documents,
     }
 
 
@@ -663,6 +662,26 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
     adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("adapter_acceptable", False) == True]
+
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _adl(
+            "convert_media_list_to_text_document:return",
+            {
+                "vectorstore_len": len(vector_store_document_list_formatted),
+                "analysis_len": len(analysis_document_list_formatted),
+                "adapter_len": len(adapter_document_list_formatted),
+                "sample_vs_doc_id": (
+                    (vector_store_document_list_formatted[0].metadata or {}).get("document_id")
+                    if vector_store_document_list_formatted else None
+                ),
+            },
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
@@ -1880,8 +1899,10 @@ async def process_adapter_documents(
             langsmith_jsonl,
         )
 
+    # Clear the adapter buffer of what we just processed (append-reducer
+    # semantics: an empty list would leave processed docs queued).
     return {
-        "documents_to_be_processed_for_adapter_training": [],
+        "documents_to_be_processed_for_adapter_training": "delete",
     }
 
 

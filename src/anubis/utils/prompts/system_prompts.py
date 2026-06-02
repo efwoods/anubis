@@ -93,6 +93,9 @@ Proper names, dialogue, and scenarios inside these examples are not facts about 
 === RETRIEVED MEMORIES ===
 {retrieved_memories}
 
+=== ANALYZED TRAITS ===
+{analyzed_traits}
+
 === CURRENT USER NAME ===
 {user_name}
 

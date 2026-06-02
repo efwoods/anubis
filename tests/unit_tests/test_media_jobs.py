@@ -25,14 +25,30 @@ from src.api.media_jobs import (
 
 
 class _FakeCompiled:
-    """Stand-in for the compiled graph; emits two progress events and one update."""
+    """Stand-in for the compiled graph; emits two progress events and one update.
 
-    def __init__(self, *, raise_exc: Exception | None = None):
+    ``failed_files`` lets a test inject an ``index_docs``-style
+    ``failed_to_index_files`` update so the failed-file capture path is covered.
+    """
+
+    def __init__(
+        self,
+        *,
+        raise_exc: Exception | None = None,
+        failed_files: list[dict] | None = None,
+    ):
         self._raise_exc = raise_exc
+        self._failed_files = failed_files
 
     async def astream(self, _input, *, config, context, stream_mode, subgraphs):
         yield (("ns",), "custom", {"type": "media_progress", "stage": "labeling", "total": 1})
         yield (("ns",), "updates", {"some_node": {}})
+        if self._failed_files is not None:
+            yield (
+                ("ns",),
+                "updates",
+                {"index_docs": {"failed_to_index_files": self._failed_files}},
+            )
         if self._raise_exc is not None:
             raise self._raise_exc
         yield (
@@ -65,10 +81,36 @@ async def test_run_media_job_records_progress_and_result(monkeypatch):
     assert job.result == {
         "items_processed": 1,
         "filenames": ["clip.mp3"],
+        "indexed_filenames": ["clip.mp3"],
+        "failed_files": [],
         "message": "Media processed and indexed successfully",
     }
     stages = [e["stage"] for e in job.events]
     assert stages == ["labeling", "indexing"]  # only media_progress events buffered
+
+
+@pytest.mark.asyncio
+async def test_run_media_job_surfaces_failed_files(monkeypatch):
+    """Failed-file logic must survive the move to a background job: an
+    ``index_docs`` ``failed_to_index_files`` update is captured onto the job
+    result so the SSE ``done`` event reports the failure instead of a silent
+    success (the bug the failed-file logic originally fixed)."""
+    failed = [{"filename": "bad.pdf", "error": "indexing error", "document_ids": ["d1"]}]
+    monkeypatch.setattr(
+        pme, "workflow", _FakeWorkflow(_FakeCompiled(failed_files=failed))
+    )
+
+    registry: dict[str, MediaJob] = {}
+    job = create_job(registry, user_id="u1", assistant_id="a1")
+    media_files = [{"filename": "good.mp3"}, {"filename": "bad.pdf"}]
+
+    await run_media_job(job, media_files, config={}, store=None, context=None)
+
+    assert job.status == "completed"  # the job itself succeeded; some files did not
+    assert job.result["failed_files"] == failed
+    assert job.result["indexed_filenames"] == ["good.mp3"]  # bad.pdf excluded
+    assert job.result["filenames"] == ["good.mp3", "bad.pdf"]
+    assert "bad.pdf" in job.result["message"]
 
 
 @pytest.mark.asyncio

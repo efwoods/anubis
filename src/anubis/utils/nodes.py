@@ -379,6 +379,18 @@ async def _build_consciousness_system_message_update(
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
+    """ Retrieve Analyzed Latent Traits """
+
+    # The analysis namespace holds psycho-analysis findings about the target
+    # (beliefs, emotional triggers, relationships, OCEAN, etc.) produced by the
+    # process_media_graph analysis stage. Retrieve those relevant to the current
+    # conversation by similarity to the user's message.
+    analyzed_trait_items = await runtime.store.asearch(
+        (creator_id, assistant_id, "analysis"), query=query
+    )
+    logger.info(f"analyzed_trait_items: {analyzed_trait_items}")
+    analyzed_traits = reduce_docs([], analyzed_trait_items)
+
     """ Retrieve Emotions """
 
     # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt
@@ -431,6 +443,7 @@ async def _build_consciousness_system_message_update(
         assistant_identity=assistant_identity,
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
+        analyzed_traits=analyzed_traits,
         direct_quotes=direct_quotes,
         user_name=user_name,
         user_description=user_description,

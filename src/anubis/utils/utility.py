@@ -154,6 +154,64 @@ from typing import Union, Any, Literal
 
 from langgraph.store.base import SearchItem, Item
 
+# region agent log
+def _agent_debug_log(message: str, data: dict | None = None, hypothesis_id: str = "") -> None:
+    """Append one NDJSON line to the debug session log.
+
+    Picks the in-container bind-mount path when present, falls back to the
+    host workspace path otherwise. Best-effort: any failure is silently
+    swallowed so instrumentation never affects production behavior.
+    """
+    try:
+        import json as _json
+        import os as _os
+        import time as _time
+        _container_path = "/deps/anubis/.cursor/debug-aaf3d3.log"
+        _host_path = "/home/user/gh/anubis-project/wt/f-psycho-analysis/.cursor/debug-aaf3d3.log"
+        _path = _container_path if _os.path.isdir("/deps/anubis/.cursor") else _host_path
+        _payload = {
+            "sessionId": "aaf3d3",
+            "timestamp": int(_time.time() * 1000),
+            "location": "src/anubis/utils/utility.py",
+            "message": message,
+            "data": data or {},
+            "hypothesisId": hypothesis_id,
+        }
+        with open(_path, "a") as _f:
+            _f.write(_json.dumps(_payload, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
+
+
+def _doc_dedup_key(doc: Document) -> str:
+    """Return a stable identity key for de-duplicating a Document in the buffer.
+
+    Prefers the explicit ``document_id`` / top-level ``id`` so re-emitting the
+    same cached doc (e.g. ``load_consciousness`` returning its identity lists on
+    every tool-loop iteration) is idempotent; falls back to ``page_content`` for
+    docs that carry no stable id.
+    """
+    meta = getattr(doc, "metadata", None) or {}
+    return str(
+        getattr(doc, "id", None)
+        or meta.get("document_id")
+        or meta.get("id")
+        or doc.page_content
+    )
+
+
+def remove_docs_update(docs: Sequence[Document]) -> dict[str, Any]:
+    """Build a :func:`reduce_docs` instruction that removes exactly ``docs``.
+
+    A consumer (e.g. ``index_docs``) returns this instead of the blunt
+    ``"delete"`` so it clears only the documents it actually processed, leaving
+    un-processed docs — including any appended concurrently in the same
+    superstep — on the buffer for the next pass.
+    """
+    return {"op": "remove", "keys": [_doc_dedup_key(d) for d in docs]}
+
+
 def reduce_docs(
     existing: Sequence[Document] | None,
     new: Union[
@@ -161,27 +219,85 @@ def reduce_docs(
         Sequence[dict[str, Any]],
         Sequence[str],
         Sequence[SearchItem],
+        dict[str, Any],
         str,
         Literal["delete"],
     ],
 ) -> Sequence[Document]:
-    """Reduce and process documents based on the input type.
+    """Append new documents onto the existing working buffer.
 
-    This function handles various input types and converts them into a sequence of Document objects.
-    It can delete existing documents, create new ones from strings or dictionaries, or return the existing documents.
+    This is an *append* reducer, not a replace: a node contributes only the new
+    documents it produced and they are appended to whatever is already on the
+    channel. A node never re-reads the existing list — which avoids re-queuing
+    already-processed documents.
+
+    Supported ``new`` values:
+        * a sequence of Documents / dicts / strings / ``SearchItem``s — coerced
+          to Documents and **appended** (de-duped by identity);
+        * the literal ``"delete"`` — clears the **entire** buffer;
+        * a removal instruction ``{"op": "remove", "keys": [...]}`` (see
+          :func:`remove_docs_update`) — removes only the listed docs, leaving
+          everything else. Prefer this over ``"delete"`` when other nodes may
+          write the same channel in the same superstep.
+
+    De-duplication by stable document identity (:func:`_doc_dedup_key`) keeps
+    the append idempotent: re-emitting a doc already on the buffer does not grow
+    it, while genuinely new docs accumulate.
 
     Args:
-        existing (Optional[Sequence[Document]]): The existing docs in the state, if any.
-        new (Union[Sequence[Document], Sequence[dict[str, Any]], Sequence[str], str, Literal["delete"]]):
-            The new input to process. Can be a sequence of Documents, dictionaries, strings, a single string,
-            or the literal "delete".
+        existing: The docs already on the channel, if any.
+        new: The instruction to apply (see above).
     """
-    if new == "delete":
-        return []
-    if isinstance(new, str):
-        return [Document(page_content=new, metadata={"id": str(uuid.uuid4())})]
+    # region agent log
+    _existing_len = len(existing) if existing is not None else 0
+    _new_kind = type(new).__name__
+    _new_summary: dict[str, Any] = {"kind": _new_kind}
     if isinstance(new, list):
-        coerced = []
+        _new_summary["len"] = len(new)
+        _new_summary["item_kinds"] = list({type(i).__name__ for i in new})[:5]
+    elif isinstance(new, dict):
+        _new_summary["op"] = new.get("op")
+        _new_summary["keys_len"] = len(new.get("keys") or [])
+    elif isinstance(new, str):
+        _new_summary["str_value_short"] = new[:24]
+    _agent_debug_log(
+        "reduce_docs:enter",
+        {"existing_len": _existing_len, "new": _new_summary},
+        hypothesis_id="H1+H2+H3",
+    )
+    # endregion
+
+    if new == "delete":
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=delete",
+            {"existing_len": _existing_len, "result_len": 0},
+            hypothesis_id="H2",
+        )
+        # endregion
+        return []
+
+    # Targeted removal: drop only the processed docs, keep the rest.
+    if isinstance(new, dict) and new.get("op") == "remove":
+        to_remove = set(new.get("keys") or [])
+        _filtered = [d for d in (existing or []) if _doc_dedup_key(d) not in to_remove]
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=remove",
+            {
+                "existing_len": _existing_len,
+                "remove_keys_len": len(to_remove),
+                "result_len": len(_filtered),
+            },
+            hypothesis_id="H2",
+        )
+        # endregion
+        return _filtered
+
+    coerced: list[Document] = []
+    if isinstance(new, str):
+        coerced.append(Document(page_content=new, metadata={"id": str(uuid.uuid4())}))
+    elif isinstance(new, list):
         for item in new:
             if isinstance(item, str):
                 coerced.append(
@@ -190,16 +306,61 @@ def reduce_docs(
             elif isinstance(item, dict):
                 coerced.append(Document(**item))
             elif isinstance(item, SearchItem) or isinstance(item, Item):
-                logger.info("breakpoint")
-                page_content = getattr(item,'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
+                page_content = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
                 document_metadata = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})
-                document = Document(page_content=page_content, metadata=document_metadata)
-                coerced.append(document)
+                coerced.append(Document(page_content=page_content, metadata=document_metadata))
             else:
                 coerced.append(item)
-        return coerced
-    return existing or []
+    else:
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=unknown_new_type",
+            {"existing_len": _existing_len, "new_kind": _new_kind},
+            hypothesis_id="H2",
+        )
+        # endregion
+        # Unknown ``new`` type: leave the buffer unchanged.
+        return existing or []
 
+    # Append new docs onto existing, dropping any whose identity is already
+    # present so re-emitted docs do not accumulate.
+    result: list[Document] = list(existing or [])
+    seen = {_doc_dedup_key(doc) for doc in result}
+    # region agent log
+    _skip_count = 0
+    _sample_skip_key: str | None = None
+    _sample_added_key: str | None = None
+    # endregion
+    for doc in coerced:
+        key = _doc_dedup_key(doc)
+        if key in seen:
+            # region agent log
+            _skip_count += 1
+            if _sample_skip_key is None:
+                _sample_skip_key = key[:64]
+            # endregion
+            continue
+        seen.add(key)
+        # region agent log
+        if _sample_added_key is None:
+            _sample_added_key = key[:64]
+        # endregion
+        result.append(doc)
+    # region agent log
+    _agent_debug_log(
+        "reduce_docs:branch=append_dedup",
+        {
+            "existing_len": _existing_len,
+            "coerced_len": len(coerced),
+            "result_len": len(result),
+            "skip_count": _skip_count,
+            "sample_skip_key": _sample_skip_key,
+            "sample_added_key": _sample_added_key,
+        },
+        hypothesis_id="H3+H4+H5",
+    )
+    # endregion
+    return result
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime

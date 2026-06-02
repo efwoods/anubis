@@ -145,6 +145,12 @@ async def run_media_job(
         job.started_at = time.time()
         job.status = "running"
 
+        # index_docs does not raise on per-file indexing failures; it reports
+        # them on ``failed_to_index_files`` (accumulated via operator.add). We
+        # collect those entries from the "updates" stream so the silent-success
+        # bug stays fixed — the failed files are surfaced on the job result
+        # rather than the upload reporting success unconditionally.
+        failed_files: List[Dict[str, Any]] = []
         async for item in compiled.astream(
             {"media_files": media_files},
             config=config,
@@ -161,13 +167,42 @@ async def run_media_job(
                 and payload.get("type") == "media_progress"
             ):
                 add_event(job, payload)
+            elif mode == "updates" and isinstance(payload, dict):
+                # Each value is a node's state update; index_docs reports
+                # ``failed_to_index_files``. Gather them across all nodes/passes.
+                for node_update in payload.values():
+                    if not isinstance(node_update, dict):
+                        continue
+                    node_failures = node_update.get("failed_to_index_files")
+                    if node_failures:
+                        failed_files.extend(node_failures)
+
+        requested_filenames = [m.get("filename") for m in media_files]
+        failed_filenames = {
+            f.get("filename")
+            for f in failed_files
+            if isinstance(f, dict) and f.get("filename") is not None
+        }
+        indexed_filenames = [
+            name for name in requested_filenames if name not in failed_filenames
+        ]
+
+        if failed_files:
+            message = (
+                "Some files failed to index and should be reprocessed: "
+                + ", ".join(sorted(n for n in failed_filenames if n))
+            )
+        else:
+            message = "Media processed and indexed successfully"
 
         finish_job(
             job,
             result={
                 "items_processed": len(media_files),
-                "filenames": [m.get("filename") for m in media_files],
-                "message": "Media processed and indexed successfully",
+                "filenames": requested_filenames,
+                "indexed_filenames": indexed_filenames,
+                "failed_files": failed_files,
+                "message": message,
             },
         )
     except Exception as exc:  # noqa: BLE001 - surface every failure via the job

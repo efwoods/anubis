@@ -7,6 +7,16 @@
       "description": "Enter your Neural Nexus API Key",
       "default": "",
       "type": "promptString"
+    },
+    {
+      "id": "debugPort",
+      "type": "command",
+      "command": "extension.commandvariable.file.content",
+      "args": {
+        "fileName": "${workspaceFolder}/.env.dev",
+        "key": "DEBUG_PORT",
+        "default": "9031"
+      }
     }
   ],
   "configurations": [
@@ -16,7 +26,7 @@
       "request": "attach",
       "connect": {
         "host": "localhost",
-        "port": 5678
+        "port": "${input:debugPort}"
       },
       "pathMappings": [
         {

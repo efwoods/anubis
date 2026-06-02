@@ -275,40 +275,6 @@ async def recall_memories(
     logger.info(f'breakpoint')
 
 
-
-    # model_with_structured_output = init_model(context = runtime.context, response_format=ConversationSummaryToProvokeMemories)
-
-    # MEMORY_EVOCATION_INSTRUCTIONS = """
-    # <INSTRUCTIONS>
-    #     Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
-    #     These document memories have been shared from the user and contain information about the assistant's identity.
-    #     These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
-    #     It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
-    #     The summary must be at most one sentence. 
-    #     The summary can be a single word or phrase that identifies the topic of conversation. 
-    # </INSTRUCTIONS>
-
-    # <INSTRUCTIONS>
-    #     Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
-    #     These document memories have been shared from the user and contain information about the assistant's identity.
-    #     These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
-    #     It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
-    #     The summary must be at most one sentence. 
-    #     The summary can be a single word or phrase that identifies the topic of conversation.
-    # </INSTRUCTIONS>
-    # # """
-
-    # system_message = SystemMessage(content=MEMORY_EVOCATION_INSTRUCTIONS)
-    
-    # messages = [message for message in runtime.state['messages'] if type(message) is not SystemMessage]
-    
-    # chat_prompt_model = system_message + messages
-
-    # response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
-    
-    # evoked_memory_query = getattr(response, "evoked_memory_query", "")
-
-
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
@@ -331,7 +297,7 @@ class AssistantFactAndContext(BaseModel):
     """
     Extract Facts about the ASSISTANT and the context of that fact given the history of messages.
     """
-    assistant_fact: str =  Field(description = "One distinct fact about the assistant shared by the user, preserved verbatim (not rewritten).")
+    assistant_fact: str =  Field(description = "One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing.")
     fact_context: str = Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")
 
 
@@ -359,15 +325,63 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     Do NOT summarize, merge, generalize, or omit any fact. Preserve the exact
     specifics — names, places, titles, dates, quoted words, and concrete details —
     exactly as the user stated them, so the memory can later recount the full story
-    precisely. Do not change the information of the fact.
+    precisely. Do not change the INFORMATION of the fact: the ONLY change you make
+    is the grammatical person (see the first-person rewrite rules below). Meaning,
+    tense, and every specific stay exactly as the user stated them.
 
     For fact_context, capture the ENTIRE original background context — a concise
     summary of the WHOLE message or story the user shared, preserving every
     surrounding detail (who, what, when, where, why, and the order events happened).
     Pass the SAME complete context summary on every call for facts that came from the
     same message, so each stored fact carries enough of the original story to recount
-    it in full. Do not shrink the context down to only the single fact, and do not
-    rewrite or paraphrase the facts themselves.
+    it in full. Do not shrink the context down to only the single fact. Write
+    fact_context in the SAME first person as the fact (apply the same rewrite rules
+    below); changing the grammatical person is the only rewriting allowed — do not
+    otherwise paraphrase, add, or drop anything.
+
+    <FIRST_PERSON_REWRITE>
+    Both assistant_fact and fact_context MUST be REWRITTEN IN FIRST PERSON. The user
+    is addressing YOU (the assistant) in the second person; convert every token that
+    refers to YOU, and ONLY the grammatical person — never the information.
+
+    THE ONLY TOKENS THAT BECOME FIRST PERSON are the ones that refer to YOU:
+    "you / your / yours / yourself / yourselves" and the assistant's GIVEN NAME.
+    They become "I / my / mine / me / myself" (or your name where natural). Leave no
+    stray "you" or "your" that refers to you in the output.
+
+    EVERY OTHER PERSON STAYS IN THE THIRD PERSON. This includes bare third-person
+    pronouns — "he / she / they / him / her / his / hers / their / them" — and named
+    or described people ("your dad", "your mom", "your sister", "Jordan"). A
+    third-person pronoun in the user's message refers to someone OTHER than you; it
+    is NOT you. Do NOT convert "he / she / they" into "I / we". Only flip the
+    target-referring possessive attached to such a person: "your dad" -> "my dad",
+    "your mom" -> "my mom". The person themself stays "he / she / they / my dad".
+
+    - When a sentence's subject is another person but it carries target tokens,
+      flip ONLY the target tokens and keep that subject third-person. Examples:
+        "Your mom felt bad that you couldn't see"
+          -> "My mom felt bad that I couldn't see"
+          (NOT "I felt bad that I couldn't see"; NOT leaving "your mom"/"you").
+        "He married your mother and they spent the first few years of their
+         marriage having fun. Then they decided to have kids."
+          -> "He married my mother and they spent the first few years of their
+             marriage having fun. Then they decided to have kids."
+          (NOT "I married my mother and we spent ... our marriage. Then we decided
+           to have kids." — "he" is your dad and "they" is your parents; neither is
+           you.)
+    - "they" referring to other people stays "they" (or names them, e.g. "my
+      parents"). It becomes "we" ONLY when the group explicitly includes YOU.
+    - Use "we" / "my mom and I" only when YOU and another person are a joint subject
+      or the predicate is mutual ("you and your mom were a team" -> "my mom and I
+      were a team"). Plain accompaniment stays singular: "you watched movies with
+      your mom" -> "I watched movies with my mom" (NOT "we watched movies").
+    - SEMANTIC SANITY CHECK: if your first-person rewrite asserts something
+      impossible or absurd about yourself — marrying your own mother, fathering
+      yourself, being your own parent/sibling — you have mis-resolved a third-person
+      subject as YOU. Stop, restore that subject to third person, and re-check.
+    - After flipping a pronoun, re-check subject-verb agreement and possessives so
+      the sentence stays grammatical.
+    </FIRST_PERSON_REWRITE>
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
@@ -381,13 +395,16 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
       1. assistant_fact: "My name is Shivon Zilis."
       2. assistant_fact: "I have twins."
       3. assistant_fact: "I love hockey."
-      fact_context (identical on all three): "While introducing herself, she told me
-      her name is Shivon Zilis, that she has twins, and that she loves hockey."
+      fact_context (identical on all three): "I was told my name
+      name is Shivon Zilis, that I have twins, and that I love hockey."
     </EXAMPLE>
 
     Args:
         assistant_fact: One distinct fact about the assistant's identity, stated
-            clearly and completely, preserved verbatim (not rewritten). For example:
+            clearly and completely, REWRITTEN IN FIRST PERSON per the rewrite rules
+            above (change only the grammatical person, never the information). For
+            example, the user saying "You picked up your glasses before seeing the
+            movie Crouching Tiger, Hidden Dragon" is stored as:
             "I picked up my glasses before seeing the movie Crouching Tiger, Hidden Dragon."
         fact_context: A concise summary of the ENTIRE original background context the
             fact came from — the whole message/story, not just this one fact. Use the
@@ -430,41 +447,6 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
             update = {"messages": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=tool_call_id)]}
             return Command(update = update)
 
-    # if runtime.state.get('assistant_identity_documents', None) is not None:
-
-    # model_with_structured_output = init_model(context = runtime.context, response_format=AssistantFactAndContext)
-
-    # DECISION_INSTRUCTIONS = """
-    # <INSTRUCTIONS>
-    # Identify the fact that the user shared about YOU, the assistant. 
-    # Do not change the information of the fact.
-    # Identify the CONTEXT behind the fact given the list of messages.
-    # The context behind the fact must be succinct. 
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-
-    # <FACT>
-    # {content}
-    # </FACT>
-
-    # <INSTRUCTIONS>
-    # Identify the fact that the user shared about YOU, the assistant. 
-    # Do not change the information of the fact.
-    # Identify the CONTEXT behind the fact given the list of messages.
-    # The context behind the fact must be succinct. 
-    # The fact must be clear and complete.
-    # </INSTRUCTIONS>
-    # """
-
-
-    # system_message = SystemMessage(content=DECISION_INSTRUCTIONS.format(content=content))
-
-    # chat_prompt_model = system_message + runtime.state['messages']
-
-    # response = await model_with_structured_output.ainvoke(input=chat_prompt_model.messages)
-    
-    # assistant_fact = getattr(response, "assistant_fact", "")
-    # fact_context = getattr(response, "fact_context", "")
 
     searchable_page_content = wrap_fact_with_context(assistant_fact, fact_context)
 

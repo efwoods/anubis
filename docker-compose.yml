@@ -46,4 +46,3 @@ services:
             - .:/deps/anubis
             # Prefetched Hub weights (see ``ensure_huggingface_models_cached``); survives container restarts.
             - ~/.cache/huggingface:/root/.cache/huggingface
-  

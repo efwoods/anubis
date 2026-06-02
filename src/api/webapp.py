@@ -1214,6 +1214,8 @@ async def message_selected_avatar(
     return JSONResponse(response_data, status_code=200)
 
 
+from time import sleep
+
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,
@@ -1237,7 +1239,10 @@ async def message_avatar(
     # now so the frontend can wire its UI without a breaking API change later.
 
     # allow for select avatar in query and anonymous user for a dedicated endpoint\
-    breakpoint
+
+    # TODO: REMOVE THIS BEFORE DEPLOYMENT AND AFTER TESTING!!!
+    # sleep(300)
+
     logger.warning(f"stream:{stream}")
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})

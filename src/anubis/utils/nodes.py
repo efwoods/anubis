@@ -458,7 +458,6 @@ async def _build_consciousness_system_message_update(
 
     system_message_str = populated_identity_template.messages[0].content
 
-
     _write_dev_system_prompt(system_message_str, runtime)
 
     input_update = {

@@ -50,6 +50,7 @@ QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND 
 
 """
 
+<<<<<<< Updated upstream
 
 def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     """Wrap a single atomic fact with its ENTIRE original background context.
@@ -74,6 +75,8 @@ def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     )
 
 
+=======
+>>>>>>> Stashed changes
 @tool("test_update")
 async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
     """ Test update system message CALL THIS TOOL ALWAYS"""

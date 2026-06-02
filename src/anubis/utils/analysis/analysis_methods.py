@@ -26,6 +26,7 @@ from src.anubis.utils.prompts.psycho_analysis.emotional_trigger_analysis_prompt 
 from src.anubis.utils.prompts.psycho_analysis.latent_feature_analysis_prompts import (
     BELIEFS_ANALYSIS_SYSTEM_PROMPT,
     DESCRIPTION_ANALYSIS_SYSTEM_PROMPT,
+    DSM5_ANALYSIS_SYSTEM_PROMPT,
     FEARS_ANALYSIS_SYSTEM_PROMPT,
     FLAWS_ANALYSIS_SYSTEM_PROMPT,
     GOALS_ANALYSIS_SYSTEM_PROMPT,
@@ -337,6 +338,8 @@ async def perform_emotional_trigger_analysis(
 _NARRATIVE_ANALYZER_SPECS: dict[str, tuple[str, str]] = {
     "beliefs": ("belief", BELIEFS_ANALYSIS_SYSTEM_PROMPT),
     "relationships": ("relationship", RELATIONSHIPS_ANALYSIS_SYSTEM_PROMPT),
+    # DSM-5 disorder indications (screening characterization, not diagnosis).
+    # "dsm5": ("dsm5_indication", DSM5_ANALYSIS_SYSTEM_PROMPT),
     # Registered stubs (generic prompt body; refine into bespoke prompts later).
     "values": ("value", VALUES_ANALYSIS_SYSTEM_PROMPT),
     "opinions": ("opinion", OPINIONS_ANALYSIS_SYSTEM_PROMPT),

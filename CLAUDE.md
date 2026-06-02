@@ -185,3 +185,12 @@ Use ~/.claude/skills/gstack/... for gstack file paths (the global path).
 
 
 when adding environment variables, include the environment variable in the .env.example without any set values.
+
+
+
+# five main pillars/levers to maximize authenticity
+1. increase the amount of data collected
+2. increase the quality of the data that is collected (preprocessing)
+3. increase the quality of the prompt that instructs the model and uses that data from working memory and consciousness
+4. increase the size of the base model used for inference
+5. increase the quality of the adapters that are attached to the basemodel

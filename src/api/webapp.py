@@ -2569,18 +2569,50 @@ async def update_avatar_identity_with_media(
             "media_files": media_files,
         }
 
-        await process_media_graph_api_endpoint.ainvoke(
+        final_state = await process_media_graph_api_endpoint.ainvoke(
             initial_state,
             config=config,
             context=app.state.context,
         )
 
-        # Indexing clears vectorstore_documents_to_be_indexed in final state; rely on exceptions for failures.
+        # index_docs does not raise on per-file indexing failures; it reports
+        # them on ``failed_to_index_files`` so the rest of the upload still
+        # succeeds and the caller can reprocess only the failed files.
+        failed_files = (final_state or {}).get("failed_to_index_files", []) or []
+        failed_filenames = {
+            f.get("filename")
+            for f in failed_files
+            if f.get("filename") is not None
+        }
+
+        requested_filenames = [m.get("filename") for m in media_files]
+        indexed_filenames = [
+            name for name in requested_filenames if name not in failed_filenames
+        ]
+
+        if failed_files:
+            # 207 Multi-Status: some files indexed, some did not.
+            return JSONResponse(
+                status_code=207,
+                content={
+                    "items_processed": len(media_files),
+                    "filenames": requested_filenames,
+                    "indexed_filenames": indexed_filenames,
+                    "failed_files": failed_files,
+                    "message": (
+                        "Some files failed to index and should be reprocessed: "
+                        + ", ".join(sorted(n for n in failed_filenames if n))
+                    ),
+                },
+            )
+
         return JSONResponse(
             status_code=200,
             content={
                 "items_processed": len(media_files),
-                "filenames": [m.get("filename") for m in media_files],
+                "filenames": requested_filenames,
+                "indexed_filenames": indexed_filenames,
+                "failed_files": [],
                 "message": "Media processed and indexed successfully",
             },
         )
@@ -2629,7 +2661,7 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
-
+    
     # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
     # leaving only the filename or already-derived namespace id.
     source_document_name = source_document_name.strip(" \t\n\r\"'`(),[]")
@@ -2693,7 +2725,6 @@ OR (
     return JSONResponse(
         content=f"Successfully deleted: {source_document_name}", status_code=200
     )
-
 
 if __name__ == "__main__":
     import uvicorn

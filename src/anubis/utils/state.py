@@ -252,6 +252,11 @@ class GlobalState(TypedDict):
     # List of Documents to be uploaded to the vectorstore (processed_media -> formatt -> vectorstore_documents)
     vectorstore_documents_to_be_indexed: VectorstoreIndexState
 
+    # Original uploaded files (by filename) that failed to index. index_docs
+    # indexes everything it can and appends a per-file failure report here
+    # instead of raising, so the upload layer can surface and reprocess them.
+    failed_to_index_files: Annotated[List[Dict[str, Any]], operator.add]
+
     # Analysis list
     documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: (
         AnalysisIndexState

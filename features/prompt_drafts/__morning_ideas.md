@@ -17,4 +17,26 @@ data analysis/slack bot
 
 add and process a list of urls and zip files
 
-authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?)
+
+# Measure Authenticity
+authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?) (use a baseline of questions, generate responses to the baseline of questions and compare)
+
+
+add optional context to media upload 
+allow the process media graph to be used as a tool triggered in conversation
+
+# Evaluation
+# Tuning Prompts to reduce false negatives
+# Tuning Prompts to reduce false positives
+# Tuning Behaviors in Threads
+# Train-Attach-Evaluate Adapter Lifecycle
+
+
+# Scan and pull data from scripts after setting an explicit target
+# Scan and parse quotes and biographical information from websites (curie)
+# Increase quality of data from pdf, random websites, markdown
+# crawl linktree;
+# recurse media sites
+# Deep research
+
+

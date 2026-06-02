@@ -472,7 +472,6 @@ async def process_uploaded_files_and_label_media_type(
         "media_files": []
     }
 
-
 async def analyze_documents(
     state: GlobalState,
     runtime: Runtime[GlobalContext],
@@ -524,7 +523,7 @@ async def analyze_documents(
             labels.append(name)
             coros.append(runner(doc))
 
-    out: List[Document] = []
+    analyzed_documents: List[Document] = []
     if coros:
         results = await asyncio.gather(*coros, return_exceptions=True)
         for name, result in zip(labels, results):
@@ -536,14 +535,30 @@ async def analyze_documents(
                 )
                 continue
             if result:
-                out.extend(result)
+                analyzed_documents.extend(result)
 
-    existing_vs: List[Document] = list(
-        state.get("vectorstore_documents_to_be_indexed") or []
-    )
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _adl(
+            "analyze_documents:return",
+            {
+                "queue_len": len(queue),
+                "analyzed_documents_len": len(analyzed_documents),
+                "sample_doc_id": (
+                    (analyzed_documents[0].metadata or {}).get("document_id")
+                    if analyzed_documents else None
+                ),
+            },
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
+
     return {
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete",
-        "vectorstore_documents_to_be_indexed": existing_vs + out,
+        "vectorstore_documents_to_be_indexed": analyzed_documents,
     }
 
 
@@ -623,6 +638,26 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
     adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("adapter_acceptable", False) == True]
+
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _adl(
+            "convert_media_list_to_text_document:return",
+            {
+                "vectorstore_len": len(vector_store_document_list_formatted),
+                "analysis_len": len(analysis_document_list_formatted),
+                "adapter_len": len(adapter_document_list_formatted),
+                "sample_vs_doc_id": (
+                    (vector_store_document_list_formatted[0].metadata or {}).get("document_id")
+                    if vector_store_document_list_formatted else None
+                ),
+            },
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
@@ -1824,8 +1859,10 @@ async def process_adapter_documents(
             langsmith_jsonl,
         )
 
+    # Clear the adapter buffer of what we just processed (append-reducer
+    # semantics: an empty list would leave processed docs queued).
     return {
-        "documents_to_be_processed_for_adapter_training": [],
+        "documents_to_be_processed_for_adapter_training": "delete",
     }
 
 

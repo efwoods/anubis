@@ -1,3 +1,9 @@
+
+
+MERGE PSYCHO ANALYSIS WITH MULTI-FILE UPLOADS
+
+status updates while thinking of WHAT the avatar is currently thinking (streamed messages)
+
 pdf processing is unclean
 
 
@@ -75,3 +81,6 @@ https://www.youtube.com/watch?v=xRHFylOgeJA
 # - fine-tuning adapter with the creation of a dialogue when available to create prompt questions or use a dialogue to create a fine-tuned adapter to capture the speaking style and behavioral choices of the avatar
 
 # This realizes Success: speak like the person in real time with audio of the individual; write like the person; infer the thoughts (that's what I thought!)
+
+
+

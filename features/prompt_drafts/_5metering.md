@@ -48,3 +48,4 @@ This is an example of a text call. Note that in the @src/anubis/utils/nodes.py d
 
 for each @src/api/webapp.py /message /message selected avatar, there should be the aggregration of totals for all the previous metrics for the single call (total cost, total input_tokens, total completion_tokens, total tokens, total latency_ms, and each of the previous categories for each distinct model type  and each distinct inference type)
 
+# I need to implement rate limiting and respect rate limits of the models for which I am calling

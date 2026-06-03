@@ -73,7 +73,7 @@ https://www.youtube.com/watch?v=nDLb8_wgX50
 https://www.youtube.com/watch?v=QmOF0crdyRU
 
   
-  Example of playlist:
+Example of playlist:
   Gracie Abrams
 https://www.youtube.com/playlist?list=PL9rU625vkl4XLqULoLJkid_iOxgtQnn8O
   
@@ -98,10 +98,7 @@ https://youtu.be/KBnJLz1mifs?si=pxTSZhRAxVwY-w4q
 
 # COST estimation of PROCESSING PIPELINE/ MESSAGING (USD, TOKEN, TIME)
 
-
-
 ###############################
-
 
 # This is the wrong speaker when using reference audio from the following clip; a user will not know this is the incorrect speaker ever
 /home/user/gh/anubis-project/anubis/data/lex_fridman/video_data/dialogue_long_clip.mp4

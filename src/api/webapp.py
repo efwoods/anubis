@@ -2071,6 +2071,15 @@ def _collect_input_urls(raw_url_field: Any) -> List[str]:
     line above a playlist link — are ignored, mirroring ``_extract_manifest_urls``
     so the same paste works in the field or in an uploaded manifest. Order is
     preserved and duplicates dropped.
+
+    The ``url`` field is typed as an array (``Optional[List[str]]``), so API
+    browsers (Swagger "Try it out", the LangGraph API explorer, etc.) often
+    present and submit it as a JSON-array literal — e.g. ``["https://…"]`` or a
+    bare ``[https://…]`` — rather than a plain value. We strip the surrounding
+    ``[ ]`` brackets, quotes and stray commas per token so a single URL works
+    whether or not the user wraps it in quotes/brackets. We deliberately do *not*
+    strip ``) }`` (keeps Wikipedia-style ``…_(disambiguation)`` URLs intact) and
+    split on whitespace only (keeps comma-bearing query strings intact).
     """
     from urllib.parse import urlparse
 
@@ -2085,7 +2094,7 @@ def _collect_input_urls(raw_url_field: Any) -> List[str]:
     urls: List[str] = []
     for value in values:
         for token in re.split(r"\s+", value or ""):
-            candidate = token.strip().strip("<>\"'").lstrip("-*•").strip()
+            candidate = token.strip().strip("<>\"'[],").lstrip("-*•").strip()
             if not candidate:
                 continue
             try:

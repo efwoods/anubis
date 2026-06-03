@@ -68,4 +68,5 @@ allow the process media graph to be used as a tool triggered in conversation
 # recurse media sites
 # Deep research
 
-
+# get reference audio file and reference image file url endpoints
+# CRUD memories/identity_memories endpoints

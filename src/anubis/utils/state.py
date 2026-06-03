@@ -256,7 +256,13 @@ class GlobalState(TypedDict):
     processed_media_to_be_formatted: Annotated[Sequence[Document], operator.add]
 
     # List of Documents to be uploaded to the vectorstore (processed_media -> formatt -> vectorstore_documents)
-    vectorstore_documents_to_be_indexed: VectorstoreIndexState
+    # NOTE: this is a reduce_docs channel, not the VectorstoreIndexState wrapper.
+    # convert_media_list_to_text_document and analyze_documents both fan into
+    # index_docs in the same superstep, so a reducer is required to merge their
+    # writes (and to interpret the "delete"/remove_docs_update sentinels). Typing
+    # the vectorstore_documents_to_be_indexed as the wrapper dataclass made the variable a LastValue channel → "Can receive only
+    # one value per step" on concurrent updates.
+    vectorstore_documents_to_be_indexed: Annotated[Sequence[Document], reduce_docs]
 
     # Original uploaded files (by filename) that failed to index. index_docs
     # indexes everything it can and appends a per-file failure report here
@@ -265,14 +271,18 @@ class GlobalState(TypedDict):
 
     # Analysis list
     documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant: (
-        AnalysisIndexState
+        Annotated[Sequence[Document], reduce_docs]
     )
 
     # Adapter list
-    documents_to_be_processed_for_adapter_training: AdapterIndexState
+    documents_to_be_processed_for_adapter_training: Annotated[
+        Sequence[Document], reduce_docs
+    ]
 
     # Ground Truth User First Person Speech (literal quotes from the target entity)
-    ground_truth_user_first_person_speech_baseline_for_evaluation: BaselineIndexState
+    ground_truth_user_first_person_speech_baseline_for_evaluation: Annotated[
+        Sequence[Document], reduce_docs
+    ]
 
     """ Node Routing """
 

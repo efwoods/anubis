@@ -283,10 +283,19 @@ class URLDocumentLoaderClass:
         Returns one ``type="url"`` watch item per entry; each re-enters this
         class on the next pass and flows through the single-video YouTube path
         (subtitles fast-path, else audio + diarization)."""
-        entries = await _extract_playlist_entries(url)
+        entries, playlist_title = await _extract_playlist_entries(url)
         if not entries:
             logger.warning("YouTube playlist produced no entries: %s", url)
             return []
+
+        # The playlist's own deterministic key. Every video in the playlist is
+        # keyed by a COMPOSITE ``{playlist_ns}::{video_ns}`` so the namespace
+        # carries both identities: items group under their playlist (prefix =
+        # playlist_ns) yet stay disambiguated from one another and from the same
+        # video in a different playlist. /list_avatar_documents groups on this,
+        # the skip-set matches on it, and /delete_avatar_document can drop a whole
+        # playlist (``{playlist_ns}::%``) or a single video (exact composite).
+        playlist_ns = _namespace_for(url)
 
         media_items: List[Dict[str, Any]] = []
         for entry in entries:
@@ -296,6 +305,7 @@ class URLDocumentLoaderClass:
             )
             if not watch_url:
                 continue
+            video_ns = _namespace_for(watch_url)
             media_items.append(
                 {
                     "type": "url",
@@ -307,16 +317,18 @@ class URLDocumentLoaderClass:
                         "assistant_id": assistant_id,
                         "url_kind": "youtube_playlist_entry",
                         "playlist_url": url,
-                        # Key each entry by playlist + video so items are grouped
-                        # under their playlist yet disambiguated from one another
-                        # (and from the same video in a different playlist). This
-                        # is what /list_avatar_documents and the skip-set match on.
-                        "namespace_filename": _namespace_for(f"{url}::{watch_url}"),
+                        "playlist_namespace_filename": playlist_ns,
+                        "playlist_title": playlist_title,
+                        "video_title": entry.get("title") or "",
+                        "namespace_filename": f"{playlist_ns}::{video_ns}",
                     },
                 }
             )
         logger.info(
-            "Expanded YouTube playlist %s into %d videos", url, len(media_items)
+            "Expanded YouTube playlist %s (%s) into %d videos",
+            url,
+            playlist_title or "untitled",
+            len(media_items),
         )
         return media_items
 
@@ -413,14 +425,19 @@ async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
         return text
 
 
-async def _extract_playlist_entries(url: str) -> List[Dict[str, Any]]:
-    """Return the flat list of entries (``{id, url, ...}``) for a YouTube playlist."""
+async def _extract_playlist_entries(url: str) -> tuple[List[Dict[str, Any]], str]:
+    """Return ``(entries, playlist_title)`` for a YouTube playlist.
+
+    ``entries`` is the flat list (``{id, url, ...}``); ``playlist_title`` is the
+    human-readable playlist name (empty string when yt_dlp can't resolve it),
+    surfaced so individual videos can be listed under their playlist.
+    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _extract_playlist_entries_sync, url)
 
 
-def _extract_playlist_entries_sync(url: str) -> List[Dict[str, Any]]:
-    """Sync helper: flat-extract playlist entries via ``yt_dlp`` (no download)."""
+def _extract_playlist_entries_sync(url: str) -> tuple[List[Dict[str, Any]], str]:
+    """Sync helper: flat-extract playlist entries + title via ``yt_dlp`` (no download)."""
     import yt_dlp  # local import: heavy module
 
     ydl_opts = {
@@ -435,11 +452,12 @@ def _extract_playlist_entries_sync(url: str) -> List[Dict[str, Any]]:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # pragma: no cover - logged for the operator
         logger.exception("yt_dlp playlist extraction failed for %s: %s", url, exc)
-        return []
+        return [], ""
 
     entries = (info or {}).get("entries") or []
+    playlist_title = (info or {}).get("title") or ""
     # Drop unavailable/private entries that yt_dlp returns as ``None``.
-    return [e for e in entries if isinstance(e, dict)]
+    return [e for e in entries if isinstance(e, dict)], playlist_title
 
 
 async def _download_youtube_audio_b64(url: str) -> tuple[str, str]:

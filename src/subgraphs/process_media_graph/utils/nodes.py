@@ -1647,12 +1647,38 @@ async def process_media_item_task(
                 )
                 fallback_text = (fallback.get("text") or "").strip()
             except Exception as e:
+                # A transcription API failure is a REAL error, not "no speech".
+                # Surfacing it as status="error" makes convert_media_list_to_text_document
+                # count it in items_error, emit an item_error progress event, and
+                # report the file in failed_to_index_files for reprocessing —
+                # instead of silently reporting the upload as completed. Transient
+                # failures were already retried with backoff in _speech_call_with_retry;
+                # reaching here means retries were exhausted or the error is permanent
+                # (e.g. insufficient_quota), so the user must see it.
                 logger.exception(
                     "Fallback transcription failed for %s: %s", filename, e
                 )
-                fallback_text = ""
+                all_documents.append(
+                    Document(
+                        page_content=f"[{media_type.capitalize()} transcription failed: {e}]",
+                        metadata={
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                            "type": media_type,
+                            "filename": filename,
+                            "vectorstore_acceptable": False,
+                            "status": "error",
+                            "error": f"transcription_failed: {e}",
+                            "namespace_filename": namespace_filename,
+                        },
+                    )
+                )
+                return all_documents
 
             if not fallback_text:
+                # Transcription SUCCEEDED but produced no text (genuinely silent /
+                # speechless audio). This is not an error — record it as such.
                 all_documents.append(
                     Document(
                         page_content=f"[{media_type.capitalize()} transcription unavailable]",
@@ -1804,15 +1830,15 @@ async def _expand_url_media_item(
         child_meta = item.setdefault("metadata", {})
         child_ns = child_meta.get("namespace_filename")
         if not child_ns:
-            # Loader didn't pre-key this child (e.g. single-video subs/audio):
-            # derive from its own source so the key matches the top-level item.
-            child_source = (
-                item.get("url")
-                or child_meta.get("source")
-                or child_meta.get("filename")
-                or url
-            )
-            child_ns = _namespace_for(child_source)
+            # A keyless child is the single logical content of THIS url item
+            # (e.g. a video's subtitles or audio). Inherit the parent item's
+            # namespace_filename so the content lands under the SAME key as the
+            # item. This is what preserves a playlist entry's composite
+            # ``{playlist_ns}::{video_ns}`` key: deriving a fresh key from the
+            # child's own URL here would collapse it to a video-only key and
+            # lose the playlist grouping. For a standalone video/article the
+            # parent key already equals the per-source key, so this is a no-op.
+            child_ns = namespace_filename
             child_meta["namespace_filename"] = child_ns
         if child_ns in existing:
             _emit_media_progress(
@@ -1859,6 +1885,29 @@ async def _expand_url_media_item(
             collected.extend(child_docs)
         elif child_docs is not None:
             collected.append(child_docs)
+
+    # Propagate playlist context onto the produced Documents so the listing can
+    # group videos under their playlist and the delete endpoint can target a
+    # whole playlist. Only stamp when THIS item carries playlist context (i.e.
+    # it is a playlist entry being expanded into its subs/audio content) and
+    # never overwrite a child's own namespace_filename (already the composite
+    # ``{playlist_ns}::{video_ns}`` inherited above).
+    item_meta = media_item.get("metadata", {}) or {}
+    if item_meta.get("playlist_url"):
+        playlist_fields = {
+            key: item_meta[key]
+            for key in (
+                "playlist_url",
+                "playlist_namespace_filename",
+                "playlist_title",
+                "video_title",
+            )
+            if item_meta.get(key) is not None
+        }
+        for doc in collected:
+            if isinstance(getattr(doc, "metadata", None), dict):
+                for key, value in playlist_fields.items():
+                    doc.metadata.setdefault(key, value)
     return collected
 
 

@@ -293,6 +293,20 @@ class GlobalContext:
         },
     )
 
+    openai_speech_max_retries: int = field(
+        default=4,
+        metadata={
+            "description": "Max retries for transient OpenAI speech (transcription/diarization) failures — 429 rate_limit_exceeded, timeouts, connection errors, 5xx — retried with exponential backoff. Permanent errors (insufficient_quota, auth) are NOT retried and surface immediately as item errors. Env OPENAI_SPEECH_MAX_RETRIES."
+        },
+    )
+
+    openai_speech_retry_base_seconds: float = field(
+        default=1.0,
+        metadata={
+            "description": "Base delay (seconds) for exponential backoff between transient OpenAI speech retries; delay = base * 2**attempt + jitter. Env OPENAI_SPEECH_RETRY_BASE_SECONDS."
+        },
+    )
+
     """ </Audio Transcription & Diarization Model> """
 
     """ <Stylistic + Knowledge Profile thresholds> """

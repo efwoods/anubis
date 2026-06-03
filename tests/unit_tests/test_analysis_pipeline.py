@@ -278,3 +278,103 @@ async def test_index_docs_success_reports_no_failures(monkeypatch, stub_index_id
 
     assert result["failed_to_index_files"] == []
     assert result["vectorstore_documents_to_be_indexed"]["keys"] == ["a1"]
+
+
+# --------------------------------------------------------------------------- #
+# batch_index_documents_vectorstore — replace-by-filename must be scoped to the
+# (namespace_filename, namespace) pair, so the analysis pass does NOT delete the
+# source quote/identity docs it was derived from (they share namespace_filename).
+# --------------------------------------------------------------------------- #
+
+
+class _FakeStoreItem(SimpleNamespace):
+    pass
+
+
+class _FakeStore:
+    """Minimal store: records puts, supports prefix search and delete."""
+
+    def __init__(self):
+        # keyed by (namespace_tuple, key) -> value dict
+        self._items: dict[tuple, dict] = {}
+
+    def seed(self, namespace, key, value):
+        self._items[(namespace, key)] = value
+
+    async def asearch(self, prefix, limit=1000):
+        return [
+            _FakeStoreItem(namespace=ns, key=key, value=value)
+            for (ns, key), value in self._items.items()
+            if ns[: len(prefix)] == tuple(prefix)
+        ]
+
+    async def adelete(self, namespace, key):
+        self._items.pop((namespace, key), None)
+
+    async def abatch(self, ops):
+        for op in ops:
+            self._items[(op.namespace, op.key)] = op.value
+
+    def keys(self):
+        return set(self._items.keys())
+
+
+def _store_doc(doc_id, namespace_filename, namespace):
+    return Document(
+        page_content=doc_id,
+        metadata={
+            "document_id": doc_id,
+            "namespace_filename": namespace_filename,
+            "namespace": namespace,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_analysis_pass_does_not_delete_source_docs_same_filename():
+    """The bug: indexing analysis docs wiped the source docs sharing a filename.
+
+    Source (quote) docs are indexed first; the derived analysis docs carry the
+    SAME namespace_filename. The replace-by-filename sweep must only replace
+    prior rows of the SAME namespace, so the quote source survives.
+    """
+    from src.subgraphs.vector_store_graph.utils.helper_functions import (
+        batch_index_documents_vectorstore,
+    )
+
+    store = _FakeStore()
+    # First pass already persisted a quote source doc for nsf1.
+    src = _store_doc("src1", "nsf1", "quote")
+    src_ns = ("u", "a", "quote", "nsf1")
+    store.seed(src_ns, "src1", {"document": src.to_json()})
+
+    # Second pass: index the analysis doc derived from it (same namespace_filename).
+    analysis = _store_doc("an1", "nsf1", "analysis")
+    result = await batch_index_documents_vectorstore(store, "u", "a", [analysis])
+
+    assert result["success"] is True
+    keys = store.keys()
+    # The quote source doc must NOT have been swept away...
+    assert (src_ns, "src1") in keys
+    # ...and the analysis doc is now indexed under the analysis namespace.
+    assert (("u", "a", "analysis", "nsf1"), "an1") in keys
+
+
+@pytest.mark.asyncio
+async def test_reindex_same_namespace_replaces_prior_version():
+    """Same-namespace re-index of a file still replaces its prior rows."""
+    from src.subgraphs.vector_store_graph.utils.helper_functions import (
+        batch_index_documents_vectorstore,
+    )
+
+    store = _FakeStore()
+    old = _store_doc("old1", "nsf1", "quote")
+    old_ns = ("u", "a", "quote", "nsf1")
+    store.seed(old_ns, "old1", {"document": old.to_json()})
+
+    new = _store_doc("new1", "nsf1", "quote")
+    await batch_index_documents_vectorstore(store, "u", "a", [new])
+
+    keys = store.keys()
+    assert (old_ns, "old1") not in keys  # prior version replaced
+    assert (old_ns, "new1") in keys

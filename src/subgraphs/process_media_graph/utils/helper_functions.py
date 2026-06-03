@@ -295,6 +295,12 @@ async def _build_identity_documents_from_facts(
     The identity-namespace embed field (``document.kwargs.page_content``) is
     the first-person statement, so retrieval at chat time finds these as
     primary self-knowledge of the avatar.
+
+    Each Document is both ``vectorstore_acceptable`` (stored under ``identity``)
+    and ``analysis_acceptable`` (queued for the analyzer fan-out), so a
+    biographical fact is preserved verbatim as self-knowledge while also driving
+    the latent-feature/OCEAN/emotional-trigger analysis — storage and analysis
+    are maintained side by side rather than being mutually exclusive.
     """
     if not facts:
         return []
@@ -338,7 +344,14 @@ async def _build_identity_documents_from_facts(
                 "namespace": "identity",
                 "vectorstore_acceptable": True,
                 "adapter_acceptable": False,
-                "analysis_acceptable": False,
+                # Biographical facts are stored under ``identity`` AND fed to the
+                # analysis pipeline: the first-person fact is exactly the input
+                # the latent-feature/OCEAN/emotional-trigger analyzers consume to
+                # derive beliefs, values, history, relationships, etc. Storage and
+                # analysis are maintained side by side (the doc lands on both the
+                # vectorstore-index buffer and the analysis queue; analyzer
+                # outputs are separate ``analysis``-namespace Documents).
+                "analysis_acceptable": True,
                 "classified_situation": "biographical_facts",
                 "synthetic": True,
                 "original_statement": original_statement,

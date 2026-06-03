@@ -28,8 +28,10 @@ from typing import Optional
 
 import asyncio
 import math
+import random
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from moviepy import AudioFileClip, VideoFileClip
 from time import time_ns
@@ -638,7 +640,76 @@ def _openai_client_for_speech(context: GlobalContext) -> OpenAI:
     if not key:
         msg = "Set `openai_api_key` / OPENAI_API_KEY or `llm_provider_api_key` for speech APIs."
         raise ValueError(msg)
-    return OpenAI(api_key=key)
+    # max_retries=0: retries are handled by _speech_call_with_retry so we can
+    # back off transient failures (rate_limit_exceeded / timeouts / 5xx) while
+    # failing FAST on permanent ones (insufficient_quota / auth) instead of
+    # burning the SDK's blind exponential backoff on an error that can't recover.
+    return OpenAI(api_key=key, max_retries=0)
+
+
+# Permanent OpenAI error codes — retrying cannot succeed, so surface immediately.
+_NON_RETRYABLE_OPENAI_CODES = frozenset(
+    {"insufficient_quota", "billing_hard_limit_reached", "access_terminated"}
+)
+
+
+def _speech_call_with_retry(make_call, context: GlobalContext, *, description: str):
+    """Run a synchronous OpenAI speech call with durable backoff on transient errors.
+
+    Retries ``rate_limit_exceeded`` (429), request timeouts, connection errors and
+    5xx with exponential backoff + jitter, up to ``openai_speech_max_retries``.
+    Permanent failures (``insufficient_quota`` and other billing/auth errors) are
+    re-raised on the first occurrence so they surface as a real item error rather
+    than being slow-retried or silently swallowed.
+    """
+    import openai
+
+    max_retries = max(0, int(context.openai_speech_max_retries or 0))
+    base = float(context.openai_speech_retry_base_seconds or 0.0)
+    attempts = max_retries + 1
+    last_exc: Exception | None = None
+
+    for attempt in range(attempts):
+        try:
+            return make_call()
+        except openai.RateLimitError as exc:
+            code = getattr(exc, "code", None)
+            if code in _NON_RETRYABLE_OPENAI_CODES:
+                logger.error(
+                    "%s: permanent OpenAI error (%s); not retrying: %s",
+                    description,
+                    code,
+                    exc,
+                )
+                raise
+            last_exc = exc
+        except (
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        ) as exc:
+            last_exc = exc
+        except openai.APIStatusError as exc:
+            # Retry only transient 5xx; other status errors (4xx) are caller bugs.
+            if getattr(exc, "status_code", 0) < 500:
+                raise
+            last_exc = exc
+
+        if attempt < attempts - 1:
+            delay = base * (2 ** attempt) + random.uniform(0, base or 0.0)
+            logger.warning(
+                "%s: transient OpenAI failure (attempt %d/%d), retrying in %.2fs: %s",
+                description,
+                attempt + 1,
+                attempts,
+                delay,
+                last_exc,
+            )
+            time.sleep(delay)
+
+    # Exhausted all retries on a transient error.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _audio_mime_from_suffix(suffix: str) -> str:
@@ -719,10 +790,14 @@ def _transcribe_one_segment_path(
     transcription_cost = duration_seconds * context.audio_transcription_price_per_minute
     model = context.audio_transcription_model or "whisper-1"
     with open(path, "rb") as audio_f:
-        content = client.audio.transcriptions.create(
-            file=(upload_filename, audio_f),
-            model=model,
-            response_format="text",
+        content = _speech_call_with_retry(
+            lambda: client.audio.transcriptions.create(
+                file=(upload_filename, audio_f),
+                model=model,
+                response_format="text",
+            ),
+            context,
+            description=f"transcription({upload_filename})",
         )
     return {
         "text": content,
@@ -1088,19 +1163,27 @@ def _diarize_one_mp3_path(
     extra = _diarize_known_speaker_extra_body(context, encoded_reference_audio)
     with open(mp3_path, "rb") as audio_f:
         if extra:
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=(upload_name, audio_f),
-                response_format="diarized_json",
-                chunking_strategy="auto",
-                extra_body=extra,
+            result = _speech_call_with_retry(
+                lambda: client.audio.transcriptions.create(
+                    model=model,
+                    file=(upload_name, audio_f),
+                    response_format="diarized_json",
+                    chunking_strategy="auto",
+                    extra_body=extra,
+                ),
+                context,
+                description=f"diarization({upload_name})",
             )
         else:
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=(upload_name, audio_f),
-                response_format="diarized_json",
-                chunking_strategy="auto",
+            result = _speech_call_with_retry(
+                lambda: client.audio.transcriptions.create(
+                    model=model,
+                    file=(upload_name, audio_f),
+                    response_format="diarized_json",
+                    chunking_strategy="auto",
+                ),
+                context,
+                description=f"diarization({upload_name})",
             )
     if not isinstance(result, TranscriptionDiarized):
         msg = "Expected diarized_json transcription response from OpenAI."

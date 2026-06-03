@@ -172,7 +172,25 @@ async def batch_index_documents_vectorstore(
         # never destroys the prior version: the old documents are only removed at
         # the moment the new ones are written. Idempotent on the deterministic
         # namespace_filename (uuid5), so resumed/re-run items overwrite cleanly.
-        incoming_filenames = {f for f in filenames if f}
+        # Replace is scoped to the exact (namespace_filename, namespace-category)
+        # pair, NOT to the bare filename. The media pipeline indexes a single
+        # source file in TWO passes that share one namespace_filename: the source
+        # docs (quote / identity / document / ...) are indexed first, then the
+        # derived analysis-namespace docs are indexed in a second pass (they carry
+        # the SAME namespace_filename forwarded from their source). A blanket
+        # filename sweep made the analysis pass delete the just-written source
+        # docs, so only the analysis documents survived. Keying the sweep on
+        # (filename, namespace) lets each pass overwrite only its own prior
+        # version of that file while leaving the other namespaces intact.
+        incoming_file_namespace_keys = {
+            (
+                doc.metadata.get("namespace_filename"),
+                doc.metadata.get("namespace", "document"),
+            )
+            for doc in vectorstore_documents_to_be_indexed
+            if doc.metadata.get("namespace_filename")
+        }
+        incoming_filenames = {key[0] for key in incoming_file_namespace_keys}
         if incoming_filenames:
             try:
                 existing_items = await store.asearch(
@@ -215,6 +233,13 @@ async def batch_index_documents_vectorstore(
                              in ("reference_audio", "reference_image")))
                 )
                 if is_reference:
+                    continue
+                # Only replace a prior row of the SAME (filename, namespace)
+                # pair as something in the incoming batch. Without this, the
+                # analysis pass (namespace="analysis", same namespace_filename)
+                # would delete the source quote/identity docs written by the
+                # first pass for the same file.
+                if (stored_filename, ns_category) not in incoming_file_namespace_keys:
                     continue
                 to_delete.append((item.namespace, item.key))
 

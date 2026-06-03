@@ -3124,6 +3124,13 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
         ) from exc
 
     uploaded_documents: set[str] = set()
+    # A playlist entry's Documents carry playlist_url / playlist_title /
+    # video_title (see URLDocumentLoaderClass._load_youtube_playlist). Such
+    # videos are listed by the convention ``{playlist} :: {video}`` so the
+    # playlist a video belongs to is discernible from the flat list; everything
+    # else is listed by its plain filename. Titles fall back to URLs/filenames
+    # when yt_dlp couldn't resolve them. The set de-dupes the multiple Documents
+    # per video (quote / identity / analysis) down to one entry.
     for item in all_document_items or []:
         value = getattr(item, "value", None)
         if value is None and isinstance(item, dict):
@@ -3133,8 +3140,19 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
         document = value.get("document")
         kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
         metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
-        filename = metadata.get("filename") if isinstance(metadata, dict) else None
-        if isinstance(filename, str) and filename:
+        if not isinstance(metadata, dict):
+            continue
+        filename = metadata.get("filename")
+        playlist_url = metadata.get("playlist_url")
+        if isinstance(playlist_url, str) and playlist_url:
+            playlist_label = (metadata.get("playlist_title") or playlist_url).strip()
+            video_label = (
+                metadata.get("video_title")
+                or (filename if isinstance(filename, str) else "")
+                or "untitled"
+            ).strip()
+            uploaded_documents.add(f"{playlist_label} :: {video_label}")
+        elif isinstance(filename, str) and filename:
             uploaded_documents.add(filename)
 
     return {"uploaded_documents": sorted(uploaded_documents)}
@@ -3169,10 +3187,17 @@ async def delete_avatar_documents(
     # (reference_image, reference_audio, …) where the serialized LangChain Document holds the
     # basename under value.document.kwargs.metadata.filename (same path as list_documents).
     # Rows removed from store CASCADE-delete matching store_vectors embeddings.
+    # Playlist videos are keyed by a composite namespace_filename
+    # ``{playlist_ns}::{video_ns}`` (see URLDocumentLoaderClass._load_youtube_playlist).
+    # Passing a bare playlist namespace id (or its URL, hashed above) deletes the
+    # WHOLE playlist via the ``{name}::%`` prefix; passing a full composite id
+    # deletes the single video via the exact-match clauses below. A plain
+    # (non-playlist) id has no ``::`` children, so the playlist clauses are inert.
     SQL_DELETE_DOCUMENT_QUERY = """
 DELETE FROM store
 WHERE (
     prefix = %s
+    OR prefix LIKE %s
     OR prefix LIKE %s
     OR prefix LIKE %s
     OR prefix LIKE %s
@@ -3191,6 +3216,13 @@ OR (
                     f"{user_id}.{assistant_id}.{source_document_name}.%",
                     f"{user_id}.{assistant_id}.%.{source_document_name}",
                     f"{user_id}.{assistant_id}.%.{source_document_name}.%",
+                    # Whole playlist: every composite-keyed video under this playlist.
+                    # Scoped to this user/assistant via the prefix — playlist_ns is a
+                    # deterministic hash of the playlist URL and is therefore shared
+                    # across users who uploaded the same playlist, so an unscoped
+                    # value match would cross avatars. namespace_filename is the 4th
+                    # prefix segment, so this targets exactly this avatar's videos.
+                    f"{user_id}.{assistant_id}.%.{source_document_name}::%",
                     f"{user_id}.{assistant_id}.reference_%",
                     source_document_name,
                 )

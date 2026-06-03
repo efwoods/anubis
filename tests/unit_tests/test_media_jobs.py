@@ -229,3 +229,114 @@ def test_registry_create_get_finish_and_cancel():
 )
 def test_classify_url_youtube_playlist(url, expected):
     assert _classify_url(url) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Playlist namespace: each video is keyed by a composite {playlist_ns}::{video_ns}
+# so the namespace carries both the playlist and the individual video, and the
+# content (subs/audio) inherits that composite key instead of collapsing to a
+# video-only key.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_playlist_entries_get_composite_namespace(monkeypatch):
+    """_load_youtube_playlist keys each video by {playlist_ns}::{video_ns} and
+    stamps playlist context (url / ns / title) onto every entry."""
+    import src.anubis.utils.classes.URLDocumentLoaderClass as loader_mod
+    from src.anubis.utils.classes.URLDocumentLoaderClass import (
+        URLDocumentLoaderClass,
+        _namespace_for,
+    )
+
+    playlist_url = "https://www.youtube.com/playlist?list=PLxyz"
+    watch_a = "https://www.youtube.com/watch?v=aaa"
+    watch_b = "https://www.youtube.com/watch?v=bbb"
+
+    async def _fake_entries(url):
+        return (
+            [
+                {"id": "aaa", "url": watch_a, "title": "Episode A"},
+                {"id": "bbb", "url": watch_b, "title": "Episode B"},
+            ],
+            "My Playlist",
+        )
+
+    monkeypatch.setattr(loader_mod, "_extract_playlist_entries", _fake_entries)
+
+    items = await URLDocumentLoaderClass()._load_youtube_playlist(
+        playlist_url, user_id="u", assistant_id="a"
+    )
+
+    playlist_ns = _namespace_for(playlist_url)
+    assert [i["metadata"]["namespace_filename"] for i in items] == [
+        f"{playlist_ns}::{_namespace_for(watch_a)}",
+        f"{playlist_ns}::{_namespace_for(watch_b)}",
+    ]
+    for item, title in zip(items, ("Episode A", "Episode B")):
+        meta = item["metadata"]
+        assert meta["playlist_url"] == playlist_url
+        assert meta["playlist_namespace_filename"] == playlist_ns
+        assert meta["playlist_title"] == "My Playlist"
+        assert meta["video_title"] == title
+
+
+@pytest.mark.asyncio
+async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
+    """A playlist entry's keyless content (subs/audio) inherits the composite
+    namespace and gets playlist context stamped onto the produced Documents."""
+    from langchain_core.documents import Document
+
+    import src.subgraphs.process_media_graph.utils.nodes as nodes_mod
+
+    playlist_ns = "PLNS"
+    composite = f"{playlist_ns}::VIDNS"
+    parent_item = {
+        "type": "url",
+        "url": "https://www.youtube.com/watch?v=aaa",
+        "metadata": {
+            "filename": "https://www.youtube.com/watch?v=aaa",
+            "namespace_filename": composite,
+            "playlist_url": "https://www.youtube.com/playlist?list=PLxyz",
+            "playlist_namespace_filename": playlist_ns,
+            "playlist_title": "My Playlist",
+            "video_title": "Episode A",
+        },
+    }
+
+    # Loader returns a single keyless child (the video's transcript text).
+    class _FakeLoader:
+        async def load(self, url, user_id=None, assistant_id=None):
+            return [{"type": "text", "content": "hello", "metadata": {}}]
+
+    monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
+
+    captured = {}
+
+    async def _fake_process(item, runtime, config, store, **kwargs):
+        # The child must have inherited the parent's composite namespace_filename.
+        captured["child_ns"] = item["metadata"].get("namespace_filename")
+        return [Document(page_content="hello", metadata={"namespace_filename": item["metadata"]["namespace_filename"], "namespace": "quote"})]
+
+    monkeypatch.setattr(nodes_mod, "process_media_item_task", _fake_process)
+
+    docs = await nodes_mod._expand_url_media_item(
+        parent_item,
+        None,
+        None,
+        None,
+        url=parent_item["url"],
+        filename=parent_item["metadata"]["filename"],
+        namespace_filename=composite,
+        user_id="u",
+        assistant_id="a",
+    )
+
+    assert captured["child_ns"] == composite
+    assert len(docs) == 1
+    meta = docs[0].metadata
+    assert meta["namespace_filename"] == composite
+    assert meta["playlist_url"] == "https://www.youtube.com/playlist?list=PLxyz"
+    assert meta["playlist_namespace_filename"] == playlist_ns
+    assert meta["playlist_title"] == "My Playlist"
+    assert meta["video_title"] == "Episode A"

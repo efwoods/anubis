@@ -14,6 +14,9 @@ import logging
 from pathlib import Path
 
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
+from src.anubis.utils.context_compression import (
+    truncate_string_to_token_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -337,14 +340,15 @@ async def _build_consciousness_system_message_update(
     # ``query`` was extracted above (identity load) and is reused here.
     assistant_memory_namespace = (user_id, assistant_id, "memory")
     retrieved_memories_items = await runtime.store.asearch(
-        assistant_memory_namespace, query=query, limit=1000
+        assistant_memory_namespace,
+        query=query,
+        limit=10000,
     )
 
     # Coerce into document objects from Search Items
     retrieved_memories = reduce_docs([], retrieved_memories_items)
 
     # retrieved_memories.extend(retrieved_identity_memories)
-
     # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
     #     assistant_identity_namespace = (user_id, assistant_id, "memory")
     #     query = state['messages'][-1].content
@@ -355,11 +359,8 @@ async def _build_consciousness_system_message_update(
     #     retrieved_memories = reduce_docs([], retrieved_memories_items)
     # else:
     #     retrieved_memories = state['recalled_memory_documents']
-
     logger.info("breakpoint")
-
     """ Retrieve Direct Quotes """
-
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
@@ -367,11 +368,8 @@ async def _build_consciousness_system_message_update(
         (creator_id, assistant_id, "quote"), query=query
     )
     logger.info(f"direct_quote_items: {direct_quote_items}")
-
     direct_quotes = reduce_docs([], direct_quote_items)
-
     """ Retrieve Documents """
-
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
     retrieved_knowledge_items = await runtime.store.asearch(
         (creator_id, assistant_id, "document"), query=query

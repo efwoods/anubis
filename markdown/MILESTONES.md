@@ -60,3 +60,18 @@
         How many users are available?
         How many users are immediately obtainable?
 
+
+# Expected costs
+3 words / 4 tokens and 5 characters per word 
+15 characters / 4 tokens
+
+expected: 
+at $0.27/10^6 tokens input and 0.85/10^6 tokens output 
+
+270 characters input and output
+10 messages per user-day
+30 days
+$0.12156 cost in tokens input & output per user month
+
+max window is 1 M tokens input and 8192 tokens output
+costs $0.2796932 / message at 15 characters / 4 tokens

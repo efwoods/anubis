@@ -1,12 +1,18 @@
-gcloud compute instances create nn-demo \
-  --machine-type=e2-micro \
-  --zone=us-central1-a \
-  --image-family=debian-12 \
-  --image-project=debian-cloud \
-  --boot-disk-size=100GB \
-  --tags=http-server,https-server
+# gcloud compute instances create nn-demo \
+#   --machine-type=e2-micro \
+#   --zone=us-central1-a \
+#   --image-project=debian-cloud \
+#   --boot-disk-size=100GB \
+#   --tags=http-server,https-server \
+#   --image-family=debian-12
 
+# gcloud compute firewall-rules create allow-langgraph \
+#   --allow tcp:8123 \
+#   --target-tags=http-server
 
+gcloud compute ssh neural-nexus-api-demo --zone=us-centra1-a
+
+# On the VM:
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 sudo apt-get install -y docker-compose-plugin
@@ -20,4 +26,3 @@ newgrp docker
 && sudo apt update \
 && sudo apt install gh -y
 
-gcloud compute ssh anubis-demo --zone=us-centra1-a

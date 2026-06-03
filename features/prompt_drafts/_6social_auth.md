@@ -4,3 +4,5 @@ Custom Social Connections: For providers not in the standard list, you can use t
 https://auth0.com/docs/authenticate/identity-providers/social-identity-providers 
 
 I will be using this information to verify the user exists and owns the account (youtube, instagram, twitter, twitch, discord, linkedin, slack, telegram, etc.)
+
+Increase preprocessing quality of social media sites (x, instagram, twitch, etc.)

@@ -98,6 +98,15 @@ def _build_context() -> GlobalContext:
     )
 
 
+def _namespace_filename(name: str) -> str:
+    """Mirror webapp._namespace_safe_formatted_filename: dotted names are keyed by
+    uuid5(NAMESPACE_URL, name); the endpoint always sets this on every entry and
+    process_media_item_task requires it."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    return name if "." not in name else str(uuid5(NAMESPACE_URL, name))
+
+
 def _build_media_files() -> List[Dict[str, Any]]:
     """Build the same media_files payload shape that webapp.py constructs."""
     media_files: List[Dict[str, Any]] = []
@@ -115,6 +124,7 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "reference_audio": False,
             "reference_image": True,
             "base64_encoded_str": _make_data_uri("image/jpeg", ref_img_bytes),
+            "namespace_filename": _namespace_filename(ref_img_name),
         }
     )
 
@@ -131,6 +141,7 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "reference_audio": False,
             "reference_image": False,
             "base64_encoded_str": _make_data_uri("image/png", other_img_bytes),
+            "namespace_filename": _namespace_filename(other_img_name),
         }
     )
 
@@ -147,6 +158,7 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "reference_audio": True,
             "reference_image": False,
             "base64_encoded_str": _make_data_uri("audio/mp4", ref_audio_bytes),
+            "namespace_filename": _namespace_filename(ref_audio_name),
         }
     )
 
@@ -163,6 +175,7 @@ def _build_media_files() -> List[Dict[str, Any]]:
             "reference_audio": False,
             "reference_image": False,
             "base64_encoded_str": _make_data_uri("text/plain", quotes_bytes),
+            "namespace_filename": _namespace_filename(quotes_name),
         }
     )
 
@@ -268,7 +281,13 @@ async def _stub_transcribe_audio(audio_base64, context, filename=None):
 
 
 async def _stub_extract_personality_from_image(
-    image_data, filename, store, user_id, assistant_id, context=None
+    image_data,
+    reference_image=False,
+    filename=None,
+    store=None,
+    user_id=None,
+    assistant_id=None,
+    context=None,
 ):
     """Return a Document mimicking the vision model's first-person description."""
     return Document(
@@ -282,6 +301,47 @@ async def _stub_extract_personality_from_image(
 
 async def _stub_perform_ocean_analysis(human_message, additional_metadata=None):
     return []
+
+
+async def _stub_transcribe_audio_diarize(
+    media_base64,
+    context=None,
+    encoded_reference_audio=None,
+    filename=None,
+    content_type=None,
+):
+    """Offline stand-in for the OpenAI diarizer on a normal (non-reference) audio
+    upload. Labels the single segment as the known target speaker so the transcript
+    is routed to the avatar's content (indexed under the quote namespace)."""
+    target = getattr(context, "audio_diarization_known_speaker_name", None) or "avatar"
+    text = (
+        "Hi sweetie, this is Mom. I love you and I am proud of you. "
+        "Remember to eat your vegetables and call me when you can."
+    )
+    return {
+        "text": text,
+        "segments": [
+            {"speaker": target, "text": text, "start": 0.0, "end": 5.0},
+        ],
+    }
+
+
+async def _stub_isolate_dominant_speaker_audio_b64(
+    audio_base64, context=None, filename=None, content_type=None, reference_audio=False
+):
+    """Offline stand-in for the OpenAI diarizer used on reference audio.
+
+    Returns the same triple shape the real helper does (preprocessed mp3, matching
+    transcript text, duration) so the reference-audio Document is persisted without
+    a network call."""
+    return {
+        "audio_base64_preprocessed": audio_base64,
+        "text": (
+            "Hi sweetie, this is Mom. I love you and I am proud of you. "
+            "Remember to eat your vegetables and call me when you can."
+        ),
+        "duration": 5.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +375,16 @@ def patched_pipeline():
         patch(
             "src.subgraphs.process_media_graph.utils.nodes.transcribe_audio",
             side_effect=_stub_transcribe_audio,
+        ),
+        patch(
+            "src.subgraphs.process_media_graph.utils.nodes."
+            "isolate_dominant_speaker_audio_b64",
+            side_effect=_stub_isolate_dominant_speaker_audio_b64,
+        ),
+        patch(
+            "src.subgraphs.process_media_graph.utils.nodes."
+            "transcribe_audio_diarize",
+            side_effect=_stub_transcribe_audio_diarize,
         ),
         patch(
             "src.subgraphs.process_media_graph.utils.nodes."

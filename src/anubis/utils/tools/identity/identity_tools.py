@@ -50,7 +50,6 @@ QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND 
 
 """
 
-<<<<<<< Updated upstream
 
 def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     """Wrap a single atomic fact with its ENTIRE original background context.
@@ -75,8 +74,6 @@ def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     )
 
 
-=======
->>>>>>> Stashed changes
 @tool("test_update")
 async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
     """ Test update system message CALL THIS TOOL ALWAYS"""
@@ -608,10 +605,10 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
 from src.anubis.utils.utility import download_transcript, parse_vtt
 
 @tool
-def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
+async def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
     """
-    Use this tool when a user suggests there is a youtube link 
-    or the link included in the message contains the word 'youtube'. 
+    Use this tool when a user suggests there is a youtube link
+    or the link included in the message contains the word 'youtube'.
     Use this to download the text from the link.
 
 
@@ -624,7 +621,8 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
         Transcript as a plain text string
     """
     print(f"Downloading subtitles for: {url}")
-    vtt_path = download_transcript(url, lang=lang)
+    # download_transcript is async (runs yt_dlp in a worker thread); must be awaited.
+    vtt_path = await download_transcript(url, lang=lang)
 
     print(f"Parsing: {vtt_path}")
     transcript = parse_vtt(vtt_path)

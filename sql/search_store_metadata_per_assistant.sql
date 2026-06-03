@@ -3,5 +3,5 @@ SELECT prefix,
     (value->'document'->'kwargs'->'metadata'->>'filename') as filename, 
     (value->'document'->'kwargs'->'metadata'->>'assistant_id') as assistant_id 
  FROM store 
- WHERE prefix LIKE '%e1699cb2-cbc2-4c92-966c-2c830b0df910%' 
+ WHERE prefix LIKE '%bf40fb38-59b9-4045-9e2f-09607a9578e6%' 
  LIMIT 100

@@ -4,10 +4,10 @@ import asyncio
 from curses import napms
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 import logging
 logger = logging.getLogger(__name__)
 import base64
@@ -41,6 +41,16 @@ def _emit_media_progress(stage: str, **fields: Any) -> None:
         writer({"type": "media_progress", "stage": stage, **fields})
     except Exception:  # pragma: no cover - progress must never break processing
         pass
+
+
+def _namespace_for(source: str) -> str:
+    """Deterministic store key for a media source.
+
+    Mirrors ``webapp._namespace_safe_formatted_filename`` (uuid5 over NAMESPACE_URL)
+    so child keys computed here line up with the top-level keys the upload endpoint
+    records — required for the skip/dedup set to match.
+    """
+    return str(uuid5(NAMESPACE_URL, source))
 
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
@@ -610,14 +620,64 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
             "media_list": []
         }
 
-    logger.info(f"Processing {len(media_list)} media items")
-    total_items = len(media_list)
-    _emit_media_progress("converting_started", total=total_items)
+    # namespace_filename values already indexed for this avatar. Items whose key
+    # is present are skipped (top-level here; expanded playlist/linktree children
+    # inside _expand_url_media_item) so a re-upload doesn't reprocess hundreds of
+    # already-stored files. Populated by the upload endpoint.
+    existing_namespaces: set = set(state.get("existing_namespaces") or [])
 
-    # Create tasks for parallel processing
-    all_documents: list = []
-    processing_errors: list[str] = []
-    for index, media_item in enumerate(media_list):
+    # Drop top-level items already indexed before doing any work.
+    to_process: list = []
+    for media_item in media_list:
+        ns = (media_item.get("metadata", {}) or {}).get("namespace_filename")
+        if ns and ns in existing_namespaces:
+            _emit_media_progress(
+                "skipped_existing",
+                filename=(media_item.get("metadata", {}) or {}).get("filename"),
+                namespace_filename=ns,
+            )
+            continue
+        to_process.append(media_item)
+
+    skipped_count = len(media_list) - len(to_process)
+    total_items = len(to_process)
+    logger.info(
+        "Processing %d media items (%d skipped as already indexed)",
+        total_items,
+        skipped_count,
+    )
+    _emit_media_progress("converting_started", total=total_items, skipped=skipped_count)
+
+    # Per-item / batch identity passed by the upload orchestrator. Stamped onto
+    # every produced Document below so a per-item or batch cancel can delete
+    # exactly the rows this run wrote (including expanded playlist children).
+    try:
+        configurable = (config or {}).get("configurable", {}) or {}
+    except Exception:
+        configurable = {}
+    item_job_id = configurable.get("item_job_id")
+    master_job_id = configurable.get("master_job_id")
+
+    # Bound how many items convert in parallel (OpenAI diarization / yt_dlp /
+    # web fetches) so a big playlist or batch upload can't exhaust rate limits or
+    # memory. The same semaphore is threaded through URL expansion so the cap is
+    # global across the whole recursion. When part of a batch, reuse the batch's
+    # shared limiter (registered by run_batch_media_job, keyed by master_job_id) so
+    # every item — and every playlist child — draws from one global pool of slots
+    # instead of N independent per-item pools. See media_processing_concurrency.
+    concurrency = max(1, GlobalContext().media_processing_concurrency)
+    semaphore = None
+    if master_job_id:
+        try:
+            from src.api.media_jobs import get_batch_semaphore
+
+            semaphore = get_batch_semaphore(master_job_id)
+        except Exception:  # pragma: no cover - registry import must never break work
+            semaphore = None
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(concurrency)
+
+    async def _convert_one(index: int, media_item: Dict[str, Any]) -> List[Document]:
         _emit_media_progress(
             "converting",
             current=index + 1,
@@ -625,24 +685,71 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
             filename=media_item.get("metadata", {}).get("filename")
             or media_item.get("filename"),
         )
-        docs = await process_media_item_task(media_item, runtime, config, store)
+        try:
+            return await process_media_item_task(
+                media_item,
+                runtime,
+                config,
+                store,
+                existing_namespaces=existing_namespaces,
+                semaphore=semaphore,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad item must not abort the batch
+            logger.exception("Media item processing crashed: %s", exc)
+            return [
+                Document(
+                    page_content=f"[Error processing media: {exc}]",
+                    metadata={
+                        "status": "error",
+                        "error": str(exc),
+                        "filename": media_item.get("metadata", {}).get("filename"),
+                    },
+                )
+            ]
 
+    # Process every item in parallel; collect results and per-item errors without
+    # aborting the batch (partial success — one failed video shouldn't sink a
+    # 300-item playlist). Errors are surfaced as media_progress events + summary.
+    all_documents: list = []
+    processing_errors: list[str] = []
+    results = await asyncio.gather(
+        *(_convert_one(i, item) for i, item in enumerate(to_process))
+    )
+    for docs in results:
         for doc in docs:
             status = doc.metadata.get("status", "")
             if status == "error":
                 error = doc.metadata.get("error", "")
                 filename = doc.metadata.get("filename", "")
                 processing_errors.append(f"{filename}: {error or 'unknown'}")
-                logger.warning(
-                    "Error processing media: %s %s", filename, error
+                logger.warning("Error processing media: %s %s", filename, error)
+                _emit_media_progress(
+                    "item_error", filename=filename, error=error or "unknown"
                 )
             else:
                 all_documents.append(doc)
 
-    if processing_errors:
-        raise RuntimeError(
-            "Media processing failed: " + "; ".join(processing_errors)
-        )
+    _emit_media_progress(
+        "converting_complete",
+        total=total_items,
+        skipped=skipped_count,
+        errors=len(processing_errors),
+        indexed=len(all_documents),
+    )
+
+    # Stamp batch/item identity onto every produced Document so it is persisted
+    # under value.document.kwargs.metadata at index time — this is the key a
+    # per-item or batch cancel deletes by (covers playlist children, whose
+    # namespace_filename differs from the top-level item's).
+    if item_job_id or master_job_id:
+        for doc in all_documents:
+            try:
+                if item_job_id:
+                    doc.metadata["item_job_id"] = item_job_id
+                if master_job_id:
+                    doc.metadata["master_job_id"] = master_job_id
+            except Exception:  # pragma: no cover - metadata must never break work
+                pass
 
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
@@ -691,13 +798,25 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     }
 
 async def process_media_item_task(
-    media_item: Dict[str, Any], 
-    runtime: Runtime[GlobalContext], 
+    media_item: Dict[str, Any],
+    runtime: Runtime[GlobalContext],
     config: RunnableConfig,
-    store: BaseStore
+    store: BaseStore,
+    *,
+    existing_namespaces: Optional[set] = None,
+    semaphore: Optional["asyncio.Semaphore"] = None,
 ) -> List[Document]:
-    """Task: Convert a single media item to a list of Documents"""
-    
+    """Task: Convert a single media item to a list of Documents.
+
+    ``existing_namespaces`` / ``semaphore`` thread the skip-set and the global
+    concurrency limit through the recursion (URL items expand into children that
+    re-enter this function). URL items are expansion *coordinators*: they must not
+    hold a semaphore slot while awaiting their children, or the bounded pool would
+    deadlock — so they are delegated to ``_expand_url_media_item`` which takes a
+    slot only around the heavy ``loader.load()`` call. Every other (leaf) media
+    type holds a slot for the duration of its conversion work below.
+    """
+
     logger.info(f"process_media_item_task entry")
 
     media_type = media_item.get("type", "")
@@ -716,6 +835,29 @@ async def process_media_item_task(
     if not namespace_filename:
         raise Exception(f"namespace_filename is required for media item: {media_item}")
 
+    # URL items expand into children and must not hold a concurrency slot while
+    # awaiting them (see docstring). Delegate before taking the leaf semaphore.
+    if media_type == "url":
+        return await _expand_url_media_item(
+            media_item,
+            runtime,
+            config,
+            store,
+            url=(media_item.get("url") or "").strip(),
+            filename=filename,
+            namespace_filename=namespace_filename,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            existing_namespaces=existing_namespaces,
+            semaphore=semaphore,
+        )
+
+    # Leaf media types: hold a concurrency slot for the duration of the (heavy)
+    # conversion so a large batch/playlist can't fan out unboundedly.
+    leaf_acquired = False
+    if semaphore is not None:
+        await semaphore.acquire()
+        leaf_acquired = True
     try:
         if media_type in ("image", "image_url"):
             reference_image = metadata.get("reference_image", False)
@@ -1047,72 +1189,10 @@ async def process_media_item_task(
                             final_documents.append(document)
 
             return final_documents
-        # Handle URLs - YouTube subs/audio, articles, tweets, linktrees.
-        elif media_type == "url":
-            url = (media_item.get("url") or "").strip()
-            if not url:
-                return [
-                    Document(
-                        page_content="[Empty URL]",
-                        metadata={
-                            "type": "url",
-                            "status": "error",
-                            "error": "empty_url",
-                            "filename": filename,
-                            "namespace_filename": namespace_filename,
-                        },
-                    )
-                ]
-            loader = URLDocumentLoaderClass()
-            expanded_items = await loader.load(
-                url,
-                user_id=user_id,
-                assistant_id=assistant_id,
-            )
-            if not expanded_items:
-                return [
-                    Document(
-                        page_content=f"[URL produced no content: {url}]",
-                        metadata={
-                            "type": "url",
-                            "status": "error",
-                            "error": "url_no_content",
-                            "filename": filename,
-                        },
-                    )
-                ]
-            collected: List[Document] = []
-            total_children = len(expanded_items)
-            _emit_media_progress("expanding", url=url, total=total_children)
-            for child_index, item in enumerate(expanded_items):
-                # Each expanded item already has user_id / assistant_id baked
-                # into its metadata; recurse into the same task. Linktree
-                # children and YouTube playlist entries come back as
-                # ``type="url"`` so they pass back through this branch.
-                _emit_media_progress(
-                    "converting_child",
-                    current=child_index + 1,
-                    total=total_children,
-                    filename=item.get("metadata", {}).get("filename") or url,
-                )
-                try:
-                    item["metadata"]["namespace_filename"] = namespace_filename
-                    child_docs = await process_media_item_task(
-                        item, runtime, config, store
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "URL child item processing failed for %s: %s",
-                        item.get("metadata", {}).get("filename") or url,
-                        exc,
-                    )
-                    continue
-                if isinstance(child_docs, list):
-                    collected.extend(child_docs)
-                elif child_docs is not None:
-                    collected.append(child_docs)
-            return collected
-        
+        # NOTE: ``type == "url"`` is handled before the leaf semaphore guard by
+        # _expand_url_media_item (see the early return at the top of this
+        # function) so it never reaches this branch chain.
+
         elif media_type == "pdf":
             """Extract text from each PDF page and route it through process_text_to_document
             so reference + content situation classifiers decide the namespace per page."""
@@ -1647,6 +1727,140 @@ async def process_media_item_task(
             metadata={"type": media_type, "status": "error", "error": str(e)}
         )]
         return documents
+    finally:
+        if leaf_acquired:
+            semaphore.release()
+
+
+async def _expand_url_media_item(
+    media_item: Dict[str, Any],
+    runtime: Runtime[GlobalContext],
+    config: RunnableConfig,
+    store: BaseStore,
+    *,
+    url: str,
+    filename: str,
+    namespace_filename: str,
+    user_id: str,
+    assistant_id: str,
+    existing_namespaces: Optional[set] = None,
+    semaphore: Optional["asyncio.Semaphore"] = None,
+) -> List[Document]:
+    """Expand a ``type="url"`` item (YouTube subs/audio, playlist, article, tweet,
+    linktree) into Documents.
+
+    Concurrency contract: a semaphore slot is held only around the heavy
+    ``loader.load()`` call, never while awaiting the recursive children — children
+    take their own slots, so the bounded pool can't deadlock. Each child carries
+    its own ``namespace_filename`` (playlist entries: ``{playlist}::{video}``,
+    linktree: the child href); ones already present in ``existing_namespaces`` are
+    skipped so a re-upload doesn't reprocess hundreds of indexed items.
+    """
+    if not url:
+        return [
+            Document(
+                page_content="[Empty URL]",
+                metadata={
+                    "type": "url",
+                    "status": "error",
+                    "error": "empty_url",
+                    "filename": filename,
+                    "namespace_filename": namespace_filename,
+                },
+            )
+        ]
+
+    loader = URLDocumentLoaderClass()
+    if semaphore is not None:
+        async with semaphore:
+            expanded_items = await loader.load(
+                url, user_id=user_id, assistant_id=assistant_id
+            )
+    else:
+        expanded_items = await loader.load(
+            url, user_id=user_id, assistant_id=assistant_id
+        )
+
+    if not expanded_items:
+        return [
+            Document(
+                page_content=f"[URL produced no content: {url}]",
+                metadata={
+                    "type": "url",
+                    "status": "error",
+                    "error": "url_no_content",
+                    "filename": filename,
+                },
+            )
+        ]
+
+    existing = existing_namespaces or set()
+    total_children = len(expanded_items)
+    _emit_media_progress("expanding", url=url, total=total_children)
+
+    # Resolve each child's namespace_filename, then drop ones already indexed.
+    pending: List[Dict[str, Any]] = []
+    for item in expanded_items:
+        child_meta = item.setdefault("metadata", {})
+        child_ns = child_meta.get("namespace_filename")
+        if not child_ns:
+            # Loader didn't pre-key this child (e.g. single-video subs/audio):
+            # derive from its own source so the key matches the top-level item.
+            child_source = (
+                item.get("url")
+                or child_meta.get("source")
+                or child_meta.get("filename")
+                or url
+            )
+            child_ns = _namespace_for(child_source)
+            child_meta["namespace_filename"] = child_ns
+        if child_ns in existing:
+            _emit_media_progress(
+                "skipped_existing",
+                filename=child_meta.get("filename") or url,
+                namespace_filename=child_ns,
+            )
+            continue
+        pending.append(item)
+
+    if not pending:
+        return []
+
+    async def _run_child(child_index: int, item: Dict[str, Any]) -> List[Document]:
+        _emit_media_progress(
+            "converting_child",
+            current=child_index + 1,
+            total=len(pending),
+            filename=item.get("metadata", {}).get("filename") or url,
+        )
+        try:
+            return await process_media_item_task(
+                item,
+                runtime,
+                config,
+                store,
+                existing_namespaces=existing_namespaces,
+                semaphore=semaphore,
+            )
+        except Exception as exc:
+            logger.exception(
+                "URL child item processing failed for %s: %s",
+                item.get("metadata", {}).get("filename") or url,
+                exc,
+            )
+            return []
+
+    results = await asyncio.gather(
+        *(_run_child(i, item) for i, item in enumerate(pending))
+    )
+    collected: List[Document] = []
+    for child_docs in results:
+        if isinstance(child_docs, list):
+            collected.extend(child_docs)
+        elif child_docs is not None:
+            collected.append(child_docs)
+    return collected
+
 
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     

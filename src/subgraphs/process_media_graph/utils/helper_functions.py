@@ -507,6 +507,85 @@ def _build_target_quote_documents_from_dialogue(
     return documents
 
 
+def build_all_speakers_quote_documents(
+    statements: List[Dict[str, Any]],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str],
+    multi_speaker: bool,
+) -> List[Document]:
+    """One verbatim ``quote`` Document per statement when EVERY speaker is the
+    avatar (the ``all_speakers_target`` path only).
+
+    This is a standalone builder: it never calls — and is never called by — the
+    standard dialogue/quote/monologue helpers, so it cannot change any behaviour
+    of the normal media-processing pipeline.
+
+    Each statement (a diarized turn) becomes one adapter-eligible ``quote``
+    Document. The synthesized question is decided per statement by
+    :func:`process_adapter_documents` from the ``adapter_prompt`` metadata:
+
+    * ``multi_speaker=True`` (a dialogue): the immediately preceding statement's
+      text is attached as ``adapter_prompt`` so the real prior turn is **reused**
+      as the question (the first statement has no predecessor → ``None`` →
+      synthesized).
+    * ``multi_speaker=False`` (one speaker): no ``adapter_prompt`` is attached,
+      so a question is **generated** for every statement.
+    """
+    item_metadata = media_item.get("metadata", {}) or {}
+    filename = item_metadata.get("filename", "")
+    filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
+    source = item_metadata.get("source") or filename or "user_upload"
+    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+
+    valid = [s for s in statements if (s.get("text") or "").strip()]
+    total = len(valid)
+
+    documents: List[Document] = []
+    for idx, seg in enumerate(valid):
+        text = (seg.get("text") or "").strip()
+        adapter_prompt: Optional[str] = None
+        if multi_speaker and idx > 0:
+            adapter_prompt = (valid[idx - 1].get("text") or "").strip() or None
+        documents.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "created_at": current_timestamp,
+                    "processing_task_id": str(uuid4()),
+                    "source": source,
+                    "type": "text",
+                    "chunk_index": idx,
+                    "total_chunks": total,
+                    "filename": filename,
+                    "filename_uuid5": filename_uuid5,
+                    "document_id": str(uuid4()),
+                    "namespace": "quote",
+                    "vectorstore_acceptable": True,
+                    "adapter_acceptable": True,
+                    "adapter_formatted": False,
+                    "analysis_acceptable": True,
+                    "classified_situation": (
+                        "dialogue" if multi_speaker else "monologue"
+                    ),
+                    "synthetic": False,
+                    "speaker": seg.get("speaker"),
+                    "is_target": True,
+                    "target_name": target_name,
+                    "adapter_prompt": adapter_prompt,
+                    "all_speakers_target": True,
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                },
+            )
+        )
+    return documents
+
+
 def _build_adapter_dialogue_document(
     dialogue_segments: List[Dict[str, Any]],
     *,

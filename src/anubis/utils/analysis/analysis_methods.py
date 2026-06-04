@@ -8,7 +8,7 @@ narrative latent-feature analyzers) and the single
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -26,7 +26,6 @@ from src.anubis.utils.prompts.psycho_analysis.emotional_trigger_analysis_prompt 
 from src.anubis.utils.prompts.psycho_analysis.latent_feature_analysis_prompts import (
     BELIEFS_ANALYSIS_SYSTEM_PROMPT,
     DESCRIPTION_ANALYSIS_SYSTEM_PROMPT,
-    DSM5_ANALYSIS_SYSTEM_PROMPT,
     FEARS_ANALYSIS_SYSTEM_PROMPT,
     FLAWS_ANALYSIS_SYSTEM_PROMPT,
     GOALS_ANALYSIS_SYSTEM_PROMPT,
@@ -49,6 +48,10 @@ from src.anubis.utils.prompts.psycho_analysis.OCEAN_analysis import (
     NEUROTICISM_OCEAN_ANALYSIS_PROMPT,
     OPENNESS_OCEAN_ANALYSIS_EXTRACTION,
     OPENNESS_OCEAN_ANALYSIS_PROMPT,
+)
+from src.anubis.utils.prompts.psycho_analysis.standardized_question_analysis_prompt import (
+    STANDARDIZED_QUESTION_ANALYSIS_SYSTEM_PROMPT,
+    StandardizedQuestionAnswer,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,7 +254,7 @@ def _analysis_output_metadata(
         "adapter_acceptable": False,
         "analysis_acceptable": False,
         "synthetic": True,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
         "document_id": str(uuid4()),
         "processing_task_id": str(uuid4()),
         "model_inference_type": model_inference_type,
@@ -326,6 +329,99 @@ async def perform_emotional_trigger_analysis(
             }
         )
         documents.append(Document(page_content=page_content, metadata=metadata))
+
+    return documents
+
+
+""" STANDARDIZED QUESTION ANALYSIS """
+
+
+async def perform_standardized_question_analysis(
+    human_message: HumanMessage,
+    target_name: str | None = None,
+    source_metadata: dict[str, Any] | None = None,
+) -> list[Document]:
+    """Search the content for an answer to each standardized identity question.
+
+    Each question in ``ALL_STANDARDIZED_QUESTIONS``
+    (``data/standardized_questions.py``) is asked in its own structured-output
+    model call that searches the analyzed content for an answer about the
+    target — stated directly by the target or inferable from information present
+    about the target. The bank is fanned out concurrently (bounded by
+    ``GlobalContext().standardized_question_analysis_concurrency``). Returns one
+    ``analysis``-namespace Document per question/answer pair found; questions
+    with no answer in the content produce no document.
+    """
+    from data.standardized_questions import ALL_STANDARDIZED_QUESTIONS
+    from src.anubis.utils.context import GlobalContext
+
+    content = human_message.content
+    text = content.strip() if isinstance(content, str) else content
+    if not text:
+        return []
+
+    source_metadata = source_metadata or {}
+
+    # One model instance, reused across every per-question call (stateless).
+    model = init_model(response_format=StandardizedQuestionAnswer)
+    concurrency = max(1, GlobalContext().standardized_question_analysis_concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _answer_one(question: str) -> Document | None:
+        async with semaphore:
+            response = await model.ainvoke(
+                [
+                    SystemMessage(
+                        content=STANDARDIZED_QUESTION_ANALYSIS_SYSTEM_PROMPT.format(
+                            target_name=target_name,
+                            question=question,
+                        )
+                    ),
+                    human_message,
+                ]
+            )
+        if not getattr(response, "answer_found", False):
+            return None
+        answer = (response.answer or "").strip()
+        if not answer:
+            return None
+        context = f'In response to the question "{question}"'
+        page_content = LatentFeatureAnalysisClass._format_page_content(
+            context, answer
+        )
+        metadata = _analysis_output_metadata(
+            source_metadata,
+            feature="standardized_question",
+            model_inference_type="standardized_question_structured_output",
+        )
+        metadata.update(
+            {
+                "question": question,
+                "answer": answer,
+                "supporting_reason": response.supporting_reason,
+                "concise_context_summary": context,
+                "original_statement": str(text),
+                "target_name": target_name,
+            }
+        )
+        return Document(page_content=page_content, metadata=metadata)
+
+    results = await asyncio.gather(
+        *(_answer_one(q) for q in ALL_STANDARDIZED_QUESTIONS),
+        return_exceptions=True,
+    )
+
+    documents: list[Document] = []
+    for question, result in zip(ALL_STANDARDIZED_QUESTIONS, results):
+        if isinstance(result, Exception):
+            logger.warning(
+                "standardized_question analyzer: question %r failed: %s; skipping",
+                question,
+                result,
+            )
+            continue
+        if result is not None:
+            documents.append(result)
 
     return documents
 
@@ -429,11 +525,20 @@ async def _run_emotional_triggers(doc: Document) -> list[Document]:
     )
 
 
+async def _run_standardized_questions(doc: Document) -> list[Document]:
+    return await perform_standardized_question_analysis(
+        HumanMessage(content=doc.page_content or ""),
+        target_name=(doc.metadata or {}).get("target_name"),
+        source_metadata=metadata_for_analysis_outputs(doc),
+    )
+
+
 # Single modular registry: feature name → analyzer runner. Default set runs on
 # every analysis-acceptable doc unless a doc narrows it via
 # ``metadata["analysis_scaffolds"]``.
 ANALYSIS_SCAFFOLD_RUNNERS: dict[str, Any] = {
     "ocean": _run_ocean,
     "emotional_triggers": _run_emotional_triggers,
+    "standardized_questions": _run_standardized_questions,
     **{name: _make_narrative_runner(name) for name in _NARRATIVE_ANALYZER_SPECS},
 }

@@ -145,6 +145,141 @@ async def test_analyze_documents_returns_only_new_docs(stub_init_model):
     assert returned[0].metadata["analysis_acceptable"] is False
 
 
+# ---------------------------------------------------------------------------
+# Standardized-question analyzer: one model call per question; a question/answer
+# document is created only when an answer is found/inferred in the content.
+# ---------------------------------------------------------------------------
+
+_TEST_QUESTIONS = [
+    "What is your greatest fear?",
+    "What is your favorite food?",
+    "How do you handle stress?",
+]
+
+
+class _FakeStandardizedQuestionModel:
+    """Returns an answer only for questions whose text is in ``answered``."""
+
+    def __init__(self, response_format, answered):
+        from src.anubis.utils.prompts.psycho_analysis.standardized_question_analysis_prompt import (
+            StandardizedQuestionAnswer,
+        )
+
+        self._schema = StandardizedQuestionAnswer
+        self._answered = answered
+
+    async def ainvoke(self, messages):
+        system = messages[0].content
+        for question, payload in self._answered.items():
+            if question in system:
+                return self._schema(answer_found=True, **payload)
+        return self._schema(answer_found=False)
+
+
+def _patch_standardized(monkeypatch, answered):
+    """Stub init_model + shrink the question bank for offline determinism."""
+    import data.standardized_questions as sq
+
+    monkeypatch.setattr(
+        analysis_methods,
+        "init_model",
+        lambda *a, **k: _FakeStandardizedQuestionModel(
+            k.get("response_format"), answered
+        ),
+    )
+    monkeypatch.setattr(sq, "ALL_STANDARDIZED_QUESTIONS", list(_TEST_QUESTIONS))
+
+
+@pytest.mark.asyncio
+async def test_standardized_question_found_answer_creates_pair(monkeypatch):
+    """A question whose answer is in the content yields one Q&A analysis doc."""
+    from langchain_core.messages import HumanMessage
+
+    _patch_standardized(
+        monkeypatch,
+        {
+            "What is your greatest fear?": {
+                "answer": "I fear being forgotten.",
+                "supporting_reason": "The content says he dreads being forgotten.",
+            }
+        },
+    )
+
+    docs = await analysis_methods.perform_standardized_question_analysis(
+        HumanMessage(content="He often says he dreads being forgotten."),
+        target_name="Bob",
+        source_metadata={"filename": "bio.txt", "user_id": "u1", "assistant_id": "a1"},
+    )
+
+    # Exactly one of the three questions had an answer in the content.
+    assert len(docs) == 1
+    doc = docs[0]
+    # FACT_CONTEXT/FACT structure pairs the question (context) with the answer.
+    assert doc.page_content.startswith("<FACT_CONTEXT_AND_FACT> <FACT_CONTEXT>")
+    assert 'In response to the question "What is your greatest fear?"' in doc.page_content
+    assert "<FACT>I fear being forgotten.</FACT>" in doc.page_content
+    # Question/answer pair + analysis-namespace metadata and flags.
+    assert doc.metadata["feature"] == "standardized_question"
+    assert doc.metadata["question"] == "What is your greatest fear?"
+    assert doc.metadata["answer"] == "I fear being forgotten."
+    assert doc.metadata["namespace"] == "analysis"
+    assert doc.metadata["vectorstore_acceptable"] is True
+    assert doc.metadata["adapter_acceptable"] is False
+    assert doc.metadata["analysis_acceptable"] is False
+    assert doc.metadata["target_name"] == "Bob"
+    assert doc.metadata["filename"] == "bio.txt"
+
+
+@pytest.mark.asyncio
+async def test_standardized_question_no_answer_creates_no_doc(monkeypatch):
+    """When no question is answered by the content, no documents are created."""
+    from langchain_core.messages import HumanMessage
+
+    _patch_standardized(monkeypatch, {})  # nothing found for any question
+
+    docs = await analysis_methods.perform_standardized_question_analysis(
+        HumanMessage(content="Unrelated content with no identity signal."),
+        target_name="Bob",
+        source_metadata={"filename": "bio.txt"},
+    )
+    assert docs == []
+
+
+@pytest.mark.asyncio
+async def test_standardized_question_blank_answer_dropped(monkeypatch):
+    """answer_found=True but an empty answer string still creates no document."""
+    from langchain_core.messages import HumanMessage
+
+    _patch_standardized(
+        monkeypatch,
+        {"What is your favorite food?": {"answer": "   ", "supporting_reason": "x"}},
+    )
+
+    docs = await analysis_methods.perform_standardized_question_analysis(
+        HumanMessage(content="Some content."),
+        target_name="Bob",
+        source_metadata={"filename": "bio.txt"},
+    )
+    assert docs == []
+
+
+@pytest.mark.asyncio
+async def test_standardized_question_empty_source_returns_empty(monkeypatch):
+    """Empty source text short-circuits before any model call."""
+    from langchain_core.messages import HumanMessage
+
+    _patch_standardized(monkeypatch, {})
+    docs = await analysis_methods.perform_standardized_question_analysis(
+        HumanMessage(content="   "), target_name="Bob"
+    )
+    assert docs == []
+
+
+def test_standardized_question_registered_in_scaffold_runners():
+    """The analyzer is wired into the modular registry under a stable key."""
+    assert "standardized_questions" in analysis_methods.ANALYSIS_SCAFFOLD_RUNNERS
+
+
 def test_reduce_docs_appends_dedupes_and_deletes():
     """The buffer reducer appends new docs, de-dupes by id, and clears on delete."""
     from src.anubis.utils.utility import reduce_docs

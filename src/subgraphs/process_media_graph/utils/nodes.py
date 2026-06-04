@@ -54,6 +54,7 @@ def _namespace_for(source: str) -> str:
 
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
+    build_all_speakers_quote_documents,
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
     process_nontarget_text_to_identity_documents,
@@ -156,6 +157,7 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
+            all_speakers_target = file_data.get("all_speakers_target", False)
             namespace_filename = file_data.get("namespace_filename")
         
             logger.info(f"Processing file: {filename} ({content_type})")
@@ -206,6 +208,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
+                        "all_speakers_target": all_speakers_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -231,6 +234,8 @@ async def process_uploaded_files_and_label_media_type(
                         "size": 0,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "reference_audio": reference_audio,
+                        "all_speakers_target": all_speakers_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -251,6 +256,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": 0,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "all_speakers_target": all_speakers_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -337,8 +343,9 @@ async def process_uploaded_files_and_label_media_type(
                         "content_type": content_type,
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
-                        "assistant_id": assistant_id, 
+                        "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
+                        "all_speakers_target": all_speakers_target,
                         "namespace_filename": namespace_filename
                     }
                 })
@@ -366,6 +373,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "reference_audio": reference_audio,
+                        "all_speakers_target": all_speakers_target,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -1265,7 +1273,11 @@ async def process_media_item_task(
             "reference_audio")`` so the next non-reference upload can use it.
             """
             reference_audio = metadata.get("reference_audio", False)
-            if not reference_audio:
+            # Batch-wide "no single target": every detected speaker is the avatar.
+            # Diarization still runs, but no stored reference clip is required and
+            # known-speaker labelling is skipped (every turn is forced is_target).
+            all_speakers_target = bool(metadata.get("all_speakers_target", False))
+            if not reference_audio and not all_speakers_target:
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
                 if not ref_item and not reference_audio:
@@ -1435,16 +1447,17 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
-            try:
-                ref_item = await store.aget(
-                    (user_id, assistant_id, "reference_audio"), assistant_id
-                )
-                if ref_item is not None:
-                    encoded_reference_audio = (
-                        getattr(ref_item, "value", {}) or {}
-                    ).get("reference_audio_data") or None
-            except Exception as exc:
-                logger.debug("Reference audio lookup failed (continuing): %s", exc)
+            if not all_speakers_target:
+                try:
+                    ref_item = await store.aget(
+                        (user_id, assistant_id, "reference_audio"), assistant_id
+                    )
+                    if ref_item is not None:
+                        encoded_reference_audio = (
+                            getattr(ref_item, "value", {}) or {}
+                        ).get("reference_audio_data") or None
+                except Exception as exc:
+                    logger.debug("Reference audio lookup failed (continuing): %s", exc)
 
             if not payload_uri:
                 # URL-only path - the upload pipeline currently base64-encodes
@@ -1491,6 +1504,167 @@ async def process_media_item_task(
             target_speaker_label = (
                 runtime.context.audio_diarization_known_speaker_name or "avatar"
             )
+
+            # ---------------------------------------------------------------
+            # all_speakers_target: no single target speaker, so EVERY detected
+            # speaker is the avatar. Routed only through standalone helpers / the
+            # normal text classifier so the established dialogue path is never
+            # touched. This branch returns early.
+            #
+            #   * MULTIPLE speakers -> one adapter-eligible ``quote`` Document per
+            #     statement, each reusing the PRECEDING statement as its genuine
+            #     question (``adapter_prompt``); the first statement has no
+            #     predecessor so a question is synthesized for it downstream.
+            #   * a SINGLE speaker -> a monologue: classified normally (monologue
+            #     / tweets_or_quotes) via process_text_to_document, which already
+            #     stores it in the vectorstore, marks it analysis-acceptable, and
+            #     makes it adapter-acceptable with a synthesized prompt.
+            # ---------------------------------------------------------------
+            if all_speakers_target:
+                statements: List[Dict[str, Any]] = []
+                for seg in (diar_response or {}).get("segments") or []:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_text = (seg.get("text") or "").strip()
+                    if not seg_text:
+                        continue
+                    statements.append(
+                        {
+                            "speaker": str(seg.get("speaker") or "unknown"),
+                            "text": seg_text,
+                            "start": seg.get("start"),
+                            "end": seg.get("end"),
+                            "is_target": True,
+                        }
+                    )
+
+                if not statements:
+                    # Diarization yielded no usable segments — fall back to a
+                    # plain transcription pass and treat it as one statement.
+                    try:
+                        plain = await transcribe_audio(
+                            audio_base64=payload_uri,
+                            context=runtime.context,
+                            filename=filename,
+                        )
+                        plain_text = (plain.get("text") or "").strip()
+                    except Exception as e:
+                        logger.exception(
+                            "all_speakers_target transcription failed for %s: %s",
+                            filename,
+                            e,
+                        )
+                        all_documents.append(
+                            Document(
+                                page_content=f"[{media_type.capitalize()} transcription failed: {e}]",
+                                metadata={
+                                    "user_id": user_id,
+                                    "assistant_id": assistant_id,
+                                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                                    "type": media_type,
+                                    "filename": filename,
+                                    "vectorstore_acceptable": False,
+                                    "status": "error",
+                                    "error": f"transcription_failed: {e}",
+                                    "namespace_filename": namespace_filename,
+                                },
+                            )
+                        )
+                        return all_documents
+                    if plain_text:
+                        statements = [
+                            {
+                                "speaker": "unknown",
+                                "text": plain_text,
+                                "start": None,
+                                "end": None,
+                                "is_target": True,
+                            }
+                        ]
+
+                if not statements:
+                    all_documents.append(
+                        Document(
+                            page_content=f"[{media_type.capitalize()} transcription unavailable]",
+                            metadata={
+                                "user_id": user_id,
+                                "assistant_id": assistant_id,
+                                "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                                "type": media_type,
+                                "filename": filename,
+                                "vectorstore_acceptable": False,
+                                "status": "transcription_unavailable",
+                                "namespace_filename": namespace_filename,
+                            },
+                        )
+                    )
+                    return all_documents
+
+                source_label = (
+                    metadata.get("source")
+                    or filename
+                    or f"{media_type}_transcription"
+                )
+                multi_speaker = len({s["speaker"] for s in statements}) > 1
+
+                if multi_speaker:
+                    # Speaker-coalesce into alternating turns so each turn's
+                    # predecessor is a clean, genuine question, then build one
+                    # quote Q&A Document per statement (each reusing the preceding
+                    # statement as its question; the first is synthesized
+                    # downstream). No monologue is created for multi-speaker
+                    # content — a monologue is the single-speaker case below.
+                    turns = coalesce_segments_by_speaker(statements)
+                    quote_media_item = {
+                        "metadata": {"filename": filename, "source": source_label}
+                    }
+                    quote_documents = build_all_speakers_quote_documents(
+                        turns,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        media_item=quote_media_item,
+                        target_name=target_speaker_label,
+                        multi_speaker=True,
+                    )
+                    for d in quote_documents:
+                        d.metadata.setdefault("audio_filename", filename)
+                        d.metadata["namespace_filename"] = namespace_filename
+                    all_documents.extend(quote_documents)
+                    return all_documents
+
+                # Single speaker -> a monologue: classify normally (monologue /
+                # tweets_or_quotes) over the full transcript, exactly like any
+                # other single-speaker target text. That path already stores the
+                # content in the vectorstore, marks it analysis-acceptable, and
+                # makes it adapter-acceptable (a synthetic prompt is generated
+                # downstream) — no custom handling needed here.
+                full_text = "\n".join(
+                    (s.get("text") or "").strip()
+                    for s in statements
+                    if (s.get("text") or "").strip()
+                ).strip()
+                single_media_item = {
+                    "type": "text",
+                    "content": full_text,
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "source": source_label,
+                        "namespace_filename": namespace_filename,
+                    },
+                }
+                documents = await process_text_to_document(
+                    metadata=single_media_item["metadata"],
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=single_media_item,
+                )
+                for d in documents:
+                    d.metadata.setdefault("audio_filename", filename)
+                    d.metadata["namespace_filename"] = namespace_filename
+                all_documents.extend(documents)
+                return all_documents
 
             # ---------------------------------------------------------------
             # Normalize diarizer segments, then coalesce consecutive
@@ -1796,15 +1970,29 @@ async def _expand_url_media_item(
             )
         ]
 
+    # Batch-wide "no single target": every detected speaker is the avatar. This
+    # forces the YouTube loader past its subtitles fast-path onto the audio +
+    # diarization path so the avatar's voice is actually transcribed (subtitles
+    # carry no speaker turns), and is inherited by every expanded child below.
+    parent_all_speakers_target = bool(
+        (media_item.get("metadata") or {}).get("all_speakers_target")
+    )
+
     loader = URLDocumentLoaderClass()
     if semaphore is not None:
         async with semaphore:
             expanded_items = await loader.load(
-                url, user_id=user_id, assistant_id=assistant_id
+                url,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                expect_multispeaker=parent_all_speakers_target,
             )
     else:
         expanded_items = await loader.load(
-            url, user_id=user_id, assistant_id=assistant_id
+            url,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            expect_multispeaker=parent_all_speakers_target,
         )
 
     if not expanded_items:
@@ -1825,9 +2013,14 @@ async def _expand_url_media_item(
     _emit_media_progress("expanding", url=url, total=total_children)
 
     # Resolve each child's namespace_filename, then drop ones already indexed.
+    # Children (e.g. playlist videos) inherit the parent URL item's batch-wide
+    # "no single target" flag so every expanded video is diarized with every
+    # speaker treated as the target.
     pending: List[Dict[str, Any]] = []
     for item in expanded_items:
         child_meta = item.setdefault("metadata", {})
+        if parent_all_speakers_target:
+            child_meta.setdefault("all_speakers_target", True)
         child_ns = child_meta.get("namespace_filename")
         if not child_ns:
             # A keyless child is the single logical content of THIS url item

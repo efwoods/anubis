@@ -306,7 +306,9 @@ async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
 
     # Loader returns a single keyless child (the video's transcript text).
     class _FakeLoader:
-        async def load(self, url, user_id=None, assistant_id=None):
+        async def load(
+            self, url, user_id=None, assistant_id=None, expect_multispeaker=False
+        ):
             return [{"type": "text", "content": "hello", "metadata": {}}]
 
     monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
@@ -340,3 +342,174 @@ async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
     assert meta["playlist_namespace_filename"] == playlist_ns
     assert meta["playlist_title"] == "My Playlist"
     assert meta["video_title"] == "Episode A"
+
+
+@pytest.mark.asyncio
+async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch):
+    """A URL item flagged ``all_speakers_target`` must call the loader with
+    ``expect_multispeaker=True`` (forcing the audio/diarize path over subtitles)
+    and stamp the flag onto every expanded child so playlist videos inherit it."""
+    from langchain_core.documents import Document
+
+    import src.subgraphs.process_media_graph.utils.nodes as nodes_mod
+
+    parent_item = {
+        "type": "url",
+        "url": "https://www.youtube.com/watch?v=aaa",
+        "metadata": {
+            "filename": "https://www.youtube.com/watch?v=aaa",
+            "namespace_filename": "NS",
+            "all_speakers_target": True,
+        },
+    }
+
+    captured = {}
+
+    class _FakeLoader:
+        async def load(
+            self, url, user_id=None, assistant_id=None, expect_multispeaker=False
+        ):
+            captured["expect_multispeaker"] = expect_multispeaker
+            return [{"type": "audio", "content": "hi", "metadata": {}}]
+
+    monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
+
+    async def _fake_process(item, runtime, config, store, **kwargs):
+        captured["child_all_speakers_target"] = item["metadata"].get(
+            "all_speakers_target"
+        )
+        return [Document(page_content="hi", metadata={"namespace": "quote"})]
+
+    monkeypatch.setattr(nodes_mod, "process_media_item_task", _fake_process)
+
+    await nodes_mod._expand_url_media_item(
+        parent_item,
+        None,
+        None,
+        None,
+        url=parent_item["url"],
+        filename=parent_item["metadata"]["filename"],
+        namespace_filename="NS",
+        user_id="u",
+        assistant_id="a",
+    )
+
+    assert captured["expect_multispeaker"] is True
+    assert captured["child_all_speakers_target"] is True
+
+
+def _make_runtime():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        context=SimpleNamespace(audio_diarization_known_speaker_name="avatar")
+    )
+
+
+def _audio_item():
+    return {
+        "type": "audio",
+        "base64_encoded_str": "data:audio/mp3;base64,QUJD",
+        "metadata": {
+            "filename": "talk.mp3",
+            "content_type": "audio/mp3",
+            "user_id": "u",
+            "assistant_id": "a",
+            "namespace_filename": "NS",
+            "reference_audio": False,
+            "all_speakers_target": True,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypatch):
+    """Multiple speakers (all target): one ``quote`` Document per statement, each
+    later turn reusing the PRECEDING statement as ``adapter_prompt`` (the genuine
+    question); the first statement has no predecessor (synthesized downstream).
+    No monologue/adapter-conversation doc is produced for multi-speaker content,
+    and the standard dialogue document builder is never run."""
+    import src.subgraphs.process_media_graph.utils.nodes as nodes_mod
+
+    captured = {}
+
+    async def _fake_diarize(*, media_base64, context, encoded_reference_audio,
+                            filename, content_type):
+        captured["encoded_reference_audio"] = encoded_reference_audio
+        return {
+            "text": "Q1 A1 Q2",
+            "segments": [
+                {"speaker": "A", "text": "How are you?", "start": 0, "end": 1},
+                {"speaker": "B", "text": "I am well.", "start": 1, "end": 2},
+                {"speaker": "A", "text": "Glad to hear.", "start": 2, "end": 3},
+            ],
+        }
+
+    async def _fail_dialogue(*args, **kwargs):  # must NOT be called
+        raise AssertionError("dialogue path must not run in all_speakers_target mode")
+
+    monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", _fake_diarize)
+    monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", _fail_dialogue)
+
+    docs = await nodes_mod.process_media_item_task(
+        _audio_item(), _make_runtime(), {}, store=None
+    )
+
+    # Diarized without a known-speaker reference clip.
+    assert captured["encoded_reference_audio"] is None
+
+    # Only per-statement quote docs (no adapter-conversation/monologue doc).
+    assert all(d.metadata.get("namespace") == "quote" for d in docs)
+    assert [d.page_content for d in docs] == [
+        "How are you?",
+        "I am well.",
+        "Glad to hear.",
+    ]
+    assert all(d.metadata.get("adapter_acceptable") is True for d in docs)
+    # First statement has no predecessor (-> synthesized); later statements
+    # reuse the immediately preceding turn as the question.
+    assert docs[0].metadata.get("adapter_prompt") is None
+    assert docs[1].metadata.get("adapter_prompt") == "How are you?"
+    assert docs[2].metadata.get("adapter_prompt") == "I am well."
+
+
+@pytest.mark.asyncio
+async def test_all_speakers_target_single_speaker_classified_normally(monkeypatch):
+    """A single speaker is classified normally (monologue / tweets_or_quotes):
+    the full transcript is routed through ``process_text_to_document`` rather than
+    the per-statement / dialogue paths."""
+    from langchain_core.documents import Document
+
+    import src.subgraphs.process_media_graph.utils.nodes as nodes_mod
+
+    captured = {}
+
+    async def _fake_diarize(*, media_base64, context, encoded_reference_audio,
+                            filename, content_type):
+        return {
+            "text": "Statement one. Statement two.",
+            "segments": [
+                {"speaker": "S", "text": "Statement one.", "start": 0, "end": 1},
+                {"speaker": "S", "text": "Statement two.", "start": 1, "end": 2},
+            ],
+        }
+
+    async def _fail_dialogue(*args, **kwargs):
+        raise AssertionError("dialogue path must not run in all_speakers_target mode")
+
+    async def _fake_classify(*, metadata, user_id, assistant_id, media_item):
+        captured["classify_text"] = media_item.get("content")
+        return [Document(page_content="chunk", metadata={"namespace": "quote"})]
+
+    monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", _fake_diarize)
+    monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", _fail_dialogue)
+    monkeypatch.setattr(nodes_mod, "process_text_to_document", _fake_classify)
+
+    docs = await nodes_mod.process_media_item_task(
+        _audio_item(), _make_runtime(), {}, store=None
+    )
+
+    # The whole single-speaker transcript was sent to the normal classifier.
+    assert captured["classify_text"] == "Statement one.\nStatement two."
+    assert len(docs) == 1
+    assert docs[0].metadata.get("namespace") == "quote"

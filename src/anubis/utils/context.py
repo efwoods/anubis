@@ -268,6 +268,13 @@ class GlobalContext:
         },
     )
 
+    standardized_question_analysis_concurrency: int = field(
+        default=8,
+        metadata={
+            "description": "Max standardized identity questions asked in parallel per document by the standardized-question analyzer (each question is a separate structured-output call; bounds the per-document fan-out so the full question bank does not exhaust LLM rate limits). Env STANDARDIZED_QUESTION_ANALYSIS_CONCURRENCY."
+        },
+    )
+
     audio_transcription_model: str = field(
         default=None, metadata={"description": "Audio transcription model name."}
     )

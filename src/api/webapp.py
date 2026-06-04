@@ -2565,6 +2565,7 @@ async def update_avatar_identity_with_media(
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
+    all_speakers_target: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -2591,6 +2592,21 @@ async def update_avatar_identity_with_media(
     With **reference_image=true** or **reference_audio=true** the request must carry
     **exactly one** file or URL (a reference clip/image is a single item): the file
     or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
+
+    With **all_speakers_target=true** the batch has **no single target speaker**:
+    every detected speaker is the avatar. Audio/video items are still diarized (so
+    no stored reference-audio clip is required and known-speaker labelling is
+    skipped). With **multiple speakers**, each statement becomes one ``quote``
+    training example whose question is the **preceding statement** (the first
+    statement, having no predecessor, gets a synthesized question). With a
+    **single speaker** the transcript is a monologue: it is classified normally
+    (monologue / tweets_or_quotes), which stores it in the vectorstore, marks it
+    analysis-acceptable, and makes it adapter-acceptable with a synthesized prompt.
+    YouTube items are forced onto the audio/diarize path (subtitles, which carry no
+    speaker turns, are skipped). Use it for playlists/recordings where all voices
+    belong to the avatar. It is mutually exclusive with ``reference_image`` /
+    ``reference_audio`` (which designate a single target) and applies to every item
+    in the request, including expanded playlist children.
     """
     try:
         user_id = current_user["identities"][0]["user_id"]
@@ -2656,6 +2672,16 @@ async def update_avatar_identity_with_media(
             raise HTTPException(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
+            )
+        if all_speakers_target and (reference_image or reference_audio):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "all_speakers_target cannot be combined with "
+                    "reference_image/reference_audio: a reference clip designates a "
+                    "single target, while all_speakers_target treats every detected "
+                    "speaker as the target."
+                ),
             )
 
         reference_mode = reference_image or reference_audio
@@ -2768,6 +2794,14 @@ async def update_avatar_identity_with_media(
                 status_code=400,
                 detail="No processable media found in the request.",
             )
+
+        # Stamp the batch-wide "no single target" flag onto every entry (top
+        # level, alongside reference_audio/reference_image). convert_uploaded_
+        # files_to_media reads it for audio/video/url items and threads it into
+        # their metadata; expanded playlist children inherit it downstream.
+        if all_speakers_target:
+            for entry in media_files:
+                entry["all_speakers_target"] = True
 
         store = app.state.store
 

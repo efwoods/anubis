@@ -53,3 +53,34 @@ curl /update_avatar_identity_with_media \
   --form 'reference_image=false' \
   --form 'all_speakers_target=false' \
   --form 'files=@confirmed_search_results_list.txt'
+
+
+{
+  "job_id": "6a0ce994-305b-4a03-a504-35cf17fdf655",
+  "status": "queued",
+  "progress_url": "/media_job/6a0ce994-305b-4a03-a504-35cf17fdf655/progress",
+  "cancel_url": "/media_job/6a0ce994-305b-4a03-a504-35cf17fdf655/cancel",
+  "items_accepted": 2,
+  "filenames": [
+    "Machine Intelligence - Shivon Zilis.pdf",
+    "https://grokipedia.com/page/Shivon_Zilis"
+  ],
+  "items": [
+    {
+      "job_id": "b116d3ad-c467-4106-b94c-559fc57972be",
+      "filename": "Machine Intelligence - Shivon Zilis.pdf",
+      "status": "queued",
+      "progress_url": "/media_job/b116d3ad-c467-4106-b94c-559fc57972be/progress",
+      "cancel_url": "/media_job/b116d3ad-c467-4106-b94c-559fc57972be/cancel"
+    },
+    {
+      "job_id": "8f2d56cb-5992-445e-a0c7-cb582bfa5421",
+      "filename": "https://grokipedia.com/page/Shivon_Zilis",
+      "status": "queued",
+      "progress_url": "/media_job/8f2d56cb-5992-445e-a0c7-cb582bfa5421/progress",
+      "cancel_url": "/media_job/8f2d56cb-5992-445e-a0c7-cb582bfa5421/cancel"
+    }
+  ],
+  "playlists_expanding": 1,
+  "message": "Media processing started; enumerating 1 playlist(s) in the background"
+}

@@ -1,6 +1,7 @@
 # src/anubis/webapp.py
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -444,7 +445,12 @@ async def lifespan(app: FastAPI):
     # Initialize context / context
     app.state.context = GlobalContext()
     ensure_huggingface_models_cached(app.state.context)
-    app.state.httpx_client = httpx.AsyncClient()
+    # Explicit timeouts instead of httpx's silent 5 s default: a short connect
+    # timeout fails fast on an unreachable host, while a generous read timeout
+    # tolerates a slow-but-alive upstream.
+    app.state.httpx_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0)
+    )
     app.state.stripe = stripe
     app.state.stripe.api_key = app.state.context.stripe_secret_key
 
@@ -2319,6 +2325,96 @@ async def _build_media_entries_for_file(
     return entries
 
 
+def _is_youtube_playlist_url_str(url_clean: str) -> bool:
+    """Cheap, network-free check for a YouTube **playlist** URL.
+
+    Used on the request path to *detect* playlists (so they can be enumerated
+    later, in the background) without paying for ``yt_dlp``. The enumeration
+    itself lives in ``_expand_youtube_playlist_to_media_entries``.
+    """
+    from src.anubis.utils.classes.URLDocumentLoaderClass import _classify_url
+
+    return _classify_url(url_clean) == "youtube_playlist"
+
+
+async def _expand_youtube_playlist_to_media_entries(
+    url_clean: str,
+    *,
+    user_id: str,
+    assistant_id: str,
+    all_speakers_target: bool = False,
+) -> Optional[list]:
+    """Expand a YouTube **playlist** URL into one media entry per video.
+
+    Each video becomes its own top-level item — and therefore its own child job
+    with its own progress/cancel id — keyed by the composite
+    ``{playlist_ns}::{video_ns}`` namespace and named ``{playlist}::{video}`` so
+    the videos list, dedupe, and cancel individually rather than collapsing into a
+    single playlist job. Playlist context (``playlist_url`` / title / ns) rides on
+    each entry so the produced Documents get stamped and ``/list_avatar_documents``
+    groups every video under its playlist.
+
+    Returns ``None`` for any non-playlist URL so the caller falls back to the
+    normal single-URL path; returns ``[]`` if the playlist resolves to no videos.
+    """
+    # Lazy import (heavy yt_dlp path + cold-start convention). _classify_url is
+    # pure; _extract_playlist_entries does the flat yt_dlp enumeration.
+    from src.anubis.utils.classes.URLDocumentLoaderClass import (
+        _classify_url,
+        _extract_playlist_entries,
+    )
+
+    if _classify_url(url_clean) != "youtube_playlist":
+        return None
+
+    entries, playlist_title = await _extract_playlist_entries(url_clean)
+    if not entries:
+        logger.warning("YouTube playlist produced no entries: %s", url_clean)
+        return []
+
+    # playlist_ns mirrors URLDocumentLoaderClass._namespace_for so the composite
+    # keys built here match what the graph would have produced — dedup stays
+    # consistent across upload paths.
+    playlist_ns = _namespace_safe_formatted_filename(url_clean)
+    playlist_label = (playlist_title or url_clean).strip()
+    media_entries: list = []
+    for entry in entries:
+        video_id = entry.get("id")
+        watch_url = entry.get("url") or (
+            f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+        )
+        if not watch_url:
+            continue
+        video_ns = _namespace_safe_formatted_filename(watch_url)
+        video_title = (entry.get("title") or "").strip()
+        media_entries.append(
+            {
+                "filename": f"{playlist_label}::{video_title or watch_url}",
+                "content_type": "text/html",
+                "content": b"",
+                "page_url": watch_url,
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "reference_audio": False,
+                "reference_image": False,
+                "all_speakers_target": all_speakers_target,
+                "namespace_filename": f"{playlist_ns}::{video_ns}",
+                "playlist_url": url_clean,
+                "playlist_namespace_filename": playlist_ns,
+                "playlist_title": playlist_title,
+                "video_title": video_title,
+                "url_kind": "youtube_playlist_entry",
+            }
+        )
+    logger.info(
+        "Expanded YouTube playlist %s (%s) into %d per-video upload items",
+        url_clean,
+        playlist_title or "untitled",
+        len(media_entries),
+    )
+    return media_entries
+
+
 async def _build_media_entries_for_url(
     url_clean: str,
     *,
@@ -2578,12 +2674,16 @@ async def update_avatar_identity_with_media(
     ``.md`` file whose lines are bare URLs is treated as a **manifest**: its URLs
     are expanded and processed individually (name/header lines are ignored), so a
     saved list like ``confirmed_search_results_list.txt`` works the same as pasting
-    the URLs. A YouTube **playlist** URL expands into its videos inside the media
-    graph. Every item is processed in parallel (bounded by
-    ``media_processing_concurrency``); items whose key already exists for this
+    the URLs. A YouTube **playlist** URL is enumerated in the background (so the
+    202 isn't blocked on yt_dlp) into one item per video — each its own upload
+    with its own progress/cancel id, listed individually as ``{playlist}::{video}``;
+    those child ids appear on the master's progress stream as
+    ``playlist_child_added`` events. Every item is processed in parallel (bounded
+    by ``media_processing_concurrency``); items whose key already exists for this
     avatar (see ``/list_avatar_documents``) are **skipped**, so re-uploading a
-    large playlist only processes new entries. The endpoint returns ``202`` with a
-    ``job_id`` immediately; progress streams from ``GET /media_job/{job_id}/progress``.
+    large playlist only processes new videos. The endpoint returns ``202`` with a
+    ``job_id`` immediately; progress streams from
+    ``GET /media_job/{job_id}/progress``.
 
     Images must use real MIME types: ``image/jpeg``, ``image/png``, ``image/gif`` (non-animated),
     or ``image/webp`` (non-animated). Proprietary vs biographical classification is done inside
@@ -2695,6 +2795,10 @@ async def update_avatar_identity_with_media(
             )
 
         media_files: list = []
+        # Playlist URLs detected on the request path but enumerated later, in the
+        # background master task, so the 202 isn't blocked on yt_dlp. Each yields
+        # one child job per video once expanded.
+        playlist_urls: list[str] = []
 
         if reference_mode:
             # Exactly one input (guarded above). No manifest expansion in reference
@@ -2776,6 +2880,12 @@ async def update_avatar_identity_with_media(
             rich_urls = len(file_entries) == 0 and len(all_urls) == 1
             url_entries: list = []
             for u in all_urls:
+                # A playlist is set aside for background enumeration (one child job
+                # per video, expanded off the request path); non-playlist URLs take
+                # the normal single-URL path here.
+                if _is_youtube_playlist_url_str(u):
+                    playlist_urls.append(u)
+                    continue
                 url_entries.extend(
                     await _build_media_entries_for_url(
                         u,
@@ -2789,7 +2899,10 @@ async def update_avatar_identity_with_media(
 
             media_files = [*file_entries, *url_entries]
 
-        if not media_files:
+        # A playlist-only upload has no ready media_files yet (its videos are
+        # enumerated in the background), so only reject when nothing at all — no
+        # files and no playlists — was found.
+        if not media_files and not playlist_urls:
             raise HTTPException(
                 status_code=400,
                 detail="No processable media found in the request.",
@@ -2896,10 +3009,25 @@ async def update_avatar_identity_with_media(
                     "job_id": child.job_id,
                     "filename": child.filename,
                     "status": child.status,
+                    "status_url": f"/media_job/{child.job_id}",
                     "progress_url": f"/media_job/{child.job_id}/progress",
                     "cancel_url": f"/media_job/{child.job_id}/cancel",
                 }
             )
+
+        # Playlists are enumerated inside the background task (off the request
+        # path); each binds its URL + flags into an async expander that mints one
+        # child job per video under this master once it resolves.
+        deferred_expanders = [
+            functools.partial(
+                _expand_youtube_playlist_to_media_entries,
+                playlist_url,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                all_speakers_target=all_speakers_target,
+            )
+            for playlist_url in playlist_urls
+        ]
 
         master.task = asyncio.create_task(
             run_batch_media_job(
@@ -2912,6 +3040,8 @@ async def update_avatar_identity_with_media(
                     1, app.state.context.media_processing_concurrency
                 ),
                 existing_namespaces=sorted(existing_namespaces),
+                registry=registry,
+                deferred_expanders=deferred_expanders,
             )
         )
 
@@ -2926,12 +3056,22 @@ async def update_avatar_identity_with_media(
             content={
                 "job_id": master.job_id,
                 "status": master.status,
+                "status_url": f"/media_job/{master.job_id}",
                 "progress_url": f"/media_job/{master.job_id}/progress",
                 "cancel_url": f"/media_job/{master.job_id}/cancel",
                 "items_accepted": len(media_files),
                 "filenames": [m.get("filename") for m in media_files],
                 "items": item_descriptors,
-                "message": "Media processing started",
+                # Playlists resolve to their per-video child jobs in the background;
+                # those child ids surface on the master's progress stream as
+                # ``playlist_child_added`` events rather than in this response.
+                "playlists_expanding": len(playlist_urls),
+                "message": (
+                    "Media processing started; enumerating "
+                    f"{len(playlist_urls)} playlist(s) in the background"
+                    if playlist_urls
+                    else "Media processing started"
+                ),
             },
         )
 
@@ -2941,6 +3081,63 @@ async def update_avatar_identity_with_media(
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
+
+
+@app.get("/media_job/{job_id}")
+async def media_job_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Point-in-time snapshot of a media job — a pollable alternative to the SSE
+    ``/progress`` stream.
+
+    For a **master** job this lists its current child jobs, **including videos a
+    YouTube playlist enumerated in the background** after the upload returned 202
+    (those don't appear in the upload response because they don't exist yet at
+    request time). Poll this to watch the queue fill in and drain; for a child job
+    it returns that single item's status/result.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    registry = app.state.media_jobs
+    job: Optional[MediaJob] = get_job(registry, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired job_id")
+    if job.user_id != user_id:
+        raise HTTPException(
+            status_code=403, detail="This job belongs to another user."
+        )
+
+    def _descriptor(j: MediaJob) -> dict:
+        return {
+            "job_id": j.job_id,
+            "filename": j.filename,
+            "namespace_filename": j.namespace_filename,
+            "status": j.status,
+            "error": j.error,
+            "created_at": j.created_at,
+            "started_at": j.started_at,
+            "finished_at": j.finished_at,
+            "duration_seconds": j.duration_seconds,
+            "progress_url": f"/media_job/{j.job_id}/progress",
+            "cancel_url": f"/media_job/{j.job_id}/cancel",
+        }
+
+    snapshot: dict = {
+        **_descriptor(job),
+        "is_master": job.is_master,
+        "result": job.result,
+    }
+    if job.is_master:
+        children = [registry[cid] for cid in job.child_ids if cid in registry]
+        statuses = [c.status for c in children]
+        snapshot["children"] = [_descriptor(c) for c in children]
+        snapshot["children_total"] = len(children)
+        snapshot["children_completed"] = statuses.count("completed")
+        snapshot["children_error"] = statuses.count("error")
+        snapshot["children_cancelled"] = statuses.count("cancelled")
+        snapshot["children_running"] = statuses.count("running")
+        snapshot["children_queued"] = statuses.count("queued")
+    return snapshot
 
 
 @app.get("/media_job/{job_id}/progress")

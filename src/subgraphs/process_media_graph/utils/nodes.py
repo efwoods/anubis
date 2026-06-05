@@ -247,18 +247,34 @@ async def process_uploaded_files_and_label_media_type(
             page_url_remote = (file_data.get("page_url") or "").strip()
             if page_url_remote:
                 mime = content_type.split(";")[0].strip().lower()
+                url_metadata = {
+                    "filename": filename,
+                    "content_type": mime,
+                    "size": 0,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "all_speakers_target": all_speakers_target,
+                    "namespace_filename": namespace_filename,
+                }
+                # Carry playlist context when the upload endpoint expanded a
+                # playlist into one page_url entry per video (each its own child
+                # job). _expand_url_media_item stamps these onto the produced
+                # Documents so /list_avatar_documents groups each video under its
+                # playlist and a whole-playlist delete can target them.
+                for playlist_key in (
+                    "playlist_url",
+                    "playlist_namespace_filename",
+                    "playlist_title",
+                    "video_title",
+                    "url_kind",
+                ):
+                    playlist_value = file_data.get(playlist_key)
+                    if playlist_value is not None:
+                        url_metadata[playlist_key] = playlist_value
                 entry = {
                     "type": "url",
                     "url": page_url_remote,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": mime,
-                        "size": 0,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "all_speakers_target": all_speakers_target,
-                        "namespace_filename": namespace_filename,
-                    },
+                    "metadata": url_metadata,
                 }
                 if full_payload_uri:
                     entry["base64_encoded_str"] = full_payload_uri
@@ -1225,7 +1241,9 @@ async def process_media_item_task(
                 tmp_path = tmp_file.name
             try:
                 loader = PyPDFLoader(tmp_path)
-                pages = loader.load()
+                # PyPDFLoader.load() is synchronous and pypdf parsing is
+                # CPU-bound; offload so the event loop isn't blocked.
+                pages = await asyncio.to_thread(loader.load)
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -1348,8 +1366,8 @@ async def process_media_item_task(
                 # target-only track. Video first extracts the audio track so both
                 # branches share the same code path.
                 if media_type == "video":
-                    audio_uri, audio_name = extract_video_audio_b64(
-                        payload_uri, filename
+                    audio_uri, audio_name = await asyncio.to_thread(
+                        extract_video_audio_b64, payload_uri, filename
                     )
                 else:
                     audio_uri = payload_uri

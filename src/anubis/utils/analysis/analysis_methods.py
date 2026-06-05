@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.anubis.utils.classes.LatentFeatureAnalysisClass import (
     LatentFeatureAnalysisClass,
+    format_analysis_input_with_context,
 )
 from src.anubis.utils.model import init_model
 from src.anubis.utils.prompts.psycho_analysis.emotional_trigger_analysis_prompt import (
@@ -62,12 +63,27 @@ logger = logging.getLogger(__name__)
 async def perform_ocean_analysis(
     human_message: HumanMessage,
     additional_metadata: dict[str, Any] | None = None,
+    situational_context: str | None = None,
 ) -> list[Document]:
     """Analyze a human message and return five OCEAN-trait Documents.
 
     Ingests a human message containing content to analyze and returns a list of
-    Documents containing the five results of the analysis.
+    Documents containing the five results of the analysis. ``situational_context``
+    (spec Step 2), when supplied, frames the target statement with the
+    whole-scene summary and the preceding "user" turn.
     """
+    if situational_context:
+        _ocean_content = human_message.content
+        _ocean_text = (
+            _ocean_content.strip()
+            if isinstance(_ocean_content, str)
+            else _ocean_content
+        )
+        human_message = HumanMessage(
+            content=format_analysis_input_with_context(
+                str(_ocean_text), situational_context
+            )
+        )
     logger.info("breakpoint")
     # TODO: CALCULATE TOKEN USAGE response['response_metadata'], latency_ms, cost
 
@@ -242,6 +258,29 @@ def metadata_for_analysis_outputs(doc: Document) -> dict[str, Any]:
     }
 
 
+def _situational_context_from_doc(doc: Document) -> str | None:
+    """Build the per-target situational-context block from a source Document.
+
+    Spec Step 2: a target statement is analyzed using the preceding "user" turn
+    (``user_context``, falling back to ``adapter_prompt``) and the one
+    whole-scene summary (``scene_summary``) as context. Documents that carry
+    neither (e.g. biographical/monologue sources) return ``None`` and are
+    analyzed in isolation exactly as before.
+    """
+    md = doc.metadata or {}
+    scene = (md.get("scene_summary") or "").strip()
+    user_ctx = (md.get("user_context") or md.get("adapter_prompt") or "").strip()
+    parts: list[str] = []
+    if scene:
+        parts.append(f"Scene summary (the overall situation): {scene}")
+    if user_ctx:
+        parts.append(
+            "The statement the target is responding to (the preceding 'user' "
+            "turn): " + user_ctx
+        )
+    return "\n".join(parts) if parts else None
+
+
 def _analysis_output_metadata(
     source_meta: dict[str, Any], feature: str, model_inference_type: str
 ) -> dict[str, Any]:
@@ -268,12 +307,15 @@ async def perform_emotional_trigger_analysis(
     human_message: HumanMessage,
     target_name: str | None = None,
     source_metadata: dict[str, Any] | None = None,
+    situational_context: str | None = None,
 ) -> list[Document]:
     """Detect base-six emotion shifts + triggers, corroborated by GoEmotions.
 
     Returns one ``analysis``-namespace Document per detected shift. Each
     Document also carries the GoEmotions classifier label/score for the source
-    text under ``go_emotions`` metadata.
+    text under ``go_emotions`` metadata. ``situational_context`` (spec Step 2),
+    when supplied, frames the target statement with scene + preceding-user
+    context; GoEmotions still runs over the raw statement.
     """
     from src.anubis.utils.emotion_classifier import classify_go_emotions
 
@@ -292,7 +334,11 @@ async def perform_emotional_trigger_analysis(
                     target_name=target_name
                 )
             ),
-            human_message,
+            HumanMessage(
+                content=format_analysis_input_with_context(
+                    str(text), situational_context
+                )
+            ),
         ]
     )
 
@@ -310,7 +356,7 @@ async def perform_emotional_trigger_analysis(
             f"{shift.trigger_event}"
         )
         page_content = LatentFeatureAnalysisClass._format_page_content(
-            context, statement
+            context, statement, shift.supporting_reason
         )
         metadata = _analysis_output_metadata(
             source_metadata,
@@ -340,6 +386,7 @@ async def perform_standardized_question_analysis(
     human_message: HumanMessage,
     target_name: str | None = None,
     source_metadata: dict[str, Any] | None = None,
+    situational_context: str | None = None,
 ) -> list[Document]:
     """Search the content for an answer to each standardized identity question.
 
@@ -351,8 +398,13 @@ async def perform_standardized_question_analysis(
     ``GlobalContext().standardized_question_analysis_concurrency``). Returns one
     ``analysis``-namespace Document per question/answer pair found; questions
     with no answer in the content produce no document.
+
+    ``situational_context`` (spec Step 2), when supplied, frames the analyzed
+    statement with the whole-scene summary and the preceding "user" turn the
+    target was responding to. Provenance (``original_statement``) stays the raw
+    statement; only the model input is contextualized.
     """
-    from data.standardized_questions import ALL_STANDARDIZED_QUESTIONS
+    from src.anubis.utils.analysis.standardized_questions import ALL_STANDARDIZED_QUESTIONS
     from src.anubis.utils.context import GlobalContext
 
     content = human_message.content
@@ -361,6 +413,10 @@ async def perform_standardized_question_analysis(
         return []
 
     source_metadata = source_metadata or {}
+
+    analyzer_human_message = HumanMessage(
+        content=format_analysis_input_with_context(str(text), situational_context)
+    )
 
     # One model instance, reused across every per-question call (stateless).
     model = init_model(response_format=StandardizedQuestionAnswer)
@@ -377,7 +433,7 @@ async def perform_standardized_question_analysis(
                             question=question,
                         )
                     ),
-                    human_message,
+                    analyzer_human_message,
                 ]
             )
         if not getattr(response, "answer_found", False):
@@ -387,7 +443,7 @@ async def perform_standardized_question_analysis(
             return None
         context = f'In response to the question "{question}"'
         page_content = LatentFeatureAnalysisClass._format_page_content(
-            context, answer
+            context, answer, response.supporting_reason
         )
         metadata = _analysis_output_metadata(
             source_metadata,
@@ -471,6 +527,7 @@ def _make_narrative_runner(
             doc.page_content or "",
             target_name=(doc.metadata or {}).get("target_name"),
             source_metadata=metadata_for_analysis_outputs(doc),
+            situational_context=_situational_context_from_doc(doc),
         )
 
     return runner
@@ -481,7 +538,10 @@ async def _run_ocean(doc: Document) -> list[Document]:
     if not text:
         return []
     source_meta = metadata_for_analysis_outputs(doc)
-    raw = await perform_ocean_analysis(HumanMessage(content=text))
+    raw = await perform_ocean_analysis(
+        HumanMessage(content=text),
+        situational_context=_situational_context_from_doc(doc),
+    )
     out: list[Document] = []
     for d in raw:
         trait = d.metadata.get("trait", "trait")
@@ -522,6 +582,7 @@ async def _run_emotional_triggers(doc: Document) -> list[Document]:
         HumanMessage(content=doc.page_content or ""),
         target_name=(doc.metadata or {}).get("target_name"),
         source_metadata=metadata_for_analysis_outputs(doc),
+        situational_context=_situational_context_from_doc(doc),
     )
 
 
@@ -530,6 +591,7 @@ async def _run_standardized_questions(doc: Document) -> list[Document]:
         HumanMessage(content=doc.page_content or ""),
         target_name=(doc.metadata or {}).get("target_name"),
         source_metadata=metadata_for_analysis_outputs(doc),
+        situational_context=_situational_context_from_doc(doc),
     )
 
 

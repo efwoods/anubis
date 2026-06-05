@@ -12,6 +12,7 @@ SELECT
     value->'document'->'kwargs'->'metadata'->>'namespace' AS namespace,
     value->'document'->'kwargs'->'metadata'->>'document_id' AS document_id,
     value->'document'->'kwargs'->'metadata'->>'total_chunks' AS total_chunks,
+    value->'document'->'kwargs'->>'metadata' AS metadata,
     prefix,
     key
 FROM store

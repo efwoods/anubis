@@ -48,6 +48,36 @@ from src.anubis.utils.prompts.concise_context_summary_prompt import (
 logger = logging.getLogger(__name__)
 
 
+def format_analysis_input_with_context(
+    statement: str, situational_context: str | None
+) -> str:
+    """Wrap a target statement with optional situational context for analysis.
+
+    When ``situational_context`` is empty/None the statement is returned
+    unchanged (backward-compatible — analyzers that receive isolated text behave
+    exactly as before). When context is supplied (the whole-scene summary and/or
+    the preceding "user" turn the target is responding to), it is rendered as a
+    clearly-labelled block so the analyzer model interprets the target statement
+    in situ while still extracting features ONLY about the target. The caller
+    keeps the raw ``statement`` for provenance (``original_statement``); only the
+    model input is wrapped.
+    """
+    statement = (statement or "").strip()
+    ctx = (situational_context or "").strip()
+    if not ctx:
+        return statement
+    return (
+        "<SITUATIONAL_CONTEXT>\n"
+        + ctx
+        + "\n</SITUATIONAL_CONTEXT>\n\n<TARGET_STATEMENT>\n"
+        + statement
+        + "\n</TARGET_STATEMENT>\n\n"
+        "Analyze ONLY the target's statement above. Use the situational context "
+        "solely to interpret what the target means; do not extract features "
+        "about anyone other than the target."
+    )
+
+
 class ExtractedLatentFeature(BaseModel):
     """One atomic latent feature detected about the target — model output."""
 
@@ -116,12 +146,26 @@ class LatentFeatureAnalysisClass:
 
     @staticmethod
     def _format_page_content(
-        concise_context_summary: str, feature_statement: str
+        concise_context_summary: str,
+        feature_statement: str,
+        supporting_reason: str | None = None,
     ) -> str:
-        """Wrap a finding in the ``<FACT_CONTEXT_AND_FACT>`` structure."""
+        """Wrap a finding in the ``<FACT_CONTEXT_AND_FACT>`` structure.
+
+        When ``supporting_reason`` is supplied it is folded into the context
+        block — *in addition to* the concise context summary — so the
+        embedded/searchable ``page_content`` carries the evidence behind the
+        finding. Because this same text is what gets embedded and stored, the
+        supporting reason then participates both in the dedup similarity search
+        (verifying a finding does not already exist) and in the stored fact.
+        """
+        context = (concise_context_summary or "").strip()
+        reason = (supporting_reason or "").strip()
+        if reason:
+            context = f"{context} {reason}".strip()
         return (
             "<FACT_CONTEXT_AND_FACT> <FACT_CONTEXT>"
-            + concise_context_summary.strip()
+            + context
             + "</FACT_CONTEXT><FACT>"
             + feature_statement.strip()
             + "</FACT></FACT_CONTEXT_AND_FACT>"
@@ -140,6 +184,7 @@ class LatentFeatureAnalysisClass:
         input_str: str,
         target_name: str | None = None,
         source_metadata: Dict[str, Any] | None = None,
+        situational_context: str | None = None,
     ) -> List[Document]:
         """Detect ``feature_name`` instances in ``input_str``.
 
@@ -161,7 +206,11 @@ class LatentFeatureAnalysisClass:
 
         analyzer_messages = [
             SystemMessage(content=self._format_system_prompt(target_name)),
-            HumanMessage(content=text),
+            HumanMessage(
+                content=format_analysis_input_with_context(
+                    text, situational_context
+                )
+            ),
         ]
         summary_model = init_model(response_format=ConciseContextOfTheSourceOfFacts)
         summary_messages = [
@@ -186,7 +235,9 @@ class LatentFeatureAnalysisClass:
             statement = (feature.feature_statement or "").strip()
             if not statement:
                 continue
-            page_content = self._format_page_content(concise_context_summary, statement)
+            page_content = self._format_page_content(
+                concise_context_summary, statement, feature.supporting_reason
+            )
             metadata: Dict[str, Any] = {
                 **source_metadata,
                 self.feature_name: statement,

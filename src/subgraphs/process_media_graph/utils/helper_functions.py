@@ -645,6 +645,104 @@ def _build_adapter_dialogue_document(
     )
 
 
+def _format_dialogue_transcript(segments: List[Dict[str, Any]]) -> str:
+    """Render coalesced turns as ``speaker: text`` lines for whole-scene summary."""
+    lines: List[str] = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = str(seg.get("speaker") or "unknown")
+        lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+async def generate_scene_summary(
+    transcript_text: str, *, target_name: Optional[str] = None
+) -> str:
+    """Spec Step 1: ONE structured-output summary of the entire scene.
+
+    Reuses the concise-context-summary model (the same model the fact rewriter
+    uses) over the FULL transcript so each target statement can later be
+    analyzed with the overall situation as situational context. Returns ``""``
+    on empty input or any failure, in which case analysis simply proceeds
+    without the scene context.
+    """
+    text = (transcript_text or "").strip()
+    if not text:
+        return ""
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from src.anubis.utils.classes.FactRewriterClass import (
+            ConciseContextOfTheSourceOfFacts,
+        )
+        from src.anubis.utils.model import init_model
+        from src.anubis.utils.prompts.concise_context_summary_prompt import (
+            CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT,
+        )
+
+        model = init_model(response_format=ConciseContextOfTheSourceOfFacts)
+        response = await model.ainvoke(
+            [
+                SystemMessage(
+                    content=CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT.format(
+                        target_name=target_name
+                    )
+                ),
+                HumanMessage(content=text),
+            ]
+        )
+        return (getattr(response, "concise_context_summary", "") or "").strip()
+    except Exception as exc:
+        logger.warning("Scene summary generation failed: %s", exc)
+        return ""
+
+
+async def _attach_target_analysis_context(
+    target_quote_docs: List[Document], *, scene_summary: str
+) -> None:
+    """Spec Step 2 prep: stamp whole-scene summary + guaranteed user-context.
+
+    Each target quote already carries ``adapter_prompt`` (the preceding
+    non-target turn) when one exists. This adds, in place:
+
+      * ``scene_summary`` — the one whole-scene summary, identical across every
+        target statement in the dialogue.
+      * ``user_context`` — the "user" turn the target statement responds to,
+        used by the per-target analyzers. When the target led the conversation
+        (no preceding non-target turn), a synthetic user statement is generated
+        from the target statement so there is ALWAYS a target statement with a
+        previous user input (per the spec).
+    """
+    if not target_quote_docs:
+        return
+
+    missing = [
+        d
+        for d in target_quote_docs
+        if not (d.metadata.get("adapter_prompt") or "").strip()
+    ]
+    synthetic_iter = iter(())
+    if missing:
+        from src.anubis.utils.dataset.formatting import create_question_list
+
+        synth = await create_question_list(
+            [d.page_content or "" for d in missing]
+        )
+        synthetic_iter = iter(synth)
+
+    for doc in target_quote_docs:
+        if scene_summary:
+            doc.metadata["scene_summary"] = scene_summary
+        real = (doc.metadata.get("adapter_prompt") or "").strip()
+        if real:
+            doc.metadata["user_context"] = real
+        else:
+            doc.metadata["user_context"] = next(synthetic_iter, "")
+            doc.metadata["user_context_synthetic"] = True
+
+
 async def process_dialogue_json_to_documents(
     dialogue_payload: Dict[str, Any],
     *,
@@ -685,17 +783,27 @@ async def process_dialogue_json_to_documents(
 
     documents: List[Document] = []
 
-    # Target turns under ``quote`` (verbatim), each carrying its preceding
-    # non-target turn as ``adapter_prompt``.
-    documents.extend(
-        _build_target_quote_documents_from_dialogue(
-            segments,
-            user_id=user_id,
-            assistant_id=assistant_id,
-            media_item=media_item,
-            target_name=target_name,
-        )
+    # Spec Step 1: summarize the entire scene ONCE so each target statement can
+    # be analyzed with the overall situation as situational context.
+    scene_summary = await generate_scene_summary(
+        _format_dialogue_transcript(segments), target_name=target_name
     )
+
+    # Target turns under ``quote`` (verbatim), each carrying its preceding
+    # non-target turn as ``adapter_prompt``. Spec Step 2 prep: stamp the scene
+    # summary and a guaranteed user-context (synthetic when the target led) onto
+    # each so the per-target analyzers run with that context.
+    target_quote_docs = _build_target_quote_documents_from_dialogue(
+        segments,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        media_item=media_item,
+        target_name=target_name,
+    )
+    await _attach_target_analysis_context(
+        target_quote_docs, scene_summary=scene_summary
+    )
+    documents.extend(target_quote_docs)
 
     # Full role-converted dialogue under ``adapter``.
     adapter_doc = _build_adapter_dialogue_document(

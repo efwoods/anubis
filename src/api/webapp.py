@@ -83,6 +83,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 from pydantic import BaseModel, BeforeValidator
 from typing import Any
+from collections.abc import Iterator
 
 
 def _drop_empty_file_fields(value: Any) -> Any:
@@ -132,6 +133,60 @@ from uuid import uuid5, NAMESPACE_URL
 def _namespace_safe_formatted_filename(u: str) -> str:
     formatted_name = str(uuid5(NAMESPACE_URL, u))
     return formatted_name
+
+
+def _document_label_and_key(metadata: dict) -> tuple[str | None, str | None]:
+    """Map a stored Document's metadata to the pair (human label, storage key).
+
+    The *label* is what ``/list_avatar_documents`` displays; the *key* is the
+    ``namespace_filename`` that ``/delete_avatar_document`` matches store rows on.
+    Keeping both in one place is what lets the two endpoints round-trip: a string
+    a user copies out of the list resolves back to the exact key delete needs.
+
+    Playlist videos carry playlist_url / playlist_title / video_title (see
+    ``URLDocumentLoaderClass._load_youtube_playlist``); they are labeled
+    ``{playlist_title} :: {video_title}`` but keyed by an opaque uuid5
+    namespace_filename (hashed over ``{playlist_ns}::{video_ns}``) — the label is
+    human-readable titles, the key is a hash, so the two never coincide. Everything
+    else is both labeled and keyed by its plain filename. Titles fall back to
+    URLs/filenames when yt_dlp couldn't resolve them.
+    """
+    filename = metadata.get("filename")
+    namespace_filename = metadata.get("namespace_filename")
+    key = namespace_filename if isinstance(namespace_filename, str) and namespace_filename else None
+    playlist_url = metadata.get("playlist_url")
+    if isinstance(playlist_url, str) and playlist_url:
+        playlist_label = (metadata.get("playlist_title") or playlist_url).strip()
+        video_label = (
+            metadata.get("video_title")
+            or (filename if isinstance(filename, str) else "")
+            or "untitled"
+        ).strip()
+        return f"{playlist_label} :: {video_label}", key
+    if isinstance(filename, str) and filename:
+        return filename, key
+    return None, key
+
+
+def _iter_document_labels(store_items) -> Iterator[tuple[str, str | None]]:
+    """Yield (label, key) for each stored Document, de-structuring the same
+    value.document.kwargs.metadata path /list and /delete read. Multiple
+    Documents per source (quote / identity / analysis) yield the same pair; the
+    caller de-dupes."""
+    for item in store_items or []:
+        value = getattr(item, "value", None)
+        if value is None and isinstance(item, dict):
+            value = item.get("value")
+        if not isinstance(value, dict):
+            continue
+        document = value.get("document")
+        kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
+        metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+        if not isinstance(metadata, dict):
+            continue
+        label, key = _document_label_and_key(metadata)
+        if label:
+            yield label, key
 
 
 def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
@@ -2342,17 +2397,18 @@ async def _expand_youtube_playlist_to_media_entries(
     *,
     user_id: str,
     assistant_id: str,
-    all_speakers_target: bool = False,
+    treat_every_speaker_as_target: bool = False,
 ) -> Optional[list]:
     """Expand a YouTube **playlist** URL into one media entry per video.
 
     Each video becomes its own top-level item — and therefore its own child job
-    with its own progress/cancel id — keyed by the composite
-    ``{playlist_ns}::{video_ns}`` namespace and named ``{playlist}::{video}`` so
-    the videos list, dedupe, and cancel individually rather than collapsing into a
-    single playlist job. Playlist context (``playlist_url`` / title / ns) rides on
-    each entry so the produced Documents get stamped and ``/list_avatar_documents``
-    groups every video under its playlist.
+    with its own progress/cancel id — keyed by a single uuid5 over
+    ``{playlist_ns}::{video_ns}`` and named ``{playlist}::{video}`` so the videos
+    list, dedupe, and cancel individually rather than collapsing into a single
+    playlist job. Playlist context (``playlist_url`` / title / ns) rides on each
+    entry so the produced Documents get stamped, ``/list_avatar_documents`` groups
+    every video under its playlist, and a whole-playlist delete can match them by
+    ``playlist_namespace_filename``.
 
     Returns ``None`` for any non-playlist URL so the caller falls back to the
     normal single-URL path; returns ``[]`` if the playlist resolves to no videos.
@@ -2397,8 +2453,14 @@ async def _expand_youtube_playlist_to_media_entries(
                 "assistant_id": assistant_id,
                 "reference_audio": False,
                 "reference_image": False,
-                "all_speakers_target": all_speakers_target,
-                "namespace_filename": f"{playlist_ns}::{video_ns}",
+                "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                # Single opaque uuid5 over the composite so the store key carries
+                # no ``::`` separator. The playlist a video belongs to is recovered
+                # from playlist_namespace_filename below (and from playlist_url /
+                # title for the listing), not by parsing this key.
+                "namespace_filename": _namespace_safe_formatted_filename(
+                    f"{playlist_ns}::{video_ns}"
+                ),
                 "playlist_url": url_clean,
                 "playlist_namespace_filename": playlist_ns,
                 "playlist_title": playlist_title,
@@ -2661,7 +2723,7 @@ async def update_avatar_identity_with_media(
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
-    all_speakers_target: Annotated[bool, Form()] = False,
+    treat_every_speaker_as_target: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -2693,7 +2755,7 @@ async def update_avatar_identity_with_media(
     **exactly one** file or URL (a reference clip/image is a single item): the file
     or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
 
-    With **all_speakers_target=true** the batch has **no single target speaker**:
+    With **treat_every_speaker_as_target=true** the batch has **no single target speaker**:
     every detected speaker is the avatar. Audio/video items are still diarized (so
     no stored reference-audio clip is required and known-speaker labelling is
     skipped). With **multiple speakers**, each statement becomes one ``quote``
@@ -2773,13 +2835,13 @@ async def update_avatar_identity_with_media(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
             )
-        if all_speakers_target and (reference_image or reference_audio):
+        if treat_every_speaker_as_target and (reference_image or reference_audio):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "all_speakers_target cannot be combined with "
+                    "treat_every_speaker_as_target cannot be combined with "
                     "reference_image/reference_audio: a reference clip designates a "
-                    "single target, while all_speakers_target treats every detected "
+                    "single target, while treat_every_speaker_as_target treats every detected "
                     "speaker as the target."
                 ),
             )
@@ -2912,9 +2974,9 @@ async def update_avatar_identity_with_media(
         # level, alongside reference_audio/reference_image). convert_uploaded_
         # files_to_media reads it for audio/video/url items and threads it into
         # their metadata; expanded playlist children inherit it downstream.
-        if all_speakers_target:
+        if treat_every_speaker_as_target:
             for entry in media_files:
-                entry["all_speakers_target"] = True
+                entry["treat_every_speaker_as_target"] = True
 
         store = app.state.store
 
@@ -3024,7 +3086,7 @@ async def update_avatar_identity_with_media(
                 playlist_url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                all_speakers_target=all_speakers_target,
+                treat_every_speaker_as_target=treat_every_speaker_as_target,
             )
             for playlist_url in playlist_urls
         ]
@@ -3354,37 +3416,14 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
             detail=f"Could not read this avatar's documents: {exc}",
         ) from exc
 
-    uploaded_documents: set[str] = set()
-    # A playlist entry's Documents carry playlist_url / playlist_title /
-    # video_title (see URLDocumentLoaderClass._load_youtube_playlist). Such
-    # videos are listed by the convention ``{playlist} :: {video}`` so the
-    # playlist a video belongs to is discernible from the flat list; everything
-    # else is listed by its plain filename. Titles fall back to URLs/filenames
-    # when yt_dlp couldn't resolve them. The set de-dupes the multiple Documents
-    # per video (quote / identity / analysis) down to one entry.
-    for item in all_document_items or []:
-        value = getattr(item, "value", None)
-        if value is None and isinstance(item, dict):
-            value = item.get("value")
-        if not isinstance(value, dict):
-            continue
-        document = value.get("document")
-        kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
-        metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
-        if not isinstance(metadata, dict):
-            continue
-        filename = metadata.get("filename")
-        playlist_url = metadata.get("playlist_url")
-        if isinstance(playlist_url, str) and playlist_url:
-            playlist_label = (metadata.get("playlist_title") or playlist_url).strip()
-            video_label = (
-                metadata.get("video_title")
-                or (filename if isinstance(filename, str) else "")
-                or "untitled"
-            ).strip()
-            uploaded_documents.add(f"{playlist_label} :: {video_label}")
-        elif isinstance(filename, str) and filename:
-            uploaded_documents.add(filename)
+    # Each source produces several Documents (quote / identity / analysis); the
+    # set de-dupes them down to one entry per source. Playlist videos are listed
+    # as ``{playlist} :: {video}`` and everything else by plain filename — see
+    # _document_label_and_key, shared with /delete_avatar_document so a label
+    # copied out of this list resolves back to the key delete needs.
+    uploaded_documents: set[str] = {
+        label for label, _key in _iter_document_labels(all_document_items)
+    }
 
     return {"uploaded_documents": sorted(uploaded_documents)}
 
@@ -3397,8 +3436,9 @@ async def delete_avatar_documents(
     # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
     # leaving only the filename or already-derived namespace id.
     source_document_name = source_document_name.strip(" \t\n\r\"'`(),[]")
-    if "." in source_document_name:
-        source_document_name = _namespace_safe_formatted_filename(source_document_name)
+    # Keep the user-facing name for the response; source_document_name itself may
+    # be rewritten below into an opaque hashed/composite store key.
+    display_name = source_document_name
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = (
         current_user["app_metadata"]
@@ -3411,6 +3451,32 @@ async def delete_avatar_documents(
             detail="Please select an avatar before continuing.", status_code=400
         )
 
+    # Users delete by pasting a string straight out of /list_avatar_documents.
+    # For a plain file that string IS the stored key (filename), but a playlist
+    # video is listed by the human-readable ``{playlist_title} :: {video_title}``
+    # label, whose words never equal the uuid5-hashed
+    # ``{playlist_ns}::{video_ns}`` namespace_filename it's stored under — so the
+    # raw label matches no row and delete 404s. Resolve the label back to its key
+    # via the same helper /list builds labels with, so the two round-trip. Only
+    # when nothing matches do we treat the input as a filename/URL and hash it
+    # (this also avoids mangling a label that happens to contain a ".").
+    try:
+        existing_items = await app.state.store.asearch(
+            (user_id, assistant_id), limit=1_000_000
+        )
+        label_to_key = {
+            label: key
+            for label, key in _iter_document_labels(existing_items)
+            if key
+        }
+    except Exception:
+        label_to_key = {}
+    resolved_key = label_to_key.get(source_document_name)
+    if resolved_key:
+        source_document_name = resolved_key
+    elif "." in source_document_name:
+        source_document_name = _namespace_safe_formatted_filename(source_document_name)
+
     pool = app.state.pool
 
     # LangGraph store: prefix = namespace tuple dot-joined.
@@ -3418,12 +3484,14 @@ async def delete_avatar_documents(
     # (reference_image, reference_audio, …) where the serialized LangChain Document holds the
     # basename under value.document.kwargs.metadata.filename (same path as list_documents).
     # Rows removed from store CASCADE-delete matching store_vectors embeddings.
-    # Playlist videos are keyed by a composite namespace_filename
-    # ``{playlist_ns}::{video_ns}`` (see URLDocumentLoaderClass._load_youtube_playlist).
-    # Passing a bare playlist namespace id (or its URL, hashed above) deletes the
-    # WHOLE playlist via the ``{name}::%`` prefix; passing a full composite id
-    # deletes the single video via the exact-match clauses below. A plain
-    # (non-playlist) id has no ``::`` children, so the playlist clauses are inert.
+    # Playlist videos are keyed by a single opaque namespace_filename (a uuid5 over
+    # ``{playlist_ns}::{video_ns}``) and carry their playlist's id under
+    # value.document.kwargs.metadata.playlist_namespace_filename. Passing a bare
+    # playlist namespace id (or its URL, hashed above) deletes the WHOLE playlist
+    # via the playlist_namespace_filename value-match clause; passing a single
+    # video's namespace_filename (resolved from its list label above) deletes that
+    # one video via the prefix clauses. A plain (non-playlist) id matches no
+    # playlist_namespace_filename, so that clause is inert for it.
     SQL_DELETE_DOCUMENT_QUERY = """
 DELETE FROM store
 WHERE (
@@ -3431,7 +3499,10 @@ WHERE (
     OR prefix LIKE %s
     OR prefix LIKE %s
     OR prefix LIKE %s
-    OR prefix LIKE %s
+)
+OR (
+    prefix LIKE %s
+    AND value #>> '{document,kwargs,metadata,playlist_namespace_filename}' = %s
 )
 OR (
     prefix LIKE %s
@@ -3447,13 +3518,13 @@ OR (
                     f"{user_id}.{assistant_id}.{source_document_name}.%",
                     f"{user_id}.{assistant_id}.%.{source_document_name}",
                     f"{user_id}.{assistant_id}.%.{source_document_name}.%",
-                    # Whole playlist: every composite-keyed video under this playlist.
-                    # Scoped to this user/assistant via the prefix — playlist_ns is a
-                    # deterministic hash of the playlist URL and is therefore shared
-                    # across users who uploaded the same playlist, so an unscoped
-                    # value match would cross avatars. namespace_filename is the 4th
-                    # prefix segment, so this targets exactly this avatar's videos.
-                    f"{user_id}.{assistant_id}.%.{source_document_name}::%",
+                    # Whole playlist: every video whose playlist_namespace_filename
+                    # equals this id. Scoped to this user/assistant via the prefix —
+                    # playlist_ns is a deterministic hash of the playlist URL and is
+                    # therefore shared across users who uploaded the same playlist,
+                    # so an unscoped value match would cross avatars.
+                    f"{user_id}.{assistant_id}.%",
+                    source_document_name,
                     f"{user_id}.{assistant_id}.reference_%",
                     source_document_name,
                 )
@@ -3465,11 +3536,11 @@ OR (
     if total_deleted == 0:
         raise HTTPException(
             status_code=404,
-            detail=f"No stored rows matched document: {source_document_name}",
+            detail=f"No stored rows matched document: {display_name}",
         )
 
     return JSONResponse(
-        content=f"Successfully deleted: {source_document_name}", status_code=200
+        content=f"Successfully deleted: {display_name}", status_code=200
     )
 
 if __name__ == "__main__":

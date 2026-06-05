@@ -428,8 +428,8 @@ async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch):
-    """A URL item flagged ``all_speakers_target`` must call the loader with
+async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(monkeypatch):
+    """A URL item flagged ``treat_every_speaker_as_target`` must call the loader with
     ``expect_multispeaker=True`` (forcing the audio/diarize path over subtitles)
     and stamp the flag onto every expanded child so playlist videos inherit it."""
     from langchain_core.documents import Document
@@ -442,7 +442,7 @@ async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch)
         "metadata": {
             "filename": "https://www.youtube.com/watch?v=aaa",
             "namespace_filename": "NS",
-            "all_speakers_target": True,
+            "treat_every_speaker_as_target": True,
         },
     }
 
@@ -458,8 +458,8 @@ async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch)
     monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
 
     async def _fake_process(item, runtime, config, store, **kwargs):
-        captured["child_all_speakers_target"] = item["metadata"].get(
-            "all_speakers_target"
+        captured["child_treat_every_speaker_as_target"] = item["metadata"].get(
+            "treat_every_speaker_as_target"
         )
         return [Document(page_content="hi", metadata={"namespace": "quote"})]
 
@@ -478,7 +478,7 @@ async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch)
     )
 
     assert captured["expect_multispeaker"] is True
-    assert captured["child_all_speakers_target"] is True
+    assert captured["child_treat_every_speaker_as_target"] is True
 
 
 def _make_runtime():
@@ -500,13 +500,13 @@ def _audio_item():
             "assistant_id": "a",
             "namespace_filename": "NS",
             "reference_audio": False,
-            "all_speakers_target": True,
+            "treat_every_speaker_as_target": True,
         },
     }
 
 
 @pytest.mark.asyncio
-async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypatch):
+async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement(monkeypatch):
     """Multiple speakers (all target): one ``quote`` Document per statement, each
     later turn reusing the PRECEDING statement as ``adapter_prompt`` (the genuine
     question); the first statement has no predecessor (synthesized downstream).
@@ -529,7 +529,7 @@ async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypat
         }
 
     async def _fail_dialogue(*args, **kwargs):  # must NOT be called
-        raise AssertionError("dialogue path must not run in all_speakers_target mode")
+        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
 
     monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", _fake_diarize)
     monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", _fail_dialogue)
@@ -557,7 +557,7 @@ async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_all_speakers_target_single_speaker_classified_normally(monkeypatch):
+async def test_treat_every_speaker_as_target_single_speaker_classified_normally(monkeypatch):
     """A single speaker is classified normally (monologue / tweets_or_quotes):
     the full transcript is routed through ``process_text_to_document`` rather than
     the per-statement / dialogue paths."""
@@ -578,7 +578,7 @@ async def test_all_speakers_target_single_speaker_classified_normally(monkeypatc
         }
 
     async def _fail_dialogue(*args, **kwargs):
-        raise AssertionError("dialogue path must not run in all_speakers_target mode")
+        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
 
     async def _fake_classify(*, metadata, user_id, assistant_id, media_item):
         captured["classify_text"] = media_item.get("content")

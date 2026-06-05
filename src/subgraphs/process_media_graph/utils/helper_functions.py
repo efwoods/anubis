@@ -517,7 +517,7 @@ def build_all_speakers_quote_documents(
     multi_speaker: bool,
 ) -> List[Document]:
     """One verbatim ``quote`` Document per statement when EVERY speaker is the
-    avatar (the ``all_speakers_target`` path only).
+    avatar (the ``treat_every_speaker_as_target`` path only).
 
     This is a standalone builder: it never calls — and is never called by — the
     standard dialogue/quote/monologue helpers, so it cannot change any behaviour
@@ -577,7 +577,7 @@ def build_all_speakers_quote_documents(
                     "is_target": True,
                     "target_name": target_name,
                     "adapter_prompt": adapter_prompt,
-                    "all_speakers_target": True,
+                    "treat_every_speaker_as_target": True,
                     "start": seg.get("start"),
                     "end": seg.get("end"),
                 },

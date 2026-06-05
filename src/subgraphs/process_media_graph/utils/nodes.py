@@ -157,7 +157,7 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
-            all_speakers_target = file_data.get("all_speakers_target", False)
+            treat_every_speaker_as_target = file_data.get("treat_every_speaker_as_target", False)
             namespace_filename = file_data.get("namespace_filename")
         
             logger.info(f"Processing file: {filename} ({content_type})")
@@ -208,7 +208,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "all_speakers_target": all_speakers_target,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -235,7 +235,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "all_speakers_target": all_speakers_target,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -253,7 +253,7 @@ async def process_uploaded_files_and_label_media_type(
                     "size": 0,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "all_speakers_target": all_speakers_target,
+                    "treat_every_speaker_as_target": treat_every_speaker_as_target,
                     "namespace_filename": namespace_filename,
                 }
                 # Carry playlist context when the upload endpoint expanded a
@@ -361,7 +361,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "all_speakers_target": all_speakers_target,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "namespace_filename": namespace_filename
                     }
                 })
@@ -389,7 +389,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "reference_audio": reference_audio,
-                        "all_speakers_target": all_speakers_target,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -1294,8 +1294,8 @@ async def process_media_item_task(
             # Batch-wide "no single target": every detected speaker is the avatar.
             # Diarization still runs, but no stored reference clip is required and
             # known-speaker labelling is skipped (every turn is forced is_target).
-            all_speakers_target = bool(metadata.get("all_speakers_target", False))
-            if not reference_audio and not all_speakers_target:
+            treat_every_speaker_as_target = bool(metadata.get("treat_every_speaker_as_target", False))
+            if not reference_audio and not treat_every_speaker_as_target:
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
                 if not ref_item and not reference_audio:
@@ -1465,7 +1465,7 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
-            if not all_speakers_target:
+            if not treat_every_speaker_as_target:
                 try:
                     ref_item = await store.aget(
                         (user_id, assistant_id, "reference_audio"), assistant_id
@@ -1524,7 +1524,7 @@ async def process_media_item_task(
             )
 
             # ---------------------------------------------------------------
-            # all_speakers_target: no single target speaker, so EVERY detected
+            # treat_every_speaker_as_target: no single target speaker, so EVERY detected
             # speaker is the avatar. Routed only through standalone helpers / the
             # normal text classifier so the established dialogue path is never
             # touched. This branch returns early.
@@ -1538,7 +1538,7 @@ async def process_media_item_task(
             #     stores it in the vectorstore, marks it analysis-acceptable, and
             #     makes it adapter-acceptable with a synthesized prompt.
             # ---------------------------------------------------------------
-            if all_speakers_target:
+            if treat_every_speaker_as_target:
                 statements: List[Dict[str, Any]] = []
                 for seg in (diar_response or {}).get("segments") or []:
                     if not isinstance(seg, dict):
@@ -1568,7 +1568,7 @@ async def process_media_item_task(
                         plain_text = (plain.get("text") or "").strip()
                     except Exception as e:
                         logger.exception(
-                            "all_speakers_target transcription failed for %s: %s",
+                            "treat_every_speaker_as_target transcription failed for %s: %s",
                             filename,
                             e,
                         )
@@ -1970,8 +1970,9 @@ async def _expand_url_media_item(
     Concurrency contract: a semaphore slot is held only around the heavy
     ``loader.load()`` call, never while awaiting the recursive children — children
     take their own slots, so the bounded pool can't deadlock. Each child carries
-    its own ``namespace_filename`` (playlist entries: ``{playlist}::{video}``,
-    linktree: the child href); ones already present in ``existing_namespaces`` are
+    its own ``namespace_filename`` (playlist entries: a uuid5 over
+    ``{playlist_ns}::{video_ns}``, linktree: the child href); ones already present
+    in ``existing_namespaces`` are
     skipped so a re-upload doesn't reprocess hundreds of indexed items.
     """
     if not url:
@@ -1992,8 +1993,8 @@ async def _expand_url_media_item(
     # forces the YouTube loader past its subtitles fast-path onto the audio +
     # diarization path so the avatar's voice is actually transcribed (subtitles
     # carry no speaker turns), and is inherited by every expanded child below.
-    parent_all_speakers_target = bool(
-        (media_item.get("metadata") or {}).get("all_speakers_target")
+    parent_treat_every_speaker_as_target = bool(
+        (media_item.get("metadata") or {}).get("treat_every_speaker_as_target")
     )
 
     loader = URLDocumentLoaderClass()
@@ -2003,14 +2004,14 @@ async def _expand_url_media_item(
                 url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                expect_multispeaker=parent_all_speakers_target,
+                expect_multispeaker=parent_treat_every_speaker_as_target,
             )
     else:
         expanded_items = await loader.load(
             url,
             user_id=user_id,
             assistant_id=assistant_id,
-            expect_multispeaker=parent_all_speakers_target,
+            expect_multispeaker=parent_treat_every_speaker_as_target,
         )
 
     if not expanded_items:
@@ -2037,15 +2038,15 @@ async def _expand_url_media_item(
     pending: List[Dict[str, Any]] = []
     for item in expanded_items:
         child_meta = item.setdefault("metadata", {})
-        if parent_all_speakers_target:
-            child_meta.setdefault("all_speakers_target", True)
+        if parent_treat_every_speaker_as_target:
+            child_meta.setdefault("treat_every_speaker_as_target", True)
         child_ns = child_meta.get("namespace_filename")
         if not child_ns:
             # A keyless child is the single logical content of THIS url item
             # (e.g. a video's subtitles or audio). Inherit the parent item's
             # namespace_filename so the content lands under the SAME key as the
-            # item. This is what preserves a playlist entry's composite
-            # ``{playlist_ns}::{video_ns}`` key: deriving a fresh key from the
+            # item. This is what preserves a playlist entry's key (a uuid5 over
+            # ``{playlist_ns}::{video_ns}``): deriving a fresh key from the
             # child's own URL here would collapse it to a video-only key and
             # lose the playlist grouping. For a standalone video/article the
             # parent key already equals the per-source key, so this is a no-op.
@@ -2101,7 +2102,7 @@ async def _expand_url_media_item(
     # group videos under their playlist and the delete endpoint can target a
     # whole playlist. Only stamp when THIS item carries playlist context (i.e.
     # it is a playlist entry being expanded into its subs/audio content) and
-    # never overwrite a child's own namespace_filename (already the composite
+    # never overwrite a child's own namespace_filename (already the uuid5 over
     # ``{playlist_ns}::{video_ns}`` inherited above).
     item_meta = media_item.get("metadata", {}) or {}
     if item_meta.get("playlist_url"):

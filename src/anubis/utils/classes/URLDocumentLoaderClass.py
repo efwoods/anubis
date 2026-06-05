@@ -288,13 +288,15 @@ class URLDocumentLoaderClass:
             logger.warning("YouTube playlist produced no entries: %s", url)
             return []
 
-        # The playlist's own deterministic key. Every video in the playlist is
-        # keyed by a COMPOSITE ``{playlist_ns}::{video_ns}`` so the namespace
-        # carries both identities: items group under their playlist (prefix =
-        # playlist_ns) yet stay disambiguated from one another and from the same
-        # video in a different playlist. /list_avatar_documents groups on this,
-        # the skip-set matches on it, and /delete_avatar_document can drop a whole
-        # playlist (``{playlist_ns}::%``) or a single video (exact composite).
+        # The playlist's own deterministic key. Every video is keyed by a single
+        # uuid5 over ``{playlist_ns}::{video_ns}`` — derived from BOTH identities so
+        # it stays disambiguated from other videos and from the same video in a
+        # different playlist, but emitted as one opaque hash so the store key holds
+        # no ``::`` separator. The playlist a video belongs to is recovered from the
+        # playlist_namespace_filename / playlist_url / title metadata below, not by
+        # parsing the key: /list_avatar_documents groups on playlist_url, the
+        # skip-set matches the opaque key, and /delete_avatar_document drops a whole
+        # playlist via playlist_namespace_filename or a single video via this key.
         playlist_ns = _namespace_for(url)
 
         media_items: List[Dict[str, Any]] = []
@@ -320,7 +322,9 @@ class URLDocumentLoaderClass:
                         "playlist_namespace_filename": playlist_ns,
                         "playlist_title": playlist_title,
                         "video_title": entry.get("title") or "",
-                        "namespace_filename": f"{playlist_ns}::{video_ns}",
+                        "namespace_filename": _namespace_for(
+                            f"{playlist_ns}::{video_ns}"
+                        ),
                     },
                 }
             )

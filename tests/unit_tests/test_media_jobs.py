@@ -194,6 +194,89 @@ async def test_run_batch_media_job_aggregates_children(monkeypatch):
     assert all(spec["child"].status == "completed" for spec in items)
 
 
+@pytest.mark.asyncio
+async def test_run_batch_media_job_expands_deferred_playlist(monkeypatch):
+    """A deferred expander (playlist enumeration) mints one child job per video
+    under the master, in the background, and runs them alongside ready items."""
+    monkeypatch.setattr(pme, "workflow", _FakeWorkflow(_FakeCompiled()))
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+
+    # One ready (non-playlist) item plus a deferred expander yielding two videos.
+    ready_child = create_child_job(
+        registry,
+        user_id="u1",
+        assistant_id="a1",
+        parent_id=master.job_id,
+        filename="ready.mp3",
+        namespace_filename="ns::ready",
+    )
+    master.child_ids.append(ready_child.job_id)
+    items = [{"child": ready_child, "media_file": {"filename": "ready.mp3"}}]
+
+    async def _expander():
+        return [
+            {"filename": "PL::Episode A", "namespace_filename": "PLNS::AAA",
+             "page_url": "https://www.youtube.com/watch?v=aaa"},
+            {"filename": "PL::Episode B", "namespace_filename": "PLNS::BBB",
+             "page_url": "https://www.youtube.com/watch?v=bbb"},
+        ]
+
+    await run_batch_media_job(
+        master, items, config={"configurable": {}}, store=None, context=None,
+        concurrency=5, registry=registry, deferred_expanders=[_expander],
+    )
+
+    # Master saw the ready item + two enumerated videos = three children.
+    assert master.status == "completed"
+    assert master.result["items_total"] == 3
+    assert master.result["items_completed"] == 3
+    # Two fresh child jobs were registered with the composite playlist keys.
+    composite_children = [
+        j for j in registry.values()
+        if j.namespace_filename in ("PLNS::AAA", "PLNS::BBB")
+    ]
+    assert len(composite_children) == 2
+    assert all(c.parent_id == master.job_id for c in composite_children)
+    assert all(c.job_id in master.child_ids for c in composite_children)
+    # The master stream announced each enumerated video.
+    added = [e for e in master.events if e.get("stage") == "playlist_child_added"]
+    assert sorted(e["item_filename"] for e in added) == [
+        "PL::Episode A", "PL::Episode B",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deferred_expander_failure_is_isolated(monkeypatch):
+    """A failing expander surfaces an item_error on the master but doesn't abort
+    the batch — ready items still complete."""
+    monkeypatch.setattr(pme, "workflow", _FakeWorkflow(_FakeCompiled()))
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    ready_child = create_child_job(
+        registry, user_id="u1", assistant_id="a1", parent_id=master.job_id,
+        filename="ready.mp3", namespace_filename="ns::ready",
+    )
+    master.child_ids.append(ready_child.job_id)
+    items = [{"child": ready_child, "media_file": {"filename": "ready.mp3"}}]
+
+    async def _boom():
+        raise RuntimeError("yt_dlp exploded")
+
+    await run_batch_media_job(
+        master, items, config={"configurable": {}}, store=None, context=None,
+        concurrency=5, registry=registry, deferred_expanders=[_boom],
+    )
+
+    assert master.status == "completed"
+    assert master.result["items_total"] == 1
+    assert ready_child.status == "completed"
+    errors = [e for e in master.events if e.get("stage") == "item_error"]
+    assert any("yt_dlp exploded" in (e.get("error") or "") for e in errors)
+
+
 def test_registry_create_get_finish_and_cancel():
     registry: dict[str, MediaJob] = {}
     master, child = _master_and_child(registry)
@@ -345,8 +428,8 @@ async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch):
-    """A URL item flagged ``all_speakers_target`` must call the loader with
+async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(monkeypatch):
+    """A URL item flagged ``treat_every_speaker_as_target`` must call the loader with
     ``expect_multispeaker=True`` (forcing the audio/diarize path over subtitles)
     and stamp the flag onto every expanded child so playlist videos inherit it."""
     from langchain_core.documents import Document
@@ -359,7 +442,7 @@ async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch)
         "metadata": {
             "filename": "https://www.youtube.com/watch?v=aaa",
             "namespace_filename": "NS",
-            "all_speakers_target": True,
+            "treat_every_speaker_as_target": True,
         },
     }
 
@@ -375,8 +458,8 @@ async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch)
     monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
 
     async def _fake_process(item, runtime, config, store, **kwargs):
-        captured["child_all_speakers_target"] = item["metadata"].get(
-            "all_speakers_target"
+        captured["child_treat_every_speaker_as_target"] = item["metadata"].get(
+            "treat_every_speaker_as_target"
         )
         return [Document(page_content="hi", metadata={"namespace": "quote"})]
 
@@ -395,7 +478,7 @@ async def test_all_speakers_target_forces_multispeaker_and_inherits(monkeypatch)
     )
 
     assert captured["expect_multispeaker"] is True
-    assert captured["child_all_speakers_target"] is True
+    assert captured["child_treat_every_speaker_as_target"] is True
 
 
 def _make_runtime():
@@ -417,13 +500,13 @@ def _audio_item():
             "assistant_id": "a",
             "namespace_filename": "NS",
             "reference_audio": False,
-            "all_speakers_target": True,
+            "treat_every_speaker_as_target": True,
         },
     }
 
 
 @pytest.mark.asyncio
-async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypatch):
+async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement(monkeypatch):
     """Multiple speakers (all target): one ``quote`` Document per statement, each
     later turn reusing the PRECEDING statement as ``adapter_prompt`` (the genuine
     question); the first statement has no predecessor (synthesized downstream).
@@ -446,7 +529,7 @@ async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypat
         }
 
     async def _fail_dialogue(*args, **kwargs):  # must NOT be called
-        raise AssertionError("dialogue path must not run in all_speakers_target mode")
+        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
 
     monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", _fake_diarize)
     monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", _fail_dialogue)
@@ -474,7 +557,7 @@ async def test_all_speakers_target_dialogue_reuses_preceding_statement(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_all_speakers_target_single_speaker_classified_normally(monkeypatch):
+async def test_treat_every_speaker_as_target_single_speaker_classified_normally(monkeypatch):
     """A single speaker is classified normally (monologue / tweets_or_quotes):
     the full transcript is routed through ``process_text_to_document`` rather than
     the per-statement / dialogue paths."""
@@ -495,7 +578,7 @@ async def test_all_speakers_target_single_speaker_classified_normally(monkeypatc
         }
 
     async def _fail_dialogue(*args, **kwargs):
-        raise AssertionError("dialogue path must not run in all_speakers_target mode")
+        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
 
     async def _fake_classify(*, metadata, user_id, assistant_id, media_item):
         captured["classify_text"] = media_item.get("content")
@@ -513,3 +596,72 @@ async def test_all_speakers_target_single_speaker_classified_normally(monkeypatc
     assert captured["classify_text"] == "Statement one.\nStatement two."
     assert len(docs) == 1
     assert docs[0].metadata.get("namespace") == "quote"
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint-level playlist expansion: a playlist URL is exploded into one
+# upload entry per video BEFORE child jobs are created, so each video gets its
+# own processing id and lists as ``{playlist}::{video}``.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_expand_youtube_playlist_to_media_entries(monkeypatch):
+    """A playlist URL becomes one page_url entry per video, each keyed by the
+    composite {playlist_ns}::{video_ns}, named {playlist}::{video}, and carrying
+    playlist context so downstream Documents group under the playlist."""
+    import src.anubis.utils.classes.URLDocumentLoaderClass as loader_mod
+    from src.api.webapp import (
+        _expand_youtube_playlist_to_media_entries,
+        _namespace_safe_formatted_filename,
+    )
+
+    playlist_url = "https://www.youtube.com/playlist?list=PLxyz"
+    watch_a = "https://www.youtube.com/watch?v=aaa"
+    watch_b = "https://www.youtube.com/watch?v=bbb"
+
+    async def _fake_entries(url):
+        return (
+            [
+                {"id": "aaa", "url": watch_a, "title": "Episode A"},
+                {"id": "bbb", "url": watch_b, "title": "Episode B"},
+            ],
+            "My Playlist",
+        )
+
+    monkeypatch.setattr(loader_mod, "_extract_playlist_entries", _fake_entries)
+
+    entries = await _expand_youtube_playlist_to_media_entries(
+        playlist_url, user_id="u", assistant_id="a"
+    )
+
+    playlist_ns = _namespace_safe_formatted_filename(playlist_url)
+    assert [e["namespace_filename"] for e in entries] == [
+        f"{playlist_ns}::{_namespace_safe_formatted_filename(watch_a)}",
+        f"{playlist_ns}::{_namespace_safe_formatted_filename(watch_b)}",
+    ]
+    assert [e["filename"] for e in entries] == [
+        "My Playlist::Episode A",
+        "My Playlist::Episode B",
+    ]
+    for entry, watch, title in (
+        (entries[0], watch_a, "Episode A"),
+        (entries[1], watch_b, "Episode B"),
+    ):
+        assert entry["page_url"] == watch
+        assert entry["playlist_url"] == playlist_url
+        assert entry["playlist_namespace_filename"] == playlist_ns
+        assert entry["playlist_title"] == "My Playlist"
+        assert entry["video_title"] == title
+        assert entry["url_kind"] == "youtube_playlist_entry"
+
+
+@pytest.mark.asyncio
+async def test_expand_non_playlist_url_returns_none(monkeypatch):
+    """A non-playlist URL yields ``None`` so the caller takes the normal path."""
+    from src.api.webapp import _expand_youtube_playlist_to_media_entries
+
+    result = await _expand_youtube_playlist_to_media_entries(
+        "https://www.youtube.com/watch?v=abc123", user_id="u", assistant_id="a"
+    )
+    assert result is None

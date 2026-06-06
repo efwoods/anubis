@@ -809,8 +809,13 @@ def _transcribe_one_segment_path(
     }
 
 
-async def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
-    """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit."""
+def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
+    """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit.
+
+    Fully synchronous (moviepy chunking + the blocking OpenAI speech client +
+    ``time.sleep`` backoff). Callers MUST run it via ``asyncio.to_thread`` so it
+    never blocks the event loop.
+    """
     start_time = time_ns()
     size_bytes = os.path.getsize(path)
     client = _openai_client_for_speech(context)
@@ -883,7 +888,7 @@ async def transcribe_audio(
         path = tmp.name
     try:
         name = Path(filename or f"audio{suffix}").name
-        result = await _transcribe_saved_path(path, name, context)
+        result = await asyncio.to_thread(_transcribe_saved_path, path, name, context)
         result['audio_base64_preprocessed'] = audio_base64
         return result
 
@@ -959,25 +964,32 @@ async def preprocess_audio(
 
         sample_rate: Optional[int] = None
 
-        clip = AudioFileClip(src_path)
-        try:
-            full_duration = float(clip.duration or 0.0)
-            
-            if reference_audio and truncate_only and full_duration > max_seconds:
-                sub = clip.subclipped(0, max_seconds)
-                duration_seconds = max_seconds
-            else:
-                sub = clip
-                duration_seconds = full_duration
+        # moviepy + ffmpeg are fully synchronous and CPU/IO-bound. Run them in a
+        # worker thread so the event loop stays free (otherwise a long encode
+        # blocks every other request — including auth — and starves cancellation).
+        def _convert() -> tuple[float, Optional[int]]:
+            clip = AudioFileClip(src_path)
             try:
-                sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+                full_duration = float(clip.duration or 0.0)
+
+                if reference_audio and truncate_only and full_duration > max_seconds:
+                    sub = clip.subclipped(0, max_seconds)
+                    local_duration = max_seconds
+                else:
+                    sub = clip
+                    local_duration = full_duration
+                try:
+                    sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+                finally:
+                    if sub is not clip:
+                        sub.close()
+                fps = getattr(clip, "fps", None)
+                local_sample_rate = int(fps) if fps else None
             finally:
-                if sub is not clip:
-                    sub.close()
-            fps = getattr(clip, "fps", None)
-            sample_rate = int(fps) if fps else None
-        finally:
-            clip.close()
+                clip.close()
+            return local_duration, local_sample_rate
+
+        duration_seconds, sample_rate = await asyncio.to_thread(_convert)
         # else: # Noise reduction and ENERGY clipping
         #     import librosa
         #     import noisereduce as nr
@@ -1274,7 +1286,9 @@ async def transcribe_video(
     reference_audio: bool = False,
     max_duration_seconds: Optional[float] = 9.0,
 ) -> dict:
-    audio_uri, audio_name = extract_video_audio_b64(video_base64, filename)
+    audio_uri, audio_name = await asyncio.to_thread(
+        extract_video_audio_b64, video_base64, filename
+    )
     return await transcribe_audio(
         audio_uri,
         context,
@@ -1331,6 +1345,11 @@ def _select_dominant_speaker_segments(
             totals[spk] = 0.0
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
+
+    # Only one distinct speaker: there is no "dominant" speaker to isolate, so
+    # signal the caller to fall through to passthrough (use the whole clip).
+    if len(totals) <= 1:
+        return None
 
     target_speaker = sorted(
         first_seen, key=lambda s: (-totals[s], first_seen.index(s))
@@ -1451,85 +1470,93 @@ async def isolate_dominant_speaker_audio_b64(
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_out:
             output_path = tmp_out.name
 
-        clip_for_crop = AudioFileClip(work_path)
-        try:
-            if reference_audio:
-                # Reference clip: single longest contiguous target segment,
-                # capped at reference_audio_clip_max_seconds.
-                longest = max(target_segs, key=lambda s: s["end"] - s["start"])
-                seg_start = float(longest["start"])
-                seg_end = float(longest["end"])
-                if (seg_end - seg_start) > target_clip_max_s:
-                    seg_end = seg_start + target_clip_max_s
-                # Floor the clip at OpenAI's 1.2 s minimum: if the longest
-                # contiguous target segment is too short, widen the window into
-                # the surrounding audio (it still centers on the target) rather
-                # than emit a sub-1.2 s reference the diarizer will reject.
-                clip_total = float(clip_for_crop.duration or 0.0)
-                if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
-                    seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
-                    if (seg_end - seg_start) < _OPENAI_REF_MIN_S:
-                        seg_start = max(0.0, seg_end - _OPENAI_REF_MIN_S)
-                sub = clip_for_crop.subclipped(seg_start, seg_end)
-                try:
-                    sub.write_audiofile(output_path, codec="mp3", logger=None)
-                finally:
-                    sub.close()
-                clip_duration = float(seg_end - seg_start)
-                clip_content = (longest.get("text") or "").strip()
-                logger.info(
-                    "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
-                    longest["end"] - longest["start"],
-                    clip_duration,
-                )
-            else:
-                # Non-reference: concatenate all target segments with short
-                # fades, capturing the full target transcript.
-                from moviepy.audio.AudioClip import concatenate_audioclips
-                from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
-
-                subs = []
-                try:
-                    for seg in target_segs:
-                        seg_dur = seg["end"] - seg["start"]
-                        sub = clip_for_crop.subclipped(seg["start"], seg["end"])
-                        f = min(fade_s, seg_dur / 4)
-                        if f > 0:
-                            sub = sub.with_effects([AudioFadeIn(f), AudioFadeOut(f)])
-                        subs.append(sub)
-                    glued = concatenate_audioclips(subs)
+        # The cropping/concatenation/encode below is all synchronous moviepy +
+        # ffmpeg work. Run it in a worker thread so the event loop stays free
+        # (a long encode here previously blocked auth and other requests, and
+        # prevented cancellation from being serviced).
+        def _produce_clip() -> dict:
+            clip_for_crop = AudioFileClip(work_path)
+            try:
+                if reference_audio:
+                    # Reference clip: single longest contiguous target segment,
+                    # capped at reference_audio_clip_max_seconds.
+                    longest = max(target_segs, key=lambda s: s["end"] - s["start"])
+                    seg_start = float(longest["start"])
+                    seg_end = float(longest["end"])
+                    if (seg_end - seg_start) > target_clip_max_s:
+                        seg_end = seg_start + target_clip_max_s
+                    # Floor the clip at OpenAI's 1.2 s minimum: if the longest
+                    # contiguous target segment is too short, widen the window
+                    # into the surrounding audio (it still centers on the
+                    # target) rather than emit a sub-1.2 s reference the
+                    # diarizer will reject.
+                    clip_total = float(clip_for_crop.duration or 0.0)
+                    if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
+                        seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
+                        if (seg_end - seg_start) < _OPENAI_REF_MIN_S:
+                            seg_start = max(0.0, seg_end - _OPENAI_REF_MIN_S)
+                    sub = clip_for_crop.subclipped(seg_start, seg_end)
                     try:
-                        glued.write_audiofile(output_path, codec="mp3", logger=None)
+                        sub.write_audiofile(output_path, codec="mp3", logger=None)
                     finally:
-                        glued.close()
-                finally:
-                    for s in subs:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                clip_duration = float(target_total)
-                clip_content = " ".join(
-                    (s.get("text") or "").strip() for s in target_segs
-                ).strip()
-                logger.info(
-                    "isolate_dominant_speaker_audio_b64[nonref]: concatenated %d target segments (%.2fs)",
-                    len(target_segs),
-                    target_total,
-                )
-        finally:
-            clip_for_crop.close()
+                        sub.close()
+                    clip_duration = float(seg_end - seg_start)
+                    clip_content = (longest.get("text") or "").strip()
+                    logger.info(
+                        "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
+                        longest["end"] - longest["start"],
+                        clip_duration,
+                    )
+                else:
+                    # Non-reference: concatenate all target segments with short
+                    # fades, capturing the full target transcript.
+                    from moviepy.audio.AudioClip import concatenate_audioclips
+                    from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
 
-        with open(output_path, "rb") as fh:
-            final_audio_b64 = (
-                "data:audio/mp3;base64,"
-                + base64.b64encode(fh.read()).decode("utf-8")
-            )
-        return {
-            "audio_base64_preprocessed": final_audio_b64,
-            "duration": clip_duration,
-            "text": clip_content,
-        }
+                    subs = []
+                    try:
+                        for seg in target_segs:
+                            seg_dur = seg["end"] - seg["start"]
+                            sub = clip_for_crop.subclipped(seg["start"], seg["end"])
+                            f = min(fade_s, seg_dur / 4)
+                            if f > 0:
+                                sub = sub.with_effects([AudioFadeIn(f), AudioFadeOut(f)])
+                            subs.append(sub)
+                        glued = concatenate_audioclips(subs)
+                        try:
+                            glued.write_audiofile(output_path, codec="mp3", logger=None)
+                        finally:
+                            glued.close()
+                    finally:
+                        for s in subs:
+                            try:
+                                s.close()
+                            except Exception:
+                                pass
+                    clip_duration = float(target_total)
+                    clip_content = " ".join(
+                        (s.get("text") or "").strip() for s in target_segs
+                    ).strip()
+                    logger.info(
+                        "isolate_dominant_speaker_audio_b64[nonref]: concatenated %d target segments (%.2fs)",
+                        len(target_segs),
+                        target_total,
+                    )
+            finally:
+                clip_for_crop.close()
+
+            with open(output_path, "rb") as fh:
+                final_audio_b64 = (
+                    "data:audio/mp3;base64,"
+                    + base64.b64encode(fh.read()).decode("utf-8")
+                )
+            return {
+                "audio_base64_preprocessed": final_audio_b64,
+                "duration": clip_duration,
+                "text": clip_content,
+            }
+
+        return await asyncio.to_thread(_produce_clip)
 
     finally:
         for pth in (work_path, output_path):
@@ -1579,14 +1606,20 @@ async def transcribe_audio_diarize(
             temp_upload.flush()
             source_path = temp_upload.name
 
-        video = VideoFileClip(source_path)
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
-                audio_path = temp_audio.name
-            video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
-        finally:
-            video.close()
-            os.unlink(source_path)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+            audio_path = temp_audio.name
+
+        # moviepy/ffmpeg audio extraction is synchronous and CPU/IO-bound; run
+        # it off the event loop so concurrent requests stay responsive.
+        def _extract_audio() -> None:
+            video = VideoFileClip(source_path)
+            try:
+                video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
+            finally:
+                video.close()
+                os.unlink(source_path)
+
+        await asyncio.to_thread(_extract_audio)
 
         with open(audio_path, "rb") as audio_f:
             b64_encoded_reference_audio = (

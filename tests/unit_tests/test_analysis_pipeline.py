@@ -178,7 +178,7 @@ class _FakeStandardizedQuestionModel:
 
 def _patch_standardized(monkeypatch, answered):
     """Stub init_model + shrink the question bank for offline determinism."""
-    import data.standardized_questions as sq
+    import src.anubis.utils.analysis.standardized_questions as sq
 
     monkeypatch.setattr(
         analysis_methods,
@@ -278,6 +278,98 @@ async def test_standardized_question_empty_source_returns_empty(monkeypatch):
 def test_standardized_question_registered_in_scaffold_runners():
     """The analyzer is wired into the modular registry under a stable key."""
     assert "standardized_questions" in analysis_methods.ANALYSIS_SCAFFOLD_RUNNERS
+
+
+# ---------------------------------------------------------------------------
+# Situational context (spec Step 2): per-target analyzers receive the scene
+# summary + the preceding "user" turn instead of analyzing a quote in isolation.
+# ---------------------------------------------------------------------------
+
+
+def test_situational_context_from_doc_combines_scene_and_user():
+    """A target quote doc yields a context block with both scene + user turn."""
+    doc = Document(
+        page_content="I'm supposed to be in Singapore.",
+        metadata={
+            "scene_summary": "Miranda is redirected to Berlin.",
+            "user_context": "Get on it. You're meeting me in Berlin.",
+        },
+    )
+    ctx = analysis_methods._situational_context_from_doc(doc)
+    assert "Miranda is redirected to Berlin." in ctx
+    assert "Get on it. You're meeting me in Berlin." in ctx
+
+
+def test_situational_context_falls_back_to_adapter_prompt():
+    """When user_context is absent, the adapter_prompt (preceding turn) is used."""
+    doc = Document(
+        page_content="Yeah.",
+        metadata={"adapter_prompt": "See that plane?"},
+    )
+    ctx = analysis_methods._situational_context_from_doc(doc)
+    assert "See that plane?" in ctx
+
+
+def test_situational_context_none_for_isolated_doc():
+    """Docs with no scene/user context (e.g. biographical) analyze in isolation."""
+    doc = Document(page_content="A fact.", metadata={"filename": "bio.txt"})
+    assert analysis_methods._situational_context_from_doc(doc) is None
+
+
+def test_format_analysis_input_wraps_and_passthrough():
+    """The wrapper labels context + statement; empty context is passthrough."""
+    from src.anubis.utils.classes.LatentFeatureAnalysisClass import (
+        format_analysis_input_with_context,
+    )
+
+    wrapped = format_analysis_input_with_context("Speaking.", "Scene: a call.")
+    assert "<SITUATIONAL_CONTEXT>" in wrapped
+    assert "Scene: a call." in wrapped
+    assert "<TARGET_STATEMENT>" in wrapped
+    assert "Speaking." in wrapped
+    # No context -> the raw statement is returned unchanged.
+    assert format_analysis_input_with_context("Speaking.", None) == "Speaking."
+    assert format_analysis_input_with_context("Speaking.", "  ") == "Speaking."
+
+
+@pytest.mark.asyncio
+async def test_standardized_question_sees_situational_context(monkeypatch):
+    """The model input is contextualized, but provenance stays the raw statement."""
+    from langchain_core.messages import HumanMessage
+
+    seen = {}
+
+    class _CapturingModel:
+        def __init__(self, response_format):
+            from src.anubis.utils.prompts.psycho_analysis.standardized_question_analysis_prompt import (
+                StandardizedQuestionAnswer,
+            )
+
+            self._schema = StandardizedQuestionAnswer
+
+        async def ainvoke(self, messages):
+            seen["human"] = messages[1].content
+            return self._schema(answer_found=False)
+
+    import src.anubis.utils.analysis.standardized_questions as sq
+
+    monkeypatch.setattr(
+        analysis_methods,
+        "init_model",
+        lambda *a, **k: _CapturingModel(k.get("response_format")),
+    )
+    monkeypatch.setattr(sq, "ALL_STANDARDIZED_QUESTIONS", ["What is your name?"])
+
+    docs = await analysis_methods.perform_standardized_question_analysis(
+        HumanMessage(content="I'm supposed to be in Singapore."),
+        target_name="Miranda",
+        source_metadata={"filename": "scene.wav"},
+        situational_context="Scene: Miranda is redirected to Berlin.",
+    )
+    assert docs == []  # no answer found in this stub
+    # The model saw the wrapped input carrying the scene context...
+    assert "Scene: Miranda is redirected to Berlin." in seen["human"]
+    assert "I'm supposed to be in Singapore." in seen["human"]
 
 
 def test_reduce_docs_appends_dedupes_and_deletes():

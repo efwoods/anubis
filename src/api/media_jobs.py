@@ -24,7 +24,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -338,6 +338,10 @@ async def run_batch_media_job(
     context: Any,
     concurrency: int,
     existing_namespaces: Optional[List[str]] = None,
+    registry: Optional[Dict[str, MediaJob]] = None,
+    deferred_expanders: Optional[
+        List[Callable[[], Awaitable[Optional[List[Dict[str, Any]]]]]]
+    ] = None,
 ) -> None:
     """Orchestrate a batch: one child task per item, one shared concurrency pool.
 
@@ -346,16 +350,77 @@ async def run_batch_media_job(
     every playlist/linktree child expanded inside the graph — draws from one global
     pool of slots. Child tasks run concurrently; the master finishes once all have
     settled (completed, errored, or cancelled). Never raises.
+
+    ``deferred_expanders`` are async callables (e.g. a YouTube playlist enumeration)
+    awaited **here**, off the request path, so the upload endpoint can return ``202``
+    without blocking on ``yt_dlp``. Each one yields per-video ``media_file`` dicts
+    that are turned into fresh child jobs registered under this master (``registry``
+    required) — so every playlist video gets its own progress/cancel id, created
+    asynchronously rather than at request time.
     """
     semaphore = asyncio.Semaphore(max(1, concurrency))
     set_batch_semaphore(master.job_id, semaphore)
     master.started_at = time.time()
     master.status = "running"
     try:
+        items = list(items)
+        # Expand deferred sources (playlists) in the background, minting one child
+        # job per discovered video. Guarded by ``master.cancelled`` so a cancel
+        # that arrives mid-enumeration stops us from spawning more work.
+        if deferred_expanders and registry is not None:
+            for expander in deferred_expanders:
+                if master.cancelled:
+                    break
+                try:
+                    expanded = await expander()
+                except Exception as exc:  # noqa: BLE001 - surface via master stream
+                    logger.exception("Deferred media expansion failed: %s", exc)
+                    add_event(
+                        master,
+                        {
+                            "type": "media_progress",
+                            "stage": "item_error",
+                            "error": f"playlist expansion failed: {exc}",
+                        },
+                    )
+                    continue
+                for media_file in expanded or []:
+                    child = create_child_job(
+                        registry,
+                        user_id=master.user_id,
+                        assistant_id=master.assistant_id,
+                        parent_id=master.job_id,
+                        filename=media_file.get("filename"),
+                        namespace_filename=media_file.get("namespace_filename"),
+                    )
+                    master.child_ids.append(child.job_id)
+                    items.append({"child": child, "media_file": media_file})
+                    add_event(
+                        master,
+                        {
+                            "type": "media_progress",
+                            "stage": "playlist_child_added",
+                            "item_job_id": child.job_id,
+                            "item_filename": child.filename,
+                        },
+                    )
+
         child_tasks: List[asyncio.Task] = []
         for spec in items:
             child: MediaJob = spec["child"]
             media_file: Dict[str, Any] = spec["media_file"]
+            # A cancel may have landed during expansion (children created after the
+            # cancel request weren't in its target set); settle them without running.
+            if master.cancelled:
+                finish_job(
+                    child,
+                    cancelled=True,
+                    result={
+                        "message": "Batch cancelled before item start",
+                        "filename": child.filename,
+                    },
+                )
+                continue
             task = asyncio.create_task(
                 run_single_item_job(
                     child,

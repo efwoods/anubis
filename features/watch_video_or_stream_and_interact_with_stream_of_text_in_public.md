@@ -16,3 +16,6 @@ The messages may be directed at the avatar (mentioned).
 The avatar may ignore a message, respond, to a message, or notify the user to respond to the message (the response preference is stored in the vectorstore and returned)
 The messages are a stream and each message is triaged (do I ignore this message? do I respond to the message? I need to respond to this message and I don't know what to say, notify the user to ask for an edit and respond)
 
+# Live-stream text chat; triage a block of text
+# Mentioned directly is triaged in response
+

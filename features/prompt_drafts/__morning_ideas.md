@@ -70,3 +70,19 @@ allow the process media graph to be used as a tool triggered in conversation
 
 # get reference audio file and reference image file url endpoints
 # CRUD memories/identity_memories endpoints
+
+# I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present; verify that the requester is the creator
+
+
+
+
+# Moving forward
+
+# measure quality
+# create and attach adapters
+# create integrations to social media platforms
+# Create integrations to communications platforms
+# Ambient email agent has information on updating preferences; triaging
+# MCP Server to access data as an integration
+# save transcriptions for parsing from calls or video meetings
+

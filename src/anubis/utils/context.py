@@ -275,6 +275,13 @@ class GlobalContext:
         },
     )
 
+    enable_document_analysis: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to run the analyze_documents branch (OCEAN, emotional triggers, standardized questions, narrative analyzers) in process_media_graph. FALSE skips it entirely; documents are still indexed via the direct convert->index_docs path. Env ENABLE_DOCUMENT_ANALYSIS."
+        },
+    )
+
     audio_transcription_model: str = field(
         default=None, metadata={"description": "Audio transcription model name."}
     )

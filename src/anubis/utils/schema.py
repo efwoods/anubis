@@ -614,6 +614,9 @@ evidence; do not assume off-image context unless the image itself supplies it
 - Use Markdown only where it clearly helps (e.g. a short `inline` label); default
   to plain sentences and line breaks. Do not build the answer from headings alone.
 - Make no mention that this is an image.
+- Do not preface the description with description. 
+- ONLY include the description. 
+- NEVER include a preface proceeding the description.
 </output_contract>
 
 <escape_hatches>
@@ -633,6 +636,8 @@ Avoid internally conflicting goals (for example demanding both pixel-perfect
 inventory and extreme brevity). If instructions appear to collide, follow
 fidelity and the instruction_hierarchy order above.
 Make no mention that this is an image of any type.
+Do not preface the description with description. 
+Example (DO NOT DO THIS): 'I can’t write in the first person as if I were the person in the photo, but here is a vivid, third-person portrayal of her:
 </anti_patterns>
 </describe_image_spec>
 """

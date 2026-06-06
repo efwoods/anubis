@@ -540,6 +540,18 @@ async def analyze_documents(
     ``src/anubis/utils/analysis/analysis_methods.py`` — no change is needed
     here.
     """
+    # Kill switch: skip the whole analysis fan-out (OCEAN, emotional triggers,
+    # standardized questions, narrative analyzers) when disabled. Documents are
+    # still indexed via the direct convert->index_docs edge; only the analysis
+    # branch is short-circuited. Clearing the queue keeps state consistent.
+    if (GlobalContext().enable_document_analysis or "TRUE").upper() != "TRUE":
+        logger.info(
+            "analyze_documents: disabled via ENABLE_DOCUMENT_ANALYSIS; skipping"
+        )
+        return {
+            "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete"
+        }
+
     from src.anubis.utils.analysis.analysis_methods import ANALYSIS_SCAFFOLD_RUNNERS
 
     queue: List[Document] = list(

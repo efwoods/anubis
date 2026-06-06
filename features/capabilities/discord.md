@@ -1,0 +1,1 @@
+https://www.assemblyai.com/blog/build-a-discord-voice-bot-to-add-chatgpt-to-your-voice-channel

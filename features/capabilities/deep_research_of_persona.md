@@ -6,3 +6,5 @@ collect all information about a person and verify the source (Evan Woods or Shiv
 
 or collect all information about a persona (Curie fallout wiki etc. or Jester from the Mighty Nein)
 crawl link trees (ev0ra)
+
+https://docs.langchain.com/oss/python/deepagents/deep-research

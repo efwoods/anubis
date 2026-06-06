@@ -295,6 +295,12 @@ async def _build_identity_documents_from_facts(
     The identity-namespace embed field (``document.kwargs.page_content``) is
     the first-person statement, so retrieval at chat time finds these as
     primary self-knowledge of the avatar.
+
+    Each Document is both ``vectorstore_acceptable`` (stored under ``identity``)
+    and ``analysis_acceptable`` (queued for the analyzer fan-out), so a
+    biographical fact is preserved verbatim as self-knowledge while also driving
+    the latent-feature/OCEAN/emotional-trigger analysis — storage and analysis
+    are maintained side by side rather than being mutually exclusive.
     """
     if not facts:
         return []
@@ -338,7 +344,14 @@ async def _build_identity_documents_from_facts(
                 "namespace": "identity",
                 "vectorstore_acceptable": True,
                 "adapter_acceptable": False,
-                "analysis_acceptable": False,
+                # Biographical facts are stored under ``identity`` AND fed to the
+                # analysis pipeline: the first-person fact is exactly the input
+                # the latent-feature/OCEAN/emotional-trigger analyzers consume to
+                # derive beliefs, values, history, relationships, etc. Storage and
+                # analysis are maintained side by side (the doc lands on both the
+                # vectorstore-index buffer and the analysis queue; analyzer
+                # outputs are separate ``analysis``-namespace Documents).
+                "analysis_acceptable": True,
                 "classified_situation": "biographical_facts",
                 "synthetic": True,
                 "original_statement": original_statement,
@@ -494,6 +507,85 @@ def _build_target_quote_documents_from_dialogue(
     return documents
 
 
+def build_all_speakers_quote_documents(
+    statements: List[Dict[str, Any]],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str],
+    multi_speaker: bool,
+) -> List[Document]:
+    """One verbatim ``quote`` Document per statement when EVERY speaker is the
+    avatar (the ``treat_every_speaker_as_target`` path only).
+
+    This is a standalone builder: it never calls — and is never called by — the
+    standard dialogue/quote/monologue helpers, so it cannot change any behaviour
+    of the normal media-processing pipeline.
+
+    Each statement (a diarized turn) becomes one adapter-eligible ``quote``
+    Document. The synthesized question is decided per statement by
+    :func:`process_adapter_documents` from the ``adapter_prompt`` metadata:
+
+    * ``multi_speaker=True`` (a dialogue): the immediately preceding statement's
+      text is attached as ``adapter_prompt`` so the real prior turn is **reused**
+      as the question (the first statement has no predecessor → ``None`` →
+      synthesized).
+    * ``multi_speaker=False`` (one speaker): no ``adapter_prompt`` is attached,
+      so a question is **generated** for every statement.
+    """
+    item_metadata = media_item.get("metadata", {}) or {}
+    filename = item_metadata.get("filename", "")
+    filename_uuid5 = str(uuid5(NAMESPACE_URL, filename or "unknown"))
+    source = item_metadata.get("source") or filename or "user_upload"
+    current_timestamp = datetime.now(tz=timezone.utc).isoformat()
+
+    valid = [s for s in statements if (s.get("text") or "").strip()]
+    total = len(valid)
+
+    documents: List[Document] = []
+    for idx, seg in enumerate(valid):
+        text = (seg.get("text") or "").strip()
+        adapter_prompt: Optional[str] = None
+        if multi_speaker and idx > 0:
+            adapter_prompt = (valid[idx - 1].get("text") or "").strip() or None
+        documents.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "created_at": current_timestamp,
+                    "processing_task_id": str(uuid4()),
+                    "source": source,
+                    "type": "text",
+                    "chunk_index": idx,
+                    "total_chunks": total,
+                    "filename": filename,
+                    "filename_uuid5": filename_uuid5,
+                    "document_id": str(uuid4()),
+                    "namespace": "quote",
+                    "vectorstore_acceptable": True,
+                    "adapter_acceptable": True,
+                    "adapter_formatted": False,
+                    "analysis_acceptable": True,
+                    "classified_situation": (
+                        "dialogue" if multi_speaker else "monologue"
+                    ),
+                    "synthetic": False,
+                    "speaker": seg.get("speaker"),
+                    "is_target": True,
+                    "target_name": target_name,
+                    "adapter_prompt": adapter_prompt,
+                    "treat_every_speaker_as_target": True,
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                },
+            )
+        )
+    return documents
+
+
 def _build_adapter_dialogue_document(
     dialogue_segments: List[Dict[str, Any]],
     *,
@@ -553,6 +645,104 @@ def _build_adapter_dialogue_document(
     )
 
 
+def _format_dialogue_transcript(segments: List[Dict[str, Any]]) -> str:
+    """Render coalesced turns as ``speaker: text`` lines for whole-scene summary."""
+    lines: List[str] = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = str(seg.get("speaker") or "unknown")
+        lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
+
+
+async def generate_scene_summary(
+    transcript_text: str, *, target_name: Optional[str] = None
+) -> str:
+    """Spec Step 1: ONE structured-output summary of the entire scene.
+
+    Reuses the concise-context-summary model (the same model the fact rewriter
+    uses) over the FULL transcript so each target statement can later be
+    analyzed with the overall situation as situational context. Returns ``""``
+    on empty input or any failure, in which case analysis simply proceeds
+    without the scene context.
+    """
+    text = (transcript_text or "").strip()
+    if not text:
+        return ""
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from src.anubis.utils.classes.FactRewriterClass import (
+            ConciseContextOfTheSourceOfFacts,
+        )
+        from src.anubis.utils.model import init_model
+        from src.anubis.utils.prompts.concise_context_summary_prompt import (
+            CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT,
+        )
+
+        model = init_model(response_format=ConciseContextOfTheSourceOfFacts)
+        response = await model.ainvoke(
+            [
+                SystemMessage(
+                    content=CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT.format(
+                        target_name=target_name
+                    )
+                ),
+                HumanMessage(content=text),
+            ]
+        )
+        return (getattr(response, "concise_context_summary", "") or "").strip()
+    except Exception as exc:
+        logger.warning("Scene summary generation failed: %s", exc)
+        return ""
+
+
+async def _attach_target_analysis_context(
+    target_quote_docs: List[Document], *, scene_summary: str
+) -> None:
+    """Spec Step 2 prep: stamp whole-scene summary + guaranteed user-context.
+
+    Each target quote already carries ``adapter_prompt`` (the preceding
+    non-target turn) when one exists. This adds, in place:
+
+      * ``scene_summary`` — the one whole-scene summary, identical across every
+        target statement in the dialogue.
+      * ``user_context`` — the "user" turn the target statement responds to,
+        used by the per-target analyzers. When the target led the conversation
+        (no preceding non-target turn), a synthetic user statement is generated
+        from the target statement so there is ALWAYS a target statement with a
+        previous user input (per the spec).
+    """
+    if not target_quote_docs:
+        return
+
+    missing = [
+        d
+        for d in target_quote_docs
+        if not (d.metadata.get("adapter_prompt") or "").strip()
+    ]
+    synthetic_iter = iter(())
+    if missing:
+        from src.anubis.utils.dataset.formatting import create_question_list
+
+        synth = await create_question_list(
+            [d.page_content or "" for d in missing]
+        )
+        synthetic_iter = iter(synth)
+
+    for doc in target_quote_docs:
+        if scene_summary:
+            doc.metadata["scene_summary"] = scene_summary
+        real = (doc.metadata.get("adapter_prompt") or "").strip()
+        if real:
+            doc.metadata["user_context"] = real
+        else:
+            doc.metadata["user_context"] = next(synthetic_iter, "")
+            doc.metadata["user_context_synthetic"] = True
+
+
 async def process_dialogue_json_to_documents(
     dialogue_payload: Dict[str, Any],
     *,
@@ -593,17 +783,27 @@ async def process_dialogue_json_to_documents(
 
     documents: List[Document] = []
 
-    # Target turns under ``quote`` (verbatim), each carrying its preceding
-    # non-target turn as ``adapter_prompt``.
-    documents.extend(
-        _build_target_quote_documents_from_dialogue(
-            segments,
-            user_id=user_id,
-            assistant_id=assistant_id,
-            media_item=media_item,
-            target_name=target_name,
-        )
+    # Spec Step 1: summarize the entire scene ONCE so each target statement can
+    # be analyzed with the overall situation as situational context.
+    scene_summary = await generate_scene_summary(
+        _format_dialogue_transcript(segments), target_name=target_name
     )
+
+    # Target turns under ``quote`` (verbatim), each carrying its preceding
+    # non-target turn as ``adapter_prompt``. Spec Step 2 prep: stamp the scene
+    # summary and a guaranteed user-context (synthetic when the target led) onto
+    # each so the per-target analyzers run with that context.
+    target_quote_docs = _build_target_quote_documents_from_dialogue(
+        segments,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        media_item=media_item,
+        target_name=target_name,
+    )
+    await _attach_target_analysis_context(
+        target_quote_docs, scene_summary=scene_summary
+    )
+    documents.extend(target_quote_docs)
 
     # Full role-converted dialogue under ``adapter``.
     adapter_doc = _build_adapter_dialogue_document(

@@ -2,11 +2,12 @@
 
 import asyncio
 from curses import napms
+import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 import logging
 logger = logging.getLogger(__name__)
 import base64
@@ -41,8 +42,19 @@ def _emit_media_progress(stage: str, **fields: Any) -> None:
     except Exception:  # pragma: no cover - progress must never break processing
         pass
 
+
+def _namespace_for(source: str) -> str:
+    """Deterministic store key for a media source.
+
+    Mirrors ``webapp._namespace_safe_formatted_filename`` (uuid5 over NAMESPACE_URL)
+    so child keys computed here line up with the top-level keys the upload endpoint
+    records — required for the skip/dedup set to match.
+    """
+    return str(uuid5(NAMESPACE_URL, source))
+
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
+    build_all_speakers_quote_documents,
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
     process_nontarget_text_to_identity_documents,
@@ -145,6 +157,7 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
+            treat_every_speaker_as_target = file_data.get("treat_every_speaker_as_target", False)
             namespace_filename = file_data.get("namespace_filename")
         
             logger.info(f"Processing file: {filename} ({content_type})")
@@ -195,6 +208,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -220,6 +234,8 @@ async def process_uploaded_files_and_label_media_type(
                         "size": 0,
                         "user_id": user_id,
                         "assistant_id": assistant_id,
+                        "reference_audio": reference_audio,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -231,17 +247,34 @@ async def process_uploaded_files_and_label_media_type(
             page_url_remote = (file_data.get("page_url") or "").strip()
             if page_url_remote:
                 mime = content_type.split(";")[0].strip().lower()
+                url_metadata = {
+                    "filename": filename,
+                    "content_type": mime,
+                    "size": 0,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                    "namespace_filename": namespace_filename,
+                }
+                # Carry playlist context when the upload endpoint expanded a
+                # playlist into one page_url entry per video (each its own child
+                # job). _expand_url_media_item stamps these onto the produced
+                # Documents so /list_avatar_documents groups each video under its
+                # playlist and a whole-playlist delete can target them.
+                for playlist_key in (
+                    "playlist_url",
+                    "playlist_namespace_filename",
+                    "playlist_title",
+                    "video_title",
+                    "url_kind",
+                ):
+                    playlist_value = file_data.get(playlist_key)
+                    if playlist_value is not None:
+                        url_metadata[playlist_key] = playlist_value
                 entry = {
                     "type": "url",
                     "url": page_url_remote,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": mime,
-                        "size": 0,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "namespace_filename": namespace_filename,
-                    },
+                    "metadata": url_metadata,
                 }
                 if full_payload_uri:
                     entry["base64_encoded_str"] = full_payload_uri
@@ -326,8 +359,9 @@ async def process_uploaded_files_and_label_media_type(
                         "content_type": content_type,
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
-                        "assistant_id": assistant_id, 
+                        "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "namespace_filename": namespace_filename
                     }
                 })
@@ -355,6 +389,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "reference_audio": reference_audio,
+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -486,54 +521,39 @@ async def process_uploaded_files_and_label_media_type(
         "media_files": []
     }
 
-
-# Metadata keys only used for queue routing; omitted from ``additional_metadata`` for scaffolds.
-_ANALYSIS_QUEUE_METADATA_KEYS = frozenset(
-    {
-        "analysis_scaffolds",
-        "analysis_job_kind",
-        "analysis_acceptable",
-        "vectorstore_acceptable",
-        "adapter_acceptable",
-    }
-)
-
-
-def _metadata_for_analysis_outputs(doc: Document) -> Dict[str, Any]:
-    return {
-        k: v
-        for k, v in (doc.metadata or {}).items()
-        if k not in _ANALYSIS_QUEUE_METADATA_KEYS
-    }
-
-
-async def _analysis_scaffold_ocean(doc: Document) -> List[Document]:
-    from src.anubis.utils.analysis.analysis_methods import perform_ocean_analysis
-
-    text = (doc.page_content or "").strip()
-    if not text:
-        return []
-    meta = _metadata_for_analysis_outputs(doc)
-    meta.setdefault("vectorstore_acceptable", True)
-    return await perform_ocean_analysis(
-        HumanMessage(content=text),
-        additional_metadata=meta,
-    )
-
-
-# Extend with additional keyed scaffolds (emotion, relational graphs, etc.).
-ANALYSIS_SCAFFOLD_RUNNERS: Dict[str, Any] = {
-    "ocean": _analysis_scaffold_ocean,
-}
-
-
 async def analyze_documents(
     state: GlobalState,
     runtime: Runtime[GlobalContext],
     config: RunnableConfig,
     store: BaseStore,
 ) -> Dict[str, Any]:
-    """Run registered analysis scaffolds on queued documents; merge vector-bound results."""
+    """Fan registered analyzers out over queued docs in parallel; merge results.
+
+    For every ``analysis_acceptable`` Document, run each applicable analyzer
+    from :data:`ANALYSIS_SCAFFOLD_RUNNERS`. The default analyzer set is the
+    full registry; a Document narrows it by listing analyzer keys in
+    ``metadata["analysis_scaffolds"]``. Every analyzer produces
+    ``analysis``-namespace Documents which are merged into the vector-store
+    index batch so ``index_docs`` persists them alongside the source docs.
+
+    To add a feature, register one analyzer in
+    ``src/anubis/utils/analysis/analysis_methods.py`` — no change is needed
+    here.
+    """
+    # Kill switch: skip the whole analysis fan-out (OCEAN, emotional triggers,
+    # standardized questions, narrative analyzers) when disabled. Documents are
+    # still indexed via the direct convert->index_docs edge; only the analysis
+    # branch is short-circuited. Clearing the queue keeps state consistent.
+    if (GlobalContext().enable_document_analysis or "TRUE").upper() != "TRUE":
+        logger.info(
+            "analyze_documents: disabled via ENABLE_DOCUMENT_ANALYSIS; skipping"
+        )
+        return {
+            "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete"
+        }
+
+    from src.anubis.utils.analysis.analysis_methods import ANALYSIS_SCAFFOLD_RUNNERS
+
     queue: List[Document] = list(
         state.get(
             "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant",
@@ -544,37 +564,62 @@ async def analyze_documents(
         logger.info("analyze_documents: empty queue; skipping")
         return {}
 
-    out: List[Document] = []
+    # Build (label, coroutine) pairs across docs × analyzers, then run them all
+    # concurrently in a single gather.
+    labels: List[str] = []
+    coros = []
     for doc in queue:
-        scaffolds = doc.metadata.get("analysis_scaffolds")
-        if not scaffolds:
-            scaffolds = ["ocean"]
+        scaffolds = doc.metadata.get("analysis_scaffolds") or list(
+            ANALYSIS_SCAFFOLD_RUNNERS.keys()
+        )
         for name in scaffolds:
             runner = ANALYSIS_SCAFFOLD_RUNNERS.get(name)
             if runner is None:
                 logger.warning(
-                    "analyze_documents: unknown scaffold %r (filename=%s); skipping",
+                    "analyze_documents: unknown analyzer %r (filename=%s); skipping",
                     name,
                     doc.metadata.get("filename", ""),
                 )
                 continue
-            try:
-                produced = await runner(doc)
-                if produced:
-                    out.extend(produced)
-            except Exception as exc:
-                logger.warning(
-                    "analyze_documents: scaffold %r failed: %s; continuing",
-                    name,
-                    exc,
-                )
+            labels.append(name)
+            coros.append(runner(doc))
 
-    existing_vs: List[Document] = list(
-        state.get("vectorstore_documents_to_be_indexed") or []
-    )
+    analyzed_documents: List[Document] = []
+    if coros:
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for name, result in zip(labels, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "analyze_documents: analyzer %r failed: %s; continuing",
+                    name,
+                    result,
+                )
+                continue
+            if result:
+                analyzed_documents.extend(result)
+
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _adl(
+            "analyze_documents:return",
+            {
+                "queue_len": len(queue),
+                "analyzed_documents_len": len(analyzed_documents),
+                "sample_doc_id": (
+                    (analyzed_documents[0].metadata or {}).get("document_id")
+                    if analyzed_documents else None
+                ),
+            },
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
+
     return {
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete",
-        "vectorstore_documents_to_be_indexed": existing_vs + out,
+        "vectorstore_documents_to_be_indexed": analyzed_documents,
     }
 
 
@@ -611,14 +656,64 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
             "media_list": []
         }
 
-    logger.info(f"Processing {len(media_list)} media items")
-    total_items = len(media_list)
-    _emit_media_progress("converting_started", total=total_items)
+    # namespace_filename values already indexed for this avatar. Items whose key
+    # is present are skipped (top-level here; expanded playlist/linktree children
+    # inside _expand_url_media_item) so a re-upload doesn't reprocess hundreds of
+    # already-stored files. Populated by the upload endpoint.
+    existing_namespaces: set = set(state.get("existing_namespaces") or [])
 
-    # Create tasks for parallel processing
-    all_documents: list = []
-    processing_errors: list[str] = []
-    for index, media_item in enumerate(media_list):
+    # Drop top-level items already indexed before doing any work.
+    to_process: list = []
+    for media_item in media_list:
+        ns = (media_item.get("metadata", {}) or {}).get("namespace_filename")
+        if ns and ns in existing_namespaces:
+            _emit_media_progress(
+                "skipped_existing",
+                filename=(media_item.get("metadata", {}) or {}).get("filename"),
+                namespace_filename=ns,
+            )
+            continue
+        to_process.append(media_item)
+
+    skipped_count = len(media_list) - len(to_process)
+    total_items = len(to_process)
+    logger.info(
+        "Processing %d media items (%d skipped as already indexed)",
+        total_items,
+        skipped_count,
+    )
+    _emit_media_progress("converting_started", total=total_items, skipped=skipped_count)
+
+    # Per-item / batch identity passed by the upload orchestrator. Stamped onto
+    # every produced Document below so a per-item or batch cancel can delete
+    # exactly the rows this run wrote (including expanded playlist children).
+    try:
+        configurable = (config or {}).get("configurable", {}) or {}
+    except Exception:
+        configurable = {}
+    item_job_id = configurable.get("item_job_id")
+    master_job_id = configurable.get("master_job_id")
+
+    # Bound how many items convert in parallel (OpenAI diarization / yt_dlp /
+    # web fetches) so a big playlist or batch upload can't exhaust rate limits or
+    # memory. The same semaphore is threaded through URL expansion so the cap is
+    # global across the whole recursion. When part of a batch, reuse the batch's
+    # shared limiter (registered by run_batch_media_job, keyed by master_job_id) so
+    # every item — and every playlist child — draws from one global pool of slots
+    # instead of N independent per-item pools. See media_processing_concurrency.
+    concurrency = max(1, GlobalContext().media_processing_concurrency)
+    semaphore = None
+    if master_job_id:
+        try:
+            from src.api.media_jobs import get_batch_semaphore
+
+            semaphore = get_batch_semaphore(master_job_id)
+        except Exception:  # pragma: no cover - registry import must never break work
+            semaphore = None
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(concurrency)
+
+    async def _convert_one(index: int, media_item: Dict[str, Any]) -> List[Document]:
         _emit_media_progress(
             "converting",
             current=index + 1,
@@ -626,24 +721,71 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
             filename=media_item.get("metadata", {}).get("filename")
             or media_item.get("filename"),
         )
-        docs = await process_media_item_task(media_item, runtime, config, store)
+        try:
+            return await process_media_item_task(
+                media_item,
+                runtime,
+                config,
+                store,
+                existing_namespaces=existing_namespaces,
+                semaphore=semaphore,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad item must not abort the batch
+            logger.exception("Media item processing crashed: %s", exc)
+            return [
+                Document(
+                    page_content=f"[Error processing media: {exc}]",
+                    metadata={
+                        "status": "error",
+                        "error": str(exc),
+                        "filename": media_item.get("metadata", {}).get("filename"),
+                    },
+                )
+            ]
 
+    # Process every item in parallel; collect results and per-item errors without
+    # aborting the batch (partial success — one failed video shouldn't sink a
+    # 300-item playlist). Errors are surfaced as media_progress events + summary.
+    all_documents: list = []
+    processing_errors: list[str] = []
+    results = await asyncio.gather(
+        *(_convert_one(i, item) for i, item in enumerate(to_process))
+    )
+    for docs in results:
         for doc in docs:
             status = doc.metadata.get("status", "")
             if status == "error":
                 error = doc.metadata.get("error", "")
                 filename = doc.metadata.get("filename", "")
                 processing_errors.append(f"{filename}: {error or 'unknown'}")
-                logger.warning(
-                    "Error processing media: %s %s", filename, error
+                logger.warning("Error processing media: %s %s", filename, error)
+                _emit_media_progress(
+                    "item_error", filename=filename, error=error or "unknown"
                 )
             else:
                 all_documents.append(doc)
 
-    if processing_errors:
-        raise RuntimeError(
-            "Media processing failed: " + "; ".join(processing_errors)
-        )
+    _emit_media_progress(
+        "converting_complete",
+        total=total_items,
+        skipped=skipped_count,
+        errors=len(processing_errors),
+        indexed=len(all_documents),
+    )
+
+    # Stamp batch/item identity onto every produced Document so it is persisted
+    # under value.document.kwargs.metadata at index time — this is the key a
+    # per-item or batch cancel deletes by (covers playlist children, whose
+    # namespace_filename differs from the top-level item's).
+    if item_job_id or master_job_id:
+        for doc in all_documents:
+            try:
+                if item_job_id:
+                    doc.metadata["item_job_id"] = item_job_id
+                if master_job_id:
+                    doc.metadata["master_job_id"] = master_job_id
+            except Exception:  # pragma: no cover - metadata must never break work
+                pass
 
     # Identify Vector Store formatted documents
     # NOTE This contains only information from the target speaker or about the target speaker
@@ -664,6 +806,26 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
 
     adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("adapter_acceptable", False) == True]
 
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _adl(
+            "convert_media_list_to_text_document:return",
+            {
+                "vectorstore_len": len(vector_store_document_list_formatted),
+                "analysis_len": len(analysis_document_list_formatted),
+                "adapter_len": len(adapter_document_list_formatted),
+                "sample_vs_doc_id": (
+                    (vector_store_document_list_formatted[0].metadata or {}).get("document_id")
+                    if vector_store_document_list_formatted else None
+                ),
+            },
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
+
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": analysis_document_list_formatted,
@@ -672,13 +834,25 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     }
 
 async def process_media_item_task(
-    media_item: Dict[str, Any], 
-    runtime: Runtime[GlobalContext], 
+    media_item: Dict[str, Any],
+    runtime: Runtime[GlobalContext],
     config: RunnableConfig,
-    store: BaseStore
+    store: BaseStore,
+    *,
+    existing_namespaces: Optional[set] = None,
+    semaphore: Optional["asyncio.Semaphore"] = None,
 ) -> List[Document]:
-    """Task: Convert a single media item to a list of Documents"""
-    
+    """Task: Convert a single media item to a list of Documents.
+
+    ``existing_namespaces`` / ``semaphore`` thread the skip-set and the global
+    concurrency limit through the recursion (URL items expand into children that
+    re-enter this function). URL items are expansion *coordinators*: they must not
+    hold a semaphore slot while awaiting their children, or the bounded pool would
+    deadlock — so they are delegated to ``_expand_url_media_item`` which takes a
+    slot only around the heavy ``loader.load()`` call. Every other (leaf) media
+    type holds a slot for the duration of its conversion work below.
+    """
+
     logger.info(f"process_media_item_task entry")
 
     media_type = media_item.get("type", "")
@@ -697,6 +871,29 @@ async def process_media_item_task(
     if not namespace_filename:
         raise Exception(f"namespace_filename is required for media item: {media_item}")
 
+    # URL items expand into children and must not hold a concurrency slot while
+    # awaiting them (see docstring). Delegate before taking the leaf semaphore.
+    if media_type == "url":
+        return await _expand_url_media_item(
+            media_item,
+            runtime,
+            config,
+            store,
+            url=(media_item.get("url") or "").strip(),
+            filename=filename,
+            namespace_filename=namespace_filename,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            existing_namespaces=existing_namespaces,
+            semaphore=semaphore,
+        )
+
+    # Leaf media types: hold a concurrency slot for the duration of the (heavy)
+    # conversion so a large batch/playlist can't fan out unboundedly.
+    leaf_acquired = False
+    if semaphore is not None:
+        await semaphore.acquire()
+        leaf_acquired = True
     try:
         if media_type in ("image", "image_url"):
             reference_image = metadata.get("reference_image", False)
@@ -1028,72 +1225,10 @@ async def process_media_item_task(
                             final_documents.append(document)
 
             return final_documents
-        # Handle URLs - YouTube subs/audio, articles, tweets, linktrees.
-        elif media_type == "url":
-            url = (media_item.get("url") or "").strip()
-            if not url:
-                return [
-                    Document(
-                        page_content="[Empty URL]",
-                        metadata={
-                            "type": "url",
-                            "status": "error",
-                            "error": "empty_url",
-                            "filename": filename,
-                            "namespace_filename": namespace_filename,
-                        },
-                    )
-                ]
-            loader = URLDocumentLoaderClass()
-            expanded_items = await loader.load(
-                url,
-                user_id=user_id,
-                assistant_id=assistant_id,
-            )
-            if not expanded_items:
-                return [
-                    Document(
-                        page_content=f"[URL produced no content: {url}]",
-                        metadata={
-                            "type": "url",
-                            "status": "error",
-                            "error": "url_no_content",
-                            "filename": filename,
-                        },
-                    )
-                ]
-            collected: List[Document] = []
-            total_children = len(expanded_items)
-            _emit_media_progress("expanding", url=url, total=total_children)
-            for child_index, item in enumerate(expanded_items):
-                # Each expanded item already has user_id / assistant_id baked
-                # into its metadata; recurse into the same task. Linktree
-                # children and YouTube playlist entries come back as
-                # ``type="url"`` so they pass back through this branch.
-                _emit_media_progress(
-                    "converting_child",
-                    current=child_index + 1,
-                    total=total_children,
-                    filename=item.get("metadata", {}).get("filename") or url,
-                )
-                try:
-                    item["metadata"]["namespace_filename"] = namespace_filename
-                    child_docs = await process_media_item_task(
-                        item, runtime, config, store
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "URL child item processing failed for %s: %s",
-                        item.get("metadata", {}).get("filename") or url,
-                        exc,
-                    )
-                    continue
-                if isinstance(child_docs, list):
-                    collected.extend(child_docs)
-                elif child_docs is not None:
-                    collected.append(child_docs)
-            return collected
-        
+        # NOTE: ``type == "url"`` is handled before the leaf semaphore guard by
+        # _expand_url_media_item (see the early return at the top of this
+        # function) so it never reaches this branch chain.
+
         elif media_type == "pdf":
             """Extract text from each PDF page and route it through process_text_to_document
             so reference + content situation classifiers decide the namespace per page."""
@@ -1118,7 +1253,9 @@ async def process_media_item_task(
                 tmp_path = tmp_file.name
             try:
                 loader = PyPDFLoader(tmp_path)
-                pages = loader.load()
+                # PyPDFLoader.load() is synchronous and pypdf parsing is
+                # CPU-bound; offload so the event loop isn't blocked.
+                pages = await asyncio.to_thread(loader.load)
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -1166,7 +1303,11 @@ async def process_media_item_task(
             "reference_audio")`` so the next non-reference upload can use it.
             """
             reference_audio = metadata.get("reference_audio", False)
-            if not reference_audio:
+            # Batch-wide "no single target": every detected speaker is the avatar.
+            # Diarization still runs, but no stored reference clip is required and
+            # known-speaker labelling is skipped (every turn is forced is_target).
+            treat_every_speaker_as_target = bool(metadata.get("treat_every_speaker_as_target", False))
+            if not reference_audio and not treat_every_speaker_as_target:
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
                 if not ref_item and not reference_audio:
@@ -1237,8 +1378,8 @@ async def process_media_item_task(
                 # target-only track. Video first extracts the audio track so both
                 # branches share the same code path.
                 if media_type == "video":
-                    audio_uri, audio_name = extract_video_audio_b64(
-                        payload_uri, filename
+                    audio_uri, audio_name = await asyncio.to_thread(
+                        extract_video_audio_b64, payload_uri, filename
                     )
                 else:
                     audio_uri = payload_uri
@@ -1336,16 +1477,17 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
-            try:
-                ref_item = await store.aget(
-                    (user_id, assistant_id, "reference_audio"), assistant_id
-                )
-                if ref_item is not None:
-                    encoded_reference_audio = (
-                        getattr(ref_item, "value", {}) or {}
-                    ).get("reference_audio_data") or None
-            except Exception as exc:
-                logger.debug("Reference audio lookup failed (continuing): %s", exc)
+            if not treat_every_speaker_as_target:
+                try:
+                    ref_item = await store.aget(
+                        (user_id, assistant_id, "reference_audio"), assistant_id
+                    )
+                    if ref_item is not None:
+                        encoded_reference_audio = (
+                            getattr(ref_item, "value", {}) or {}
+                        ).get("reference_audio_data") or None
+                except Exception as exc:
+                    logger.debug("Reference audio lookup failed (continuing): %s", exc)
 
             if not payload_uri:
                 # URL-only path - the upload pipeline currently base64-encodes
@@ -1392,6 +1534,167 @@ async def process_media_item_task(
             target_speaker_label = (
                 runtime.context.audio_diarization_known_speaker_name or "avatar"
             )
+
+            # ---------------------------------------------------------------
+            # treat_every_speaker_as_target: no single target speaker, so EVERY detected
+            # speaker is the avatar. Routed only through standalone helpers / the
+            # normal text classifier so the established dialogue path is never
+            # touched. This branch returns early.
+            #
+            #   * MULTIPLE speakers -> one adapter-eligible ``quote`` Document per
+            #     statement, each reusing the PRECEDING statement as its genuine
+            #     question (``adapter_prompt``); the first statement has no
+            #     predecessor so a question is synthesized for it downstream.
+            #   * a SINGLE speaker -> a monologue: classified normally (monologue
+            #     / tweets_or_quotes) via process_text_to_document, which already
+            #     stores it in the vectorstore, marks it analysis-acceptable, and
+            #     makes it adapter-acceptable with a synthesized prompt.
+            # ---------------------------------------------------------------
+            if treat_every_speaker_as_target:
+                statements: List[Dict[str, Any]] = []
+                for seg in (diar_response or {}).get("segments") or []:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_text = (seg.get("text") or "").strip()
+                    if not seg_text:
+                        continue
+                    statements.append(
+                        {
+                            "speaker": str(seg.get("speaker") or "unknown"),
+                            "text": seg_text,
+                            "start": seg.get("start"),
+                            "end": seg.get("end"),
+                            "is_target": True,
+                        }
+                    )
+
+                if not statements:
+                    # Diarization yielded no usable segments — fall back to a
+                    # plain transcription pass and treat it as one statement.
+                    try:
+                        plain = await transcribe_audio(
+                            audio_base64=payload_uri,
+                            context=runtime.context,
+                            filename=filename,
+                        )
+                        plain_text = (plain.get("text") or "").strip()
+                    except Exception as e:
+                        logger.exception(
+                            "treat_every_speaker_as_target transcription failed for %s: %s",
+                            filename,
+                            e,
+                        )
+                        all_documents.append(
+                            Document(
+                                page_content=f"[{media_type.capitalize()} transcription failed: {e}]",
+                                metadata={
+                                    "user_id": user_id,
+                                    "assistant_id": assistant_id,
+                                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                                    "type": media_type,
+                                    "filename": filename,
+                                    "vectorstore_acceptable": False,
+                                    "status": "error",
+                                    "error": f"transcription_failed: {e}",
+                                    "namespace_filename": namespace_filename,
+                                },
+                            )
+                        )
+                        return all_documents
+                    if plain_text:
+                        statements = [
+                            {
+                                "speaker": "unknown",
+                                "text": plain_text,
+                                "start": None,
+                                "end": None,
+                                "is_target": True,
+                            }
+                        ]
+
+                if not statements:
+                    all_documents.append(
+                        Document(
+                            page_content=f"[{media_type.capitalize()} transcription unavailable]",
+                            metadata={
+                                "user_id": user_id,
+                                "assistant_id": assistant_id,
+                                "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                                "type": media_type,
+                                "filename": filename,
+                                "vectorstore_acceptable": False,
+                                "status": "transcription_unavailable",
+                                "namespace_filename": namespace_filename,
+                            },
+                        )
+                    )
+                    return all_documents
+
+                source_label = (
+                    metadata.get("source")
+                    or filename
+                    or f"{media_type}_transcription"
+                )
+                multi_speaker = len({s["speaker"] for s in statements}) > 1
+
+                if multi_speaker:
+                    # Speaker-coalesce into alternating turns so each turn's
+                    # predecessor is a clean, genuine question, then build one
+                    # quote Q&A Document per statement (each reusing the preceding
+                    # statement as its question; the first is synthesized
+                    # downstream). No monologue is created for multi-speaker
+                    # content — a monologue is the single-speaker case below.
+                    turns = coalesce_segments_by_speaker(statements)
+                    quote_media_item = {
+                        "metadata": {"filename": filename, "source": source_label}
+                    }
+                    quote_documents = build_all_speakers_quote_documents(
+                        turns,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        media_item=quote_media_item,
+                        target_name=target_speaker_label,
+                        multi_speaker=True,
+                    )
+                    for d in quote_documents:
+                        d.metadata.setdefault("audio_filename", filename)
+                        d.metadata["namespace_filename"] = namespace_filename
+                    all_documents.extend(quote_documents)
+                    return all_documents
+
+                # Single speaker -> a monologue: classify normally (monologue /
+                # tweets_or_quotes) over the full transcript, exactly like any
+                # other single-speaker target text. That path already stores the
+                # content in the vectorstore, marks it analysis-acceptable, and
+                # makes it adapter-acceptable (a synthetic prompt is generated
+                # downstream) — no custom handling needed here.
+                full_text = "\n".join(
+                    (s.get("text") or "").strip()
+                    for s in statements
+                    if (s.get("text") or "").strip()
+                ).strip()
+                single_media_item = {
+                    "type": "text",
+                    "content": full_text,
+                    "metadata": {
+                        "filename": filename,
+                        "user_id": user_id,
+                        "assistant_id": assistant_id,
+                        "source": source_label,
+                        "namespace_filename": namespace_filename,
+                    },
+                }
+                documents = await process_text_to_document(
+                    metadata=single_media_item["metadata"],
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=single_media_item,
+                )
+                for d in documents:
+                    d.metadata.setdefault("audio_filename", filename)
+                    d.metadata["namespace_filename"] = namespace_filename
+                all_documents.extend(documents)
+                return all_documents
 
             # ---------------------------------------------------------------
             # Normalize diarizer segments, then coalesce consecutive
@@ -1548,12 +1851,38 @@ async def process_media_item_task(
                 )
                 fallback_text = (fallback.get("text") or "").strip()
             except Exception as e:
+                # A transcription API failure is a REAL error, not "no speech".
+                # Surfacing it as status="error" makes convert_media_list_to_text_document
+                # count it in items_error, emit an item_error progress event, and
+                # report the file in failed_to_index_files for reprocessing —
+                # instead of silently reporting the upload as completed. Transient
+                # failures were already retried with backoff in _speech_call_with_retry;
+                # reaching here means retries were exhausted or the error is permanent
+                # (e.g. insufficient_quota), so the user must see it.
                 logger.exception(
                     "Fallback transcription failed for %s: %s", filename, e
                 )
-                fallback_text = ""
+                all_documents.append(
+                    Document(
+                        page_content=f"[{media_type.capitalize()} transcription failed: {e}]",
+                        metadata={
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                            "type": media_type,
+                            "filename": filename,
+                            "vectorstore_acceptable": False,
+                            "status": "error",
+                            "error": f"transcription_failed: {e}",
+                            "namespace_filename": namespace_filename,
+                        },
+                    )
+                )
+                return all_documents
 
             if not fallback_text:
+                # Transcription SUCCEEDED but produced no text (genuinely silent /
+                # speechless audio). This is not an error — record it as such.
                 all_documents.append(
                     Document(
                         page_content=f"[{media_type.capitalize()} transcription unavailable]",
@@ -1628,6 +1957,183 @@ async def process_media_item_task(
             metadata={"type": media_type, "status": "error", "error": str(e)}
         )]
         return documents
+    finally:
+        if leaf_acquired:
+            semaphore.release()
+
+
+async def _expand_url_media_item(
+    media_item: Dict[str, Any],
+    runtime: Runtime[GlobalContext],
+    config: RunnableConfig,
+    store: BaseStore,
+    *,
+    url: str,
+    filename: str,
+    namespace_filename: str,
+    user_id: str,
+    assistant_id: str,
+    existing_namespaces: Optional[set] = None,
+    semaphore: Optional["asyncio.Semaphore"] = None,
+) -> List[Document]:
+    """Expand a ``type="url"`` item (YouTube subs/audio, playlist, article, tweet,
+    linktree) into Documents.
+
+    Concurrency contract: a semaphore slot is held only around the heavy
+    ``loader.load()`` call, never while awaiting the recursive children — children
+    take their own slots, so the bounded pool can't deadlock. Each child carries
+    its own ``namespace_filename`` (playlist entries: a uuid5 over
+    ``{playlist_ns}::{video_ns}``, linktree: the child href); ones already present
+    in ``existing_namespaces`` are
+    skipped so a re-upload doesn't reprocess hundreds of indexed items.
+    """
+    if not url:
+        return [
+            Document(
+                page_content="[Empty URL]",
+                metadata={
+                    "type": "url",
+                    "status": "error",
+                    "error": "empty_url",
+                    "filename": filename,
+                    "namespace_filename": namespace_filename,
+                },
+            )
+        ]
+
+    # Batch-wide "no single target": every detected speaker is the avatar. This
+    # forces the YouTube loader past its subtitles fast-path onto the audio +
+    # diarization path so the avatar's voice is actually transcribed (subtitles
+    # carry no speaker turns), and is inherited by every expanded child below.
+    parent_treat_every_speaker_as_target = bool(
+        (media_item.get("metadata") or {}).get("treat_every_speaker_as_target")
+    )
+
+    loader = URLDocumentLoaderClass()
+    if semaphore is not None:
+        async with semaphore:
+            expanded_items = await loader.load(
+                url,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                expect_multispeaker=parent_treat_every_speaker_as_target,
+            )
+    else:
+        expanded_items = await loader.load(
+            url,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            expect_multispeaker=parent_treat_every_speaker_as_target,
+        )
+
+    if not expanded_items:
+        return [
+            Document(
+                page_content=f"[URL produced no content: {url}]",
+                metadata={
+                    "type": "url",
+                    "status": "error",
+                    "error": "url_no_content",
+                    "filename": filename,
+                },
+            )
+        ]
+
+    existing = existing_namespaces or set()
+    total_children = len(expanded_items)
+    _emit_media_progress("expanding", url=url, total=total_children)
+
+    # Resolve each child's namespace_filename, then drop ones already indexed.
+    # Children (e.g. playlist videos) inherit the parent URL item's batch-wide
+    # "no single target" flag so every expanded video is diarized with every
+    # speaker treated as the target.
+    pending: List[Dict[str, Any]] = []
+    for item in expanded_items:
+        child_meta = item.setdefault("metadata", {})
+        if parent_treat_every_speaker_as_target:
+            child_meta.setdefault("treat_every_speaker_as_target", True)
+        child_ns = child_meta.get("namespace_filename")
+        if not child_ns:
+            # A keyless child is the single logical content of THIS url item
+            # (e.g. a video's subtitles or audio). Inherit the parent item's
+            # namespace_filename so the content lands under the SAME key as the
+            # item. This is what preserves a playlist entry's key (a uuid5 over
+            # ``{playlist_ns}::{video_ns}``): deriving a fresh key from the
+            # child's own URL here would collapse it to a video-only key and
+            # lose the playlist grouping. For a standalone video/article the
+            # parent key already equals the per-source key, so this is a no-op.
+            child_ns = namespace_filename
+            child_meta["namespace_filename"] = child_ns
+        if child_ns in existing:
+            _emit_media_progress(
+                "skipped_existing",
+                filename=child_meta.get("filename") or url,
+                namespace_filename=child_ns,
+            )
+            continue
+        pending.append(item)
+
+    if not pending:
+        return []
+
+    async def _run_child(child_index: int, item: Dict[str, Any]) -> List[Document]:
+        _emit_media_progress(
+            "converting_child",
+            current=child_index + 1,
+            total=len(pending),
+            filename=item.get("metadata", {}).get("filename") or url,
+        )
+        try:
+            return await process_media_item_task(
+                item,
+                runtime,
+                config,
+                store,
+                existing_namespaces=existing_namespaces,
+                semaphore=semaphore,
+            )
+        except Exception as exc:
+            logger.exception(
+                "URL child item processing failed for %s: %s",
+                item.get("metadata", {}).get("filename") or url,
+                exc,
+            )
+            return []
+
+    results = await asyncio.gather(
+        *(_run_child(i, item) for i, item in enumerate(pending))
+    )
+    collected: List[Document] = []
+    for child_docs in results:
+        if isinstance(child_docs, list):
+            collected.extend(child_docs)
+        elif child_docs is not None:
+            collected.append(child_docs)
+
+    # Propagate playlist context onto the produced Documents so the listing can
+    # group videos under their playlist and the delete endpoint can target a
+    # whole playlist. Only stamp when THIS item carries playlist context (i.e.
+    # it is a playlist entry being expanded into its subs/audio content) and
+    # never overwrite a child's own namespace_filename (already the uuid5 over
+    # ``{playlist_ns}::{video_ns}`` inherited above).
+    item_meta = media_item.get("metadata", {}) or {}
+    if item_meta.get("playlist_url"):
+        playlist_fields = {
+            key: item_meta[key]
+            for key in (
+                "playlist_url",
+                "playlist_namespace_filename",
+                "playlist_title",
+                "video_title",
+            )
+            if item_meta.get(key) is not None
+        }
+        for doc in collected:
+            if isinstance(getattr(doc, "metadata", None), dict):
+                for key, value in playlist_fields.items():
+                    doc.metadata.setdefault(key, value)
+    return collected
+
 
 async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
     
@@ -1880,8 +2386,10 @@ async def process_adapter_documents(
             langsmith_jsonl,
         )
 
+    # Clear the adapter buffer of what we just processed (append-reducer
+    # semantics: an empty list would leave processed docs queued).
     return {
-        "documents_to_be_processed_for_adapter_training": [],
+        "documents_to_be_processed_for_adapter_training": "delete",
     }
 
 

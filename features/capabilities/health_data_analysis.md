@@ -9,3 +9,4 @@ https://docs.langchain.com/oss/python/deepagents/data-analysis
 
 https://docs.langchain.com/oss/python/deepagents/data-analysis
 
+https://docs.langchain.com/oss/python/langchain/deep-agent-from-scratch#build-a-data-analysis-agent-from-scratch

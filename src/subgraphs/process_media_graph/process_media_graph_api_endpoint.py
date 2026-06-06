@@ -41,14 +41,17 @@ workflow.add_node("build_stylistic_fingerprint", build_stylistic_fingerprint)
 workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
 
-# After classification: adapter rows and full-text analysis feed the vector store;
-# analysis runs before indexing so trait Documents merge into the same index batch.
-# workflow.add_edge("convert_media_list_to_text_document", "analyze_documents")
-workflow.add_edge("convert_media_list_to_text_document", "index_docs")
+
+workflow.add_edge("convert_media_list_to_text_document", "index_docs") # Send vectorstore_documents_to_be_indexed to index_docs
+
+# After classification: analysis runs before indexing so latent-trait Documents
+# (analysis namespace) merge into the same vector-store index batch as the
+# source documents.
+
+workflow.add_edge("convert_media_list_to_text_document", "analyze_documents") # analyze analysis_acceptable documents
+workflow.add_edge("analyze_documents", "index_docs") # Send analysis_documents to index_docs
 
 # workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
-
-# workflow.add_edge("analyze_documents", "index_docs")
 
 # workflow.add_edge("index_docs", "build_stylistic_fingerprint")
 

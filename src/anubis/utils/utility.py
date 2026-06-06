@@ -28,8 +28,10 @@ from typing import Optional
 
 import asyncio
 import math
+import random
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from moviepy import AudioFileClip, VideoFileClip
 from time import time_ns
@@ -152,6 +154,64 @@ from typing import Union, Any, Literal
 
 from langgraph.store.base import SearchItem, Item
 
+# region agent log
+def _agent_debug_log(message: str, data: dict | None = None, hypothesis_id: str = "") -> None:
+    """Append one NDJSON line to the debug session log.
+
+    Picks the in-container bind-mount path when present, falls back to the
+    host workspace path otherwise. Best-effort: any failure is silently
+    swallowed so instrumentation never affects production behavior.
+    """
+    try:
+        import json as _json
+        import os as _os
+        import time as _time
+        _container_path = "/deps/anubis/.cursor/debug-aaf3d3.log"
+        _host_path = "/home/user/gh/anubis-project/wt/f-psycho-analysis/.cursor/debug-aaf3d3.log"
+        _path = _container_path if _os.path.isdir("/deps/anubis/.cursor") else _host_path
+        _payload = {
+            "sessionId": "aaf3d3",
+            "timestamp": int(_time.time() * 1000),
+            "location": "src/anubis/utils/utility.py",
+            "message": message,
+            "data": data or {},
+            "hypothesisId": hypothesis_id,
+        }
+        with open(_path, "a") as _f:
+            _f.write(_json.dumps(_payload, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
+
+
+def _doc_dedup_key(doc: Document) -> str:
+    """Return a stable identity key for de-duplicating a Document in the buffer.
+
+    Prefers the explicit ``document_id`` / top-level ``id`` so re-emitting the
+    same cached doc (e.g. ``load_consciousness`` returning its identity lists on
+    every tool-loop iteration) is idempotent; falls back to ``page_content`` for
+    docs that carry no stable id.
+    """
+    meta = getattr(doc, "metadata", None) or {}
+    return str(
+        getattr(doc, "id", None)
+        or meta.get("document_id")
+        or meta.get("id")
+        or doc.page_content
+    )
+
+
+def remove_docs_update(docs: Sequence[Document]) -> dict[str, Any]:
+    """Build a :func:`reduce_docs` instruction that removes exactly ``docs``.
+
+    A consumer (e.g. ``index_docs``) returns this instead of the blunt
+    ``"delete"`` so it clears only the documents it actually processed, leaving
+    un-processed docs — including any appended concurrently in the same
+    superstep — on the buffer for the next pass.
+    """
+    return {"op": "remove", "keys": [_doc_dedup_key(d) for d in docs]}
+
+
 def reduce_docs(
     existing: Sequence[Document] | None,
     new: Union[
@@ -159,27 +219,85 @@ def reduce_docs(
         Sequence[dict[str, Any]],
         Sequence[str],
         Sequence[SearchItem],
+        dict[str, Any],
         str,
         Literal["delete"],
     ],
 ) -> Sequence[Document]:
-    """Reduce and process documents based on the input type.
+    """Append new documents onto the existing working buffer.
 
-    This function handles various input types and converts them into a sequence of Document objects.
-    It can delete existing documents, create new ones from strings or dictionaries, or return the existing documents.
+    This is an *append* reducer, not a replace: a node contributes only the new
+    documents it produced and they are appended to whatever is already on the
+    channel. A node never re-reads the existing list — which avoids re-queuing
+    already-processed documents.
+
+    Supported ``new`` values:
+        * a sequence of Documents / dicts / strings / ``SearchItem``s — coerced
+          to Documents and **appended** (de-duped by identity);
+        * the literal ``"delete"`` — clears the **entire** buffer;
+        * a removal instruction ``{"op": "remove", "keys": [...]}`` (see
+          :func:`remove_docs_update`) — removes only the listed docs, leaving
+          everything else. Prefer this over ``"delete"`` when other nodes may
+          write the same channel in the same superstep.
+
+    De-duplication by stable document identity (:func:`_doc_dedup_key`) keeps
+    the append idempotent: re-emitting a doc already on the buffer does not grow
+    it, while genuinely new docs accumulate.
 
     Args:
-        existing (Optional[Sequence[Document]]): The existing docs in the state, if any.
-        new (Union[Sequence[Document], Sequence[dict[str, Any]], Sequence[str], str, Literal["delete"]]):
-            The new input to process. Can be a sequence of Documents, dictionaries, strings, a single string,
-            or the literal "delete".
+        existing: The docs already on the channel, if any.
+        new: The instruction to apply (see above).
     """
-    if new == "delete":
-        return []
-    if isinstance(new, str):
-        return [Document(page_content=new, metadata={"id": str(uuid.uuid4())})]
+    # region agent log
+    _existing_len = len(existing) if existing is not None else 0
+    _new_kind = type(new).__name__
+    _new_summary: dict[str, Any] = {"kind": _new_kind}
     if isinstance(new, list):
-        coerced = []
+        _new_summary["len"] = len(new)
+        _new_summary["item_kinds"] = list({type(i).__name__ for i in new})[:5]
+    elif isinstance(new, dict):
+        _new_summary["op"] = new.get("op")
+        _new_summary["keys_len"] = len(new.get("keys") or [])
+    elif isinstance(new, str):
+        _new_summary["str_value_short"] = new[:24]
+    _agent_debug_log(
+        "reduce_docs:enter",
+        {"existing_len": _existing_len, "new": _new_summary},
+        hypothesis_id="H1+H2+H3",
+    )
+    # endregion
+
+    if new == "delete":
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=delete",
+            {"existing_len": _existing_len, "result_len": 0},
+            hypothesis_id="H2",
+        )
+        # endregion
+        return []
+
+    # Targeted removal: drop only the processed docs, keep the rest.
+    if isinstance(new, dict) and new.get("op") == "remove":
+        to_remove = set(new.get("keys") or [])
+        _filtered = [d for d in (existing or []) if _doc_dedup_key(d) not in to_remove]
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=remove",
+            {
+                "existing_len": _existing_len,
+                "remove_keys_len": len(to_remove),
+                "result_len": len(_filtered),
+            },
+            hypothesis_id="H2",
+        )
+        # endregion
+        return _filtered
+
+    coerced: list[Document] = []
+    if isinstance(new, str):
+        coerced.append(Document(page_content=new, metadata={"id": str(uuid.uuid4())}))
+    elif isinstance(new, list):
         for item in new:
             if isinstance(item, str):
                 coerced.append(
@@ -188,16 +306,61 @@ def reduce_docs(
             elif isinstance(item, dict):
                 coerced.append(Document(**item))
             elif isinstance(item, SearchItem) or isinstance(item, Item):
-                logger.info("breakpoint")
-                page_content = getattr(item,'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
+                page_content = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
                 document_metadata = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})
-                document = Document(page_content=page_content, metadata=document_metadata)
-                coerced.append(document)
+                coerced.append(Document(page_content=page_content, metadata=document_metadata))
             else:
                 coerced.append(item)
-        return coerced
-    return existing or []
+    else:
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=unknown_new_type",
+            {"existing_len": _existing_len, "new_kind": _new_kind},
+            hypothesis_id="H2",
+        )
+        # endregion
+        # Unknown ``new`` type: leave the buffer unchanged.
+        return existing or []
 
+    # Append new docs onto existing, dropping any whose identity is already
+    # present so re-emitted docs do not accumulate.
+    result: list[Document] = list(existing or [])
+    seen = {_doc_dedup_key(doc) for doc in result}
+    # region agent log
+    _skip_count = 0
+    _sample_skip_key: str | None = None
+    _sample_added_key: str | None = None
+    # endregion
+    for doc in coerced:
+        key = _doc_dedup_key(doc)
+        if key in seen:
+            # region agent log
+            _skip_count += 1
+            if _sample_skip_key is None:
+                _sample_skip_key = key[:64]
+            # endregion
+            continue
+        seen.add(key)
+        # region agent log
+        if _sample_added_key is None:
+            _sample_added_key = key[:64]
+        # endregion
+        result.append(doc)
+    # region agent log
+    _agent_debug_log(
+        "reduce_docs:branch=append_dedup",
+        {
+            "existing_len": _existing_len,
+            "coerced_len": len(coerced),
+            "result_len": len(result),
+            "skip_count": _skip_count,
+            "sample_skip_key": _sample_skip_key,
+            "sample_added_key": _sample_added_key,
+        },
+        hypothesis_id="H3+H4+H5",
+    )
+    # endregion
+    return result
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
@@ -328,7 +491,7 @@ import os
 import re
 
 
-async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: str = ".") -> str:
+async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: Optional[str] = None) -> str:
     """
     Download transcript/subtitles from a YouTube video.
 
@@ -336,30 +499,42 @@ async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True
         url: YouTube video URL
         lang: Language code (e.g., 'en', 'es', 'fr')
         auto_subs: Fall back to auto-generated subtitles if manual not found
-        output_dir: Directory to save files
+        output_dir: Directory to save files. Defaults to a fresh temp dir per call
+            so concurrent downloads never pick up each other's ``.vtt`` files.
 
     Returns:
         Path to the downloaded subtitle file
     """
+    # Each call gets an isolated directory: the batch pipeline downloads many
+    # videos in parallel, and the previous "write to '.' then grab the first
+    # *.vtt" approach raced (one video's transcript shadowing another's).
+    out_dir = output_dir or tempfile.mkdtemp(prefix="yt_subs_")
+
     ydl_opts = {
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": auto_subs,
         "subtitleslangs": [lang],
         "subtitlesformat": "vtt",
-        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "no_warnings": False,
     }
 
-    async with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get("title", "video")
+    # yt_dlp.YoutubeDL is a *synchronous* context manager and extract_info blocks,
+    # so run it off the event loop in a worker thread (the same pattern used by
+    # the audio-download and playlist-extraction paths).
+    def _extract() -> str:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "video")
 
-    # Find the downloaded .vtt file
-    for f in os.listdir(output_dir):
+    title = await asyncio.to_thread(_extract)
+
+    # Find the downloaded .vtt file in this call's own directory.
+    for f in os.listdir(out_dir):
         if f.endswith(".vtt"):
-            return os.path.join(output_dir, f)
+            return os.path.join(out_dir, f)
 
     raise FileNotFoundError(f"No subtitle file found for '{title}'. "
                             "Try listing available languages first.")
@@ -417,7 +592,7 @@ def list_available_subtitles(url: str) -> dict:
 
 
 # This needs to be in-memory rather than using file storage
-def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
+async def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
     """
     High-level function: download + parse transcript, return plain text.
 
@@ -430,7 +605,7 @@ def get_transcript(url: str, lang: str = "en", save_txt: bool = True) -> str:
         Transcript as a plain text string
     """
     print(f"Downloading subtitles for: {url}")
-    vtt_path = download_transcript(url, lang=lang)
+    vtt_path = await download_transcript(url, lang=lang)
 
     print(f"Parsing: {vtt_path}")
     transcript = parse_vtt(vtt_path)
@@ -465,7 +640,76 @@ def _openai_client_for_speech(context: GlobalContext) -> OpenAI:
     if not key:
         msg = "Set `openai_api_key` / OPENAI_API_KEY or `llm_provider_api_key` for speech APIs."
         raise ValueError(msg)
-    return OpenAI(api_key=key)
+    # max_retries=0: retries are handled by _speech_call_with_retry so we can
+    # back off transient failures (rate_limit_exceeded / timeouts / 5xx) while
+    # failing FAST on permanent ones (insufficient_quota / auth) instead of
+    # burning the SDK's blind exponential backoff on an error that can't recover.
+    return OpenAI(api_key=key, max_retries=0)
+
+
+# Permanent OpenAI error codes — retrying cannot succeed, so surface immediately.
+_NON_RETRYABLE_OPENAI_CODES = frozenset(
+    {"insufficient_quota", "billing_hard_limit_reached", "access_terminated"}
+)
+
+
+def _speech_call_with_retry(make_call, context: GlobalContext, *, description: str):
+    """Run a synchronous OpenAI speech call with durable backoff on transient errors.
+
+    Retries ``rate_limit_exceeded`` (429), request timeouts, connection errors and
+    5xx with exponential backoff + jitter, up to ``openai_speech_max_retries``.
+    Permanent failures (``insufficient_quota`` and other billing/auth errors) are
+    re-raised on the first occurrence so they surface as a real item error rather
+    than being slow-retried or silently swallowed.
+    """
+    import openai
+
+    max_retries = max(0, int(context.openai_speech_max_retries or 0))
+    base = float(context.openai_speech_retry_base_seconds or 0.0)
+    attempts = max_retries + 1
+    last_exc: Exception | None = None
+
+    for attempt in range(attempts):
+        try:
+            return make_call()
+        except openai.RateLimitError as exc:
+            code = getattr(exc, "code", None)
+            if code in _NON_RETRYABLE_OPENAI_CODES:
+                logger.error(
+                    "%s: permanent OpenAI error (%s); not retrying: %s",
+                    description,
+                    code,
+                    exc,
+                )
+                raise
+            last_exc = exc
+        except (
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        ) as exc:
+            last_exc = exc
+        except openai.APIStatusError as exc:
+            # Retry only transient 5xx; other status errors (4xx) are caller bugs.
+            if getattr(exc, "status_code", 0) < 500:
+                raise
+            last_exc = exc
+
+        if attempt < attempts - 1:
+            delay = base * (2 ** attempt) + random.uniform(0, base or 0.0)
+            logger.warning(
+                "%s: transient OpenAI failure (attempt %d/%d), retrying in %.2fs: %s",
+                description,
+                attempt + 1,
+                attempts,
+                delay,
+                last_exc,
+            )
+            time.sleep(delay)
+
+    # Exhausted all retries on a transient error.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _audio_mime_from_suffix(suffix: str) -> str:
@@ -546,10 +790,14 @@ def _transcribe_one_segment_path(
     transcription_cost = duration_seconds * context.audio_transcription_price_per_minute
     model = context.audio_transcription_model or "whisper-1"
     with open(path, "rb") as audio_f:
-        content = client.audio.transcriptions.create(
-            file=(upload_filename, audio_f),
-            model=model,
-            response_format="text",
+        content = _speech_call_with_retry(
+            lambda: client.audio.transcriptions.create(
+                file=(upload_filename, audio_f),
+                model=model,
+                response_format="text",
+            ),
+            context,
+            description=f"transcription({upload_filename})",
         )
     return {
         "text": content,
@@ -561,8 +809,13 @@ def _transcribe_one_segment_path(
     }
 
 
-async def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
-    """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit."""
+def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
+    """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit.
+
+    Fully synchronous (moviepy chunking + the blocking OpenAI speech client +
+    ``time.sleep`` backoff). Callers MUST run it via ``asyncio.to_thread`` so it
+    never blocks the event loop.
+    """
     start_time = time_ns()
     size_bytes = os.path.getsize(path)
     client = _openai_client_for_speech(context)
@@ -635,7 +888,7 @@ async def transcribe_audio(
         path = tmp.name
     try:
         name = Path(filename or f"audio{suffix}").name
-        result = await _transcribe_saved_path(path, name, context)
+        result = await asyncio.to_thread(_transcribe_saved_path, path, name, context)
         result['audio_base64_preprocessed'] = audio_base64
         return result
 
@@ -711,25 +964,32 @@ async def preprocess_audio(
 
         sample_rate: Optional[int] = None
 
-        clip = AudioFileClip(src_path)
-        try:
-            full_duration = float(clip.duration or 0.0)
-            
-            if reference_audio and truncate_only and full_duration > max_seconds:
-                sub = clip.subclipped(0, max_seconds)
-                duration_seconds = max_seconds
-            else:
-                sub = clip
-                duration_seconds = full_duration
+        # moviepy + ffmpeg are fully synchronous and CPU/IO-bound. Run them in a
+        # worker thread so the event loop stays free (otherwise a long encode
+        # blocks every other request — including auth — and starves cancellation).
+        def _convert() -> tuple[float, Optional[int]]:
+            clip = AudioFileClip(src_path)
             try:
-                sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+                full_duration = float(clip.duration or 0.0)
+
+                if reference_audio and truncate_only and full_duration > max_seconds:
+                    sub = clip.subclipped(0, max_seconds)
+                    local_duration = max_seconds
+                else:
+                    sub = clip
+                    local_duration = full_duration
+                try:
+                    sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
+                finally:
+                    if sub is not clip:
+                        sub.close()
+                fps = getattr(clip, "fps", None)
+                local_sample_rate = int(fps) if fps else None
             finally:
-                if sub is not clip:
-                    sub.close()
-            fps = getattr(clip, "fps", None)
-            sample_rate = int(fps) if fps else None
-        finally:
-            clip.close()
+                clip.close()
+            return local_duration, local_sample_rate
+
+        duration_seconds, sample_rate = await asyncio.to_thread(_convert)
         # else: # Noise reduction and ENERGY clipping
         #     import librosa
         #     import noisereduce as nr
@@ -915,19 +1175,27 @@ def _diarize_one_mp3_path(
     extra = _diarize_known_speaker_extra_body(context, encoded_reference_audio)
     with open(mp3_path, "rb") as audio_f:
         if extra:
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=(upload_name, audio_f),
-                response_format="diarized_json",
-                chunking_strategy="auto",
-                extra_body=extra,
+            result = _speech_call_with_retry(
+                lambda: client.audio.transcriptions.create(
+                    model=model,
+                    file=(upload_name, audio_f),
+                    response_format="diarized_json",
+                    chunking_strategy="auto",
+                    extra_body=extra,
+                ),
+                context,
+                description=f"diarization({upload_name})",
             )
         else:
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=(upload_name, audio_f),
-                response_format="diarized_json",
-                chunking_strategy="auto",
+            result = _speech_call_with_retry(
+                lambda: client.audio.transcriptions.create(
+                    model=model,
+                    file=(upload_name, audio_f),
+                    response_format="diarized_json",
+                    chunking_strategy="auto",
+                ),
+                context,
+                description=f"diarization({upload_name})",
             )
     if not isinstance(result, TranscriptionDiarized):
         msg = "Expected diarized_json transcription response from OpenAI."
@@ -1018,7 +1286,9 @@ async def transcribe_video(
     reference_audio: bool = False,
     max_duration_seconds: Optional[float] = 9.0,
 ) -> dict:
-    audio_uri, audio_name = extract_video_audio_b64(video_base64, filename)
+    audio_uri, audio_name = await asyncio.to_thread(
+        extract_video_audio_b64, video_base64, filename
+    )
     return await transcribe_audio(
         audio_uri,
         context,
@@ -1075,6 +1345,11 @@ def _select_dominant_speaker_segments(
             totals[spk] = 0.0
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
+
+    # Only one distinct speaker: there is no "dominant" speaker to isolate, so
+    # signal the caller to fall through to passthrough (use the whole clip).
+    if len(totals) <= 1:
+        return None
 
     target_speaker = sorted(
         first_seen, key=lambda s: (-totals[s], first_seen.index(s))
@@ -1195,85 +1470,93 @@ async def isolate_dominant_speaker_audio_b64(
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_out:
             output_path = tmp_out.name
 
-        clip_for_crop = AudioFileClip(work_path)
-        try:
-            if reference_audio:
-                # Reference clip: single longest contiguous target segment,
-                # capped at reference_audio_clip_max_seconds.
-                longest = max(target_segs, key=lambda s: s["end"] - s["start"])
-                seg_start = float(longest["start"])
-                seg_end = float(longest["end"])
-                if (seg_end - seg_start) > target_clip_max_s:
-                    seg_end = seg_start + target_clip_max_s
-                # Floor the clip at OpenAI's 1.2 s minimum: if the longest
-                # contiguous target segment is too short, widen the window into
-                # the surrounding audio (it still centers on the target) rather
-                # than emit a sub-1.2 s reference the diarizer will reject.
-                clip_total = float(clip_for_crop.duration or 0.0)
-                if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
-                    seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
-                    if (seg_end - seg_start) < _OPENAI_REF_MIN_S:
-                        seg_start = max(0.0, seg_end - _OPENAI_REF_MIN_S)
-                sub = clip_for_crop.subclipped(seg_start, seg_end)
-                try:
-                    sub.write_audiofile(output_path, codec="mp3", logger=None)
-                finally:
-                    sub.close()
-                clip_duration = float(seg_end - seg_start)
-                clip_content = (longest.get("text") or "").strip()
-                logger.info(
-                    "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
-                    longest["end"] - longest["start"],
-                    clip_duration,
-                )
-            else:
-                # Non-reference: concatenate all target segments with short
-                # fades, capturing the full target transcript.
-                from moviepy.audio.AudioClip import concatenate_audioclips
-                from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
-
-                subs = []
-                try:
-                    for seg in target_segs:
-                        seg_dur = seg["end"] - seg["start"]
-                        sub = clip_for_crop.subclipped(seg["start"], seg["end"])
-                        f = min(fade_s, seg_dur / 4)
-                        if f > 0:
-                            sub = sub.with_effects([AudioFadeIn(f), AudioFadeOut(f)])
-                        subs.append(sub)
-                    glued = concatenate_audioclips(subs)
+        # The cropping/concatenation/encode below is all synchronous moviepy +
+        # ffmpeg work. Run it in a worker thread so the event loop stays free
+        # (a long encode here previously blocked auth and other requests, and
+        # prevented cancellation from being serviced).
+        def _produce_clip() -> dict:
+            clip_for_crop = AudioFileClip(work_path)
+            try:
+                if reference_audio:
+                    # Reference clip: single longest contiguous target segment,
+                    # capped at reference_audio_clip_max_seconds.
+                    longest = max(target_segs, key=lambda s: s["end"] - s["start"])
+                    seg_start = float(longest["start"])
+                    seg_end = float(longest["end"])
+                    if (seg_end - seg_start) > target_clip_max_s:
+                        seg_end = seg_start + target_clip_max_s
+                    # Floor the clip at OpenAI's 1.2 s minimum: if the longest
+                    # contiguous target segment is too short, widen the window
+                    # into the surrounding audio (it still centers on the
+                    # target) rather than emit a sub-1.2 s reference the
+                    # diarizer will reject.
+                    clip_total = float(clip_for_crop.duration or 0.0)
+                    if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
+                        seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
+                        if (seg_end - seg_start) < _OPENAI_REF_MIN_S:
+                            seg_start = max(0.0, seg_end - _OPENAI_REF_MIN_S)
+                    sub = clip_for_crop.subclipped(seg_start, seg_end)
                     try:
-                        glued.write_audiofile(output_path, codec="mp3", logger=None)
+                        sub.write_audiofile(output_path, codec="mp3", logger=None)
                     finally:
-                        glued.close()
-                finally:
-                    for s in subs:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                clip_duration = float(target_total)
-                clip_content = " ".join(
-                    (s.get("text") or "").strip() for s in target_segs
-                ).strip()
-                logger.info(
-                    "isolate_dominant_speaker_audio_b64[nonref]: concatenated %d target segments (%.2fs)",
-                    len(target_segs),
-                    target_total,
-                )
-        finally:
-            clip_for_crop.close()
+                        sub.close()
+                    clip_duration = float(seg_end - seg_start)
+                    clip_content = (longest.get("text") or "").strip()
+                    logger.info(
+                        "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
+                        longest["end"] - longest["start"],
+                        clip_duration,
+                    )
+                else:
+                    # Non-reference: concatenate all target segments with short
+                    # fades, capturing the full target transcript.
+                    from moviepy.audio.AudioClip import concatenate_audioclips
+                    from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
 
-        with open(output_path, "rb") as fh:
-            final_audio_b64 = (
-                "data:audio/mp3;base64,"
-                + base64.b64encode(fh.read()).decode("utf-8")
-            )
-        return {
-            "audio_base64_preprocessed": final_audio_b64,
-            "duration": clip_duration,
-            "text": clip_content,
-        }
+                    subs = []
+                    try:
+                        for seg in target_segs:
+                            seg_dur = seg["end"] - seg["start"]
+                            sub = clip_for_crop.subclipped(seg["start"], seg["end"])
+                            f = min(fade_s, seg_dur / 4)
+                            if f > 0:
+                                sub = sub.with_effects([AudioFadeIn(f), AudioFadeOut(f)])
+                            subs.append(sub)
+                        glued = concatenate_audioclips(subs)
+                        try:
+                            glued.write_audiofile(output_path, codec="mp3", logger=None)
+                        finally:
+                            glued.close()
+                    finally:
+                        for s in subs:
+                            try:
+                                s.close()
+                            except Exception:
+                                pass
+                    clip_duration = float(target_total)
+                    clip_content = " ".join(
+                        (s.get("text") or "").strip() for s in target_segs
+                    ).strip()
+                    logger.info(
+                        "isolate_dominant_speaker_audio_b64[nonref]: concatenated %d target segments (%.2fs)",
+                        len(target_segs),
+                        target_total,
+                    )
+            finally:
+                clip_for_crop.close()
+
+            with open(output_path, "rb") as fh:
+                final_audio_b64 = (
+                    "data:audio/mp3;base64,"
+                    + base64.b64encode(fh.read()).decode("utf-8")
+                )
+            return {
+                "audio_base64_preprocessed": final_audio_b64,
+                "duration": clip_duration,
+                "text": clip_content,
+            }
+
+        return await asyncio.to_thread(_produce_clip)
 
     finally:
         for pth in (work_path, output_path):
@@ -1323,14 +1606,20 @@ async def transcribe_audio_diarize(
             temp_upload.flush()
             source_path = temp_upload.name
 
-        video = VideoFileClip(source_path)
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
-                audio_path = temp_audio.name
-            video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
-        finally:
-            video.close()
-            os.unlink(source_path)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+            audio_path = temp_audio.name
+
+        # moviepy/ffmpeg audio extraction is synchronous and CPU/IO-bound; run
+        # it off the event loop so concurrent requests stay responsive.
+        def _extract_audio() -> None:
+            video = VideoFileClip(source_path)
+            try:
+                video.audio.write_audiofile(audio_path, codec="mp3", logger=None)
+            finally:
+                video.close()
+                os.unlink(source_path)
+
+        await asyncio.to_thread(_extract_audio)
 
         with open(audio_path, "rb") as audio_f:
             b64_encoded_reference_audio = (

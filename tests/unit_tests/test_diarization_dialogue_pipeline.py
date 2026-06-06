@@ -21,8 +21,10 @@ from src.anubis.utils.dataset.formatting import (
 )
 import src.subgraphs.process_media_graph.utils.helper_functions as helper_functions
 from src.subgraphs.process_media_graph.utils.helper_functions import (
+    _attach_target_analysis_context,
     _build_adapter_dialogue_document,
     _build_target_quote_documents_from_dialogue,
+    _format_dialogue_transcript,
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
 )
@@ -309,7 +311,7 @@ def stub_biographical_identity(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_each_nontarget_statement_emits_its_own_identity_document(
-    stub_biographical_identity,
+    stub_biographical_identity, stub_scene_summary, stub_synthetic_questions
 ):
     """Two distinct non-target speakers must produce two identity Documents,
     each tagged with its own speaker label and timestamps — not one merged
@@ -339,7 +341,9 @@ async def test_each_nontarget_statement_emits_its_own_identity_document(
 
 
 @pytest.mark.asyncio
-async def test_empty_nontarget_statements_emit_no_documents(stub_biographical_identity):
+async def test_empty_nontarget_statements_emit_no_documents(
+    stub_biographical_identity, stub_scene_summary, stub_synthetic_questions
+):
     payload = {
         "segments": [
             {"speaker": "A", "text": "   ", "is_target": False, "start": 0, "end": 1},
@@ -429,3 +433,105 @@ def test_select_dominant_speaker_ignores_invalid_timestamps():
     target_speaker, _segs, totals, _total = result
     assert target_speaker == "A"  # 7s vs D's 2s; B/C dropped as invalid
     assert set(totals.keys()) == {"A", "D"}
+
+
+# --------------------------------------------------------------------------- #
+# Scene summary (spec Step 1) + per-target situational context (spec Step 2)
+# --------------------------------------------------------------------------- #
+
+# The Miranda scene from OVERALL_PREPROCESSING_PROCESS.md, already coalesced into
+# alternating two-speaker turns (the form produced after coalescence).
+_MIRANDA_SEGMENTS = [
+    {"speaker": "other", "text": "Agent Miranda?", "is_target": False, "start": 0.0, "end": 1.0},
+    {"speaker": "Miranda", "text": "Speaking.", "is_target": True, "start": 1.0, "end": 2.0},
+    {"speaker": "other", "text": "Denny Carmichael. See that plane across the way?", "is_target": False, "start": 2.0, "end": 4.0},
+    {"speaker": "Miranda", "text": "Yeah. Hard to miss.", "is_target": True, "start": 4.0, "end": 5.0},
+    {"speaker": "other", "text": "Get on it. You're meeting me in Berlin.", "is_target": False, "start": 5.0, "end": 7.0},
+    {"speaker": "Miranda", "text": "I'm supposed to be in Singapore.", "is_target": True, "start": 7.0, "end": 9.0},
+]
+
+
+@pytest.fixture
+def stub_scene_summary(monkeypatch):
+    """Pin the whole-scene summary so Step 1 is deterministic and offline."""
+
+    async def _fake(transcript_text, *, target_name=None):
+        return "SCENE::Miranda is redirected from Singapore to Berlin by Denny."
+
+    monkeypatch.setattr(helper_functions, "generate_scene_summary", _fake)
+
+
+def test_format_dialogue_transcript_renders_speaker_lines():
+    text = _format_dialogue_transcript(_MIRANDA_SEGMENTS)
+    assert "other: Agent Miranda?" in text
+    assert "Miranda: Speaking." in text
+    # Empty/whitespace turns are dropped.
+    assert _format_dialogue_transcript([{"speaker": "x", "text": "  "}]) == ""
+
+
+@pytest.mark.asyncio
+async def test_attach_context_uses_preceding_user_turn(stub_synthetic_questions):
+    """Each target quote gets the scene summary and its preceding non-target
+    turn as ``user_context`` — no synthesis when a real predecessor exists."""
+    quotes = _build_target_quote_documents_from_dialogue(
+        _MIRANDA_SEGMENTS,
+        user_id="u",
+        assistant_id="a",
+        media_item=_media_item(),
+        target_name="Miranda",
+    )
+    await _attach_target_analysis_context(quotes, scene_summary="SCENE::redirected")
+
+    assert [q.page_content for q in quotes] == [
+        "Speaking.",
+        "Yeah. Hard to miss.",
+        "I'm supposed to be in Singapore.",
+    ]
+    for q in quotes:
+        assert q.metadata["scene_summary"] == "SCENE::redirected"
+    # user_context == the immediately preceding non-target turn (the "user").
+    assert quotes[0].metadata["user_context"] == "Agent Miranda?"
+    assert quotes[1].metadata["user_context"] == "Denny Carmichael. See that plane across the way?"
+    assert quotes[2].metadata["user_context"] == "Get on it. You're meeting me in Berlin."
+    # No synthesis happened (every target turn had a real predecessor).
+    assert all("user_context_synthetic" not in q.metadata for q in quotes)
+
+
+@pytest.mark.asyncio
+async def test_attach_context_synthesizes_when_target_leads(stub_synthetic_questions):
+    """When the target spoke first there is no preceding user turn, so a
+    synthetic 'user' statement is generated (spec: there must always be a
+    target statement with a previous user input)."""
+    segments = [
+        {"speaker": "Miranda", "text": "Speaking.", "is_target": True, "start": 0.0, "end": 1.0},
+        {"speaker": "other", "text": "Meet me in Berlin.", "is_target": False, "start": 1.0, "end": 2.0},
+        {"speaker": "Miranda", "text": "I'm supposed to be in Singapore.", "is_target": True, "start": 2.0, "end": 3.0},
+    ]
+    quotes = _build_target_quote_documents_from_dialogue(
+        segments, user_id="u", assistant_id="a", media_item=_media_item(), target_name="Miranda",
+    )
+    await _attach_target_analysis_context(quotes, scene_summary="SCENE::x")
+
+    # Leading target turn -> synthetic user_context; later turn -> real predecessor.
+    assert quotes[0].metadata["user_context"] == "SYNTH::Speaking."
+    assert quotes[0].metadata["user_context_synthetic"] is True
+    assert quotes[1].metadata["user_context"] == "Meet me in Berlin."
+    assert "user_context_synthetic" not in quotes[1].metadata
+
+
+@pytest.mark.asyncio
+async def test_process_dialogue_attaches_scene_and_user_context(
+    stub_scene_summary, stub_synthetic_questions, stub_biographical_identity
+):
+    """End-to-end: the dialogue processor stamps the one scene summary and the
+    per-target user_context onto every quote Document (spec Steps 1 & 2)."""
+    payload = {"segments": _MIRANDA_SEGMENTS, "target_name": "Miranda"}
+    docs = await process_dialogue_json_to_documents(
+        payload, user_id="u", assistant_id="a", media_item=_media_item()
+    )
+    quotes = [d for d in docs if d.metadata.get("namespace") == "quote"]
+    assert len(quotes) == 3
+    for q in quotes:
+        assert q.metadata["scene_summary"].startswith("SCENE::Miranda is redirected")
+        assert q.metadata["user_context"]  # always present
+    assert quotes[0].metadata["user_context"] == "Agent Miranda?"

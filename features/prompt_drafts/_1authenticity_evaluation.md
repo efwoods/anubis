@@ -105,7 +105,5 @@ I need to create a linguistic profile and measure the authenticity of the genera
 # Psycho Analysis Plans (analysis and stylistic fingerprint and analysis pipeline)
 ~/.claude/plans/serene-stargazing-sutherland.md 
 
-
-
 # One off feature/modification: There is a prompt injection in the system prompt for examples of writing style that need to be the metrics defined from the linguistic profile rather than the actual examples 
 Style needs to use the linguistic fingerprint rather than explicit examples of the style of writing

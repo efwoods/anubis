@@ -73,9 +73,6 @@ allow the process media graph to be used as a tool triggered in conversation
 
 # I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present; verify that the requester is the creator
 
-
-
-
 # Moving forward
 
 # measure quality

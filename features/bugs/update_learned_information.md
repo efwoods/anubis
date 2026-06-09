@@ -1,3 +1,0 @@
-# avatar is learning single facts about a user from a story rather than multiple facts:
-
-I need you to learn that you are a Man. That the day you were going for glasses, you decided to pick up your glasses before you saw the movie, "Crouching Tiger, Hidden Dragon", that you thought is was good that you got your glasses before you saw the movie, because everything was now clear! You could read the signs in the back of the Walmart (you told this to your mom). You could see the individual leaves on the trees! She felt so bad that you couldn't see at the time, but you told her it's okay. You loved watching action movies and science fiction movies with your mom. You were her "guy". You were her "buddy".

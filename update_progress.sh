@@ -6,7 +6,7 @@ else
   _MESSAGE="$1"
 fi
 
-git diff HEAD > progress.txt
+git diff main > progress.txt
 
 curl http://localhost:8123/message/00da3ee4-e091-4f7e-b958-f2cc7f13e19f \
   --request POST \

@@ -1,6 +1,6 @@
 """This "graph" simply exposes an endpoint for a user to upload docs to be indexed."""
 
-from typing import Sequence
+from typing import Any, Sequence, cast
 
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
 from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.utility import extract_user_id_assistant_id
+from src.anubis.utils.utility import extract_user_id_assistant_id, remove_docs_update
 
 
 def ensure_docs_have_user_id(
@@ -48,19 +48,26 @@ def ensure_docs_have_user_id(
     ]
 
 
+def _file_identity(doc: Document) -> str:
+    """Original-file key for a Document (its uploaded filename)."""
+    meta = doc.metadata or {}
+    return meta.get("filename") or meta.get("namespace_filename") or "unknown"
+
+
 async def index_docs(
     state: GlobalState, runtime: Runtime[GlobalContext], config: RunnableConfig,
     store: BaseStore
-) -> dict[str, str]:
-    """Asynchronously index documents in the given state using the configured retriever.
+) -> dict[str, Any]:
+    """Index the queued documents, tolerating per-file failures.
 
-    This function takes the documents from the state, ensures they have a user ID,
-    adds them to the retriever's index, and then signals for the documents to be
-    deleted from the state.
+    Indexes everything it can. A document/batch that fails does NOT stop the
+    pipeline: the original files (by filename) whose documents failed are
+    collected into ``failed_to_index_files`` so the upload layer can surface and
+    reprocess them, while every other file is indexed normally.
 
-    Args:
-        state (IndexState): The current state containing documents and retriever.
-        config (Optional[RunnableConfig]): Configuration for the indexing process.r
+    The processed snapshot is removed from the buffer via a targeted removal
+    (not a blind ``"delete"``), so documents appended by a concurrent node in
+    the same superstep are preserved for the next pass.
     """
     logger.info(f"INDEXING DOCUMENTS")
 
@@ -69,33 +76,90 @@ async def index_docs(
     user_id = updated_user_id['user_id']
     assistant_id = updated_assistant_id['assistant_id']
 
-    docs = state.get('vectorstore_documents_to_be_indexed') or []
+    # region agent log
+    try:
+        from src.anubis.utils.utility import _agent_debug_log as _adl
+        _raw = state.get('vectorstore_documents_to_be_indexed')
+        _kind = type(_raw).__name__
+        _len = len(_raw) if hasattr(_raw, "__len__") else None
+        _adl(
+            "index_docs:entry:vectorstore_documents_to_be_indexed",
+            {"kind": _kind, "len": _len},
+            hypothesis_id="H1",
+        )
+    except Exception:
+        pass
+    # endregion
+
+    docs: list[Document] = list(
+        cast(Sequence[Document], state.get('vectorstore_documents_to_be_indexed') or [])
+    )
 
     if not docs:
+        # Nothing in our snapshot to index. Do NOT clear the buffer: another
+        # node (e.g. analyze_documents) may have appended docs in this same
+        # superstep, and a blind clear would discard them un-indexed.
         logger.info("No documents to index; skipping batch indexing")
-        return {"vectorstore_documents_to_be_indexed": "delete"}
+        return {}
 
-    filenames = [doc.metadata.get("namespace_filename") for doc in docs]
+    # Files whose documents failed to index, keyed by original filename.
+    failed_file_keys: set[str] = set()
+    error_detail: str | None = None
+
     try:
-        assert(len(filenames) == len(docs))
-    except AssertionError as e:
-        logger.warning(f"Missing {len(docs) - len(filenames)} filenames on documents")
+        result = await batch_index_documents_vectorstore(
+            store, user_id, assistant_id, docs, BATCH_SIZE=1000
+        )
+        if not result.get("success", False):
+            # batch_index_documents_vectorstore already kept going past failed
+            # batches; it returns the failed PutOps (keyed by document_id).
+            error_ops = result.get("error_batch_documents", []) or []
+            failed_keys = {getattr(op, "key", None) for op in error_ops}
+            for doc in docs:
+                if doc.metadata.get("document_id") in failed_keys:
+                    failed_file_keys.add(_file_identity(doc))
+            error_detail = "batch indexing error"
+            logger.error(
+                "Indexing failed for %d file(s): %s",
+                len(failed_file_keys),
+                sorted(failed_file_keys),
+            )
+    except Exception as exc:
+        # Hard failure indexing this snapshot: do not stop the pipeline. Mark
+        # every attempted file as failed so the uploader can reprocess them.
+        error_detail = str(exc)
+        failed_file_keys = {_file_identity(doc) for doc in docs}
+        logger.error("Indexing raised; marking all attempted files failed: %s", exc)
 
-    if len(filenames) > 0:
-        result = await batch_index_documents_vectorstore(store, user_id, assistant_id, docs, BATCH_SIZE=1000)
+    # Build a per-file failure report (one entry per original filename) so the
+    # original upload can be made aware and reprocess only the failed files.
+    file_failures: dict[str, dict[str, Any]] = {}
+    if failed_file_keys:
+        for doc in docs:
+            fkey = _file_identity(doc)
+            if fkey not in failed_file_keys:
+                continue
+            entry = file_failures.setdefault(
+                fkey,
+                {
+                    "filename": (doc.metadata or {}).get("filename"),
+                    "namespace_filename": (doc.metadata or {}).get("namespace_filename"),
+                    "document_ids": [],
+                    "error": error_detail or "indexing error",
+                },
+            )
+            entry["document_ids"].append((doc.metadata or {}).get("document_id"))
 
-        try:
-            assert(result['success'] == True)
-        except AssertionError as e:
-            logger.error(f"Error uploading documents: {result['error_batch_documents']}")
+    logger.info(f"breakpoint after batch_index_documents_vectorstore")
 
-            # Clear the documents to be indexed on error
-            state['vectorstore_documents_to_be_indexed'] = []            
-            raise Exception(f"Error uploading documents: {result['error_batch_documents']}")
-
-        logger.info(f"breakpoint after batch_index_documents_vectorstore")
-
-    return {"vectorstore_documents_to_be_indexed": "delete"}
+    # Remove the entire attempted snapshot from the buffer (targeted, so a
+    # concurrent append in the same superstep survives). Successful files are
+    # persisted; failed files are surfaced via failed_to_index_files for
+    # reprocessing rather than being silently retried here.
+    return {
+        "vectorstore_documents_to_be_indexed": remove_docs_update(docs),
+        "failed_to_index_files": list(file_failures.values()),
+    }
 
 # Define a new graph
 builder = StateGraph(GlobalState, context_schema=GlobalContext)

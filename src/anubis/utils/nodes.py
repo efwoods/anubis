@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ``nodes.py`` → ``utils`` → ``anubis`` → ``src`` → repo root
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 _DEV_SYSTEM_PROMPT_PATH = _PROJECT_ROOT / "system_prompt.txt"
 
 
@@ -36,7 +37,13 @@ def _global_context_from_runtime(runtime) -> GlobalContext:
 def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
     """Dump the built system prompt when ``DEV=TRUE`` (dev-only debugging aid)."""
     context = _global_context_from_runtime(runtime)
-    if context.dev != "TRUE":
+    logger.info(f"context.dev: {context.dev}")
+    if context.dev.upper() == "TRUE":
+        logger.info(f"context.dev == TRUE: Writing dev system prompt")
+    else:
+        logger.info(f"context.dev == FALSE: system prompt is not being written")
+
+    if context.dev.upper() != "TRUE":
         return
     _DEV_SYSTEM_PROMPT_PATH.write_text(system_message_str, encoding="utf-8")
     logger.info("dev system prompt written to: %s", _DEV_SYSTEM_PROMPT_PATH)
@@ -259,8 +266,21 @@ async def _build_consciousness_system_message_update(
 
     """ Load User Identity documents (always from store — checkpoint cache is not authoritative). """
 
+    # The identity namespaces are contractually loaded in full every turn (see the
+    # READ ME in identity_tools.py). ``asearch`` defaults to limit=10 and, with no
+    # query, returns an arbitrary slice — which silently dropped media-ingested
+    # identity facts (e.g. an uploaded résumé's education history) from the prompt,
+    # producing recall false-negatives. Pass the latest user message as the
+    # relevance query and raise the limit to 1000 so every identity document is
+    # surfaced (relevance-ranked only if the count ever exceeds the limit).
+    query = state["messages"][-1].content
+    if isinstance(query, list):
+        query = query[0]["text"]
+
     user_identity_namespace = (assistant_id, user_id, "identity")
-    user_identity_document_items = await runtime.store.asearch(user_identity_namespace)
+    user_identity_document_items = await runtime.store.asearch(
+        user_identity_namespace, query=query, limit=1000
+    )
     user_identity = reduce_docs([], user_identity_document_items)
 
     """ Load Assistant Identity documents """
@@ -268,7 +288,7 @@ async def _build_consciousness_system_message_update(
 
     assistant_identity_namespace = (creator_id, assistant_id, "identity")
     assistant_identity_document_items = await runtime.store.asearch(
-        assistant_identity_namespace
+        assistant_identity_namespace, query=query, limit=1000
     )
     assistant_identity = reduce_docs([], assistant_identity_document_items)
 
@@ -317,10 +337,7 @@ async def _build_consciousness_system_message_update(
 
     """ Retrieve memories """
 
-    query = state["messages"][-1].content
-    if isinstance(query, list):
-        query = query[0]["text"]
-
+    # ``query`` was extracted above (identity load) and is reused here.
     assistant_memory_namespace = (user_id, assistant_id, "memory")
     retrieved_memories_items = await runtime.store.asearch(
         assistant_memory_namespace,
@@ -359,6 +376,18 @@ async def _build_consciousness_system_message_update(
     )
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
+
+    """ Retrieve Analyzed Latent Traits """
+
+    # The analysis namespace holds psycho-analysis findings about the target
+    # (beliefs, emotional triggers, relationships, OCEAN, etc.) produced by the
+    # process_media_graph analysis stage. Retrieve those relevant to the current
+    # conversation by similarity to the user's message.
+    analyzed_trait_items = await runtime.store.asearch(
+        (creator_id, assistant_id, "analysis"), query=query
+    )
+    logger.info(f"analyzed_trait_items: {analyzed_trait_items}")
+    analyzed_traits = reduce_docs([], analyzed_trait_items)
 
     """ Retrieve Emotions """
 
@@ -412,6 +441,7 @@ async def _build_consciousness_system_message_update(
         assistant_identity=assistant_identity,
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
+        analyzed_traits=analyzed_traits,
         direct_quotes=direct_quotes,
         user_name=user_name,
         user_description=user_description,

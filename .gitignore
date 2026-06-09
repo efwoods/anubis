@@ -1,3 +1,5 @@
+progress_summary.txt
+progress.txt
 _.md
 system_prompt.txt
 scratch*
@@ -31,6 +33,9 @@ test.ipynb
 .env.dev
 data/**
 data/elon-musk-dataset
+# Tracked source modules that live under data/ (the rest of data/ is runtime output)
+!data/__init__.py
+!data/standardized_questions.py
 .langgraph_api
 
 # Byte-compiled / optimized / DLL files

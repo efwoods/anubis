@@ -1,2 +1,0 @@
-I want to send multiple urls and a mixture of multiple urls, and documents the the update_avatar_identity_with_media endpoint and have everything processed (each individual upload in parallel); 
-  I need to be able to send a playlist (youtube) and have an optional cap of the number items in the playlist that are processed (otherwise, all items in the playlist are processed)

@@ -379,11 +379,20 @@ async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
             return _api_key_cache[cache_key]
 
     headers = await _mgmt_headers(request)
-    result = await request.app.state.httpx_client.get(
-        f"{BASE_AUTH_URL}/api/v2/users",
-        params={"q": f'app_metadata.api_key:"{cache_key}"', "search_engine": "v3"},
-        headers=headers,
-    )
+    try:
+        result = await request.app.state.httpx_client.get(
+            f"{BASE_AUTH_URL}/api/v2/users",
+            params={"q": f'app_metadata.api_key:"{cache_key}"', "search_engine": "v3"},
+            headers=headers,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.TimeoutException, httpx.TransportError) as exc:
+        # The identity provider is unreachable (DNS/egress/outage, or the event
+        # loop was starved). Surface a clean 503 instead of a generic 500 so the
+        # client can retry rather than treating it as a request error.
+        logger.warning("Auth lookup to %s failed (transport): %s", BASE_AUTH_URL, exc)
+        raise HTTPException(
+            status_code=503, detail="Authentication service temporarily unreachable."
+        ) from exc
     result.raise_for_status()
     users = result.json()
     if not users:

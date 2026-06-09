@@ -1,0 +1,8 @@
+https://docs.langchain.com/oss/python/langchain/voice-agent
+
+# Build a realtime voice agent (allows for passive listening and collection of information in real time for conversation suggestions)
+
+https://www.google.com/search?client=ubuntu-sn&channel=fs&q=discord+voice+chatbot+llm
+https://docs.langchain.com/oss/python/langchain/voice-agent
+
+only the custom voice streaming (generation) needs to be completed using an api and a reference audio file. (audio to text may be served from a mobile device in the UI for now).

@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
@@ -38,6 +39,16 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.utility import get_transcript
 
 logger = logging.getLogger(__name__)
+
+
+def _namespace_for(source: str) -> str:
+    """Deterministic store key for a media source.
+
+    Mirrors ``webapp._namespace_safe_formatted_filename`` so the dedup/skip keys
+    produced here for expanded children line up exactly with the ones the upload
+    endpoint computes for top-level items.
+    """
+    return str(uuid5(NAMESPACE_URL, source))
 
 
 _YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"})
@@ -255,6 +266,7 @@ class URLDocumentLoaderClass:
                         "assistant_id": assistant_id,
                         "url_kind": "linktree_child",
                         "linktree_root": url,
+                        "namespace_filename": _namespace_for(link),
                     },
                 }
             )
@@ -271,10 +283,21 @@ class URLDocumentLoaderClass:
         Returns one ``type="url"`` watch item per entry; each re-enters this
         class on the next pass and flows through the single-video YouTube path
         (subtitles fast-path, else audio + diarization)."""
-        entries = await _extract_playlist_entries(url)
+        entries, playlist_title = await _extract_playlist_entries(url)
         if not entries:
             logger.warning("YouTube playlist produced no entries: %s", url)
             return []
+
+        # The playlist's own deterministic key. Every video is keyed by a single
+        # uuid5 over ``{playlist_ns}::{video_ns}`` — derived from BOTH identities so
+        # it stays disambiguated from other videos and from the same video in a
+        # different playlist, but emitted as one opaque hash so the store key holds
+        # no ``::`` separator. The playlist a video belongs to is recovered from the
+        # playlist_namespace_filename / playlist_url / title metadata below, not by
+        # parsing the key: /list_avatar_documents groups on playlist_url, the
+        # skip-set matches the opaque key, and /delete_avatar_document drops a whole
+        # playlist via playlist_namespace_filename or a single video via this key.
+        playlist_ns = _namespace_for(url)
 
         media_items: List[Dict[str, Any]] = []
         for entry in entries:
@@ -284,6 +307,7 @@ class URLDocumentLoaderClass:
             )
             if not watch_url:
                 continue
+            video_ns = _namespace_for(watch_url)
             media_items.append(
                 {
                     "type": "url",
@@ -295,11 +319,20 @@ class URLDocumentLoaderClass:
                         "assistant_id": assistant_id,
                         "url_kind": "youtube_playlist_entry",
                         "playlist_url": url,
+                        "playlist_namespace_filename": playlist_ns,
+                        "playlist_title": playlist_title,
+                        "video_title": entry.get("title") or "",
+                        "namespace_filename": _namespace_for(
+                            f"{playlist_ns}::{video_ns}"
+                        ),
                     },
                 }
             )
         logger.info(
-            "Expanded YouTube playlist %s into %d videos", url, len(media_items)
+            "Expanded YouTube playlist %s (%s) into %d videos",
+            url,
+            playlist_title or "untitled",
+            len(media_items),
         )
         return media_items
 
@@ -313,10 +346,13 @@ class URLDocumentLoaderClass:
         """Subtitles fast-path; otherwise download audio for diarization."""
         if not expect_multispeaker:
             try:
-                loop = asyncio.get_event_loop()
-                transcript = await loop.run_in_executor(
-                    None, _get_transcript_sync, url
-                )
+                # get_transcript / download_transcript are async (they run yt_dlp in
+                # a worker thread internally). Awaiting directly was the missing
+                # piece: the old run_in_executor(_get_transcript_sync) called the
+                # coroutine without awaiting it, so this branch always raised and
+                # silently fell back to the audio path (which then needed a
+                # reference-audio clip and failed).
+                transcript = await get_transcript(url, lang="en", save_txt=False)
                 if (transcript or "").strip():
                     return [
                         {
@@ -350,7 +386,10 @@ class URLDocumentLoaderClass:
                 "type": "audio",
                 "base64_encoded_str": audio_b64,
                 "metadata": {
-                    "filename": f"youtube{suffix}",
+                    # Keep the original URL as the filename — never rename to a
+                    # generic "youtube.mp3". ``content_type`` still carries the real
+                    # audio container so the audio branch decodes correctly.
+                    "filename": url,
                     "content_type": f"audio/{suffix.lstrip('.') or 'mp3'}",
                     "source": url,
                     "user_id": user_id,
@@ -367,11 +406,6 @@ def _load_webdocs_sync(url: str):
 
     loader = WebBaseLoader(url)
     return loader.load()
-
-
-def _get_transcript_sync(url: str) -> str:
-    """Run the existing ``get_transcript`` helper synchronously in a worker."""
-    return get_transcript(url=url, lang="en", save_txt=False)
 
 
 async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
@@ -395,14 +429,19 @@ async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
         return text
 
 
-async def _extract_playlist_entries(url: str) -> List[Dict[str, Any]]:
-    """Return the flat list of entries (``{id, url, ...}``) for a YouTube playlist."""
+async def _extract_playlist_entries(url: str) -> tuple[List[Dict[str, Any]], str]:
+    """Return ``(entries, playlist_title)`` for a YouTube playlist.
+
+    ``entries`` is the flat list (``{id, url, ...}``); ``playlist_title`` is the
+    human-readable playlist name (empty string when yt_dlp can't resolve it),
+    surfaced so individual videos can be listed under their playlist.
+    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _extract_playlist_entries_sync, url)
 
 
-def _extract_playlist_entries_sync(url: str) -> List[Dict[str, Any]]:
-    """Sync helper: flat-extract playlist entries via ``yt_dlp`` (no download)."""
+def _extract_playlist_entries_sync(url: str) -> tuple[List[Dict[str, Any]], str]:
+    """Sync helper: flat-extract playlist entries + title via ``yt_dlp`` (no download)."""
     import yt_dlp  # local import: heavy module
 
     ydl_opts = {
@@ -417,11 +456,12 @@ def _extract_playlist_entries_sync(url: str) -> List[Dict[str, Any]]:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # pragma: no cover - logged for the operator
         logger.exception("yt_dlp playlist extraction failed for %s: %s", url, exc)
-        return []
+        return [], ""
 
     entries = (info or {}).get("entries") or []
+    playlist_title = (info or {}).get("title") or ""
     # Drop unavailable/private entries that yt_dlp returns as ``None``.
-    return [e for e in entries if isinstance(e, dict)]
+    return [e for e in entries if isinstance(e, dict)], playlist_title
 
 
 async def _download_youtube_audio_b64(url: str) -> tuple[str, str]:
@@ -451,7 +491,7 @@ def _download_youtube_audio_b64_sync(url: str) -> tuple[str, str]:
             ],
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            ydl.extract_info(url, download=True)  # download side effect; info unused
 
         # Locate the produced .mp3 (post-processor renames the file).
         mp3_path: Optional[str] = None

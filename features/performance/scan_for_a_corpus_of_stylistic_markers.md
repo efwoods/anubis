@@ -7,7 +7,6 @@ catchphrases
 preferred synonyms
 achronisms or slang
 
-
 Capture Syntax and Structure
 punctuation habits
 sentence length

@@ -1,8 +1,4 @@
-I need to upload documents and process those documents into the update_avatar_identity_with_media endpoint and the @src/anubis/utils/nodes.py langgraph graph. The file @data/mom/ texts_with_mom_adapter_training.txt should be classified with @ContentSituationClassificationClass.py (1-44) I also need a class like ContentSituationClassificationClass for reference document or biographical information: @schema.py (184-354) that will classify the menus as proprietary content or the bible as proprietary content and all other media appropriately here:
-@schema.py (356-394) 
-
-These are the different types of situations to classify:
-@_CURRENT_ACTION_ITEM.md (4-13) 
+# NAMESPACE GUIDANCE
 
 all media will be distilled from video, audio, and images into text if not text. 
 

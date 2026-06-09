@@ -1300,10 +1300,7 @@ async def message_avatar(
     # while the upload + evaluation pipeline ships first; the parameters exist
     # now so the frontend can wire its UI without a breaking API change later.
 
-    # allow for select avatar in query and anonymous user for a dedicated endpoint\
-
-    # TODO: REMOVE THIS BEFORE DEPLOYMENT AND AFTER TESTING!!!
-    # sleep(300)
+    # allow for select avatar in query and anonymous user for a dedicated endpoint
 
     logger.warning(f"stream:{stream}")
     start_time = time_ns()
@@ -1316,7 +1313,7 @@ async def message_avatar(
     user_name = your_name
     user_description = your_description
     user_id = current_user["identities"][0]["user_id"]
-    if request.headers.get("api-key") != "":
+    if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
         try:
             langgraph_client = get_client(headers=langgraph_client_headers)
@@ -1462,7 +1459,7 @@ async def get_all_conversations(
 ):
     """Return all threads for this user + assistant, newest-first."""
     user_id = current_user["identities"][0]["user_id"]
-    if request.headers.get("api-key") != "":
+    if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
         langgraph_client_headers = {
@@ -1490,7 +1487,7 @@ async def get_thread_messages(
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return the message history for a single thread."""
-    if request.headers.get("api-key") != "":
+    if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
         langgraph_client_headers = {
@@ -2042,7 +2039,7 @@ async def get_avatar_reference_image(
     same portrait that the chat-time consciousness loader reads.
     """
     store = app.state.store
-    if request.headers.get("api-key") != "":
+    if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
     else:
         langgraph_client_headers = {"API-KEY": app.state.context.anonymous_api_key}

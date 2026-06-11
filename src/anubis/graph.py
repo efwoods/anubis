@@ -296,15 +296,10 @@ async def think(
 
     if isinstance(final_message, AIMessage) and not final_message.tool_calls:
         _attach_go_emotions_metadata(final_message)
-        logger.info(
-            "Avatar Model Response: %s", getattr(final_message, "content", "")
-        )
-    else:
-        logger.warning(
-            "Deep agent final message is not a clean AIMessage; type=%s tool_calls=%s",
-            type(final_message).__name__,
-            getattr(final_message, "tool_calls", None),
-        )
+    # TODO: Authenticity metrics: score the (already-streamed) reply against the
+    # target author + ChatGPT baseline and attach to response_metadata. The
+    # user has seen the reply by now, so this adds no perceived latency.
+
 
     update: dict[str, Any] = {
         "messages": [final_message],

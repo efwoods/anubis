@@ -6,7 +6,6 @@ https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct
 https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct-QLORA_INT4_EO8
 https://llama.developer.meta.com/docs/overview/?team_id=3775658676066270&project_id=1839029780145302
 
-
 # state of the art
 https://developers.openai.com/api/docs/guides/model-optimization
 

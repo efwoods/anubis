@@ -16,6 +16,15 @@ FROM langchain/langgraph-api:3.11-wolfi
 #                  fallback for PyTorch's threading.
 RUN apk add --no-cache ffmpeg-7 libsndfile libgomp
 
+
+
+# spaCy English model used by the stylistic-profile / authenticity evaluator
+# (src/anubis/utils/dataset/stylistic_profile.py). Pre-bake it so the syntax
+# engine resolves to "spacy" without a multi-second runtime auto-download on the
+# first authenticity evaluation. Code degrades to nltk if this is ever absent.
+RUN python -m spacy download en_core_web_sm
+
+
 # -- Adding local package . --
 ADD . /deps/anubis
 # -- End of local package . --
@@ -23,6 +32,7 @@ ADD . /deps/anubis
 # -- Installing all local dependencies --
 RUN for dep in /deps/*; do             echo "Installing $dep";             if [ -d "$dep" ]; then                 echo "Installing $dep";                 (cd "$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e .);             fi;         done
 # -- End of local dependencies install --
+
 ENV LANGGRAPH_STORE='{"index": {"dims": 640, "embed": "huggingface:microsoft/harrier-oss-v1-270m", "fields": ["document.kwargs.page_content"]}}'
 # ENV LANGGRAPH_AUTH='{"path": "/deps/anubis/src/security/auth.py:auth", "disable_studio_auth": true}'
 ENV LANGGRAPH_HTTP='{"app": "/deps/anubis/src/api/webapp.py:app"}'

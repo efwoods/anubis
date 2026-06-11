@@ -22,7 +22,6 @@ https://www.google.com/search?client=firefox-b-1-m&q=mahalanobis+plot+i+need+to+
 
 ##############
 
-
 Iterate through a playlist: https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=6
 
 

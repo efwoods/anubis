@@ -49,6 +49,24 @@ def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
     logger.info("dev system prompt written to: %s", _DEV_SYSTEM_PROMPT_PATH)
 
 
+def _filter_items_by_score(items, threshold: float):
+    """Keep only ranked store items whose similarity ``score`` clears ``threshold``.
+
+    ``BaseStore.asearch``'s ``filter`` param matches against each item's stored
+    ``value`` dict — NOT the vector-similarity score. The relevance score is a
+    separate attribute on the returned ``SearchItem`` (populated post-ranking),
+    so score thresholding has to happen here, after the search returns. Items
+    with no score (e.g. an unranked, query-less search) are passed through
+    unchanged rather than dropped.
+    """
+    out = []
+    for it in items or []:
+        score = getattr(it, "score", None)
+        if score is None or score >= threshold:
+            out.append(it)
+    return out
+
+
 def _resolve_user_timezone(tz_name: str | None):
     """Resolve a client-supplied IANA timezone name to a ``tzinfo``.
 
@@ -182,6 +200,10 @@ async def _build_consciousness_system_message_update(
     ``load_consciousness`` tool (operates on ``AvatarDeepAgentState``); both
     schemas expose the same keys this helper reads.
     """
+
+    _RETRIEVAL_LIMIT = 10
+    _FILTER_SCORE = 0.40
+
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
 
@@ -288,7 +310,8 @@ async def _build_consciousness_system_message_update(
 
     assistant_identity_namespace = (creator_id, assistant_id, "identity")
     assistant_identity_document_items = await runtime.store.asearch(
-        assistant_identity_namespace, query=query, limit=1000
+        assistant_identity_namespace, query=query, 
+        # limit=_RETRIEVAL_LIMIT, filter={"score": {"$gte": _FILTER_SCORE}}
     )
     assistant_identity = reduce_docs([], assistant_identity_document_items)
 
@@ -342,7 +365,10 @@ async def _build_consciousness_system_message_update(
     retrieved_memories_items = await runtime.store.asearch(
         assistant_memory_namespace,
         query=query,
-        limit=10000,
+        limit=_RETRIEVAL_LIMIT,
+    )
+    retrieved_memories_items = _filter_items_by_score(
+        retrieved_memories_items, _FILTER_SCORE
     )
 
     # Coerce into document objects from Search Items
@@ -366,7 +392,9 @@ async def _build_consciousness_system_message_update(
 
     direct_quote_items = await runtime.store.asearch(
         (creator_id, assistant_id, "quote"), query=query,
+        limit=_RETRIEVAL_LIMIT,
     )
+    direct_quote_items = _filter_items_by_score(direct_quote_items, _FILTER_SCORE)
     logger.info(f"direct_quote_items: {direct_quote_items}")
     direct_quotes = reduce_docs([], direct_quote_items)
     
@@ -374,7 +402,10 @@ async def _build_consciousness_system_message_update(
     """ Retrieve Documents """
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
     retrieved_knowledge_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "document"), query=query
+        (creator_id, assistant_id, "document"), query=query, limit=_RETRIEVAL_LIMIT,
+    )
+    retrieved_knowledge_items = _filter_items_by_score(
+        retrieved_knowledge_items, _FILTER_SCORE
     )
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)

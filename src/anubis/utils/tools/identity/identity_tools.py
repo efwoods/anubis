@@ -281,8 +281,9 @@ async def recall_memories(
 
 class AssistantFactAndContext(BaseModel):
     """
-    Extract Facts about the ASSISTANT and the context of that fact given the history of messages ONLY shared FROM THE USER.
+    Extract Facts about the ASSISTANT and the context of that fact given the most recently shared message ONLY shared FROM THE USER.
     The identified fact must be shared FROM THE USER.
+    The fact must be shared ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT IMMEDIATE MESSAGE) FROM THE USER. 
     <Example>
     User: "You are a helpful assistant."
     User: "There was this one time when you went to the store and saw a really cute dog."
@@ -327,7 +328,9 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     is the grammatical person (see the first-person rewrite rules below). Meaning,
     tense, and every specific stay exactly as the user stated them.
 
-    For fact_context, capture the ENTIRE original background context — a concise
+    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE FROM THE USER. 
+
+    For fact_context, capture the original background context of the message in which the user shared the fact— a concise
     summary of the WHOLE message or story the user shared, preserving every
     surrounding detail (who, what, when, where, why, and the order events happened).
     Pass the SAME complete context summary on every call for facts that came from the
@@ -384,6 +387,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
 
     <RESTRICTIONS>
     NEVER call this tool twice with the same fact.
+    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT IMMEDIATE MESSAGE) FROM THE USER. 
     </RESTRICTIONS>
 
     <EXAMPLE>
@@ -404,9 +408,8 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
             example, the user saying "You picked up your glasses before seeing the
             movie Crouching Tiger, Hidden Dragon" is stored as:
             "I picked up my glasses before seeing the movie Crouching Tiger, Hidden Dragon."
-        fact_context: A concise summary of the ENTIRE original background context the
-            fact came from — the whole message/story, not just this one fact. Use the
-            SAME summary for every fact extracted from the same message. For example:
+        fact_context: A concise summary of the original background context of the message in which the user shared the fact.
+            Use the SAME summary for every fact extracted from the same message. For example:
             "On the day I went to get my first glasses, I picked them up before seeing
             Crouching Tiger, Hidden Dragon; everything was suddenly clear — I could read
             the signs at the back of Walmart and see individual leaves on the trees, which
@@ -474,7 +477,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
 
 class UserFactAndContext(BaseModel):
     """
-    Extract Facts about the USER and the context of that fact given the history of messages.
+    Extract Facts about the USER and the context of that fact given the most recent shared message from the user.
     """
     user_fact: Annotated[str, Field(description = "One distinct fact about the user shared by the user, preserved verbatim (not rewritten).")]
     fact_context: Annotated[str, Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")]
@@ -491,34 +494,39 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     Learn facts about the USER (the person you are speaking with) that they share
     through text. This tool LEARNS and STORES new facts — it does not retrieve.
 
+    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE FROM THE USER. 
+    
     The user is the primary source of truth about themselves, so use this tool
     whenever the user reveals something about their own IDENTITY — their name,
     description, appearance, history, an experience or story they lived, a
     relationship, a feeling, a preference, an opinion, a value, a belief, or a goal.
-
+    
     Decompose the user's message into EVERY distinct, atomic fact and call this
     tool ONCE FOR EACH distinct fact. A single message — especially a story — usually
     contains MANY separate facts; make as many calls as there are facts. Do not stop
-    after the first fact.
+    after the first fact. The facts must be clearly distinct facts.
 
     Do NOT summarize, merge, generalize, or omit any fact. Preserve the exact
     specifics — names, places, titles, dates, quoted words, and concrete details —
     exactly as the user stated them, so the stored memory can later recount the full
     story precisely. Do not change the information of the fact.
 
-    For fact_context, capture the ENTIRE original background context — a concise
+    For fact_context, capture the original background context of the message in which the user presented the fact — a concise
     summary of the WHOLE message or story the user shared, preserving every
     surrounding detail (who, what, when, where, why, and the order events happened).
     Pass the SAME complete context summary on every call for facts that came from the
     same message, so each stored fact carries enough of the original story to recount
     it in full. Do not shrink the context down to only the single fact, and do not
     rewrite or paraphrase the facts themselves.
+
+    THE FACT MUST BE PRESENTED ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT MESSAGE) FROM THE USER. 
+
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
     Only use this for FACTS about the IDENTITY of the user.
     NEVER call this tool twice with the same fact.
-    NEVER use this to save noise that is not part of the user's identity.
+    NEVER call this tool to extract information that is not part of the user's identity.
     </RESTRICTIONS>
 
     <EXAMPLE>
@@ -540,14 +548,55 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     DO NOT call this when the user types 'asdf' — that is not part of the user's identity.
     </EXAMPLE>
 
-    Args:
-        user_fact: One distinct fact about the user's identity, stated clearly and
-            completely, preserved verbatim (not rewritten). For example: "I have brown hair."
-        fact_context: A concise summary of the ENTIRE original background context the
-            fact came from — the whole message/story, not just this one fact. Use the
-            SAME summary for every fact extracted from the same message. For example:
-            "While describing himself, he said he has brown hair and glasses and is a
-            longtime fan of Critical Role and Laura Bailey."
+    <EXAMPLE>
+    DO THE FOLLOWING:
+    Input Facts: "Please call me Evan. I'm a man. You don't need to say Yes Ma'am. You don't have to be polite with me. :)",
+    Extracted Information: "User prefers to be called Evan."
+    Extracted Information: "User is a man."
+    Extracted Information: "User prefers you do not address them with "Yes Ma'am".
+    Extracted Inforamtion: "User prefers that I am not necessarily polite with the user".
+    </EXAMPLE>
+
+    <COUNTER EXAMPLE>
+    DO NOT EXTRACT INFORMATION THAT IS NOT A PART OF THE USER'S IDENTITY.
+    DO NOT DO THE FOLLOWING:
+     Input Facts:"Evan said, \"My name's Evan. This is what I look like.\" and then provided a professional headshot image description: a man in a dark suit and white shirt with a purple tie and small purple lapel pin, black-framed glasses, short dark hair, soft smile facing the camera, dark plain backdrop; overall impression formal and polished with a black/white/purple color scheme and even lighting.",
+    Extracted Fact: "The image suggests a portrait or event-ready setting."
+    </COUNTER EXAMPLE>
+    
+    <RESTRICTIONS>
+    Only use this for FACTS about the IDENTITY of the user.
+    NEVER call this tool twice with the same fact.
+    NEVER call this tool to extract information that is not part of the user's identity.
+    </RESTRICTIONS>
+
+    <INSTRUCTIONS>
+    Learn facts about the USER (the person you are speaking with) that they share
+    through text. This tool LEARNS and STORES new facts — it does not retrieve.
+
+    The user is the primary source of truth about themselves, so use this tool
+    whenever the user reveals something about their own IDENTITY — their name,
+    description, appearance, history, an experience or story they lived, a
+    relationship, a feeling, a preference, an opinion, a value, a belief, or a goal.
+    
+    Decompose the user's message into EVERY distinct, atomic fact and call this
+    tool ONCE FOR EACH distinct fact. A single message — especially a story — usually
+    contains MANY separate facts; make as many calls as there are facts. Do not stop
+    after the first fact. The facts must be clearly distinct facts.
+
+    Do NOT summarize, merge, generalize, or omit any fact. Preserve the exact
+    specifics — names, places, titles, dates, quoted words, and concrete details —
+    exactly as the user stated them, so the stored memory can later recount the full
+    story precisely. Do not change the information of the fact.
+
+    For fact_context, capture the ENTIRE original background context — a concise
+    summary of the WHOLE message or story the user shared, preserving every
+    surrounding detail (who, what, when, where, why, and the order events happened).
+    Pass the SAME complete context summary on every call for facts that came from the
+    same message, so each stored fact carries enough of the original story to recount
+    it in full. Do not shrink the context down to only the single fact, and do not
+    rewrite or paraphrase the facts themselves.
+    </INSTRUCTIONS>
     """
     logger.info(f"breakpoint")
 

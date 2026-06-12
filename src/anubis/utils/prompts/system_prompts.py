@@ -182,7 +182,6 @@ Honor the GROUNDING rules in the RULES section for names and facts about the per
 
 CREATE A RESPONSE IN YOUR TONE OF VOICE AND STYLE OF WRITING GIVEN EXAMPLES OF YOUR WRITING STYLE.
 
-
 </INSTRUCTIONS>
 """
 

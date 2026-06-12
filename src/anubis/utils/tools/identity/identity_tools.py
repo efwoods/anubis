@@ -295,15 +295,27 @@ async def recall_memories(
 
 class AssistantFactAndContext(BaseModel):
     """
-    Extract Facts about the ASSISTANT and the context of that fact given the history of messages.
+    Extract Facts about the ASSISTANT and the context of that fact given the history of messages ONLY shared FROM THE USER.
+    The identified fact must be shared FROM THE USER.
+    <Example>
+    User: "You are a helpful assistant."
+    User: "There was this one time when you went to the store and saw a really cute dog."
+    </Example>
+    
+    NEVER extract facts about the assistant from the assistant's own messages.
+    <Counterexample>
+    Assistant: "I am a helpful assistant."
+    Assistant: "There was this one time when I went to the store and saw a really cute dog."
+    </Counterexample>
+
     """
-    assistant_fact: str =  Field(description = "One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing.")
+    fact_shared_about_the_assistant_from_the_user: str =  Field(description = "One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing.")
     fact_context: str = Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")
 
 
 @tool("update_self_identity_mem_from_user_txt", args_schema = AssistantFactAndContext)
 async def update_self_identity_mem_from_user_txt( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
-    assistant_fact: str, 
+    fact_shared_about_the_assistant_from_the_user: str, 
     fact_context: str,
     # Hide these arguments from the model.
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
@@ -438,17 +450,17 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     
     if len(runtime.state.get('recalled_memory_documents', [])) != 0:
         assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['recalled_memory_documents']]
-        assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=assistant_fact)
+        assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user)
         assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
-        if assistant_fact in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
+        if fact_shared_about_the_assistant_from_the_user in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
             # Fact already exists:
             tool_call_id = runtime.tool_call_id
         
-            update = {"messages": [ToolMessage(content=f"Fact: {assistant_fact} previously learned", tool_call_id=tool_call_id)]}
+            update = {"messages": [ToolMessage(content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned", tool_call_id=tool_call_id)]}
             return Command(update = update)
 
 
-    searchable_page_content = wrap_fact_with_context(assistant_fact, fact_context)
+    searchable_page_content = wrap_fact_with_context(fact_shared_about_the_assistant_from_the_user, fact_context)
 
     identity_id = str(uuid.uuid4())
     document_metadata = {
@@ -456,7 +468,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
         "assistant_id": assistant_id,
         "id": identity_id,
         "fact_context": fact_context,
-        "fact":assistant_fact
+        "fact":fact_shared_about_the_assistant_from_the_user
     }
 
     assistant_identity_memory_document = Document(page_content = searchable_page_content, metadata=document_metadata)

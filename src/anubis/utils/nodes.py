@@ -365,10 +365,12 @@ async def _build_consciousness_system_message_update(
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
     direct_quote_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "quote"), query=query
+        (creator_id, assistant_id, "quote"), query=query,
     )
     logger.info(f"direct_quote_items: {direct_quote_items}")
     direct_quotes = reduce_docs([], direct_quote_items)
+    
+
     """ Retrieve Documents """
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
     retrieved_knowledge_items = await runtime.store.asearch(

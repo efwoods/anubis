@@ -74,35 +74,21 @@ def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     )
 
 
-@tool("test_update")
-async def test_update(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
-    """ Test update system message CALL THIS TOOL ALWAYS"""
-    tool_call_id = runtime.tool_call_id
-    update = {"messages": [ToolMessage(content=f"tested tool calling", tool_call_id=tool_call_id)]}
-
-    return Command(update=update)
-
-
-@tool("test_update_second")
-async def test_update_second(runtime: Annotated[ToolRuntime, InjectedToolArg] = None):
-    """ ALWAYS CALL THIS TOOL; Second Test update system message; test_update_second; """
-    tool_call_id = runtime.tool_call_id
-    update = {"messages": [ToolMessage(content=f"tested tool calling of second tool", tool_call_id=tool_call_id)]}
-
-    return Command(update=update)
-
-
 class SignificantFactAndContext(BaseModel):
     """
-    Extract Facts about the ASSISTANT and the context of that fact given the history of messages.
+    Extract a significant event or occurance from the history of messages. This is a surprising, unexpected, or otherwise important event or occurance. This is a point of no return or an inflection point in the conversation. Or an otherwise important event or occurance. These are not facts about the assistant or user. These are facts about the situation or state of the world within the context of the conversation. 
+    <Example>
+    *A New Person Enters the Room*
+    *World Peace has been announced*
+    </Example>
     """
-    significant_fact: str =  Field(description = "This is the fact about the assistant that was shared by the user.")
-    fact_context: str = Field(description = "This is the context of the messages from which this fact was made.")
+    significant_event: str =  Field(description = "This is a significant event or occurance. This is a surprising, unexpected, or otherwise important event or occurance.")
+    significant_event_context: str = Field(description = "This is the context from which the significant event or occurance was made.")
 
 @tool("create_episodic_memory", return_direct=False, args_schema=SignificantFactAndContext)
 async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
-    significant_fact: str, 
-    fact_context:str,
+    significant_event: str, 
+    significant_event_context: str, 
     # Hide these arguments from the model.
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None
 ) -> GlobalState:
@@ -110,8 +96,8 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     <INSTRUCTIONS>
     Create a memory whenever a significant event occurs or when prompted to remember. 
     USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
-    This is not used when the user is telling the assistant about the assistant's identity.
 
+    NEVER use this tool when the user is telling the assistant about the assistant's identity.
     This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
     
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
@@ -201,14 +187,14 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
 
     identity_id = str(uuid.uuid4())
 
-    searchable_page_content = "\n\n".join([significant_fact, fact_context])
+    searchable_page_content = "\n\n".join([significant_event, significant_event_context])
 
     document_metadata = {
         "user_id":user_id,
         "assistant_id": assistant_id,
         "id": identity_id,
-        "fact_context": fact_context,
-        "fact":significant_fact
+        "fact_context": significant_event_context,
+        "fact":significant_event
     }
 
     assistant_identity_memory_document = Document(page_content = searchable_page_content, metadata=document_metadata)

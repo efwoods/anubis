@@ -307,89 +307,36 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
-    Learn facts about YOURSELF (the assistant) that the user shares through text.
+    Learn facts about the ASSISTANT (you, the avatar) when the user tells you, in
+    text, something about who you are. This tool LEARNS and STORES new identity
+    facts about you — it does not retrieve.
 
-    Use this tool whenever the user tells you something about the IDENTITY of the
-    assistant, model, or LLM — anything addressed to the assistant using YOU, YOUR, YOURS, or by the
-    assistant's given name (for example, the user telling you your name, your
-    history, an experience you had, a relationship, a feeling, or a preference).
+    THE FACT MUST COME ONLY FROM THE PREVIOUS MESSAGE (the most recent, immediate
+    message) FROM THE USER. Do not learn from older messages already processed, and
+    do not re-run on a message you have already learned from — repeated copies of
+    the same message must NOT produce the same fact again.
 
-    NOT ALL STATEMENTS USING YOU, YOUR, YOURS, or the assistant's given name are facts about the assistant.
-    ONLY use this tool when a story or fact is being shared about the assistant directly
-    ALWAYS CALL THIS TOOL WHEN A STATEMENT IS ABOUT YOU DIRECTLY AND YOU DO NOT ALREADY KNOW THAT INFORMATION. For example: You are a smart and confident person.
+    Decompose the user's message into EVERY distinct, atomic fact and call this tool
+    ONCE FOR EACH distinct fact. A single message — especially a story — usually
+    contains MANY separate facts; make as many calls as there are facts, each with
+    the SAME ``fact_context``. Do not stop after the first fact.
 
-    Decompose the user's message into EVERY distinct, atomic fact and call this
-    tool ONCE FOR EACH distinct fact. A single message usually contains MANY
-    separate facts — make as many calls as there are facts. Do not stop after the
-    first fact.
+    Every fact MUST be REWRITTEN IN FIRST PERSON per the rewrite rules in the field
+    description: only the tokens that refer to you ("you / your / yourself" and your
+    given name) become "I / my / myself"; every other person stays third person.
+    Change ONLY the grammatical person — never the information, specifics, or tense.
 
-    Do NOT summarize, merge, generalize, or omit any fact. Preserve the exact
-    specifics — names, places, titles, dates, quoted words, and concrete details —
-    exactly as the user stated them, so the memory can later recount the full story
-    precisely. Do not change the INFORMATION of the fact: the ONLY change you make
-    is the grammatical person (see the first-person rewrite rules below). Meaning,
-    tense, and every specific stay exactly as the user stated them.
-
-    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE FROM THE USER. 
-
-    For fact_context, capture the original background context of the message in which the user shared the fact— a concise
-    summary of the WHOLE message or story the user shared, preserving every
-    surrounding detail (who, what, when, where, why, and the order events happened).
-    Pass the SAME complete context summary on every call for facts that came from the
-    same message, so each stored fact carries enough of the original story to recount
-    it in full. Do not shrink the context down to only the single fact. Write
-    fact_context in the SAME first person as the fact (apply the same rewrite rules
-    below); changing the grammatical person is the only rewriting allowed — do not
-    otherwise paraphrase, add, or drop anything.
-
-    <FIRST_PERSON_REWRITE>
-    Both assistant_fact and fact_context MUST be REWRITTEN IN FIRST PERSON. The user
-    is addressing YOU (the assistant) in the second person; convert every token that
-    refers to YOU, and ONLY the grammatical person — never the information.
-
-    THE ONLY TOKENS THAT BECOME FIRST PERSON are the ones that refer to YOU:
-    "you / your / yours / yourself / yourselves" and the assistant's GIVEN NAME.
-    They become "I / my / mine / me / myself" (or your name where natural). Leave no
-    stray "you" or "your" that refers to you in the output.
-
-    EVERY OTHER PERSON STAYS IN THE THIRD PERSON. This includes bare third-person
-    pronouns — "he / she / they / him / her / his / hers / their / them" — and named
-    or described people ("your dad", "your mom", "your sister", "Jordan"). A
-    third-person pronoun in the user's message refers to someone OTHER than you; it
-    is NOT you. Do NOT convert "he / she / they" into "I / we". Only flip the
-    target-referring possessive attached to such a person: "your dad" -> "my dad",
-    "your mom" -> "my mom". The person themself stays "he / she / they / my dad".
-
-    - When a sentence's subject is another person but it carries target tokens,
-      flip ONLY the target tokens and keep that subject third-person. Examples:
-        "Your mom felt bad that you couldn't see"
-          -> "My mom felt bad that I couldn't see"
-          (NOT "I felt bad that I couldn't see"; NOT leaving "your mom"/"you").
-        "He married your mother and they spent the first few years of their
-         marriage having fun. Then they decided to have kids."
-          -> "He married my mother and they spent the first few years of their
-             marriage having fun. Then they decided to have kids."
-          (NOT "I married my mother and we spent ... our marriage. Then we decided
-           to have kids." — "he" is your dad and "they" is your parents; neither is
-           you.)
-    - "they" referring to other people stays "they" (or names them, e.g. "my
-      parents"). It becomes "we" ONLY when the group explicitly includes YOU.
-    - Use "we" / "my mom and I" only when YOU and another person are a joint subject
-      or the predicate is mutual ("you and your mom were a team" -> "my mom and I
-      were a team"). Plain accompaniment stays singular: "you watched movies with
-      your mom" -> "I watched movies with my mom" (NOT "we watched movies").
-    - SEMANTIC SANITY CHECK: if your first-person rewrite asserts something
-      impossible or absurd about yourself — marrying your own mother, fathering
-      yourself, being your own parent/sibling — you have mis-resolved a third-person
-      subject as YOU. Stop, restore that subject to third person, and re-check.
-    - After flipping a pronoun, re-check subject-verb agreement and possessives so
-      the sentence stays grammatical.
-    </FIRST_PERSON_REWRITE>
+    DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN.
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
+    Only use this for FACTS about the IDENTITY of the assistant (you).
     NEVER call this tool twice with the same fact.
-    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT IMMEDIATE MESSAGE) FROM THE USER. 
+    NEVER learn a fact from any message other than the user's most recent message.
+    NEVER learn a fact from an ASSISTANT message — including the assistant restating
+      a fact it already learned about itself. Facts come ONLY from the user.
+    NEVER store a request, instruction, goal, or preference about how you should
+      behave or be built — that is not an identity fact about the avatar.
     </RESTRICTIONS>
 
     <EXAMPLE>
@@ -403,7 +350,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
       name is Shivon Zilis, that I have twins, and that I love hockey."
     </EXAMPLE>
 
-        
+
     <Example>
     Input: There was this one time where you went on a picnic and we tried new foods and rolled around in a bed of flowers.
     fact_context: I was told that I once went on a picnic and influenced another person to try new foods and rolled around in a bed of flowers with that person.
@@ -413,10 +360,24 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     </Example>
 
     <Example>
-    Input: You have long flowing curly hair. 
+    Input: You have long flowing curly hair.
     fact_context: I was told that I have long flowing curly hair.
     Fact: I have long flowing curly hair.
     </Example>
+
+    <COUNTER EXAMPLE>
+    DO NOT store behavior requests or build instructions, and DO NOT store facts that
+    were never rewritten into first person. The following is WRONG on both counts and
+    must NEVER be produced:
+      fact_context: 'In the conversation, the user says: I want you to sound
+        authentic like shivon zilis and be able to be integrated in social media
+        applications and perform analysis on your personal data...'
+      fact_shared_about_the_assistant_from_the_user: 'I want you to sound authentic
+        like shivon zilis and be able to be integrated in social media applications
+        and perform analysis on your personal data.'
+    This is a request about how the avatar should be built — not a fact about the
+    assistant's identity — so this tool should not be called at all.
+    </COUNTER EXAMPLE>
 
     Args:
         fact_shared_about_the_assistant_from_the_user: One distinct fact about the assistant's identity, stated
@@ -452,18 +413,30 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     # namespace the consciousness loader reads from.
     assistant_memory_namespace = (user_id, assistant_id, 'identity_memory')
 
-    # VERIFY FACT DOES NOT ALREADY EXIST in memories
-    
-    if len(runtime.state.get('recalled_memory_documents', [])) != 0:
-        assistant_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['recalled_memory_documents']]
-        assistant_content_store_query_results = await runtime.store.asearch(assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user)
-        assistant_content_store_query_results_significant = [item for item in assistant_content_store_query_results if item.score > 0.8]
-        if fact_shared_about_the_assistant_from_the_user in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
-            # Fact already exists:
-            tool_call_id = runtime.tool_call_id
-        
-            update = {"messages": [ToolMessage(content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned", tool_call_id=tool_call_id)]}
-            return Command(update = update)
+    # VERIFY FACT DOES NOT ALREADY EXIST.
+    # Dedup against (a) the identity docs already loaded into state this turn and
+    # (b) a live similarity search of the same namespace. We compare against
+    # ``assistant_identity_documents`` — the field ``load_consciousness`` fills from
+    # this exact ``identity_memory`` namespace — NOT ``recalled_memory_documents``,
+    # which comes from the separate episodic ``memory`` namespace and is unrelated
+    # here. The store search must run unconditionally (the previous code gated it on
+    # recalled memories being present, so duplicates slipped through on any turn
+    # with no recalled memories). Mirrors ``learn_information_about_the_user``.
+    assistant_identity_documents_text_list = [
+        document.metadata.get("fact")
+        for document in runtime.state.get('assistant_identity_documents', [])
+    ]
+    assistant_content_store_query_results = await runtime.store.asearch(
+        assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user
+    )
+    assistant_content_store_query_results_significant = [
+        item for item in assistant_content_store_query_results if item.score and item.score > 0.8
+    ]
+    if fact_shared_about_the_assistant_from_the_user in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
+        # Fact already exists:
+        tool_call_id = runtime.tool_call_id
+        update = {"messages": [ToolMessage(content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned", tool_call_id=tool_call_id)]}
+        return Command(update = update)
 
 
     searchable_page_content = wrap_fact_with_context(fact_shared_about_the_assistant_from_the_user, fact_context)

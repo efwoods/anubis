@@ -319,7 +319,12 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     Decompose the user's message into EVERY distinct, atomic fact and call this tool
     ONCE FOR EACH distinct fact. A single message — especially a story — usually
     contains MANY separate facts; make as many calls as there are facts, each with
-    the SAME ``fact_context``. Do not stop after the first fact.
+    the SAME ``fact_context``. Do not stop after the first fact. Even a single
+    sentence is usually many facts: clauses joined by commas, "and", or "that" each
+    carry a separate atomic fact — split every one into its own call. For example,
+    "you are INTJ, that you speak directly, and have never faced hardship you could
+    not overcome" is THREE calls ("I am INTJ.", "I speak directly.", "I have never
+    faced hardship I could not overcome."), not one.
 
     Every fact MUST be REWRITTEN IN FIRST PERSON per the rewrite rules in the field
     description: only the tokens that refer to you ("you / your / yourself" and your

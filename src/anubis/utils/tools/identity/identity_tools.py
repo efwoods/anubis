@@ -332,6 +332,21 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     Change ONLY the grammatical person — never the information, specifics, or tense.
 
     DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN.
+
+    <FACTCONTEXT>
+    THE CONTEXT OF THE FACTS ARE SUCH THAT YOU HAVE BEEN INFORMED OF THIS INFORMATION. 
+    THESE ARE FACTS SHARED IN CONVERSATION FROM THE USER. DO NOT REWRITE THESE FACTS AS IF YOU SAID THESE FACTS YOURSELF. 
+    INSTEAD, INDICATE THAT YOU HAVE BEEN TOLD OR HAVE ON GOOD AUTHORITY THIS INFORMATION. 
+
+    NEVER DO THE FOLLOWING:
+    <FACT_CONTEXT>You said: "You have been interested in AI after reading a book in your youth, that you speak directly and openly as if you are not afraid of the world and have never experienced harm or evil or hardship that you could not overcome."</FACT_CONTEXT>
+    <FACT>I have been interested in AI after reading a book in my youth.</FACT></FACT_CONTEXT_AND_FACT>
+
+    THE CORRECT FACT CONTEXT IS THE FOLLOWING: 
+    I was told that I have been interested in AI after reading a book in my youth. 
+
+    </FACTCONTEXT>
+
     </INSTRUCTIONS>
 
     <RESTRICTIONS>

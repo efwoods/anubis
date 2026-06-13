@@ -1,4 +1,17 @@
 
+# Obvious problems
+ - [] Transcription is not always accurate: “empirical version of the JACE talk.”: https://www.youtube.com/watch?v=-tQwzhHjAVI
+ - [] Response structure sounds like chatgpt: response; suggested list of advice; probe to continue the conversation
+ - [] Testing is slow
+ - [] Fine tuning on known responses to reduce false positives; 
+ - [] Duplicates in system prompt of retrieved assistant_identity documents
+  
+The data is inaccurate; duplicated, responses are incorrect and inauthentic.
+
+Tool: update_self_identity_mem_from_text: incorrect format and use;
+
+# Goal: Accurate relevant data and correct authentic responses.
+
 
 # COMPARING AUTHENTICITY OF GENERATED RESPONSES
 data/elon-musk-dataset/elon_musk_tweets.csv

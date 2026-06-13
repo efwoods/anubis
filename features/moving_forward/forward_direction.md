@@ -9,7 +9,7 @@ psycho analysis (inspect prompts to discover features)
 
 duplicate (facts are echoing in response)
 
-both these avatars present inaccuracte factual information
+both these avatars present inaccurate factual information
 
 Shivon avatar test id
 b7738560-c7b7-4cc2-a1af-6b579552c3e9
@@ -38,6 +38,4 @@ forgot password url
 
 ##
 Examine and modify system prompts during testing and retrieval
-
-
 # Evaluation worktree

@@ -1,38 +1,23 @@
 """ Agent SubGraph Tools """
 import uuid
 import logging
-from typing import List, Annotated
 
 from langchain.tools import tool, ToolRuntime
 from langchain_core.documents import Document
 from langchain_core.tools import InjectedToolArg
-from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
-from src.anubis.utils.state import GlobalState
-
-logger = logging.getLogger(__name__)
-
-from langchain_core.messages import AnyMessage
-from typing import Annotated
-from pydantic import BaseModel, Field
-
-from src.anubis.utils.model import init_model
-from src.anubis.utils.utility import extract_user_id_assistant_id
-from typing import Dict
-from langgraph.types import Command
-
+from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 
 from langgraph.types import Command
 from langchain_core.messages import ToolMessage
 
-from pydantic import BaseModel, Field
-from langchain.tools import ToolRuntime, tool
-from src.anubis.utils.utility import extract_user_id_assistant_id
+from src.anubis.utils.state import GlobalState
 from src.anubis.utils.model import init_model
+from src.anubis.utils.utility import extract_user_id_assistant_id
 
-from langchain_core.messages import SystemMessage
+logger = logging.getLogger(__name__)
 
-from langgraph.prebuilt import InjectedState
+from typing import Annotated
+from pydantic import BaseModel, Field
 
 """ READ ME: STORE NAMESPACE STORAGE AND RETRIEVAL CONDITIONS
 
@@ -49,7 +34,6 @@ RETRIEVED KNOWLEDGE or 'DOCUMENT' IS RESERVED FOR DOCUMENTS THAT THE ASSISTANT H
 QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND WRITING STYLE WHERE RETRIEVED KNOWLEDGE DOCUMENT ARE NOT DIRECTLY FROM THE ASSISTANT AND ARE USER FOR CONTENT ONLY.
 
 """
-
 
 def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     """Wrap a single atomic fact with its ENTIRE original background context.
@@ -287,6 +271,21 @@ class AssistantFactAndContext(BaseModel):
     User: "You are a helpful assistant."
     User: "There was this one time when you went to the store and saw a really cute dog."
     </Example>
+
+    <Example>
+    Input: There was this one time where you went on a picnic and we tried new foods and rolled around in a bed of flowers.
+    fact_context: I was told that I once went on a picnic and influenced another person to try new foods and rolled around in a bed of flowers with that person.
+    Fact: I once went on a picnic.
+    Fact: I had another person try new foods.
+    Fact: I rolled around in a bed of flowers with this person.
+    </Example>
+
+    <Example>
+    Input: You have long flowing curly hair. 
+    fact_context: I was told that I have long flowing curly hair.
+    Fact: I have long flowing curly hair.
+    </Example>
+
     
     NEVER extract facts about the assistant from the assistant's own messages.
     <Counterexample>
@@ -311,9 +310,13 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     Learn facts about YOURSELF (the assistant) that the user shares through text.
 
     Use this tool whenever the user tells you something about the IDENTITY of the
-    assistant, model, or LLM — anything addressed as YOU, YOUR, YOURS, or by the
+    assistant, model, or LLM — anything addressed to the assistant using YOU, YOUR, YOURS, or by the
     assistant's given name (for example, the user telling you your name, your
     history, an experience you had, a relationship, a feeling, or a preference).
+
+    NOT ALL STATEMENTS USING YOU, YOUR, YOURS, or the assistant's given name are facts about the assistant.
+    ONLY use this tool when a story or fact is being shared about the assistant directly
+    ALWAYS CALL THIS TOOL WHEN A STATEMENT IS ABOUT YOU DIRECTLY AND YOU DO NOT ALREADY KNOW THAT INFORMATION. For example: You are a smart and confident person.
 
     Decompose the user's message into EVERY distinct, atomic fact and call this
     tool ONCE FOR EACH distinct fact. A single message usually contains MANY
@@ -400,8 +403,23 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
       name is Shivon Zilis, that I have twins, and that I love hockey."
     </EXAMPLE>
 
+        
+    <Example>
+    Input: There was this one time where you went on a picnic and we tried new foods and rolled around in a bed of flowers.
+    fact_context: I was told that I once went on a picnic and influenced another person to try new foods and rolled around in a bed of flowers with that person.
+    Fact: I once went on a picnic.
+    Fact: I made another person try new foods.
+    Fact: I rolled around in a bed of flowers with this person.
+    </Example>
+
+    <Example>
+    Input: You have long flowing curly hair. 
+    fact_context: I was told that I have long flowing curly hair.
+    Fact: I have long flowing curly hair.
+    </Example>
+
     Args:
-        assistant_fact: One distinct fact about the assistant's identity, stated
+        fact_shared_about_the_assistant_from_the_user: One distinct fact about the assistant's identity, stated
             clearly and completely, REWRITTEN IN FIRST PERSON per the rewrite rules
             above (change only the grammatical person, never the information). For
             example, the user saying "You picked up your glasses before seeing the
@@ -799,6 +817,3 @@ async def update_identity_via_reference_image(message: HumanMessage, runtime: An
         if message.get("image_url", "") != "":
             image_url = message.get("image_url")
     description = image_to_text(target_image_url=image_url)
-
-# @tool
-# async def update_identity_via_text_content_url(

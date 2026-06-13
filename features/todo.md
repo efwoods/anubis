@@ -1,4 +1,15 @@
 
+# Obvious problems
+ - [] Transcription is not always accurate: “empirical version of the JACE talk.”: https://www.youtube.com/watch?v=-tQwzhHjAVI
+ - [] Response structure sounds like chatgpt: response; suggested list of advice; probe to continue the conversation
+ - [] Testing is slow
+ - [] Fine tuning on known responses to reduce false positives; 
+ - [] Duplicates in system prompt of retrieved assistant_identity documents
+  
+The data is inaccurate; duplicated, responses are incorrect and inauthentic.
+
+# Goal: Accurate relevant data and correct authentic responses.
+
 
 <<<<<<< HEAD
 MERGE PSYCHO ANALYSIS WITH MULTI-FILE UPLOADS
@@ -28,7 +39,6 @@ automate preprocessing collecting and preprocessing of llm data for responses (c
 https://www.google.com/search?client=firefox-b-1-m&q=mahalanobis+plot+i+need+to+know+to+what+degree+the+tweets+i+make+are+authentic&zx=1774299854965&no_sw_cr=1&fbs=ADc_l-bZnt6jMmErT-KRarIgXyuyzQTJF2PfkaOcTEalUPOVQOtlzownaoM46W2pScWjtBeiLTI6jl7uuBUhx4iC4iPTTJimJc6C_VwSLMaMy1J-5nzkD6p6csmb37ID92SDE-exCF46WPNzQdNHd1fpq-TmW4kQlGQ7a2_aVG30JAA7JPbzRX-wBWFkIAoqZbjb1_qIrzkSk-L-rW19pSfNoCRBAQlFCx-IDUv1N5OidEAKGpywaXo&aep=10&ntc=1&mstk=AUtExfCUxcYygjoG8VdAMpRFVH-POCqcz91VZBq-or3lPPszQWPRwtEh6ZqyxMKVi1g8HBMbN_C-9f9Vr-5_RAH3tN8L8TX9FtjC0WkcSGazwcp4o7yOg5rwZuRE8W6mRtDC9d_7Wh7lB3LFxApf_v54WpvAYQgVvOyE2co_AVkKrXYsBFO7mBnQWpqlzI5Bn1R-XGImR-zoSHCL_Oi3FJxxrOt57rSoobhErRlPVyZ4hSP0BSGM1VyYR07r0YduPyE8zSL8RBsslmOYnvKRcFxu3YTocgNOl-8xumE&csuir=1&aioh=3&mtid=86rBabO6O-DdptQP7uqL6A0&udm=50#lfId=ChxjMe
 
 ##############
-
 
 Iterate through a playlist: https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=6
 

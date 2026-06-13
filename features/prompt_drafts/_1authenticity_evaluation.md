@@ -96,11 +96,9 @@ similarity to the ACTUAL PRIMARY SOURCE OF WRITING FROM THE REAL PERSON (this da
 I need to create a linguistic profile and measure the authenticity of the generated responses (dissimilarity to whatever base model is being used and similarity to any of the ground truth 
   examples that exist; also include all other metrics as detailed in these plans; synthsize all plans together along with all reference materials here in this document): 
 
-
 # Evaluation Measurement Plans
 ~/.claude/plans/features-given-the-sparkling-valiant.md
 ~/.claude/plans/hazy-snacking-treasure.md
-
 
 # Psycho Analysis Plans (analysis and stylistic fingerprint and analysis pipeline)
 ~/.claude/plans/serene-stargazing-sutherland.md 

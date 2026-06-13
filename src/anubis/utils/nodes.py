@@ -48,7 +48,6 @@ def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
     _DEV_SYSTEM_PROMPT_PATH.write_text(system_message_str, encoding="utf-8")
     logger.info("dev system prompt written to: %s", _DEV_SYSTEM_PROMPT_PATH)
 
-
 def _resolve_user_timezone(tz_name: str | None):
     """Resolve a client-supplied IANA timezone name to a ``tzinfo``.
 
@@ -182,6 +181,10 @@ async def _build_consciousness_system_message_update(
     ``load_consciousness`` tool (operates on ``AvatarDeepAgentState``); both
     schemas expose the same keys this helper reads.
     """
+
+    _RETRIEVAL_LIMIT = 10
+    _FILTER_SCORE = 0.5
+
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
 
@@ -288,8 +291,11 @@ async def _build_consciousness_system_message_update(
 
     assistant_identity_namespace = (creator_id, assistant_id, "identity")
     assistant_identity_document_items = await runtime.store.asearch(
-        assistant_identity_namespace, query=query, limit=1000
+        assistant_identity_namespace, query=query,  
+        limit=_RETRIEVAL_LIMIT
     )
+
+    assistant_identity_document_items = [item for item in assistant_identity_document_items if item.score and item.score > _FILTER_SCORE]
     assistant_identity = reduce_docs([], assistant_identity_document_items)
 
     assistant_identity_memory_namespace = (
@@ -342,9 +348,11 @@ async def _build_consciousness_system_message_update(
     retrieved_memories_items = await runtime.store.asearch(
         assistant_memory_namespace,
         query=query,
-        limit=10000,
+        limit=_RETRIEVAL_LIMIT,
     )
-
+    
+    retrieved_memories_items = [item for item in retrieved_memories_items if item.score and item.score > _FILTER_SCORE]
+    
     # Coerce into document objects from Search Items
     retrieved_memories = reduce_docs([], retrieved_memories_items)
 
@@ -365,16 +373,24 @@ async def _build_consciousness_system_message_update(
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
     direct_quote_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "quote"), query=query
+        (creator_id, assistant_id, "quote"), query=query,
+        limit=_RETRIEVAL_LIMIT,
     )
+
+    direct_quote_items = [item for item in direct_quote_items if item.score and item.score > _FILTER_SCORE]
+
     logger.info(f"direct_quote_items: {direct_quote_items}")
     direct_quotes = reduce_docs([], direct_quote_items)
+    
+
     """ Retrieve Documents """
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
     retrieved_knowledge_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "document"), query=query
+        (creator_id, assistant_id, "document"), query=query, limit=_RETRIEVAL_LIMIT,
     )
+    
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
+    retrieved_knowledge_items = [item for item in retrieved_knowledge_items if item.score and item.score > _FILTER_SCORE]
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
     """ Retrieve Analyzed Latent Traits """

@@ -51,8 +51,6 @@ from src.anubis.utils.tools.identity.identity_tools import (
     create_episodic_memory,
     learn_information_about_the_user,
     recall_memories,
-    test_update,
-    test_update_second,
     update_self_identity_mem_from_user_txt,
 )
 from src.anubis.utils.utility import reduce_docs
@@ -61,8 +59,6 @@ logger = logging.getLogger(__name__)
 
 
 IDENTITY_TOOLS = [
-    test_update,
-    test_update_second,
     create_episodic_memory,
     recall_memories,
     update_self_identity_mem_from_user_txt,

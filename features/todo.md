@@ -10,18 +10,9 @@ The data is inaccurate; duplicated, responses are incorrect and inauthentic.
 
 # Goal: Accurate relevant data and correct authentic responses.
 
-
-<<<<<<< HEAD
-MERGE PSYCHO ANALYSIS WITH MULTI-FILE UPLOADS
-
 status updates while thinking of WHAT the avatar is currently thinking (streamed messages)
 
-=======
-# COMPARING AUTHENTICITY OF GENERATED RESPONSES
-data/elon-musk-dataset/elon_musk_tweets.csv
-
 URL processing is unclean
->>>>>>> dev
 pdf processing is unclean
 processing media is incorrect/needs edits
 

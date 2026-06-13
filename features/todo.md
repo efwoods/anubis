@@ -8,8 +8,6 @@
   
 The data is inaccurate; duplicated, responses are incorrect and inauthentic.
 
-Tool: update_self_identity_mem_from_text: incorrect format and use;
-
 # Goal: Accurate relevant data and correct authentic responses.
 
 

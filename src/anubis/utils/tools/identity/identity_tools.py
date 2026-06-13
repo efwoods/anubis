@@ -260,7 +260,6 @@ async def recall_memories(
 
     logger.info(f'breakpoint')
 
-
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
@@ -478,6 +477,19 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
 class UserFactAndContext(BaseModel):
     """
     Extract Facts about the USER and the context of that fact given the most recent shared message from the user.
+    THESE MUST BE FACTS ABOUT THE USER. 
+    <Example>
+    User: "My name is Evan."
+    User: "I have brown hair and glasses."
+    User: "I am a fan of Critical Role and Laura Bailey."
+    Extracted Facts:
+    - "My name is Evan."
+    - "I have brown hair and glasses."
+    - "I am a fan of Critical Role."
+    - "I am a fan of Laura Bailey."
+    Fact Context:
+    - "While introducing himself, Evan said his name is Evan, that he has brown hair and glasses, and that he is a fan of Critical Role and Laura Bailey."
+    </Example>
     """
     user_fact: Annotated[str, Field(description = "One distinct fact about the user shared by the user, preserved verbatim (not rewritten).")]
     fact_context: Annotated[str, Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")]
@@ -491,11 +503,15 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
+
     Learn facts about the USER (the person you are speaking with) that they share
     through text. This tool LEARNS and STORES new facts — it does not retrieve.
 
     THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE FROM THE USER. 
     
+    DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN. 
+    DO NOT LEARN INFORMATION THAT IS ABOUT THE USER THAT IS NOT SAID FROM THE USER.
+
     The user is the primary source of truth about themselves, so use this tool
     whenever the user reveals something about their own IDENTITY — their name,
     description, appearance, history, an experience or story they lived, a
@@ -527,6 +543,9 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     Only use this for FACTS about the IDENTITY of the user.
     NEVER call this tool twice with the same fact.
     NEVER call this tool to extract information that is not part of the user's identity.
+    NEVER LEARN INFORMATION THAT IS ALREADY KNOWN. 
+    NEVER LEARN INFORMATION THAT IS ABOUT THE USER THAT IS NOT SAID FROM THE USER.
+    NEVER LEARN INFORMATION THAT YOU YOURSELF SAID.
     </RESTRICTIONS>
 
     <EXAMPLE>
@@ -780,11 +799,6 @@ async def update_identity_via_reference_image(message: HumanMessage, runtime: An
         if message.get("image_url", "") != "":
             image_url = message.get("image_url")
     description = image_to_text(target_image_url=image_url)
-
-
-
-
-
 
 # @tool
 # async def update_identity_via_text_content_url(

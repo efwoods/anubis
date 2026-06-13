@@ -96,6 +96,8 @@ class DynamicPromptBuilder:
             else:
                 assistant_identity_str = assistant_description
         else:
+            # assistant_identity_distinct = list(set(assistant_identity))
+
             assistant_identity_str = "\n\n".join([doc.page_content for doc in assistant_identity])
             if assistant_description is not None:
                 assistant_identity_str = assistant_description + "\n\n" + assistant_identity_str

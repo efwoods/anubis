@@ -15,20 +15,28 @@ profile once per evaluation pass and never re-process the corpus.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from langgraph.store.base import BaseStore
 
 from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.dataset.stylistic_profile import compute_profile_from_quotes
+from src.anubis.utils.dataset.stylistic_profile import compute_feature_matrix_profile
 
 logger = logging.getLogger(__name__)
 
 
 STYLISTIC_PROFILE_NAMESPACE_TAG = "stylistic_profile"
 STYLISTIC_PROFILE_KEY = "profile"
+
+# The ChatGPT baseline cloud is the same for every avatar, so it ships as a
+# bundled artifact (regenerated once) rather than living per-avatar in the store.
+_BASELINE_PROFILE_PATH = os.path.join(
+    os.path.dirname(__file__), "data", "chatgpt_baseline_profile.json"
+)
 
 
 async def _enumerate_quote_texts(
@@ -118,7 +126,10 @@ async def maybe_build_stylistic_profile(
         (existing or {}).get("target_name")
         or context.audio_diarization_known_speaker_name
     )
-    profile = compute_profile_from_quotes(quotes, target_name=target_name)
+    # The quote namespace holds the real person's primary-source writing, so this
+    # per-avatar profile IS the ground-truth cloud for the authenticity axis. We
+    # build the flat feature-matrix (Mahalanobis-ready) shape.
+    profile = compute_feature_matrix_profile(quotes, target_name=target_name)
     profile["built_with_document_count"] = len(quotes)
     profile["built_at"] = datetime.now(tz=timezone.utc).isoformat()
 
@@ -136,5 +147,32 @@ async def maybe_build_stylistic_profile(
 async def load_stylistic_profile(
     *, user_id: str, assistant_id: str, store: BaseStore
 ) -> Optional[Dict[str, Any]]:
-    """Read-only fetch used by the authenticity evaluator."""
+    """Read-only fetch of the per-avatar ground-truth profile (built from quotes).
+
+    Used by the authenticity evaluator as the *ground-truth* cloud — the cloud
+    the avatar should be similar to. Returns ``None`` if no profile has been
+    built yet (e.g. not enough primary-source quotes ingested).
+    """
     return await _load_existing_profile(user_id, assistant_id, store)
+
+
+_BASELINE_PROFILE_CACHE: Optional[Dict[str, Any]] = None
+
+
+def load_baseline_profile() -> Optional[Dict[str, Any]]:
+    """Load the bundled ChatGPT baseline profile (the cloud to be UNLIKE).
+
+    The artifact is identical across avatars, so we read it once from disk and
+    cache it in-process. Returns ``None`` if the artifact is missing/corrupt,
+    in which case the evaluator simply skips the baseline distance.
+    """
+    global _BASELINE_PROFILE_CACHE
+    if _BASELINE_PROFILE_CACHE is not None:
+        return _BASELINE_PROFILE_CACHE
+    try:
+        with open(_BASELINE_PROFILE_PATH, encoding="utf-8") as handle:
+            _BASELINE_PROFILE_CACHE = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not load baseline profile at %s: %s", _BASELINE_PROFILE_PATH, exc)
+        return None
+    return _BASELINE_PROFILE_CACHE

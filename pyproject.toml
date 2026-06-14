@@ -67,6 +67,7 @@ dependencies = [
     "textstat>=0.7.13",
     "lexicalrichness>=0.5.1",
     "faststylometry>=1.0.5",
+    "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]

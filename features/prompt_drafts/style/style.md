@@ -10,6 +10,10 @@ I want to compute the metrics for baseline once (unchanged) then store and retri
 I am using Mahalanobis Distance as a metric.
 I need to verify the distribution of the data so as to be able to use the Mahalanobis distance. 
 
+If the distribution is not chi squared, I understand I may not use the Mahalanobis Distance effectively.
+I do not want to use spaCy in addition to nltk.
+I do not want to use Vader sentiment scores. 
+
 I do not want to use z scores. I want to normalize the scores between zero and one. 
 
 # Impute NaNs with per-column median, then z-score using global stats so every

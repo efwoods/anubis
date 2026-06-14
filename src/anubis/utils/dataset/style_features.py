@@ -224,7 +224,7 @@ def extract_style_features(text: str) -> Dict[str, float]:
     features["hdd_lexical_diversity"] = _safe(
         lambda: lex.hdd(draws=min(42, max(1, lex.words)))
     )
-    # features["maas_lexical_diversity"] = _safe(lambda: lex.Maas)
+    features["maas_lexical_diversity"] = _safe(lambda: lex.Maas)
 
     # Yule's K = 10^4 * (Σ m^2 · V_m − N) / N^2, where V_m is the number of word
     # types occurring exactly m times. Length-stable measure of repetition.
@@ -366,3 +366,70 @@ def _population_stdev(values: Sequence[float], mean: float) -> float:
     if len(values) < 2:
         return 0.0
     return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import LedoitWolf
+
+def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
+    """Compute Mahalanobis distance between synthetic features and reference features of a dataset.
+
+    Args:
+        synthetic_features (np.array): shape is (n_observations, n_features); n_observations are one or more
+        reference_feature_array (np.array): shape is (n_observations, n_features)
+    """
+    scaler = StandardScaler()
+
+    corpus_scaled = scaler.fit_transform(reference_feature_array)
+
+    corpus_scaled_mean = np.mean(corpus_scaled, axis=0)
+
+    corpus_scaled_reg = LedoitWolf().fit(corpus_scaled)
+    corpus_scaled_reg_cov_inv = np.linalg.inv(corpus_scaled_reg.covariance_)
+    corpus_scaled_mean_series = pd.Series(corpus_scaled_mean)
+
+    M_d_arr = []
+
+    for synthetic_feature_index in range(0, synthetic_features.shape[0]):
+        synthetic_feature = synthetic_features[synthetic_feature_index, :]
+        synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
+        synth_scaled_flattened = synth_scaled.flatten()
+        synth_scaled_series = pd.Series(synth_scaled_flattened)
+
+        M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
+        M_d_arr.append(M_d)
+
+    return M_d_arr
+
+
+def compute_empirical_distribution(reference_dataset_arr):
+    """Compute the empirical distribution using the leave-one-out method for comparison.
+
+    Args:
+        reference_dataset_arr (np.arr): expected shape (n_observations, n_features)
+    """
+
+    scaler = StandardScaler()
+    M_d_squared_arr = []
+
+    reference_dataset_df = pd.DataFrame(reference_dataset_arr)
+
+    for i in range(0, reference_dataset_df.values.shape[0]):
+        data = reference_dataset_df.values[i, :]
+        corpus = reference_dataset_df.drop(reference_dataset_df.index[i])    
+        corpus_scaled = scaler.fit_transform(corpus.values)
+        corpus_scaled_mean = np.mean(corpus_scaled, axis=0)
+        corpus_scaled_reg = LedoitWolf().fit(corpus_scaled)    
+        corpus_scaled_reg_cov_inv = np.linalg.inv(corpus_scaled_reg.covariance_)
+
+        data_scaled = scaler.transform(data.reshape(1, -1))
+        data_scaled = data_scaled.flatten()
+
+        data_scaled_series = pd.Series(data_scaled)
+        corpus_scaled_mean_series = pd.Series(corpus_scaled_mean)
+        
+        M_d_squared_arr.append(np.dot(np.dot((data_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (data_scaled_series - corpus_scaled_mean_series)))
+
+    return M_d_squared_arr
+

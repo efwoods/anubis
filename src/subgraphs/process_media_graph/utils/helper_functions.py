@@ -18,6 +18,7 @@ from src.anubis.utils.classes.FirstPersonRewriterClass import (
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
 )
+from langgraph.store.base import BaseStore
 
 logger = logging.getLogger(__name__)
 
@@ -901,12 +902,12 @@ async def process_nontarget_text_to_identity_documents(
         document.metadata.update({"namespace_filename": namespace_filename})
     return documents
 
-
 async def process_text_to_document(
     metadata,
     user_id,
     assistant_id,
     media_item,
+    store: BaseStore,
     namespace_hint: Optional[str] = None,
 ) -> List[Document]:
     """Reference-document gate, then content-situation classifier, then route to chunkers.
@@ -1057,6 +1058,47 @@ async def process_text_to_document(
             media_item=media_item,
             classification_metadata=classification_metadata,
         )
+
+        # TODO: EXTRACT FEATURES FROM LINE; UPDATE THE GROUND_TRUTH_TEXT_FEATURES_ARRAY
+        from src.anubis.utils.dataset.style_features import extract_style_features, compute_empirical_distribution
+        import  pandas as pd
+        import numpy as np
+        
+        features = [extract_style_features(doc.page_content) for doc in documents]
+        features_arr = pd.DataFrame(features).values # n_obs/documents, n_features (33)
+        
+        ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr")        
+
+        ground_truth_text_features_arr = await store.aget(
+            ground_truth_text_features_arr_namespace, 
+            key="ground_truth_text_features_arr").value
+
+        if ground_truth_text_features_arr:
+            ground_truth_text_features_arr = np.concatonate([ground_truth_text_features_arr, features_arr], axis=0)
+        else:
+            ground_truth_text_features_arr = features_arr
+
+        # Recalibrate the Empirical Distribution and threshold
+        ground_truth_empirical_arr = compute_empirical_distribution(ground_truth_text_features_arr)
+
+        # RECALCULATE THE GROUND_TRUTH_EMPIRICAL_THRESHOLD
+        ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
+        ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
+        ground_truth_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
+
+        ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold")
+
+        # Update values
+        await store.aput(
+            ground_truth_text_features_arr_namespace, 
+            key="ground_truth_text_features_arr", 
+            value=ground_truth_text_features_arr)
+
+        await store.aput(
+            ground_truth_text_empirical_threshold_namespace, key="ground_truth_text_empirical_threshold", 
+            value=ground_truth_threshold)
+
+
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True
         # adapter_acceptable: True

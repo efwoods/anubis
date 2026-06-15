@@ -68,6 +68,7 @@ dependencies = [
     "lexicalrichness>=0.5.1",
     "faststylometry>=1.0.5",
     "seaborn>=0.13.2",
+    "shap>=0.51.0",
 ]
 
 [project.optional-dependencies]

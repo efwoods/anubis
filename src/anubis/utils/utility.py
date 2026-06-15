@@ -1827,3 +1827,22 @@ async def resize_image_bytes(image_bytes: bytes) -> tuple[bytes, Optional[str]]:
         out = io.BytesIO()
         image.save(out, format="JPEG", quality=85, optimize=True)
         return out.getvalue(), "image/jpeg"
+
+def load_baseline_features_explainer_model():
+    import base64, pickle
+
+    _PATH = "src/anubis/utils/dataset/baseline_features_explainer_b64.pkl"
+    with open(_PATH, 'rb') as fp:
+        explainer_bytes_pkl = fp.read()
+        fp.close()
+    explainer = pickle.loads(base64.b64decode(explainer_bytes_pkl))
+    return explainer
+
+async def compute_shap_values_against_baseline(feature_values):
+    from src.anubis.utils.dataset.style_features import FEATURE_NAMES
+    _explainer = load_baseline_features_explainer_model()
+    shap_values = _explainer.shap_values(feature_values, )
+    # features_list = list(pd.Series(features).index)
+    df = pd.DataFrame(shap_values, index = FEATURE_NAMES, columns = ['shap_values'])
+    shap_dict = df[df['shap_values']!=0.0].to_dict()
+    return shap_dict

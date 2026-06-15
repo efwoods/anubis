@@ -370,7 +370,7 @@ def _population_stdev(values: Sequence[float], mean: float) -> float:
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 import pandas as pd
-from scipy.spatial.distance import LedoitWolf
+from sklearn.covariance import LedoitWolf
 
 def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
     """Compute Mahalanobis distance between synthetic features and reference features of a dataset.
@@ -391,12 +391,20 @@ def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
 
     M_d_arr = []
 
-    for synthetic_feature_index in range(0, synthetic_features.shape[0]):
-        synthetic_feature = synthetic_features[synthetic_feature_index, :]
+    if synthetic_features.ndim > 1:
+        for synthetic_feature_index in range(0, synthetic_features.shape[0]):
+            synthetic_feature = synthetic_features[synthetic_feature_index, :]
+            synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
+            synth_scaled_flattened = synth_scaled.flatten()
+            synth_scaled_series = pd.Series(synth_scaled_flattened)
+
+            M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
+            M_d_arr.append(M_d)
+    else:
+        synthetic_feature = synthetic_features
         synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
         synth_scaled_flattened = synth_scaled.flatten()
         synth_scaled_series = pd.Series(synth_scaled_flattened)
-
         M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
         M_d_arr.append(M_d)
 

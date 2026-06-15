@@ -1069,11 +1069,16 @@ async def process_text_to_document(
         
         ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr")        
 
-        ground_truth_text_features_arr = await store.aget(
+        ground_truth_text_features_arr_item = await store.aget(
             ground_truth_text_features_arr_namespace, 
-            key="ground_truth_text_features_arr").value
+            key="ground_truth_text_features_arr_list_str")
+        
+        ground_truth_text_features_arr_list_str = getattr(ground_truth_text_features_arr_item, "value", None)
 
-        if ground_truth_text_features_arr:
+        if ground_truth_text_features_arr_list_str:
+            # Convert to arr from str
+            ground_truth_text_features_arr = np.array(json.loads(ground_truth_text_features_arr_list_str))
+
             ground_truth_text_features_arr = np.concatonate([ground_truth_text_features_arr, features_arr], axis=0)
         else:
             ground_truth_text_features_arr = features_arr
@@ -1084,19 +1089,24 @@ async def process_text_to_document(
         # RECALCULATE THE GROUND_TRUTH_EMPIRICAL_THRESHOLD
         ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
         ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
-        ground_truth_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
+        ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
 
-        ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold")
+        ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
+
+        # Convert to str for storage
+        ground_truth_text_features_arr_list_str = json.dumps(ground_truth_text_features_arr.tolist())
+        ground_truth_text_empirical_threshold_list_str = json.dumps(ground_truth_text_empirical_threshold.tolist())
 
         # Update values
         await store.aput(
             ground_truth_text_features_arr_namespace, 
-            key="ground_truth_text_features_arr", 
-            value=ground_truth_text_features_arr)
+            key="ground_truth_text_features_arr_list_str", 
+            value=ground_truth_text_features_arr_list_str)
 
         await store.aput(
-            ground_truth_text_empirical_threshold_namespace, key="ground_truth_text_empirical_threshold", 
-            value=ground_truth_threshold)
+            ground_truth_text_empirical_threshold_namespace, 
+            key="ground_truth_text_empirical_threshold_list_str", 
+            value=ground_truth_text_empirical_threshold_list_str)
 
 
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 

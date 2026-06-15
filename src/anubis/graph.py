@@ -137,6 +137,12 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         
         avatar_response.response_metadata.update({"significantly_different_from_baseline_chatgpt_response":bool(M_d_square_synth_from_baseline_chatgpt[0] > baseline_response_threshold)})
 
+        # Explain the result
+        from src.anubis.utils.utility import compute_shap_values_against_baseline
+        
+        shap_values_dict = await compute_shap_values_against_baseline(features_arr)
+        avatar_response.response_metadata.update(shap_values_dict)
+
         # Compare against ground truth quotes if available:
         ground_truth_text_features_arr_item = await runtime.store.aget(
             ground_truth_text_features_arr_namespace, 

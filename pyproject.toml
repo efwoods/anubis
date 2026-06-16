@@ -69,6 +69,7 @@ dependencies = [
     "faststylometry>=1.0.5",
     "seaborn>=0.13.2",
     "shap>=0.51.0",
+    "aiofiles>=25.1.0",
 ]
 
 [project.optional-dependencies]

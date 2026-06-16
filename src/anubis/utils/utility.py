@@ -1828,24 +1828,69 @@ async def resize_image_bytes(image_bytes: bytes) -> tuple[bytes, Optional[str]]:
         image.save(out, format="JPEG", quality=85, optimize=True)
         return out.getvalue(), "image/jpeg"
 
-def load_baseline_features_explainer_model():
-    import base64, pickle
-    _PATH = "src/anubis/utils/dataset/baseline_features_explainer_b64.pkl"
-    with open(_PATH, 'rb') as fp:
-        explainer_bytes_pkl = fp.read()
-        fp.close()
-    explainer = pickle.loads(base64.b64decode(explainer_bytes_pkl))
-    return explainer
+async def load_baseline_features_explainer_model(store: BaseStore):
+    import base64, pickle, shap, aoifiles, json
+    import numpy as np
 
-async def compute_shap_values_against_baseline(feature_values):
+    # Attempt to pull stored model and data from store
+    baseline_features_namespace = ("baseline_features_arr_list_str",)
+    baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
+
+    baseline_features_arr_item = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
+    baseline_features_arr_list_str = getattr(baseline_features_arr_item, "value", None)
+
+    baseline_features_model_item = await store.aget(baseline_features_model_namespace, key="baseline_features_model_b64_pkl")
+    baseline_features_model_b64_pkl = getattr(baseline_features_model_item, "value", None)
+
+    # If the baseline_features_model has not yet been stored, load from disk and store the model:
+    if not baseline_features_model_b64_pkl:
+        _MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
+        # Load model 
+        async with aoifiles.open(_MODEL_PATH, 'rb') as fp:
+            baseline_features_model_b64_pkl = await fp.read()
+            await fp.close()
+        await store.aput(
+            baseline_features_model_namespace, 
+            key="baseline_features_model_b64_pkl", 
+            value=baseline_features_model_b64_pkl)
+    
+    # Convert from pickled string to Isolation Forest model
+    if isinstance(baseline_features_model_b64_pkl, str):
+        logger.info(f"Converting Model: \n\ntype(baseline_features_model_b64_pkl): {type(baseline_features_model_b64_pkl)}")
+        model = pickle.loads(base64.b64decode(baseline_features_model_b64_pkl))
+    else:
+        logger.error(f"error converting model: \n\ntype(baseline_features_model_b64_pkl): {type(baseline_features_model_b64_pkl)}")
+
+    # If the baseline_features_arr has not yet been stored, load from disk and store the array:
+    if not baseline_features_arr_list_str:
+        _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
+        baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
+        
+        baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
+        await store.aput(
+            baseline_features_namespace, 
+            key="baseline_features_arr_list_str", 
+            value=baseline_features_arr_list_str)
+        
+    # Convert from str to np.array
+    if isinstance(baseline_features_arr_list_str, str):
+        baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
+    else:
+        baseline_features_arr = np.array(baseline_features_arr_list_str)
+    
+    explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+    return explainer, model
+
+async def compute_shap_values_against_baseline(feature_values, store: BaseStore) -> dict:
     from src.anubis.utils.dataset.style_features import FEATURE_NAMES
     import pandas as pd
-    _explainer = load_baseline_features_explainer_model()
-    shap_values = _explainer.shap_values(feature_values, )
-    # features_list = list(pd.Series(features).index)
+    _explainer, _model = load_baseline_features_explainer_model(store)
+    prediction = bool(_model.predict(feature_values))
+    shap_values = _explainer.shap_values(feature_values)
+
     df = pd.DataFrame(shap_values, index = FEATURE_NAMES, columns = ['shap_values'])
     shap_dict = df[df['shap_values']!=0.0].to_dict()
-    shap_dict['description'] = "Negative values indicate dissimilarity from dataset. Scale is -1 to 1."
-
+    shap_dict['description'] = "Negative values indicate dissimilarity from unmodified chatgpt dataset. Scale is -1 to 1."
+    shap_dict['sample_is_similar_to_dataset'] = prediction
 
     return shap_dict

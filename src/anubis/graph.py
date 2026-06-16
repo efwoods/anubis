@@ -135,7 +135,7 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
         M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(features_arr, baseline_features_arr)
         
-        avatar_response.response_metadata.update({"significantly_different_from_baseline_chatgpt_response":bool(M_d_square_synth_from_baseline_chatgpt[0] > baseline_response_threshold)})
+        avatar_response.response_metadata.update({"significantly_different_from_baseline_chatgpt_response_using_squared_mahalanobis_distance":bool(M_d_square_synth_from_baseline_chatgpt[0] > baseline_response_threshold)})
 
         # Explain the result
         from src.anubis.utils.utility import compute_shap_values_against_baseline
@@ -144,6 +144,11 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         avatar_response.response_metadata.update(shap_values_dict)
 
         # Compare against ground truth quotes if available:
+        ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+        ground_truth_text_features_model_item = await runtime.store.aget(ground_truth_text_features_model_namespace, key="ground_truth_text_features_model_b64_pkl")
+
+        ground_truth_text_features_model_b64_pkl = getattr(ground_truth_text_features_model_item,"value", None)
+
         ground_truth_text_features_arr_item = await runtime.store.aget(
             ground_truth_text_features_arr_namespace, 
             key="ground_truth_text_features_arr_list_str")
@@ -156,7 +161,9 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         
         ground_truth_text_empirical_threshold_list_str = getattr(ground_truth_text_empirical_threshold_item,"value", None)
 
-        if ground_truth_text_features_arr_list_str and ground_truth_text_empirical_threshold_list_str:
+        if ground_truth_text_features_arr_list_str and ground_truth_text_empirical_threshold_list_str and ground_truth_text_features_model_b64_pkl:
+            import base64, shap, pandas as pd
+            from src.anubis.utils.dataset.style_features import FEATURE_NAMES
             
             # Convert from str to np format
             if isinstance(ground_truth_text_features_arr_list_str, str):
@@ -168,11 +175,27 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 ground_truth_text_empirical_threshold = np.array(json.loads(ground_truth_text_empirical_threshold_list_str)).flatten()
             else:
                 ground_truth_text_empirical_threshold = np.array(ground_truth_text_empirical_threshold_list_str).flatten()
+
+            ground_truth_text_features_model = pickle.loads(base64.b64decode(ground_truth_text_features_model_b64_pkl))
             
             # Compute the difference between the synthetic text and the direct quotes.
             M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(features_arr, ground_truth_text_features_arr)
 
-            avatar_response.response_metadata.update({"no_significant_difference_from_direct_quotes":bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold)})
+            avatar_response.response_metadata.update({"no_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance":bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold)})
+
+            # Predict and explain the classification
+            ground_truth_prediction = bool(ground_truth_text_features_model.predict(features_arr.reshape(1,-1)))
+            
+            explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, ground_truth_text_features_arr)
+            ground_truth_shap_values = explainer.shap_values(features_arr.reshape(1,-1))
+            ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
+
+            ground_truth_shap_values_dict = ground_truth_shap_values_df[ground_truth_shap_values_df['ground_truth_shap_values']!=0].to_dict()
+
+            ground_truth_shap_values_dict['sample_is_similar_to_dataset'] = ground_truth_prediction
+            ground_truth_shap_values_dict['description'] = "Negative values indicate dissimilarity from direct quotes dataset. Scale is -1 to 1."
+
+            avatar_response.response_metadata.update(ground_truth_shap_values_dict)
 
     except Exception as e:
         logger.error(f"error analyzing features: {e}")

@@ -1067,26 +1067,22 @@ async def process_text_to_document(
         features = [extract_style_features(doc.page_content) for doc in documents]
         features_arr = pd.DataFrame(features).values # n_obs/documents, n_features (33)
         
-        ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr")        
-        
+        # Namespace must match the reader in graph._attach_analyzed_features.
 
-        ground_truth_text_features_arr_item = await store.aget(
-            ground_truth_text_features_arr_namespace, 
-            key="ground_truth_text_features_arr_list_str")
-        
-        ground_truth_text_features_arr_list_str = getattr(ground_truth_text_features_arr_item, "value", None)
+        ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr_list_str")
+
+
+        ground_truth_text_features_arr_list_str_ITEM = await store.aget(ground_truth_text_features_arr_namespace, key="ground_truth_text_features_arr_list_str")
+        ground_truth_text_features_arr_list_str = (getattr(ground_truth_text_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
 
         if ground_truth_text_features_arr_list_str:
             # Convert to arr from str
-            if isinstance(ground_truth_text_features_arr_list_str, str):
-                ground_truth_text_features_arr = np.array(json.loads(ground_truth_text_features_arr_list_str))
-            else:
-                # Expected list format
-                ground_truth_text_features_arr = np.array(ground_truth_text_features_arr_list_str)
+            ground_truth_text_features_arr = np.array(json.loads(ground_truth_text_features_arr_list_str))
             
             # Extend the features array with the new feature observation
-            ground_truth_text_features_arr = np.concatonate([ground_truth_text_features_arr, features_arr], axis=0)
+            ground_truth_text_features_arr = np.concatenate([ground_truth_text_features_arr, features_arr], axis=0)
         else:
+            # New Data; No pre-existing data
             ground_truth_text_features_arr = features_arr
 
         # Recalibrate the Empirical Distribution and threshold
@@ -1102,29 +1098,33 @@ async def process_text_to_document(
         import pickle, base64
         model = IsolationForest().fit(ground_truth_text_features_arr)
 
-        # Convert to str for storage
-
         # Empirical Threshold
         ground_truth_text_features_arr_list_str = json.dumps(ground_truth_text_features_arr.tolist())
         ground_truth_text_empirical_threshold_list_str = json.dumps(ground_truth_text_empirical_threshold.tolist())
 
-        # Isolation Forest Modle
-        model_str_pkl = base64.b64encode(pickle.dumps(model))        
+        # Convert to str for storage
+        # Isolation Forest model: b64encode yields bytes; decode to str so the value is
+        # JSON-serializable for the store (orjson cannot serialize raw bytes).
+        model_str_pkl = base64.b64encode(pickle.dumps(model)).decode("utf-8")
 
-        # Update values
+        # Update values 
         await store.aput(
-            ground_truth_text_features_arr_namespace, 
-            key="ground_truth_text_features_arr_list_str", 
-            value=ground_truth_text_features_arr_list_str)
-        
+            ground_truth_text_features_arr_namespace,
+            key="ground_truth_text_features_arr_list_str", value={"value":ground_truth_text_features_arr_list_str}
+        )
+
         ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
         await store.aput(
-            ground_truth_text_empirical_threshold_namespace, 
-            key="ground_truth_text_empirical_threshold_list_str", 
-            value=ground_truth_text_empirical_threshold_list_str)
-    
+            ground_truth_text_empirical_threshold_namespace,
+            key="ground_truth_text_empirical_threshold_list_str", value={"value":ground_truth_text_empirical_threshold_list_str}
+        )
+
         ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
-        await store.aput(ground_truth_text_features_model_namespace, key="ground_truth_text_features_model_b64_pkl", value=model_str_pkl)
+
+        await store.aput(
+            ground_truth_text_features_model_namespace,
+            key="ground_truth_text_features_model_b64_pkl", value={"value":model_str_pkl}
+        )
 
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True

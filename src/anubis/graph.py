@@ -113,53 +113,62 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr_list_str")
         ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
 
-        baseline_features_arr_item = await runtime.store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
+        baseline_features_arr_list_str_ITEM = await runtime.store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
 
-        baseline_features_arr_list_str = getattr(baseline_features_arr_item, "value", None)
+        baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
 
         # If the baseline_features_arr has not yet been stored, store the array:
         if not baseline_features_arr_list_str:
             _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
             baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
-            
+
             baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
 
-            await runtime.store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value=baseline_features_arr_list_str)
+            await runtime.store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
 
         # Convert from str to np.array
         if isinstance(baseline_features_arr_list_str, str):
             baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
-        else:
-            baseline_features_arr = np.array(baseline_features_arr_list_str)
 
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
         M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(features_arr, baseline_features_arr)
-        
-        avatar_response.response_metadata.update({"significantly_different_from_baseline_chatgpt_response_using_squared_mahalanobis_distance":bool(M_d_square_synth_from_baseline_chatgpt[0] > baseline_response_threshold)})
 
         # Explain the result
         from src.anubis.utils.utility import compute_shap_values_against_baseline
-        
+
         shap_values_dict = await compute_shap_values_against_baseline(features_arr, runtime.store)
-        avatar_response.response_metadata.update(shap_values_dict)
+
+        # Nest the distance verdict together with the SHAP explanation under a single key
+        # (verdict first to match the documented output order).
+        comparison_to_unmodified_llm_response_analysis = {
+            "significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_baseline_chatgpt[0] > baseline_response_threshold),
+            **shap_values_dict,
+        }
+        avatar_response.response_metadata.update({"comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis})
 
         # Compare against ground truth quotes if available:
         ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
-        ground_truth_text_features_model_item = await runtime.store.aget(ground_truth_text_features_model_namespace, key="ground_truth_text_features_model_b64_pkl")
 
-        ground_truth_text_features_model_b64_pkl = getattr(ground_truth_text_features_model_item,"value", None)
+        ground_truth_text_features_model_b64_pkl_ITEM = await runtime.store.aget(
+            ground_truth_text_features_model_namespace, 
+            key="ground_truth_text_features_model_b64_pkl"
+        )
 
-        ground_truth_text_features_arr_item = await runtime.store.aget(
+        ground_truth_text_features_arr_list_str_ITEM = await runtime.store.aget(
             ground_truth_text_features_arr_namespace, 
-            key="ground_truth_text_features_arr_list_str")
+            key="ground_truth_text_features_arr_list_str"
+        )
 
-        ground_truth_text_features_arr_list_str = getattr(ground_truth_text_features_arr_item,"value", None)
-
-        ground_truth_text_empirical_threshold_item = await runtime.store.aget(
+        ground_truth_text_empirical_threshold_list_str_ITEM = await runtime.store.aget(
             ground_truth_text_empirical_threshold_namespace, 
-            key="ground_truth_text_empirical_threshold_list_str")
-        
-        ground_truth_text_empirical_threshold_list_str = getattr(ground_truth_text_empirical_threshold_item,"value", None)
+            key="ground_truth_text_empirical_threshold_list_str"
+        )
+
+        ground_truth_text_features_model_b64_pkl = (getattr(ground_truth_text_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+
+        ground_truth_text_features_arr_list_str = (getattr(ground_truth_text_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
+
+        ground_truth_text_empirical_threshold_list_str = (getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None) or {}).get("value", None)
 
         if ground_truth_text_features_arr_list_str and ground_truth_text_empirical_threshold_list_str and ground_truth_text_features_model_b64_pkl:
             import base64, shap, pandas as pd
@@ -181,21 +190,23 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             # Compute the difference between the synthetic text and the direct quotes.
             M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(features_arr, ground_truth_text_features_arr)
 
-            avatar_response.response_metadata.update({"no_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance":bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold)})
-
             # Predict and explain the classification
-            ground_truth_prediction = bool(ground_truth_text_features_model.predict(features_arr.reshape(1,-1)))
-            
+            ground_truth_prediction = bool(ground_truth_text_features_model.predict(features_arr.reshape(1,-1))==1)
+
             explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, ground_truth_text_features_arr)
             ground_truth_shap_values = explainer.shap_values(features_arr.reshape(1,-1))
             ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
 
             ground_truth_shap_values_dict = ground_truth_shap_values_df[ground_truth_shap_values_df['ground_truth_shap_values']!=0].to_dict()
 
-            ground_truth_shap_values_dict['sample_is_similar_to_dataset'] = ground_truth_prediction
-            ground_truth_shap_values_dict['description'] = "Negative values indicate dissimilarity from direct quotes dataset. Scale is -1 to 1."
-
-            avatar_response.response_metadata.update(ground_truth_shap_values_dict)
+            # Nest the distance verdict, SHAP explanation, and isolation-forest verdict under a single key.
+            comparison_to_direct_quote_response_analysis = {
+                "no_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold),
+                "no_statisically_significant_difference_between_sample_and_direct_quotes_dataset_according_to_isolation_forest": ground_truth_prediction,
+                "ground_truth_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from direct quotes dataset. Positive values indicate similarity to direct quotes. Scale is -1 to 1.",
+                **ground_truth_shap_values_dict,
+            }
+            avatar_response.response_metadata.update({"comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis})
 
     except Exception as e:
         logger.error(f"error analyzing features: {e}")

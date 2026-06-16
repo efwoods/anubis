@@ -1,3 +1,7 @@
+# Better UI: Login
+# Improvement of response quality
+
+
 <!-- - [x] I need to chunk the logs -->
 - [ ] I need to work on git_log_all.sh additional update to the log file
 

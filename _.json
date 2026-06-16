@@ -1,0 +1,70 @@
+{
+  "type": "done",
+  "content": "Yeah\u2014got it. What do you want to do?",
+  "thread_id": "c75dcb2a-af6d-45d5-846f-d7c58e9af6ff",
+  "request_id": "1a87b7cf-5abb-4374-bd2a-28c423c063ce",
+  "total_response_time_ms": 46304,
+  "response_metadata": {
+    "finish_reason": "stop",
+    "model_name": "gpt-5.4-nano-2026-03-17",
+    "service_tier": "default",
+    "model_provider": "openai",
+    "sentiment": {
+      "base_emotion": "surprise",
+      "emotion": "curiosity",
+      "score": 0.41297242045402527
+    },
+    "features": {
+      "type_token_ratio": 0.875,
+      "moving_average_ttr": 0.875,
+      "mtld_lexical_diversity": 17.92,
+      "hdd_lexical_diversity": 0.875,
+      "maas_lexical_diversity": 0.03088089984435136,
+      "yule_characteristic_k": 246.91358024691357,
+      "lexical_density_content_word_ratio": 0.4166666666666667,
+      "noun_density": 0.08333333333333333,
+      "verb_density": 0.3333333333333333,
+      "adjective_density": 0.0,
+      "adverb_density": 0.0,
+      "pronoun_density": 0.25,
+      "preposition_density": 0.08333333333333333,
+      "noun_to_verb_ratio": 0.4,
+      "pos_sequence_compressibility": 0.74,
+      "mean_sentence_length_words": 4.5,
+      "stdev_sentence_length_words": 1.5,
+      "interrogative_sentence_ratio": 0.5,
+      "exclamatory_sentence_ratio": 0.0,
+      "comma_rate_per_1k": 0.0,
+      "semicolon_rate_per_1k": 0.0,
+      "colon_rate_per_1k": 0.0,
+      "dash_rate_per_1k": 111.11111111111111,
+      "ellipsis_rate_per_1k": 0.0,
+      "exclamation_rate_per_1k": 0.0,
+      "question_mark_rate_per_1k": 111.11111111111111,
+      "all_caps_word_ratio": 0.0,
+      "words_per_paragraph": 9.0,
+      "transition_word_rate_per_1k": 0.0,
+      "flesch_kincaid_grade": 0.8049999999999997,
+      "gunning_fog_index": 3.2,
+      "smog_index": 3.1291,
+      "lexical_entropy_bits": 2.94770277922009
+    },
+    "comparison_to_unmodified_llm_response_analysis": {
+      "significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": true,
+      "unmodified_llm_comparison_isolation_forest_shap_values": {
+        "mtld_lexical_diversity": -0.15868359688208125,
+        "yule_characteristic_k": -0.1518081360932802,
+        "lexical_density_content_word_ratio": -0.13640694159135813,
+        "noun_density": -0.12555909971812662,
+        "verb_density": -0.24540113165637975,
+        "pos_sequence_compressibility": -0.1353296924881771,
+        "comma_rate_per_1k": -0.18748875618598454,
+        "question_mark_rate_per_1k": -0.309151325779999,
+        "smog_index": -0.14841529274064602,
+        "lexical_entropy_bits": -0.3272218653732839
+      },
+      "unmodified_llm_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from unmodified llm dataset. Positive values indicate similarity to unmodified llm responses. Scale is -1 to 1.",
+      "no_statistically_significant_difference_between_sample_and_unmodified_llm_according_to_isolation_forest": false
+    }
+  }
+}

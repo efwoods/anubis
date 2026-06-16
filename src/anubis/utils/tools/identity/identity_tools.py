@@ -206,7 +206,7 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     document_metadata = {
         "user_id":user_id,
         "assistant_id": assistant_id,
-        "id": identity_id,
+        "document_id": identity_id,
         "fact_context": fact_context,
         "fact":significant_fact
     }
@@ -454,7 +454,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     document_metadata = {
         "user_id":user_id,
         "assistant_id": assistant_id,
-        "id": identity_id,
+        "document_id": identity_id,
         "fact_context": fact_context,
         "fact":assistant_fact
     }
@@ -581,7 +581,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     document_metadata = {
         "user_id":user_id,
         "assistant_id": assistant_id,
-        "id": identity_id,
+        "document_id": identity_id,
         "fact_context": fact_context,
         "fact":user_fact
     }

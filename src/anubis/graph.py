@@ -19,7 +19,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 from langchain_core.runnables import RunnableConfig, Runnable
 from src.anubis.utils.utility import (
     extract_user_id_assistant_id,
@@ -97,7 +96,13 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
     """ analyze the avatar_response features, compare against unmodified chatgpt responses and any existing direct quotes if possible.
     Update the metadata with the feature analysis and the results of comparison.
     """
-    from src.anubis.utils.dataset.style_features import extract_style_features, compute_mahalanobis_distance
+    from src.anubis.utils.dataset.style_features import (
+        GROUND_TRUTH_FEATURES_DICT_KEY,
+        compute_mahalanobis_distance,
+        deserialize_features_by_doc_id,
+        extract_style_features,
+        features_by_doc_id_to_arr,
+    )
     import json
 
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
@@ -110,7 +115,7 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
     try:
         baseline_features_namespace = ("baseline_features_arr_list_str",)
-        ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr_list_str")
+        ground_truth_text_features_by_doc_id_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
         ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
 
         baseline_features_arr_list_str_ITEM = await runtime.store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
@@ -154,9 +159,9 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             key="ground_truth_text_features_model_b64_pkl"
         )
 
-        ground_truth_text_features_arr_list_str_ITEM = await runtime.store.aget(
-            ground_truth_text_features_arr_namespace, 
-            key="ground_truth_text_features_arr_list_str"
+        ground_truth_text_features_by_doc_id_ITEM = await runtime.store.aget(
+            ground_truth_text_features_by_doc_id_namespace,
+            key=GROUND_TRUTH_FEATURES_DICT_KEY
         )
 
         ground_truth_text_empirical_threshold_list_str_ITEM = await runtime.store.aget(
@@ -166,19 +171,18 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
         ground_truth_text_features_model_b64_pkl = (getattr(ground_truth_text_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
 
-        ground_truth_text_features_arr_list_str = (getattr(ground_truth_text_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_features_by_doc_id_str = (getattr(ground_truth_text_features_by_doc_id_ITEM, "value", None) or {}).get("value", None)
 
         ground_truth_text_empirical_threshold_list_str = (getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None) or {}).get("value", None)
 
-        if ground_truth_text_features_arr_list_str and ground_truth_text_empirical_threshold_list_str and ground_truth_text_features_model_b64_pkl:
+        # Reconstruct the (n_docs, 33) corpus array from the per-document dict.
+        ground_truth_text_features_arr = features_by_doc_id_to_arr(
+            deserialize_features_by_doc_id(ground_truth_text_features_by_doc_id_str)
+        )
+
+        if ground_truth_text_features_arr.shape[0] > 0 and ground_truth_text_empirical_threshold_list_str and ground_truth_text_features_model_b64_pkl:
             import base64, shap, pandas as pd
             from src.anubis.utils.dataset.style_features import FEATURE_NAMES
-            
-            # Convert from str to np format
-            if isinstance(ground_truth_text_features_arr_list_str, str):
-                ground_truth_text_features_arr = np.array(json.loads(ground_truth_text_features_arr_list_str))
-            else:
-                ground_truth_text_features_arr = np.array(ground_truth_text_features_arr_list_str)
 
             if isinstance(ground_truth_text_empirical_threshold_list_str, str):
                 ground_truth_text_empirical_threshold = np.array(json.loads(ground_truth_text_empirical_threshold_list_str)).flatten()

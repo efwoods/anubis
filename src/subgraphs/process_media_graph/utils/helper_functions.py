@@ -1058,74 +1058,10 @@ async def process_text_to_document(
             media_item=media_item,
             classification_metadata=classification_metadata,
         )
-
-        # TODO: EXTRACT FEATURES FROM LINE; UPDATE THE GROUND_TRUTH_TEXT_FEATURES_ARRAY
-        from src.anubis.utils.dataset.style_features import extract_style_features, compute_empirical_distribution
-        import  pandas as pd
-        import numpy as np
+        """ CALIBRATE GROUND TRUTH """
+        from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
+        await calibrate_ground_truth(store=store, assitant_id=assistant_id, documents=documents)
         
-        features = [extract_style_features(doc.page_content) for doc in documents]
-        features_arr = pd.DataFrame(features).values # n_obs/documents, n_features (33)
-        
-        # Namespace must match the reader in graph._attach_analyzed_features.
-
-        ground_truth_text_features_arr_namespace = (assistant_id, "ground_truth_text_features_arr_list_str")
-
-
-        ground_truth_text_features_arr_list_str_ITEM = await store.aget(ground_truth_text_features_arr_namespace, key="ground_truth_text_features_arr_list_str")
-        ground_truth_text_features_arr_list_str = (getattr(ground_truth_text_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
-
-        if ground_truth_text_features_arr_list_str:
-            # Convert to arr from str
-            ground_truth_text_features_arr = np.array(json.loads(ground_truth_text_features_arr_list_str))
-            
-            # Extend the features array with the new feature observation
-            ground_truth_text_features_arr = np.concatenate([ground_truth_text_features_arr, features_arr], axis=0)
-        else:
-            # New Data; No pre-existing data
-            ground_truth_text_features_arr = features_arr
-
-        # Recalibrate the Empirical Distribution and threshold
-        ground_truth_empirical_arr = compute_empirical_distribution(ground_truth_text_features_arr)
-
-        # RECALCULATE THE GROUND_TRUTH_EMPIRICAL_THRESHOLD
-        ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
-        ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
-        ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
-
-        # Recalibrate the Isolation Forest for prediction and explainable values
-        from sklearn.ensemble import IsolationForest
-        import pickle, base64
-        model = IsolationForest().fit(ground_truth_text_features_arr)
-
-        # Empirical Threshold
-        ground_truth_text_features_arr_list_str = json.dumps(ground_truth_text_features_arr.tolist())
-        ground_truth_text_empirical_threshold_list_str = json.dumps(ground_truth_text_empirical_threshold.tolist())
-
-        # Convert to str for storage
-        # Isolation Forest model: b64encode yields bytes; decode to str so the value is
-        # JSON-serializable for the store (orjson cannot serialize raw bytes).
-        model_str_pkl = base64.b64encode(pickle.dumps(model)).decode("utf-8")
-
-        # Update values 
-        await store.aput(
-            ground_truth_text_features_arr_namespace,
-            key="ground_truth_text_features_arr_list_str", value={"value":ground_truth_text_features_arr_list_str}
-        )
-
-        ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
-        await store.aput(
-            ground_truth_text_empirical_threshold_namespace,
-            key="ground_truth_text_empirical_threshold_list_str", value={"value":ground_truth_text_empirical_threshold_list_str}
-        )
-
-        ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
-
-        await store.aput(
-            ground_truth_text_features_model_namespace,
-            key="ground_truth_text_features_model_b64_pkl", value={"value":model_str_pkl}
-        )
-
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True
         # adapter_acceptable: True

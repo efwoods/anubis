@@ -296,12 +296,12 @@ def reduce_docs(
 
     coerced: list[Document] = []
     if isinstance(new, str):
-        coerced.append(Document(page_content=new, metadata={"id": str(uuid.uuid4())}))
+        coerced.append(Document(page_content=new, metadata={"document_id": str(uuid.uuid4())}))
     elif isinstance(new, list):
         for item in new:
             if isinstance(item, str):
                 coerced.append(
-                    Document(page_content=item, metadata={"id": str(uuid.uuid4())})
+                    Document(page_content=item, metadata={"document_id": str(uuid.uuid4())})
                 )
             elif isinstance(item, dict):
                 coerced.append(Document(**item))

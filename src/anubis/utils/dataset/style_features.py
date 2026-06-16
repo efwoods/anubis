@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import gzip
 import html
+import json
 import math
 import re
 from collections import Counter
@@ -440,4 +441,98 @@ def compute_empirical_distribution(reference_dataset_arr):
         M_d_squared_arr.append(np.dot(np.dot((data_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (data_scaled_series - corpus_scaled_mean_series)))
 
     return M_d_squared_arr
+
+
+# ---------------------------------------------------------------------------
+# Ground-truth corpus persistence helpers.
+#
+# The "direct quote" corpus is persisted in the LangGraph store as a dict
+# {document_id: [33 floats]} rather than a flat (n_docs, 33) array, so that an
+# individual source document's rows can be pruned when that document is deleted.
+# Wherever the corpus is consumed (Mahalanobis distance, IsolationForest fit,
+# SHAP background) it is reconstructed into a single (n_docs, 33) array; those
+# consumers are all set-based, so ROW ORDER is irrelevant.
+# ---------------------------------------------------------------------------
+
+# Store key (and second namespace element) for the per-document feature dict.
+# The writer (process_text_to_document), the reader
+# (graph._attach_analyzed_features), and the deleter (delete_avatar_documents)
+# must all agree on this name.
+GROUND_TRUTH_FEATURES_DICT_KEY = "ground_truth_text_features_by_doc_id_dict_str"
+
+
+def serialize_features_by_doc_id(features_by_doc_id: Dict[str, Any]) -> str:
+    """Serialize ``{document_id: 1-D 33-feature row}`` to a JSON string.
+
+    Each row is coerced via ``.tolist()`` (numpy) or ``list`` so the whole dict
+    is JSON-serializable for the store's ``{"value": <str>}`` envelope.
+    """
+    return json.dumps(
+        {
+            doc_id: (row.tolist() if hasattr(row, "tolist") else list(row))
+            for doc_id, row in features_by_doc_id.items()
+        }
+    )
+
+
+def deserialize_features_by_doc_id(features_by_doc_id_str: Any) -> Dict[str, Any]:
+    """Inverse of :func:`serialize_features_by_doc_id`.
+
+    Returns ``{}`` for any falsy input (key missing / never written) so callers
+    can treat "no corpus yet" and "empty corpus" identically. Each value is
+    rehydrated into a 1-D numpy array.
+    """
+    if not features_by_doc_id_str:
+        return {}
+    raw = json.loads(features_by_doc_id_str)
+    return {doc_id: np.array(row) for doc_id, row in raw.items()}
+
+
+def features_by_doc_id_to_arr(features_by_doc_id: Dict[str, Any]) -> Any:
+    """Recombine per-document feature rows into one ``(n_docs, 33)`` array.
+
+    Row order is irrelevant: every downstream consumer (empirical distribution,
+    Mahalanobis covariance, IsolationForest) is a set statistic over the rows.
+    Returns an empty ``(0, 33)`` array when the dict is empty.
+    """
+    if not features_by_doc_id:
+        return np.empty((0, len(FEATURE_NAMES)))
+    return np.vstack([np.asarray(row) for row in features_by_doc_id.values()])
+
+
+def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tuple[str, str]:
+    """Recalibrate the empirical threshold and IsolationForest from the corpus.
+
+    Given the reconstructed ``(n_docs, 33)`` corpus array, returns
+    ``(empirical_threshold_list_str, model_b64_pkl)`` serialized exactly as the
+    store expects:
+
+    * threshold — Tukey upper fence ``Q3 + 1.5*(Q3-Q1)`` of the leave-one-out
+      squared-Mahalanobis empirical distribution, then ``json.dumps``'d.
+    * model — an ``IsolationForest`` fit on the corpus, pickled then
+      base64-encoded to a ``str`` (orjson in the store cannot serialize raw
+      bytes).
+
+    sklearn/pickle/base64 are imported lazily to keep module import cheap.
+    """
+    import base64
+    import pickle
+
+    from sklearn.ensemble import IsolationForest
+
+    # Recalibrate the empirical distribution and its Tukey-fence threshold.
+    ground_truth_empirical_arr = compute_empirical_distribution(ground_truth_text_features_arr)
+    ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
+    ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
+    ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
+
+    # Recalibrate the Isolation Forest for prediction and explainable values.
+    model = IsolationForest().fit(ground_truth_text_features_arr)
+
+    ground_truth_text_empirical_threshold_list_str = json.dumps(
+        ground_truth_text_empirical_threshold.tolist()
+    )
+    model_b64_pkl = base64.b64encode(pickle.dumps(model)).decode("utf-8")
+
+    return ground_truth_text_empirical_threshold_list_str, model_b64_pkl
 

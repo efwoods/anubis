@@ -140,7 +140,7 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         # Explain the result
         from src.anubis.utils.utility import compute_shap_values_against_baseline
         
-        shap_values_dict = await compute_shap_values_against_baseline(features_arr)
+        shap_values_dict = await compute_shap_values_against_baseline(features_arr, runtime.store)
         avatar_response.response_metadata.update(shap_values_dict)
 
         # Compare against ground truth quotes if available:

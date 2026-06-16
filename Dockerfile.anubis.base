@@ -22,7 +22,7 @@ RUN apk add --no-cache ffmpeg-7 libsndfile libgomp
 # (src/anubis/utils/dataset/stylistic_profile.py). Pre-bake it so the syntax
 # engine resolves to "spacy" without a multi-second runtime auto-download on the
 # first authenticity evaluation. Code degrades to nltk if this is ever absent.
-RUN python -m spacy download en_core_web_sm
+# RUN python -m spacy download en_core_web_sm
 
 
 # -- Adding local package . --

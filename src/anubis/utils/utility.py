@@ -1829,7 +1829,7 @@ async def resize_image_bytes(image_bytes: bytes) -> tuple[bytes, Optional[str]]:
         return out.getvalue(), "image/jpeg"
 
 async def load_baseline_features_explainer_model(store: BaseStore):
-    import base64, pickle, shap, aoifiles, json
+    import base64, pickle, shap, aiofiles, json
     import numpy as np
 
     # Attempt to pull stored model and data from store
@@ -1846,7 +1846,7 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     if not baseline_features_model_b64_pkl:
         _MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
         # Load model 
-        async with aoifiles.open(_MODEL_PATH, 'rb') as fp:
+        async with aiofiles.open(_MODEL_PATH, 'rb') as fp:
             baseline_features_model_b64_pkl = await fp.read()
             await fp.close()
         await store.aput(
@@ -1884,7 +1884,7 @@ async def load_baseline_features_explainer_model(store: BaseStore):
 async def compute_shap_values_against_baseline(feature_values, store: BaseStore) -> dict:
     from src.anubis.utils.dataset.style_features import FEATURE_NAMES
     import pandas as pd
-    _explainer, _model = load_baseline_features_explainer_model(store)
+    _explainer, _model = await load_baseline_features_explainer_model(store)
     prediction = bool(_model.predict(feature_values))
     shap_values = _explainer.shap_values(feature_values)
 

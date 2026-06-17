@@ -146,7 +146,7 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         # Nest the distance verdict together with the SHAP explanation under a single key
         # (verdict first to match the documented output order).
         comparison_to_unmodified_llm_response_analysis = {
-            "significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_baseline_chatgpt[0] > baseline_response_threshold),
+            "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_baseline_chatgpt[0] <= baseline_response_threshold),
             **shap_values_dict,
         }
         avatar_response.response_metadata.update({"comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis})
@@ -197,15 +197,28 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             # Predict and explain the classification
             ground_truth_prediction = bool(ground_truth_text_features_model.predict(features_arr.reshape(1,-1))==1)
 
-            explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, ground_truth_text_features_arr)
+            # KernelExplainer weights model.predict over EVERY background row per
+            # explanation, so passing the full corpus (which can be thousands of
+            # quote rows after calibration) makes this step effectively hang.
+            # Summarize to a bounded background sample using kmeans clustering — standard SHAP practice.
+            shap_background = (
+                shap.kmeans(ground_truth_text_features_arr, 100)
+                if ground_truth_text_features_arr.shape[0] > 100
+                else ground_truth_text_features_arr
+            )
+            explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, shap_background)
             ground_truth_shap_values = explainer.shap_values(features_arr.reshape(1,-1))
+            # shap_values for a single sample comes back shaped (1, 33); flatten to
+            # (33,) so it aligns with the 33-row FEATURE_NAMES index (the DataFrame
+            # expects (n_features, 1), not (1, n_features)).
+            ground_truth_shap_values = np.asarray(ground_truth_shap_values).ravel()
             ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
 
             ground_truth_shap_values_dict = ground_truth_shap_values_df[ground_truth_shap_values_df['ground_truth_shap_values']!=0].to_dict()
 
             # Nest the distance verdict, SHAP explanation, and isolation-forest verdict under a single key.
             comparison_to_direct_quote_response_analysis = {
-                "no_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold),
+                "no_statistically_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold),
                 "no_statisically_significant_difference_between_sample_and_direct_quotes_dataset_according_to_isolation_forest": ground_truth_prediction,
                 "ground_truth_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from direct quotes dataset. Positive values indicate similarity to direct quotes. Scale is -1 to 1.",
                 **ground_truth_shap_values_dict,
@@ -213,8 +226,11 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             avatar_response.response_metadata.update({"comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis})
 
     except Exception as e:
+        # Post-stream analysis is best-effort: the user has already received the
+        # reply, so a failure here must never fail the response. Log and keep
+        # whatever metadata was attached before the error (features/sentiment,
+        # and the baseline comparison if it got that far).
         logger.error(f"error analyzing features: {e}")
-        raise Exception(f"error analyzing features: {e}")
 
 
 async def message_interface(

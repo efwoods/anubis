@@ -1,0 +1,1 @@
+choose to respondo to direct messages or observe a stream of text or notify when uncertain of the response. 

@@ -1,3 +1,7 @@
+# Better UI: Login
+# Improvement of response quality
+
+
 <!-- - [x] I need to chunk the logs -->
 - [ ] I need to work on git_log_all.sh additional update to the log file
 
@@ -72,9 +76,6 @@ allow the process media graph to be used as a tool triggered in conversation
 # CRUD memories/identity_memories endpoints
 
 # I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present; verify that the requester is the creator
-
-
-
 
 # Moving forward
 

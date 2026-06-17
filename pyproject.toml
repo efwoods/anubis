@@ -48,6 +48,14 @@ dependencies = [
     "python-multipart>=0.0.22",
     "requests>=2.31.0",
     "rouge>=1.0.1",
+    # Pinned exactly: sklearn pickles (IsolationForest / ExtraTreeRegressor in the
+    # style baseline + ground-truth models) are not portable across versions and raise
+    # InconsistentVersionWarning when loaded under a different release. sklearn is only a
+    # transitive dep here, and the Docker base image resolves deps freshly via
+    # `uv pip install -e .` (not `uv sync`/uv.lock), so without an exact pin the container,
+    # host venv, and style.ipynb drift apart. Keep this in lockstep with the env that
+    # generates the .pkl files, and rebuild the image after bumping.
+    "scikit-learn==1.9.0",
     "scipy>=1.13.0",
     "sentence-transformers>=5.2.3",
     "slack-sdk>=3.41.0",
@@ -63,6 +71,13 @@ dependencies = [
     "soundfile>=0.13.1",
     "ruff>=0.15.15",
     "mypy>=2.1.0",
+    "rich>=15.0.0",
+    "textstat>=0.7.13",
+    "lexicalrichness>=0.5.1",
+    "faststylometry>=1.0.5",
+    "seaborn>=0.13.2",
+    "shap>=0.51.0",
+    "aiofiles>=25.1.0",
 ]
 
 [project.optional-dependencies]

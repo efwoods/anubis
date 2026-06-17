@@ -8,9 +8,19 @@
   
 The data is inaccurate; duplicated, responses are incorrect and inauthentic.
 
+
 # Goal: Accurate relevant data and correct authentic responses.
 
 status updates while thinking of WHAT the avatar is currently thinking (streamed messages)
+- [ ] edit memories
+- [ ] twitter login: https://x.com/shivon
+- [ ] fragments in dataset from PDF: 11/5/25, 11:46 PM; Page 14 of 10; Machine Intelligence - Shivon Zilis.pdf
+- [ ] transcription fragments from youtube: "so you're"; https://www.youtube.com/watch?v=WV329HQvzUw
+- [ ] 
+
+
+# COMPARING AUTHENTICITY OF GENERATED RESPONSES
+data/elon-musk-dataset/elon_musk_tweets.csv
 
 URL processing is unclean
 pdf processing is unclean

@@ -513,6 +513,13 @@ class GlobalContext:
         default=None, metadata={"description": "Payment URL for subscriptions."}
     )
 
+    baseline_response_threshold: float = field(
+        default=54.35471173951366,
+        metadata={
+            "description": "Pre-calculated IQR threshold for the empirical representation of the squared mahalanobis distances of the features presented from the unmodified chatgpt responses using a leave-one-out method."
+        }
+    )
+
     def __post_init__(self):
         """Fetch env vars for attributes that were not passed as args; coerce int/float hints from str."""
         hints = typing.get_type_hints(self.__class__)

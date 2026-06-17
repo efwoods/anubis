@@ -3505,8 +3505,12 @@ OR (
     prefix LIKE %s
     AND value #>> '{document,kwargs,metadata,namespace_filename}' = %s
 )
+RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
 """
     total_deleted = 0
+    # document_ids of the rows just deleted; used below to prune the stylometric
+    # "direct quote" feature corpus so it no longer reflects removed documents.
+    deleted_document_ids: set[str] = set()
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -3526,7 +3530,11 @@ OR (
                     source_document_name,
                 )
                 await cur.execute(SQL_DELETE_DOCUMENT_QUERY, params)
-                total_deleted += cur.rowcount if cur.rowcount is not None else 0
+                returned_rows = await cur.fetchall()
+                total_deleted += len(returned_rows)
+                deleted_document_ids = {
+                    row[0] for row in returned_rows if row and row[0]
+                }
     except Exception:
         raise HTTPException(detail="Error deleting documents.", status_code=500)
 
@@ -3536,8 +3544,96 @@ OR (
             detail=f"No stored rows matched document: {display_name}",
         )
 
+    # Prune the deleted documents' rows from the stylometric "direct quote"
+    # feature corpus (a {document_id: [33 floats]} dict in the store), then
+    # recalibrate the empirical threshold + IsolationForest from what remains.
+    # Best-effort: a failure here must not fail the (already committed) delete.
+    try:
+        await _prune_ground_truth_features_for_deleted_docs(
+            assistant_id, deleted_document_ids
+        )
+    except Exception as exc:  # pragma: no cover - operator log only
+        logger.warning("ground-truth feature prune failed for %s: %s", assistant_id, exc)
+
     return JSONResponse(
         content=f"Successfully deleted: {display_name}", status_code=200
+    )
+
+
+async def _prune_ground_truth_features_for_deleted_docs(
+    assistant_id: str | None, deleted_document_ids: set[str]
+) -> None:
+    """Remove deleted documents from the per-document stylometric feature corpus.
+
+    Reads the ``{document_id: [33 floats]}`` dict the avatar's "direct quote"
+    corpus is stored under, drops every ``deleted_document_ids`` entry, then:
+
+    * if rows remain — rebuilds the ``(n_docs, 33)`` array and recalibrates the
+      empirical threshold + IsolationForest from it, persisting all three
+      artifacts (dict, threshold, model);
+    * if the corpus is now empty — deletes all three keys so a later re-upload
+      starts clean.
+
+    No-op when there is no assistant or nothing was deleted.
+    """
+    if not assistant_id or not deleted_document_ids:
+        return
+
+    from src.anubis.utils.dataset.style_features import (
+        GROUND_TRUTH_FEATURES_DICT_KEY,
+        deserialize_features_by_doc_id,
+        features_by_doc_id_to_arr,
+        recompute_ground_truth_artifacts,
+        serialize_features_by_doc_id,
+    )
+
+    store = app.state.store
+
+    dict_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
+    threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
+    model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+
+    item = await store.aget(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
+    features_by_doc_id_str = (getattr(item, "value", None) or {}).get("value", None)
+    features_by_doc_id = deserialize_features_by_doc_id(features_by_doc_id_str)
+    if not features_by_doc_id:
+        return
+
+    # Drop the deleted documents' rows.
+    removed = False
+    for document_id in deleted_document_ids:
+        if features_by_doc_id.pop(document_id, None) is not None:
+            removed = True
+    if not removed:
+        return
+
+    if not features_by_doc_id:
+        # Corpus is now empty: clear all three derived keys.
+        await store.adelete(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
+        await store.adelete(threshold_namespace, key="ground_truth_text_empirical_threshold_list_str")
+        await store.adelete(model_namespace, key="ground_truth_text_features_model_b64_pkl")
+        return
+
+    # Rebuild the corpus array and recalibrate the derived artifacts.
+    ground_truth_text_features_arr = features_by_doc_id_to_arr(features_by_doc_id)
+    threshold_list_str, model_b64_pkl = recompute_ground_truth_artifacts(
+        ground_truth_text_features_arr
+    )
+
+    await store.aput(
+        dict_namespace,
+        key=GROUND_TRUTH_FEATURES_DICT_KEY,
+        value={"value": serialize_features_by_doc_id(features_by_doc_id)},
+    )
+    await store.aput(
+        threshold_namespace,
+        key="ground_truth_text_empirical_threshold_list_str",
+        value={"value": threshold_list_str},
+    )
+    await store.aput(
+        model_namespace,
+        key="ground_truth_text_features_model_b64_pkl",
+        value={"value": model_b64_pkl},
     )
 
 if __name__ == "__main__":

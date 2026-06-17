@@ -1,0 +1,1 @@
+given context of text up to a particular line in a script, the avatar should recant the line. multiple iterations with annotations to determine quality of responses and tuning (applies to religious characters and screenplays)

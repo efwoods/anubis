@@ -11,7 +11,7 @@ SELECT
     value->'document'->'kwargs'->>'page_content' AS page_content,
     prefix,
     key,
-    value->'document'->'kwargs'->'metadata'->>'user_id' AS owner_user_id,
+    value->'document'->'kwargs'->'metadata'->>'user_id' AS owner_user_id, 
     value->'document'->'kwargs'->>'metadata' AS metadata
 FROM store
 WHERE split_part(prefix, '.', -1) = 'identity_memory'

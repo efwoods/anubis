@@ -1201,6 +1201,12 @@ async def process_media_item_task(
                                 }
                             )
                             final_documents.append(document)
+
+                        # FINAL DOCUMENTS ARE USED TO CALIBRATE THE GROUND_TRUTH_FEATURES
+                """ CALIBRATE GROUND TRUTH """
+                from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
+                await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=final_documents)
+
                 return final_documents
 
             # Existing single-conversation shape: ``{"messages": [...]}``

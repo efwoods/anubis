@@ -27,7 +27,10 @@ from src.anubis.utils.dataset.authenticity_evaluator import (
     evaluate_authenticity_against_profile,
 )
 from src.anubis.utils.dataset.build_knowledge_profile import load_knowledge_profile
-from src.anubis.utils.dataset.build_profile import load_stylistic_profile
+from src.anubis.utils.dataset.build_profile import (
+    load_baseline_profile,
+    load_stylistic_profile,
+)
 from src.anubis.utils.dataset.knowledge_evaluator import evaluate_knowledge
 from src.anubis.utils.dataset.quality import evaluate as evaluate_content_quality
 
@@ -65,15 +68,20 @@ async def run_evaluation(
     """
     ctx = context or GlobalContext()
 
-    stylistic_profile = await load_stylistic_profile(
+    # Ground-truth cloud = the real person's style (per-avatar, from quotes);
+    # baseline cloud = the bundled ChatGPT voice (shared across avatars).
+    ground_truth_profile = await load_stylistic_profile(
         user_id=user_id, assistant_id=assistant_id, store=store
     )
+    baseline_profile = load_baseline_profile()
     knowledge_profile = await load_knowledge_profile(
         user_id=user_id, assistant_id=assistant_id, store=store
     )
 
     authenticity_report = evaluate_authenticity_against_profile(
-        candidate_text, stylistic_profile or {}
+        candidate_text,
+        baseline_profile,
+        ground_truth_profile,
     )
 
     if knowledge_profile is None:
@@ -114,7 +122,8 @@ async def run_evaluation(
         "user_id": user_id,
         "assistant_id": assistant_id,
         "candidate_text_excerpt": (candidate_text or "")[:500],
-        "stylistic_profile_built": stylistic_profile is not None,
+        "ground_truth_profile_built": ground_truth_profile is not None,
+        "baseline_profile_loaded": baseline_profile is not None,
         "knowledge_profile_built": knowledge_profile is not None,
         "authenticity": authenticity_report,
         "knowledge": knowledge_report,

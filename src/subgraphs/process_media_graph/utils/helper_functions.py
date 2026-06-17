@@ -18,6 +18,7 @@ from src.anubis.utils.classes.FirstPersonRewriterClass import (
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
 )
+from langgraph.store.base import BaseStore
 
 logger = logging.getLogger(__name__)
 
@@ -901,12 +902,12 @@ async def process_nontarget_text_to_identity_documents(
         document.metadata.update({"namespace_filename": namespace_filename})
     return documents
 
-
 async def process_text_to_document(
     metadata,
     user_id,
     assistant_id,
     media_item,
+    store: BaseStore,
     namespace_hint: Optional[str] = None,
 ) -> List[Document]:
     """Reference-document gate, then content-situation classifier, then route to chunkers.
@@ -1057,6 +1058,10 @@ async def process_text_to_document(
             media_item=media_item,
             classification_metadata=classification_metadata,
         )
+        """ CALIBRATE GROUND TRUTH """
+        from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
+        await calibrate_ground_truth(store=store, assitant_id=assistant_id, documents=documents)
+        
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True
         # adapter_acceptable: True

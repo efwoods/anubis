@@ -296,12 +296,12 @@ def reduce_docs(
 
     coerced: list[Document] = []
     if isinstance(new, str):
-        coerced.append(Document(page_content=new, metadata={"id": str(uuid.uuid4())}))
+        coerced.append(Document(page_content=new, metadata={"document_id": str(uuid.uuid4())}))
     elif isinstance(new, list):
         for item in new:
             if isinstance(item, str):
                 coerced.append(
-                    Document(page_content=item, metadata={"id": str(uuid.uuid4())})
+                    Document(page_content=item, metadata={"document_id": str(uuid.uuid4())})
                 )
             elif isinstance(item, dict):
                 coerced.append(Document(**item))
@@ -1827,3 +1827,62 @@ async def resize_image_bytes(image_bytes: bytes) -> tuple[bytes, Optional[str]]:
         out = io.BytesIO()
         image.save(out, format="JPEG", quality=85, optimize=True)
         return out.getvalue(), "image/jpeg"
+
+async def load_baseline_features_explainer_model(store: BaseStore):
+    import base64, pickle, shap, aiofiles, json
+    import numpy as np
+
+    # Attempt to pull stored model and data from store
+    baseline_features_namespace = ("baseline_features_arr_list_str",)
+    baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
+
+    baseline_features_arr_list_str_ITEM = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
+    baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
+
+    baseline_features_model_b64_pkl_ITEM = await store.aget(baseline_features_model_namespace, key="baseline_features_model_b64_pkl")
+    baseline_features_model_b64_pkl = (getattr(baseline_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+
+    # If the baseline_features_model has not yet been stored, load from disk and store the model:
+    if not baseline_features_model_b64_pkl:
+        _MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
+        # Load model
+        async with aiofiles.open(_MODEL_PATH, 'rb') as fp:
+            baseline_features_model_b64_pkl = await fp.read()
+        baseline_features_model_b64_pkl_str = (baseline_features_model_b64_pkl).decode('utf-8')
+        await store.aput(
+            baseline_features_model_namespace, 
+            key="baseline_features_model_b64_pkl", 
+            value={"value":baseline_features_model_b64_pkl_str})        
+
+    # Convert from pickled string to Isolation Forest model
+    model = pickle.loads(base64.b64decode(baseline_features_model_b64_pkl))
+
+    # If the baseline_features_arr has not yet been stored, load from disk and store the array:
+    if not baseline_features_arr_list_str:
+        _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
+        baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
+
+        baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
+
+        await store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
+
+    # Convert from str to np.array
+    baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
+    
+    explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+    return explainer, model
+
+async def compute_shap_values_against_baseline(feature_values, store: BaseStore) -> dict:
+    from src.anubis.utils.dataset.style_features import FEATURE_NAMES
+    import pandas as pd
+    _explainer, _model = await load_baseline_features_explainer_model(store)
+    prediction = bool(_model.predict(feature_values.reshape(1,-1))==1)
+
+    shap_values = _explainer.shap_values(feature_values.reshape(1,-1))
+
+    df = pd.DataFrame(shap_values.flatten(), index = FEATURE_NAMES, columns = ['unmodified_llm_comparison_isolation_forest_shap_values'])
+    shap_dict = df[df['unmodified_llm_comparison_isolation_forest_shap_values']!=0.0].to_dict()
+    shap_dict['unmodified_llm_comparison_isolation_forest_shap_values_description'] = "Negative values indicate dissimilarity from unmodified llm dataset. Positive values indicate similarity to unmodified llm responses. Scale is -1 to 1."
+    shap_dict['no_statistically_significant_difference_between_sample_and_unmodified_llm_according_to_isolation_forest'] = prediction
+
+    return shap_dict

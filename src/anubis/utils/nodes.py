@@ -408,6 +408,8 @@ async def _build_consciousness_system_message_update(
     """ Retrieve Style Profile """
     style_profile_namespace = (assistant_id, "style_profile")
     style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
+    
+    # style_profile_str will be "" if the style profile does not exist
     style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")
 
     """ Retrieve Emotions """
@@ -463,7 +465,7 @@ async def _build_consciousness_system_message_update(
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
         analyzed_traits=analyzed_traits,
-        style_prompt=style_profile_str,
+        style_profile_str=style_profile_str,
         direct_quotes=direct_quotes,
         user_name=user_name,
         user_description=user_description,

@@ -441,6 +441,7 @@ async def think(
     # TODO: Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata. The
     # user has seen the reply by now, so this adds no perceived latency.
+    if config.get("configurable", {}).get("include_metrics", False):
         await _attach_analyzed_features(final_message, runtime=runtime, assistant_id=state['assistant_state']['assistant_id'])
 
 

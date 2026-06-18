@@ -1,0 +1,87 @@
+{
+  "type": "done",
+  "content": "Got it. What are we testing\u2014something specific you want to check, or just a quick \u201cdoes this work\u201d test?",
+  "thread_id": "e39a6781-73c3-4be9-9c04-215be329e62f",
+  "request_id": "6fe2aa74-1678-4167-9a2b-9d0645a385bb",
+  "total_response_time_ms": 20094,
+  "response_metadata": {
+    "finish_reason": "stop",
+    "model_name": "gpt-5.4-nano-2026-03-17",
+    "service_tier": "default",
+    "model_provider": "openai",
+    "sentiment": {
+      "base_emotion": "surprise",
+      "emotion": "curiosity",
+      "score": 0.639224112033844
+    },
+    "features": {
+      "type_token_ratio": 1.0,
+      "moving_average_ttr": 1.0,
+      "mtld_lexical_diversity": 19.0,
+      "hdd_lexical_diversity": 0.9999999999999996,
+      "maas_lexical_diversity": 0.0,
+      "yule_characteristic_k": 0.0,
+      "lexical_density_content_word_ratio": 0.5769230769230769,
+      "noun_density": 0.15384615384615385,
+      "verb_density": 0.19230769230769232,
+      "adjective_density": 0.11538461538461539,
+      "adverb_density": 0.11538461538461539,
+      "pronoun_density": 0.15384615384615385,
+      "preposition_density": 0.038461538461538464,
+      "noun_to_verb_ratio": 0.8333333333333334,
+      "pos_sequence_compressibility": 1.0512820512820513,
+      "mean_sentence_length_words": 10.0,
+      "stdev_sentence_length_words": 8.0,
+      "interrogative_sentence_ratio": 0.5,
+      "exclamatory_sentence_ratio": 0.0,
+      "comma_rate_per_1k": 50.0,
+      "semicolon_rate_per_1k": 0.0,
+      "colon_rate_per_1k": 0.0,
+      "dash_rate_per_1k": 50.0,
+      "ellipsis_rate_per_1k": 0.0,
+      "exclamation_rate_per_1k": 0.0,
+      "question_mark_rate_per_1k": 50.0,
+      "all_caps_word_ratio": 0.0,
+      "words_per_paragraph": 20.0,
+      "transition_word_rate_per_1k": 0.0,
+      "flesch_kincaid_grade": 6.725263157894737,
+      "gunning_fog_index": 11.810526315789474,
+      "smog_index": 11.20814326018867,
+      "lexical_entropy_bits": 4.321928094887363
+    },
+    "comparison_to_unmodified_llm_response_analysis": {
+      "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": false,
+      "unmodified_llm_comparison_isolation_forest_shap_values": {
+        "moving_average_ttr": -0.08813384539091274,
+        "mtld_lexical_diversity": -0.1540267249065924,
+        "hdd_lexical_diversity": -0.16691582064450303,
+        "maas_lexical_diversity": -0.25007318852402427,
+        "noun_density": -0.10494606428287077,
+        "adverb_density": -0.08219498852709917,
+        "pronoun_density": -0.11220443539757342,
+        "pos_sequence_compressibility": -0.22442567903488897,
+        "question_mark_rate_per_1k": -0.17075525936701713,
+        "lexical_entropy_bits": -0.5717898324338345
+      },
+      "unmodified_llm_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from unmodified llm dataset. Positive values indicate similarity to unmodified llm responses. Scale is -1 to 1.",
+      "no_statistically_significant_difference_between_sample_and_unmodified_llm_according_to_isolation_forest": false
+    },
+    "comparison_to_direct_quote_response_analysis": {
+      "no_statistically_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": true,
+      "no_statisically_significant_difference_between_sample_and_direct_quotes_dataset_according_to_isolation_forest": true,
+      "ground_truth_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from direct quotes dataset. Positive values indicate similarity to direct quotes. Scale is -1 to 1.",
+      "ground_truth_shap_values": {
+        "moving_average_ttr": 0.015906275942657835,
+        "hdd_lexical_diversity": 0.007258280445781003,
+        "mean_sentence_length_words": 0.01953089131510914,
+        "stdev_sentence_length_words": -0.0681701391831422,
+        "interrogative_sentence_ratio": -0.04455966972023082,
+        "exclamatory_sentence_ratio": 0.02253258214343712,
+        "exclamation_rate_per_1k": 0.00810257094633263,
+        "flesch_kincaid_grade": 0.020586344136980312,
+        "gunning_fog_index": 0.017736062072872826,
+        "lexical_entropy_bits": 0.013271923851421575
+      }
+    }
+  }
+}

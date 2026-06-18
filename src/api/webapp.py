@@ -1145,6 +1145,7 @@ async def message_selected_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
+    include_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1194,6 +1195,7 @@ async def message_selected_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    config['configurable']['include_metrics'] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
@@ -1276,8 +1278,6 @@ async def message_selected_avatar(
     return JSONResponse(response_data, status_code=200)
 
 
-from time import sleep
-
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,
@@ -1293,6 +1293,7 @@ async def message_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
+    include_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1366,6 +1367,7 @@ async def message_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    config['configurable']['include_metrics'] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
@@ -1449,7 +1451,6 @@ async def message_avatar(
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
     return JSONResponse(response_data, status_code=200)
-
 
 @app.get("/conversations")
 async def get_all_conversations(

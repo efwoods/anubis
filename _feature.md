@@ -1,1 +1,0 @@
-I need human readable descriptions of the following features to allow for the model to intrepret the style appropriately using the median of the features that are calculated 

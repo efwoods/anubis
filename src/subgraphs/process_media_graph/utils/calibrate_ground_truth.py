@@ -27,6 +27,8 @@ async def calibrate_ground_truth(
     on first call, merged thereafter); the threshold/model are only recomputed
     once the merged corpus reaches ``MIN_ROWS_FOR_CALIBRATION`` rows.
     """
+    import asyncio
+
     import numpy as np
     import pandas as pd
 
@@ -39,7 +41,16 @@ async def calibrate_ground_truth(
         serialize_features_by_doc_id,
     )
 
-    features = [extract_style_features(doc.page_content) for doc in documents]
+    # extract_style_features is heavy, fully-synchronous CPU work per document
+    # (nltk pos-tagging, textstat, lexicalrichness, gzip, entropy). A CSV upload
+    # (e.g. a tweet dump) fans out to thousands of documents, so running this
+    # comprehension inline would pin the single asyncio event loop for the whole
+    # batch and stall every other request. Offload the whole loop to one worker
+    # thread (one to_thread, not thousands of tasks) so the loop stays responsive.
+    page_contents = [doc.page_content for doc in documents]
+    features = await asyncio.to_thread(
+        lambda: [extract_style_features(text) for text in page_contents]
+    )
     features_arr = np.array(pd.DataFrame(features).values)  # shape (n_obs/documents, n_features=33); ndarray so downstream .tolist()/np.concatenate work
 
     # Map each document id to its feature row. features_arr rows are positionally
@@ -85,16 +96,21 @@ async def calibrate_ground_truth(
         return
 
     # Recalibrate the empirical threshold + IsolationForest from the corpus.
+    # This is also synchronous CPU-bound work (a leave-one-out LedoitWolf fit per
+    # row plus an IsolationForest fit), so it is likewise offloaded off the event
+    # loop to keep the server responsive during a large upload.
     (
         ground_truth_text_empirical_threshold_list_str,
         model_str_pkl,
-    ) = recompute_ground_truth_artifacts(ground_truth_text_features_arr)
+    ) = await asyncio.to_thread(
+        recompute_ground_truth_artifacts, ground_truth_text_features_arr
+    )
 
-    # TODO: BUILD STYLE PROFILE
-    # style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
+    # BUILD AND STORE STYLE PROFILE
+    from src.anubis.utils.dataset.style_features import build_style_profile_str
+    style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
     style_profile_namespace = (assistant_id, "style_profile")
     await store.aput(style_profile_namespace, key="style_profile", value={"value":style_profile_str})
-
 
     ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
     await store.aput(

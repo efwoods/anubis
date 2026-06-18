@@ -3592,6 +3592,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
     dict_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
     threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
     model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+    style_prompt_namespace = (assistant_id, "style_prompt")
 
     item = await store.aget(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
     features_by_doc_id_str = (getattr(item, "value", None) or {}).get("value", None)
@@ -3612,6 +3613,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
         await store.adelete(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
         await store.adelete(threshold_namespace, key="ground_truth_text_empirical_threshold_list_str")
         await store.adelete(model_namespace, key="ground_truth_text_features_model_b64_pkl")
+        await store.adelete(style_prompt_namespace, key="style_prompt")
         return
 
     # Rebuild the corpus array and recalibrate the derived artifacts.
@@ -3619,6 +3621,9 @@ async def _prune_ground_truth_features_for_deleted_docs(
     threshold_list_str, model_b64_pkl = recompute_ground_truth_artifacts(
         ground_truth_text_features_arr
     )
+
+    from src.anubis.utils.dataset.style_features import build_style_profile_str
+    style_prompt_str = await build_style_profile_str(ground_truth_text_features_arr)
 
     await store.aput(
         dict_namespace,
@@ -3634,6 +3639,11 @@ async def _prune_ground_truth_features_for_deleted_docs(
         model_namespace,
         key="ground_truth_text_features_model_b64_pkl",
         value={"value": model_b64_pkl},
+    )
+    await store.aput(
+        style_prompt_namespace, 
+        key="style_prompt",
+        value={"value": style_prompt_str}
     )
 
 if __name__ == "__main__":

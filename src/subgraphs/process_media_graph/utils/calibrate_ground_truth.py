@@ -90,6 +90,12 @@ async def calibrate_ground_truth(
         model_str_pkl,
     ) = recompute_ground_truth_artifacts(ground_truth_text_features_arr)
 
+    # TODO: BUILD STYLE PROFILE
+    # style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
+    style_profile_namespace = (assistant_id, "style_profile")
+    await store.aput(style_profile_namespace, key="style_profile", value={"value":style_profile_str})
+
+
     ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
     await store.aput(
         ground_truth_text_empirical_threshold_namespace,

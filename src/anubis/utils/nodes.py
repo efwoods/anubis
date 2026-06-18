@@ -405,6 +405,11 @@ async def _build_consciousness_system_message_update(
     logger.info(f"analyzed_trait_items: {analyzed_trait_items}")
     analyzed_traits = reduce_docs([], analyzed_trait_items)
 
+    """ Retrieve Style Profile """
+    style_profile_namespace = (assistant_id, "style_profile")
+    style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
+    style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")
+
     """ Retrieve Emotions """
 
     # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt
@@ -458,6 +463,7 @@ async def _build_consciousness_system_message_update(
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
         analyzed_traits=analyzed_traits,
+        style_prompt=style_profile_str,
         direct_quotes=direct_quotes,
         user_name=user_name,
         user_description=user_description,

@@ -89,6 +89,97 @@ FEATURE_NAMES: List[str] = [
 assert len(FEATURE_NAMES) == 33, f"expected 33 features, found {len(FEATURE_NAMES)}"
 
 
+FEATURE_NAMES_HUMAN_LEGIBLE: List[Dict[str,str]] = [{
+    # ── Lexical diversity (7) ──────────────────────────────────────────────
+    "type_token_ratio": "Type Token Ratio",                    # unique words / total words (length-biased)
+    "moving_average_ttr": "test",                  # TTR averaged over a sliding window (length-robust)
+    "mtld_lexical_diversity": "test",              # Measure of Textual Lexical Diversity
+    "hdd_lexical_diversity": "test",               # Hypergeometric Distribution Diversity (HD-D)
+    "maas_lexical_diversity": "test",              # Maas index a^2 (log-curve fit of TTR vs length)
+    "yule_characteristic_k": "test",               # Yule's K — vocabulary repetition, length-stable
+    "lexical_density_content_word_ratio": "test",  # content words / all words
+    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    "noun_density": "test",                        # share of tokens tagged noun
+    "verb_density": "test",                        # share of tokens tagged verb
+    "adjective_density": "test",                   # share of tokens tagged adjective
+    "adverb_density": "test",                      # share of tokens tagged adverb
+    "pronoun_density": "test",                     # share of tokens tagged pronoun
+    "preposition_density": "test",                 # share of tokens tagged preposition
+    "noun_to_verb_ratio": "test",                  # nominal (high) vs verbal/conversational (low) style
+    "pos_sequence_compressibility": "test",        # gzip ratio of the POS-tag stream (template reuse proxy)
+    # ── Sentence shape (4) ─────────────────────────────────────────────────
+    "mean_sentence_length_words": "test",          # average words per sentence
+    "stdev_sentence_length_words": "test",         # sentence-length variability (rhythm)
+    "interrogative_sentence_ratio": "test",        # share of sentences ending in '?'
+    "exclamatory_sentence_ratio": "test",          # share of sentences ending in '!'
+    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
+    "comma_rate_per_1k": "test",
+    "semicolon_rate_per_1k": "test",
+    "colon_rate_per_1k": "test",
+    "dash_rate_per_1k": "test",
+    "ellipsis_rate_per_1k": "test",
+    "exclamation_rate_per_1k": "test",
+    "question_mark_rate_per_1k": "test",
+    # ── Surface / flow (3) ─────────────────────────────────────────────────
+    "all_caps_word_ratio": "test",                 # SHOUTING / emphasis habit
+    "words_per_paragraph": "test",                 # internet writing = short paragraphs
+    "transition_word_rate_per_1k": "test",         # logical-bridge words per 1k (however, therefore, …)
+    # ── Readability composites via textstat (3) ────────────────────────────
+    "flesch_kincaid_grade": "test",                # words/sentence + syllables/word -> US grade
+    "gunning_fog_index": "test",                   # sentence length + % complex words
+    "smog_index": "test",                          # polysyllable-count grade estimate
+    # ── Information theory (1) ─────────────────────────────────────────────
+    "lexical_entropy_bits": "test",                # Shannon entropy of the word distribution
+}]
+
+assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
+
+FEATURE_DESCRIPTIONS: List[Dict[str,str]] = [{
+    # ── Lexical diversity (7) ──────────────────────────────────────────────
+    "type_token_ratio": "Type Token Ratio",                    # unique words / total words (length-biased)
+    "moving_average_ttr": "test",                  # TTR averaged over a sliding window (length-robust)
+    "mtld_lexical_diversity": "test",              # Measure of Textual Lexical Diversity
+    "hdd_lexical_diversity": "test",               # Hypergeometric Distribution Diversity (HD-D)
+    "maas_lexical_diversity": "test",              # Maas index a^2 (log-curve fit of TTR vs length)
+    "yule_characteristic_k": "test",               # Yule's K — vocabulary repetition, length-stable
+    "lexical_density_content_word_ratio": "test",  # content words / all words
+    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    "noun_density": "test",                        # share of tokens tagged noun
+    "verb_density": "test",                        # share of tokens tagged verb
+    "adjective_density": "test",                   # share of tokens tagged adjective
+    "adverb_density": "test",                      # share of tokens tagged adverb
+    "pronoun_density": "test",                     # share of tokens tagged pronoun
+    "preposition_density": "test",                 # share of tokens tagged preposition
+    "noun_to_verb_ratio": "test",                  # nominal (high) vs verbal/conversational (low) style
+    "pos_sequence_compressibility": "test",        # gzip ratio of the POS-tag stream (template reuse proxy)
+    # ── Sentence shape (4) ─────────────────────────────────────────────────
+    "mean_sentence_length_words": "test",          # average words per sentence
+    "stdev_sentence_length_words": "test",         # sentence-length variability (rhythm)
+    "interrogative_sentence_ratio": "test",        # share of sentences ending in '?'
+    "exclamatory_sentence_ratio": "test",          # share of sentences ending in '!'
+    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
+    "comma_rate_per_1k": "test",
+    "semicolon_rate_per_1k": "test",
+    "colon_rate_per_1k": "test",
+    "dash_rate_per_1k": "test",
+    "ellipsis_rate_per_1k": "test",
+    "exclamation_rate_per_1k": "test",
+    "question_mark_rate_per_1k": "test",
+    # ── Surface / flow (3) ─────────────────────────────────────────────────
+    "all_caps_word_ratio": "test",                 # SHOUTING / emphasis habit
+    "words_per_paragraph": "test",                 # internet writing = short paragraphs
+    "transition_word_rate_per_1k": "test",         # logical-bridge words per 1k (however, therefore, …)
+    # ── Readability composites via textstat (3) ────────────────────────────
+    "flesch_kincaid_grade": "test",                # words/sentence + syllables/word -> US grade
+    "gunning_fog_index": "test",                   # sentence length + % complex words
+    "smog_index": "test",                          # polysyllable-count grade estimate
+    # ── Information theory (1) ─────────────────────────────────────────────
+    "lexical_entropy_bits": "test",                # Shannon entropy of the word distribution
+}]
+
+assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
+
+
 # ---------------------------------------------------------------------------
 # Lexicons / regexes built once at import (cheap, no model downloads).
 # ---------------------------------------------------------------------------
@@ -536,3 +627,28 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
 
     return ground_truth_text_empirical_threshold_list_str, model_b64_pkl
 
+async def build_style_profile_str(ground_truth_text_features_arr) -> str:
+    """ Build the LLM interpretable string to allow for the 
+    median calculated features of the direct quotes of the 
+    target to influence the writing of the avatar. 
+    Allows the features to be LLM legible. 
+    """
+    import pandas as pd
+    import numpy as np
+
+
+    ground_truth_text_features_median = np.array(list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values))
+    
+    # ground_truth_text_features_median expected shape: (n_features, )
+    
+    # Feature names need to be non-snake case with a mapping in FEATURE_NAMES_HUMAN_LEGIBLE
+    # Each Feature name needs a description with a mapping in FEATURE_DESCRIPTIONS
+    
+    style_profile_str = ""
+
+    idx = 0
+    for name in FEATURE_NAMES:
+        style_profile_str += f"{FEATURE_NAMES_HUMAN_LEGIBLE[name]}: {ground_truth_text_features_median[idx]}; Description: {FEATURE_DESCRIPTIONS[name]}\n\n"
+        idx +=1
+
+    return style_profile_str

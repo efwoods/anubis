@@ -210,6 +210,5 @@ I’m supposed to be in Singapore.
 The process is exactly the same as above. however, the coalescence creates a single assistant from the entire content (which would then be a monologue) and there is a synthetic prompt that is created. 
 each statement uses the previous statement as a genuine prompt when there are more than one speaker in the video. when there is only a single speaker, the content is classified as normally (monologue for long content with a single thesis, tweets_quotes for only a single short statement)
 
-
 Normally non-target information will be classified as biographical content and scanned for information about the target and create documents if information exists as per the above pipeline. 
 

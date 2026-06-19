@@ -11,9 +11,7 @@
 - [ ] PERSONALIZATION (TALIOR RESPONSES TO USER PREFERENCES, COMMUNICATION STYLE, PREVIOUS INTERACTIONS)
 - [ ] MODERATE CONVERSATIONS
 
-
-
-
+'
 # Obvious problems
  - [] Transcription is not always accurate: “empirical version of the JACE talk.”: https://www.youtube.com/watch?v=-tQwzhHjAVI
  - [] Response structure sounds like chatgpt: response; suggested list of advice; probe to continue the conversation

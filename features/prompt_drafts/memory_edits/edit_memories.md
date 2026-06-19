@@ -1,6 +1,6 @@
 
 When there is a typo in the frontend, the memory needs to be edited in two ways:
-edit message (message response is edited and resent with the edits; the document id is looked up that corresponds to the original message that was sent, the documents are deleted and the new message is re-pipelined throught the graph).
+edit message (message response is edited; the document id is looked up that corresponds to the original message that was sent, the documents are deleted and the new message is re-pipelined throught the graph).
 
 Natural language:
 

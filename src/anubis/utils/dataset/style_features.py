@@ -89,6 +89,108 @@ FEATURE_NAMES: List[str] = [
 assert len(FEATURE_NAMES) == 33, f"expected 33 features, found {len(FEATURE_NAMES)}"
 
 
+# Human-legible display title per feature. Keyed by the snake_case FEATURE_NAMES
+# so build_style_profile_str() can render `LEGIBLE[name]`. The titles are what the
+# LLM sees in the <STYLE> block, so they spell out acronyms (MATTR, HD-D, SMOG)
+# rather than leaving the raw variable name.
+FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
+    # ── Lexical diversity (7) ──────────────────────────────────────────────
+    "type_token_ratio": "Type-Token Ratio (TTR)",
+    "moving_average_ttr": "Moving-Average Type-Token Ratio (MATTR)",
+    "mtld_lexical_diversity": "Measure of Textual Lexical Diversity (MTLD)",
+    "hdd_lexical_diversity": "Hypergeometric Distribution Diversity (HD-D)",
+    "maas_lexical_diversity": "Maas Lexical Diversity Index (a²)",
+    "yule_characteristic_k": "Yule's Characteristic K",
+    "lexical_density_content_word_ratio": "Lexical Density (Content-Word Ratio)",
+    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    "noun_density": "Noun Density",
+    "verb_density": "Verb Density",
+    "adjective_density": "Adjective Density",
+    "adverb_density": "Adverb Density",
+    "pronoun_density": "Pronoun Density",
+    "preposition_density": "Preposition Density",
+    "noun_to_verb_ratio": "Noun-to-Verb Ratio",
+    "pos_sequence_compressibility": "Part-of-Speech Sequence Diversity",
+    # ── Sentence shape (4) ─────────────────────────────────────────────────
+    "mean_sentence_length_words": "Mean Sentence Length (words)",
+    "stdev_sentence_length_words": "Sentence-Length Variability (std dev, words)",
+    "interrogative_sentence_ratio": "Question-Sentence Ratio",
+    "exclamatory_sentence_ratio": "Exclamation-Sentence Ratio",
+    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
+    "comma_rate_per_1k": "Commas per 1,000 Words",
+    "semicolon_rate_per_1k": "Semicolons per 1,000 Words",
+    "colon_rate_per_1k": "Colons per 1,000 Words",
+    "dash_rate_per_1k": "Dashes per 1,000 Words",
+    "ellipsis_rate_per_1k": "Ellipses per 1,000 Words",
+    "exclamation_rate_per_1k": "Exclamation Marks per 1,000 Words",
+    "question_mark_rate_per_1k": "Question Marks per 1,000 Words",
+    # ── Surface / flow (3) ─────────────────────────────────────────────────
+    "all_caps_word_ratio": "ALL-CAPS Word Ratio",
+    "words_per_paragraph": "Words per Paragraph",
+    "transition_word_rate_per_1k": "Transition Words per 1,000 Words",
+    # ── Readability composites via textstat (3) ────────────────────────────
+    "flesch_kincaid_grade": "Flesch-Kincaid Grade Level",
+    "gunning_fog_index": "Gunning Fog Index",
+    "smog_index": "SMOG Index",
+    # ── Information theory (1) ─────────────────────────────────────────────
+    "lexical_entropy_bits": "Lexical Entropy (bits)",
+}
+
+assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
+
+# One-line plain-language description per feature, written for the LLM that reads
+# the style profile. Each states the unit/range, the typical band, and crucially
+# which DIRECTION means what — because the numbers alone are meaningless to the
+# model (and several features are inverse: Maas and Yule's K go DOWN as vocabulary
+# gets richer). Ranges are read straight off the computations in
+# extract_style_features (POS/diversity shares are 0–1, punctuation is per-1k,
+# Yule's K is scaled to 10⁴ words, etc.).
+FEATURE_DESCRIPTIONS: Dict[str, str] = {
+    # ── Lexical diversity (7) ──────────────────────────────────────────────
+    "type_token_ratio": "Unique words divided by total words. Ranges 0–1. Higher means more varied vocabulary, lower means more repetition. Length-biased (drops as a text grows), so it is most comparable at similar lengths.",
+    "moving_average_ttr": "Type-token ratio averaged over a sliding ~50-word window. Ranges 0–1. Higher means richer vocabulary. Length-robust, so it stays comparable across short and long texts.",
+    "mtld_lexical_diversity": "Mean length of word runs that stay above a 0.72 type-token threshold. Unbounded above; typically ~20–120 (most prose 40–100). Higher means sustained lexical variety, lower means vocabulary that repeats quickly.",
+    "hdd_lexical_diversity": "Hypergeometric (HD-D) diversity: the type-token ratio a random fixed-size sample is expected to show. Ranges 0–1, typically ~0.70–0.90. Higher means more diverse word choice.",
+    "maas_lexical_diversity": "Maas index a², a log-curve fit of type-token ratio versus length. Small positive value, typically ~0.0–0.2. Measure: LOWER means richer/more diverse vocabulary, HIGHER means more repetitive vocabulary (same words are used).",
+    "yule_characteristic_k": "Yule's K, vocabulary repetition rate scaled to 10⁴ words; length-stable. Greater than 0, typically ~50–200. Measure: HIGHER means more repetitive vocabulary, LOWER means more varied vocabulary (a variety of words are used).",
+    "lexical_density_content_word_ratio": "Content words (noun/verb/adjective/adverb) over all tagged tokens. Ranges 0–1, typically ~0.4–0.6. Higher means dense, informational, nominal writing; lower means more function words and a conversational feel.",
+    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    "noun_density": "Share of tokens tagged as nouns. Ranges 0–1, typically ~0.20–0.35. Higher means a nominal, topic-heavy style.",
+    "verb_density": "Share of tokens tagged as verbs. Ranges 0–1, typically ~0.15–0.25. Higher means an active, event-driven style.",
+    "adjective_density": "Share of tokens tagged as adjectives. Ranges 0–1, typically ~0.05–0.10. Higher means more descriptive, modifier-heavy writing.",
+    "adverb_density": "Share of tokens tagged as adverbs. Ranges 0–1, typically ~0.03–0.08. Higher means more hedging/intensifying ('really', 'very', 'just').",
+    "pronoun_density": "Share of tokens tagged as pronouns. Ranges 0–1, typically ~0.05–0.15. Higher means a personal, conversational voice (I/you/we).",
+    "preposition_density": "Share of tokens tagged as prepositions (including 'to'). Ranges 0–1, typically ~0.10–0.15. Higher means more elaborated, phrase-stacked syntax.",
+    "noun_to_verb_ratio": "Nouns divided by verbs (+1 smoothed so it stays finite). Greater than 0, typically ~1–3. Higher means a nominal, formal register; lower (near 1) means a verbal, conversational register.",
+    "pos_sequence_compressibility": "Inverse gzip-compression ratio of the part-of-speech tag stream. Roughly ~1–3. Higher means more varied sentence shapes; lower means a few repeated grammatical templates (more formulaic). Very short texts read low from compression overhead.",
+    # ── Sentence shape (4) ─────────────────────────────────────────────────
+    "mean_sentence_length_words": "Average words per sentence. Greater than 0, typically ~10–25. Higher means longer, more complex sentences; lower means short, punchy ones.",
+    "stdev_sentence_length_words": "Standard deviation of sentence length, in words. 0 or greater, typically ~4–15. Higher means rhythmic variety (mixing long and short sentences); 0 means uniform sentence length.",
+    "interrogative_sentence_ratio": "Fraction of sentences ending in '?'. Ranges 0–1. Higher means a questioning, rhetorical, engaging style.",
+    "exclamatory_sentence_ratio": "Fraction of sentences ending in '!'. Ranges 0–1. Higher means an emphatic, excited tone.",
+    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
+    "comma_rate_per_1k": "Commas per 1,000 words. 0 or greater, typically ~40–80. Higher means more clause-chaining and parenthetical phrasing.",
+    "semicolon_rate_per_1k": "Semicolons per 1,000 words. 0 or greater, usually ~0–5 (rare). Higher means deliberate, formal joining of independent clauses.",
+    "colon_rate_per_1k": "Colons per 1,000 words. 0 or greater, typically ~0–10. Higher means frequent setups, lists, or explanatory pauses.",
+    "dash_rate_per_1k": "Em dashes, en dashes, and hyphens per 1,000 words. 0 or greater, typically ~0–30. Higher means an interruptive, aside-heavy, informal rhythm.",
+    "ellipsis_rate_per_1k": "Ellipsis characters ('…') per 1,000 words. 0 or greater, typically ~0–10. Higher means trailing-off, hesitant, or suspenseful phrasing. Counts only the single '…' glyph, not three dots.",
+    "exclamation_rate_per_1k": "Exclamation marks per 1,000 words. 0 or greater. Higher means an emphatic, high-energy tone.",
+    "question_mark_rate_per_1k": "Question marks per 1,000 words. 0 or greater. Higher means a more inquisitive, rhetorical style.",
+    # ── Surface / flow (3) ─────────────────────────────────────────────────
+    "all_caps_word_ratio": "Fraction of multi-letter tokens written in ALL CAPS. Ranges 0–1, usually near 0. Higher means a habit of SHOUTING or capitalized emphasis.",
+    "words_per_paragraph": "Words divided by number of paragraphs (blank-line separated). Greater than 0. Higher means long, blocky paragraphs; lower means short, internet-style chunks.",
+    "transition_word_rate_per_1k": "Logical-bridge words (however, therefore, moreover, …) per 1,000 words. 0 or greater, typically ~0–20. Higher means explicit, essayistic argument structure.",
+    # ── Readability composites via textstat (3) ────────────────────────────
+    "flesch_kincaid_grade": "Flesch-Kincaid US grade level from words-per-sentence and syllables-per-word. Typically ~1–15 (can go negative for very simple text). Higher means harder to read / a more educated register.",
+    "gunning_fog_index": "Gunning Fog index: years of formal education a reader needs, from sentence length and the share of complex words. Typically ~6–17. Higher means denser, harder prose.",
+    "smog_index": "SMOG grade estimate from the count of polysyllabic words. Typically ~6–14. Higher means more complex, multi-syllable vocabulary.",
+    # ── Information theory (1) ─────────────────────────────────────────────
+    "lexical_entropy_bits": "Shannon entropy of the word-frequency distribution, in bits. 0 or greater and grows with vocabulary size (~4–10+ bits common). Higher means less predictable, more varied word choice; lower means repetitive, predictable wording.",
+}
+
+assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
+
+
 # ---------------------------------------------------------------------------
 # Lexicons / regexes built once at import (cheap, no model downloads).
 # ---------------------------------------------------------------------------
@@ -500,6 +602,20 @@ def features_by_doc_id_to_arr(features_by_doc_id: Dict[str, Any]) -> Any:
     return np.vstack([np.asarray(row) for row in features_by_doc_id.values()])
 
 
+# Cap on the number of corpus rows used to (re)calibrate the empirical threshold
+# and IsolationForest. ``compute_empirical_distribution`` is leave-one-out: it
+# refits StandardScaler + LedoitWolf + a matrix inverse once PER ROW, so it is
+# O(n^2) in the corpus size. The corpus accumulates across every upload
+# (``calibrate_ground_truth`` merges new rows into the persisted per-doc dict and
+# recomputes over the UNION), so a large source like a ~68k-row tweet CSV makes
+# calibration dominate processing time — and grow quadratically on each
+# subsequent upload. The threshold and model are statistical calibrations, so a
+# representative random subsample yields an equivalent Tukey fence and
+# IsolationForest at bounded cost. Raise this for a tighter fit at quadratically
+# higher calibration time.
+MAX_CALIBRATION_ROWS = 1500
+
+
 def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tuple[str, str]:
     """Recalibrate the empirical threshold and IsolationForest from the corpus.
 
@@ -520,14 +636,25 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
 
     from sklearn.ensemble import IsolationForest
 
-    # Recalibrate the empirical distribution and its Tukey-fence threshold.
-    ground_truth_empirical_arr = compute_empirical_distribution(ground_truth_text_features_arr)
+    # Bound the O(n^2) leave-one-out calibration: above MAX_CALIBRATION_ROWS use a
+    # deterministic random subsample (fixed seed so re-uploads of the same corpus
+    # stay stable) instead of the full accumulated corpus.
+    calibration_arr = ground_truth_text_features_arr
+    if calibration_arr.shape[0] > MAX_CALIBRATION_ROWS:
+        rng = np.random.default_rng(0)
+        sample_idx = rng.choice(
+            calibration_arr.shape[0], size=MAX_CALIBRATION_ROWS, replace=False
+        )
+        calibration_arr = calibration_arr[sample_idx]
+
+    # Recalibrate the empirical distribution and comparison threshold.
+    ground_truth_empirical_arr = compute_empirical_distribution(calibration_arr)
     ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
     ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
     ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
 
     # Recalibrate the Isolation Forest for prediction and explainable values.
-    model = IsolationForest().fit(ground_truth_text_features_arr)
+    model = IsolationForest().fit(calibration_arr)
 
     ground_truth_text_empirical_threshold_list_str = json.dumps(
         ground_truth_text_empirical_threshold.tolist()
@@ -536,3 +663,24 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
 
     return ground_truth_text_empirical_threshold_list_str, model_b64_pkl
 
+async def build_style_profile_str(ground_truth_text_features_arr) -> str:
+    """ Build the LLM interpretable string to allow for the 
+    median calculated features of the direct quotes of the 
+    target to influence the writing of the avatar. 
+    Allows the features to be LLM legible. 
+    """
+    import pandas as pd
+    import numpy as np
+
+    ground_truth_text_features_median = np.array(list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values))
+    
+    # ground_truth_text_features_median expected shape: (n_features, )
+    
+    style_profile_str = ""
+
+    idx = 0
+    for name in FEATURE_NAMES:
+        style_profile_str += f"{FEATURE_NAMES_HUMAN_LEGIBLE[name]}: {ground_truth_text_features_median[idx]}; Description: {FEATURE_DESCRIPTIONS[name]}\n\n"
+        idx +=1
+
+    return style_profile_str

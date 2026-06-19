@@ -1,3 +1,18 @@
+# POINT OF IMPROVEMENT
+- [ ] pre-processing: (reduce type 1 transcription errors)
+- [ ] retrieval: increase quality of responses (score)
+- [ ] quality: implement PCA and centroid for metrics that point to the quality of the response rather than the length
+- [ ] adapter: (create, train, attach, infer on local test)
+- [ ] analysis pipeline applied
+
+# suggested features Z:
+- [ ] CONTINUOUS LEARNING AND IMPROVEMENT (SYSTEM LEARNS FROM INTERACTIONS; POSITIVE SENTIMENT, ENGAGEMENT, RATINGS SYSTEM; LEARNS WHAT FEELS REAL TO USERS)
+- [ ] CONVERSATION SUBLTIES (HUMOR, SARCASM, EMOTIONAL CUES)
+- [ ] PERSONALIZATION (TALIOR RESPONSES TO USER PREFERENCES, COMMUNICATION STYLE, PREVIOUS INTERACTIONS)
+- [ ] MODERATE CONVERSATIONS
+
+
+
 
 # Obvious problems
  - [] Transcription is not always accurate: “empirical version of the JACE talk.”: https://www.youtube.com/watch?v=-tQwzhHjAVI
@@ -93,7 +108,7 @@ https://www.youtube.com/watch?v=xRHFylOgeJA
 # perform all of the previous steps in a message chat (tool use for learning information about the avatar is appropriately triggered then the graph to process media is appropriately implemented)
 
 # ontop of data processing there is:
-# - evaluating the quality of the responses given the new data that is pulled into the system prompt 
+
 # - psycho analyzing the data with respect to MEYERS briggs personality scores, OCEAN analysis, further inferred traits (emotional triggers, relationships, factual qualities of the individual, behaviors, lexicon of vocabulary, rate of speaking, style of speaking)
 # - fine-tuning adapter with the creation of a dialogue when available to create prompt questions or use a dialogue to create a fine-tuned adapter to capture the speaking style and behavioral choices of the avatar
 

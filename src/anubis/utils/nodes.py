@@ -183,7 +183,7 @@ async def _build_consciousness_system_message_update(
     """
 
     _RETRIEVAL_LIMIT = 10
-    _FILTER_SCORE = 0.5
+    _FILTER_SCORE = 0.1
 
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
@@ -367,8 +367,8 @@ async def _build_consciousness_system_message_update(
     #     retrieved_memories = reduce_docs([], retrieved_memories_items)
     # else:
     #     retrieved_memories = state['recalled_memory_documents']
-    logger.info("breakpoint")
     """ Retrieve Direct Quotes """
+    logger.info("breakpoint quote")
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
 

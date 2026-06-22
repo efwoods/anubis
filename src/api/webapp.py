@@ -2395,7 +2395,7 @@ async def _expand_youtube_playlist_to_media_entries(
     *,
     user_id: str,
     assistant_id: str,
-    treat_every_speaker_as_target: bool = False,
+    create_reference_media_from_playlist: bool = False,
 ) -> Optional[list]:
     """Expand a YouTube **playlist** URL into one media entry per video.
 
@@ -2451,7 +2451,7 @@ async def _expand_youtube_playlist_to_media_entries(
                 "assistant_id": assistant_id,
                 "reference_audio": False,
                 "reference_image": False,
-                "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                "create_reference_media_from_playlist": create_reference_media_from_playlist,
                 # Single opaque uuid5 over the composite so the store key carries
                 # no ``::`` separator. The playlist a video belongs to is recovered
                 # from playlist_namespace_filename below (and from playlist_url /
@@ -2721,7 +2721,7 @@ async def update_avatar_identity_with_media(
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
-    treat_every_speaker_as_target: Annotated[bool, Form()] = False,
+    create_reference_media_from_playlist: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -2753,7 +2753,7 @@ async def update_avatar_identity_with_media(
     **exactly one** file or URL (a reference clip/image is a single item): the file
     or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
 
-    With **treat_every_speaker_as_target=true** the batch has **no single target speaker**:
+    With **create_reference_media_from_playlist=true** the batch has **no single target speaker**:
     every detected speaker is the avatar. Audio/video items are still diarized (so
     no stored reference-audio clip is required and known-speaker labelling is
     skipped). With **multiple speakers**, each statement becomes one ``quote``
@@ -2833,13 +2833,13 @@ async def update_avatar_identity_with_media(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
             )
-        if treat_every_speaker_as_target and (reference_image or reference_audio):
+        if create_reference_media_from_playlist and (reference_image or reference_audio):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "treat_every_speaker_as_target cannot be combined with "
+                    "create_reference_media_from_playlist cannot be combined with "
                     "reference_image/reference_audio: a reference clip designates a "
-                    "single target, while treat_every_speaker_as_target treats every detected "
+                    "single target, while create_reference_media_from_playlist treats every detected "
                     "speaker as the target."
                 ),
             )
@@ -2972,9 +2972,9 @@ async def update_avatar_identity_with_media(
         # level, alongside reference_audio/reference_image). convert_uploaded_
         # files_to_media reads it for audio/video/url items and threads it into
         # their metadata; expanded playlist children inherit it downstream.
-        if treat_every_speaker_as_target:
+        if create_reference_media_from_playlist:
             for entry in media_files:
-                entry["treat_every_speaker_as_target"] = True
+                entry["create_reference_media_from_playlist"] = True
 
         store = app.state.store
 
@@ -3084,7 +3084,7 @@ async def update_avatar_identity_with_media(
                 playlist_url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                treat_every_speaker_as_target=treat_every_speaker_as_target,
+                create_reference_media_from_playlist=create_reference_media_from_playlist,
             )
             for playlist_url in playlist_urls
         ]

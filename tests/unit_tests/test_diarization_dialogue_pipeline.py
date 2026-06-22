@@ -390,6 +390,22 @@ def test_select_dominant_speaker_single_speaker_returns_none():
     assert _select_dominant_speaker_segments(segs) is None
 
 
+def test_select_dominant_speaker_single_speaker_kept_for_reference():
+    """Reference-audio extraction keeps a single speaker so the reference
+    document still gets a transcript (regression: it was returning empty text
+    via the passthrough fallback)."""
+    segs = [
+        {"speaker": "A", "text": "My name is Grant.", "start": 0.0, "end": 3.0},
+        {"speaker": "A", "text": "I build things.", "start": 3.0, "end": 6.0},
+    ]
+    result = _select_dominant_speaker_segments(segs, allow_single_speaker=True)
+    assert result is not None
+    target_speaker, target_segs, totals, total = result
+    assert target_speaker == "A"
+    assert [s["text"] for s in target_segs] == ["My name is Grant.", "I build things."]
+    assert total == pytest.approx(6.0)
+
+
 def test_select_dominant_speaker_no_text_returns_none():
     """If nothing has text the caller should fall through to passthrough."""
     segs = [

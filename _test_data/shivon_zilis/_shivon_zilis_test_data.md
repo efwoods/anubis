@@ -21,7 +21,7 @@ curl /update_avatar_identity_with_media \
   --form 'assistant_id=9549b243-4774-45fa-8234-5137d6dd5bcc' \
   --form 'reference_audio=true' \
   --form 'reference_image=false' \
-  --form 'treat_every_speaker_as_target=false'
+  --form 'create_reference_media_from_playlist=false'
 
 
 
@@ -39,7 +39,7 @@ curl /update_avatar_identity_with_media \
   --form 'assistant_id=9549b243-4774-45fa-8234-5137d6dd5bcc' \
   --form 'reference_audio=false' \
   --form 'reference_image=false' \
-  --form 'treat_every_speaker_as_target=false'
+  --form 'create_reference_media_from_playlist=false'
 
 # Test multi-media upload (pdf, url to grokipedia (biographical information))
 curl /update_avatar_identity_with_media \
@@ -51,7 +51,7 @@ curl /update_avatar_identity_with_media \
   --form 'assistant_id=9549b243-4774-45fa-8234-5137d6dd5bcc' \
   --form 'reference_audio=false' \
   --form 'reference_image=false' \
-  --form 'treat_every_speaker_as_target=false' \
+  --form 'create_reference_media_from_playlist=false' \
   --form 'files=@confirmed_search_results_list.txt'
 
 

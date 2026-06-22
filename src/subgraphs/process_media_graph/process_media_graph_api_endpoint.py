@@ -16,7 +16,6 @@ from src.anubis.utils.context import GlobalContext
 from src.subgraphs.process_media_graph.utils.nodes import (
     analyze_documents,
     convert_media_list_to_text_document,
-    build_stylistic_fingerprint,
     process_adapter_documents,
     process_uploaded_files_and_label_media_type,
 )

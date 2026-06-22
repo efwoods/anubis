@@ -52,6 +52,79 @@ def _namespace_for(source: str) -> str:
     """
     return str(uuid5(NAMESPACE_URL, source))
 
+
+# ``nodes.py`` → ``utils`` → ``process_media_graph`` → ``subgraphs`` → ``src`` → repo root
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _sanitize_for_filename(source: str, *, max_len: int = 120) -> str:
+    """Make ``source`` (a filename or URL) safe to use as a single path component.
+
+    Keep ``[A-Za-z0-9._-]``; replace everything else (path separators, URL
+    punctuation, whitespace) with ``_`` and truncate to ``max_len``.
+    """
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (source or ""))
+    safe = safe.strip("._-") or "source"
+    return safe[:max_len]
+
+
+def _write_dev_diarization_transcript(
+    diar_response: dict,
+    *,
+    source: str,
+    filename: Optional[str],
+    assistant_id: Optional[str],
+    runtime,
+) -> None:
+    """Dump the diarized transcript (labeled speakers) when ``DEV=TRUE`` (dev-only aid).
+
+    Mirrors the ``_write_dev_system_prompt`` convention: gated on
+    ``context.dev.upper() == "TRUE"``. Writes a clean, human-readable JSON view
+    (speaker-labeled segments + full text) to
+    ``<repo_root>/data/<assistant_id>/transcriptions/<source>_<timestamp>.json``.
+    The large ``encoded_audio_base64`` blob is intentionally dropped. Never raises —
+    a dev-artifact write must not break the upload pipeline.
+    """
+    try:
+        context = getattr(runtime, "context", None) or GlobalContext()
+        if str(getattr(context, "dev", "") or "").upper() != "TRUE":
+            return
+
+        out_dir = os.path.join(
+            _PROJECT_ROOT, "data", str(assistant_id or "anonymous"), "transcriptions"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        from time import time_ns
+
+        out_path = os.path.join(
+            out_dir, f"{_sanitize_for_filename(source)}_{time_ns()}.json"
+        )
+
+        payload = {
+            "source": source,
+            "filename": filename,
+            "model": diar_response.get("model"),
+            "duration": diar_response.get("duration"),
+            "text": diar_response.get("text"),
+            "segments": [
+                {
+                    "speaker": str(seg.get("speaker") or "unknown"),
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                    "text": seg.get("text"),
+                }
+                for seg in (diar_response.get("segments") or [])
+                if isinstance(seg, dict)
+            ],
+        }
+
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+        logger.info("dev diarization transcript written to: %s", out_path)
+    except Exception:  # pragma: no cover - dev aid must never break processing
+        logger.exception("failed to write dev diarization transcript")
+
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
     build_all_speakers_quote_documents,
@@ -157,7 +230,7 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
-            treat_every_speaker_as_target = file_data.get("treat_every_speaker_as_target", False)
+            create_reference_media_from_playlist = file_data.get("create_reference_media_from_playlist", False)
             namespace_filename = file_data.get("namespace_filename")
         
             logger.info(f"Processing file: {filename} ({content_type})")
@@ -208,7 +281,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -235,7 +308,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -253,7 +326,7 @@ async def process_uploaded_files_and_label_media_type(
                     "size": 0,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                    "create_reference_media_from_playlist": create_reference_media_from_playlist,
                     "namespace_filename": namespace_filename,
                 }
                 # Carry playlist context when the upload endpoint expanded a
@@ -361,7 +434,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "namespace_filename": namespace_filename
                     }
                 })
@@ -389,7 +462,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -651,7 +724,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     media_list = state.get('media_list', [])
 
     if not media_list:
-        logger.info(f"No Meida to process")
+        logger.info(f"No Media to process")
         return {
             "media_list": []
         }
@@ -1087,6 +1160,7 @@ async def process_media_item_task(
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
+                store = store, 
             )
             return documents
         elif media_type == "log":
@@ -1290,6 +1364,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=page_media_item,
+                    store=store
                 )
                 for d in documents:
                     d.metadata.setdefault("pdf_page_index", page_idx)
@@ -1312,8 +1387,8 @@ async def process_media_item_task(
             # Batch-wide "no single target": every detected speaker is the avatar.
             # Diarization still runs, but no stored reference clip is required and
             # known-speaker labelling is skipped (every turn is forced is_target).
-            treat_every_speaker_as_target = bool(metadata.get("treat_every_speaker_as_target", False))
-            if not reference_audio and not treat_every_speaker_as_target:
+            create_reference_media_from_playlist = bool(metadata.get("create_reference_media_from_playlist", False))
+            if not reference_audio and not create_reference_media_from_playlist:
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
                 if not ref_item and not reference_audio:
@@ -1403,7 +1478,7 @@ async def process_media_item_task(
                 # dominant speaker's clip, its duration, and the transcript
                 # ``text`` that matches that clip (same key as the OpenAI
                 # transcription API and ``transcribe_audio_diarize``).
-                ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
+                ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "") 
                 transcription_text = transcription_dict.get("text") or ""
                 ref_duration = transcription_dict.get("duration")
 
@@ -1483,7 +1558,7 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
-            if not treat_every_speaker_as_target:
+            if not create_reference_media_from_playlist: # Every entity is the target during create_reference_media_from_playlist
                 try:
                     ref_item = await store.aget(
                         (user_id, assistant_id, "reference_audio"), assistant_id
@@ -1537,12 +1612,28 @@ async def process_media_item_task(
                 )
                 diar_response = None
 
+            if diar_response:
+                # DEV-only: persist the full diarized transcript (labeled speakers)
+                # to disk for inspection. Placed here so it captures every routing
+                # branch below, all of which consume this same diar_response.
+                _write_dev_diarization_transcript(
+                    diar_response,
+                    source=(
+                        metadata.get("source")
+                        or filename
+                        or f"{media_type}_transcription"
+                    ),
+                    filename=filename,
+                    assistant_id=assistant_id,
+                    runtime=runtime,
+                )
+
             target_speaker_label = (
                 runtime.context.audio_diarization_known_speaker_name or "avatar"
             )
 
             # ---------------------------------------------------------------
-            # treat_every_speaker_as_target: no single target speaker, so EVERY detected
+            # create_reference_media_from_playlist: no single target speaker, so EVERY detected
             # speaker is the avatar. Routed only through standalone helpers / the
             # normal text classifier so the established dialogue path is never
             # touched. This branch returns early.
@@ -1556,7 +1647,7 @@ async def process_media_item_task(
             #     stores it in the vectorstore, marks it analysis-acceptable, and
             #     makes it adapter-acceptable with a synthesized prompt.
             # ---------------------------------------------------------------
-            if treat_every_speaker_as_target:
+            if create_reference_media_from_playlist:
                 statements: List[Dict[str, Any]] = []
                 for seg in (diar_response or {}).get("segments") or []:
                     if not isinstance(seg, dict):
@@ -1586,7 +1677,7 @@ async def process_media_item_task(
                         plain_text = (plain.get("text") or "").strip()
                     except Exception as e:
                         logger.exception(
-                            "treat_every_speaker_as_target transcription failed for %s: %s",
+                            "create_reference_media_from_playlist transcription failed for %s: %s",
                             filename,
                             e,
                         )
@@ -1695,6 +1786,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=single_media_item,
+                    store=store,
                 )
                 for d in documents:
                     d.metadata.setdefault("audio_filename", filename)
@@ -1825,6 +1917,7 @@ async def process_media_item_task(
                         user_id=user_id,
                         assistant_id=assistant_id,
                         media_item=single_media_item,
+                        store=store,
                     )
                 else:
                     # A non-target lone speaker: only biographical facts about
@@ -1932,6 +2025,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=transcript_media_item,
+                    store=store,
                 )
             else:
                 documents = await process_nontarget_text_to_identity_documents(
@@ -2011,8 +2105,8 @@ async def _expand_url_media_item(
     # forces the YouTube loader past its subtitles fast-path onto the audio +
     # diarization path so the avatar's voice is actually transcribed (subtitles
     # carry no speaker turns), and is inherited by every expanded child below.
-    parent_treat_every_speaker_as_target = bool(
-        (media_item.get("metadata") or {}).get("treat_every_speaker_as_target")
+    parent_create_reference_media_from_playlist = bool(
+        (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
     )
 
     loader = URLDocumentLoaderClass()
@@ -2022,14 +2116,14 @@ async def _expand_url_media_item(
                 url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                expect_multispeaker=parent_treat_every_speaker_as_target,
+                expect_multispeaker=parent_create_reference_media_from_playlist,
             )
     else:
         expanded_items = await loader.load(
             url,
             user_id=user_id,
             assistant_id=assistant_id,
-            expect_multispeaker=parent_treat_every_speaker_as_target,
+            expect_multispeaker=parent_create_reference_media_from_playlist,
         )
 
     if not expanded_items:
@@ -2056,8 +2150,8 @@ async def _expand_url_media_item(
     pending: List[Dict[str, Any]] = []
     for item in expanded_items:
         child_meta = item.setdefault("metadata", {})
-        if parent_treat_every_speaker_as_target:
-            child_meta.setdefault("treat_every_speaker_as_target", True)
+        if parent_create_reference_media_from_playlist:
+            child_meta.setdefault("create_reference_media_from_playlist", True)
         child_ns = child_meta.get("namespace_filename")
         if not child_ns:
             # A keyless child is the single logical content of THIS url item

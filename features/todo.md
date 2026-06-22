@@ -1,3 +1,7 @@
+
+# create synthetic question dataset from questions with pipeline
+# adapters 
+
 # POINT OF IMPROVEMENT
 - [ ] pre-processing: (reduce type 1 transcription errors)
 - [ ] retrieval: increase quality of responses (score)
@@ -111,3 +115,32 @@ https://www.youtube.com/watch?v=xRHFylOgeJA
 # - fine-tuning adapter with the creation of a dialogue when available to create prompt questions or use a dialogue to create a fine-tuned adapter to capture the speaking style and behavioral choices of the avatar
 
 # This realizes Success: speak like the person in real time with audio of the individual; write like the person; infer the thoughts (that's what I thought!)
+
+# Dataset Creation:
+
+## Question and Answer pairs focused on target direct quotes
+target speaker statements are collected and stored as quote documents
+target speaker statements are used with non-target statements to create a question and answer dataset when those prompts genuinely exist from the content. when there is not a preceeding statement, a prompt based on the target statement is generated using a model with structured output. Then there is a question and answer pair used for adapter training and evaluation. 
+
+## Multi-turn dialogue conversation dataset creation
+Then the non-target questions are coalesced such that during the entire conversation, there are only two speakers regardless of the number of speakers that are present in the original media. The target is the assistant and any non target is the user such that there are only individual turns between the target and the non-target. for example:
+
+- 1. Q and A with direct quotes
+- 2. Full Q and A dialogue
+
+
+## Transcription Dialogue:  
+https://www.youtube.com/watch?v=CkUcCcRq_eM
+
+## Text labeled multi-speaker
+### Challenge: scan for a particular individual; create datasets focusing on that target
+https://scrapsfromtheloft.com/movies/gray-man-2022-transcript/
+
+## Reference Corpus:
+### Challenge: scan reference corpus for direct quotes and immediately preceeding prompt questions. If there are no preceeding prompt questions, generate a synthetic prompt. 
+
+<!-- /home/user/gh/anubis-project/anubis/data/bible/king_james/king_james_bible.txt -->
+
+
+
+

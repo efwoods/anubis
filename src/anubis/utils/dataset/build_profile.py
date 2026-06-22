@@ -84,66 +84,6 @@ async def _load_existing_profile(
     return None
 
 
-async def maybe_build_stylistic_profile(
-    *,
-    user_id: str,
-    assistant_id: str,
-    store: BaseStore,
-    context: GlobalContext,
-) -> Optional[Dict[str, Any]]:
-    """Build or refresh the stylistic profile if thresholds are met.
-
-    Returns the (possibly newly written) profile dict, or ``None`` if a
-    build was skipped. Callers can ignore the return value; this helper
-    exists primarily for the LangGraph node ``build_stylistic_fingerprint``.
-    """
-    if not user_id or not assistant_id:
-        logger.info("Skipping stylistic profile: missing user/assistant id")
-        return None
-
-    quotes = await _enumerate_quote_texts(user_id, assistant_id, store)
-    if len(quotes) < int(context.min_quotes_for_profile or 0):
-        logger.info(
-            "Stylistic profile build skipped: %d quotes < min_quotes_for_profile=%s",
-            len(quotes),
-            context.min_quotes_for_profile,
-        )
-        return None
-
-    existing = await _load_existing_profile(user_id, assistant_id, store)
-    if existing is not None:
-        last_count = int(existing.get("built_with_document_count", 0) or 0)
-        delta = len(quotes) - last_count
-        if delta < int(context.profile_refresh_threshold or 0):
-            logger.info(
-                "Stylistic profile refresh skipped: only %d new quotes since last build (%d).",
-                delta,
-                last_count,
-            )
-            return existing
-
-    target_name = (
-        (existing or {}).get("target_name")
-        or context.audio_diarization_known_speaker_name
-    )
-    # The quote namespace holds the real person's primary-source writing, so this
-    # per-avatar profile IS the ground-truth cloud for the authenticity axis. We
-    # build the flat feature-matrix (Mahalanobis-ready) shape.
-    profile = compute_feature_matrix_profile(quotes, target_name=target_name)
-    profile["built_with_document_count"] = len(quotes)
-    profile["built_at"] = datetime.now(tz=timezone.utc).isoformat()
-
-    namespace = (user_id, assistant_id, STYLISTIC_PROFILE_NAMESPACE_TAG)
-    await store.aput(namespace, key=STYLISTIC_PROFILE_KEY, value=profile)
-    logger.info(
-        "Stylistic profile written for %s/%s (n=%d quotes)",
-        user_id,
-        assistant_id,
-        len(quotes),
-    )
-    return profile
-
-
 async def load_stylistic_profile(
     *, user_id: str, assistant_id: str, store: BaseStore
 ) -> Optional[Dict[str, Any]]:

@@ -2324,25 +2324,35 @@ async def process_adapter_documents(
     config: RunnableConfig,
     store: BaseStore,
 ) -> Dict[str, Any]:
-    """Persist adapter-training rows for any newly-classified Documents.
+    """Build and persist the three adapter datasets into the runtime store.
 
-    Two source kinds:
+    Datasets are written to the LangGraph cross-thread store (NOT disk), one
+    entry per source file, keyed by ``source_uuid5 = uuid5(NAMESPACE_URL,
+    source_filename)``. Each value is a wrapped dict holding the dataset as a
+    JSONL string: ``{"jsonl", "source_filename", "row_count", "created_at"}``.
 
-    * Dialogue Documents (``namespace == "adapter"``): the page_content is
-      already a ``{"messages": [...]}`` JSON blob produced by
-      :func:`process_dialogue_json_to_documents`. We append it to
-      ``data/<assistant_id>/adapter_training.jsonl`` as-is and write the
-      same row to the LangGraph store under ``(user_id, assistant_id,
-      "adapter")`` so retrieval can later use it.
+    Source kinds and outputs:
 
     * Quote Documents (``namespace == "quote"``, ``adapter_acceptable=True``):
-      grouped by source filename, each group produces single-turn
-      ``(synthetic_question, verbatim_quote)`` adapter rows plus matching
-      LangSmith dataset rows via :func:`build_adapter_and_langsmith_for_quotes`.
+      grouped by source filename. Each verbatim target quote is paired with its
+      genuine preceding non-target turn (carried as ``adapter_prompt``); a
+      synthetic prompt is generated ONLY where no genuine prompt exists. Via
+      :func:`build_adapter_and_langsmith_for_quotes` this yields:
+        - single-turn Q&A adapter rows -> ``(user_id, assistant_id,
+          "q_and_a_adapter", source_uuid5)`` (for training adapters), and
+        - LangSmith example rows -> ``(user_id, assistant_id,
+          "langsmith_factual_q_and_a", source_uuid5)`` (for factual testing).
 
-    The node is idempotent because each adapter Document carries its own
-    ``document_id``; rerunning over the same input simply rewrites the JSONL
-    line for that id.
+    * Dialogue Documents (``namespace == "adapter"``): the page_content is the
+      role-converted ``{"messages": [...]}`` conversation. Genuine preceding
+      user turns are reused as prompts (synthetic only where the target led) via
+      :func:`pairs_from_conversation`, then formatted with
+      :func:`llm_multiturn_dataset_one_conversation` into one conversation row ->
+      ``(user_id, assistant_id, "multi_turn_dataset_adapter", source_uuid5)``
+      (to attune adapter behaviour).
+
+    Idempotent per source: the store key is the source uuid5, so rerunning a
+    source overwrites its dataset entry rather than duplicating it.
     """
 
     logger.info("process_adapter_documents NODE")
@@ -2354,72 +2364,69 @@ async def process_adapter_documents(
         logger.info("No adapter Documents queued; skipping")
         return {}
 
-    user_id, assistant_id = await extract_user_id_assistant_id(config)
+    # extract_user_id_assistant_id returns ({"user_id": ...}, {"assistant_id": ...}).
+    user_state, assistant_state = await extract_user_id_assistant_id(config)
+    user_id = user_state.get("user_id")
+    assistant_id = assistant_state.get("assistant_id")
 
     # Lazy import so optional helpers don't slow the graph cold start.
     from src.anubis.utils.dataset.formatting import (
         build_adapter_and_langsmith_for_quotes,
-        build_langsmith_for_conversation,
-        llm_single_turn_dataset,
+        llm_multiturn_dataset_one_conversation,
+        pairs_from_conversation,
     )
 
-    out_dir = os.path.join("data", assistant_id)
-    os.makedirs(out_dir, exist_ok=True)
-    adapter_jsonl = os.path.join(out_dir, "adapter_training.jsonl")
-    langsmith_jsonl = os.path.join(out_dir, "langsmith_eval_dataset.jsonl")
+    def _source_of(d: Document) -> str:
+        """Source-file label that ties a doc's datasets to one store key."""
+        return (
+            d.metadata.get("filename")
+            or d.metadata.get("original_source")
+            or d.metadata.get("source")
+            or "unknown"
+        )
 
-    adapter_rows_total: List[Dict[str, Any]] = []
-    langsmith_rows_total: List[Dict[str, Any]] = []
-
-    # ------------------------------------------------------------------
-    # 1) Dialogue conversations: pass-through (already role-converted).
-    # ------------------------------------------------------------------
-    dialogue_docs = [
-        d for d in adapter_docs if d.metadata.get("namespace") == "adapter"
-    ]
-    for d in dialogue_docs:
+    async def _store_dataset(
+        dataset_type: str,
+        source_filename: str,
+        source_uuid5: str,
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        """Persist one dataset as a JSONL-in-dict value under its namespace."""
+        if not rows:
+            return
+        jsonl = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
         try:
-            payload = json.loads(d.page_content)
-        except Exception:
-            payload = {"messages": d.metadata.get("messages") or []}
-        messages = payload.get("messages") or []
-        if not messages:
-            continue
-        # (1) Multi-turn conversation row for adapter training (pass-through).
-        adapter_rows_total.append(payload)
-        # (3) Conversation-level LangSmith Q&A pairs derived from the same
-        #     role-converted messages.
-        try:
-            conv_source = (
-                d.metadata.get("filename")
-                or d.metadata.get("source")
-                or "unknown"
-            )
-            conversation_langsmith_rows = await build_langsmith_for_conversation(
-                messages=messages,
-                dataset_source_filename=conv_source,
-            )
-            langsmith_rows_total.extend(conversation_langsmith_rows)
-        except Exception as exc:
-            logger.warning(
-                "Conversation LangSmith build failed for %s: %s",
-                d.metadata.get("filename", ""),
-                exc,
-            )
-        try:
-            ns = (user_id, assistant_id, "adapter")
             await store.aput(
-                ns,
-                key=str(d.metadata.get("document_id") or uuid4()),
-                value={"document": d.to_json()},
+                (user_id, assistant_id, dataset_type, source_uuid5),
+                key=source_uuid5,
+                value={
+                    "jsonl": jsonl,
+                    "source_filename": source_filename,
+                    "row_count": len(rows),
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+            logger.info(
+                "Stored %d %s rows -> (%s, %s, %s, %s)",
+                len(rows),
+                dataset_type,
+                user_id,
+                assistant_id,
+                dataset_type,
+                source_uuid5,
             )
         except Exception as exc:  # pragma: no cover - operator log only
-            logger.warning("Failed to put adapter dialogue Document: %s", exc)
+            logger.warning(
+                "Failed to store %s dataset for %s: %s",
+                dataset_type,
+                source_filename,
+                exc,
+            )
 
     # ------------------------------------------------------------------
-    # 2) Quote-shaped Documents: synthesize a question per quote and emit
-    #    single-turn adapter + langsmith rows. Group by filename so each
-    #    source file becomes one ``langsmith_eval_dataset`` source label.
+    # 1) Quote Documents -> Q&A adapter dataset + LangSmith factual dataset.
+    #    Grouped by source so each file becomes one store entry per dataset.
+    #    Genuine ``adapter_prompt`` is reused; synthetic prompts fill only gaps.
     # ------------------------------------------------------------------
     quote_docs = [
         d
@@ -2428,62 +2435,80 @@ async def process_adapter_documents(
         and d.metadata.get("adapter_acceptable") is True
         and (d.page_content or "").strip()
     ]
-    grouped: Dict[str, List[Document]] = {}
+    grouped_quotes: Dict[str, List[Document]] = {}
     for d in quote_docs:
-        key = (
-            d.metadata.get("filename")
-            or d.metadata.get("original_source")
-            or d.metadata.get("source")
-            or "unknown"
-        )
-        grouped.setdefault(key, []).append(d)
+        grouped_quotes.setdefault(_source_of(d), []).append(d)
 
-    for source_key, docs_for_source in grouped.items():
+    for source_filename, docs_for_source in grouped_quotes.items():
+        source_uuid5 = str(uuid5(NAMESPACE_URL, source_filename))
         quotes = [d.page_content.strip() for d in docs_for_source]
-        # Use the real preceding non-target turn as the prompt when present
-        # (carried as ``adapter_prompt`` by diarized target quotes); otherwise
-        # the builder synthesizes a question per quote.
         prompts = [d.metadata.get("adapter_prompt") for d in docs_for_source]
         try:
             adapter_rows, langsmith_rows = await build_adapter_and_langsmith_for_quotes(
                 quotes=quotes,
-                dataset_source_filename=source_key,
+                dataset_source_filename=source_filename,
                 prompts=prompts,
             )
         except Exception as exc:
             logger.exception(
-                "Adapter+LangSmith builder failed for %s: %s; falling back to no-question pairs",
-                source_key,
+                "Adapter+LangSmith builder failed for %s: %s; skipping source",
+                source_filename,
                 exc,
             )
-            adapter_rows = await llm_single_turn_dataset(
-                question_list=[""] * len(quotes), answer_list=quotes
-            )
-            langsmith_rows = []
-        adapter_rows_total.extend(adapter_rows)
-        langsmith_rows_total.extend(langsmith_rows)
-
-    # ------------------------------------------------------------------
-    # 3) Persist to disk (append-only JSONL).
-    # ------------------------------------------------------------------
-    if adapter_rows_total:
-        with open(adapter_jsonl, "a", encoding="utf-8") as fh:
-            for row in adapter_rows_total:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        logger.info(
-            "Wrote %d adapter rows -> %s",
-            len(adapter_rows_total),
-            adapter_jsonl,
+            continue
+        await _store_dataset(
+            "q_and_a_adapter", source_filename, source_uuid5, adapter_rows
+        )
+        await _store_dataset(
+            "langsmith_factual_q_and_a",
+            source_filename,
+            source_uuid5,
+            langsmith_rows,
         )
 
-    if langsmith_rows_total:
-        with open(langsmith_jsonl, "a", encoding="utf-8") as fh:
-            for row in langsmith_rows_total:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        logger.info(
-            "Wrote %d langsmith eval rows -> %s",
-            len(langsmith_rows_total),
-            langsmith_jsonl,
+    # ------------------------------------------------------------------
+    # 2) Dialogue Documents -> multi-turn adapter dataset (one conversation).
+    #    Each role-converted conversation reuses genuine user turns as prompts;
+    #    a synthetic prompt is generated only where the target led.
+    # ------------------------------------------------------------------
+    dialogue_docs = [
+        d for d in adapter_docs if d.metadata.get("namespace") == "adapter"
+    ]
+    grouped_dialogue: Dict[str, List[Document]] = {}
+    for d in dialogue_docs:
+        grouped_dialogue.setdefault(_source_of(d), []).append(d)
+
+    for source_filename, docs_for_source in grouped_dialogue.items():
+        source_uuid5 = str(uuid5(NAMESPACE_URL, source_filename))
+        conversation_rows: List[Dict[str, Any]] = []
+        for d in docs_for_source:
+            try:
+                payload = json.loads(d.page_content)
+            except Exception:
+                payload = {"messages": d.metadata.get("messages") or []}
+            messages = payload.get("messages") or []
+            if not messages:
+                continue
+            try:
+                question_list, answer_list = await pairs_from_conversation(messages)
+                if not answer_list:
+                    continue
+                conversation_rows.append(
+                    llm_multiturn_dataset_one_conversation(
+                        question_list=question_list, answer_list=answer_list
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Multi-turn build failed for %s: %s",
+                    source_filename,
+                    exc,
+                )
+        await _store_dataset(
+            "multi_turn_dataset_adapter",
+            source_filename,
+            source_uuid5,
+            conversation_rows,
         )
 
     # Clear the adapter buffer of what we just processed (append-reducer

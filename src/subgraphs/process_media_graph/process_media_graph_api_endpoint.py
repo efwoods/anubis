@@ -48,7 +48,8 @@ workflow.add_edge("convert_media_list_to_text_document", "index_docs") # Send ve
 workflow.add_edge("convert_media_list_to_text_document", "analyze_documents") # analyze analysis_acceptable documents
 workflow.add_edge("analyze_documents", "index_docs") # Send analysis_documents to index_docs
 
-# workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
+workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
+workflow.add_edge("process_adapter_documents", END)
 
 workflow.add_edge("index_docs", END)
 

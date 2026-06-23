@@ -794,6 +794,8 @@ async def process_dialogue_json_to_documents(
     # non-target turn as ``adapter_prompt``. Spec Step 2 prep: stamp the scene
     # summary and a guaranteed user-context (synthetic when the target led) onto
     # each so the per-target analyzers run with that context.
+
+    """ Direct Quotes and Question and Answer Dataset """
     target_quote_docs = _build_target_quote_documents_from_dialogue(
         segments,
         user_id=user_id,
@@ -807,6 +809,8 @@ async def process_dialogue_json_to_documents(
     documents.extend(target_quote_docs)
 
     # Full role-converted dialogue under ``adapter``.
+
+    """ Create Multi-Turn Dialogue for adapter training """
     adapter_doc = _build_adapter_dialogue_document(
         segments,
         user_id=user_id,
@@ -823,6 +827,8 @@ async def process_dialogue_json_to_documents(
     # non-target statement says nothing about the target, so empty statements
     # produce no Documents and non-target speech never lands in the quote
     # namespace.
+
+    """ Biographical Documents from non-target """
     for seg in segments:
         if seg.get("is_target"):
             continue

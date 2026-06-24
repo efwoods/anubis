@@ -229,7 +229,6 @@ async def pairs_from_conversation(
 
     return question_list, answer_list
 
-
 async def build_langsmith_for_conversation(
     messages: List[dict],
     dataset_source_filename: str,

@@ -78,6 +78,9 @@ dependencies = [
     "seaborn>=0.13.2",
     "shap>=0.51.0",
     "aiofiles>=25.1.0",
+    "peft>=0.19.1",
+    "datasets>=5.0.0",
+    "trl>=1.6.0",
 ]
 
 [project.optional-dependencies]

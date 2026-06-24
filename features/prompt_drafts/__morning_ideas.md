@@ -83,3 +83,4 @@ allow the process media graph to be used as a tool triggered in conversation
 # MCP Server to access data as an integration
 # save transcriptions for parsing from calls or video meetings
 
+# MCP servers for connecting accounts and pulling information

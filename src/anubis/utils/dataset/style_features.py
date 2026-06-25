@@ -292,6 +292,17 @@ def extract_style_features(text: str) -> Dict[str, float]:
     The returned dict is keyed by :data:`FEATURE_NAMES`. Values are floats; a
     metric that cannot be computed on the given text yields ``nan`` rather than
     raising, so a single short document never breaks a batch.
+
+    FUTURE DIRECTION asdf : 
+        character n-grams
+        word n-grams
+        function word frequencies
+        punctuation frequencies 
+        lexical richness (vocab size): unique_words vs. total_words
+        (FIND AND STORE KEY PHRASES) such as "you know" "got it." "what do ya mean?"
+        average sentence length (words_per_sentence)
+        average word length (characters per word)
+
     """
     _ensure_nltk_resources()
 

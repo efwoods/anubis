@@ -1,5 +1,7 @@
 
 # Metering 72 tokens
+# tiered and pay per use to support adapters training to improve authenticity; higher tiers allow for adapters and different forms of media; stories are free, 
+# integrations
 
 # create synthetic question dataset from questions with pipeline
 # adapters 

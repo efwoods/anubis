@@ -1,13 +1,16 @@
 """ Agent SubGraph Tools """
+import asyncio
+import re
 import uuid
 import logging
+from dataclasses import dataclass
 
 from langchain.tools import tool, ToolRuntime
 from langchain_core.documents import Document
 from langchain_core.tools import InjectedToolArg
 from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from langchain_core.messages import ToolMessage
 
 from src.anubis.utils.state import GlobalState
@@ -676,6 +679,656 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
                "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
 
     return Command(update=update)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conversational correction of inaccurate stored facts (human-in-the-loop)
+# ──────────────────────────────────────────────────────────────────────────────
+# Score above which a store hit is treated as the same fact the user is correcting.
+# Calibrated to the PRODUCTION embedding model (``microsoft/harrier-oss-v1-270m``),
+# whose cosine scores sit on the same compressed scale ``load_consciousness`` uses to
+# decide a fact is relevant enough to inject every turn (``nodes._FILTER_SCORE = 0.1``).
+# An earlier 0.8/0.6 gate — tuned to the unit-test mock embedding, which returns cosine
+# 1.0 for any shared keyword — rejected every real match, so the sweep returned nothing
+# and the tool reported "No stored fact matched" for facts that were actually stored.
+# This path favors recall: the HITL interrupt is the safety net (the owner sees every
+# proposed match and approves/edits/rejects; nothing is applied unapproved). Facts
+# already retrieved into this turn's prompt are actively shaping the response, so they
+# are matched at the loader's own relevance floor; everything else needs a small margin
+# above it to avoid sweeping in loosely-related facts.
+_CORRECTION_MATCH_THRESHOLD = 0.3
+_CORRECTION_RETRIEVED_DOC_THRESHOLD = 0.1
+
+# Sentence-level gate for long-text namespaces (quote/document/analysis). Those store
+# raw multi-sentence text, so whole-document cosine of a short claim against a ~2,000-word
+# transcript is near zero and clears no document-level threshold — the offending clause
+# has to be located sentence-by-sentence instead. A single sentence that restates the
+# claim scores much higher than the whole blob, so this gate sits above the document
+# floor. Recall-biased and HITL-gated like the thresholds above; tune empirically.
+_SENTENCE_MATCH_THRESHOLD = 0.45
+
+# Namespace "kind" (3rd tuple element) whose stored ``page_content`` is raw, multi-
+# sentence text rather than a single atomic ``<FACT>``-wrapped statement. These need
+# sentence-level matching + in-place sentence redaction; the atomic-fact namespaces
+# (identity, identity_memory, memory) are matched and rewritten whole.
+_LONG_TEXT_NAMESPACE_KINDS = frozenset({"quote", "document", "analysis"})
+
+
+def _namespace_is_long_text(namespace: tuple) -> bool:
+    """True if ``namespace`` holds raw multi-sentence docs (quote/document/analysis)."""
+    return len(namespace) >= 3 and namespace[2] in _LONG_TEXT_NAMESPACE_KINDS
+
+
+# Cheap sentence splitter (mirrors ``dataset.stylistic_profile._split_sentences``;
+# inlined to avoid importing that module's heavy numpy/burrows-delta dependency chain at
+# tool-call time). Splits on sentence-final punctuation followed by whitespace.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    if not text:
+        return []
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    return sentences or [text.strip()]
+
+
+async def _score_sentences(query: str, sentences: list[str]) -> list[float]:
+    """Cosine similarity of ``query`` against each of ``sentences`` (same order).
+
+    Embeds with the process-wide cached ``SentenceTransformer`` (same model as the store
+    index, so scores are on the retrieval scale). The blocking ``encode`` runs in a
+    worker thread so it does not stall the event loop — same pattern the media graph uses
+    (``process_media_graph/utils/nodes.py``). Returns ``[]`` for empty input.
+    """
+    if not sentences:
+        return []
+
+    def _compute() -> list[float]:
+        from src.anubis.utils.runtime_handles import get_sentence_embedder
+
+        model = get_sentence_embedder()
+        query_embedding = model.encode([query], convert_to_numpy=True)
+        sentence_embeddings = model.encode(sentences, convert_to_numpy=True)
+        # Row 0 of the similarity matrix = query vs every sentence.
+        similarities = model.similarity(query_embedding, sentence_embeddings)[0]
+        return [float(score) for score in similarities]
+
+    return await asyncio.to_thread(_compute)
+
+
+def _item_document_kwargs(item) -> dict:
+    """Pull ``{page_content, metadata}`` out of a store SearchItem value.
+
+    Store values are ``{"document": Document.to_json()}`` and
+    ``Document.to_json()`` is ``{"kwargs": {"page_content": ..., "metadata": ...}}``
+    (same shape ``reduce_docs`` reads in ``utility.py``).
+    """
+    value = getattr(item, "value", None) or {}
+    document = value.get("document") or {}
+    kwargs = document.get("kwargs") or {}
+    return kwargs if isinstance(kwargs, dict) else {}
+
+
+def _item_fact(item) -> str | None:
+    return (_item_document_kwargs(item).get("metadata") or {}).get("fact")
+
+
+def _item_document_id(item) -> str | None:
+    metadata = _item_document_kwargs(item).get("metadata") or {}
+    # Identity/identity_memory/user-identity write ``document_id``; episodic memory
+    # writes ``id`` — accept either so a correction reaches every namespace.
+    return metadata.get("document_id") or metadata.get("id")
+
+
+@dataclass
+class FactMatch:
+    """One thing a correction will change.
+
+    ``kind == "fact"``  → a whole atomic-fact document (identity/identity_memory/memory);
+    the entire stored fact is rewritten or the document deleted.
+    ``kind == "sentence"`` → one offending sentence inside a long verbatim document
+    (quote/document/analysis); only that sentence is redacted/replaced in place.
+    """
+
+    item: object
+    namespace: tuple
+    key: str
+    kind: str  # "fact" | "sentence"
+    matched_text: str | None  # the atomic fact, or the specific offending sentence
+    score: float
+
+
+@dataclass
+class CorrectionChange:
+    """Record of one applied change, for the HITL summary + state update."""
+
+    action: str  # "rewrite" | "redact" | "delete"
+    namespace: tuple
+    key: str
+    old_text: str | None
+    new_text: str | None
+    document: Document | None  # surviving Document (None when the doc was deleted)
+
+
+def _proposed_text(match: FactMatch, corrected_information: str, is_deletion: bool) -> str:
+    """What ``match`` becomes once applied — for the HITL preview."""
+    if is_deletion:
+        return "(removed)"
+    return corrected_information
+
+
+def _match_preview(match: FactMatch, corrected_information: str, is_deletion: bool) -> dict:
+    """Compact, JSON-serializable description of one pending change for the HITL preview."""
+    return {
+        "kind": match.kind,
+        "namespace": list(match.namespace or []),
+        "key": match.key,
+        "matched_text": match.matched_text,
+        "proposed_text": _proposed_text(match, corrected_information, is_deletion),
+        "score": match.score,
+    }
+
+
+def _correction_namespaces(creator_id: str, assistant_id: str, user_id: str) -> list[tuple]:
+    """Assistant-side namespaces a correction sweeps.
+
+    ``(creator_id, assistant_id, "identity")`` is a *prefix* search — it also covers
+    the media/URL sub-namespaces ``(creator_id, assistant_id, "identity", <uuid5>)``.
+    ``analysis`` holds derived psycho-analysis traits (beliefs/relationships/OCEAN) that
+    can also ground a response. User-identity is intentionally excluded (this tool
+    corrects facts about the AVATAR, not the user).
+    """
+    return [
+        (user_id, assistant_id, "memory"),
+        (creator_id, assistant_id, "identity_memory"),
+        (creator_id, assistant_id, "identity"),
+        (creator_id, assistant_id, "document"),
+        (creator_id, assistant_id, "quote"),
+        (creator_id, assistant_id, "analysis"),
+    ]
+
+
+_STOPWORDS = frozenset(
+    {
+        "this", "that", "with", "have", "from", "they", "your", "about", "into",
+        "also", "been", "were", "which", "their", "would", "there", "what", "when",
+        "will", "i've", "ive", "never", "incorrect", "wrong",
+    }
+)
+
+
+def _salient_tokens(text: str) -> set[str]:
+    """Content words (len ≥ 4, non-stopword) used as a cheap document prefilter."""
+    return {
+        token
+        for token in re.findall(r"[a-z']+", (text or "").lower())
+        if len(token) >= 4 and token not in _STOPWORDS
+    }
+
+
+async def find_fact_matches(
+    store,
+    *,
+    creator_id: str,
+    assistant_id: str,
+    user_id: str,
+    query: str,
+    state_docs=None,
+) -> list[FactMatch]:
+    """Find everything matching ``query`` across the assistant namespaces.
+
+    Two matching modes by namespace kind:
+
+    - **Atomic-fact** (identity / identity_memory / memory): whole-document semantic
+      match. Retrieved-docs-first — documents already pulled into this turn's prompt
+      (``state_docs``, keyed by ``document_id``/``id``) clear the softer
+      ``_CORRECTION_RETRIEVED_DOC_THRESHOLD``; everything else needs
+      ``_CORRECTION_MATCH_THRESHOLD``.
+    - **Long-text** (quote / document / analysis): the claim is one clause inside a
+      multi-sentence blob, so whole-document cosine is meaningless. Retrieve all docs,
+      split each into sentences, and keep sentences clearing
+      ``_SENTENCE_MATCH_THRESHOLD``. A cheap salient-token prefilter skips docs that
+      share no content word with the claim, to bound on-the-fly embedding.
+
+    De-duplicated by ``(namespace, key)`` for facts and ``(namespace, key, sentence)``
+    for sentences. Reads only — safe to re-run when an interrupt resumes.
+    """
+    retrieved_doc_ids: set[str] = set()
+    for doc in state_docs or []:
+        metadata = getattr(doc, "metadata", None) or {}
+        did = metadata.get("document_id") or metadata.get("id")
+        if did:
+            retrieved_doc_ids.add(did)
+
+    query_tokens = _salient_tokens(query)
+    fact_matches: dict[tuple, FactMatch] = {}
+    sentence_matches: dict[tuple, FactMatch] = {}
+
+    for namespace in _correction_namespaces(creator_id, assistant_id, user_id):
+        try:
+            items = await store.asearch(namespace, query=query, limit=1000)
+        except Exception:
+            logger.exception("correct_identity_fact: search failed for %s", namespace)
+            continue
+
+        if _namespace_is_long_text(namespace):
+            for item in items:
+                page_content = _item_document_kwargs(item).get("page_content") or ""
+                # Prefilter: skip docs sharing no salient token with the claim (very
+                # unlikely to assert it), unless the claim has no salient tokens at all.
+                if query_tokens and not (query_tokens & _salient_tokens(page_content)):
+                    continue
+                sentences = _split_into_sentences(page_content)
+                scores = await _score_sentences(query, sentences)
+                for sentence, score in zip(sentences, scores):
+                    if score <= _SENTENCE_MATCH_THRESHOLD:
+                        continue
+                    dedup_key = (tuple(item.namespace), item.key, sentence)
+                    existing = sentence_matches.get(dedup_key)
+                    if existing is None or score > existing.score:
+                        sentence_matches[dedup_key] = FactMatch(
+                            item=item,
+                            namespace=tuple(item.namespace),
+                            key=item.key,
+                            kind="sentence",
+                            matched_text=sentence,
+                            score=score,
+                        )
+            continue
+
+        # Atomic-fact namespace: whole-document semantic match.
+        for item in items:
+            score = getattr(item, "score", None)
+            if score is None:
+                continue
+            is_retrieved = _item_document_id(item) in retrieved_doc_ids
+            threshold = (
+                _CORRECTION_RETRIEVED_DOC_THRESHOLD
+                if is_retrieved
+                else _CORRECTION_MATCH_THRESHOLD
+            )
+            if score > threshold:
+                fact_matches[(tuple(item.namespace), item.key)] = FactMatch(
+                    item=item,
+                    namespace=tuple(item.namespace),
+                    key=item.key,
+                    kind="fact",
+                    matched_text=_item_fact(item)
+                    or _item_document_kwargs(item).get("page_content"),
+                    score=float(score),
+                )
+
+    return list(fact_matches.values()) + list(sentence_matches.values())
+
+
+def _page_content_is_wrapped(page_content: str) -> bool:
+    """True if ``page_content`` uses the ``<FACT_CONTEXT_AND_FACT>`` wrapper."""
+    return (page_content or "").lstrip().startswith("<FACT_CONTEXT_AND_FACT>")
+
+
+async def _apply_fact_rewrite(
+    store, match: FactMatch, corrected_information: str, correction_context: str
+) -> CorrectionChange:
+    """Rewrite a whole atomic-fact document in place (same key ⇒ re-embeds).
+
+    Format-aware: identity/identity_memory/user-identity use the ``<FACT>`` wrapper;
+    episodic ``memory`` stores plain ``event\\n\\ncontext``. Preserves all other
+    metadata and records ``corrected_from``.
+    """
+    kwargs = _item_document_kwargs(match.item)
+    metadata = dict(kwargs.get("metadata") or {})
+    old_fact = metadata.get("fact")
+    old_page_content = kwargs.get("page_content") or ""
+
+    if _page_content_is_wrapped(old_page_content):
+        new_page_content = wrap_fact_with_context(corrected_information, correction_context)
+    else:
+        new_page_content = f"{corrected_information}\n\n{correction_context}".strip()
+
+    metadata["fact"] = corrected_information
+    metadata["fact_context"] = correction_context
+    if old_fact is not None:
+        metadata["corrected_from"] = old_fact
+
+    corrected_document = Document(page_content=new_page_content, metadata=metadata)
+    await store.aput(
+        match.namespace, key=match.key, value={"document": corrected_document.to_json()}
+    )
+    return CorrectionChange(
+        action="rewrite",
+        namespace=match.namespace,
+        key=match.key,
+        old_text=old_fact if old_fact is not None else old_page_content,
+        new_text=corrected_information,
+        document=corrected_document,
+    )
+
+
+def _redact_sentences(page_content: str, sentences_to_change: dict[str, str | None]) -> str:
+    """Return ``page_content`` with each target sentence removed (value ``None``) or
+    replaced (value = replacement). Matching is whitespace-normalized; surrounding blank
+    space is collapsed so the redaction leaves clean prose."""
+    result = page_content
+    for sentence, replacement in sentences_to_change.items():
+        result = result.replace(sentence, replacement or "")
+    # Collapse the gaps left by removed sentences.
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
+async def _apply_sentence_redaction(
+    store,
+    namespace: tuple,
+    key: str,
+    item,
+    sentence_matches: list[FactMatch],
+    corrected_information: str,
+    is_deletion: bool,
+) -> CorrectionChange:
+    """Redact (or replace) every matched sentence inside one long-text document.
+
+    All sentence edits for a document are applied together against the original
+    ``page_content`` (applying them one-by-one would operate on stale text). The removed
+    sentences are recorded in ``metadata.redacted_sentences`` and ``corrected_from``.
+    """
+    kwargs = _item_document_kwargs(item)
+    metadata = dict(kwargs.get("metadata") or {})
+    old_page_content = kwargs.get("page_content") or ""
+
+    replacement = None if is_deletion else corrected_information
+    changed = {m.matched_text: replacement for m in sentence_matches if m.matched_text}
+    new_page_content = _redact_sentences(old_page_content, changed)
+
+    redacted = list(metadata.get("redacted_sentences") or [])
+    redacted.extend(changed.keys())
+    metadata["redacted_sentences"] = redacted
+    metadata["corrected_from"] = "; ".join(changed.keys())
+
+    corrected_document = Document(page_content=new_page_content, metadata=metadata)
+    await store.aput(
+        namespace, key=key, value={"document": corrected_document.to_json()}
+    )
+    return CorrectionChange(
+        action="redact",
+        namespace=namespace,
+        key=key,
+        old_text="; ".join(changed.keys()),
+        new_text=None if is_deletion else corrected_information,
+        document=corrected_document,
+    )
+
+
+async def apply_fact_correction(
+    store,
+    *,
+    corrected_information: str,
+    correction_context: str,
+    matches: list[FactMatch],
+    is_deletion: bool = False,
+) -> list[CorrectionChange]:
+    """Apply every match, dispatching by kind. Returns one change record per edit.
+
+    - Atomic-fact match → rewrite the whole fact, or ``adelete`` it on deletion.
+    - Sentence match → redact/replace the offending sentence inside its long document;
+      multiple sentence matches in the same document are applied together.
+    """
+    changes: list[CorrectionChange] = []
+
+    fact_matches = [m for m in matches if m.kind == "fact"]
+    sentence_matches = [m for m in matches if m.kind == "sentence"]
+
+    for match in fact_matches:
+        if is_deletion:
+            await store.adelete(match.namespace, match.key)
+            changes.append(
+                CorrectionChange(
+                    action="delete",
+                    namespace=match.namespace,
+                    key=match.key,
+                    old_text=match.matched_text,
+                    new_text=None,
+                    document=None,
+                )
+            )
+        else:
+            changes.append(
+                await _apply_fact_rewrite(
+                    store, match, corrected_information, correction_context
+                )
+            )
+
+    # Group sentence matches by the document they live in, edit each doc once.
+    by_document: dict[tuple, list[FactMatch]] = {}
+    for match in sentence_matches:
+        by_document.setdefault((match.namespace, match.key), []).append(match)
+    for (namespace, key), group in by_document.items():
+        changes.append(
+            await _apply_sentence_redaction(
+                store,
+                namespace,
+                key,
+                group[0].item,
+                group,
+                corrected_information,
+                is_deletion,
+            )
+        )
+
+    return changes
+
+
+class FactCorrection(BaseModel):
+    """Correct a previously stored fact about the ASSISTANT that the user says is wrong.
+
+    Use ONLY when the user asserts that an existing/known fact about the avatar is
+    inaccurate AND supplies the correction. This is NOT for brand-new facts — those
+    still go to ``update_self_identity_mem_from_user_txt``.
+
+    <Example>
+    User: "Actually I was born in Ottawa, not Toronto."
+      inaccurate_information: "I was born in Toronto."
+      corrected_information:  "I was born in Ottawa."
+      correction_context:     "I was told I was born in Ottawa, not Toronto."
+      correction_kind:        "update"
+    </Example>
+    <Example>
+    User: "That never happened — I have no association with the University of Alberta."
+      inaccurate_information: "I've also worked with University of Alberta."
+      corrected_information:  ""
+      correction_context:     "I was told I have no association with University of Alberta."
+      correction_kind:        "delete"
+    </Example>
+    """
+
+    inaccurate_information: str = Field(
+        description="The wrong claim, phrased as the stored fact it should match — used "
+        "as the semantic search query to find the fact(s) to fix. e.g. 'I was born in Toronto.'"
+    )
+    corrected_information: str = Field(
+        default="",
+        description="The corrected fact, REWRITTEN IN FIRST PERSON exactly like "
+        "``update_self_identity_mem_from_user_txt`` (change only the grammatical "
+        "person, never other information). e.g. 'I was born in Ottawa.' Leave EMPTY when "
+        "``correction_kind`` is 'delete' (the user is removing a fact, not replacing it).",
+    )
+    correction_context: str = Field(
+        description="A concise context summary for the corrected fact, same convention "
+        "as ``fact_context`` (indicate you were told/corrected, not that you said it)."
+    )
+    correction_kind: str = Field(
+        default="update",
+        description="'update' when the user supplies a replacement fact; 'delete' when "
+        "the user says the fact never happened / is simply wrong with NO replacement "
+        "(e.g. 'that never happened', 'I have no association with X').",
+    )
+
+
+@tool("correct_identity_fact", args_schema=FactCorrection)
+async def correct_identity_fact(
+    inaccurate_information: str,
+    corrected_information: str = "",
+    correction_context: str = "",
+    correction_kind: str = "update",
+    # Hidden from the model.
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+) -> GlobalState:
+    """
+    <INSTRUCTIONS>
+    Correct a fact already stored about you (the avatar) when the user says it is
+    WRONG. This tool FINDS every matching stored fact across your identity namespaces —
+    including a single offending sentence buried inside a long direct quote — shows the
+    owner exactly what will change, and only after the owner approves (or edits) either
+    REPLACES each matched fact in place ('update') or REMOVES it ('delete').
+
+    Call this when the user references a fact that already exists about you and says it
+    is wrong. For 'update', rewrite ``corrected_information`` in FIRST PERSON (change
+    only the grammatical person, never other specifics). For 'delete' (the user says it
+    never happened / they have no association with X), leave ``corrected_information``
+    empty and set ``correction_kind='delete'``.
+    </INSTRUCTIONS>
+
+    <RESTRICTIONS>
+    Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
+    Do NOT use this for facts about the USER.
+    Only the avatar's creator may correct its identity (enforced server-side).
+    </RESTRICTIONS>
+
+    <EXAMPLE>
+    User: "That's wrong — I was actually born in Ottawa, not Toronto."
+      inaccurate_information: "I was born in Toronto."
+      corrected_information:  "I was born in Ottawa."
+      correction_context:     "I was told I was born in Ottawa, not Toronto."
+      correction_kind:        "update"
+    </EXAMPLE>
+
+    Args:
+        inaccurate_information: The wrong claim (search query) phrased as the stored fact.
+        corrected_information: The corrected fact, rewritten in first person (empty for delete).
+        correction_context: Concise context for the corrected fact.
+        correction_kind: "update" to replace the fact, "delete" to remove it.
+    """
+    logger.info("correct_identity_fact breakpoint")
+
+    # Owner guard — only the avatar's creator may rewrite its identity.
+    assistant_owner_user_id = runtime.config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
+    requester_user_id = runtime.config["configurable"]["user_id"]
+    if assistant_owner_user_id != requester_user_id:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content="Only the avatar's creator can correct its identity.",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    user_id = updated_user_state.get("user_id")
+    assistant_id = updated_assistant_state.get("assistant_id")
+    creator_id = assistant_owner_user_id
+
+    state_docs = [
+        *(runtime.state.get("assistant_identity_documents") or []),
+        *(runtime.state.get("recalled_memory_documents") or []),
+        *(runtime.state.get("user_identity_documents") or []),
+    ]
+
+    is_deletion = correction_kind == "delete"
+
+    matches = await find_fact_matches(
+        runtime.store,
+        creator_id=creator_id,
+        assistant_id=assistant_id,
+        user_id=user_id,
+        query=inaccurate_information,
+        state_docs=state_docs,
+    )
+
+    if not matches:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f"No stored fact matched '{inaccurate_information}'. "
+                            "Ask the user to restate the inaccurate fact."
+                        ),
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    # Human-in-the-loop: pause and let the owner approve / edit / reject before any
+    # write. Everything above is a pure read, so it is safe to re-run on resume.
+    decision = interrupt(
+        {
+            "kind": "fact_correction",
+            "inaccurate_information": inaccurate_information,
+            "correction_kind": correction_kind,
+            "proposed": {
+                "corrected_information": corrected_information,
+                "correction_context": correction_context,
+            },
+            "matches": [
+                _match_preview(match, corrected_information, is_deletion)
+                for match in matches
+            ],
+        }
+    )
+
+    decision = decision if isinstance(decision, dict) else {}
+    decision_type = decision.get("type", "approve")
+
+    if decision_type == "reject":
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content="Left the existing fact(s) unchanged.",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    final_corrected = corrected_information
+    final_context = correction_context
+    if decision_type == "edit":
+        final_corrected = decision.get("corrected_information") or corrected_information
+        final_context = decision.get("correction_context") or correction_context
+
+    changes = await apply_fact_correction(
+        runtime.store,
+        corrected_information=final_corrected,
+        correction_context=final_context,
+        matches=matches,
+        is_deletion=is_deletion,
+    )
+
+    corrected_documents = [c.document for c in changes if c.document is not None]
+    verb = {"rewrite": "Corrected", "redact": "Redacted", "delete": "Deleted"}
+    summary = "; ".join(
+        f"{verb.get(c.action, 'Changed')} '{c.old_text}'"
+        + (f" → '{c.new_text}'" if c.new_text else "")
+        for c in changes
+        if c.old_text
+    )
+    return Command(
+        update={
+            "assistant_identity_documents": corrected_documents,
+            "messages": [
+                ToolMessage(
+                    content=f"Applied {len(changes)} change(s): {summary}",
+                    tool_call_id=runtime.tool_call_id,
+                )
+            ],
+        }
+    )
+
 
 # TODO: YOUTUBE IDENTITY UPDATER
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM

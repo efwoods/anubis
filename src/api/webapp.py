@@ -118,6 +118,8 @@ from urllib.parse import quote
 
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.types import Command
+from src.anubis.utils import runtime_handles
 import stripe
 
 import logging
@@ -204,6 +206,19 @@ def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     return last_ai
 
 
+def _collect_pending_interrupts(snapshot) -> list:
+    """Return any Interrupt objects pending on a graph StateSnapshot.
+
+    Newer LangGraph exposes ``snapshot.interrupts``; older surfaces them per task.
+    """
+    interrupts = list(getattr(snapshot, "interrupts", None) or [])
+    if interrupts:
+        return interrupts
+    for task in getattr(snapshot, "tasks", None) or []:
+        interrupts.extend(getattr(task, "interrupts", None) or [])
+    return interrupts
+
+
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -217,13 +232,22 @@ async def message_graph_sse(
     start_time_ns: int,
     request_id: str,
     langgraph_client_headers: dict,
+    resume_command: Optional[Command] = None,
 ):
-    """Stream assistant tokens (SSE) then a final ``done`` event with full metadata."""
+    """Stream assistant tokens (SSE) then a terminal event with full metadata.
+
+    Terminal event is ``done`` on completion, or ``interrupt`` when the graph pauses
+    for human approval (carrying the approve/edit/reject preview payload). Pass
+    ``resume_command`` (``Command(resume=...)``) to continue a paused run instead of
+    sending a fresh ``human_message``.
+    """
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
 
+    graph_input = resume_command if resume_command is not None else {"messages": [human_message]}
+
     async for item in graph.astream(
-        input={"messages": [human_message]},
+        input=graph_input,
         config=config,
         context=context,
         stream_mode=["custom", "updates"],
@@ -252,6 +276,21 @@ async def message_graph_sse(
     }
     langgraph_client = get_client(headers=langgraph_client_headers)
     await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+
+    # If the graph paused for human approval, surface the preview instead of ``done``.
+    # The client resumes via ``POST /message/{assistant_id}/resume`` on this thread_id.
+    snapshot = await graph.aget_state(config)
+    pending_interrupts = _collect_pending_interrupts(snapshot)
+    if pending_interrupts:
+        interrupt_event: dict = {
+            "type": "interrupt",
+            "thread_id": thread_id,
+            "request_id": request_id,
+            "interrupt": getattr(pending_interrupts[0], "value", None),
+            "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
+        }
+        yield f"data: {json.dumps(interrupt_event, default=str)}\n\n"
+        return
 
     content = (
         last_ai.content
@@ -542,6 +581,9 @@ async def lifespan(app: FastAPI):
         checkpointer = AsyncPostgresSaver(app.state.pool)
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
+        # Publish the shared checkpointer so the deep agent (rebuilt each turn inside
+        # the ``think`` node) can reuse it and make HITL ``interrupt``s durable.
+        runtime_handles.set_deep_agent_checkpointer(checkpointer)
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
@@ -1451,6 +1493,110 @@ async def message_avatar(
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
     return JSONResponse(response_data, status_code=200)
+
+
+@app.post("/message/{assistant_id}/resume")
+async def resume_avatar_message(
+    request: Request,
+    assistant_id: str,
+    thread_id: str = Form(...),
+    decision: str = Form("approve"),
+    corrected_information: Optional[str] = Form(None),
+    correction_context: Optional[str] = Form(None),
+    your_name: Optional[str] = Form(None),
+    your_description: Optional[str] = Form(None),
+    user_timezone: Optional[str] = Form(None),
+    include_metrics: bool = Form(True),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Resume a run paused for human approval (e.g. ``correct_identity_fact``).
+
+    ``decision`` is ``approve`` | ``edit`` | ``reject``. For ``edit``, the owner's
+    revised ``corrected_information``/``correction_context`` are forwarded. Streams
+    the continuation as SSE (same ``assistant_token`` → ``done``/``interrupt`` shape
+    as ``/message/{assistant_id}``).
+    """
+    start_time = time_ns()
+
+    decision_value = (decision or "approve").strip().lower()
+    if decision_value not in ("approve", "edit", "reject"):
+        raise HTTPException(
+            status_code=400, detail="decision must be approve, edit, or reject."
+        )
+
+    config = current_user.get("app_metadata", {}).get("assistant_config", {})
+    if not config:
+        raise HTTPException(
+            detail="Error retrieving assistant information.", status_code=400
+        )
+
+    user_id = current_user["identities"][0]["user_id"]
+    if request.headers.get("api-key", "") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
+        try:
+            langgraph_client = get_client(headers=langgraph_client_headers)
+            assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Error selecting avatar.")
+        config_update = {
+            "configurable": {
+                "user_ctx": {"name": your_name, "description": your_description},
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "assistant_ctx": {
+                    "name": assistant.get("name", None),
+                    "description": assistant.get("description", None),
+                    "metadata": assistant.get("metadata", {}),
+                },
+            }
+        }
+    else:
+        langgraph_client_headers = {"API-KEY": app.state.context.anonymous_api_key}
+        config_update = {
+            "configurable": {
+                "user_ctx": {"name": your_name, "description": your_description},
+            }
+        }
+
+    config_update["configurable"]["thread_id"] = thread_id
+    config["configurable"].update(config_update["configurable"])
+    config["configurable"]["user_timezone"] = user_timezone
+    config["configurable"]["include_metrics"] = include_metrics
+
+    graph = app.state.graph
+
+    # The resume value is the decision dict the paused tool's ``interrupt`` expects;
+    # it flows outer-``interrupt`` → ``think`` → the deep-agent tool unchanged.
+    resume_payload: dict = {"type": decision_value}
+    if decision_value == "edit":
+        if corrected_information:
+            resume_payload["corrected_information"] = corrected_information
+        if correction_context:
+            resume_payload["correction_context"] = correction_context
+
+    return StreamingResponse(
+        message_graph_sse(
+            graph,
+            None,
+            config,
+            app.state.context,
+            thread_id=thread_id,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            conversation_title_value=None,
+            start_time_ns=start_time,
+            request_id=request.state.request_id,
+            langgraph_client_headers=langgraph_client_headers,
+            resume_command=Command(resume=resume_payload),
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @app.get("/conversations")
 async def get_all_conversations(

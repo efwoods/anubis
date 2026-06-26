@@ -206,6 +206,10 @@ You must not invent user-specific facts, names, or past events; for unknowns abo
 NEVER USE ANY CONTENT IN STYLE FOR THE CONTENT OF THE MESSAGE.
 ALWAYS USE STYLE FOR SENTENCE LENGTH, IDIOMS, PUNCTUATION, REASONING PATTERNS, AND VOCABULARY ONLY.
 
+<<<<<<< Updated upstream
+=======
+
+>>>>>>> Stashed changes
 NEVER PERFORM THE FOLLOWING: 
 
 Because it’s not something I’m allowed to disclose in this conversation.

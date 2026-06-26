@@ -29,9 +29,10 @@ from src.anubis.utils.schema import RouteDecision
 
 from pydantic import BaseModel, Field
 from typing import Literal
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 import logging
+import uuid
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ from langgraph.graph import MessagesState
 
 from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
 from src.anubis.utils.deep_agent import build_avatar_deep_agent
+from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
 from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
 from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
 import numpy as np
@@ -333,6 +335,85 @@ async def terms_and_services_content_moderation(
     }
     return {"moderation_response": moderation_response}
 
+def _deep_agent_config(
+    config: RunnableConfig, turn_key: int
+) -> tuple[RunnableConfig, str | None]:
+    """Derive the deep agent's own config + thread id from the outer config.
+
+    The deep agent is checkpointed on a deterministic per-turn thread derived from
+    ``"<outer-thread>::deepagent::<turn_key>"``. The ``turn_key`` (the outer
+    conversation length) makes the thread **unique per turn** — so checkpointed
+    deep-agent state doesn't accumulate across turns — while staying **stable across
+    the interrupt → resume of the same turn** (no message is added while paused).
+    The outer ``checkpoint_id``/``checkpoint_ns`` are dropped so the inner run isn't
+    pinned to an outer checkpoint.
+
+    The derived value is hashed through ``uuid5`` because the shared
+    ``AsyncPostgresSaver`` (langgraph-api managed schema) types its ``thread_id``
+    column as ``uuid`` — a raw ``"<uuid>::deepagent::<n>"`` string fails on the first
+    ``aget_state`` with ``InvalidTextRepresentation``. ``uuid5`` is deterministic, so
+    it preserves the "stable while paused, unique per turn" property while yielding a
+    valid UUID.
+    """
+    outer_configurable = dict((config or {}).get("configurable", {}) or {})
+    outer_thread = outer_configurable.get("thread_id")
+    deep_agent_configurable = dict(outer_configurable)
+    deep_agent_configurable.pop("checkpoint_id", None)
+    deep_agent_configurable.pop("checkpoint_ns", None)
+    if outer_thread:
+        deep_agent_configurable["thread_id"] = str(
+            uuid.uuid5(uuid.NAMESPACE_OID, f"{outer_thread}::deepagent::{turn_key}")
+        )
+    deep_agent_config: RunnableConfig = {"configurable": deep_agent_configurable}
+    return deep_agent_config, outer_thread
+
+
+async def _stream_deep_agent(deep_agent, agent_input, deep_agent_config, context, writer):
+    """Run the deep agent (fresh input or ``Command(resume=...)``), streaming only
+    the final user-visible reply's tokens. Returns the deep agent's terminal state
+    dict (carrying ``messages`` + identity-doc snapshots), or ``None`` if it produced
+    no terminal output (e.g. it paused on an interrupt).
+
+    Same streaming heuristic as the legacy ``think`` body: tokens are emitted per
+    LLM call only while the running merged chunk shows no ``tool_calls``; once a tool
+    call appears, that call is a tool-planning turn and its tokens are dropped.
+    """
+    stream_buffers: dict[str, dict[str, Any]] = {}
+    final_output: dict[str, Any] | None = None
+
+    async for event in deep_agent.astream_events(
+        agent_input,
+        config=deep_agent_config,
+        context=context,
+        version="v2",
+    ):
+        ev_name = event.get("event")
+        if ev_name == "on_chat_model_stream":
+            run_id = event.get("run_id")
+            chunk = event["data"].get("chunk")
+            if chunk is None or run_id is None:
+                continue
+            buf = stream_buffers.setdefault(
+                run_id, {"merged": None, "streamed_text": False}
+            )
+            merged_prev = buf["merged"]
+            buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
+            if not (getattr(buf["merged"], "tool_calls", None) or []):
+                delta = chunk.content
+                if isinstance(delta, str) and delta:
+                    writer({"type": "assistant_token", "text": delta})
+                    buf["streamed_text"] = True
+        elif ev_name == "on_chat_model_end":
+            stream_buffers.pop(event.get("run_id"), None)
+        elif ev_name == "on_chain_end":
+            data = event.get("data") or {}
+            output = data.get("output")
+            if isinstance(output, dict) and "messages" in output:
+                final_output = output
+
+    return final_output
+
+
 async def think(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
@@ -359,7 +440,17 @@ async def think(
         - ``system_message`` / identity-doc snapshots forwarded from the
           deep agent's final state so the outer state stays in sync.
     """
-    deep_agent = build_avatar_deep_agent(runtime.context)
+    # The deep agent is checkpointed on its own deterministic thread so a
+    # human-in-the-loop ``interrupt`` raised mid-tool (e.g. ``correct_identity_fact``)
+    # is durable. ``store`` is passed explicitly because under its own checkpointer the
+    # agent no longer inherits it implicitly from the parent run.
+    checkpointer = get_deep_agent_checkpointer()
+    # Key the deep-agent thread on the conversation length so each turn is isolated
+    # but the interrupt/resume of one turn shares a thread (stable while paused).
+    deep_agent_config, outer_thread = _deep_agent_config(config, len(state["messages"]))
+    deep_agent = build_avatar_deep_agent(
+        runtime.context, checkpointer=checkpointer, store=runtime.store
+    )
 
     deep_agent_input = {
         "messages": list(state["messages"]),
@@ -375,49 +466,41 @@ async def think(
         "assistant_state": state["assistant_state"],
         "internal_thoughts": [],
     }
-    input_messages_count = len(deep_agent_input["messages"])
+    # Slice new messages from the deep agent's persisted conversation against the
+    # outer conversation length — stable across the interrupt/resume re-run.
+    input_messages_count = len(state["messages"])
 
     writer = get_stream_writer()
-    # Per-LLM-call streaming buffers keyed by `run_id`. We emit tokens
-    # incrementally as long as the running merged chunk shows no
-    # tool_calls — once one appears, we know this call is a tool-planning
-    # turn and silently drop the rest. Same heuristic the legacy node used,
-    # applied independently to each LLM call in the deep agent's loop.
-    stream_buffers: dict[str, dict[str, Any]] = {}
-    final_output: dict[str, Any] | None = None
 
-    async for event in deep_agent.astream_events(
-        deep_agent_input,
-        config=config,
-        context=runtime.context,
-        version="v2",
-    ):
-        ev_name = event.get("event")
-        if ev_name == "on_chat_model_stream":
-            run_id = event.get("run_id")
-            chunk = event["data"].get("chunk")
-            if chunk is None or run_id is None:
-                continue
-            buf = stream_buffers.setdefault(
-                run_id, {"merged": None, "streamed_text": False}
+    # Idempotency guard: this whole node re-runs when the OUTER graph resumes. If the
+    # deep-agent thread is already paused mid-interrupt, skip the fresh run (which
+    # would re-stream the same tokens) and go straight to resuming it below.
+    can_persist = checkpointer is not None and bool(outer_thread)
+    already_paused = False
+    if can_persist:
+        snapshot = await deep_agent.aget_state(deep_agent_config)
+        already_paused = bool(snapshot.next)
+
+    final_output: dict[str, Any] | None = None
+    if not already_paused:
+        final_output = await _stream_deep_agent(
+            deep_agent, deep_agent_input, deep_agent_config, runtime.context, writer
+        )
+
+    # If the deep agent paused on an interrupt, surface it through the OUTER graph so
+    # its ``AsyncPostgresSaver`` persists the pause and the API can present the
+    # approve/edit/reject preview. On resume, the outer ``interrupt`` returns the
+    # owner's decision, which we forward into the deep agent on its own thread.
+    if can_persist:
+        snapshot = await deep_agent.aget_state(deep_agent_config)
+        pending_interrupts = [
+            intr for task in snapshot.tasks for intr in task.interrupts
+        ]
+        if pending_interrupts:
+            decision = interrupt(pending_interrupts[0].value)
+            final_output = await _stream_deep_agent(
+                deep_agent, Command(resume=decision), deep_agent_config, runtime.context, writer
             )
-            merged_prev = buf["merged"]
-            buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
-            if not (getattr(buf["merged"], "tool_calls", None) or []):
-                delta = chunk.content
-                if isinstance(delta, str) and delta:
-                    writer({"type": "assistant_token", "text": delta})
-                    buf["streamed_text"] = True
-        elif ev_name == "on_chat_model_end":
-            stream_buffers.pop(event.get("run_id"), None)
-        elif ev_name == "on_chain_end":
-            # Capture the outermost graph's terminal output. The deep
-            # agent's compiled graph is the chain we're streaming; its
-            # final on_chain_end event carries the resulting state.
-            data = event.get("data") or {}
-            output = data.get("output")
-            if isinstance(output, dict) and "messages" in output:
-                final_output = output
 
     if final_output is None:
         logger.warning(

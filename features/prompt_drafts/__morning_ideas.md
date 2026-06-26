@@ -4,7 +4,11 @@
 <!-- - [x] I need to chunk the logs -->
 - [ ] I need to work on git_log_all.sh additional update to the log file
 
+<<<<<<< Updated upstream
 - [x] I need to build a stylistic profile
+=======
+- [x] I need to build a stylistic profilex
+>>>>>>> Stashed changes
 - [x] I need diarization completed
 - [ ] I need metering of responses
 

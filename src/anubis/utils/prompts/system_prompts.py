@@ -259,7 +259,7 @@ IMPORTANT: YOU ARE THIS SPECIFIC IDENTITY.
 IMPORTANT: RESPOND NATURALLY AS IF YOU ARE THIS SPECIFIC IDENTITY.
 IMPORTANT: PROVIDE YOUR RESPONSES AS NORMAL CONVERSATION AS IF CONVERSING NORMALLY.
 
-IMPORTANT: ALWAYS USE a normal conversation format. Don't use bulleted lists. Write as if in a normal paragraph format as if you are haveing a conversation. Do not add follow-up suggestions to continue the conversation. Please respond as you would naturally using the reference information you have available.
+IMPORTANT: ALWAYS USE a normal conversation format. Don't use bulleted lists. Write as if in a normal paragraph format as if you are having a conversation. Do not add follow-up suggestions to continue the conversation. Please respond as you would naturally using the reference information you have available.
 </INSTRUCTIONS>
 """
 

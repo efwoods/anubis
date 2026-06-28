@@ -400,11 +400,71 @@ class URLDocumentLoaderClass:
         ]
 
 
+# Structural tags that are almost never article content — stripped before text
+# extraction so navigation, sidebars, footers, and forms don't become fragments.
+_BOILERPLATE_TAGS = (
+    "script",
+    "style",
+    "noscript",
+    "nav",
+    "header",
+    "footer",
+    "aside",
+    "form",
+    "button",
+    "iframe",
+    "svg",
+)
+
+
+def _clean_soup_to_text(soup) -> str:
+    """Strip boilerplate tags, pick the main content block, collapse whitespace.
+
+    Main-content heuristic: prefer a semantic ``<main>``/``<article>`` element;
+    otherwise fall back to the whole (de-boilerplated) document. This keeps real
+    prose while dropping nav/sidebar/footer text that would otherwise be stored as
+    useless fragments.
+    """
+    for tag in soup(list(_BOILERPLATE_TAGS)):
+        tag.decompose()
+
+    main = soup.find("main") or soup.find("article")
+    container = main if main is not None else soup
+    text = container.get_text("\n", strip=True)
+    # Collapse runaway blank lines produced by removed elements.
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _clean_html_text(html: str) -> str:
+    """Parse raw HTML and return cleaned main-content text (or raw on failure)."""
+    try:
+        from bs4 import BeautifulSoup
+
+        return _clean_soup_to_text(BeautifulSoup(html, "html.parser"))
+    except Exception:
+        return html
+
+
 def _load_webdocs_sync(url: str):
-    """Run ``WebBaseLoader`` in a worker thread (sync API)."""
+    """Fetch via ``WebBaseLoader`` (sync API) with improved HTML→text cleaning.
+
+    Keeps ``WebBaseLoader`` as the fetcher but runs its scraped soup through
+    ``_clean_soup_to_text`` (drop nav/footer/aside, main-content heuristic,
+    whitespace collapse). Falls back to the loader's default ``load()`` if
+    scraping/cleaning yields nothing.
+    """
     from langchain_community.document_loaders import WebBaseLoader
 
     loader = WebBaseLoader(url)
+    try:
+        soup = loader.scrape()
+        cleaned = _clean_soup_to_text(soup)
+        if cleaned:
+            from langchain_core.documents import Document
+
+            return [Document(page_content=cleaned, metadata={"source": url})]
+    except Exception as exc:  # pragma: no cover - fall back to default loader
+        logger.warning("WebBaseLoader scrape/clean failed for %s: %s", url, exc)
     return loader.load()
 
 
@@ -418,15 +478,8 @@ async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
         text = response.text
     if return_html:
         return text
-    try:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(text, "html.parser")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
-    except Exception:
-        return text
+    cleaned = _clean_html_text(text)
+    return cleaned or text
 
 
 async def _extract_playlist_entries(url: str) -> tuple[List[Dict[str, Any]], str]:

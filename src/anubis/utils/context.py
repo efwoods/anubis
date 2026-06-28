@@ -282,6 +282,20 @@ class GlobalContext:
         },
     )
 
+    min_useful_tokens: int = field(
+        default=4,
+        metadata={
+            "description": "Minimum token count for an extracted chunk/page to be kept by the fragment filter. Chunks below this (after the regex/boilerplate heuristic) are dropped as fragments (page numbers, headers/footers, nav text). Env MIN_USEFUL_TOKENS."
+        },
+    )
+
+    fragment_llm_fallback: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to send borderline chunks (pass the length floor but look short/ambiguous) to the UsefulContentClassification LLM judge before keeping them. FALSE uses the cheap heuristic only. Env FRAGMENT_LLM_FALLBACK."
+        },
+    )
+
     audio_transcription_model: str = field(
         default=None, metadata={"description": "Audio transcription model name."}
     )
@@ -304,6 +318,13 @@ class GlobalContext:
         default="avatar",
         metadata={
             "description": "Speaker id passed as known_speaker_names[0] with reference audio. Env AUDIO_DIARIZATION_KNOWN_SPEAKER_NAME."
+        },
+    )
+
+    enable_speaker_reconciliation: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to run the LLM speaker-reconciliation pass when building the golden transcript (merges diarizer labels that are the same person — gpt-4o-transcribe-diarize has no speaker-count parameter and over-splits). FALSE keeps raw diarizer labels. Env ENABLE_SPEAKER_RECONCILIATION."
         },
     )
 

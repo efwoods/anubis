@@ -128,10 +128,15 @@ def _write_dev_diarization_transcript(
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
     build_all_speakers_quote_documents,
+    build_golden_transcript,
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
     process_nontarget_text_to_identity_documents,
     process_text_media_item_target_for_vectorstore,
+)
+from src.subgraphs.process_media_graph.utils.fragment_filter import (
+    classify_fragment_heuristic,
+    strip_repeated_lines,
 )
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
@@ -1332,7 +1337,13 @@ async def process_media_item_task(
                 tmp_file.write(pdf_bytes)
                 tmp_path = tmp_file.name
             try:
-                loader = PyPDFLoader(tmp_path)
+                # ``layout`` mode preserves column/line structure better than the
+                # default; fall back to the plain loader if the installed pypdf
+                # signature doesn't accept it.
+                try:
+                    loader = PyPDFLoader(tmp_path, extraction_mode="layout")
+                except TypeError:
+                    loader = PyPDFLoader(tmp_path)
                 # PyPDFLoader.load() is synchronous and pypdf parsing is
                 # CPU-bound; offload so the event loop isn't blocked.
                 pages = await asyncio.to_thread(loader.load)
@@ -1342,34 +1353,62 @@ async def process_media_item_task(
                 except OSError:
                     pass
 
-            final_documents: List[Document] = []
-            for page_idx, page_doc in enumerate(pages):
-                page_text = (page_doc.page_content or "").strip()
-                if not page_text:
+            # Optimize extraction quality before classification/chunking:
+            #   1. Strip lines that recur across many pages (running headers /
+            #      footers / page numbers) — the root cause of fragments like
+            #      "Page 13 of 10".
+            #   2. Drop pages whose remaining text is pure page furniture.
+            #   3. Concatenate the surviving pages into one continuous body so a
+            #      sentence spanning a page break survives and header-only pages
+            #      can't become standalone Documents. The whole document is then
+            #      classified + chunked once (cross-page coherent).
+            raw_page_texts = [(p.page_content or "") for p in pages]
+            cleaned_page_texts = strip_repeated_lines(raw_page_texts)
+
+            kept_page_texts: List[str] = []
+            first_kept_page_index: Optional[int] = None
+            for page_idx, page_text in enumerate(cleaned_page_texts):
+                stripped = (page_text or "").strip()
+                if not stripped:
                     continue
-                page_media_item = {
-                    "type": "text",
-                    "content": page_text,
-                    "metadata": {
-                        "filename": filename,
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "source": "pdf_page",
-                        "pdf_page_index": page_idx,
-                        "namespace_filename": namespace_filename,
-                    },
-                }
-                documents = await process_text_to_document(
-                    metadata=page_media_item["metadata"],
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    media_item=page_media_item,
-                    store=store
+                if classify_fragment_heuristic(stripped) == "junk":
+                    continue
+                if first_kept_page_index is None:
+                    first_kept_page_index = page_idx
+                kept_page_texts.append(stripped)
+
+            if not kept_page_texts:
+                logger.warning(
+                    "PDF %s yielded no useful page text after cleaning", filename
                 )
-                for d in documents:
-                    d.metadata.setdefault("pdf_page_index", page_idx)
-                    d.metadata["namespace_filename"]=namespace_filename
-                final_documents.extend(documents)
+                return []
+
+            document_text = "\n\n".join(kept_page_texts)
+            pdf_media_item = {
+                "type": "text",
+                "content": document_text,
+                "metadata": {
+                    "filename": filename,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "source": "pdf_document",
+                    "pdf_page_count": len(pages),
+                    "pdf_first_content_page_index": first_kept_page_index,
+                    "namespace_filename": namespace_filename,
+                    # Carry any user-supplied target through so target-aware
+                    # extraction runs for PDFs (e.g. a memoir with a named subject).
+                    "target_name": metadata.get("target_name"),
+                },
+            }
+            final_documents = await process_text_to_document(
+                metadata=pdf_media_item["metadata"],
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=pdf_media_item,
+                store=store,
+            )
+            for d in final_documents:
+                d.metadata["namespace_filename"] = namespace_filename
 
             return final_documents
            
@@ -1612,12 +1651,32 @@ async def process_media_item_task(
                 )
                 diar_response = None
 
+            target_speaker_label = (
+                runtime.context.audio_diarization_known_speaker_name or "avatar"
+            )
+
+            # Reformat the raw diarizer response into the canonical golden
+            # transcript: coalesce consecutive same-speaker segments, run the LLM
+            # speaker-reconciliation pass (gpt-4o-transcribe-diarize has no
+            # speaker-count parameter and over-splits), relabel the target's turns
+            # to ``avatar``, and recompute the top-level text. Everything below
+            # (and the dev artifact) consumes THIS golden form.
+            golden_transcript: Optional[Dict[str, Any]] = None
             if diar_response:
-                # DEV-only: persist the full diarized transcript (labeled speakers)
-                # to disk for inspection. Placed here so it captures every routing
-                # branch below, all of which consume this same diar_response.
-                _write_dev_diarization_transcript(
+                reconcile_enabled = str(
+                    getattr(runtime.context, "enable_speaker_reconciliation", "TRUE")
+                    or "TRUE"
+                ).upper() == "TRUE"
+                golden_transcript = await build_golden_transcript(
                     diar_response,
+                    target_speaker_label=target_speaker_label,
+                    reference_audio=bool(reference_audio),
+                    reconcile=reconcile_enabled,
+                )
+                # DEV-only: persist the golden transcript for inspection. Placed
+                # here so it captures every routing branch below.
+                _write_dev_diarization_transcript(
+                    golden_transcript,
                     source=(
                         metadata.get("source")
                         or filename
@@ -1627,10 +1686,6 @@ async def process_media_item_task(
                     assistant_id=assistant_id,
                     runtime=runtime,
                 )
-
-            target_speaker_label = (
-                runtime.context.audio_diarization_known_speaker_name or "avatar"
-            )
 
             # ---------------------------------------------------------------
             # create_reference_media_from_playlist: no single target speaker, so EVERY detected
@@ -1809,31 +1864,20 @@ async def process_media_item_task(
             #   * 0 usable    -> transcribe once and apply the same is_target
             #     (reference-upload) gate.
             # ---------------------------------------------------------------
-            segments_raw = (diar_response or {}).get("segments") or []
-            normalized_segments: List[Dict[str, Any]] = []
-            for seg in segments_raw:
-                if not isinstance(seg, dict):
-                    continue
-                seg_text = (seg.get("text") or "").strip()
-                if not seg_text:
-                    continue
-                speaker_label = seg.get("speaker") or "unknown"
-                is_target = (
-                    encoded_reference_audio is not None
-                    and target_speaker_label is not None
-                    and target_speaker_label.lower() in str(speaker_label).lower()
-                )
-                normalized_segments.append(
-                    {
-                        "speaker": str(speaker_label),
-                        "text": seg_text,
-                        "start": seg.get("start"),
-                        "end": seg.get("end"),
-                        "is_target": bool(is_target) or bool(reference_audio),
-                    }
-                )
-
-            turns = coalesce_segments_by_speaker(normalized_segments)
+            # Turns come from the already-coalesced, speaker-reconciled golden
+            # transcript built above. The target's turns are labeled ``avatar``;
+            # ``is_target`` is carried through for the routing gate below.
+            turns: List[Dict[str, Any]] = [
+                {
+                    "speaker": seg["speaker"],
+                    "text": seg["text"],
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                    "is_target": bool(seg.get("is_target")),
+                }
+                for seg in (golden_transcript or {}).get("segments", [])
+                if (seg.get("text") or "").strip()
+            ]
             distinct_speakers = {t["speaker"] for t in turns}
 
             # Lone-speaker promotion. If the diarizer returned exactly one

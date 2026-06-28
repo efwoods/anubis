@@ -91,16 +91,50 @@ async def index_docs(
         pass
     # endregion
 
-    docs: list[Document] = list(
+    # The full snapshot we pulled from the buffer. We must remove THIS exact set
+    # from the buffer at the end (even fragments we choose not to index), or
+    # dropped junk would linger and be reprocessed every superstep.
+    attempted_docs: list[Document] = list(
         cast(Sequence[Document], state.get('vectorstore_documents_to_be_indexed') or [])
     )
 
-    if not docs:
+    # Final fragment safety net: drop any document whose page_content is clear
+    # boilerplate (page numbers, headers/footers, nav) that slipped past the
+    # per-loader filters. Heuristic-only (no LLM) so the index path stays cheap;
+    # borderline short lines (genuine one-line quotes) are kept.
+    docs: list[Document] = attempted_docs
+    if attempted_docs:
+        try:
+            from src.subgraphs.process_media_graph.utils.fragment_filter import (
+                is_useful_content,
+            )
+
+            kept_docs = [
+                d for d in attempted_docs if is_useful_content(d.page_content or "")
+            ]
+            if len(kept_docs) != len(attempted_docs):
+                logger.info(
+                    "index_docs fragment net dropped %d/%d documents",
+                    len(attempted_docs) - len(kept_docs),
+                    len(attempted_docs),
+                )
+            docs = kept_docs
+        except Exception as exc:  # pragma: no cover - never block indexing
+            logger.warning("index_docs fragment net failed (%s); indexing all", exc)
+
+    if not attempted_docs:
         # Nothing in our snapshot to index. Do NOT clear the buffer: another
         # node (e.g. analyze_documents) may have appended docs in this same
         # superstep, and a blind clear would discard them un-indexed.
         logger.info("No documents to index; skipping batch indexing")
         return {}
+
+    if not docs:
+        # Every attempted document was a fragment. Nothing to index, but still
+        # remove the attempted snapshot so the fragments don't linger and get
+        # reprocessed every superstep.
+        logger.info("All attempted documents were fragments; removing snapshot")
+        return {"vectorstore_documents_to_be_indexed": remove_docs_update(attempted_docs)}
 
     # Files whose documents failed to index, keyed by original filename.
     failed_file_keys: set[str] = set()
@@ -157,7 +191,7 @@ async def index_docs(
     # persisted; failed files are surfaced via failed_to_index_files for
     # reprocessing rather than being silently retried here.
     return {
-        "vectorstore_documents_to_be_indexed": remove_docs_update(docs),
+        "vectorstore_documents_to_be_indexed": remove_docs_update(attempted_docs),
         "failed_to_index_files": list(file_failures.values()),
     }
 

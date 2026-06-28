@@ -15,6 +15,10 @@ from src.anubis.utils.classes.FactRewriterClass import FactRewriterClass
 from src.anubis.utils.classes.FirstPersonRewriterClass import (
     FirstPersonRewriterClass,
 )
+from src.anubis.utils.context import GlobalContext
+from src.subgraphs.process_media_graph.utils.fragment_filter import (
+    filter_fragment_documents,
+)
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
 )
@@ -45,6 +49,29 @@ def _coerce_classification_input_to_string(content: Any) -> str:
 
 def _classification_slice(text: str, limit: int = CLASSIFICATION_INPUT_CHAR_LIMIT) -> str:
     return text[:limit] if len(text) > limit else text
+
+
+async def drop_fragment_documents(documents: List[Document]) -> List[Document]:
+    """Filter out fragment/boilerplate Documents using context-configured thresholds.
+
+    Reads ``min_useful_tokens`` and ``fragment_llm_fallback`` from ``GlobalContext``
+    so the floor and LLM-judge toggle are env-tunable. Never raises — on any error
+    the input list is returned unfiltered so ingestion is not blocked.
+    """
+    if not documents:
+        return documents
+    try:
+        context = GlobalContext()
+        min_tokens = int(getattr(context, "min_useful_tokens", 4) or 4)
+        use_llm_fallback = str(
+            getattr(context, "fragment_llm_fallback", "TRUE") or "TRUE"
+        ).upper() == "TRUE"
+        return await filter_fragment_documents(
+            documents, min_tokens=min_tokens, use_llm_fallback=use_llm_fallback
+        )
+    except Exception as exc:  # pragma: no cover - filtering must not break ingestion
+        logger.warning("drop_fragment_documents failed (%s); keeping all docs", exc)
+        return documents
 
 
 def normal_chunking(
@@ -155,6 +182,15 @@ async def process_text_media_item_target_for_vectorstore(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
         )
+
+        # Drop fragment chunks (page numbers, headers/footers, nav text) before
+        # they are stamped and indexed.
+        all_documents = await drop_fragment_documents(all_documents)
+        if not all_documents:
+            logger.warning(
+                "All chunks filtered as fragments for %s; no documents emitted", filename
+            )
+            return []
 
         current_timestamp = datetime.now(tz=timezone.utc).isoformat()
         total_chunks = len(all_documents)
@@ -432,6 +468,124 @@ def coalesce_segments_by_speaker(
                 }
             )
     return turns
+
+
+async def _reconcile_speakers(
+    turns: List[Dict[str, Any]], target_label: str
+) -> List[Dict[str, Any]]:
+    """Correct diarizer over/under-splitting via the SpeakerReconciliation judge.
+
+    ``gpt-4o-transcribe-diarize`` has no parameter to set the number of speakers
+    and commonly splits one person across several labels. This maps each raw label
+    to a canonical speaker (target relabeled to ``target_label``) and re-coalesces.
+    Never raises — on failure the original diarizer turns are returned unchanged.
+    """
+    try:
+        from src.anubis.utils.classes.SpeakerReconciliationClass import (
+            SpeakerReconciliationClass,
+        )
+
+        result = await SpeakerReconciliationClass().reconcile(
+            turns, target_speaker_label=target_label
+        )
+        label_map = {
+            entry.get("raw_speaker"): entry
+            for entry in (result.get("label_map") or [])
+            if isinstance(entry, dict) and entry.get("raw_speaker") is not None
+        }
+        if not label_map:
+            return turns
+        for turn in turns:
+            entry = label_map.get(turn.get("speaker"))
+            if not entry:
+                continue
+            turn["speaker"] = entry.get("canonical_speaker") or turn["speaker"]
+            turn["is_target"] = bool(entry.get("is_target")) or bool(
+                turn.get("is_target")
+            )
+        return coalesce_segments_by_speaker(turns)
+    except Exception as exc:  # pragma: no cover - reconciliation must not break ingestion
+        logger.warning(
+            "speaker reconciliation failed (%s); using raw diarizer labels", exc
+        )
+        return turns
+
+
+async def build_golden_transcript(
+    diar_response: Dict[str, Any],
+    *,
+    target_speaker_label: Optional[str],
+    reference_audio: bool = False,
+    reconcile: bool = True,
+) -> Dict[str, Any]:
+    """Normalize a raw diarizer response into the canonical golden-transcript format.
+
+    Produces the same shape as ``*_golden_dataset_hand_annotated.json``:
+    ``{source, filename, model, duration, text, segments:[{speaker, start, end,
+    text, is_target}]}``. Consecutive same-speaker segments are coalesced, the
+    target's turns are relabeled to ``target_speaker_label`` (``avatar`` by
+    default), other speakers keep their (reconciled) labels, and the top-level
+    ``text`` is recomputed from the coalesced turns. This is the single canonical
+    intermediate that both the on-disk artifact and downstream document creation
+    consume.
+    """
+    target_label = target_speaker_label or "avatar"
+    segments_raw = (diar_response or {}).get("segments") or []
+
+    normalized: List[Dict[str, Any]] = []
+    for seg in segments_raw:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker_label = seg.get("speaker") or "unknown"
+        is_target = (
+            target_speaker_label is not None
+            and target_label.lower() in str(speaker_label).lower()
+        ) or bool(reference_audio)
+        normalized.append(
+            {
+                "speaker": str(speaker_label),
+                "text": text,
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "is_target": bool(is_target),
+            }
+        )
+
+    turns = coalesce_segments_by_speaker(normalized)
+
+    # Speaker reconciliation only helps when the diarizer reported >1 label.
+    if reconcile and len({t["speaker"] for t in turns}) > 1:
+        turns = await _reconcile_speakers(turns, target_label)
+
+    # Canonical relabel: every target turn becomes ``target_label`` (``avatar``),
+    # then re-coalesce so adjacent target turns merge under the unified label.
+    for turn in turns:
+        if turn.get("is_target"):
+            turn["speaker"] = target_label
+    turns = coalesce_segments_by_speaker(turns)
+
+    golden = {
+        "source": (diar_response or {}).get("source")
+        or (diar_response or {}).get("filename"),
+        "filename": (diar_response or {}).get("filename"),
+        "model": (diar_response or {}).get("model"),
+        "duration": (diar_response or {}).get("duration"),
+        "text": "\n".join(t["text"] for t in turns),
+        "segments": [
+            {
+                "speaker": t["speaker"],
+                "start": t.get("start"),
+                "end": t.get("end"),
+                "text": t["text"],
+                "is_target": bool(t.get("is_target")),
+            }
+            for t in turns
+        ],
+    }
+    return golden
 
 
 def _build_target_quote_documents_from_dialogue(
@@ -908,6 +1062,114 @@ async def process_nontarget_text_to_identity_documents(
         document.metadata.update({"namespace_filename": namespace_filename})
     return documents
 
+# Long-form prose is attributed to speakers in windows so dialogue context is
+# preserved per call. The window count is bounded so a very large corpus (e.g. a
+# whole Bible) can't fan out into thousands of LLM calls in one request; raise
+# the cap or split the upload for fuller coverage.
+_TARGET_ATTRIBUTION_WINDOW_CHARS = 6000
+_MAX_TARGET_ATTRIBUTION_WINDOWS = 25
+
+
+def _window_text(text: str, window_chars: int, max_windows: int) -> List[str]:
+    """Split ``text`` into ``<= max_windows`` character windows on paragraph/line
+    boundaries where possible (keeps a speaker turn intact across the split)."""
+    windows: List[str] = []
+    remaining = text
+    while remaining and len(windows) < max_windows:
+        if len(remaining) <= window_chars:
+            windows.append(remaining)
+            break
+        # Prefer to cut on a paragraph/line/sentence boundary before the hard cap.
+        cut = window_chars
+        for sep in ("\n\n", "\n", ". "):
+            idx = remaining.rfind(sep, int(window_chars * 0.5), window_chars)
+            if idx != -1:
+                cut = idx + len(sep)
+                break
+        windows.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return windows
+
+
+async def _process_target_aware_text(
+    *,
+    text_content: str,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: Optional[str],
+) -> List[Document]:
+    """Attribute long-form prose to speakers, then run the dialogue pipeline.
+
+    Uses :class:`TargetIdentificationInTextClass` to turn unstructured prose
+    (script, wiki, Bible passage, article) into speaker-attributed statements
+    with ``is_target`` flags, then feeds them through
+    :func:`process_dialogue_json_to_documents` so the SAME outputs as diarized
+    audio are produced: target direct-quote Documents, biographical-fact
+    Documents from non-target turns, and the role-converted adapter conversation.
+    This is what makes prompt-completion + multi-turn adapter datasets available
+    from text/URL/PDF per ``_OVERALL_PREPROCESSING_PROCESS.md``.
+    """
+    import asyncio
+
+    from src.anubis.utils.classes.TargetIdentificationInTextClass import (
+        TargetIdentificationInTextClass,
+    )
+
+    windows = _window_text(
+        text_content,
+        _TARGET_ATTRIBUTION_WINDOW_CHARS,
+        _MAX_TARGET_ATTRIBUTION_WINDOWS,
+    )
+    if not windows:
+        return []
+
+    identifier = TargetIdentificationInTextClass()
+    responses = await asyncio.gather(
+        *[identifier.identify(window, target_name) for window in windows],
+        return_exceptions=True,
+    )
+
+    segments: List[Dict[str, Any]] = []
+    resolved_target = target_name
+    for response in responses:
+        if isinstance(response, Exception):
+            logger.warning("target attribution window failed: %s", response)
+            continue
+        resolved_target = (
+            response.get("target_name")
+            if response.get("target_name") not in (None, "", "UNKNOWN")
+            else resolved_target
+        )
+        for statement in response.get("statements") or []:
+            content = (statement.get("content") or "").strip()
+            if not content:
+                continue
+            segments.append(
+                {
+                    "speaker": statement.get("speaker") or "unknown",
+                    "text": content,
+                    "is_target": bool(statement.get("is_target")),
+                    "start": None,
+                    "end": None,
+                }
+            )
+
+    if not segments:
+        return []
+
+    dialogue_payload = {
+        "segments": segments,
+        "target_name": resolved_target or target_name,
+    }
+    return await process_dialogue_json_to_documents(
+        dialogue_payload=dialogue_payload,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        media_item=media_item,
+    )
+
+
 async def process_text_to_document(
     metadata,
     user_id,
@@ -915,6 +1177,7 @@ async def process_text_to_document(
     media_item,
     store: BaseStore,
     namespace_hint: Optional[str] = None,
+    target_name: Optional[str] = None,
 ) -> List[Document]:
     """Reference-document gate, then content-situation classifier, then route to chunkers.
 
@@ -947,12 +1210,41 @@ async def process_text_to_document(
         logger.warning("Empty text content in media_item; returning no documents")
         return []
 
+    # An explicit target supplied at upload time (param or media_item metadata)
+    # signals intent to reconstruct THAT person from this text. It forces the
+    # target-aware attribution path (direct quotes + biographical facts + adapter
+    # datasets) and overrides the menu/holy-text short-circuit.
+    explicit_target_name = target_name or (
+        media_item.get("metadata", {}) or {}
+    ).get("target_name")
+
     reference_classifier = ReferenceDocumentClassificationClass()
     reference_response = await reference_classifier.classify(classification_input)
     is_menu_or_religious_text = bool(
         reference_response.get("is_menu_or_religious_text", False)
     )
     reference_reasoning = reference_response.get("reasoning", "")
+
+    # Bible-with-target-"Jesus" and similar: when a target is explicitly supplied,
+    # run target-aware extraction instead of dumping the whole text into the
+    # ``document`` namespace, so the target's quotes / facts / adapter data are
+    # produced per _OVERALL_PREPROCESSING_PROCESS.md.
+    if is_menu_or_religious_text and namespace_hint is None and explicit_target_name:
+        logger.info(
+            "Reference document with explicit target %r -> target-aware extraction",
+            explicit_target_name,
+        )
+        documents = await _process_target_aware_text(
+            text_content=text_content,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            media_item=media_item,
+            target_name=explicit_target_name,
+        )
+        for document in documents:
+            document.metadata.setdefault("namespace_filename", namespace_filename)
+            document.metadata.setdefault("target_name", explicit_target_name)
+        return documents
 
     if is_menu_or_religious_text and namespace_hint is None:
         logger.info("Reference document detected (menu/holy text) -> document namespace")
@@ -1101,15 +1393,18 @@ async def process_text_to_document(
             )
 
     elif classified_situation == "dialogue":
-        # TODO: Verify and test
-        # Dialogue -> dialogue namespace
-        # This will need to create quotes documents of what the target said
-        # This will need to create the entire conversation document for the adapter namespace
-        documents = await process_dialogue_json_to_documents(
-            dialogue_payload=media_item,
+        # Dialogue in raw prose form (script, interview, chat export). Attribute
+        # the text to speakers (flagging the target), then run the shared dialogue
+        # pipeline to emit: target direct-quote Documents, biographical-fact
+        # Documents from non-target turns, and the role-converted adapter
+        # conversation — the prompt-completion + multi-turn datasets are then built
+        # downstream by process_adapter_documents.
+        documents = await _process_target_aware_text(
+            text_content=text_content,
             user_id=user_id,
             assistant_id=assistant_id,
             media_item=media_item,
+            target_name=explicit_target_name or target_name,
         )
         for document in documents:
             document.metadata.update(

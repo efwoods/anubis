@@ -575,6 +575,69 @@ Remember: line breaks, name mentions, @-mentions, topic shifts, and tone shifts 
 """
 
 
+# ===========================================================
+# STEP 2b — Useful-Content vs Fragment Classification
+# ============================================================
+
+
+class UsefulContentClassification(BaseModel):
+    """
+    Decides whether a chunk of extracted text is meaningful identity / quote /
+    biographical content, or boilerplate noise (page numbers, running headers /
+    footers, navigation menus, timestamps, cookie banners, ads). Used as the
+    LLM fallback for borderline chunks the cheap heuristic can't decide.
+    """
+
+    is_useful: bool = Field(
+        description=(
+            "True when the text carries real semantic content about a person, "
+            "their words, or a topic. False when it is boilerplate / navigation "
+            "/ page furniture with no standalone meaning."
+        )
+    )
+    reasoning: str = Field(
+        description="Brief justification citing what in the text drove the decision."
+    )
+
+
+USEFUL_CONTENT_CLASSIFICATION_SYSTEM_PROMPT = """
+# Role and Objective
+
+You are a data-quality gate for a document-ingestion pipeline. You receive a
+single short chunk of text that was extracted from a PDF, a web page, or a
+transcript. Decide whether the chunk is USEFUL content worth storing, or a
+FRAGMENT of boilerplate that should be discarded.
+
+# What counts as USEFUL (is_useful = true)
+- A sentence or statement that conveys information, opinion, narrative, or dialogue.
+- A direct quote, a biographical fact, a list item with real meaning, a heading
+  that labels real content followed by substance.
+- Even a short line is useful if it is a genuine standalone statement
+  (e.g. a tweet, an aphorism, a spoken line).
+
+# What counts as a FRAGMENT (is_useful = false)
+- Page numbers and pagination ("Page 13 of 10", "12", "- 4 -").
+- Running headers / footers repeated across pages.
+- Date/time stamps and print artifacts ("11/5/25, 11:46 PM").
+- Navigation menus, breadcrumbs, "Skip to content", "Share", "Subscribe".
+- Cookie / consent banners, copyright lines, ad slugs, "Read more".
+- Pure punctuation, separators, or whitespace.
+- Strings with no parseable meaning out of context.
+
+# Reasoning Steps
+1. Read the chunk.
+2. Ask: if a human read ONLY this chunk, would it tell them something real about
+   a person, their words, or a subject?
+3. If yes -> is_useful = true. If it is page furniture / navigation / noise ->
+   is_useful = false.
+4. When genuinely uncertain, lean toward is_useful = true (favor recall; the
+   cheap heuristic already removed the obvious garbage).
+
+# Output Format
+Return a structured object with `is_useful` (bool) and `reasoning` (str).
+"""
+
+
 DESCRIBE_IMAGE_PROMPT = """
 <describe_image_spec>
 <role>
@@ -882,6 +945,86 @@ Steps:
 - If the target cannot be found in the text, set target_name to "UNKNOWN" and
   explain why in target_identification_reasoning.
 </Rules>
+"""
+
+
+# ============================================================
+# STEP 5a-bis — Diarization Speaker Reconciliation
+# ============================================================
+
+
+class ReconciledSpeakerLabel(BaseModel):
+    raw_speaker: str = Field(
+        description="A speaker label exactly as produced by the diarizer (e.g. 'A', 'B', 'C')."
+    )
+    canonical_speaker: str = Field(
+        description=(
+            "The corrected speaker this raw label really belongs to. Raw labels "
+            "that are the same underlying person share one canonical_speaker. The "
+            "target individual's canonical_speaker MUST be the literal string 'avatar'."
+        )
+    )
+    is_target: bool = Field(
+        description="True only for the canonical speaker that is the target individual."
+    )
+
+
+class SpeakerReconciliation(BaseModel):
+    """
+    Corrects over/under-splitting from ``gpt-4o-transcribe-diarize``. The diarizer
+    has no parameter to set the number of speakers and frequently splits one
+    person across several labels (or, rarely, merges two). Given the labeled,
+    coalesced turns and the known target name, this produces a mapping from each
+    raw diarizer label to a corrected canonical speaker, and identifies which
+    canonical speaker is the target (relabeled 'avatar').
+    """
+
+    label_map: List[ReconciledSpeakerLabel] = Field(
+        description="One entry per DISTINCT raw diarizer label, mapping it to its canonical speaker."
+    )
+    canonical_speaker_count: int = Field(
+        description="The corrected number of distinct real speakers in the conversation."
+    )
+    reasoning: str = Field(
+        description="Concise evidence (voice continuity, turn-taking, content cues) for the merges/splits."
+    )
+
+
+SPEAKER_RECONCILIATION_SYSTEM_PROMPT = """
+# Role and Objective
+
+You correct speaker-diarization labels for a transcript. An automatic diarizer
+labeled each turn with a speaker tag (e.g. "A", "B", "C"), but it often SPLITS a
+single real person across multiple tags, and occasionally MERGES two people under
+one tag. Using the conversation content and turn-taking, produce a corrected
+mapping from each raw label to a canonical speaker.
+
+# Inputs
+- The known TARGET speaker label/name (the persona being reconstructed).
+- The list of turns, each with its raw diarizer speaker tag and text.
+
+# Instructions
+1. Read the whole transcript and follow the flow of who is speaking.
+2. Group raw labels that are clearly the SAME person (consistent voice, role,
+   self-reference, and coherent continuation across turns) under one
+   `canonical_speaker` name.
+3. Keep genuinely distinct people as distinct canonical speakers.
+4. The TARGET individual's `canonical_speaker` MUST be exactly the string
+   "avatar", and its `is_target` MUST be true. All other canonical speakers have
+   `is_target` = false.
+5. Output exactly one `label_map` entry per DISTINCT raw label that appears.
+6. Set `canonical_speaker_count` to the number of distinct canonical speakers.
+
+# Guidance
+- An interviewer/host who asks the questions is usually ONE person even if the
+  diarizer split them into several tags between the target's long answers.
+- Prefer FEWER canonical speakers when evidence is ambiguous — over-splitting is
+  the diarizer's common failure mode.
+- Do not invent speakers that have no turns.
+
+# Output Format
+Return `label_map` (one entry per distinct raw label), `canonical_speaker_count`
+(int), and `reasoning` (str).
 """
 
 

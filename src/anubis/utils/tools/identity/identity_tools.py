@@ -844,8 +844,9 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
 # already retrieved into this turn's prompt are actively shaping the response, so they
 # are matched at the loader's own relevance floor; everything else needs a small margin
 # above it to avoid sweeping in loosely-related facts.
-_CORRECTION_MATCH_THRESHOLD = 0.3
-_CORRECTION_RETRIEVED_DOC_THRESHOLD = 0.1
+
+_CORRECTION_MATCH_THRESHOLD = 0.6 # retrieved documents from the store namespaces 
+_CORRECTION_RETRIEVED_DOC_THRESHOLD = 0.1 # all documents contained in the current state
 
 # Sentence-level gate for long-text namespaces (quote/document/analysis). Those store
 # raw multi-sentence text, so whole-document cosine of a short claim against a ~2,000-word
@@ -1193,9 +1194,7 @@ async def find_fact_matches(
 
     De-duplicated by ``(namespace, key)`` for facts and ``(namespace, key, sentence)``
     for sentences. Reads only — safe to re-run when an interrupt resumes.
-
-    TODO: INCORRECT DOCUMENT RETRIEVAL asdf
-    
+   
     """
     retrieved_doc_ids: set[str] = set()
     for doc in state_docs or []:
@@ -1351,7 +1350,7 @@ async def _apply_sentence_redaction(
     new_page_content = _redact_sentences(old_page_content, changed)
 
     # Keep human-readable summaries consistent when they restate the offending sentence.
-    for summary_field in ("scene_summary", "user_context"):
+    for summary_field in ("scene_summary", "user_context"): 
         if metadata.get(summary_field):
             metadata[summary_field] = _redact_sentences(metadata[summary_field], changed)
 

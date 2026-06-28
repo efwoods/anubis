@@ -265,6 +265,103 @@ async def recall_memories(
 
     return Command(update=update)
 
+
+def _extract_message_text(content: object) -> str:
+    """Flatten a message ``content`` (str or list of content blocks) into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(parts)
+    return str(content or "")
+
+
+def _latest_user_message_text(messages: object) -> str:
+    """Return the text of the most recent ``HumanMessage`` in ``messages`` (else "")."""
+    for message in reversed(list(messages or [])):
+        if isinstance(message, HumanMessage):
+            return _extract_message_text(message.content)
+    return ""
+
+
+class _UserMessageGroundsFact(BaseModel):
+    """Whether the user's most recent message is the actual source of a proposed identity fact.
+
+    Guards ``update_self_identity_mem_from_user_txt`` against learning facts the avatar surfaced
+    from its own retrieved consciousness (identity/quote transcripts injected into the system
+    prompt) or from earlier in the conversation, rather than from something the user just shared.
+    """
+
+    user_asserted_the_fact: bool = Field(
+        description=(
+            "True ONLY if the user's most recent message itself states/shares this fact about "
+            "the assistant — i.e. the information the fact was derived from is present in that "
+            "message. False if the message merely ASKS about, requests, or mentions the topic "
+            "without asserting it, or if the fact could only have come from retrieved documents, "
+            "a transcript, the assistant's own words, or an earlier message."
+        )
+    )
+    reason: str = Field(description="One short sentence explaining the decision.")
+
+
+_FACT_GROUNDING_SYSTEM_PROMPT = """You are a strict gatekeeper deciding whether a proposed \
+fact about the ASSISTANT was actually shared by the user in their MOST RECENT message.
+
+You are given:
+- USER_MESSAGE: the user's most recent message, verbatim.
+- PROPOSED_FACT: a first-person fact about the assistant that another component wants to store.
+
+Set `user_asserted_the_fact` true ONLY when USER_MESSAGE itself contains the information the \
+PROPOSED_FACT was derived from — the user is telling the assistant this is true about it.
+
+Set it false when:
+- USER_MESSAGE only ASKS about, requests, or mentions the topic (e.g. "tell me about X", \
+"spell your name", "how does Y affect you?") without asserting the fact.
+- The fact could only have come from retrieved documents, a transcript, the assistant's own \
+prior statements, or an earlier message — not from THIS message.
+- USER_MESSAGE does not contain the specific information in the fact at all.
+
+A question or request is never an assertion. When in doubt, answer false.
+"""
+
+
+async def _user_message_grounds_fact(fact: str, user_message_text: str) -> bool:
+    """Verify the user's most recent message is the source the ``fact`` was derived from.
+
+    Safeguard for ``update_self_identity_mem_from_user_txt``: the model frequently "learns"
+    facts it actually surfaced from its own retrieved consciousness (identity/quote documents)
+    when the user merely ASKS about those topics. We re-check the proposed fact against the
+    latest user message only — not retrieved context, the assistant's own messages, or earlier
+    turns. Returns True when that message asserts the fact, False otherwise.
+
+    Fails OPEN (returns True) on an empty message or model error so transient failures never
+    silently drop a genuine fact — mirrors ``_suggest_correction``'s graceful fallback.
+    """
+    if not user_message_text.strip():
+        return True
+    try:
+        model = init_model(response_format=_UserMessageGroundsFact)
+        result = await model.ainvoke(
+            [
+                SystemMessage(content=_FACT_GROUNDING_SYSTEM_PROMPT),
+                HumanMessage(content=f"USER_MESSAGE: {user_message_text}\n\nPROPOSED_FACT: {fact}"),
+            ]
+        )
+        return bool(result.user_asserted_the_fact)
+    except Exception:
+        logger.exception(
+            "update_self_identity_mem_from_user_txt: fact-grounding check failed; allowing the fact"
+        )
+        return True
+
+
 class AssistantFactAndContext(BaseModel):
     """
     Extract Facts about the ASSISTANT and the context of that fact given the most recently shared message ONLY shared FROM THE USER.
@@ -336,6 +433,8 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
 
     DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN.
 
+    DO NOT CALL THIS TOOL ON INFORMATION THAT WAS PRESENTED FROM THE ASSISTANT IN EARLIER CONTEXT OF THE CONVERSATION (INFORMATION YOU PRESENTED YOURSELF)
+
     <FACTCONTEXT>
     THE CONTEXT OF THE FACTS ARE SUCH THAT YOU HAVE BEEN INFORMED OF THIS INFORMATION. 
     THESE ARE FACTS SHARED IN CONVERSATION FROM THE USER. DO NOT REWRITE THESE FACTS AS IF YOU SAID THESE FACTS YOURSELF. 
@@ -353,6 +452,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
+    DO NOT CALL THIS TOOL ON INFORMATION THAT WAS PRESENTED FROM THE ASSISTANT IN EARLIER CONTEXT OF THE CONVERSATION (INFORMATION YOU PRESENTED YOURSELF)
     Only use this for FACTS about the IDENTITY of the assistant (you).
     NEVER call this tool twice with the same fact.
     NEVER learn a fact from any message other than the user's most recent message.
@@ -426,7 +526,55 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
         tool_call_id = runtime.tool_call_id
         update = {"messages": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
         return Command(update=update)
- 
+
+
+
+    # SAFEGUARD: only learn a fact the user actually shared in their MOST RECENT message.
+    # The model often surfaces facts from the avatar's own retrieved consciousness
+    # (identity/quote transcripts injected into the system prompt) when the user merely ASKS
+    # about those topics, then "learns" them as if the user had asserted them. Verify the fact
+    # was derived from the latest user message — not retrieved context, the assistant's own
+    # words, or an earlier turn — before storing anything.
+    latest_user_message_text = _latest_user_message_text(runtime.state.get("messages"))
+    
+    _SIMILARITY_THRESHOLD = 0.6
+
+    def _compute_message_fact_similarity() -> float:
+        from src.anubis.utils.runtime_handles import get_sentence_embedder
+
+        model = get_sentence_embedder()
+        message_embedding, fact_embedding = model.encode(
+            [latest_user_message_text, fact_shared_about_the_assistant_from_the_user],
+            convert_to_numpy=True,
+        )
+        scores = model.similarity(message_embedding, fact_embedding)
+        return float(scores[0][0])
+
+    similarity = await asyncio.to_thread(_compute_message_fact_similarity)
+    if similarity < _SIMILARITY_THRESHOLD:
+        """ 
+            If the fact is not similar to the most recent user message 
+            (the fact should come from the user message), then verify with an llm. 
+            If that fails, do not learn the fact.
+        """
+    
+        if not await _user_message_grounds_fact(
+            fact_shared_about_the_assistant_from_the_user, latest_user_message_text
+        ):
+            tool_call_id = runtime.tool_call_id
+            update = {
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{fact_shared_about_the_assistant_from_the_user}" was '
+                            "not shared by the user in their most recent message."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+            return Command(update=update)
+
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")

@@ -1,13 +1,5 @@
 FROM anubis-base:latest
 
-# -- Force uv to COPY files instead of hardlinking. The deps below are installed
-#    on top of the base image, whose package files live in a lower overlayfs
-#    layer. uv's default hardlink link-mode truncates those lower-layer source
-#    files to 0 bytes when it reinstalls a package, leaving valid .pyc shadowed
-#    by an empty .py (e.g. langchain_core/load/load.py → "cannot import name
-#    'Reviver'"). Copy mode writes real files and avoids the corruption.
-ENV UV_LINK_MODE=copy
-
 # -- Add full source (replaces the stub left by the base image) --
 ADD . /deps/anubis
 

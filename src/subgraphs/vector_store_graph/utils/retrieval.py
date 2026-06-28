@@ -32,4 +32,3 @@ async def make_text_encoder(model: str = "microsoft/harrier-oss-v1-270m") -> Emb
     )
 
     return embeddings
-

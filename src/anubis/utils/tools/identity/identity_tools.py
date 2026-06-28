@@ -1193,6 +1193,9 @@ async def find_fact_matches(
 
     De-duplicated by ``(namespace, key)`` for facts and ``(namespace, key, sentence)``
     for sentences. Reads only — safe to re-run when an interrupt resumes.
+
+    TODO: INCORRECT DOCUMENT RETRIEVAL asdf
+    
     """
     retrieved_doc_ids: set[str] = set()
     for doc in state_docs or []:

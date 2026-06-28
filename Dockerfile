@@ -1,8 +1,16 @@
 FROM anubis-base:latest
- 
+
+# -- Force uv to COPY files instead of hardlinking. The deps below are installed
+#    on top of the base image, whose package files live in a lower overlayfs
+#    layer. uv's default hardlink link-mode truncates those lower-layer source
+#    files to 0 bytes when it reinstalls a package, leaving valid .pyc shadowed
+#    by an empty .py (e.g. langchain_core/load/load.py → "cannot import name
+#    'Reviver'"). Copy mode writes real files and avoids the corruption.
+ENV UV_LINK_MODE=copy
+
 # -- Add full source (replaces the stub left by the base image) --
 ADD . /deps/anubis
- 
+
 # -- Install only net-new / changed deps; uv skips already-satisfied packages --
 #    No --no-deps: full resolution is required so uv can diff against the
 #    already-installed base layer and fetch only what's missing.
@@ -10,7 +18,7 @@ RUN for dep in /deps/*; do \
         if [ -d "$dep" ]; then \
             echo "Installing $dep"; \
             (cd "$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir \
-                -c /api/constraints.txt -e .); \
+                --link-mode=copy -c /api/constraints.txt -e .); \
         fi; \
     done
  

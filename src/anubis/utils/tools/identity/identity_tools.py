@@ -958,21 +958,174 @@ class CorrectionChange:
     document: Document | None  # surviving Document (None when the doc was deleted)
 
 
-def _proposed_text(match: FactMatch, corrected_information: str, is_deletion: bool) -> str:
-    """What ``match`` becomes once applied — for the HITL preview."""
-    if is_deletion:
-        return "(removed)"
-    return corrected_information
+@dataclass
+class ResolvedCorrection:
+    """A single match paired with the FINAL per-document edit to apply to it.
+
+    Produced after the HITL panel resolves: each matched fact/sentence carries its own
+    ``corrected_text``/``corrected_context`` (the owner's edit, or the model's per-document
+    suggestion) and its own ``include`` flag. An empty ``corrected_text`` on an included
+    match means "remove" (delete the atomic fact / redact the sentence).
+    """
+
+    match: FactMatch
+    corrected_text: str
+    corrected_context: str
+    include: bool = True
+
+    @property
+    def is_removal(self) -> bool:
+        return not (self.corrected_text or "").strip()
 
 
-def _match_preview(match: FactMatch, corrected_information: str, is_deletion: bool) -> dict:
-    """Compact, JSON-serializable description of one pending change for the HITL preview."""
+class ProposedFactEdit(BaseModel):
+    """A per-document suggested minimal edit for ONE matched fact/sentence.
+
+    The correction tool finds many stored texts that match the inaccurate claim; each one
+    is a different sentence in a different document, so a single global replacement would
+    flatten unrelated facts (see the failure cases in ``features/.../fp_correction``). This
+    model is generated PER MATCH so only the offending span is changed and everything else
+    in that specific text is preserved verbatim.
+    """
+
+    asserts_inaccurate_fact: bool = Field(
+        description="True only if THIS specific text actually states the inaccurate fact the "
+        "user is correcting. False when the matched text is about something else (it was swept "
+        "in by a loose semantic match) and must be left untouched."
+    )
+    corrected_text: str = Field(
+        default="",
+        description="The matched text rewritten with ONLY the inaccurate portion fixed (or "
+        "removed); every other word — names, places, dates, unrelated clauses — preserved "
+        "exactly. First person, like the original. Return an EMPTY string to remove the matched "
+        "text entirely (a pure deletion, or when the whole sentence only asserted the wrong fact).",
+    )
+    corrected_context: str = Field(
+        default="",
+        description="The text's ORIGINAL background context, minimally edited so it stays "
+        "accurate — preserve the parts that are still true, change only what the correction "
+        "touches. Do NOT blanket-overwrite the whole context with the new fact.",
+    )
+
+
+_CORRECTION_SUGGESTION_SYSTEM_PROMPT = """You revise ONE stored statement about a person so a \
+single inaccurate fact is corrected while everything else is preserved exactly.
+
+You are given:
+- INACCURATE_FACT: the claim the user says is wrong.
+- USER_CORRECTION: what the user said is actually true (may be empty for a pure deletion).
+- MATCHED_TEXT: the specific stored sentence/fact that was matched and may need editing.
+- FULL_DOCUMENT: the surrounding text MATCHED_TEXT came from (for context only — do NOT return it).
+- ORIGINAL_CONTEXT: the stored background context for MATCHED_TEXT.
+
+Rules:
+- Decide `asserts_inaccurate_fact`: is MATCHED_TEXT actually stating INACCURATE_FACT? If it is \
+about something else, set it false and leave the text unchanged.
+- Edit MATCHED_TEXT minimally: fix or remove ONLY the inaccurate portion; keep every other \
+detail (names, places, dates, other clauses) verbatim and in first person.
+- If MATCHED_TEXT only asserted the wrong fact and has nothing true left, or the user is \
+deleting the fact with no replacement, return an empty `corrected_text`.
+- Edit ORIGINAL_CONTEXT the same way: keep the still-true parts, change only what the \
+correction affects. Never replace the whole context with just the new fact.
+"""
+
+
+# Per-match suggestion calls fan out concurrently; bound them so a correction touching many
+# documents does not open dozens of simultaneous model calls.
+_SUGGESTION_CONCURRENCY = asyncio.Semaphore(8)
+
+
+async def _suggest_correction(
+    match: FactMatch,
+    *,
+    inaccurate_information: str,
+    corrected_information: str,
+    correction_context: str,
+    is_deletion: bool,
+) -> tuple[str, str, bool]:
+    """Suggest a minimal in-place edit for ``match`` → ``(corrected_text, context, asserts)``.
+
+    Uses a structured-output model so the suggestion only changes the offending span of THIS
+    document. On any failure (no model configured, network error) it falls back to the global
+    correction the model proposed, so the HITL flow still works — the owner can edit anything
+    in the panel regardless. Mockable at module scope for tests.
+    """
+    fallback = ("" if is_deletion else corrected_information, correction_context, True)
+    try:
+        kwargs = _item_document_kwargs(match.item)
+        full_document = kwargs.get("page_content") or ""
+        original_context = (kwargs.get("metadata") or {}).get("fact_context") or correction_context
+        human_message = HumanMessage(
+            content=(
+                f"INACCURATE_FACT: {inaccurate_information}\n"
+                f"USER_CORRECTION: {corrected_information or '(remove — the user says this is simply wrong)'}\n"
+                f"MATCHED_TEXT: {match.matched_text}\n"
+                f"ORIGINAL_CONTEXT: {original_context}\n"
+                f"FULL_DOCUMENT: {full_document[:4000]}"
+            )
+        )
+        async with _SUGGESTION_CONCURRENCY:
+            model = init_model(response_format=ProposedFactEdit)
+            result = await model.ainvoke(
+                [SystemMessage(content=_CORRECTION_SUGGESTION_SYSTEM_PROMPT), human_message]
+            )
+        corrected_text = "" if is_deletion else (result.corrected_text or "")
+        corrected_context = result.corrected_context or correction_context
+        return corrected_text, corrected_context, bool(result.asserts_inaccurate_fact)
+    except Exception:
+        logger.exception(
+            "correct_identity_fact: per-document suggestion failed; using global correction"
+        )
+        return fallback
+
+
+def _match_preview(
+    index: int, match: FactMatch, suggestion: tuple[str, str, bool], *, is_deletion: bool
+) -> dict:
+    """Compact, JSON-serializable description of ONE editable pending change for the HITL panel.
+
+    Each match is its own editable item. The owner chooses exactly one ``action`` per item
+    (see the resume contract in ``correct_identity_fact``):
+
+    - ``"skip"`` — leave this document completely unchanged (the DEFAULT for every item, so a
+      falsely-retrieved doc is never touched unless the owner explicitly acts on it).
+    - ``"accept"`` — apply the per-document ``suggested_text`` / ``suggested_context``.
+    - ``"edit"`` — apply the owner's own ``corrected_text`` / ``correction_context``.
+    - ``"remove"`` — delete the atomic fact / redact the offending sentence.
+
+    ``default_action`` states the safe fallback explicitly; ``recommended_action`` is the
+    model's suggestion the UI may pre-select (it is only a hint — nothing applies unless the
+    owner's resume payload names an action). ``index`` correlates the reply back to ``matches``.
+    """
+    suggested_text, suggested_context, asserts_flag = suggestion
+    kwargs = _item_document_kwargs(match.item)
+    excerpt = kwargs.get("page_content") or ""
+    # The stored background context, shown beside ``suggested_context`` so the owner can see
+    # the original is preserved and only minimally edited in line with the correction.
+    current_context = (kwargs.get("metadata") or {}).get("fact_context") or ""
+    if not asserts_flag:
+        # The model thinks this text does not actually state the inaccurate fact (a loose
+        # semantic match), so the safe recommendation is to leave it alone.
+        recommended_action = "skip"
+    elif is_deletion or not (suggested_text or "").strip():
+        # A pure deletion, or a sentence that only asserted the wrong fact with nothing true
+        # left, can only be removed/redacted — there is no surviving text to keep.
+        recommended_action = "remove"
+    else:
+        recommended_action = "accept"
     return {
+        "index": index,
         "kind": match.kind,
         "namespace": list(match.namespace or []),
         "key": match.key,
-        "matched_text": match.matched_text,
-        "proposed_text": _proposed_text(match, corrected_information, is_deletion),
+        "document_id": _item_document_id(match.item),
+        "current_text": match.matched_text,
+        "current_context": current_context,
+        "document_excerpt": excerpt[:1000],
+        "suggested_text": suggested_text,
+        "suggested_context": suggested_context,
+        "default_action": "skip",
+        "recommended_action": recommended_action,
         "score": match.score,
     }
 
@@ -1170,29 +1323,41 @@ async def _apply_sentence_redaction(
     namespace: tuple,
     key: str,
     item,
-    sentence_matches: list[FactMatch],
-    corrected_information: str,
-    is_deletion: bool,
+    resolved_group: list["ResolvedCorrection"],
 ) -> CorrectionChange:
-    """Redact (or replace) every matched sentence inside one long-text document.
+    """Apply every per-sentence edit inside one long-text document.
 
-    All sentence edits for a document are applied together against the original
-    ``page_content`` (applying them one-by-one would operate on stale text). The removed
-    sentences are recorded in ``metadata.redacted_sentences`` and ``corrected_from``.
+    Each matched sentence gets ITS OWN replacement (empty ⇒ the sentence is removed), so a
+    quote keeps every sentence except the one offending clause instead of being flattened to
+    the corrected fact repeated over and over. All edits for a document are applied together
+    against the original ``page_content`` (one-by-one would operate on stale text). The same
+    sentence substitutions are mirrored into ``scene_summary``/``user_context`` so a summary
+    that quotes the offending sentence verbatim is fixed too. Removed/replaced sentences are
+    recorded in ``metadata.redacted_sentences`` and ``corrected_from``.
     """
     kwargs = _item_document_kwargs(item)
     metadata = dict(kwargs.get("metadata") or {})
     old_page_content = kwargs.get("page_content") or ""
 
-    replacement = None if is_deletion else corrected_information
-    changed = {m.matched_text: replacement for m in sentence_matches if m.matched_text}
+    # sentence -> replacement (None removes it; a string replaces it in place).
+    changed = {
+        resolved.match.matched_text: ((resolved.corrected_text or "").strip() or None)
+        for resolved in resolved_group
+        if resolved.match.matched_text
+    }
     new_page_content = _redact_sentences(old_page_content, changed)
+
+    # Keep human-readable summaries consistent when they restate the offending sentence.
+    for summary_field in ("scene_summary", "user_context"):
+        if metadata.get(summary_field):
+            metadata[summary_field] = _redact_sentences(metadata[summary_field], changed)
 
     redacted = list(metadata.get("redacted_sentences") or [])
     redacted.extend(changed.keys())
     metadata["redacted_sentences"] = redacted
     metadata["corrected_from"] = "; ".join(changed.keys())
 
+    replacements = "; ".join(replacement for replacement in changed.values() if replacement)
     corrected_document = Document(page_content=new_page_content, metadata=metadata)
     await store.aput(
         namespace, key=key, value={"document": corrected_document.to_json()}
@@ -1202,32 +1367,26 @@ async def _apply_sentence_redaction(
         namespace=namespace,
         key=key,
         old_text="; ".join(changed.keys()),
-        new_text=None if is_deletion else corrected_information,
+        new_text=replacements or None,
         document=corrected_document,
     )
 
 
-async def apply_fact_correction(
-    store,
-    *,
-    corrected_information: str,
-    correction_context: str,
-    matches: list[FactMatch],
-    is_deletion: bool = False,
+async def apply_resolved_corrections(
+    store, resolved: list["ResolvedCorrection"]
 ) -> list[CorrectionChange]:
-    """Apply every match, dispatching by kind. Returns one change record per edit.
+    """Apply each owner-resolved per-document edit, dispatching by kind.
 
-    - Atomic-fact match → rewrite the whole fact, or ``adelete`` it on deletion.
-    - Sentence match → redact/replace the offending sentence inside its long document;
-      multiple sentence matches in the same document are applied together.
+    Only ``include``-d edits are applied. An atomic fact with an empty ``corrected_text`` is
+    deleted; otherwise it is rewritten with its own text/context. Sentence edits are grouped
+    by their document so each long-text doc is rewritten exactly once.
     """
     changes: list[CorrectionChange] = []
+    included = [resolved_edit for resolved_edit in resolved if resolved_edit.include]
 
-    fact_matches = [m for m in matches if m.kind == "fact"]
-    sentence_matches = [m for m in matches if m.kind == "sentence"]
-
-    for match in fact_matches:
-        if is_deletion:
+    for resolved_edit in (edit for edit in included if edit.match.kind == "fact"):
+        match = resolved_edit.match
+        if resolved_edit.is_removal:
             await store.adelete(match.namespace, match.key)
             changes.append(
                 CorrectionChange(
@@ -1242,28 +1401,47 @@ async def apply_fact_correction(
         else:
             changes.append(
                 await _apply_fact_rewrite(
-                    store, match, corrected_information, correction_context
+                    store, match, resolved_edit.corrected_text, resolved_edit.corrected_context
                 )
             )
 
-    # Group sentence matches by the document they live in, edit each doc once.
-    by_document: dict[tuple, list[FactMatch]] = {}
-    for match in sentence_matches:
-        by_document.setdefault((match.namespace, match.key), []).append(match)
+    by_document: dict[tuple, list[ResolvedCorrection]] = {}
+    for resolved_edit in (edit for edit in included if edit.match.kind == "sentence"):
+        by_document.setdefault(
+            (resolved_edit.match.namespace, resolved_edit.match.key), []
+        ).append(resolved_edit)
     for (namespace, key), group in by_document.items():
         changes.append(
-            await _apply_sentence_redaction(
-                store,
-                namespace,
-                key,
-                group[0].item,
-                group,
-                corrected_information,
-                is_deletion,
-            )
+            await _apply_sentence_redaction(store, namespace, key, group[0].match.item, group)
         )
 
     return changes
+
+
+async def apply_fact_correction(
+    store,
+    *,
+    corrected_information: str,
+    correction_context: str,
+    matches: list[FactMatch],
+    is_deletion: bool = False,
+) -> list[CorrectionChange]:
+    """Apply ONE correction uniformly to every match (legacy convenience wrapper).
+
+    Builds a uniform :class:`ResolvedCorrection` per match — same corrected text/context for
+    all — and delegates to :func:`apply_resolved_corrections`. The HITL tool path builds
+    per-document :class:`ResolvedCorrection`s directly instead.
+    """
+    resolved = [
+        ResolvedCorrection(
+            match=match,
+            corrected_text="" if is_deletion else corrected_information,
+            corrected_context=correction_context,
+            include=True,
+        )
+        for match in matches
+    ]
+    return await apply_resolved_corrections(store, resolved)
 
 
 class FactCorrection(BaseModel):
@@ -1272,6 +1450,13 @@ class FactCorrection(BaseModel):
     Use ONLY when the user asserts that an existing/known fact about the avatar is
     inaccurate AND supplies the correction. This is NOT for brand-new facts — those
     still go to ``update_self_identity_mem_from_user_txt``.
+
+    Call this tool ONCE FOR EACH DISTINCT inaccurate fact. A single user message often
+    corrects several independent facts ("my name is Shivon and I was never at the
+    University of Alberta" is TWO corrections); make one call per fact, never bundle
+    multiple distinct corrections into one call. Each call finds and edits every stored
+    copy of that ONE fact across all namespaces — so one call per fact, not one call per
+    stored document.
 
     <Example>
     User: "Actually I was born in Ottawa, not Toronto."
@@ -1329,11 +1514,22 @@ async def correct_identity_fact(
     owner exactly what will change, and only after the owner approves (or edits) either
     REPLACES each matched fact in place ('update') or REMOVES it ('delete').
 
+    Call this ONCE PER DISTINCT inaccurate fact. If the user corrects several independent
+    facts in one message (e.g. "my name is Shivon and I was never at the University of
+    Alberta"), make a SEPARATE call for each one — never combine distinct corrections into
+    a single call. Each call already finds and fixes every stored copy of that one fact.
+
     Call this when the user references a fact that already exists about you and says it
     is wrong. For 'update', rewrite ``corrected_information`` in FIRST PERSON (change
     only the grammatical person, never other specifics). For 'delete' (the user says it
     never happened / they have no association with X), leave ``corrected_information``
     empty and set ``correction_kind='delete'``.
+
+    After you call this, the owner is shown each matched document individually and chooses,
+    per document, to leave it unchanged (the default — falsely-retrieved documents are kept
+    safe), accept the suggested in-place edit, rewrite it themselves, or remove it. They may
+    also cancel the whole correction. Nothing is saved without the owner's per-document
+    approval, so you do not need to enumerate the documents yourself.
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
@@ -1410,52 +1606,123 @@ async def correct_identity_fact(
             }
         )
 
-    # Human-in-the-loop: pause and let the owner approve / edit / reject before any
-    # write. Everything above is a pure read, so it is safe to re-run on resume.
+    # Suggest a minimal, in-place edit for EACH matched document independently, so the owner
+    # reviews one editable item per document rather than a single global replacement.
+    suggestions = await asyncio.gather(
+        *(
+            _suggest_correction(
+                match,
+                inaccurate_information=inaccurate_information,
+                corrected_information=corrected_information,
+                correction_context=correction_context,
+                is_deletion=is_deletion,
+            )
+            for match in matches
+        )
+    )
+
+    # Human-in-the-loop: pause and let the owner decide each matched document independently.
+    # Everything above is a pure read, so it is safe to re-run on resume.
+    #
+    # RESUME CONTRACT (what the owner's UI sends back):
+    #   { "type": "cancel" }
+    #       Abandon the entire correction; NOTHING is changed. (``"reject"`` is accepted as an
+    #       alias for backward compatibility.)
+    #   { "type": "apply", "items": [ {item}, ... ] }
+    #       Apply the per-item decisions. Each ``item`` is keyed by ``index`` (matching the
+    #       payload below) and carries one ``action``:
+    #         "skip"   — leave this document completely unchanged (DEFAULT for any item not
+    #                    listed, or any unrecognized action: false positives stay safe).
+    #         "accept" — apply this item's ``suggested_text`` / ``suggested_context``.
+    #         "edit"   — apply the owner's ``corrected_text`` / ``correction_context``.
+    #         "remove" — delete the atomic fact / redact the offending sentence.
+    # Because the default is "skip", an empty ``items`` (or a bare ``{"type": "apply"}``)
+    # changes nothing — there is no path where clearing a field silently deletes a document.
     decision = interrupt(
         {
             "kind": "fact_correction",
             "inaccurate_information": inaccurate_information,
             "correction_kind": correction_kind,
-            "proposed": {
-                "corrected_information": corrected_information,
-                "correction_context": correction_context,
-            },
+            "default_action": "skip",
+            "actions": ["skip", "accept", "edit", "remove"],
             "matches": [
-                _match_preview(match, corrected_information, is_deletion)
-                for match in matches
+                _match_preview(index, match, suggestion, is_deletion=is_deletion)
+                for index, (match, suggestion) in enumerate(zip(matches, suggestions))
             ],
         }
     )
 
     decision = decision if isinstance(decision, dict) else {}
-    decision_type = decision.get("type", "approve")
+    decision_type = (decision.get("type") or "apply").strip().lower()
 
-    if decision_type == "reject":
+    if decision_type in ("cancel", "reject"):
         return Command(
             update={
                 "messages": [
                     ToolMessage(
-                        content="Left the existing fact(s) unchanged.",
+                        content="Cancelled the correction; left every matched fact unchanged.",
                         tool_call_id=runtime.tool_call_id,
                     )
                 ]
             }
         )
 
-    final_corrected = corrected_information
-    final_context = correction_context
-    if decision_type == "edit":
-        final_corrected = decision.get("corrected_information") or corrected_information
-        final_context = decision.get("correction_context") or correction_context
+    # Per-item decisions, keyed by match index. Any match the owner did not explicitly act on
+    # defaults to "skip" — the document is left exactly as it was.
+    per_item_decisions = {
+        entry["index"]: entry
+        for entry in (decision.get("items") or [])
+        if isinstance(entry, dict) and "index" in entry
+    }
 
-    changes = await apply_fact_correction(
-        runtime.store,
-        corrected_information=final_corrected,
-        correction_context=final_context,
-        matches=matches,
-        is_deletion=is_deletion,
-    )
+    resolved: list[ResolvedCorrection] = []
+    for index, (match, suggestion) in enumerate(zip(matches, suggestions)):
+        suggested_text, suggested_context, _asserts_flag = suggestion
+        entry = per_item_decisions.get(index) or {}
+        action = (entry.get("action") or "skip").strip().lower()
+
+        if action == "accept":
+            # Apply the model's per-document suggestion. For a deletion (or a suggestion with
+            # no surviving text) this is an empty ``corrected_text`` → removal/redaction.
+            corrected_text = "" if is_deletion else (suggested_text or "")
+            corrected_context = suggested_context
+            include = True
+        elif action == "edit":
+            corrected_text = entry.get("corrected_text", suggested_text)
+            corrected_context = entry.get("correction_context", suggested_context)
+            include = True
+        elif action == "remove":
+            # Explicit removal — empty text drives ``is_removal`` (delete fact / redact sentence).
+            corrected_text = ""
+            corrected_context = ""
+            include = True
+        else:  # "skip" or anything unrecognized: leave the document untouched.
+            corrected_text = ""
+            corrected_context = ""
+            include = False
+
+        resolved.append(
+            ResolvedCorrection(
+                match=match,
+                corrected_text=corrected_text,
+                corrected_context=corrected_context,
+                include=include,
+            )
+        )
+
+    changes = await apply_resolved_corrections(runtime.store, resolved)
+
+    if not changes:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content="You left every matched document unchanged; nothing was changed.",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
 
     corrected_documents = [c.document for c in changes if c.document is not None]
     verb = {"rewrite": "Corrected", "redact": "Redacted", "delete": "Deleted"}

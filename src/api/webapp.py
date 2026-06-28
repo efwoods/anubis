@@ -1500,9 +1500,8 @@ async def resume_avatar_message(
     request: Request,
     assistant_id: str,
     thread_id: str = Form(...),
-    decision: str = Form("approve"),
-    corrected_information: Optional[str] = Form(None),
-    correction_context: Optional[str] = Form(None),
+    decision: str = Form("apply"),
+    items: Optional[str] = Form(None),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     user_timezone: Optional[str] = Form(None),
@@ -1511,17 +1510,24 @@ async def resume_avatar_message(
 ):
     """Resume a run paused for human approval (e.g. ``correct_identity_fact``).
 
-    ``decision`` is ``approve`` | ``edit`` | ``reject``. For ``edit``, the owner's
-    revised ``corrected_information``/``correction_context`` are forwarded. Streams
-    the continuation as SSE (same ``assistant_token`` → ``done``/``interrupt`` shape
-    as ``/message/{assistant_id}``).
+    ``decision`` is ``apply`` | ``cancel``. ``items`` (JSON list) carries the owner's
+    per-document decisions — one entry per matched document with ``index`` and an ``action``
+    ∈ ``skip`` | ``accept`` | ``edit`` | ``remove`` (plus ``corrected_text`` /
+    ``correction_context`` when the action is ``edit``). Any matched document the owner did
+    not act on defaults to ``skip`` in the tool, so a missing/empty list changes nothing.
+    Older clients' ``approve`` / ``reject`` are accepted as aliases for ``apply`` / ``cancel``.
+    Streams the continuation as SSE (same ``assistant_token`` → ``done``/``interrupt`` shape as
+    ``/message/{assistant_id}``).
     """
     start_time = time_ns()
 
-    decision_value = (decision or "approve").strip().lower()
-    if decision_value not in ("approve", "edit", "reject"):
+    # Map legacy spellings so an older panel still resolves to the current vocabulary.
+    decision_aliases = {"approve": "apply", "reject": "cancel"}
+    raw_decision = (decision or "apply").strip().lower()
+    decision_value = decision_aliases.get(raw_decision, raw_decision)
+    if decision_value not in ("apply", "cancel"):
         raise HTTPException(
-            status_code=400, detail="decision must be approve, edit, or reject."
+            status_code=400, detail="decision must be apply or cancel."
         )
 
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -1565,14 +1571,19 @@ async def resume_avatar_message(
 
     graph = app.state.graph
 
-    # The resume value is the decision dict the paused tool's ``interrupt`` expects;
-    # it flows outer-``interrupt`` → ``think`` → the deep-agent tool unchanged.
+    # The resume value is the decision dict the paused tool's ``interrupt`` expects; it flows
+    # outer-``interrupt`` → ``think`` → the deep-agent tool unchanged. ``cancel`` abandons the
+    # whole correction; ``apply`` carries the owner's per-item decisions. The tool defaults any
+    # un-acted item to ``skip``, so an empty/missing list is a safe no-op.
     resume_payload: dict = {"type": decision_value}
-    if decision_value == "edit":
-        if corrected_information:
-            resume_payload["corrected_information"] = corrected_information
-        if correction_context:
-            resume_payload["correction_context"] = correction_context
+    if items:
+        try:
+            parsed_items = json.loads(items)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="items must be a JSON list.")
+        if not isinstance(parsed_items, list):
+            raise HTTPException(status_code=400, detail="items must be a JSON list.")
+        resume_payload["items"] = parsed_items
 
     return StreamingResponse(
         message_graph_sse(

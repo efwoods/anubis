@@ -76,6 +76,20 @@ def _patch_sentence_scorer(monkeypatch):
     monkeypatch.setattr(identity_tools, "_score_sentences", _fake_score_sentences)
 
 
+async def _fake_suggest_correction(
+    match, *, inaccurate_information, corrected_information, correction_context, is_deletion
+):
+    """Deterministic stand-in for the per-document LLM suggestion: echo the global
+    correction (empty on delete) and mark every match as asserting the fact. Lets the tool's
+    HITL flow run without a model download or network call."""
+    return ("" if is_deletion else corrected_information, correction_context, True)
+
+
+@pytest.fixture(autouse=True)
+def _patch_suggestion(monkeypatch):
+    monkeypatch.setattr(identity_tools, "_suggest_correction", _fake_suggest_correction)
+
+
 async def _seed(store, namespace, fact, *, id_field="document_id", extra_meta=None):
     """Seed an ATOMIC fact document (identity/identity_memory/memory shape)."""
     doc_id = str(uuid.uuid4())
@@ -279,7 +293,11 @@ async def test_tool_approve_corrects_fact_and_redacts_quote(monkeypatch):
 
     def _fake_interrupt(payload):
         captured["payload"] = payload
-        return {"type": "approve"}
+        # Accept the model's suggested edit on every matched document.
+        return {
+            "type": "apply",
+            "items": [{"index": m["index"], "action": "accept"} for m in payload["matches"]],
+        }
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
 
@@ -306,7 +324,13 @@ async def test_tool_approve_corrects_fact_and_redacts_quote(monkeypatch):
 async def test_tool_delete_removes_atomic_fact(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
-    monkeypatch.setattr(identity_tools, "interrupt", lambda payload: {"type": "approve"})
+    monkeypatch.setattr(
+        identity_tools, "interrupt",
+        lambda payload: {
+            "type": "apply",
+            "items": [{"index": m["index"], "action": "remove"} for m in payload["matches"]],
+        },
+    )
 
     cmd = await _tool_coroutine()(
         inaccurate_information=WRONG_FACT,
@@ -326,9 +350,16 @@ async def test_tool_edit_uses_owner_revision(monkeypatch):
     monkeypatch.setattr(
         identity_tools, "interrupt",
         lambda payload: {
-            "type": "edit",
-            "corrected_information": "I was born in Montreal.",
-            "correction_context": "edited",
+            "type": "apply",
+            "items": [
+                {
+                    "index": m["index"],
+                    "action": "edit",
+                    "corrected_text": "I was born in Montreal.",
+                    "correction_context": "edited",
+                }
+                for m in payload["matches"]
+            ],
         },
     )
     await _tool_coroutine()(
@@ -378,3 +409,183 @@ async def test_tool_owner_guard_blocks_non_creator(monkeypatch):
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
     assert meta["fact"] == WRONG_FACT  # unchanged
     assert "creator" in cmd.update["messages"][0].content.lower()
+
+
+# --------------------------------------------------------------------------------------
+# Per-document HITL (each match edited independently; one approve applies all)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_payload_exposes_one_editable_item_per_match(monkeypatch):
+    """The interrupt payload carries each matched document as its own editable item with an
+    index, current text, a suggested edit, and a recommended/default action (no global field)."""
+    store = _make_store()
+    await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
+    await _seed(store, (CREATOR, ASSISTANT, "identity"), "I grew up in Toronto.")
+    captured = {}
+
+    def _fake_interrupt(payload):
+        captured["payload"] = payload
+        return {"type": "cancel"}
+
+    monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
+    await _tool_coroutine()(
+        inaccurate_information=WRONG_FACT,
+        corrected_information=RIGHT_FACT,
+        correction_context="ctx",
+        correction_kind="update",
+        runtime=_FakeRuntime(store),
+    )
+    payload = captured["payload"]
+    assert payload["default_action"] == "skip"
+    assert payload["actions"] == ["skip", "accept", "edit", "remove"]
+    items = payload["matches"]
+    assert len(items) == 2
+    assert {m["index"] for m in items} == {0, 1}
+    for m in items:
+        assert set(m) >= {
+            "index", "current_text", "suggested_text", "suggested_context",
+            "default_action", "recommended_action",
+        }
+        assert m["default_action"] == "skip"
+    assert "proposed" not in payload  # no single global correction field
+
+
+@pytest.mark.asyncio
+async def test_per_document_edits_apply_distinct_text(monkeypatch):
+    """Each matched document is rewritten with ITS OWN corrected text, not one shared value."""
+    store = _make_store()
+    key_a = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
+    key_b = await _seed(store, (CREATOR, ASSISTANT, "identity"), "I grew up in Toronto.")
+
+    def _fake_interrupt(payload):
+        return {
+            "type": "apply",
+            "items": [
+                {
+                    "index": m["index"],
+                    "action": "edit",
+                    "corrected_text": f"corrected-{m['key']}",
+                    "correction_context": "ctx",
+                }
+                for m in payload["matches"]
+            ],
+        }
+
+    monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
+    await _tool_coroutine()(
+        inaccurate_information=WRONG_FACT,
+        corrected_information=RIGHT_FACT,
+        correction_context="ctx",
+        correction_kind="update",
+        runtime=_FakeRuntime(store),
+    )
+    meta_a = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_a))["metadata"]
+    meta_b = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_b))["metadata"]
+    assert meta_a["fact"] == f"corrected-{key_a}"
+    assert meta_b["fact"] == f"corrected-{key_b}"
+
+
+@pytest.mark.asyncio
+async def test_excluded_document_is_left_untouched(monkeypatch):
+    """A document the owner skips is not modified, even though it matched."""
+    store = _make_store()
+    await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
+    await _seed(store, (CREATOR, ASSISTANT, "identity"), "I grew up in Toronto.")
+    captured = {}
+
+    def _fake_interrupt(payload):
+        captured["payload"] = payload
+        first, second = payload["matches"]
+        return {
+            "type": "apply",
+            "items": [
+                {"index": first["index"], "action": "edit", "corrected_text": "kept", "correction_context": "c"},
+                {"index": second["index"], "action": "skip", "corrected_text": "ignored", "correction_context": "c"},
+            ],
+        }
+
+    monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
+    cmd = await _tool_coroutine()(
+        inaccurate_information=WRONG_FACT,
+        corrected_information=RIGHT_FACT,
+        correction_context="ctx",
+        correction_kind="update",
+        runtime=_FakeRuntime(store),
+    )
+    included_key = captured["payload"]["matches"][0]["key"]
+    excluded_key = captured["payload"]["matches"][1]["key"]
+    included_meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), included_key))["metadata"]
+    excluded_meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), excluded_key))["metadata"]
+    assert included_meta["fact"] == "kept"
+    assert excluded_meta["fact"] in (WRONG_FACT, "I grew up in Toronto.")  # unchanged
+    assert "corrected_from" not in excluded_meta
+    assert "Applied 1 change(s)" in cmd.update["messages"][0].content
+
+
+@pytest.mark.asyncio
+async def test_default_skip_leaves_everything_untouched(monkeypatch):
+    """A bare apply with no per-item actions changes nothing — the safe default is 'skip', so
+    falsely-retrieved documents are never silently edited or deleted."""
+    store = _make_store()
+    key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
+    monkeypatch.setattr(identity_tools, "interrupt", lambda payload: {"type": "apply"})
+    cmd = await _tool_coroutine()(
+        inaccurate_information=WRONG_FACT,
+        corrected_information=RIGHT_FACT,
+        correction_context="ctx",
+        correction_kind="update",
+        runtime=_FakeRuntime(store),
+    )
+    meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
+    assert meta["fact"] == WRONG_FACT  # untouched
+    assert "corrected_from" not in meta
+    assert "unchanged" in cmd.update["messages"][0].content.lower()
+
+
+@pytest.mark.asyncio
+async def test_accept_applies_model_suggestion(monkeypatch):
+    """'accept' applies the per-document suggested edit without the owner retyping it."""
+    store = _make_store()
+    key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
+    monkeypatch.setattr(
+        identity_tools, "interrupt",
+        lambda payload: {
+            "type": "apply",
+            "items": [{"index": m["index"], "action": "accept"} for m in payload["matches"]],
+        },
+    )
+    await _tool_coroutine()(
+        inaccurate_information=WRONG_FACT,
+        corrected_information=RIGHT_FACT,  # echoed by the fake per-document suggester
+        correction_context="ctx",
+        correction_kind="update",
+        runtime=_FakeRuntime(store),
+    )
+    meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
+    assert meta["fact"] == RIGHT_FACT
+
+
+@pytest.mark.asyncio
+async def test_remove_on_update_deletes_the_fact(monkeypatch):
+    """'remove' deletes the matched fact even on an 'update'-kind correction (the owner can
+    choose to drop a document rather than rewrite it)."""
+    store = _make_store()
+    key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
+    monkeypatch.setattr(
+        identity_tools, "interrupt",
+        lambda payload: {
+            "type": "apply",
+            "items": [{"index": m["index"], "action": "remove"} for m in payload["matches"]],
+        },
+    )
+    cmd = await _tool_coroutine()(
+        inaccurate_information=WRONG_FACT,
+        corrected_information=RIGHT_FACT,
+        correction_context="ctx",
+        correction_kind="update",
+        runtime=_FakeRuntime(store),
+    )
+    assert await store.aget((CREATOR, ASSISTANT, "identity"), key) is None
+    assert "Deleted" in cmd.update["messages"][0].content

@@ -1,13 +1,70 @@
 # Solution: select and edit the actual text in the documents; select multiple documents on which to apply a bulk edit
 
 # addressing problems:
-- [ ] 1. tool is not called for each distinct fact that needs to be changed. 
-- [ ] 2. documents that are changed are not visible, unable to alter which documents are edited, unable to apply edits to individual documents, unable to select one or more documents with a bulk edit
-- [ ] 3. documents without the incorrect fact to be replaced are completely overwritten
-- [ ] 4. documents with the incorrect fact and other facts are completely overwritten (should only select the incorrect fact within the document)
-- [ ] 5. facts are not edited in place correctly in larger quote documents
-- [ ] 6. Documents with the incorrect incorrect fact are overwritten with the wrong incorrect fact.'
-- [ ] 7. fact context is not preserved. 
+- [x] 1. tool is not called for each distinct fact that needs to be changed.
+      → `FactCorrection` schema + tool docstring now instruct "call ONCE PER DISTINCT
+        inaccurate fact" (mirrors `update_self_identity_mem_from_user_txt`).
+- [x] 2. documents that are changed are not visible, unable to alter which documents are edited, unable to apply edits to individual documents, unable to select one or more documents with a bulk edit
+      → interrupt payload now emits one editable item per match (`index`, `current_text`,
+        `current_context`, `document_excerpt`, `suggested_text`, `suggested_context`,
+        `recommended_action`, `default_action`). Each item carries an explicit per-document
+        ACTION — `skip` (leave unchanged) / `accept` (suggested edit) / `edit` (owner's text) /
+        `remove` (delete/redact) — defaulting to `skip`. Frontend panel renders each as its own
+        block with a 4-way radio defaulting to "Leave unchanged" + editable text/context; a
+        single "Apply my choices" applies each item's action, "Cancel correction" abandons all.
+        Resume contract: `{type: apply|cancel, items:[{index, action, corrected_text?,
+        correction_context?}]}`. Fixed the `current_fact`/`page_content` key mismatch that
+        rendered every row as "(unnamed)".
+- [x] 3. documents without the incorrect fact to be replaced are completely overwritten
+      → per-document LLM suggestion sets `asserts_inaccurate_fact=False` for off-topic
+        matches → `recommended_action="skip"`; and because every item DEFAULTS to `skip`,
+        nothing is rewritten unless the owner explicitly opts in per document (so loose
+        false-positive matches are safe even if the owner just hits Apply).
+- [x] 4. documents with the incorrect fact and other facts are completely overwritten (should only select the incorrect fact within the document)
+      → suggestion returns a MINIMAL in-place edit (only the offending span changes; the rest
+        preserved verbatim) instead of a global overwrite.
+- [x] 5. facts are not edited in place correctly in larger quote documents
+      → each matched sentence gets its OWN replacement (empty ⇒ removed), so a quote keeps
+        every other sentence instead of being flattened to the corrected fact repeated; the
+        same substitution is mirrored into `scene_summary`/`user_context`.
+- [x] 6. Documents with the incorrect incorrect fact are overwritten with the wrong incorrect fact.'
+      → no single global correction is applied across heterogeneous matches anymore; every
+        document carries its own resolved `corrected_text`, so the name fix can't land on a
+        university doc.
+- [x] 7. fact context is not preserved.
+      → suggestion edits the document's ORIGINAL `fact_context` minimally (keeps still-true
+        parts) rather than blanket-overwriting it with the new fact.
+
+# addressing problems (learning):
+- [x] 8. `update_self_identity_mem_from_user_txt` learns facts the avatar surfaced from its OWN
+      retrieved consciousness (identity/quote transcripts in the system prompt) when the user
+      merely ASKS about those topics — e.g. "tell me about U of T … spell your name" caused it to
+      store "I grew up in Markham", "My name is Siobhan", etc. The fact never came from the user.
+      → new runtime SAFEGUARD `_user_message_grounds_fact`: before storing, verify (model-backed,
+        structured output) that the fact was derived from the user's MOST RECENT message only —
+        not retrieved context, the assistant's own words, or an earlier turn. A question/request
+        is never an assertion. Fails OPEN on empty message / model error (mirrors
+        `_suggest_correction`) so genuine facts are never silently dropped.
+      → NOTE (still open): the pre-existing dedup in this tool is non-functional for these cases —
+        it only checks the `identity_memory` namespace + `assistant_identity_documents` state,
+        while the offending facts live in the `quote`/`identity` namespaces; follow-up.
+
+# Implementation (f-edit-memory):
+- src/anubis/utils/tools/identity/identity_tools.py — message-grounding safeguard
+  (`_user_message_grounds_fact`, `_latest_user_message_text`, `_extract_message_text`,
+  `_UserMessageGroundsFact`, `_FACT_GROUNDING_SYSTEM_PROMPT`) gating
+  `update_self_identity_mem_from_user_txt`; `ProposedFactEdit`, `_suggest_correction`
+  (per-doc, concurrency-bounded, model-backed w/ graceful fallback), `ResolvedCorrection`,
+  `apply_resolved_corrections`, per-sentence redaction, rewritten HITL decision handling.
+- src/api/webapp.py — `/message/{id}/resume` accepts `match_edits` JSON → `matches` in the
+  resume payload.
+- frontend/studio_chat_app.py — per-document approve/reject panel; `api_resume_message`
+  forwards `match_edits`.
+- tests/unit_tests/test_correct_identity_fact.py — `_suggest_correction` stub fixture + new
+  per-document edit / include-toggle / payload-shape tests (14 passing).
+- tests/unit_tests/test_self_identity_fact_grounding.py — stubbed-model tests for the grounding
+  safeguard: latest-message extraction, content-block flattening, verdict passthrough,
+  question-only rejection, fail-open on empty message / model error (6 passing).
 
 
 # Examples:

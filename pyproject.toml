@@ -84,6 +84,7 @@ dependencies = [
     "bitsandbytes>=0.49.2",
     "langgraph-sdk>=0.4.2",
     "torch>=2.12.1",
+    "playwright>=1.60.0",
 ]
 
 [project.optional-dependencies]

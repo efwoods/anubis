@@ -3143,6 +3143,62 @@ async def update_avatar_identity_with_media(
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
 
 
+@app.get("/media_jobs")
+async def list_media_jobs(
+    include_finished: bool = False,
+    assistant_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the current user's media jobs — by default only the **active** ones.
+
+    Returns one entry per top-level batch (the **master** job each upload creates),
+    newest first, with rolled-up child status counts so a client can render an
+    "uploads in progress" view without polling every ``/media_job/{job_id}``. A job
+    is "active" while it is still ``queued`` or ``running`` (``done`` not yet set);
+    finished jobs linger in the registry for ``_FINISHED_TTL_SECONDS`` and are only
+    included when ``include_finished=true``. Pass ``assistant_id`` to scope the list
+    to one avatar. The registry is per-process (see media_jobs.py), so this reflects
+    jobs owned by the worker handling the request.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    registry = app.state.media_jobs
+
+    masters = [
+        job
+        for job in registry.values()
+        if job.is_master
+        and job.user_id == user_id
+        and (assistant_id is None or job.assistant_id == assistant_id)
+        and (include_finished or not job.done.is_set())
+    ]
+    masters.sort(key=lambda j: j.created_at, reverse=True)
+
+    def _summary(job: MediaJob) -> dict:
+        children = [registry[cid] for cid in job.child_ids if cid in registry]
+        statuses = [c.status for c in children]
+        return {
+            "job_id": job.job_id,
+            "assistant_id": job.assistant_id,
+            "status": job.status,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "duration_seconds": job.duration_seconds,
+            "children_total": len(children),
+            "children_completed": statuses.count("completed"),
+            "children_error": statuses.count("error"),
+            "children_cancelled": statuses.count("cancelled"),
+            "children_running": statuses.count("running"),
+            "children_queued": statuses.count("queued"),
+            "status_url": f"/media_job/{job.job_id}",
+            "progress_url": f"/media_job/{job.job_id}/progress",
+            "cancel_url": f"/media_job/{job.job_id}/cancel",
+        }
+
+    jobs = [_summary(job) for job in masters]
+    return {"count": len(jobs), "jobs": jobs}
+
+
 @app.get("/media_job/{job_id}")
 async def media_job_status(
     job_id: str,

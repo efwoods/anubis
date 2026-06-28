@@ -84,3 +84,12 @@ allow the process media graph to be used as a tool triggered in conversation
 # save transcriptions for parsing from calls or video meetings
 
 # MCP servers for connecting accounts and pulling information
+
+
+------
+# 
+# geo located assistant (each ) for ordering creates "fast-pass" experience to skip lines and enter orders via llm into a queue for local fast food restaurants and services; 
+# twitch moderators/personal avatars for personalized responses (@ev0ra_bot) to receive a response akin to and based on the likeness of that person
+# frontend experience with a gallery view of avatars; use facial recognition login, communicate privacy policy and terms of service, interesting visualization, capture reference image and reference audio, onboarding process -> create your own avatar, suggest integrations (slack, discord, twitch, MCP for data analysis) select if your avatar is private or public (share your avatar with the world!). Create your own avatar, select a variety of avatars to communicate with (public avatars). 
+# Video game/fictional characters (realtime-interaction using audio files to establish the experience of creation of the entity and translate that same experience to other real-people). communicate with the likeness (generate audio profiles etc.) based on the available data.
+# Augmented reality full-body avatars; neural data driven media;

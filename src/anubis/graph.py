@@ -48,7 +48,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMe
 from langgraph.runtime import Runtime
 from langgraph.config import get_stream_writer
 
-from src.anubis.utils.model import init_model
+from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
 
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
@@ -389,6 +389,11 @@ async def _stream_deep_agent(deep_agent, agent_input, deep_agent_config, context
     ):
         ev_name = event.get("event")
         if ev_name == "on_chat_model_stream":
+            # Skip internal structured-output calls (e.g. the per-document fact-correction
+            # ``ProposedFactEdit`` analyses, run concurrently inside tools). Their tokens are
+            # raw JSON, not a reply — streaming them leaks interleaved JSON into the chat.
+            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                continue
             run_id = event.get("run_id")
             chunk = event["data"].get("chunk")
             if chunk is None or run_id is None:

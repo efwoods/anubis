@@ -1460,6 +1460,9 @@ class FactCorrection(BaseModel):
     copy of that ONE fact across all namespaces — so one call per fact, not one call per
     stored document.
 
+    IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
+    update_self_identity_mem_from_user_txt is used to learn NEW information and is used to declare and establish identity through the statement of facts. These are distinct use cases and should not be confused.
+
     <Example>
     User: "Actually I was born in Ottawa, not Toronto."
       inaccurate_information: "I was born in Toronto."
@@ -1532,12 +1535,17 @@ async def correct_identity_fact(
     safe), accept the suggested in-place edit, rewrite it themselves, or remove it. They may
     also cancel the whole correction. Nothing is saved without the owner's per-document
     approval, so you do not need to enumerate the documents yourself.
+
+    IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
+
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
     Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
     Do NOT use this for facts about the USER.
     Only the avatar's creator may correct its identity (enforced server-side).
+    IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
+    update_self_identity_mem_from_user_txt is used to learn NEW information and is used to declare and establish identity through the statement of facts. These are distinct use cases and should not be confused.
     </RESTRICTIONS>
 
     <EXAMPLE>

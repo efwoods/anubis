@@ -28,6 +28,12 @@ from typing import Optional
 from src.anubis.utils.tokenizer import count_tokens
 import json 
 
+# Runnable tag applied to every structured-output model (``response_format`` set). The
+# streaming layer (``_stream_deep_agent`` in graph.py) uses it to positively exclude these
+# internal JSON-producing calls from the user-facing ``assistant_token`` stream — otherwise
+# their raw structured output leaks into the chat (e.g. interleaved fact-correction JSON).
+STRUCTURED_OUTPUT_STREAM_TAG = "structured_output_no_user_stream"
+
 # TODO: identify all model call token usage
 
 
@@ -79,8 +85,10 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                 api_key = context.classification_model_api_key,
             )
             model = model.with_structured_output(schema=response_format)
-            return model
-    
+            # Tag so the streaming layer never forwards this call's tokens to the user as
+            # ``assistant_token`` — structured output is internal JSON, not a reply.
+            return model.with_config(tags=[STRUCTURED_OUTPUT_STREAM_TAG])
+
     if model_provider == "OPEN_AI":
         from langchain_openai import ChatOpenAI
 

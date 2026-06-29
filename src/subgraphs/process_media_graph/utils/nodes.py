@@ -1341,7 +1341,7 @@ async def process_media_item_task(
                 # default; fall back to the plain loader if the installed pypdf
                 # signature doesn't accept it.
                 try:
-                    loader = PyPDFLoader(tmp_path, extraction_mode="layout")
+                    loader = PyPDFLoader(tmp_path, extraction_mode="plain")
                 except TypeError:
                     loader = PyPDFLoader(tmp_path)
                 # PyPDFLoader.load() is synchronous and pypdf parsing is

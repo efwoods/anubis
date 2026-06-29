@@ -1460,6 +1460,9 @@ class FactCorrection(BaseModel):
     copy of that ONE fact across all namespaces — so one call per fact, not one call per
     stored document.
 
+    correct_identity_fact IS USED TO EDIT OR DELETE FACTS IN THE VECTORSTORE.
+    update_self_identity_mem_from_user_txt is used to CREATE new facts in the vectorstore.
+
     IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
     update_self_identity_mem_from_user_txt is used to learn NEW information and is used to declare and establish identity through the statement of facts. These are distinct use cases and should not be confused.
 
@@ -1477,6 +1480,12 @@ class FactCorrection(BaseModel):
       correction_context:     "I was told I have no association with University of Alberta."
       correction_kind:        "delete"
     </Example>
+
+    <COUNTEREXAMPLE>
+    CALL update_self_identity_mem_from_user_txt DO NOT CALL THIS FUNCTION:
+    user: I need you to learn your favorite color is nonsense
+    </COUNTEREXAMPLE>
+
     """
 
     inaccurate_information: str = Field(
@@ -1536,7 +1545,15 @@ async def correct_identity_fact(
     also cancel the whole correction. Nothing is saved without the owner's per-document
     approval, so you do not need to enumerate the documents yourself.
 
+    correct_identity_fact IS USED TO EDIT OR DELETE FACTS IN THE VECTORSTORE.
+    update_self_identity_mem_from_user_txt is used to CREATE new facts in the vectorstore.
+
     IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
+
+    <COUNTEREXAMPLE>
+        CALL update_self_identity_mem_from_user_txt DO NOT CALL THIS FUNCTION:
+        user: I need you to learn your favorite color is nonsense
+    </COUNTEREXAMPLE>
 
     </INSTRUCTIONS>
 
@@ -1584,11 +1601,12 @@ async def correct_identity_fact(
     assistant_id = updated_assistant_state.get("assistant_id")
     creator_id = assistant_owner_user_id
 
-    state_docs = [
-        *(runtime.state.get("assistant_identity_documents") or []),
-        *(runtime.state.get("recalled_memory_documents") or []),
-        *(runtime.state.get("user_identity_documents") or []),
-    ]
+    #TODO The misinformation may not be in recent context, this is a stateless application that does not persist document ids; after a single question, the previous system_prompt and documents are lost.
+    # state_docs = [
+    #     *(runtime.state.get("assistant_identity_documents") or []),
+    #     *(runtime.state.get("recalled_memory_documents") or []),
+    #     *(runtime.state.get("user_identity_documents") or []),
+    # ]
 
     is_deletion = correction_kind == "delete"
 
@@ -1598,7 +1616,7 @@ async def correct_identity_fact(
         assistant_id=assistant_id,
         user_id=user_id,
         query=inaccurate_information,
-        state_docs=state_docs,
+        # state_docs=state_docs,
     )
 
     if not matches:

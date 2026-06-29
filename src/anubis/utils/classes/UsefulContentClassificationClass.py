@@ -16,7 +16,7 @@ from src.anubis.utils.tokenizer import count_tokens
 class UsefulContentClassificationClass:
     """LLM fallback for the fragment filter: useful content vs boilerplate noise.
 
-    Only invoked on borderline chunks the cheap heuristic cannot decide, so the
+    Only invoked on indeterminant chunks the cheap heuristic cannot decide, so the
     per-run cost stays small. Mirrors the structured-output classifier pattern
     used elsewhere (see ``ReferenceDocumentClassificationClass``).
     """

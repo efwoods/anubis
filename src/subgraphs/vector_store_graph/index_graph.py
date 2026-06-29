@@ -101,7 +101,7 @@ async def index_docs(
     # Final fragment safety net: drop any document whose page_content is clear
     # boilerplate (page numbers, headers/footers, nav) that slipped past the
     # per-loader filters. Heuristic-only (no LLM) so the index path stays cheap;
-    # borderline short lines (genuine one-line quotes) are kept.
+    # indeterminant short lines (genuine one-line quotes) are kept.
     docs: list[Document] = attempted_docs
     if attempted_docs:
         try:

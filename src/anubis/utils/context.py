@@ -292,7 +292,7 @@ class GlobalContext:
     fragment_llm_fallback: str = field(
         default="TRUE",
         metadata={
-            "description": "TRUE to send borderline chunks (pass the length floor but look short/ambiguous) to the UsefulContentClassification LLM judge before keeping them. FALSE uses the cheap heuristic only. Env FRAGMENT_LLM_FALLBACK."
+            "description": "TRUE to send indeterminant chunks (pass the length floor but look short/ambiguous) to the UsefulContentClassification LLM judge before keeping them. FALSE uses the cheap heuristic only. Env FRAGMENT_LLM_FALLBACK."
         },
     )
 

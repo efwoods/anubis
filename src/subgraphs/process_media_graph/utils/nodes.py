@@ -136,7 +136,7 @@ from src.subgraphs.process_media_graph.utils.helper_functions import (
 )
 from src.subgraphs.process_media_graph.utils.fragment_filter import (
     classify_fragment_heuristic,
-    strip_repeated_lines,
+    deweld_glued_text,
 )
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
@@ -1337,9 +1337,11 @@ async def process_media_item_task(
                 tmp_file.write(pdf_bytes)
                 tmp_path = tmp_file.name
             try:
-                # ``layout`` mode preserves column/line structure better than the
-                # default; fall back to the plain loader if the installed pypdf
-                # signature doesn't accept it.
+                # ``plain`` mode emits text in reading order with one visual line
+                # per ``\n``, which the line-level junk filter below depends on
+                # (``layout`` mode reconstructs page geometry with space gutters and
+                # welds a whole page onto one line). Fall back to the default loader
+                # if the installed pypdf signature doesn't accept the kwarg.
                 try:
                     loader = PyPDFLoader(tmp_path, extraction_mode="plain")
                 except TypeError:
@@ -1353,29 +1355,39 @@ async def process_media_item_task(
                 except OSError:
                     pass
 
-            # Optimize extraction quality before classification/chunking:
-            #   1. Strip lines that recur across many pages (running headers /
-            #      footers / page numbers) — the root cause of fragments like
-            #      "Page 13 of 10".
-            #   2. Drop pages whose remaining text is pure page furniture.
-            #   3. Concatenate the surviving pages into one continuous body so a
-            #      sentence spanning a page break survives and header-only pages
-            #      can't become standalone Documents. The whole document is then
-            #      classified + chunked once (cross-page coherent).
-            raw_page_texts = [(p.page_content or "") for p in pages]
-            cleaned_page_texts = strip_repeated_lines(raw_page_texts)
+            # Optimize extraction quality before classification/chunking.
+            # ``plain`` extraction emits one visual line per ``\n``, so cleaning
+            # happens at LINE granularity — a single junk line (a page number, a
+            # print timestamp, or a fused nav/title bar like
+            # "AboutMachine IntelligencePress") is dropped without discarding the
+            # real content sharing its page. Surviving lines are re-joined per
+            # page, and the pages are concatenated into one continuous body so a
+            # sentence spanning a page break survives and header-only pages can't
+            # become standalone Documents. The whole document is then classified +
+            # chunked once (cross-page coherent).
+
+            # pypdf plain extraction drops spaces the glyph spacing implied, welding
+            # a heading onto the next sentence ("...WorkflowThese") or punctuation
+            # onto the next word ("bot-her?Ah"). ``deweld_glued_text`` restores those
+            # breaks BEFORE the per-line split below, so a welded heading becomes its
+            # own line and reaches the title classifier. (All-lowercase welds like
+            # "dominantplatforms" are not shape-recoverable and remain.)
+            raw_page_texts = [deweld_glued_text(p.page_content or "") for p in pages]
+
+            # This is an attribute
+            if pages and isinstance(pages, list):
+                title = getattr(pages[0], "metadata", {}).get("title", None)
 
             kept_page_texts: List[str] = []
-            first_kept_page_index: Optional[int] = None
-            for page_idx, page_text in enumerate(cleaned_page_texts):
-                stripped = (page_text or "").strip()
-                if not stripped:
-                    continue
-                if classify_fragment_heuristic(stripped) == "junk":
-                    continue
-                if first_kept_page_index is None:
-                    first_kept_page_index = page_idx
-                kept_page_texts.append(stripped)
+            for page_text in raw_page_texts:
+                kept_lines = [
+                    line
+                    for line in (page_text or "").splitlines()
+                    if line.strip()
+                    and classify_fragment_heuristic(line.strip(), title=title) != "junk"
+                ]
+                if kept_lines:
+                    kept_page_texts.append("\n".join(kept_lines))
 
             if not kept_page_texts:
                 logger.warning(
@@ -1383,7 +1395,7 @@ async def process_media_item_task(
                 )
                 return []
 
-            document_text = "\n\n".join(kept_page_texts)
+            document_text = "\n".join(kept_page_texts)
             pdf_media_item = {
                 "type": "text",
                 "content": document_text,
@@ -1393,7 +1405,6 @@ async def process_media_item_task(
                     "assistant_id": assistant_id,
                     "source": "pdf_document",
                     "pdf_page_count": len(pages),
-                    "pdf_first_content_page_index": first_kept_page_index,
                     "namespace_filename": namespace_filename,
                     # Carry any user-supplied target through so target-aware
                     # extraction runs for PDFs (e.g. a memoir with a named subject).

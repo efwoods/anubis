@@ -585,7 +585,7 @@ class UsefulContentClassification(BaseModel):
     Decides whether a chunk of extracted text is meaningful identity / quote /
     biographical content, or boilerplate noise (page numbers, running headers /
     footers, navigation menus, timestamps, cookie banners, ads). Used as the
-    LLM fallback for borderline chunks the cheap heuristic can't decide.
+    LLM fallback for indeterminant chunks the cheap heuristic can't decide.
     """
 
     is_useful: bool = Field(
@@ -635,6 +635,69 @@ FRAGMENT of boilerplate that should be discarded.
 
 # Output Format
 Return a structured object with `is_useful` (bool) and `reasoning` (str).
+"""
+
+
+class TitleFragmentClassification(BaseModel):
+    """
+    Decides whether a single extracted line is a restatement of the document's
+    title — i.e. page furniture (a running header / nav bar / cover title) rather
+    than body content. Used as the LLM safeguard for the fragment filter when the
+    cheap embedding-similarity check between the line and the page title is in the
+    ambiguous band (high enough to be suspicious, below the auto-drop threshold).
+    Embedding similarity alone misclassifies lines that share a repeated brand or
+    keyword with the title (e.g. a paragraph that says "iPhone" several times),
+    so this judge looks at meaning and role rather than lexical overlap.
+    """
+
+    is_title: bool = Field(
+        description=(
+            "True when the line is the document/page title or a running "
+            "header/footer restating it — page furniture with no standalone "
+            "body meaning. False when it is real body content that merely shares "
+            "words with the title."
+        )
+    )
+    reasoning: str = Field(
+        description="Brief justification citing what in the line drove the decision."
+    )
+
+
+TITLE_FRAGMENT_CLASSIFICATION_SYSTEM_PROMPT = """
+# Role and Objective
+
+You are a data-quality gate for a document-ingestion pipeline. You receive the
+document's TITLE and a single LINE extracted from one of its pages. Decide whether
+the LINE is just the title repeated as page furniture (a cover title, a running
+header/footer, or a nav bar restating the title), or whether it is real body
+content that happens to share words with the title.
+
+# Why you exist
+
+A cheap embedding-similarity check already runs before you. It drops lines that
+are almost identical to the title and keeps lines that are clearly unrelated. You
+are only called for the ambiguous middle: lines that overlap the title enough to
+be suspicious. The known failure mode of similarity alone is lexical repetition —
+a paragraph that names a brand or keyword from the title several times (e.g.
+"iPhone ... iPhone ... iPhone") scores as title-like even though it is genuine
+content. Judge by MEANING and ROLE, not by shared words.
+
+# Mark is_title = true when
+- The line is the title (or an obvious truncation/variant of it) standing alone.
+- The line is a running header/footer or nav element that restates the title on
+  every page.
+- The line carries no standalone statement — it only names the document/topic.
+
+# Mark is_title = false when
+- The line is a sentence, claim, quote, or narrative that conveys information,
+  even if it repeats a word from the title.
+- The line is a genuine heading that introduces real content distinct from the
+  title.
+- When genuinely uncertain, lean toward is_title = false (favor keeping real
+  content; the similarity gate already removed near-identical title copies).
+
+# Output Format
+Return a structured object with `is_title` (bool) and `reasoning` (str).
 """
 
 

@@ -970,31 +970,28 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
 # ──────────────────────────────────────────────────────────────────────────────
 # Conversational correction of inaccurate stored facts (human-in-the-loop)
 # ──────────────────────────────────────────────────────────────────────────────
-# Score above which a store hit is treated as the same fact the user is correcting.
-# Calibrated to the PRODUCTION embedding model (``microsoft/harrier-oss-v1-270m``),
-# whose cosine scores sit on the same compressed scale ``load_consciousness`` uses to
-# decide a fact is relevant enough to inject every turn (``nodes._FILTER_SCORE = 0.1``).
-# An earlier 0.8/0.6 gate — tuned to the unit-test mock embedding, which returns cosine
-# 1.0 for any shared keyword — rejected every real match, so the sweep returned nothing
-# and the tool reported "No stored fact matched" for facts that were actually stored.
-# This path favors recall: the HITL interrupt is the safety net (the owner sees every
-# proposed match and approves/edits/rejects; nothing is applied unapproved). Facts
-# already retrieved into this turn's prompt are actively shaping the response, so they
-# are matched at the loader's own relevance floor; everything else needs a small margin
-# above it to avoid sweeping in loosely-related facts.
-
-_CORRECTION_MATCH_THRESHOLD = 0.6  # retrieved documents from the store namespaces
-_CORRECTION_RETRIEVED_DOC_THRESHOLD = (
-    0.1  # all documents contained in the current state
-)
+# Confident-match floor: the cosine score at or above which a store hit is treated as the
+# same fact the user is correcting. Calibrated to the PRODUCTION embedding model
+# (``microsoft/harrier-oss-v1-270m``). An earlier 0.8/0.6 gate — tuned to the unit-test mock
+# embedding, which returns cosine 1.0 for any shared keyword — rejected every real match, so
+# the sweep returned nothing and the tool reported "No stored fact matched" for facts that
+# were actually stored; an over-recall 0.6/0.45 gate then swept in loosely-related sentences
+# (e.g. a 58%-matching quote about incubators surfacing during a Harvard-education
+# correction). 0.65 is the empirically-tuned middle: confident enough to exclude those weak
+# matches, with the HITL panel as the final safety net (the owner sees every proposed match
+# and accepts/removes/leaves-unchanged; nothing is applied unapproved). Applied to the cosine
+# of the query against each candidate's CLEAN ``<FACT>`` text (not the context-diluted whole
+# ``page_content`` the store index embeds), so a fact buried in a long context summary still
+# clears the gate when the claim restates it.
+_CORRECTION_MATCH_THRESHOLD = 0.65  # clean-fact hits from the atomic-fact namespaces
 
 # Sentence-level gate for long-text namespaces (quote/document/analysis). Those store
 # raw multi-sentence text, so whole-document cosine of a short claim against a ~2,000-word
 # transcript is near zero and clears no document-level threshold — the offending clause
 # has to be located sentence-by-sentence instead. A single sentence that restates the
-# claim scores much higher than the whole blob, so this gate sits above the document
-# floor. Recall-biased and HITL-gated like the thresholds above; tune empirically.
-_SENTENCE_MATCH_THRESHOLD = 0.45
+# claim scores much higher than the whole blob. Held at the same 0.65 confident-match floor
+# as the document gate so a loosely-related sentence is not surfaced for correction.
+_SENTENCE_MATCH_THRESHOLD = 0.65
 
 # Namespace "kind" (3rd tuple element) whose stored ``page_content`` is raw, multi-
 # sentence text rather than a single atomic ``<FACT>``-wrapped statement. These need
@@ -1069,6 +1066,30 @@ def _item_document_id(item) -> str | None:
     return metadata.get("document_id") or metadata.get("id")
 
 
+# The atomic fact lives inside a ``<FACT>…</FACT>`` span of the wrapped ``page_content``
+# (see ``wrap_fact_with_context``). Media-ingested facts have no ``metadata.fact`` key, so the
+# clean fact must be recovered from the wrapper to score and edit it.
+_FACT_TAG_RE = re.compile(r"<FACT>(.*?)</FACT>", re.DOTALL)
+
+
+def _extract_clean_fact(item) -> str:
+    """The bare atomic fact for an atomic-fact store item.
+
+    Prefers ``metadata.fact`` (tool-created facts); falls back to the ``<FACT>`` span of the
+    wrapped ``page_content`` (media-ingested facts carry the fact only inside the wrapper),
+    then to the whole ``page_content``. This is the text a correction matches and edits, so it
+    must be the bare fact — never the context-diluted blob the store index embeds.
+    """
+    fact = _item_fact(item)
+    if fact and fact.strip():
+        return fact.strip()
+    page_content = _item_document_kwargs(item).get("page_content") or ""
+    tag_match = _FACT_TAG_RE.search(page_content)
+    if tag_match and tag_match.group(1).strip():
+        return tag_match.group(1).strip()
+    return page_content.strip()
+
+
 @dataclass
 class FactMatch:
     """One thing a correction will change.
@@ -1107,12 +1128,18 @@ class ResolvedCorrection:
     ``corrected_text``/``corrected_context`` (the owner's edit, or the model's per-document
     suggestion) and its own ``include`` flag. An empty ``corrected_text`` on an included
     match means "remove" (delete the atomic fact / redact the sentence).
+
+    ``user_modified`` records that the applied text/context differs from the model's
+    suggestion — i.e. the owner authored the edit themselves rather than accepting the
+    suggestion verbatim. Persisted as ``correction_origin`` metadata for later retrieval and
+    usage analysis (a genuine owner-preference signal).
     """
 
     match: FactMatch
     corrected_text: str
     corrected_context: str
     include: bool = True
+    user_modified: bool = False
 
     @property
     def is_removal(self) -> bool:
@@ -1136,10 +1163,13 @@ class ProposedFactEdit(BaseModel):
     )
     corrected_text: str = Field(
         default="",
-        description="The matched text rewritten with ONLY the inaccurate portion fixed (or "
-        "removed); every other word — names, places, dates, unrelated clauses — preserved "
-        "exactly. First person, like the original. Return an EMPTY string to remove the matched "
-        "text entirely (a pure deletion, or when the whole sentence only asserted the wrong fact).",
+        description="The matched text rewritten with ONLY the inaccurate portion changed; "
+        "every other word — names, places, dates, unrelated clauses — preserved exactly, in "
+        "first person like the original. For an UPDATE, replace the inaccurate portion with "
+        "the user's correction (if the whole text was nothing but the wrong fact, this is the "
+        "corrected fact itself — never empty for an update). For a DELETE, remove the "
+        "inaccurate portion and keep all other true content; return an EMPTY string ONLY when "
+        "the text stated nothing but the inaccurate event (so the whole document is removed).",
     )
     corrected_context: str = Field(
         default="",
@@ -1153,19 +1183,26 @@ _CORRECTION_SUGGESTION_SYSTEM_PROMPT = """You revise ONE stored statement about 
 single inaccurate fact is corrected while everything else is preserved exactly.
 
 You are given:
+- CORRECTION_KIND: `update` (the user supplies a replacement fact) or `delete` (the user says \
+the event never happened).
 - INACCURATE_FACT: the claim the user says is wrong.
-- USER_CORRECTION: what the user said is actually true (may be empty for a pure deletion).
+- USER_CORRECTION: what the user said is actually true (empty for a delete).
 - MATCHED_TEXT: the specific stored sentence/fact that was matched and may need editing.
 - FULL_DOCUMENT: the surrounding text MATCHED_TEXT came from (for context only — do NOT return it).
 - ORIGINAL_CONTEXT: the stored background context for MATCHED_TEXT.
 
 Rules:
 - Decide `asserts_inaccurate_fact`: is MATCHED_TEXT actually stating INACCURATE_FACT? If it is \
-about something else, set it false and leave the text unchanged.
-- Edit MATCHED_TEXT minimally: fix or remove ONLY the inaccurate portion; keep every other \
-detail (names, places, dates, other clauses) verbatim and in first person.
-- If MATCHED_TEXT only asserted the wrong fact and has nothing true left, or the user is \
-deleting the fact with no replacement, return an empty `corrected_text`.
+about something else (swept in by a loose semantic match), set it false and leave the text \
+unchanged.
+- Edit MATCHED_TEXT minimally: change ONLY the inaccurate portion; keep every other detail \
+(names, places, dates, other clauses) verbatim and in first person.
+- For CORRECTION_KIND `update`: replace the inaccurate portion with USER_CORRECTION. If the \
+whole text was nothing but the wrong fact, `corrected_text` is the corrected fact itself. \
+NEVER return an empty `corrected_text` for an update.
+- For CORRECTION_KIND `delete`: remove the inaccurate portion and KEEP all other true content. \
+Return an empty `corrected_text` ONLY when MATCHED_TEXT stated nothing but the inaccurate \
+event (nothing true is left to keep) — that signals the whole document should be removed.
 - Edit ORIGINAL_CONTEXT the same way: keep the still-true parts, change only what the \
 correction affects. Never replace the whole context with just the new fact.
 """
@@ -1200,6 +1237,7 @@ async def _suggest_correction(
         ) or correction_context
         human_message = HumanMessage(
             content=(
+                f"CORRECTION_KIND: {'delete' if is_deletion else 'update'}\n"
                 f"INACCURATE_FACT: {inaccurate_information}\n"
                 f"USER_CORRECTION: {corrected_information or '(remove — the user says this is simply wrong)'}\n"
                 f"MATCHED_TEXT: {match.matched_text}\n"
@@ -1215,7 +1253,14 @@ async def _suggest_correction(
                     human_message,
                 ]
             )
-        corrected_text = "" if is_deletion else (result.corrected_text or "")
+        # For an update the panel must always offer a replacement: if the model emptied
+        # ``corrected_text`` (the whole text was the wrong fact), fall back to the corrected
+        # fact itself so the recommendation is an edit, never a silent removal. For a delete,
+        # keep the model's trimmed output — empty means nothing true is left (remove the whole
+        # document), non-empty means other true content survives (an edit that strips the clause).
+        corrected_text = result.corrected_text or ""
+        if not is_deletion and not corrected_text.strip():
+            corrected_text = corrected_information
         corrected_context = result.corrected_context or correction_context
         return corrected_text, corrected_context, bool(result.asserts_inaccurate_fact)
     except Exception:
@@ -1239,43 +1284,59 @@ def _match_preview(
 
     - ``"skip"`` — leave this document completely unchanged (the DEFAULT for every item, so a
       falsely-retrieved doc is never touched unless the owner explicitly acts on it).
-    - ``"accept"`` — apply the per-document ``suggested_text`` / ``suggested_context``.
-    - ``"edit"`` — apply the owner's own ``corrected_text`` / ``correction_context``.
+    - ``"accept"`` — apply the editable window: the owner's own
+      ``suggested_edit_fact_content`` / ``suggested_edit_fact_context`` if they changed it,
+      otherwise the model's suggestion as pre-filled below.
     - ``"remove"`` — delete the atomic fact / redact the offending sentence.
 
-    ``default_action`` states the safe fallback explicitly; ``recommended_action`` is the
-    model's suggestion the UI may pre-select (it is only a hint — nothing applies unless the
+    The ``recommended_action`` matrix:
+      - the matched text does NOT assert the inaccurate fact (loose match) → ``"skip"``.
+      - a deletion whose matched text stated nothing but the event (no surviving text) →
+        ``"remove"``.
+      - otherwise (an update, or a deletion that leaves other true content) → ``"accept"``.
+
+    The ``suggested_edit_*`` fields are populated ONLY when the recommendation is ``"accept"``;
+    for ``"skip"`` and ``"remove"`` they are empty (the editable window starts blank). The
+    stored ``current_fact_*`` fields are always shown. ``default_action`` states the safe
+    fallback; ``recommended_action`` is the pre-selected hint (nothing applies unless the
     owner's resume payload names an action). ``index`` correlates the reply back to ``matches``.
     """
     suggested_text, suggested_context, asserts_flag = suggestion
     kwargs = _item_document_kwargs(match.item)
     excerpt = kwargs.get("page_content") or ""
-    # The stored background context, shown beside ``suggested_context`` so the owner can see
-    # the original is preserved and only minimally edited in line with the correction.
+    # The stored background context, shown beside the suggested edit so the owner can see the
+    # original is preserved and only minimally edited in line with the correction.
     current_context = (kwargs.get("metadata") or {}).get("fact_context") or ""
     if not asserts_flag:
         # The model thinks this text does not actually state the inaccurate fact (a loose
         # semantic match), so the safe recommendation is to leave it alone.
         recommended_action = "skip"
-    elif is_deletion or not (suggested_text or "").strip():
-        # A pure deletion, or a sentence that only asserted the wrong fact with nothing true
-        # left, can only be removed/redacted — there is no surviving text to keep.
+    elif is_deletion and not (suggested_text or "").strip():
+        # A deletion whose matched text only asserted the wrong fact has nothing true left, so
+        # the whole atomic fact / offending sentence is removed.
         recommended_action = "remove"
     else:
+        # An update (always an edit), or a deletion that leaves other true content (an edit
+        # that strips just the offending portion): populate the suggested edit.
         recommended_action = "accept"
+    # The suggested edit pre-fills the editable window only when the recommendation is to edit.
+    is_edit = recommended_action == "accept"
     return {
         "index": index,
         "kind": match.kind,
         "namespace": list(match.namespace or []),
         "key": match.key,
-        "document_id": _item_document_id(match.item),
-        "current_text": match.matched_text,
-        "current_context": current_context,
+        # Always show a concrete id so different matched documents are distinguishable; fall
+        # back to the store key when a namespace's metadata carries no document_id/id.
+        "document_id": _item_document_id(match.item) or match.key,
+        "current_fact_content": match.matched_text,
+        "current_fact_context": current_context,
         "document_excerpt": excerpt[:1000],
-        "suggested_text": suggested_text,
-        "suggested_context": suggested_context,
+        "suggested_edit_fact_content": suggested_text if is_edit else "",
+        "suggested_edit_fact_context": suggested_context if is_edit else "",
         "default_action": "skip",
         "recommended_action": recommended_action,
+        "match_percent": round(match.score * 100),
         "score": match.score,
     }
 
@@ -1347,17 +1408,15 @@ async def find_fact_matches(
     assistant_id: str,
     user_id: str,
     query: str,
-    state_docs=None,
 ) -> list[FactMatch]:
     """Find everything matching ``query`` across the assistant namespaces.
 
     Two matching modes by namespace kind:
 
-    - **Atomic-fact** (identity / identity_memory / memory): whole-document semantic
-      match. Retrieved-docs-first — documents already pulled into this turn's prompt
-      (``state_docs``, keyed by ``document_id``/``id``) clear the softer
-      ``_CORRECTION_RETRIEVED_DOC_THRESHOLD``; everything else needs
-      ``_CORRECTION_MATCH_THRESHOLD``.
+    - **Atomic-fact** (identity / identity_memory / memory): the store index embeds the whole
+      wrapped ``page_content``, whose long ``<FACT_CONTEXT>`` dilutes a short claim's cosine
+      below the gate, so the query is re-scored against the CLEAN ``<FACT>`` text instead. A
+      candidate clearing ``_CORRECTION_MATCH_THRESHOLD`` is the whole fact to rewrite or delete.
     - **Long-text** (quote / document / analysis): the claim is one clause inside a
       multi-sentence blob, so whole-document cosine is meaningless. Retrieve all docs,
       split each into sentences, and keep sentences clearing
@@ -1365,16 +1424,10 @@ async def find_fact_matches(
       share no content word with the claim, to bound on-the-fly embedding.
 
     De-duplicated by ``(namespace, key)`` for facts and ``(namespace, key, sentence)``
-    for sentences. Reads only — safe to re-run when an interrupt resumes.
+    for sentences, then returned sorted by descending match score so the HITL panel shows
+    the strongest matches first. Reads only — safe to re-run when an interrupt resumes.
 
     """
-    retrieved_doc_ids: set[str] = set()
-    for doc in state_docs or []:
-        metadata = getattr(doc, "metadata", None) or {}
-        did = metadata.get("document_id") or metadata.get("id")
-        if did:
-            retrieved_doc_ids.add(did)
-
     query_tokens = _salient_tokens(query)
     fact_matches: dict[tuple, FactMatch] = {}
     sentence_matches: dict[tuple, FactMatch] = {}
@@ -1411,29 +1464,46 @@ async def find_fact_matches(
                         )
             continue
 
-        # Atomic-fact namespace: whole-document semantic match.
+        # Atomic-fact namespace: the store index embeds the whole wrapped page_content, whose
+        # long <FACT_CONTEXT> dilutes a short claim's cosine below the gate. Score the query
+        # against the CLEAN <FACT> instead, so a fact buried in a long context is still found.
+        # ``asearch`` (limit=1000) is only the candidate generator; a namespace with >1000
+        # facts could drop the lowest-ranked blobs before re-scoring (acceptable headroom).
+        atomic_candidates: list = []
+        atomic_facts: list[str] = []
         for item in items:
-            score = getattr(item, "score", None)
-            if score is None:
+            clean_fact = _extract_clean_fact(item)
+            if not clean_fact:
                 continue
-            is_retrieved = _item_document_id(item) in retrieved_doc_ids
-            threshold = (
-                _CORRECTION_RETRIEVED_DOC_THRESHOLD
-                if is_retrieved
-                else _CORRECTION_MATCH_THRESHOLD
-            )
-            if score > threshold:
-                fact_matches[(tuple(item.namespace), item.key)] = FactMatch(
+            # Prefilter: skip facts sharing no salient token with the claim (unless the claim
+            # has none), bounding the on-the-fly embedding to plausibly-related facts.
+            if query_tokens and not (query_tokens & _salient_tokens(clean_fact)):
+                continue
+            atomic_candidates.append(item)
+            atomic_facts.append(clean_fact)
+
+        atomic_scores = await _score_sentences(query, atomic_facts)
+        for item, clean_fact, score in zip(
+            atomic_candidates, atomic_facts, atomic_scores
+        ):
+            if score <= _CORRECTION_MATCH_THRESHOLD:
+                continue
+            dedup_key = (tuple(item.namespace), item.key)
+            existing = fact_matches.get(dedup_key)
+            if existing is None or score > existing.score:
+                fact_matches[dedup_key] = FactMatch(
                     item=item,
                     namespace=tuple(item.namespace),
                     key=item.key,
                     kind="fact",
-                    matched_text=_item_fact(item)
-                    or _item_document_kwargs(item).get("page_content"),
+                    matched_text=clean_fact,
                     score=float(score),
                 )
 
-    return list(fact_matches.values()) + list(sentence_matches.values())
+    all_matches = list(fact_matches.values()) + list(sentence_matches.values())
+    # Greatest → least match score, so the owner reviews the strongest matches first.
+    all_matches.sort(key=lambda match: match.score, reverse=True)
+    return all_matches
 
 
 def _page_content_is_wrapped(page_content: str) -> bool:
@@ -1442,13 +1512,18 @@ def _page_content_is_wrapped(page_content: str) -> bool:
 
 
 async def _apply_fact_rewrite(
-    store, match: FactMatch, corrected_information: str, correction_context: str
+    store,
+    match: FactMatch,
+    corrected_information: str,
+    correction_context: str,
+    user_modified: bool = False,
 ) -> CorrectionChange:
     """Rewrite a whole atomic-fact document in place (same key ⇒ re-embeds).
 
     Format-aware: identity/identity_memory/user-identity use the ``<FACT>`` wrapper;
     episodic ``memory`` stores plain ``event\\n\\ncontext``. Preserves all other
-    metadata and records ``corrected_from``.
+    metadata and records ``corrected_from`` plus ``correction_origin`` (``"user"`` when the
+    owner authored the edit, ``"suggestion"`` when they accepted the model's suggestion).
     """
     kwargs = _item_document_kwargs(match.item)
     metadata = dict(kwargs.get("metadata") or {})
@@ -1464,6 +1539,7 @@ async def _apply_fact_rewrite(
 
     metadata["fact"] = corrected_information
     metadata["fact_context"] = correction_context
+    metadata["correction_origin"] = "user" if user_modified else "suggestion"
     if old_fact is not None:
         metadata["corrected_from"] = old_fact
 
@@ -1536,6 +1612,12 @@ async def _apply_sentence_redaction(
     redacted.extend(changed.keys())
     metadata["redacted_sentences"] = redacted
     metadata["corrected_from"] = "; ".join(changed.keys())
+    # Owner-authored if any sentence edit in this document diverged from the suggestion.
+    metadata["correction_origin"] = (
+        "user"
+        if any(resolved.user_modified for resolved in resolved_group)
+        else "suggestion"
+    )
 
     replacements = "; ".join(
         replacement for replacement in changed.values() if replacement
@@ -1587,6 +1669,7 @@ async def apply_resolved_corrections(
                     match,
                     resolved_edit.corrected_text,
                     resolved_edit.corrected_context,
+                    user_modified=resolved_edit.user_modified,
                 )
             )
 
@@ -1799,7 +1882,6 @@ async def correct_identity_fact(
         assistant_id=assistant_id,
         user_id=user_id,
         query=inaccurate_information,
-        # state_docs=state_docs,
     )
 
     if not matches:
@@ -1842,11 +1924,15 @@ async def correct_identity_fact(
     #   { "type": "apply", "items": [ {item}, ... ] }
     #       Apply the per-item decisions. Each ``item`` is keyed by ``index`` (matching the
     #       payload below) and carries one ``action``:
-    #         "skip"   — leave this document completely unchanged (DEFAULT for any item not
-    #                    listed, or any unrecognized action: false positives stay safe).
-    #         "accept" — apply this item's ``suggested_text`` / ``suggested_context``.
-    #         "edit"   — apply the owner's ``corrected_text`` / ``correction_context``.
-    #         "remove" — delete the atomic fact / redact the offending sentence.
+    #         "skip"   — "Leave the document unchanged" (DEFAULT for any item not listed, or
+    #                    any unrecognized action: false positives stay safe).
+    #         "accept" — "Accept Edit": apply this item's editable window — the owner's
+    #                    ``corrected_text`` / ``correction_context`` if they changed it, else
+    #                    the suggested edit. An empty edit applies nothing (treated as skip);
+    #                    deletion requires the explicit "remove" action. When the applied text
+    #                    differs from the suggestion the change is tagged ``correction_origin:
+    #                    "user"`` for later analysis. ("edit" is accepted as a legacy alias.)
+    #         "remove" — "Remove the Document": delete the atomic fact / redact the sentence.
     # Because the default is "skip", an empty ``items`` (or a bare ``{"type": "apply"}``)
     # changes nothing — there is no path where clearing a field silently deletes a document.
     decision = interrupt(
@@ -1855,7 +1941,12 @@ async def correct_identity_fact(
             "inaccurate_information": inaccurate_information,
             "correction_kind": correction_kind,
             "default_action": "skip",
-            "actions": ["skip", "accept", "edit", "remove"],
+            "actions": ["accept", "remove", "skip"],
+            "action_labels": {
+                "accept": "Accept Edit",
+                "remove": "Remove the Document",
+                "skip": "Leave the document unchanged",
+            },
             "matches": [
                 _match_preview(index, match, suggestion, is_deletion=is_deletion)
                 for index, (match, suggestion) in enumerate(zip(matches, suggestions))
@@ -1890,27 +1981,44 @@ async def correct_identity_fact(
     for index, (match, suggestion) in enumerate(zip(matches, suggestions)):
         suggested_text, suggested_context, _asserts_flag = suggestion
         entry = per_item_decisions.get(index) or {}
+        # "edit" is a legacy alias for "accept" (the separate "edit myself" action was removed;
+        # "Accept Edit" now applies whatever is in the editable window).
         action = (entry.get("action") or "skip").strip().lower()
+        if action == "edit":
+            action = "accept"
 
         if action == "accept":
-            # Apply the model's per-document suggestion. For a deletion (or a suggestion with
-            # no surviving text) this is an empty ``corrected_text`` → removal/redaction.
-            corrected_text = "" if is_deletion else (suggested_text or "")
-            corrected_context = suggested_context
-            include = True
-        elif action == "edit":
+            # Apply the editable window: the owner's text if they changed it, else the
+            # suggestion as pre-filled in the panel.
             corrected_text = entry.get("corrected_text", suggested_text)
             corrected_context = entry.get("correction_context", suggested_context)
-            include = True
+            if not (corrected_text or "").strip():
+                # Accepting an empty edit applies nothing — leave the document unchanged.
+                # Deleting a document requires the explicit "remove" action, never an emptied
+                # edit field (no path silently deletes on accept).
+                corrected_text = ""
+                corrected_context = ""
+                include = False
+                user_modified = False
+            else:
+                include = True
+                # Owner authored the edit if the applied text/context diverged from the
+                # suggestion; recorded as ``correction_origin`` metadata for usage analysis.
+                user_modified = (corrected_text, corrected_context) != (
+                    suggested_text,
+                    suggested_context,
+                )
         elif action == "remove":
             # Explicit removal — empty text drives ``is_removal`` (delete fact / redact sentence).
             corrected_text = ""
             corrected_context = ""
             include = True
+            user_modified = False
         else:  # "skip" or anything unrecognized: leave the document untouched.
             corrected_text = ""
             corrected_context = ""
             include = False
+            user_modified = False
 
         resolved.append(
             ResolvedCorrection(
@@ -1918,6 +2026,7 @@ async def correct_identity_fact(
                 corrected_text=corrected_text,
                 corrected_context=corrected_context,
                 include=include,
+                user_modified=user_modified,
             )
         )
 

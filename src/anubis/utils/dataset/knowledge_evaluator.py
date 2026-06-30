@@ -81,7 +81,7 @@ async def _extract_claims(candidate_text: str) -> List[_AtomicClaim]:
     if not (candidate_text or "").strip():
         return []
     GlobalContext()  # surface env-var validation per workspace .cursorrules
-    model = init_model(model_without_tools=False, response_format=_AtomicClaimList)
+    model = init_model(response_format=_AtomicClaimList)
     response = await model.ainvoke(
         [
             SystemMessage(content=_CLAIM_EXTRACTOR_SYSTEM),
@@ -105,7 +105,7 @@ async def _judge_support(
         + "\n".join(f"[{i}] {f}" for i, f in enumerate(retrieved_facts))
     )
     GlobalContext()
-    model = init_model(model_without_tools=False, response_format=_SupportJudgment)
+    model = init_model(response_format=_SupportJudgment)
     return await model.ainvoke(
         [
             SystemMessage(content=_SUPPORT_JUDGE_SYSTEM),

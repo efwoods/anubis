@@ -1160,12 +1160,23 @@ async def process_media_item_task(
             return documents
 
         elif media_type == "text":
+            # An explicit target supplied at upload time arrives on the graph
+            # config (``config["configurable"]["target_name"]`` from
+            # /update_avatar_identity_with_media); fall back to the item metadata.
+            # Forwarding it forces target-aware extraction (direct quotes +
+            # biographical facts) for the named person instead of the classifier's
+            # guess. URL children re-enter this branch with the same config.
+            configurable = (config or {}).get("configurable") or {}
+            explicit_target_name = (
+                configurable.get("target_name") or metadata.get("target_name")
+            )
             documents = await process_text_to_document(
                 metadata=metadata,
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
-                store = store, 
+                store=store,
+                target_name=explicit_target_name,
             )
             return documents
         elif media_type == "log":

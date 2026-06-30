@@ -1225,13 +1225,16 @@ async def process_text_to_document(
     )
     reference_reasoning = reference_response.get("reasoning", "")
 
-    # Bible-with-target-"Jesus" and similar: when a target is explicitly supplied,
-    # run target-aware extraction instead of dumping the whole text into the
-    # ``document`` namespace, so the target's quotes / facts / adapter data are
-    # produced per _OVERALL_PREPROCESSING_PROCESS.md.
-    if is_menu_or_religious_text and namespace_hint is None and explicit_target_name:
+    # Bible-with-target-"Jesus", Curie-wiki-with-target-"Curie", and similar: when
+    # a target is explicitly supplied at upload time, run target-aware extraction
+    # for ANY source (not just menu/holy text) instead of deferring to the content-
+    # situation classifier's single-bucket guess. This guarantees BOTH the target's
+    # direct quotes AND biographical facts about the target are produced, per
+    # _OVERALL_PREPROCESSING_PROCESS.md. The menu/holy-text branch below still
+    # handles reference docs when no explicit target is supplied.
+    if explicit_target_name and namespace_hint is None:
         logger.info(
-            "Reference document with explicit target %r -> target-aware extraction",
+            "Explicit target %r supplied -> target-aware extraction",
             explicit_target_name,
         )
         documents = await _process_target_aware_text(

@@ -88,27 +88,20 @@ async def perform_ocean_analysis(
     # TODO: CALCULATE TOKEN USAGE response['response_metadata'], latency_ms, cost
 
     # TODO: response_metrics_aggregation
-    openness_model_ocean_analysis = init_model(
-        model_without_tools=False, response_format=OPENNESS_OCEAN_ANALYSIS_EXTRACTION
-    )
+    openness_model_ocean_analysis = init_model(response_format=OPENNESS_OCEAN_ANALYSIS_EXTRACTION)
     # TODO: response_metrics_aggregation
     conscientiousness_model_ocean_analysis = init_model(
-        model_without_tools=False,
         response_format=CONSCIENTIOUSNESS_OCEAN_ANALYSIS_EXTRACTION,
     )
     # TODO: response_metrics_aggregation
-    extraversion_model_ocean_analysis = init_model(
-        model_without_tools=False,
-        response_format=EXTRAVERSION_OCEAN_ANALYSIS_EXTRACTION,
-    )
+    extraversion_model_ocean_analysis = init_model(response_format=EXTRAVERSION_OCEAN_ANALYSIS_EXTRACTION)
     # TODO: response_metrics_aggregation
     agreeableness_model_ocean_analysis = init_model(
-        model_without_tools=False,
         response_format=AGREEABLENESS_OCEAN_ANALYSIS_EXTRACTION,
     )
     # TODO: response_metrics_aggregation
     neuroticism_model_ocean_analysis = init_model(
-        model_without_tools=False, response_format=NEUROTICISM_OCEAN_ANALYSIS_EXTRACTION
+        response_format=NEUROTICISM_OCEAN_ANALYSIS_EXTRACTION
     )
 
     openness_ocean_analysis_prompt = SystemMessage(

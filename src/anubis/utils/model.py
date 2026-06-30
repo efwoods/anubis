@@ -46,7 +46,6 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
                tools=[], 
                tool_choice: str = "auto", 
                response_format = None, 
-               model_without_tools: Optional[bool] = False
                ):
     
     context = GlobalContext()
@@ -60,14 +59,6 @@ def init_model(context: Optional[GlobalContext] = GlobalContext(),
     logger.info(f"api_key: {api_key}")
     logger.info(f"base_url: {base_url}")
     logger.info(f"model_name: {model_name}")
-
-    # from langchain_openai import ChatOpenAI
-    if model_without_tools:
-        if response_format is None:
-            model = AsyncLlamaAPIClientWrapper()
-        else:
-            model = AsyncLlamaAPIClientWrapper(response_format=response_format)
-        return model 
 
     if response_format is not None:
             from langchain_openai import ChatOpenAI
@@ -280,80 +271,3 @@ async def calculate_token_usage_description_model(model_structured_output_respon
     token_usage = TokenUsage(prompt_tokens=input_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
     return token_usage
 
-class AsyncLlamaAPIClientWrapper:
-    def __init__(self, response_format = None):
-        context = GlobalContext()
-        self.llama_api_key = context.llama_api_key
-        self.pydantic_model = response_format
-        self.model_name = context.llama_model
-
-    async def ainvoke(self, messages: List[Literal[HumanMessage, SystemMessage, AIMessage, dict]]):
-      """ Accept a list of langchain messages and a pydantic_model 
-      and formats the messages for use as a model 
-      with structured output for analysis 
-      or returns an AI message with token usage metadata
-      if no pydantic model is accepted
-      """
-      from llama_api_client import AsyncLlamaAPIClient
-
-      client = AsyncLlamaAPIClient(api_key=self.llama_api_key)
-      class LlamaMessage(BaseModel):
-          role: Literal["human","user", "system", "assistant"] = Field(validation_alias="type")
-          content: str
-
-          @field_validator('role', mode="before")
-          @classmethod
-          def map_role(cls, value: str) -> str:
-              mapping = {"human": "user", "user":"user", "system":"system", "assistant":"assistant"}
-              return mapping.get(value, "user")
-
-      if type(messages[0]) is not dict:
-        formatted_messages = [(LlamaMessage.model_validate(message.model_dump()).model_dump()) for message in messages]
-      else:
-          formatted_messages = messages
-
-      if self.pydantic_model is not None:
-          if self.pydantic_model.__name__ == "TextualSituationalAwareness":
-              approximate_message_length = count_tokens(formatted_messages[1]['content'])
-              if approximate_message_length > 4000:
-                  formatted_messages[1]['content'] = formatted_messages[1]['content'][:4000] # truncate messages for situational analysis classification
-      
-      if self.pydantic_model is not None:
-        response = await client.chat.completions.create(
-            messages=formatted_messages,
-            model=self.model_name,
-            stream=False,
-            temperature=0.1,
-            # max_completion_tokens=4096,
-            top_p=0.1,
-            repetition_penalty=1,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": self.pydantic_model.__name__,
-                    "schema": self.pydantic_model.model_json_schema()
-                }
-            }
-        )
-
-        model = self.pydantic_model.model_validate_json(response.completion_message.content.text)
-        formatted_messages_content_str = json.dumps(formatted_messages)
-        token_usage = await calculate_token_usage_description_model(model_structured_output_response=model, input_str=formatted_messages_content_str)
-
-        result = (model, ResponseMetadata(model_name=self.model_name, token_usage=token_usage))
-        return result
-    
-      else:
-        response = await client.chat.completions.create(
-              messages=formatted_messages,
-              model=self.model_name,
-              stream=False,
-              temperature=0.1,
-              max_completion_tokens=16000,
-              top_p=0.1,
-              repetition_penalty=1,
-          )
-        # return AIMessage(content=response.completion_message.content.text)
-        result = (AIMessage(content=response.completion_message.content.text), ResponseMetadata(model_name=self.model_name, token_usage=TokenUsage(prompt_tokens=response.metrics.num_prompt_tokens, total_tokens=response.metrics.num_total_tokens, completion_tokens=response.metrics.num_completion_tokens)))
-        return result
-     

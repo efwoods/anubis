@@ -318,9 +318,7 @@ async def terms_and_services_content_moderation(
         )
     )
     # TODO: response_metrics_aggregation
-    model_with_structured_output = init_model(
-        model_without_tools=False, response_format=TermsAndServicesContentModeration
-    )
+    model_with_structured_output = init_model(response_format=TermsAndServicesContentModeration)
 
     chat_prompt_template = [system_message] + [message]
 

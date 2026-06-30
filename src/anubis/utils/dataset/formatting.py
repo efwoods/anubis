@@ -111,7 +111,7 @@ async def generate_question_for_message(message_str: str) -> str:
     presentations so that ``(user_prompt, assistant_quote)`` pairs can be
     emitted without modifying the assistant content.
     """
-    model = init_model(model_without_tools=False, response_format=_GeneratedQuestion)
+    model = init_model(response_format=_GeneratedQuestion)
     messages = [
         SystemMessage(content=_PER_LINE_SYSTEM_PROMPT),
         HumanMessage(content=message_str),
@@ -266,7 +266,7 @@ async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_sing
         if script['segments'][idx]['speaker'] == 'avatar' and idx != 0:
             prompt_query_list.append(script['segments'][idx-1]['text'])
         elif script['segments'][idx]['speaker'] == 'avatar' and idx == 0:
-            synthetic_prompt = await generate_question_for_message(message_str = prompt_query_list.append(script['segments'][idx]['text']))
+            synthetic_prompt = await generate_question_for_message(message_str = script['segments'][idx]['text'])
             prompt_query_list.append(synthetic_prompt)
     assert (len(direct_quotes) == len(prompt_query_list))
     _llm_single_turn_dataset = await llm_single_turn_dataset(prompt_query_list, direct_quotes)

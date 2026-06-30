@@ -2721,7 +2721,8 @@ async def update_avatar_identity_with_media(
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
-    create_reference_media_from_playlist: Annotated[bool, Form()] = False,
+    create_reference_media_from_playlist: Annotated[bool,Form()] = False,
+    target_name_in_media: Annotated[Optional[str],Form()] = None,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -2811,6 +2812,7 @@ async def update_avatar_identity_with_media(
                     "assistant_id": assistant_id,
                     "metadata": assistant_meta,
                 },
+                "target_name": target_name_in_media,
             }
         }
 
@@ -2930,25 +2932,25 @@ async def update_avatar_identity_with_media(
             # Merge explicit + manifest URLs, de-duplicated, order preserved.
             all_urls: list[str] = []
             seen_urls: set[str] = set()
-            for u in (*input_urls, *manifest_urls):
-                if u not in seen_urls:
-                    seen_urls.add(u)
-                    all_urls.append(u)
+            for _url in (*input_urls, *manifest_urls):
+                if _url not in seen_urls:
+                    seen_urls.add(_url)
+                    all_urls.append(_url)
 
             # Probe each URL up front only for a single lone URL; bulk requests use
             # lightweight entries the media graph classifies and expands.
             rich_urls = len(file_entries) == 0 and len(all_urls) == 1
             url_entries: list = []
-            for u in all_urls:
+            for _url in all_urls:
                 # A playlist is set aside for background enumeration (one child job
                 # per video, expanded off the request path); non-playlist URLs take
                 # the normal single-URL path here.
-                if _is_youtube_playlist_url_str(u):
-                    playlist_urls.append(u)
+                if _is_youtube_playlist_url_str(_url):
+                    playlist_urls.append(_url)
                     continue
                 url_entries.extend(
                     await _build_media_entries_for_url(
-                        u,
+                        _url,
                         reference_image=False,
                         reference_audio=False,
                         user_id=user_id,

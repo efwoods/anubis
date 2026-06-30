@@ -99,7 +99,6 @@ async def process_text_to_document(metadata, user_id, assistant_id, media_item) 
 
         
         model_with_structured_output = init_model(
-            model_without_tools=False,
             response_format=TextualSituationalAwareness
         )
         

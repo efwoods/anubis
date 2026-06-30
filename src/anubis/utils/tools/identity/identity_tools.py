@@ -1,25 +1,26 @@
-""" Agent SubGraph Tools """
+"""Agent SubGraph Tools"""
+
 import asyncio
+import logging
 import re
 import uuid
-import logging
 from dataclasses import dataclass
 
-from langchain.tools import tool, ToolRuntime
-from langchain_core.documents import Document
-from langchain_core.tools import InjectedToolArg
 from langchain.messages import HumanMessage, SystemMessage, ToolMessage
-
-from langgraph.types import Command, interrupt
+from langchain.tools import ToolRuntime, tool
+from langchain_core.documents import Document
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolArg
+from langgraph.types import Command, interrupt
 
-from src.anubis.utils.state import GlobalState
 from src.anubis.utils.model import init_model
+from src.anubis.utils.state import GlobalState
 from src.anubis.utils.utility import extract_user_id_assistant_id
 
 logger = logging.getLogger(__name__)
 
 from typing import Annotated
+
 from pydantic import BaseModel, Field
 
 """ READ ME: STORE NAMESPACE STORAGE AND RETRIEVAL CONDITIONS
@@ -37,6 +38,7 @@ RETRIEVED KNOWLEDGE or 'DOCUMENT' IS RESERVED FOR DOCUMENTS THAT THE ASSISTANT H
 QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND WRITING STYLE WHERE RETRIEVED KNOWLEDGE DOCUMENT ARE NOT DIRECTLY FROM THE ASSISTANT AND ARE USER FOR CONTENT ONLY.
 
 """
+
 
 def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     """Wrap a single atomic fact with its ENTIRE original background context.
@@ -63,44 +65,52 @@ def wrap_fact_with_context(fact: str, fact_context: str) -> str:
 
 class SignificantFactAndContext(BaseModel):
     """
-    Extract a significant event or occurance from the history of messages. This is a surprising, unexpected, or otherwise important event or occurance. This is a point of no return or an inflection point in the conversation. Or an otherwise important event or occurance. These are not facts about the assistant or user. These are facts about the situation or state of the world within the context of the conversation. 
+    Extract a significant event or occurance from the history of messages. This is a surprising, unexpected, or otherwise important event or occurance. This is a point of no return or an inflection point in the conversation. Or an otherwise important event or occurance. These are not facts about the assistant or user. These are facts about the situation or state of the world within the context of the conversation.
     <Example>
     *A New Person Enters the Room*
     *World Peace has been announced*
     </Example>
     """
-    significant_event: str =  Field(description = "This is a significant event or occurance. This is a surprising, unexpected, or otherwise important event or occurance.")
-    significant_event_context: str = Field(description = "This is the context from which the significant event or occurance was made.")
 
-@tool("create_episodic_memory", return_direct=False, args_schema=SignificantFactAndContext)
-async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
-    significant_event: str, 
-    significant_event_context: str, 
+    significant_event: str = Field(
+        description="This is a significant event or occurance. This is a surprising, unexpected, or otherwise important event or occurance."
+    )
+    significant_event_context: str = Field(
+        description="This is the context from which the significant event or occurance was made."
+    )
+
+
+@tool(
+    "create_episodic_memory", return_direct=False, args_schema=SignificantFactAndContext
+)
+async def create_episodic_memory(  # EPISODIC MEMORY CREATION IN NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
+    significant_event: str,
+    significant_event_context: str,
     # Hide these arguments from the model.
-    runtime: Annotated[ToolRuntime, InjectedToolArg] = None
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
-    Create a memory whenever a significant event occurs or when prompted to remember. 
+    Create a memory whenever a significant event occurs or when prompted to remember.
     USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
 
     NEVER use this tool when the user is telling the assistant about the assistant's identity.
-    This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
-    
+    This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt.
+
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
-    
+
     THERE MAY BE MORE THAN ONE FACT and IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
-    
+
     ALWAYS use this tool when a significant EVENT OCCURS that is SALIENT to the assistant or user's goals, beliefs, values, or perspective or is otherwise IMPORTANT, SURPRISING, EVENTFUL, UNUSUAL or EXTRAORDINARY.
-    
+
     ALWAYS use this tool when a CHOICE has been made or there is otherwise an event that has reached a point of no return.
 
-    Identify the fact, occurance, or event that was asserted was important, found significant, or was a choice or a point of no return. 
+    Identify the fact, occurance, or event that was asserted was important, found significant, or was a choice or a point of no return.
     Do not change the information of the fact.
     Identify the CONTEXT behind the fact given the list of messages.
-    The context behind the fact must be succinct. 
+    The context behind the fact must be succinct.
     The fact must be clear and complete.
-    
+
     USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
     </INSTRUCTIONS>
 
@@ -109,17 +119,17 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     NEVER call this tool when the user is telling the assistant about the assistant's identity.
     NEVER call this tool when updating information about IDENTITY.
     </RESTRICTIONS>
-    
+
     <EXAMPLE>
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
-    
+
     Example:
     WOW! THIS JUST HAPPENED!
     I never tell anyone this, but here is a secret.
     I want you to remember that.
     This is important.
     This is important to me.
-    </EXAMPLE> 
+    </EXAMPLE>
 
     <EXAMPLE>
     Please, don't call me child.
@@ -132,26 +142,26 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
     </EXAMPLE>
 
     <INSTRUCTIONS>
-    Create a memory whenever a significant event occurs or when prompted to remember. 
+    Create a memory whenever a significant event occurs or when prompted to remember.
     USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
     This is not used when the user is telling the assistant about the assistant's identity.
 
-    This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt. 
-    
+    This tool is ALWAYS used to create memories that are of SIGNIFICANT FACTS, EVENTS, OR OCCURANCES given the context of your system prompt.
+
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
-    
+
     THERE MAY BE MORE THAN ONE FACT and IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
-    
+
     ALWAYS use this tool when a significant EVENT OCCURS that is SALIENT to the assistant or user's goals, beliefs, values, or perspective or is otherwise IMPORTANT, SURPRISING, EVENTFUL, UNUSUAL or EXTRAORDINARY.
-    
+
     ALWAYS use this tool when a CHOICE has been made or there is otherwise an event that has reached a point of no return.
 
-    Identify the fact, occurance, or event that was asserted was important, found significant, or was a choice or a point of no return. 
+    Identify the fact, occurance, or event that was asserted was important, found significant, or was a choice or a point of no return.
     Do not change the information of the fact.
     Identify the CONTEXT behind the fact given the list of messages.
-    The context behind the fact must be succinct. 
+    The context behind the fact must be succinct.
     The fact must be clear and complete.
-    
+
     USE THIS FUNCTION TO REMEMBER USER PREFERENCES.
     </INSTRUCTIONS>
 
@@ -163,29 +173,37 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
             "This was mentioned while discussing career options in Europe."
     """
 
-    logger.info(f'breakpoint')
+    logger.info(f"breakpoint")
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # Memory of the Identity of the assistant presented as text from the user. (assistant's memory space)
-    assistant_memory_namespace = (user_id, assistant_id, 'memory')
+    assistant_memory_namespace = (user_id, assistant_id, "memory")
 
     identity_id = str(uuid.uuid4())
 
-    searchable_page_content = "\n\n".join([significant_event, significant_event_context])
+    searchable_page_content = "\n\n".join(
+        [significant_event, significant_event_context]
+    )
 
     document_metadata = {
-        "user_id":user_id,
+        "user_id": user_id,
         "assistant_id": assistant_id,
         "id": identity_id,
         "fact_context": significant_event_context,
-        "fact":significant_event
+        "fact": significant_event,
     }
 
-    assistant_identity_memory_document = Document(page_content = searchable_page_content, metadata=document_metadata)
-    assistant_identity_memory_document_json = assistant_identity_memory_document.to_json()
+    assistant_identity_memory_document = Document(
+        page_content=searchable_page_content, metadata=document_metadata
+    )
+    assistant_identity_memory_document_json = (
+        assistant_identity_memory_document.to_json()
+    )
 
     await runtime.store.aput(
         assistant_memory_namespace,
@@ -193,75 +211,102 @@ async def create_episodic_memory( # EPISODIC MEMORY CREATION IN NAMESPACE (USER_
         value={"document": assistant_identity_memory_document_json},
     )
     tool_call_id = runtime.tool_call_id
-    update = {"recalled_memory_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+    update = {
+        "recalled_memory_documents": [assistant_identity_memory_document],
+        "messages": [
+            ToolMessage(
+                content=f"Learned: {document_metadata['fact']}",
+                tool_call_id=tool_call_id,
+            )
+        ],
+    }
 
-    return Command(update = update)
+    return Command(update=update)
 
 
 class ConversationSummaryToProvokeMemories(BaseModel):
     """
-    Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
+    Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response.
     These document memories have been shared from the user and contain information about the assistant's identity.
     These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
     """
-    evoked_memory_query: str =  Field(description = """
-                                      This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.""")
+
+    evoked_memory_query: str = Field(
+        description="""
+                                      This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories."""
+    )
 
 
-@tool("recall_memories", return_direct = False, args_schema=ConversationSummaryToProvokeMemories)
+@tool(
+    "recall_memories",
+    return_direct=False,
+    args_schema=ConversationSummaryToProvokeMemories,
+)
 async def recall_memories(
-    evoked_memory_query: Annotated[str, Field(description="This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.")],
-
+    evoked_memory_query: Annotated[
+        str,
+        Field(
+            description="This is the summary of the converation. This summary is posed succinctly such that the summary is similar to the content to which a retrived list of documents is the response. The document memories have been shared from the user and contain information about the assistant's identity or contain information that was important that the assistant decided the assistant needed to remember. It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories."
+        ),
+    ],
     # Hide these arguments
-    runtime: Annotated[ToolRuntime, InjectedToolArg] = None): # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+):  # EPISODIC MEMORY RETRIEVAL FROM NAMESPACE (USER_ID, ASSISTANT_ID, 'MEMORY')
     """This is used to retrieve memories or 'REMEMBER MEMORIES' from the store.
      These memories have been shared from the user and contain information about the assistant's identity.
      These memories have been shared from the user and contain information that was important that assistant decided the assistant needed to remember.
-     This is used when the assistant needs to RECALL or REMEMBER important information that the assistant chose to MEMORIZE or REMEMBER. 
+     This is used when the assistant needs to RECALL or REMEMBER important information that the assistant chose to MEMORIZE or REMEMBER.
 
 
     <INSTRUCTIONS>
-        Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response. 
+        Summarize the conversation and generate a query that is the similar to the content to which a retrieved list of documents is the response.
         These document memories have been shared from the user and contain information about the assistant's identity.
         These document memories have been shared from the user and contain information that was important that the assistant decided the assistant needed to remember.
         It is possible that the summary matches no memories because the intent of the conversation does not match the topics of the stored memories.
-        The summary must be at most one sentence. 
-        The summary can be a single word or phrase that identifies the topic of conversation. 
+        The summary must be at most one sentence.
+        The summary can be a single word or phrase that identifies the topic of conversation.
     </INSTRUCTIONS>
 
     Args:
         runtime (ToolRuntime): contains the store that holds the memories.
 
     Returns:
-        GlobalState: Contains the AssistantState class 
-        and the RememberedMemories class that contains 
-        the list of memories listed as 
-        remembered_memory_documents 
-        with a description of 
-        'This is a list of memories for reference during chat created as 
-            Document objects for search by user_id and assistant_id or with 
-            relevance scores in vectorstore 
+        GlobalState: Contains the AssistantState class
+        and the RememberedMemories class that contains
+        the list of memories listed as
+        remembered_memory_documents
+        with a description of
+        'This is a list of memories for reference during chat created as
+            Document objects for search by user_id and assistant_id or with
+            relevance scores in vectorstore
             (Document type is the standard for the vector store).'
     """
 
-    logger.info(f'breakpoint')
+    logger.info(f"breakpoint")
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # Memory of the Identity of the assistant presented as text from the user.
-    assistant_memory_namespace = (user_id, assistant_id, 'memory')
+    assistant_memory_namespace = (user_id, assistant_id, "memory")
 
     evoked_memories_response = await runtime.store.asearch(
-        assistant_memory_namespace,
-        query=evoked_memory_query
+        assistant_memory_namespace, query=evoked_memory_query
     )
 
     tool_call_id = runtime.tool_call_id
-    update = {"recalled_memory_documents": evoked_memories_response, 
-              "messages": [ToolMessage(content=f"Evoked {len(evoked_memories_response)} memories.)", tool_call_id=tool_call_id)]}
+    update = {
+        "recalled_memory_documents": evoked_memories_response,
+        "messages": [
+            ToolMessage(
+                content=f"Evoked {len(evoked_memories_response)} memories.)",
+                tool_call_id=tool_call_id,
+            )
+        ],
+    }
 
     return Command(update=update)
 
@@ -351,7 +396,9 @@ async def _user_message_grounds_fact(fact: str, user_message_text: str) -> bool:
         result = await model.ainvoke(
             [
                 SystemMessage(content=_FACT_GROUNDING_SYSTEM_PROMPT),
-                HumanMessage(content=f"USER_MESSAGE: {user_message_text}\n\nPROPOSED_FACT: {fact}"),
+                HumanMessage(
+                    content=f"USER_MESSAGE: {user_message_text}\n\nPROPOSED_FACT: {fact}"
+                ),
             ]
         )
         return bool(result.user_asserted_the_fact)
@@ -366,7 +413,7 @@ class AssistantFactAndContext(BaseModel):
     """
     Extract Facts about the ASSISTANT and the context of that fact given the most recently shared message ONLY shared FROM THE USER.
     The identified fact must be shared FROM THE USER.
-    The fact must be shared ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT IMMEDIATE MESSAGE) FROM THE USER. 
+    The fact must be shared ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT IMMEDIATE MESSAGE) FROM THE USER.
     <Example>
     User: "You are a helpful assistant."
     User: "There was this one time when you went to the store and saw a really cute dog."
@@ -381,12 +428,12 @@ class AssistantFactAndContext(BaseModel):
     </Example>
 
     <Example>
-    Input: You have long flowing curly hair. 
+    Input: You have long flowing curly hair.
     fact_context: I was told that I have long flowing curly hair.
     Fact: I have long flowing curly hair.
     </Example>
 
-    
+
     NEVER extract facts about the assistant from the assistant's own messages.
     <Counterexample>
     Assistant: "I am a helpful assistant."
@@ -394,13 +441,18 @@ class AssistantFactAndContext(BaseModel):
     </Counterexample>
 
     """
-    fact_shared_about_the_assistant_from_the_user: str =  Field(description = "One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing.")
-    fact_context: str = Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")
+
+    fact_shared_about_the_assistant_from_the_user: str = Field(
+        description="One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing."
+    )
+    fact_context: str = Field(
+        description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
+    )
 
 
-@tool("update_self_identity_mem_from_user_txt", args_schema = AssistantFactAndContext)
-async def update_self_identity_mem_from_user_txt( # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
-    fact_shared_about_the_assistant_from_the_user: str, 
+@tool("update_self_identity_mem_from_user_txt", args_schema=AssistantFactAndContext)
+async def update_self_identity_mem_from_user_txt(  # pseudo identity update using namespace (USER_ID, ASSISTANT_ID, 'MEMORY')
+    fact_shared_about_the_assistant_from_the_user: str,
     fact_context: str,
     # Hide these arguments from the model.
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
@@ -436,16 +488,16 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     DO NOT CALL THIS TOOL ON INFORMATION THAT WAS PRESENTED FROM THE ASSISTANT IN EARLIER CONTEXT OF THE CONVERSATION (INFORMATION YOU PRESENTED YOURSELF)
 
     <FACTCONTEXT>
-    THE CONTEXT OF THE FACTS ARE SUCH THAT YOU HAVE BEEN INFORMED OF THIS INFORMATION. 
-    THESE ARE FACTS SHARED IN CONVERSATION FROM THE USER. DO NOT REWRITE THESE FACTS AS IF YOU SAID THESE FACTS YOURSELF. 
-    INSTEAD, INDICATE THAT YOU HAVE BEEN TOLD OR HAVE ON GOOD AUTHORITY THIS INFORMATION. 
+    THE CONTEXT OF THE FACTS ARE SUCH THAT YOU HAVE BEEN INFORMED OF THIS INFORMATION.
+    THESE ARE FACTS SHARED IN CONVERSATION FROM THE USER. DO NOT REWRITE THESE FACTS AS IF YOU SAID THESE FACTS YOURSELF.
+    INSTEAD, INDICATE THAT YOU HAVE BEEN TOLD OR HAVE ON GOOD AUTHORITY THIS INFORMATION.
 
     NEVER DO THE FOLLOWING:
     <FACT_CONTEXT>You said: "You have been interested in AI after reading a book in your youth, that you speak directly and openly as if you are not afraid of the world and have never experienced harm or evil or hardship that you could not overcome."</FACT_CONTEXT>
     <FACT>I have been interested in AI after reading a book in my youth.</FACT></FACT_CONTEXT_AND_FACT>
 
-    THE CORRECT FACT CONTEXT IS THE FOLLOWING: 
-    I was told that I have been interested in AI after reading a book in my youth. 
+    THE CORRECT FACT CONTEXT IS THE FOLLOWING:
+    I was told that I have been interested in AI after reading a book in my youth.
 
     </FACTCONTEXT>
 
@@ -520,14 +572,21 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     logger.info(f"learn_information about user breakpoint")
 
     # Verify the current user is the creator and responsible for the identity of the avatar
-    assistant_owner_user_id = runtime.config['configurable']['assistant_ctx']['metadata']['user_id']
-    user_id = runtime.config['configurable']['user_id']
+    assistant_owner_user_id = runtime.config["configurable"]["assistant_ctx"][
+        "metadata"
+    ]["user_id"]
+    user_id = runtime.config["configurable"]["user_id"]
     if assistant_owner_user_id != user_id:
         tool_call_id = runtime.tool_call_id
-        update = {"messages": [ToolMessage(content=f"Did not adopt information of the identity that was not created by the user.", tool_call_id=tool_call_id)]}
+        update = {
+            "messages": [
+                ToolMessage(
+                    content=f"Did not adopt information of the identity that was not created by the user.",
+                    tool_call_id=tool_call_id,
+                )
+            ]
+        }
         return Command(update=update)
-
-
 
     # SAFEGUARD: only learn a fact the user actually shared in their MOST RECENT message.
     # The model often surfaces facts from the avatar's own retrieved consciousness
@@ -536,7 +595,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     # was derived from the latest user message — not retrieved context, the assistant's own
     # words, or an earlier turn — before storing anything.
     latest_user_message_text = _latest_user_message_text(runtime.state.get("messages"))
-    
+
     _SIMILARITY_THRESHOLD = 0.6
 
     def _compute_message_fact_similarity() -> float:
@@ -557,7 +616,7 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
             (the fact should come from the user message), then verify with an llm. 
             If that fails, do not learn the fact.
         """
-    
+
         if not await _user_message_grounds_fact(
             fact_shared_about_the_assistant_from_the_user, latest_user_message_text
         ):
@@ -575,14 +634,16 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
             }
             return Command(update=update)
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # Memory of the Identity of the assistant presented as text from the user.
     # Post-guard, user_id is the assistant's owner, so writes land in the same
     # namespace the consciousness loader reads from.
-    assistant_memory_namespace = (user_id, assistant_id, 'identity_memory')
+    assistant_memory_namespace = (user_id, assistant_id, "identity_memory")
 
     # VERIFY FACT DOES NOT ALREADY EXIST.
     # Dedup against (a) the identity docs already loaded into state this turn and
@@ -595,34 +656,52 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     # with no recalled memories). Mirrors ``learn_information_about_the_user``.
     assistant_identity_documents_text_list = [
         document.metadata.get("fact")
-        for document in runtime.state.get('assistant_identity_documents', [])
+        for document in runtime.state.get("assistant_identity_documents", [])
     ]
     assistant_content_store_query_results = await runtime.store.asearch(
         assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user
     )
     assistant_content_store_query_results_significant = [
-        item for item in assistant_content_store_query_results if item.score and item.score > 0.8
+        item
+        for item in assistant_content_store_query_results
+        if item.score and item.score > 0.8
     ]
-    if fact_shared_about_the_assistant_from_the_user in assistant_identity_documents_text_list or len(assistant_content_store_query_results_significant) > 0:
+    if (
+        fact_shared_about_the_assistant_from_the_user
+        in assistant_identity_documents_text_list
+        or len(assistant_content_store_query_results_significant) > 0
+    ):
         # Fact already exists:
         tool_call_id = runtime.tool_call_id
-        update = {"messages": [ToolMessage(content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned", tool_call_id=tool_call_id)]}
-        return Command(update = update)
+        update = {
+            "messages": [
+                ToolMessage(
+                    content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                    tool_call_id=tool_call_id,
+                )
+            ]
+        }
+        return Command(update=update)
 
-
-    searchable_page_content = wrap_fact_with_context(fact_shared_about_the_assistant_from_the_user, fact_context)
+    searchable_page_content = wrap_fact_with_context(
+        fact_shared_about_the_assistant_from_the_user, fact_context
+    )
 
     identity_id = str(uuid.uuid4())
     document_metadata = {
-        "user_id":user_id,
+        "user_id": user_id,
         "assistant_id": assistant_id,
         "document_id": identity_id,
         "fact_context": fact_context,
-        "fact":fact_shared_about_the_assistant_from_the_user
+        "fact": fact_shared_about_the_assistant_from_the_user,
     }
 
-    assistant_identity_memory_document = Document(page_content = searchable_page_content, metadata=document_metadata)
-    assistant_identity_memory_document_json = assistant_identity_memory_document.to_json()
+    assistant_identity_memory_document = Document(
+        page_content=searchable_page_content, metadata=document_metadata
+    )
+    assistant_identity_memory_document_json = (
+        assistant_identity_memory_document.to_json()
+    )
 
     await runtime.store.aput(
         assistant_memory_namespace,
@@ -631,15 +710,23 @@ async def update_self_identity_mem_from_user_txt( # pseudo identity update using
     )
 
     tool_call_id = runtime.tool_call_id
-    update = {"assistant_identity_documents": [assistant_identity_memory_document],
-              "messages": [ToolMessage(content=f"Learned: {document_metadata['fact']}", tool_call_id=tool_call_id)]}
+    update = {
+        "assistant_identity_documents": [assistant_identity_memory_document],
+        "messages": [
+            ToolMessage(
+                content=f"Learned: {document_metadata['fact']}",
+                tool_call_id=tool_call_id,
+            )
+        ],
+    }
 
     return Command(update=update)
+
 
 class UserFactAndContext(BaseModel):
     """
     Extract Facts about the USER and the context of that fact given the most recent shared message from the user.
-    THESE MUST BE FACTS ABOUT THE USER. 
+    THESE MUST BE FACTS ABOUT THE USER.
     <Example>
     User: "My name is Evan."
     User: "I have brown hair and glasses."
@@ -653,13 +740,39 @@ class UserFactAndContext(BaseModel):
     - "While introducing himself, Evan said his name is Evan, that he has brown hair and glasses, and that he is a fan of Critical Role and Laura Bailey."
     </Example>
     """
-    user_fact: Annotated[str, Field(description = "One distinct fact about the user shared by the user, preserved verbatim (not rewritten).")]
-    fact_context: Annotated[str, Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")]
 
-@tool("learn_information_about_the_user", return_direct=False, args_schema=UserFactAndContext)
-async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT THE USER USING (ASSISTANT_ID, USER_ID, 'IDENTITY')
-    user_fact: Annotated[str, Field(description = "One distinct fact about the user shared by the user, preserved verbatim (not rewritten).")],
-    fact_context: Annotated[str, Field(description = "A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message.")],
+    user_fact: Annotated[
+        str,
+        Field(
+            description="One distinct fact about the user shared by the user, preserved verbatim (not rewritten)."
+        ),
+    ]
+    fact_context: Annotated[
+        str,
+        Field(
+            description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
+        ),
+    ]
+
+
+@tool(
+    "learn_information_about_the_user",
+    return_direct=False,
+    args_schema=UserFactAndContext,
+)
+async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT THE USER USING (ASSISTANT_ID, USER_ID, 'IDENTITY')
+    user_fact: Annotated[
+        str,
+        Field(
+            description="One distinct fact about the user shared by the user, preserved verbatim (not rewritten)."
+        ),
+    ],
+    fact_context: Annotated[
+        str,
+        Field(
+            description="A concise summary of the ENTIRE original background context (the whole message/story) the fact came from, not just this one fact. Use the SAME summary for every fact extracted from the same message."
+        ),
+    ],
     # Hide these arguments from the model.
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> GlobalState:
@@ -669,16 +782,16 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     Learn facts about the USER (the person you are speaking with) that they share
     through text. This tool LEARNS and STORES new facts — it does not retrieve.
 
-    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE FROM THE USER. 
-    
-    DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN. 
+    THE FACT MUST BE SHARED ONLY FROM THE PREVIOUS MESSAGE FROM THE USER.
+
+    DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN.
     DO NOT LEARN INFORMATION THAT IS ABOUT THE USER THAT IS NOT SAID FROM THE USER.
 
     The user is the primary source of truth about themselves, so use this tool
     whenever the user reveals something about their own IDENTITY — their name,
     description, appearance, history, an experience or story they lived, a
     relationship, a feeling, a preference, an opinion, a value, a belief, or a goal.
-    
+
     Decompose the user's message into EVERY distinct, atomic fact and call this
     tool ONCE FOR EACH distinct fact. A single message — especially a story — usually
     contains MANY separate facts; make as many calls as there are facts. Do not stop
@@ -697,7 +810,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     it in full. Do not shrink the context down to only the single fact, and do not
     rewrite or paraphrase the facts themselves.
 
-    THE FACT MUST BE PRESENTED ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT MESSAGE) FROM THE USER. 
+    THE FACT MUST BE PRESENTED ONLY FROM THE PREVIOUS MESSAGE (MOST RECENT MESSAGE) FROM THE USER.
 
     </INSTRUCTIONS>
 
@@ -705,7 +818,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     Only use this for FACTS about the IDENTITY of the user.
     NEVER call this tool twice with the same fact.
     NEVER call this tool to extract information that is not part of the user's identity.
-    NEVER LEARN INFORMATION THAT IS ALREADY KNOWN. 
+    NEVER LEARN INFORMATION THAT IS ALREADY KNOWN.
     NEVER LEARN INFORMATION THAT IS ABOUT THE USER THAT IS NOT SAID FROM THE USER.
     NEVER LEARN INFORMATION THAT YOU YOURSELF SAID.
     </RESTRICTIONS>
@@ -744,7 +857,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
      Input Facts:"Evan said, \"My name's Evan. This is what I look like.\" and then provided a professional headshot image description: a man in a dark suit and white shirt with a purple tie and small purple lapel pin, black-framed glasses, short dark hair, soft smile facing the camera, dark plain backdrop; overall impression formal and polished with a black/white/purple color scheme and even lighting.",
     Extracted Fact: "The image suggests a portrait or event-ready setting."
     </COUNTER EXAMPLE>
-    
+
     <RESTRICTIONS>
     Only use this for FACTS about the IDENTITY of the user.
     NEVER call this tool twice with the same fact.
@@ -759,7 +872,7 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     whenever the user reveals something about their own IDENTITY — their name,
     description, appearance, history, an experience or story they lived, a
     relationship, a feeling, a preference, an opinion, a value, a belief, or a goal.
-    
+
     Decompose the user's message into EVERY distinct, atomic fact and call this
     tool ONCE FOR EACH distinct fact. A single message — especially a story — usually
     contains MANY separate facts; make as many calls as there are facts. Do not stop
@@ -781,25 +894,44 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     """
     logger.info(f"breakpoint")
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # Identity of the user from the assistant's perspective
-    user_identity_namespace = (assistant_id, user_id, 'identity')
+    user_identity_namespace = (assistant_id, user_id, "identity")
 
     # VERIFY FACT DOES NOT ALREADY EXIST
-    user_identity_documents_text_list = [document.metadata.get("fact") for document in runtime.state['user_identity_documents']]
-    user_content_store_query_results = await runtime.store.asearch(user_identity_namespace, query=user_fact)
-    user_content_store_query_results_significant = [item for item in user_content_store_query_results if item.score > 0.8]
-    if user_fact in user_identity_documents_text_list or len(user_content_store_query_results_significant) > 0:
+    user_identity_documents_text_list = [
+        document.metadata.get("fact")
+        for document in runtime.state["user_identity_documents"]
+    ]
+    user_content_store_query_results = await runtime.store.asearch(
+        user_identity_namespace, query=user_fact
+    )
+    user_content_store_query_results_significant = [
+        item for item in user_content_store_query_results if item.score > 0.8
+    ]
+    if (
+        user_fact in user_identity_documents_text_list
+        or len(user_content_store_query_results_significant) > 0
+    ):
         # Fact already exists:
 
         tool_call_id = runtime.tool_call_id
 
-        update = {"messages": [ToolMessage(content=f"Fact: {user_fact} previously learned", tool_call_id = tool_call_id)]}
+        update = {
+            "messages": [
+                ToolMessage(
+                    content=f"Fact: {user_fact} previously learned",
+                    tool_call_id=tool_call_id,
+                )
+            ]
+        }
         return Command(update=update)
-    
+
     # model_with_structured_output = init_model(context = runtime.context, response_format=UserFactAndContext)
 
     identity_id = str(uuid.uuid4())
@@ -807,14 +939,16 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
     searchable_page_content = wrap_fact_with_context(user_fact, fact_context)
 
     document_metadata = {
-        "user_id":user_id,
+        "user_id": user_id,
         "assistant_id": assistant_id,
         "document_id": identity_id,
         "fact_context": fact_context,
-        "fact":user_fact
+        "fact": user_fact,
     }
 
-    user_identity_document = Document(page_content = searchable_page_content, metadata=document_metadata)
+    user_identity_document = Document(
+        page_content=searchable_page_content, metadata=document_metadata
+    )
     user_identity_document_json = user_identity_document.to_json()
 
     await runtime.store.aput(
@@ -823,8 +957,12 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
         value={"document": user_identity_document_json},
     )
     tool_call_id = runtime.tool_call_id
-    update = {"user_identity_documents": [user_identity_document],
-               "messages": [ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)]}
+    update = {
+        "user_identity_documents": [user_identity_document],
+        "messages": [
+            ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)
+        ],
+    }
 
     return Command(update=update)
 
@@ -845,8 +983,10 @@ async def learn_information_about_the_user( # UPDATE IDENTITY INFORMATION ABOUT 
 # are matched at the loader's own relevance floor; everything else needs a small margin
 # above it to avoid sweeping in loosely-related facts.
 
-_CORRECTION_MATCH_THRESHOLD = 0.6 # retrieved documents from the store namespaces 
-_CORRECTION_RETRIEVED_DOC_THRESHOLD = 0.1 # all documents contained in the current state
+_CORRECTION_MATCH_THRESHOLD = 0.6  # retrieved documents from the store namespaces
+_CORRECTION_RETRIEVED_DOC_THRESHOLD = (
+    0.1  # all documents contained in the current state
+)
 
 # Sentence-level gate for long-text namespaces (quote/document/analysis). Those store
 # raw multi-sentence text, so whole-document cosine of a short claim against a ~2,000-word
@@ -1055,7 +1195,9 @@ async def _suggest_correction(
     try:
         kwargs = _item_document_kwargs(match.item)
         full_document = kwargs.get("page_content") or ""
-        original_context = (kwargs.get("metadata") or {}).get("fact_context") or correction_context
+        original_context = (kwargs.get("metadata") or {}).get(
+            "fact_context"
+        ) or correction_context
         human_message = HumanMessage(
             content=(
                 f"INACCURATE_FACT: {inaccurate_information}\n"
@@ -1068,7 +1210,10 @@ async def _suggest_correction(
         async with _SUGGESTION_CONCURRENCY:
             model = init_model(response_format=ProposedFactEdit)
             result = await model.ainvoke(
-                [SystemMessage(content=_CORRECTION_SUGGESTION_SYSTEM_PROMPT), human_message]
+                [
+                    SystemMessage(content=_CORRECTION_SUGGESTION_SYSTEM_PROMPT),
+                    human_message,
+                ]
             )
         corrected_text = "" if is_deletion else (result.corrected_text or "")
         corrected_context = result.corrected_context or correction_context
@@ -1081,7 +1226,11 @@ async def _suggest_correction(
 
 
 def _match_preview(
-    index: int, match: FactMatch, suggestion: tuple[str, str, bool], *, is_deletion: bool
+    index: int,
+    match: FactMatch,
+    suggestion: tuple[str, str, bool],
+    *,
+    is_deletion: bool,
 ) -> dict:
     """Compact, JSON-serializable description of ONE editable pending change for the HITL panel.
 
@@ -1131,7 +1280,9 @@ def _match_preview(
     }
 
 
-def _correction_namespaces(creator_id: str, assistant_id: str, user_id: str) -> list[tuple]:
+def _correction_namespaces(
+    creator_id: str, assistant_id: str, user_id: str
+) -> list[tuple]:
     """Assistant-side namespaces a correction sweeps.
 
     ``(creator_id, assistant_id, "identity")`` is a *prefix* search — it also covers
@@ -1152,9 +1303,30 @@ def _correction_namespaces(creator_id: str, assistant_id: str, user_id: str) -> 
 
 _STOPWORDS = frozenset(
     {
-        "this", "that", "with", "have", "from", "they", "your", "about", "into",
-        "also", "been", "were", "which", "their", "would", "there", "what", "when",
-        "will", "i've", "ive", "never", "incorrect", "wrong",
+        "this",
+        "that",
+        "with",
+        "have",
+        "from",
+        "they",
+        "your",
+        "about",
+        "into",
+        "also",
+        "been",
+        "were",
+        "which",
+        "their",
+        "would",
+        "there",
+        "what",
+        "when",
+        "will",
+        "i've",
+        "ive",
+        "never",
+        "incorrect",
+        "wrong",
     }
 )
 
@@ -1194,7 +1366,7 @@ async def find_fact_matches(
 
     De-duplicated by ``(namespace, key)`` for facts and ``(namespace, key, sentence)``
     for sentences. Reads only — safe to re-run when an interrupt resumes.
-   
+
     """
     retrieved_doc_ids: set[str] = set()
     for doc in state_docs or []:
@@ -1284,7 +1456,9 @@ async def _apply_fact_rewrite(
     old_page_content = kwargs.get("page_content") or ""
 
     if _page_content_is_wrapped(old_page_content):
-        new_page_content = wrap_fact_with_context(corrected_information, correction_context)
+        new_page_content = wrap_fact_with_context(
+            corrected_information, correction_context
+        )
     else:
         new_page_content = f"{corrected_information}\n\n{correction_context}".strip()
 
@@ -1307,7 +1481,9 @@ async def _apply_fact_rewrite(
     )
 
 
-def _redact_sentences(page_content: str, sentences_to_change: dict[str, str | None]) -> str:
+def _redact_sentences(
+    page_content: str, sentences_to_change: dict[str, str | None]
+) -> str:
     """Return ``page_content`` with each target sentence removed (value ``None``) or
     replaced (value = replacement). Matching is whitespace-normalized; surrounding blank
     space is collapsed so the redaction leaves clean prose."""
@@ -1350,16 +1526,20 @@ async def _apply_sentence_redaction(
     new_page_content = _redact_sentences(old_page_content, changed)
 
     # Keep human-readable summaries consistent when they restate the offending sentence.
-    for summary_field in ("scene_summary", "user_context"): 
+    for summary_field in ("scene_summary", "user_context"):
         if metadata.get(summary_field):
-            metadata[summary_field] = _redact_sentences(metadata[summary_field], changed)
+            metadata[summary_field] = _redact_sentences(
+                metadata[summary_field], changed
+            )
 
     redacted = list(metadata.get("redacted_sentences") or [])
     redacted.extend(changed.keys())
     metadata["redacted_sentences"] = redacted
     metadata["corrected_from"] = "; ".join(changed.keys())
 
-    replacements = "; ".join(replacement for replacement in changed.values() if replacement)
+    replacements = "; ".join(
+        replacement for replacement in changed.values() if replacement
+    )
     corrected_document = Document(page_content=new_page_content, metadata=metadata)
     await store.aput(
         namespace, key=key, value={"document": corrected_document.to_json()}
@@ -1403,7 +1583,10 @@ async def apply_resolved_corrections(
         else:
             changes.append(
                 await _apply_fact_rewrite(
-                    store, match, resolved_edit.corrected_text, resolved_edit.corrected_context
+                    store,
+                    match,
+                    resolved_edit.corrected_text,
+                    resolved_edit.corrected_context,
                 )
             )
 
@@ -1414,7 +1597,9 @@ async def apply_resolved_corrections(
         ).append(resolved_edit)
     for (namespace, key), group in by_document.items():
         changes.append(
-            await _apply_sentence_redaction(store, namespace, key, group[0].match.item, group)
+            await _apply_sentence_redaction(
+                store, namespace, key, group[0].match.item, group
+            )
         )
 
     return changes
@@ -1447,44 +1632,45 @@ async def apply_fact_correction(
 
 
 class FactCorrection(BaseModel):
-    """Correct a previously stored fact about the ASSISTANT that the user says is wrong.
+    """Update or delete a fact ALREADY STORED about the avatar in the vectorstore.
 
-    Use ONLY when the user asserts that an existing/known fact about the avatar is
-    inaccurate AND supplies the correction. This is NOT for brand-new facts — those
-    still go to ``update_self_identity_mem_from_user_txt``.
+    Call this tool whenever the user says a fact the avatar already holds is wrong,
+    inaccurate, or never happened:
+      - to FIX the fact, set ``correction_kind='update'`` and supply the first-person
+        replacement in ``corrected_information``;
+      - to REMOVE the fact, set ``correction_kind='delete'`` and leave
+        ``corrected_information`` empty.
 
-    Call this tool ONCE FOR EACH DISTINCT inaccurate fact. A single user message often
-    corrects several independent facts ("my name is Shivon and I was never at the
-    University of Alberta" is TWO corrections); make one call per fact, never bundle
-    multiple distinct corrections into one call. Each call finds and edits every stored
-    copy of that ONE fact across all namespaces — so one call per fact, not one call per
-    stored document.
+    This tool is for facts the avatar ALREADY HOLDS. A brand-new fact the avatar does not
+    yet hold goes to ``update_self_identity_mem_from_user_txt`` instead. Decide by whether
+    the fact already exists about the avatar, not by surface words like "wrong" or
+    "nonsense".
 
-    correct_identity_fact IS USED TO EDIT OR DELETE FACTS IN THE VECTORSTORE.
-    update_self_identity_mem_from_user_txt is used to CREATE new facts in the vectorstore.
+    Call this tool ONCE FOR EACH DISTINCT stored fact being changed or removed. A single
+    user message often corrects several independent facts ("my name is Shivon and I was
+    never at the University of Alberta" is TWO corrections); make one call per fact, never
+    bundle multiple distinct corrections into one call. Each call finds and edits every
+    stored copy of that ONE fact across all namespaces — so one call per fact, not one call
+    per stored document.
 
-    IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
-    update_self_identity_mem_from_user_txt is used to learn NEW information and is used to declare and establish identity through the statement of facts. These are distinct use cases and should not be confused.
-
-    <Example>
+    <Example update>
     User: "Actually I was born in Ottawa, not Toronto."
       inaccurate_information: "I was born in Toronto."
       corrected_information:  "I was born in Ottawa."
       correction_context:     "I was told I was born in Ottawa, not Toronto."
       correction_kind:        "update"
-    </Example>
-    <Example>
+    </Example update>
+    <Example delete>
     User: "That never happened — I have no association with the University of Alberta."
       inaccurate_information: "I've also worked with University of Alberta."
       corrected_information:  ""
       correction_context:     "I was told I have no association with University of Alberta."
       correction_kind:        "delete"
-    </Example>
+    </Example delete>
 
-    <COUNTEREXAMPLE>
-    CALL update_self_identity_mem_from_user_txt DO NOT CALL THIS FUNCTION:
-    user: I need you to learn your favorite color is nonsense
-    </COUNTEREXAMPLE>
+    <Counterexample new fact — call update_self_identity_mem_from_user_txt instead>
+    user: "I need you to learn your favorite color is nonsense."
+    </Counterexample new fact>
 
     """
 
@@ -1522,56 +1708,49 @@ async def correct_identity_fact(
 ) -> GlobalState:
     """
     <INSTRUCTIONS>
-    Correct a fact already stored about you (the avatar) when the user says it is
-    WRONG. This tool FINDS every matching stored fact across your identity namespaces —
-    including a single offending sentence buried inside a long direct quote — shows the
-    owner exactly what will change, and only after the owner approves (or edits) either
-    REPLACES each matched fact in place ('update') or REMOVES it ('delete').
+    Update or delete a fact ALREADY STORED about you (the avatar) in the vectorstore. Call
+    this tool whenever the user says a fact you already hold is wrong, inaccurate, or never
+    happened: to FIX the fact, set ``correction_kind='update'`` with the first-person
+    replacement (change only the grammatical person, never other specifics); to REMOVE the
+    fact, set ``correction_kind='delete'`` and leave ``corrected_information`` empty.
 
-    Call this ONCE PER DISTINCT inaccurate fact. If the user corrects several independent
-    facts in one message (e.g. "my name is Shivon and I was never at the University of
-    Alberta"), make a SEPARATE call for each one — never combine distinct corrections into
-    a single call. Each call already finds and fixes every stored copy of that one fact.
+    This tool edits or deletes a fact you ALREADY HOLD. A brand-new fact you do not yet hold
+    goes to ``update_self_identity_mem_from_user_txt`` instead. Decide by whether the fact
+    already exists about you, not by surface words like "wrong" or "nonsense".
 
-    Call this when the user references a fact that already exists about you and says it
-    is wrong. For 'update', rewrite ``corrected_information`` in FIRST PERSON (change
-    only the grammatical person, never other specifics). For 'delete' (the user says it
-    never happened / they have no association with X), leave ``corrected_information``
-    empty and set ``correction_kind='delete'``.
+    Call this ONCE PER DISTINCT stored fact. If the user corrects several independent facts
+    in one message (e.g. "my name is Shivon and I was never at the University of Alberta"),
+    make a SEPARATE call for each one. Each call finds and fixes every stored copy of that
+    one fact across your identity namespaces — including a single offending sentence buried
+    inside a long direct quote.
 
     After you call this, the owner is shown each matched document individually and chooses,
     per document, to leave it unchanged (the default — falsely-retrieved documents are kept
     safe), accept the suggested in-place edit, rewrite it themselves, or remove it. They may
     also cancel the whole correction. Nothing is saved without the owner's per-document
     approval, so you do not need to enumerate the documents yourself.
-
-    correct_identity_fact IS USED TO EDIT OR DELETE FACTS IN THE VECTORSTORE.
-    update_self_identity_mem_from_user_txt is used to CREATE new facts in the vectorstore.
-
-    IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
-
-    <COUNTEREXAMPLE>
-        CALL update_self_identity_mem_from_user_txt DO NOT CALL THIS FUNCTION:
-        user: I need you to learn your favorite color is nonsense
-    </COUNTEREXAMPLE>
-
     </INSTRUCTIONS>
 
     <RESTRICTIONS>
     Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
     Do NOT use this for facts about the USER.
     Only the avatar's creator may correct its identity (enforced server-side).
-    IF THE CONTENT CONTAINS INFORMATION SUCH AS "nonsense" or another dismissive word, that word is NOT used as an indicator of the reason to call this tool and should not be an indicator nor non-reason for calling this tool exclusively. This tool is only used to correct misinformation or facts that the avatar already knows and delete information upon request.
-    update_self_identity_mem_from_user_txt is used to learn NEW information and is used to declare and establish identity through the statement of facts. These are distinct use cases and should not be confused.
     </RESTRICTIONS>
 
-    <EXAMPLE>
+    <EXAMPLE update>
     User: "That's wrong — I was actually born in Ottawa, not Toronto."
       inaccurate_information: "I was born in Toronto."
       corrected_information:  "I was born in Ottawa."
       correction_context:     "I was told I was born in Ottawa, not Toronto."
       correction_kind:        "update"
-    </EXAMPLE>
+    </EXAMPLE update>
+    <EXAMPLE delete>
+    User: "That never happened — I have no association with the University of Alberta."
+      inaccurate_information: "I've also worked with University of Alberta."
+      corrected_information:  ""
+      correction_context:     "I was told I have no association with University of Alberta."
+      correction_kind:        "delete"
+    </EXAMPLE delete>
 
     Args:
         inaccurate_information: The wrong claim (search query) phrased as the stored fact.
@@ -1582,7 +1761,9 @@ async def correct_identity_fact(
     logger.info("correct_identity_fact breakpoint")
 
     # Owner guard — only the avatar's creator may rewrite its identity.
-    assistant_owner_user_id = runtime.config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
+    assistant_owner_user_id = runtime.config["configurable"]["assistant_ctx"][
+        "metadata"
+    ]["user_id"]
     requester_user_id = runtime.config["configurable"]["user_id"]
     if assistant_owner_user_id != requester_user_id:
         return Command(
@@ -1596,12 +1777,14 @@ async def correct_identity_fact(
             }
         )
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
     creator_id = assistant_owner_user_id
 
-    #TODO The misinformation may not be in recent context, this is a stateless application that does not persist document ids; after a single question, the previous system_prompt and documents are lost.
+    # TODO The misinformation may not be in recent context, this is a stateless application that does not persist document ids; after a single question, the previous system_prompt and documents are lost.
     # state_docs = [
     #     *(runtime.state.get("assistant_identity_documents") or []),
     #     *(runtime.state.get("recalled_memory_documents") or []),
@@ -1777,6 +1960,7 @@ async def correct_identity_fact(
 # TODO: USE MEMORY RATHER THAN FILE SYSTEM
 from src.anubis.utils.utility import download_transcript, parse_vtt
 
+
 @tool
 async def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> str:
     """
@@ -1810,6 +1994,7 @@ async def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> 
 
     return transcript
 
+
 # TODO: IMAGE URL IDENTITY UPDATER
 
 # TODO: TEXT WEBPAGE URL IDENTITY UPDATER
@@ -1819,14 +2004,16 @@ async def get_transcript(url: str, lang: str = "en", save_txt: bool = False) -> 
 # is imported lazily inside ``update_identity_via_text_content_url`` (the only call
 # site) to keep ``langchain_unstructured`` off the cold-start path.  ``Document`` is
 # already imported at the top of this module.
+from uuid import NAMESPACE_URL, uuid4, uuid5
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
 from src.anubis.utils.prompts.system_prompts import FACT_FORMATTING_STRING_PROMPT
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from uuid import uuid4, uuid5, NAMESPACE_URL
+
 
 @tool
 async def update_identity_via_text_content_url(
-    url: str, 
-    runtime: Annotated[ToolRuntime, InjectedToolArg]
+    url: str, runtime: Annotated[ToolRuntime, InjectedToolArg]
 ):
     """This function is used to extract facts about a target individual from a website url. The website url contains only textual facts about this user.
     <RESTRICTIONS>
@@ -1839,7 +2026,7 @@ async def update_identity_via_text_content_url(
     </EXAMPLE>
 
     <EXAMPLE>
-    This is information about you:    
+    This is information about you:
     https://www.lexfridman.com/
     </EXAMPLE>
 
@@ -1854,52 +2041,85 @@ async def update_identity_via_text_content_url(
     Args:
         url (str): This is a url to a website.
     """
-    
+
     logger.info(f"breakpoint")
 
-    # Extract 
-    user_id = runtime.config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
-    assistant_id = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_id", "")
-    assistant_name = runtime.config.get("configurable", {}).get("assistant_ctx", {}).get("assistant_name", "")
+    # Extract
+    user_id = (
+        runtime.config.get("configurable", {}).get("user_ctx", {}).get("user_id", "")
+    )
+    assistant_id = (
+        runtime.config.get("configurable", {})
+        .get("assistant_ctx", {})
+        .get("assistant_id", "")
+    )
+    assistant_name = (
+        runtime.config.get("configurable", {})
+        .get("assistant_ctx", {})
+        .get("assistant_name", "")
+    )
 
-    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(runtime.config)
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
 
     # TODO: response_metrics_aggregation
     model = init_model()
-    
-    system_message = SystemMessage(content = FACT_FORMATTING_STRING_PROMPT.format(assistant_name=assistant_name))
+
+    system_message = SystemMessage(
+        content=FACT_FORMATTING_STRING_PROMPT.format(assistant_name=assistant_name)
+    )
 
     filename = url
     filename_uuid5 = uuid5(NAMESPACE_URL, url)
- 
+
     namespace = (user_id, assistant_id, "identity", filename_uuid5)
 
     from langchain_unstructured import UnstructuredLoader
 
     loader = UnstructuredLoader(web_url=url)
     docs = loader.load()
- 
+
     total_number_of_documents = len(docs)
     number_of_documents_to_format = 5
     for index in range(0, total_number_of_documents, number_of_documents_to_format):
-        retrieved_data = "\n\n".join([doc.page_content for doc in docs[index:index + number_of_documents_to_format]])
+        retrieved_data = "\n\n".join(
+            [
+                doc.page_content
+                for doc in docs[index : index + number_of_documents_to_format]
+            ]
+        )
         human_message = HumanMessage(content=retrieved_data)
         messages = [system_message, human_message]
         extracted_response = await model.ainvoke(input=messages)
         extracted_response_document = Document(page_content=extracted_response)
         key = str(uuid4())
-        extracted_response_document.metadata.update({"filename":filename, "user_id":user_id, "assistant_id": assistant_id, "filename_uuid5":filename_uuid5, "id":key})
+        extracted_response_document.metadata.update(
+            {
+                "filename": filename,
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "filename_uuid5": filename_uuid5,
+                "id": key,
+            }
+        )
         document_data_json = extracted_response_document.to_json()
         # Upload the document to the store
-        await runtime.store.aput(namespace, key=key, value={"document":document_data_json})
+        await runtime.store.aput(
+            namespace, key=key, value={"document": document_data_json}
+        )
 
 
 from src.anubis.utils.utility import image_to_text
+
+
 @tool
-async def update_identity_via_reference_image(message: HumanMessage, runtime: Annotated[ToolRuntime, InjectedToolArg]):
-    """ This tool is used when there is a single image in a message and the image is only of a single person. This will describe the image, store the image in base64 encoded format in the store, store the description in the identity namespace as a document, and return the document of the updated identity to update the list of assistant_identity_documents. The text description is moderated for content. """
+async def update_identity_via_reference_image(
+    message: HumanMessage, runtime: Annotated[ToolRuntime, InjectedToolArg]
+):
+    """This tool is used when there is a single image in a message and the image is only of a single person. This will describe the image, store the image in base64 encoded format in the store, store the description in the identity namespace as a document, and return the document of the updated identity to update the list of assistant_identity_documents. The text description is moderated for content."""
 
     content = getattr(message, "content")
     for message in content:

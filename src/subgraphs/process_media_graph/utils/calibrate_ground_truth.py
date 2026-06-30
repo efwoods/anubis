@@ -51,7 +51,9 @@ async def calibrate_ground_truth(
     features = await asyncio.to_thread(
         lambda: [extract_style_features(text) for text in page_contents]
     )
-    features_arr = np.array(pd.DataFrame(features).values)  # shape (n_obs/documents, n_features=33); ndarray so downstream .tolist()/np.concatenate work
+    features_arr = np.array(
+        pd.DataFrame(features).values
+    )  # shape (n_obs/documents, n_features=33); ndarray so downstream .tolist()/np.concatenate work
 
     # Map each document id to its feature row. features_arr rows are positionally
     # aligned with `documents`, so zip pairs each doc with its 1-D feature vector.
@@ -64,9 +66,13 @@ async def calibrate_ground_truth(
 
     # Namespace/key must match the reader in graph._attach_analyzed_features
     # and the deleter in webapp.delete_avatar_documents.
-    ground_truth_text_features_by_doc_id_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
+    ground_truth_text_features_by_doc_id_namespace = (
+        assistant_id,
+        GROUND_TRUTH_FEATURES_DICT_KEY,
+    )
     ground_truth_text_features_by_doc_id_ITEM = await store.aget(
-        ground_truth_text_features_by_doc_id_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY
+        ground_truth_text_features_by_doc_id_namespace,
+        key=GROUND_TRUTH_FEATURES_DICT_KEY,
     )
     ground_truth_text_features_by_doc_id_str = (
         getattr(ground_truth_text_features_by_doc_id_ITEM, "value", None) or {}
@@ -84,7 +90,9 @@ async def calibrate_ground_truth(
     await store.aput(
         ground_truth_text_features_by_doc_id_namespace,
         key=GROUND_TRUTH_FEATURES_DICT_KEY,
-        value={"value": serialize_features_by_doc_id(ground_truth_text_features_by_doc_id)},
+        value={
+            "value": serialize_features_by_doc_id(ground_truth_text_features_by_doc_id)
+        },
     )
 
     # Defer threshold/model calibration until the corpus is large enough for the
@@ -108,18 +116,29 @@ async def calibrate_ground_truth(
 
     # BUILD AND STORE STYLE PROFILE
     from src.anubis.utils.dataset.style_features import build_style_profile_str
+
     style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
     style_profile_namespace = (assistant_id, "style_profile")
-    await store.aput(style_profile_namespace, key="style_profile", value={"value":style_profile_str})
-
-    ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
     await store.aput(
-        ground_truth_text_empirical_threshold_namespace,
-        key="ground_truth_text_empirical_threshold_list_str", value={"value": ground_truth_text_empirical_threshold_list_str}
+        style_profile_namespace, key="style_profile", value={"value": style_profile_str}
     )
 
-    ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+    ground_truth_text_empirical_threshold_namespace = (
+        assistant_id,
+        "ground_truth_text_empirical_threshold_list_str",
+    )
+    await store.aput(
+        ground_truth_text_empirical_threshold_namespace,
+        key="ground_truth_text_empirical_threshold_list_str",
+        value={"value": ground_truth_text_empirical_threshold_list_str},
+    )
+
+    ground_truth_text_features_model_namespace = (
+        assistant_id,
+        "ground_truth_text_features_model_b64_pkl",
+    )
     await store.aput(
         ground_truth_text_features_model_namespace,
-        key="ground_truth_text_features_model_b64_pkl", value={"value": model_str_pkl}
+        key="ground_truth_text_features_model_b64_pkl",
+        value={"value": model_str_pkl},
     )

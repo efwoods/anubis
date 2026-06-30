@@ -9,31 +9,28 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from langgraph.graph import StateGraph, START, END
-
 # NOTE: ``retrieval_graph`` was imported here but never referenced in this module.
 # Runtime logs showed ``from ... retrieval_graph import retrieval_graph`` alone took
 # ~13 s per cold webapp worker because ``retrieval_graph`` pulls heavy retrieval deps.
-
 from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
 
 load_dotenv()
-
-from langchain_core.runnables import RunnableConfig, Runnable
-from src.anubis.utils.utility import (
-    extract_user_id_assistant_id,
-    configure_assistant_context,
-)
-
-from src.anubis.utils.schema import RouteDecision
-
-from pydantic import BaseModel, Field
-from typing import Literal
-from langgraph.types import Command, interrupt
 
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
+
+from langchain_core.runnables import Runnable, RunnableConfig
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field
+
+from src.anubis.utils.schema import RouteDecision
+from src.anubis.utils.utility import (
+    configure_assistant_context,
+    extract_user_id_assistant_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,33 +38,36 @@ logger = logging.getLogger(__name__)
 # imported here and below but never referenced in this file (the only
 # ``create_agent(...)`` site is commented out at ~line 313).  Removed to skip the
 # eager ``langchain.agents`` package load on every cold start.
+import pickle
 from typing import Any
 
+import numpy as np
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+)
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk
-from langgraph.runtime import Runtime
 from langgraph.config import get_stream_writer
+from langgraph.graph import MessagesState
+from langgraph.runtime import Runtime
 
-from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
-
-from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.deep_agent import build_avatar_deep_agent
+from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
 from src.anubis.utils.huggingface_prefetch import (
     ensure_huggingface_models_cached,
 )
+from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
+from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
+from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
+from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
+from src.anubis.utils.state import GlobalState
 from src.anubis.utils.utility import format_docs
 
-from langgraph.graph import MessagesState
-
-from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
-from src.anubis.utils.deep_agent import build_avatar_deep_agent
-from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
-from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
-from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
-import numpy as np
-import pickle
-
 """ NODES """
+
 
 def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
     """Merge streamed chunks into a single AIMessage for graph state."""
@@ -94,10 +94,14 @@ def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
     avatar_response.response_metadata.update({"sentiment": sentiment})
 
 
-async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime[GlobalContext], assistant_id: str) -> None:
-    """ analyze the avatar_response features, compare against unmodified chatgpt responses and any existing direct quotes if possible.
+async def _attach_analyzed_features(
+    avatar_response: AIMessage, runtime: Runtime[GlobalContext], assistant_id: str
+) -> None:
+    """analyze the avatar_response features, compare against unmodified chatgpt responses and any existing direct quotes if possible.
     Update the metadata with the feature analysis and the results of comparison.
     """
+    import json
+
     from src.anubis.utils.dataset.style_features import (
         GROUND_TRUTH_FEATURES_DICT_KEY,
         compute_mahalanobis_distance,
@@ -105,7 +109,6 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         extract_style_features,
         features_by_doc_id_to_arr,
     )
-    import json
 
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
 
@@ -117,87 +120,144 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
     try:
         baseline_features_namespace = ("baseline_features_arr_list_str",)
-        ground_truth_text_features_by_doc_id_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
-        ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
+        ground_truth_text_features_by_doc_id_namespace = (
+            assistant_id,
+            GROUND_TRUTH_FEATURES_DICT_KEY,
+        )
+        ground_truth_text_empirical_threshold_namespace = (
+            assistant_id,
+            "ground_truth_text_empirical_threshold_list_str",
+        )
 
-        baseline_features_arr_list_str_ITEM = await runtime.store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
+        baseline_features_arr_list_str_ITEM = await runtime.store.aget(
+            baseline_features_namespace, key="baseline_features_arr_list_str"
+        )
 
-        baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
+        baseline_features_arr_list_str = (
+            getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}
+        ).get("value", None)
 
         # If the baseline_features_arr has not yet been stored, store the array:
         if not baseline_features_arr_list_str:
-            _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
-            baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
+            _BASELINE_ANSWERS_RESPONSES_ARR_DIR = (
+                "src/anubis/utils/dataset/baseline_features_arr.npy"
+            )
+            baseline_features_arr = np.load(
+                _BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False
+            )
 
             baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
 
-            await runtime.store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
+            await runtime.store.aput(
+                baseline_features_namespace,
+                key="baseline_features_arr_list_str",
+                value={"value": baseline_features_arr_list_str},
+            )
 
         # Convert from str to np.array
         if isinstance(baseline_features_arr_list_str, str):
             baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
 
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
-        M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(features_arr, baseline_features_arr)
+        M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(
+            features_arr, baseline_features_arr
+        )
 
         # Explain the result
         from src.anubis.utils.utility import compute_shap_values_against_baseline
 
-        shap_values_dict = await compute_shap_values_against_baseline(features_arr, runtime.store)
+        shap_values_dict = await compute_shap_values_against_baseline(
+            features_arr, runtime.store
+        )
 
         # Nest the distance verdict together with the SHAP explanation under a single key
         # (verdict first to match the documented output order).
         comparison_to_unmodified_llm_response_analysis = {
-            "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_baseline_chatgpt[0] <= baseline_response_threshold),
+            "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(
+                M_d_square_synth_from_baseline_chatgpt[0] <= baseline_response_threshold
+            ),
             **shap_values_dict,
         }
-        avatar_response.response_metadata.update({"comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis})
+        avatar_response.response_metadata.update(
+            {
+                "comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis
+            }
+        )
 
         # Compare against ground truth quotes if available:
-        ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+        ground_truth_text_features_model_namespace = (
+            assistant_id,
+            "ground_truth_text_features_model_b64_pkl",
+        )
 
         ground_truth_text_features_model_b64_pkl_ITEM = await runtime.store.aget(
-            ground_truth_text_features_model_namespace, 
-            key="ground_truth_text_features_model_b64_pkl"
+            ground_truth_text_features_model_namespace,
+            key="ground_truth_text_features_model_b64_pkl",
         )
 
         ground_truth_text_features_by_doc_id_ITEM = await runtime.store.aget(
             ground_truth_text_features_by_doc_id_namespace,
-            key=GROUND_TRUTH_FEATURES_DICT_KEY
+            key=GROUND_TRUTH_FEATURES_DICT_KEY,
         )
 
         ground_truth_text_empirical_threshold_list_str_ITEM = await runtime.store.aget(
-            ground_truth_text_empirical_threshold_namespace, 
-            key="ground_truth_text_empirical_threshold_list_str"
+            ground_truth_text_empirical_threshold_namespace,
+            key="ground_truth_text_empirical_threshold_list_str",
         )
 
-        ground_truth_text_features_model_b64_pkl = (getattr(ground_truth_text_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_features_model_b64_pkl = (
+            getattr(ground_truth_text_features_model_b64_pkl_ITEM, "value", None) or {}
+        ).get("value", None)
 
-        ground_truth_text_features_by_doc_id_str = (getattr(ground_truth_text_features_by_doc_id_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_features_by_doc_id_str = (
+            getattr(ground_truth_text_features_by_doc_id_ITEM, "value", None) or {}
+        ).get("value", None)
 
-        ground_truth_text_empirical_threshold_list_str = (getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_empirical_threshold_list_str = (
+            getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None)
+            or {}
+        ).get("value", None)
 
         # Reconstruct the (n_docs, 33) corpus array from the per-document dict.
         ground_truth_text_features_arr = features_by_doc_id_to_arr(
             deserialize_features_by_doc_id(ground_truth_text_features_by_doc_id_str)
         )
 
-        if ground_truth_text_features_arr.shape[0] > 0 and ground_truth_text_empirical_threshold_list_str and ground_truth_text_features_model_b64_pkl:
-            import base64, shap, pandas as pd
+        if (
+            ground_truth_text_features_arr.shape[0] > 0
+            and ground_truth_text_empirical_threshold_list_str
+            and ground_truth_text_features_model_b64_pkl
+        ):
+            import base64
+
+            import pandas as pd
+            import shap
+
             from src.anubis.utils.dataset.style_features import FEATURE_NAMES
 
             if isinstance(ground_truth_text_empirical_threshold_list_str, str):
-                ground_truth_text_empirical_threshold = np.array(json.loads(ground_truth_text_empirical_threshold_list_str)).flatten()
+                ground_truth_text_empirical_threshold = np.array(
+                    json.loads(ground_truth_text_empirical_threshold_list_str)
+                ).flatten()
             else:
-                ground_truth_text_empirical_threshold = np.array(ground_truth_text_empirical_threshold_list_str).flatten()
+                ground_truth_text_empirical_threshold = np.array(
+                    ground_truth_text_empirical_threshold_list_str
+                ).flatten()
 
-            ground_truth_text_features_model = pickle.loads(base64.b64decode(ground_truth_text_features_model_b64_pkl))
-            
+            ground_truth_text_features_model = pickle.loads(
+                base64.b64decode(ground_truth_text_features_model_b64_pkl)
+            )
+
             # Compute the difference between the synthetic text and the direct quotes.
-            M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(features_arr, ground_truth_text_features_arr)
+            M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(
+                features_arr, ground_truth_text_features_arr
+            )
 
             # Predict and explain the classification
-            ground_truth_prediction = bool(ground_truth_text_features_model.predict(features_arr.reshape(1,-1))==1)
+            ground_truth_prediction = bool(
+                ground_truth_text_features_model.predict(features_arr.reshape(1, -1))
+                == 1
+            )
 
             # KernelExplainer weights model.predict over EVERY background row per
             # explanation, so passing the full corpus (which can be thousands of
@@ -208,24 +268,41 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 if ground_truth_text_features_arr.shape[0] > 100
                 else ground_truth_text_features_arr
             )
-            explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, shap_background)
-            ground_truth_shap_values = explainer.shap_values(features_arr.reshape(1,-1))
+            explainer = shap.KernelExplainer(
+                ground_truth_text_features_model.predict, shap_background
+            )
+            ground_truth_shap_values = explainer.shap_values(
+                features_arr.reshape(1, -1)
+            )
             # shap_values for a single sample comes back shaped (1, 33); flatten to
             # (33,) so it aligns with the 33-row FEATURE_NAMES index (the DataFrame
             # expects (n_features, 1), not (1, n_features)).
             ground_truth_shap_values = np.asarray(ground_truth_shap_values).ravel()
-            ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
+            ground_truth_shap_values_df = pd.DataFrame(
+                data=ground_truth_shap_values,
+                index=FEATURE_NAMES,
+                columns=["ground_truth_shap_values"],
+            )
 
-            ground_truth_shap_values_dict = ground_truth_shap_values_df[ground_truth_shap_values_df['ground_truth_shap_values']!=0].to_dict()
+            ground_truth_shap_values_dict = ground_truth_shap_values_df[
+                ground_truth_shap_values_df["ground_truth_shap_values"] != 0
+            ].to_dict()
 
             # Nest the distance verdict, SHAP explanation, and isolation-forest verdict under a single key.
             comparison_to_direct_quote_response_analysis = {
-                "no_statistically_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold),
+                "no_statistically_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(
+                    M_d_square_synth_from_ground_truth_corpus[0]
+                    < ground_truth_text_empirical_threshold
+                ),
                 "no_statisically_significant_difference_between_sample_and_direct_quotes_dataset_according_to_isolation_forest": ground_truth_prediction,
                 "ground_truth_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from direct quotes dataset. Positive values indicate similarity to direct quotes. Scale is -1 to 1.",
                 **ground_truth_shap_values_dict,
             }
-            avatar_response.response_metadata.update({"comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis})
+            avatar_response.response_metadata.update(
+                {
+                    "comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis
+                }
+            )
 
     except Exception as e:
         # Post-stream analysis is best-effort: the user has already received the
@@ -335,6 +412,7 @@ async def terms_and_services_content_moderation(
     }
     return {"moderation_response": moderation_response}
 
+
 def _deep_agent_config(
     config: RunnableConfig, turn_key: int
 ) -> tuple[RunnableConfig, str | None]:
@@ -368,7 +446,9 @@ def _deep_agent_config(
     return deep_agent_config, outer_thread
 
 
-async def _stream_deep_agent(deep_agent, agent_input, deep_agent_config, context, writer):
+async def _stream_deep_agent(
+    deep_agent, agent_input, deep_agent_config, context, writer
+):
     """Run the deep agent (fresh input or ``Command(resume=...)``), streaming only
     the final user-visible reply's tokens. Returns the deep agent's terminal state
     dict (carrying ``messages`` + identity-doc snapshots), or ``None`` if it produced
@@ -464,9 +544,7 @@ async def think(
         "assistant_identity_documents": list(
             state.get("assistant_identity_documents") or []
         ),
-        "recalled_memory_documents": list(
-            state.get("recalled_memory_documents") or []
-        ),
+        "recalled_memory_documents": list(state.get("recalled_memory_documents") or []),
         "user_state": state["user_state"],
         "assistant_state": state["assistant_state"],
         "internal_thoughts": [],
@@ -504,7 +582,11 @@ async def think(
         if pending_interrupts:
             decision = interrupt(pending_interrupts[0].value)
             final_output = await _stream_deep_agent(
-                deep_agent, Command(resume=decision), deep_agent_config, runtime.context, writer
+                deep_agent,
+                Command(resume=decision),
+                deep_agent_config,
+                runtime.context,
+                writer,
             )
 
     if final_output is None:
@@ -530,8 +612,11 @@ async def think(
     # target author + ChatGPT baseline and attach to response_metadata. The
     # user has seen the reply by now, so this adds no perceived latency.
     if config.get("configurable", {}).get("include_metrics", False):
-        await _attach_analyzed_features(final_message, runtime=runtime, assistant_id=state['assistant_state']['assistant_id'])
-
+        await _attach_analyzed_features(
+            final_message,
+            runtime=runtime,
+            assistant_id=state["assistant_state"]["assistant_id"],
+        )
 
     update: dict[str, Any] = {
         "messages": [final_message],
@@ -548,6 +633,7 @@ async def think(
             update[key] = final_output[key]
 
     return update
+
 
 """ GRAPH """
 
@@ -589,9 +675,7 @@ message_workflow = StateGraph(
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
-message_workflow.add_node(
-    "resolve_human_message_images", resolve_human_message_images
-)
+message_workflow.add_node("resolve_human_message_images", resolve_human_message_images)
 message_workflow.add_node("anubis", anubis)
 
 message_workflow.add_edge(START, "chat")

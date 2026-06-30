@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.documents import Document
-from src.anubis.utils.tokenizer import count_tokens
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.store.base import BaseStore
 
 from src.anubis.utils.classes.ContentSituationClassificationClass import (
     ContentSituationClassificationClass,
@@ -18,7 +18,7 @@ from src.anubis.utils.classes.FirstPersonRewriterClass import (
 from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
     ReferenceDocumentClassificationClass,
 )
-from langgraph.store.base import BaseStore
+from src.anubis.utils.tokenizer import count_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,9 @@ def _coerce_classification_input_to_string(content: Any) -> str:
         return str(content)
 
 
-def _classification_slice(text: str, limit: int = CLASSIFICATION_INPUT_CHAR_LIMIT) -> str:
+def _classification_slice(
+    text: str, limit: int = CLASSIFICATION_INPUT_CHAR_LIMIT
+) -> str:
     return text[:limit] if len(text) > limit else text
 
 
@@ -65,7 +67,7 @@ def normal_chunking(
         texts = text_content
     else:
         texts = [text_content]
-    
+
     texts = list(set([text.strip() for text in texts if text.strip()]))
 
     docs = text_splitter.create_documents(texts=texts, metadatas=[metadata])
@@ -218,6 +220,7 @@ def _is_quotes_per_line_text(text: str) -> bool:
             discrete += 1
     return (discrete / len(non_empty)) >= 0.7
 
+
 def _build_quote_documents_per_line(
     text_content: str,
     user_id: str,
@@ -310,7 +313,9 @@ async def _build_identity_documents_from_facts(
         (f.get("rewritten_statement") or "").strip() for f in facts
     ]
     rewriter = FirstPersonRewriterClass()
-    rewriter_response = await rewriter.rewrite(rewritten_inputs, concise_context_summary=concise_context_summary)
+    rewriter_response = await rewriter.rewrite(
+        rewritten_inputs, concise_context_summary=concise_context_summary
+    )
     statements = rewriter_response.get("statements") or []
 
     item_metadata = media_item.get("metadata", {}) or {}
@@ -324,9 +329,18 @@ async def _build_identity_documents_from_facts(
         if idx >= len(statements):
             break
         stmt = statements[idx] or {}
-        first_person = (stmt.get("first_person_statement") or "").strip() 
+        first_person = (stmt.get("first_person_statement") or "").strip()
         if first_person != "":
-            first_person = "<FACT_CONTEXT_AND_FACT>" + " <FACT_CONTEXT>" + (concise_context_summary.strip()) + "</FACT_CONTEXT>" + "<FACT>" + first_person + "</FACT>" + "</FACT_CONTEXT_AND_FACT>"
+            first_person = (
+                "<FACT_CONTEXT_AND_FACT>"
+                + " <FACT_CONTEXT>"
+                + (concise_context_summary.strip())
+                + "</FACT_CONTEXT>"
+                + "<FACT>"
+                + first_person
+                + "</FACT>"
+                + "</FACT_CONTEXT_AND_FACT>"
+            )
 
         if not first_person:
             continue
@@ -387,7 +401,7 @@ async def _build_biographical_identity_documents(
         media_item=media_item,
         original_statement=fact_response.get("original_statement", ""),
         target_name=fact_response.get("target_name") or target_name,
-        concise_context_summary = fact_response.get("concise_context_summary", "")
+        concise_context_summary=fact_response.get("concise_context_summary", ""),
     )
 
 
@@ -619,7 +633,9 @@ def _build_adapter_dialogue_document(
     source = item_metadata.get("source") or filename or "user_upload"
     current_timestamp = datetime.now(tz=timezone.utc).isoformat()
 
-    speakers_seen = sorted({seg.get("speaker") for seg in dialogue_segments if seg.get("speaker")})
+    speakers_seen = sorted(
+        {seg.get("speaker") for seg in dialogue_segments if seg.get("speaker")}
+    )
 
     return Document(
         page_content=json.dumps({"messages": role_messages}, ensure_ascii=False),
@@ -728,9 +744,7 @@ async def _attach_target_analysis_context(
     if missing:
         from src.anubis.utils.dataset.formatting import create_question_list
 
-        synth = await create_question_list(
-            [d.page_content or "" for d in missing]
-        )
+        synth = await create_question_list([d.page_content or "" for d in missing])
         synthetic_iter = iter(synth)
 
     for doc in target_quote_docs:
@@ -886,9 +900,7 @@ async def process_nontarget_text_to_identity_documents(
     if not (text_content or "").strip():
         return []
 
-    namespace_filename = media_item.get("metadata", {}).get(
-        "namespace_filename", ""
-    )
+    namespace_filename = media_item.get("metadata", {}).get("namespace_filename", "")
     try:
         documents = await _build_biographical_identity_documents(
             text_content=text_content,
@@ -907,6 +919,7 @@ async def process_nontarget_text_to_identity_documents(
     for document in documents:
         document.metadata.update({"namespace_filename": namespace_filename})
     return documents
+
 
 async def process_text_to_document(
     metadata,
@@ -937,9 +950,7 @@ async def process_text_to_document(
     """
     logger.info("process_text_to_document entrypoint")
 
-    text_content = _coerce_classification_input_to_string(
-        media_item.get("content", "")
-    )
+    text_content = _coerce_classification_input_to_string(media_item.get("content", ""))
     classification_input = _classification_slice(text_content)
     namespace_filename = media_item.get("metadata", {}).get("namespace_filename", "")
 
@@ -955,7 +966,9 @@ async def process_text_to_document(
     reference_reasoning = reference_response.get("reasoning", "")
 
     if is_menu_or_religious_text and namespace_hint is None:
-        logger.info("Reference document detected (menu/holy text) -> document namespace")
+        logger.info(
+            "Reference document detected (menu/holy text) -> document namespace"
+        )
         classification_metadata = {
             "classified_situation": "proprietary_content",
             "reference_classification_reasoning": reference_reasoning,
@@ -970,7 +983,12 @@ async def process_text_to_document(
             namespace=namespace_hint or "document",
         )
         for document in documents:
-            document.metadata.update({"vectorstore_acceptable": True, "namespace_filename": namespace_filename})
+            document.metadata.update(
+                {
+                    "vectorstore_acceptable": True,
+                    "namespace_filename": namespace_filename,
+                }
+            )
         return documents
 
     situation_classifier = ContentSituationClassificationClass()
@@ -1016,7 +1034,7 @@ async def process_text_to_document(
                 media_item=media_item,
                 target_name=target_name,
             )
-            # Expected metadata: 
+            # Expected metadata:
             # analysis_acceptable: True
             # namespace: identity (statements in first person about the target)
             # Analysis acceptable: True
@@ -1041,7 +1059,7 @@ async def process_text_to_document(
             )
             # Fall through to chunked path so we still capture content.
 
-    # Handle quotes-per-line text document 
+    # Handle quotes-per-line text document
     item_metadata = media_item.get("metadata", {}) or {}
     explicit_quotes_per_line = bool(item_metadata.get("quotes_per_line"))
     quotes_per_line_detected = (
@@ -1049,7 +1067,9 @@ async def process_text_to_document(
         and _is_quotes_per_line_text(text_content)
     )
 
-    if (explicit_quotes_per_line or quotes_per_line_detected) and target_namespace == "quote":
+    if (
+        explicit_quotes_per_line or quotes_per_line_detected
+    ) and target_namespace == "quote":
         logger.info(
             "Detected quotes-per-line text (explicit=%s, heuristic=%s) -> 1 Document/line",
             explicit_quotes_per_line,
@@ -1065,10 +1085,15 @@ async def process_text_to_document(
             classification_metadata=classification_metadata,
         )
         """ CALIBRATE GROUND TRUTH """
-        from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-        await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents)
-        
-        # Expected metadata (treated same as quotes below in next classified situation; only target information): 
+        from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import (
+            calibrate_ground_truth,
+        )
+
+        await calibrate_ground_truth(
+            store=store, assistant_id=assistant_id, documents=documents
+        )
+
+        # Expected metadata (treated same as quotes below in next classified situation; only target information):
         # vectorstore_acceptable: True
         # adapter_acceptable: True
         # adapter_formatted: False
@@ -1092,11 +1117,11 @@ async def process_text_to_document(
                 {
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": classified_situation
-                    in ("monologue","tweets_or_quotes"),
-                    "adapter_formatted": False, # will be processed to create prompt synthetic questions for the adapter namespace
+                    in ("monologue", "tweets_or_quotes"),
+                    "adapter_formatted": False,  # will be processed to create prompt synthetic questions for the adapter namespace
                     "analysis_acceptable": True,
                     "synthetic": False,
-                    "namespace_filename": namespace_filename, # identity namespace
+                    "namespace_filename": namespace_filename,  # identity namespace
                 }
             )
 

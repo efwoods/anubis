@@ -45,27 +45,27 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 # ---------------------------------------------------------------------------
 FEATURE_NAMES: List[str] = [
     # ── Lexical diversity (7) ──────────────────────────────────────────────
-    "type_token_ratio",                    # unique words / total words (length-biased)
-    "moving_average_ttr",                  # TTR averaged over a sliding window (length-robust)
-    "mtld_lexical_diversity",              # Measure of Textual Lexical Diversity
-    "hdd_lexical_diversity",               # Hypergeometric Distribution Diversity (HD-D)
-    "maas_lexical_diversity",              # Maas index a^2 (log-curve fit of TTR vs length)
-    "yule_characteristic_k",               # Yule's K — vocabulary repetition, length-stable
+    "type_token_ratio",  # unique words / total words (length-biased)
+    "moving_average_ttr",  # TTR averaged over a sliding window (length-robust)
+    "mtld_lexical_diversity",  # Measure of Textual Lexical Diversity
+    "hdd_lexical_diversity",  # Hypergeometric Distribution Diversity (HD-D)
+    "maas_lexical_diversity",  # Maas index a^2 (log-curve fit of TTR vs length)
+    "yule_characteristic_k",  # Yule's K — vocabulary repetition, length-stable
     "lexical_density_content_word_ratio",  # content words / all words
     # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
-    "noun_density",                        # share of tokens tagged noun
-    "verb_density",                        # share of tokens tagged verb
-    "adjective_density",                   # share of tokens tagged adjective
-    "adverb_density",                      # share of tokens tagged adverb
-    "pronoun_density",                     # share of tokens tagged pronoun
-    "preposition_density",                 # share of tokens tagged preposition
-    "noun_to_verb_ratio",                  # nominal (high) vs verbal/conversational (low) style
-    "pos_sequence_compressibility",        # gzip ratio of the POS-tag stream (template reuse proxy)
+    "noun_density",  # share of tokens tagged noun
+    "verb_density",  # share of tokens tagged verb
+    "adjective_density",  # share of tokens tagged adjective
+    "adverb_density",  # share of tokens tagged adverb
+    "pronoun_density",  # share of tokens tagged pronoun
+    "preposition_density",  # share of tokens tagged preposition
+    "noun_to_verb_ratio",  # nominal (high) vs verbal/conversational (low) style
+    "pos_sequence_compressibility",  # gzip ratio of the POS-tag stream (template reuse proxy)
     # ── Sentence shape (4) ─────────────────────────────────────────────────
-    "mean_sentence_length_words",          # average words per sentence
-    "stdev_sentence_length_words",         # sentence-length variability (rhythm)
-    "interrogative_sentence_ratio",        # share of sentences ending in '?'
-    "exclamatory_sentence_ratio",          # share of sentences ending in '!'
+    "mean_sentence_length_words",  # average words per sentence
+    "stdev_sentence_length_words",  # sentence-length variability (rhythm)
+    "interrogative_sentence_ratio",  # share of sentences ending in '?'
+    "exclamatory_sentence_ratio",  # share of sentences ending in '!'
     # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
     "comma_rate_per_1k",
     "semicolon_rate_per_1k",
@@ -75,15 +75,15 @@ FEATURE_NAMES: List[str] = [
     "exclamation_rate_per_1k",
     "question_mark_rate_per_1k",
     # ── Surface / flow (3) ─────────────────────────────────────────────────
-    "all_caps_word_ratio",                 # SHOUTING / emphasis habit
-    "words_per_paragraph",                 # internet writing = short paragraphs
-    "transition_word_rate_per_1k",         # logical-bridge words per 1k (however, therefore, …)
+    "all_caps_word_ratio",  # SHOUTING / emphasis habit
+    "words_per_paragraph",  # internet writing = short paragraphs
+    "transition_word_rate_per_1k",  # logical-bridge words per 1k (however, therefore, …)
     # ── Readability composites via textstat (3) ────────────────────────────
-    "flesch_kincaid_grade",                # words/sentence + syllables/word -> US grade
-    "gunning_fog_index",                   # sentence length + % complex words
-    "smog_index",                          # polysyllable-count grade estimate
+    "flesch_kincaid_grade",  # words/sentence + syllables/word -> US grade
+    "gunning_fog_index",  # sentence length + % complex words
+    "smog_index",  # polysyllable-count grade estimate
     # ── Information theory (1) ─────────────────────────────────────────────
-    "lexical_entropy_bits",                # Shannon entropy of the word distribution
+    "lexical_entropy_bits",  # Shannon entropy of the word distribution
 ]
 
 assert len(FEATURE_NAMES) == 33, f"expected 33 features, found {len(FEATURE_NAMES)}"
@@ -136,7 +136,9 @@ FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
     "lexical_entropy_bits": "Lexical Entropy (bits)",
 }
 
-assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
+assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), (
+    f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
+)
 
 # One-line plain-language description per feature, written for the LLM that reads
 # the style profile. Each states the unit/range, the typical band, and crucially
@@ -188,7 +190,9 @@ FEATURE_DESCRIPTIONS: Dict[str, str] = {
     "lexical_entropy_bits": "Shannon entropy of the word-frequency distribution, in bits. 0 or greater and grows with vocabulary size (~4–10+ bits common). Higher means less predictable, more varied word choice; lower means repetitive, predictable wording.",
 }
 
-assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
+assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), (
+    f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -198,20 +202,32 @@ assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_
 # Logical "bridge" words counted for transition density.
 _TRANSITION_WORDS = frozenset(
     {
-        "however", "therefore", "furthermore", "moreover", "nevertheless",
-        "consequently", "meanwhile", "conversely", "thus", "hence",
-        "accordingly", "additionally", "similarly", "instead", "otherwise",
+        "however",
+        "therefore",
+        "furthermore",
+        "moreover",
+        "nevertheless",
+        "consequently",
+        "meanwhile",
+        "conversely",
+        "thus",
+        "hence",
+        "accordingly",
+        "additionally",
+        "similarly",
+        "instead",
+        "otherwise",
         "subsequently",
     }
 )
 
 # Penn-Treebank tag prefixes -> coarse POS class. nltk.pos_tag emits PTB tags.
-_NOUN_TAGS = ("NN",)                       # NN, NNS, NNP, NNPS
-_VERB_TAGS = ("VB",)                       # VB, VBD, VBG, VBN, VBP, VBZ
-_ADJECTIVE_TAGS = ("JJ",)                  # JJ, JJR, JJS
-_ADVERB_TAGS = ("RB",)                     # RB, RBR, RBS
-_PRONOUN_TAGS = ("PRP", "WP")              # PRP, PRP$, WP, WP$
-_PREPOSITION_TAGS = ("IN", "TO")           # IN (prep/subord-conj), TO
+_NOUN_TAGS = ("NN",)  # NN, NNS, NNP, NNPS
+_VERB_TAGS = ("VB",)  # VB, VBD, VBG, VBN, VBP, VBZ
+_ADJECTIVE_TAGS = ("JJ",)  # JJ, JJR, JJS
+_ADVERB_TAGS = ("RB",)  # RB, RBR, RBS
+_PRONOUN_TAGS = ("PRP", "WP")  # PRP, PRP$, WP, WP$
+_PREPOSITION_TAGS = ("IN", "TO")  # IN (prep/subord-conj), TO
 
 _URL_RE = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\w+")
@@ -223,7 +239,7 @@ _PUNCTUATION_MARKS: Dict[str, str] = {
     "comma_rate_per_1k": ",",
     "semicolon_rate_per_1k": ";",
     "colon_rate_per_1k": ":",
-    "dash_rate_per_1k": "—–-",   # em dash, en dash, hyphen-minus
+    "dash_rate_per_1k": "—–-",  # em dash, en dash, hyphen-minus
     "ellipsis_rate_per_1k": "…",
     "exclamation_rate_per_1k": "!",
     "question_mark_rate_per_1k": "?",
@@ -277,7 +293,9 @@ def _sentences(text: str) -> List[str]:
 
         sents = [s for s in sent_tokenize(text or "") if s.strip()]
     except Exception:
-        sents = [s.strip() for s in _SENTENCE_FALLBACK_RE.split(text or "") if s.strip()]
+        sents = [
+            s.strip() for s in _SENTENCE_FALLBACK_RE.split(text or "") if s.strip()
+        ]
     return sents or ([text.strip()] if (text or "").strip() else [])
 
 
@@ -293,11 +311,11 @@ def extract_style_features(text: str) -> Dict[str, float]:
     metric that cannot be computed on the given text yields ``nan`` rather than
     raising, so a single short document never breaks a batch.
 
-    FUTURE DIRECTION asdf : 
+    FUTURE DIRECTION asdf :
         character n-grams
         word n-grams
         function word frequencies
-        punctuation frequencies 
+        punctuation frequencies
         lexical richness (vocab size): unique_words vs. total_words
         (FIND AND STORE KEY PHRASES) such as "you know" "got it." "what do ya mean?"
         average sentence length (words_per_sentence)
@@ -320,7 +338,7 @@ def extract_style_features(text: str) -> Dict[str, float]:
     # that most lexical metrics operate on.
     words = word_tokenize(cleaned)
     alpha_words = _word_tokens(cleaned)
-    alpha_count = len(alpha_words) or 1            # guard divisions by zero
+    alpha_count = len(alpha_words) or 1  # guard divisions by zero
     per_thousand = 1000.0 / alpha_count
     sentences = _sentences(cleaned)
     sentence_count = len(sentences) or 1
@@ -406,9 +424,9 @@ def extract_style_features(text: str) -> Dict[str, float]:
         )
 
     # ── E. SURFACE / FLOW ──────────────────────────────────────────────────
-    features["all_caps_word_ratio"] = (
-        sum(1 for w in words if w.isupper() and len(w) > 1) / (len(words) or 1)
-    )
+    features["all_caps_word_ratio"] = sum(
+        1 for w in words if w.isupper() and len(w) > 1
+    ) / (len(words) or 1)
     paragraphs = [p for p in re.split(r"\n\s*\n", cleaned) if p.strip()] or [cleaned]
     features["words_per_paragraph"] = alpha_count / len(paragraphs)
     features["transition_word_rate_per_1k"] = (
@@ -421,9 +439,7 @@ def extract_style_features(text: str) -> Dict[str, float]:
     features["flesch_kincaid_grade"] = _safe(
         lambda: float(textstat.flesch_kincaid_grade(cleaned))
     )
-    features["gunning_fog_index"] = _safe(
-        lambda: float(textstat.gunning_fog(cleaned))
-    )
+    features["gunning_fog_index"] = _safe(lambda: float(textstat.gunning_fog(cleaned)))
     features["smog_index"] = _safe(lambda: float(textstat.smog_index(cleaned)))
 
     # ── G. INFORMATION THEORY ──────────────────────────────────────────────
@@ -481,10 +497,12 @@ def _population_stdev(values: Sequence[float], mean: float) -> float:
         return 0.0
     return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
 
-from sklearn.preprocessing import StandardScaler
+
 import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
+from sklearn.preprocessing import StandardScaler
+
 
 def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
     """Compute Mahalanobis distance between synthetic features and reference features of a dataset.
@@ -508,18 +526,30 @@ def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
     if synthetic_features.ndim > 1:
         for synthetic_feature_index in range(0, synthetic_features.shape[0]):
             synthetic_feature = synthetic_features[synthetic_feature_index, :]
-            synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
+            synth_scaled = scaler.transform(synthetic_feature.reshape(1, -1))
             synth_scaled_flattened = synth_scaled.flatten()
             synth_scaled_series = pd.Series(synth_scaled_flattened)
 
-            M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
+            M_d = np.dot(
+                np.dot(
+                    (synth_scaled_series - corpus_scaled_mean_series).T,
+                    corpus_scaled_reg_cov_inv,
+                ),
+                (synth_scaled_series - corpus_scaled_mean_series),
+            )
             M_d_arr.append(M_d)
     else:
         synthetic_feature = synthetic_features
-        synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
+        synth_scaled = scaler.transform(synthetic_feature.reshape(1, -1))
         synth_scaled_flattened = synth_scaled.flatten()
         synth_scaled_series = pd.Series(synth_scaled_flattened)
-        M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
+        M_d = np.dot(
+            np.dot(
+                (synth_scaled_series - corpus_scaled_mean_series).T,
+                corpus_scaled_reg_cov_inv,
+            ),
+            (synth_scaled_series - corpus_scaled_mean_series),
+        )
         M_d_arr.append(M_d)
 
     return M_d_arr
@@ -539,10 +569,10 @@ def compute_empirical_distribution(reference_dataset_arr):
 
     for i in range(0, reference_dataset_df.values.shape[0]):
         data = reference_dataset_df.values[i, :]
-        corpus = reference_dataset_df.drop(reference_dataset_df.index[i])    
+        corpus = reference_dataset_df.drop(reference_dataset_df.index[i])
         corpus_scaled = scaler.fit_transform(corpus.values)
         corpus_scaled_mean = np.mean(corpus_scaled, axis=0)
-        corpus_scaled_reg = LedoitWolf().fit(corpus_scaled)    
+        corpus_scaled_reg = LedoitWolf().fit(corpus_scaled)
         corpus_scaled_reg_cov_inv = np.linalg.inv(corpus_scaled_reg.covariance_)
 
         data_scaled = scaler.transform(data.reshape(1, -1))
@@ -550,8 +580,16 @@ def compute_empirical_distribution(reference_dataset_arr):
 
         data_scaled_series = pd.Series(data_scaled)
         corpus_scaled_mean_series = pd.Series(corpus_scaled_mean)
-        
-        M_d_squared_arr.append(np.dot(np.dot((data_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (data_scaled_series - corpus_scaled_mean_series)))
+
+        M_d_squared_arr.append(
+            np.dot(
+                np.dot(
+                    (data_scaled_series - corpus_scaled_mean_series).T,
+                    corpus_scaled_reg_cov_inv,
+                ),
+                (data_scaled_series - corpus_scaled_mean_series),
+            )
+        )
 
     return M_d_squared_arr
 
@@ -627,7 +665,9 @@ def features_by_doc_id_to_arr(features_by_doc_id: Dict[str, Any]) -> Any:
 MAX_CALIBRATION_ROWS = 1500
 
 
-def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tuple[str, str]:
+def recompute_ground_truth_artifacts(
+    ground_truth_text_features_arr: Any,
+) -> Tuple[str, str]:
     """Recalibrate the empirical threshold and IsolationForest from the corpus.
 
     Given the reconstructed ``(n_docs, 33)`` corpus array, returns
@@ -662,7 +702,9 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
     ground_truth_empirical_arr = compute_empirical_distribution(calibration_arr)
     ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
     ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
-    ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
+    ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (
+        ground_truth_Q3 - ground_truth_Q1
+    )
 
     # Recalibrate the Isolation Forest for prediction and explainable values.
     model = IsolationForest().fit(calibration_arr)
@@ -674,24 +716,27 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
 
     return ground_truth_text_empirical_threshold_list_str, model_b64_pkl
 
-async def build_style_profile_str(ground_truth_text_features_arr) -> str:
-    """ Build the LLM interpretable string to allow for the 
-    median calculated features of the direct quotes of the 
-    target to influence the writing of the avatar. 
-    Allows the features to be LLM legible. 
-    """
-    import pandas as pd
-    import numpy as np
 
-    ground_truth_text_features_median = np.array(list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values))
-    
+async def build_style_profile_str(ground_truth_text_features_arr) -> str:
+    """Build the LLM interpretable string to allow for the
+    median calculated features of the direct quotes of the
+    target to influence the writing of the avatar.
+    Allows the features to be LLM legible.
+    """
+    import numpy as np
+    import pandas as pd
+
+    ground_truth_text_features_median = np.array(
+        list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values)
+    )
+
     # ground_truth_text_features_median expected shape: (n_features, )
-    
+
     style_profile_str = ""
 
     idx = 0
     for name in FEATURE_NAMES:
         style_profile_str += f"{FEATURE_NAMES_HUMAN_LEGIBLE[name]}: {ground_truth_text_features_median[idx]}; Description: {FEATURE_DESCRIPTIONS[name]}\n\n"
-        idx +=1
+        idx += 1
 
     return style_profile_str

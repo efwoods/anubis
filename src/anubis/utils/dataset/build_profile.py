@@ -113,6 +113,8 @@ def load_baseline_profile() -> Optional[Dict[str, Any]]:
         with open(_BASELINE_PROFILE_PATH, encoding="utf-8") as handle:
             _BASELINE_PROFILE_CACHE = json.load(handle)
     except (OSError, ValueError) as exc:
-        logger.warning("Could not load baseline profile at %s: %s", _BASELINE_PROFILE_PATH, exc)
+        logger.warning(
+            "Could not load baseline profile at %s: %s", _BASELINE_PROFILE_PATH, exc
+        )
         return None
     return _BASELINE_PROFILE_CACHE

@@ -46,9 +46,12 @@ def _stub_model(monkeypatch, verdict: bool) -> _FakeModel:
 
 def test_extract_message_text_handles_str_and_blocks():
     assert _extract_message_text("hello") == "hello"
-    assert _extract_message_text(
-        [{"type": "text", "text": "a"}, "b", {"type": "image", "url": "x"}]
-    ) == "a b"
+    assert (
+        _extract_message_text(
+            [{"type": "text", "text": "a"}, "b", {"type": "image", "url": "x"}]
+        )
+        == "a b"
+    )
     assert _extract_message_text(None) == ""
 
 
@@ -66,7 +69,12 @@ def test_latest_user_message_text_picks_most_recent_human_message():
 @pytest.mark.asyncio
 async def test_grounds_fact_passes_through_true_verdict(monkeypatch):
     model = _stub_model(monkeypatch, verdict=True)
-    assert await _user_message_grounds_fact("I grew up in Markham.", "I grew up in Markham.") is True
+    assert (
+        await _user_message_grounds_fact(
+            "I grew up in Markham.", "I grew up in Markham."
+        )
+        is True
+    )
     # The proposed fact and the user message are both handed to the verifier.
     (system_message, human_message) = model.calls[0]
     assert isinstance(system_message, SystemMessage)

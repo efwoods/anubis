@@ -22,7 +22,6 @@ from pydantic import BaseModel
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.model import init_model
 
-
 """ LLAMA 4 ADAPTER TRAINING FORMAT """
 
 
@@ -104,6 +103,7 @@ _PER_LINE_SYSTEM_PROMPT = (
     "('you', 'your'). Return only the question."
 )
 
+
 async def generate_question_for_message(message_str: str) -> str:
     """Generate a single user prompt for a single assistant response.
 
@@ -164,12 +164,8 @@ async def build_adapter_and_langsmith_for_quotes(
         prompts = list(prompts) + [None] * (len(quotes) - len(prompts))
 
     # Synthesize a question only where no real prompt was supplied.
-    missing_idx = [
-        i for i in range(len(quotes)) if not (prompts[i] or "").strip()
-    ]
-    synthetic_for_missing = await create_question_list(
-        [quotes[i] for i in missing_idx]
-    )
+    missing_idx = [i for i in range(len(quotes)) if not (prompts[i] or "").strip()]
+    synthetic_for_missing = await create_question_list([quotes[i] for i in missing_idx])
     synth_iter = iter(synthetic_for_missing)
     questions: List[str] = []
     for i in range(len(quotes)):
@@ -221,13 +217,12 @@ async def pairs_from_conversation(
     # Synthesize where the assistant led with no preceding user turn.
     missing_idx = [i for i, q in enumerate(question_list) if not q.strip()]
     if missing_idx:
-        synth = await create_question_list(
-            [answer_list[i] for i in missing_idx]
-        )
+        synth = await create_question_list([answer_list[i] for i in missing_idx])
         for j, i in enumerate(missing_idx):
             question_list[i] = synth[j]
 
     return question_list, answer_list
+
 
 async def build_langsmith_for_conversation(
     messages: List[dict],
@@ -248,10 +243,13 @@ async def build_langsmith_for_conversation(
         dataset_source_filename=dataset_source_filename,
     )
 
-# reformat chatgpt transcript into question and answer lists for llm_single_turn_dataset 
-async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_single_turn_dataset(script: dict) -> tuple:
-    """Accept a transcript from chatgpt formatted and diarized 
-    and return an llm_single_turn_dataset as well as the 
+
+# reformat chatgpt transcript into question and answer lists for llm_single_turn_dataset
+async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_single_turn_dataset(
+    script: dict,
+) -> tuple:
+    """Accept a transcript from chatgpt formatted and diarized
+    and return an llm_single_turn_dataset as well as the
     prompt_query_list and the direct_quotes
 
     Args:
@@ -260,67 +258,95 @@ async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_sing
     Returns:
         tuple (list, list, list): llm_single_turn_dataset, prompt_query_list, direct_quotes
     """
-    direct_quotes = [segment['text'] for segment in script['segments'] if segment['speaker'] == 'avatar']
+    direct_quotes = [
+        segment["text"]
+        for segment in script["segments"]
+        if segment["speaker"] == "avatar"
+    ]
     prompt_query_list = []
-    for idx in range(1, len(script['segments'])):
-        if script['segments'][idx]['speaker'] == 'avatar' and idx != 0:
-            prompt_query_list.append(script['segments'][idx-1]['text'])
-        elif script['segments'][idx]['speaker'] == 'avatar' and idx == 0:
-            synthetic_prompt = await generate_question_for_message(message_str = prompt_query_list.append(script['segments'][idx]['text']))
+    for idx in range(1, len(script["segments"])):
+        if script["segments"][idx]["speaker"] == "avatar" and idx != 0:
+            prompt_query_list.append(script["segments"][idx - 1]["text"])
+        elif script["segments"][idx]["speaker"] == "avatar" and idx == 0:
+            synthetic_prompt = await generate_question_for_message(
+                message_str=prompt_query_list.append(script["segments"][idx]["text"])
+            )
             prompt_query_list.append(synthetic_prompt)
-    assert (len(direct_quotes) == len(prompt_query_list))
-    _llm_single_turn_dataset = await llm_single_turn_dataset(prompt_query_list, direct_quotes)
+    assert len(direct_quotes) == len(prompt_query_list)
+    _llm_single_turn_dataset = await llm_single_turn_dataset(
+        prompt_query_list, direct_quotes
+    )
     return _llm_single_turn_dataset, prompt_query_list, direct_quotes
+
 
 # reformat from Multi-turn_conversation from chatgpt transcript format
 from typing import Optional
-async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_multiturn_dataset_one_conversation(script:dict, direct_quotes: Optional[str] = None) -> tuple:
-    """Create a multi_turn_dataset for training adapters 
+
+
+async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_multiturn_dataset_one_conversation(
+    script: dict, direct_quotes: Optional[str] = None
+) -> tuple:
+    """Create a multi_turn_dataset for training adapters
     using a chatgpt formated transcript that has been diarized
-    with the target speaker. Returns the 
-    llm_multiturn_dataset_one_conversation, 
-    the multi_turn_prompt_query_list, 
-    and the multi_turn_direct_quotes. 
-    
-    There may be a generated prompt if the assistant was 
-    the first to speak in the multi_turn_prompt_query_list 
-    and/or a null string in the multi_turn_direct_quotes 
-    if the avatar was not the last to speak. 
+    with the target speaker. Returns the
+    llm_multiturn_dataset_one_conversation,
+    the multi_turn_prompt_query_list,
+    and the multi_turn_direct_quotes.
+
+    There may be a generated prompt if the assistant was
+    the first to speak in the multi_turn_prompt_query_list
+    and/or a null string in the multi_turn_direct_quotes
+    if the avatar was not the last to speak.
 
     Args:
-        script (dict): diarized transcription with per-speaker segments 
+        script (dict): diarized transcription with per-speaker segments
             (non-speaker labeld alphabetically and target labeled as 'avatar')
-        direct_quotes (Optional[str], optional): List of direct quotes (text strings) spoken 
+        direct_quotes (Optional[str], optional): List of direct quotes (text strings) spoken
             only by the avatar/target. Defaults to None.
 
     Returns:
-        tuple (list, list, list): 
-            llm_multiturn_dataset_one_conversation (list), 
-            multi_turn_prompt_query_list (list of questions and prompts),  
-            multi_turn_direct_quotes (list of answers and statements). 
-    
-            There may be a generated prompt if the assistant was 
-            the first to speak in the multi_turn_prompt_query_list 
-            and/or a null string in the multi_turn_direct_quotes 
+        tuple (list, list, list):
+            llm_multiturn_dataset_one_conversation (list),
+            multi_turn_prompt_query_list (list of questions and prompts),
+            multi_turn_direct_quotes (list of answers and statements).
+
+            There may be a generated prompt if the assistant was
+            the first to speak in the multi_turn_prompt_query_list
+            and/or a null string in the multi_turn_direct_quotes
             if the avatar was not the last to speak.
     """
     multi_turn_prompt_query_list = []
     placeholder_idx = 0
-    for idx in range(0, len(script['segments'])):
-        if script['segments'][idx]['speaker'] == 'avatar':
-
-            _ = [multi_turn_prompt_query_list.append(segment['text']) for segment in script['segments'][placeholder_idx: idx]]
+    for idx in range(0, len(script["segments"])):
+        if script["segments"][idx]["speaker"] == "avatar":
+            _ = [
+                multi_turn_prompt_query_list.append(segment["text"])
+                for segment in script["segments"][placeholder_idx:idx]
+            ]
 
             placeholder_idx = idx + 1
-        if script['segments'][idx]['speaker'] != 'avatar' and (idx == len(script['segments'])-1):
-            _ = [multi_turn_prompt_query_list.append(segment['text']) for segment in script['segments'][placeholder_idx:]]
+        if script["segments"][idx]["speaker"] != "avatar" and (
+            idx == len(script["segments"]) - 1
+        ):
+            _ = [
+                multi_turn_prompt_query_list.append(segment["text"])
+                for segment in script["segments"][placeholder_idx:]
+            ]
 
         # Create synthetic prompt for avatar as first speaker:
-        if script['segments'][idx]['speaker'] == 'avatar' and idx == 0:
-            synthetic_prompt = await generate_question_for_message(message_str = multi_turn_prompt_query_list.append(script['segments'][idx]['text']))
+        if script["segments"][idx]["speaker"] == "avatar" and idx == 0:
+            synthetic_prompt = await generate_question_for_message(
+                message_str=multi_turn_prompt_query_list.append(
+                    script["segments"][idx]["text"]
+                )
+            )
             multi_turn_prompt_query_list.append(synthetic_prompt)
     if direct_quotes is None:
-        direct_quotes = [segment['text'] for segment in script['segments'] if segment['speaker'] == 'avatar']
+        direct_quotes = [
+            segment["text"]
+            for segment in script["segments"]
+            if segment["speaker"] == "avatar"
+        ]
 
     multi_turn_direct_quotes = direct_quotes.copy()
     if len(multi_turn_prompt_query_list) > len(direct_quotes):
@@ -329,11 +355,14 @@ async def reformat_chatgpt_transcript_into_question_and_answer_list_for_llm_mult
         # Create a null response for the dataset
         multi_turn_direct_quotes.append("")
 
-    assert(len(multi_turn_direct_quotes) == len(multi_turn_prompt_query_list))
+    assert len(multi_turn_direct_quotes) == len(multi_turn_prompt_query_list)
 
     _llm_multiturn_dataset_one_conversation = llm_multiturn_dataset_one_conversation(
-        multi_turn_prompt_query_list, 
-        multi_turn_direct_quotes
+        multi_turn_prompt_query_list, multi_turn_direct_quotes
     )
 
-    return _llm_multiturn_dataset_one_conversation, multi_turn_prompt_query_list, multi_turn_direct_quotes
+    return (
+        _llm_multiturn_dataset_one_conversation,
+        multi_turn_prompt_query_list,
+        multi_turn_direct_quotes,
+    )

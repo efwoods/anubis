@@ -67,7 +67,9 @@ async def _fake_score_sentences(query: str, sentences: list[str]) -> list[float]
             scores.append(0.0)
             continue
         shared = len(query_tokens & sentence_tokens)
-        scores.append(shared / (math.sqrt(len(query_tokens)) * math.sqrt(len(sentence_tokens))))
+        scores.append(
+            shared / (math.sqrt(len(query_tokens)) * math.sqrt(len(sentence_tokens)))
+        )
     return scores
 
 
@@ -77,7 +79,12 @@ def _patch_sentence_scorer(monkeypatch):
 
 
 async def _fake_suggest_correction(
-    match, *, inaccurate_information, corrected_information, correction_context, is_deletion
+    match,
+    *,
+    inaccurate_information,
+    corrected_information,
+    correction_context,
+    is_deletion,
 ):
     """Deterministic stand-in for the per-document LLM suggestion: echo the global
     correction (empty on delete) and mark every match as asserting the fact. Lets the tool's
@@ -163,15 +170,22 @@ async def test_find_fact_matches_spans_atomic_namespaces():
     media_uuid5 = str(uuid.uuid5(uuid.NAMESPACE_URL, "resume.pdf"))
     await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     await _seed(
-        store, (CREATOR, ASSISTANT, "identity", media_uuid5), WRONG_FACT,
-        id_field="id", extra_meta={"filename": "resume.pdf"},
+        store,
+        (CREATOR, ASSISTANT, "identity", media_uuid5),
+        WRONG_FACT,
+        id_field="id",
+        extra_meta={"filename": "resume.pdf"},
     )
     await _seed(store, (CREATOR, ASSISTANT, "identity_memory"), WRONG_FACT)
     await _seed(store, (CREATOR, ASSISTANT, "memory"), WRONG_FACT, id_field="id")
     await _seed(store, (CREATOR, ASSISTANT, "identity"), "I love hockey.")  # unrelated
 
     matches = await find_fact_matches(
-        store, creator_id=CREATOR, assistant_id=ASSISTANT, user_id=CREATOR, query=WRONG_FACT
+        store,
+        creator_id=CREATOR,
+        assistant_id=ASSISTANT,
+        user_id=CREATOR,
+        query=WRONG_FACT,
     )
     fact_matches = [m for m in matches if m.kind == "fact"]
     matched = [m.matched_text for m in fact_matches]
@@ -184,7 +198,11 @@ async def test_find_fact_matches_locates_sentence_in_quote():
     store = _make_store()
     await _seed_long_text(store, (CREATOR, ASSISTANT, "quote"), QUOTE_TEXT)
     matches = await find_fact_matches(
-        store, creator_id=CREATOR, assistant_id=ASSISTANT, user_id=CREATOR, query=WRONG_FACT
+        store,
+        creator_id=CREATOR,
+        assistant_id=ASSISTANT,
+        user_id=CREATOR,
+        query=WRONG_FACT,
     )
     sentence_matches = [m for m in matches if m.kind == "sentence"]
     assert [m.matched_text for m in sentence_matches] == [QUOTE_OFFENDING]
@@ -194,15 +212,22 @@ async def test_find_fact_matches_locates_sentence_in_quote():
 async def test_analysis_namespace_is_swept():
     store = _make_store()
     await _seed_long_text(
-        store, (CREATOR, ASSISTANT, "analysis"),
+        store,
+        (CREATOR, ASSISTANT, "analysis"),
         "Openness is high. I was born in Toronto. Conscientiousness is moderate.",
         extra_meta={"analysis_type": "biography"},
     )
     matches = await find_fact_matches(
-        store, creator_id=CREATOR, assistant_id=ASSISTANT, user_id=CREATOR, query=WRONG_FACT
+        store,
+        creator_id=CREATOR,
+        assistant_id=ASSISTANT,
+        user_id=CREATOR,
+        query=WRONG_FACT,
     )
     assert any(
-        m.kind == "sentence" and m.namespace[2] == "analysis" and m.matched_text == QUOTE_OFFENDING
+        m.kind == "sentence"
+        and m.namespace[2] == "analysis"
+        and m.matched_text == QUOTE_OFFENDING
         for m in matches
     )
 
@@ -223,12 +248,20 @@ async def test_find_fact_matches_catches_paraphrase_at_production_scale():
         return vectors
 
     store = InMemoryStore(
-        index={"dims": len(vocab), "embed": bow_embed, "fields": ["document.kwargs.page_content"]}
+        index={
+            "dims": len(vocab),
+            "embed": bow_embed,
+            "fields": ["document.kwargs.page_content"],
+        }
     )
     paraphrase = "I grew up in Toronto."
     await _seed(store, (CREATOR, ASSISTANT, "identity"), paraphrase)
     matches = await find_fact_matches(
-        store, creator_id=CREATOR, assistant_id=ASSISTANT, user_id=CREATOR, query=WRONG_FACT
+        store,
+        creator_id=CREATOR,
+        assistant_id=ASSISTANT,
+        user_id=CREATOR,
+        query=WRONG_FACT,
     )
     assert [m.matched_text for m in matches] == [paraphrase]
 
@@ -243,7 +276,11 @@ async def test_apply_fact_correction_rewrites_in_place():
     store = _make_store()
     await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     matches = await find_fact_matches(
-        store, creator_id=CREATOR, assistant_id=ASSISTANT, user_id=CREATOR, query=WRONG_FACT
+        store,
+        creator_id=CREATOR,
+        assistant_id=ASSISTANT,
+        user_id=CREATOR,
+        query=WRONG_FACT,
     )
     original_key = matches[0].key
 
@@ -254,10 +291,14 @@ async def test_apply_fact_correction_rewrites_in_place():
         matches=matches,
     )
     assert len(changes) == 1 and changes[0].action == "rewrite"
-    meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), original_key))["metadata"]
+    meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), original_key))[
+        "metadata"
+    ]
     assert meta["fact"] == RIGHT_FACT
     assert meta["corrected_from"] == WRONG_FACT
-    page_content = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), original_key))["page_content"]
+    page_content = (
+        await _read_doc(store, (CREATOR, ASSISTANT, "identity"), original_key)
+    )["page_content"]
     assert RIGHT_FACT in page_content
 
 
@@ -266,10 +307,18 @@ async def test_apply_sentence_redaction_preserves_rest():
     store = _make_store()
     key = await _seed_long_text(store, (CREATOR, ASSISTANT, "quote"), QUOTE_TEXT)
     matches = await find_fact_matches(
-        store, creator_id=CREATOR, assistant_id=ASSISTANT, user_id=CREATOR, query=WRONG_FACT
+        store,
+        creator_id=CREATOR,
+        assistant_id=ASSISTANT,
+        user_id=CREATOR,
+        query=WRONG_FACT,
     )
     changes = await apply_fact_correction(
-        store, corrected_information="", correction_context="", matches=matches, is_deletion=True
+        store,
+        corrected_information="",
+        correction_context="",
+        matches=matches,
+        is_deletion=True,
     )
     assert len(changes) == 1 and changes[0].action == "redact"
     kwargs = await _read_doc(store, (CREATOR, ASSISTANT, "quote"), key)
@@ -296,7 +345,9 @@ async def test_tool_approve_corrects_fact_and_redacts_quote(monkeypatch):
         # Accept the model's suggested edit on every matched document.
         return {
             "type": "apply",
-            "items": [{"index": m["index"], "action": "accept"} for m in payload["matches"]],
+            "items": [
+                {"index": m["index"], "action": "accept"} for m in payload["matches"]
+            ],
         }
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
@@ -325,10 +376,13 @@ async def test_tool_delete_removes_atomic_fact(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     monkeypatch.setattr(
-        identity_tools, "interrupt",
+        identity_tools,
+        "interrupt",
         lambda payload: {
             "type": "apply",
-            "items": [{"index": m["index"], "action": "remove"} for m in payload["matches"]],
+            "items": [
+                {"index": m["index"], "action": "remove"} for m in payload["matches"]
+            ],
         },
     )
 
@@ -348,7 +402,8 @@ async def test_tool_edit_uses_owner_revision(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     monkeypatch.setattr(
-        identity_tools, "interrupt",
+        identity_tools,
+        "interrupt",
         lambda payload: {
             "type": "apply",
             "items": [
@@ -445,8 +500,12 @@ async def test_payload_exposes_one_editable_item_per_match(monkeypatch):
     assert {m["index"] for m in items} == {0, 1}
     for m in items:
         assert set(m) >= {
-            "index", "current_text", "suggested_text", "suggested_context",
-            "default_action", "recommended_action",
+            "index",
+            "current_text",
+            "suggested_text",
+            "suggested_context",
+            "default_action",
+            "recommended_action",
         }
         assert m["default_action"] == "skip"
     assert "proposed" not in payload  # no single global correction field
@@ -457,7 +516,9 @@ async def test_per_document_edits_apply_distinct_text(monkeypatch):
     """Each matched document is rewritten with ITS OWN corrected text, not one shared value."""
     store = _make_store()
     key_a = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
-    key_b = await _seed(store, (CREATOR, ASSISTANT, "identity"), "I grew up in Toronto.")
+    key_b = await _seed(
+        store, (CREATOR, ASSISTANT, "identity"), "I grew up in Toronto."
+    )
 
     def _fake_interrupt(payload):
         return {
@@ -481,8 +542,12 @@ async def test_per_document_edits_apply_distinct_text(monkeypatch):
         correction_kind="update",
         runtime=_FakeRuntime(store),
     )
-    meta_a = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_a))["metadata"]
-    meta_b = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_b))["metadata"]
+    meta_a = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_a))[
+        "metadata"
+    ]
+    meta_b = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_b))[
+        "metadata"
+    ]
     assert meta_a["fact"] == f"corrected-{key_a}"
     assert meta_b["fact"] == f"corrected-{key_b}"
 
@@ -501,8 +566,18 @@ async def test_excluded_document_is_left_untouched(monkeypatch):
         return {
             "type": "apply",
             "items": [
-                {"index": first["index"], "action": "edit", "corrected_text": "kept", "correction_context": "c"},
-                {"index": second["index"], "action": "skip", "corrected_text": "ignored", "correction_context": "c"},
+                {
+                    "index": first["index"],
+                    "action": "edit",
+                    "corrected_text": "kept",
+                    "correction_context": "c",
+                },
+                {
+                    "index": second["index"],
+                    "action": "skip",
+                    "corrected_text": "ignored",
+                    "correction_context": "c",
+                },
             ],
         }
 
@@ -516,8 +591,12 @@ async def test_excluded_document_is_left_untouched(monkeypatch):
     )
     included_key = captured["payload"]["matches"][0]["key"]
     excluded_key = captured["payload"]["matches"][1]["key"]
-    included_meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), included_key))["metadata"]
-    excluded_meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), excluded_key))["metadata"]
+    included_meta = (
+        await _read_doc(store, (CREATOR, ASSISTANT, "identity"), included_key)
+    )["metadata"]
+    excluded_meta = (
+        await _read_doc(store, (CREATOR, ASSISTANT, "identity"), excluded_key)
+    )["metadata"]
     assert included_meta["fact"] == "kept"
     assert excluded_meta["fact"] in (WRONG_FACT, "I grew up in Toronto.")  # unchanged
     assert "corrected_from" not in excluded_meta
@@ -550,10 +629,13 @@ async def test_accept_applies_model_suggestion(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     monkeypatch.setattr(
-        identity_tools, "interrupt",
+        identity_tools,
+        "interrupt",
         lambda payload: {
             "type": "apply",
-            "items": [{"index": m["index"], "action": "accept"} for m in payload["matches"]],
+            "items": [
+                {"index": m["index"], "action": "accept"} for m in payload["matches"]
+            ],
         },
     )
     await _tool_coroutine()(
@@ -574,10 +656,13 @@ async def test_remove_on_update_deletes_the_fact(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     monkeypatch.setattr(
-        identity_tools, "interrupt",
+        identity_tools,
+        "interrupt",
         lambda payload: {
             "type": "apply",
-            "items": [{"index": m["index"], "action": "remove"} for m in payload["matches"]],
+            "items": [
+                {"index": m["index"], "action": "remove"} for m in payload["matches"]
+            ],
         },
     )
     cmd = await _tool_coroutine()(

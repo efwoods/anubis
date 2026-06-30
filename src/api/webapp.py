@@ -1,75 +1,60 @@
 # src/anubis/webapp.py
 
 import asyncio
+import base64
 import functools
 import json
 import os
 import re
-from typing import List
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Form,
-    HTTPException,
-    Response,
-    Depends,
-    Request,
-)
-
-import httpx
+import tempfile
+import uuid
+from collections.abc import Iterator
+from contextlib import asynccontextmanager
 
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
-from langchain_core.messages import AIMessage, HumanMessage
-from src.anubis.utils.context import GlobalContext
-from psycopg_pool import AsyncConnectionPool
-
 
 # Add metrics imports
 from time import time_ns
-import uuid
-from uuid import UUID
-from uuid import uuid4
+from typing import Annotated, Any, List, Optional
+from uuid import UUID, uuid4
 
-import base64
-import tempfile
+import httpx
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.store.base import IndexConfig
+from langgraph.store.postgres import AsyncPostgresStore
+from langgraph_sdk import get_client
 
 # NOTE: ``PyPDFLoader`` is imported lazily inside ``process_files_for_message``
 # (the only call site) — eager import of ``langchain_community`` adds ~7.3 s to
 # every cold start because the umbrella package eagerly registers many
 # integrations. The first PDF upload pays the import cost once.
-
-
 # Prometheus metrics
 from prometheus_client import (
-    Counter,
-    Histogram,
-    Gauge,
-    generate_latest,
     CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
 )
-from prometheus_client import CollectorRegistry
-from contextlib import asynccontextmanager
-from langgraph.store.postgres import AsyncPostgresStore
+from psycopg_pool import AsyncConnectionPool
+from pydantic import BaseModel, BeforeValidator
 
-from langgraph.store.base import IndexConfig
-
-from typing import Annotated, Optional
-from langgraph_sdk import get_client
-
-from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.graph import message_workflow
-
-from src.security.auth import security_route
-from src.security.auth import get_current_user
-from src.security.auth import update_assistant_config
-from src.security.auth import check_subscription_status
-
-from src.security.auth import (
-    get_current_user_or_anonymous_user,
-)
-
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.api.media_jobs import (
     MediaJob,
     create_child_job,
@@ -78,12 +63,13 @@ from src.api.media_jobs import (
     request_cancel,
     run_batch_media_job,
 )
-
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
-
-from pydantic import BaseModel, BeforeValidator
-from typing import Any
-from collections.abc import Iterator
+from src.security.auth import (
+    check_subscription_status,
+    get_current_user,
+    get_current_user_or_anonymous_user,
+    security_route,
+    update_assistant_config,
+)
 
 
 def _drop_empty_file_fields(value: Any) -> Any:
@@ -111,26 +97,25 @@ OptionalUploadFiles = Annotated[
     File(),
 ]
 
+import logging
+from urllib.parse import quote
+
+import stripe
+from dotenv import load_dotenv
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.types import Command
 from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
 
-from urllib.parse import quote
-
-
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.types import Command
 from src.anubis.utils import runtime_handles
-import stripe
 
-import logging
-
-from dotenv import load_dotenv
 load_dotenv()
 
 
 logger = logging.getLogger(__name__)
 
-from uuid import uuid5, NAMESPACE_URL
+from uuid import NAMESPACE_URL, uuid5
+
 
 def _namespace_safe_formatted_filename(u: str) -> str:
     formatted_name = str(uuid5(NAMESPACE_URL, u))
@@ -155,7 +140,11 @@ def _document_label_and_key(metadata: dict) -> tuple[str | None, str | None]:
     """
     filename = metadata.get("filename")
     namespace_filename = metadata.get("namespace_filename")
-    key = namespace_filename if isinstance(namespace_filename, str) and namespace_filename else None
+    key = (
+        namespace_filename
+        if isinstance(namespace_filename, str) and namespace_filename
+        else None
+    )
     playlist_url = metadata.get("playlist_url")
     if isinstance(playlist_url, str) and playlist_url:
         playlist_label = (metadata.get("playlist_title") or playlist_url).strip()
@@ -183,7 +172,9 @@ def _iter_document_labels(store_items) -> Iterator[tuple[str, str | None]]:
             continue
         document = value.get("document")
         kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
-        metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+        metadata = (
+            kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+        )
         if not isinstance(metadata, dict):
             continue
         label, key = _document_label_and_key(metadata)
@@ -244,7 +235,9 @@ async def message_graph_sse(
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
 
-    graph_input = resume_command if resume_command is not None else {"messages": [human_message]}
+    graph_input = (
+        resume_command if resume_command is not None else {"messages": [human_message]}
+    )
 
     async for item in graph.astream(
         input=graph_input,
@@ -292,11 +285,7 @@ async def message_graph_sse(
         yield f"data: {json.dumps(interrupt_event, default=str)}\n\n"
         return
 
-    content = (
-        last_ai.content
-        if last_ai is not None
-        else "".join(accumulated_chunks)
-    )
+    content = last_ai.content if last_ai is not None else "".join(accumulated_chunks)
     done: dict = {
         "type": "done",
         "content": content,
@@ -592,6 +581,7 @@ async def lifespan(app: FastAPI):
     finally:
         await pool.close()
 
+
 app = FastAPI(
     title="Neural Nexus API",
     description="LangGraph-based API",
@@ -700,7 +690,7 @@ async def verify_subscription_status(
 ):
     status = await check_subscription_status(request=request, current_user=current_user)
     if status["status"] == None:
-        return {"subscription_status:" "Not Subscribed"}
+        return {"subscription_status:Not Subscribed"}
     return status
 
 
@@ -892,9 +882,7 @@ async def list_user_avatars(
     logger.info("breakpoint")
     if not current_user:
         public_avatars_result = await get_public_avatars()
-        return [
-            _assistant_without_metadata_if_public(a) for a in public_avatars_result
-        ]
+        return [_assistant_without_metadata_if_public(a) for a in public_avatars_result]
     try:
         public_avatars_result = await get_public_avatars(
             user_id=current_user["identities"][0]["user_id"]
@@ -1237,15 +1225,17 @@ async def message_selected_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config['configurable']['include_metrics'] = include_metrics
+    config["configurable"]["include_metrics"] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
 
     # Process any uploaded files
-    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
-        files, message=message
-    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
 
     # Create the human message content
     if multimodal_content:
@@ -1409,15 +1399,17 @@ async def message_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config['configurable']['include_metrics'] = include_metrics
+    config["configurable"]["include_metrics"] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
 
     # Process any uploaded files
-    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
-        files, message=message
-    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
 
     # Create the human message content
     if multimodal_content:
@@ -1526,9 +1518,7 @@ async def resume_avatar_message(
     raw_decision = (decision or "apply").strip().lower()
     decision_value = decision_aliases.get(raw_decision, raw_decision)
     if decision_value not in ("apply", "cancel"):
-        raise HTTPException(
-            status_code=400, detail="decision must be apply or cancel."
-        )
+        raise HTTPException(status_code=400, detail="decision must be apply or cancel.")
 
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
@@ -1796,7 +1786,9 @@ async def probe_remote_url_content_type(url: str) -> str:
         head_ct = ""
         try:
             head = await client.head(url)
-            head_ct = (head.headers.get("content-type") or "").split(";")[0].strip().lower()
+            head_ct = (
+                (head.headers.get("content-type") or "").split(";")[0].strip().lower()
+            )
         except Exception:
             pass
         if head_ct and head_ct != "application/octet-stream":
@@ -1821,8 +1813,9 @@ async def require_url_content_type_prefix(url: str, prefix: str, label: str) -> 
 
 def _is_youtube_url(url: str) -> bool:
     """Recognize URLs whose Content-Type is HTML but whose payload is video/audio."""
-    from src.anubis.utils.classes.URLDocumentLoaderClass import _YOUTUBE_HOSTS
     from urllib.parse import urlparse
+
+    from src.anubis.utils.classes.URLDocumentLoaderClass import _YOUTUBE_HOSTS
 
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -1832,6 +1825,7 @@ def _is_youtube_url(url: str) -> bool:
 
 
 MAX_REMOTE_URL_DOWNLOAD_BYTES = 25 * 1024 * 1024
+
 
 async def fetch_remote_url_bytes(
     url: str,
@@ -1851,6 +1845,7 @@ async def fetch_remote_url_bytes(
             )
         header_ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
         return body, header_ct or "application/octet-stream"
+
 
 def make_data_uri(mime: str, body: bytes) -> str:
     """RFC 2397 data URI: ``data:<mime>;base64,<payload>``."""
@@ -1884,9 +1879,11 @@ _CSV_MIME_HINTS = frozenset(
         "application/x-csv",
     }
 )
-_CSV_NAME_HINT_RE = re.compile(r"\b(user[_-]?name|user|name|author|screen[_-]?name|"
-                               r"handle|username|creator|speaker|full[_-]?name)\b",
-                               re.IGNORECASE)
+_CSV_NAME_HINT_RE = re.compile(
+    r"\b(user[_-]?name|user|name|author|screen[_-]?name|"
+    r"handle|username|creator|speaker|full[_-]?name)\b",
+    re.IGNORECASE,
+)
 _CSV_BOOLEAN_VALUES = frozenset({"true", "false", "yes", "no", "0", "1"})
 _CSV_PREVIEW_ROW_LIMIT = 8
 _CSV_STATS_SAMPLE_VALUES = 3
@@ -1952,7 +1949,9 @@ def _parse_csv_to_rows(raw: bytes, filename: str) -> tuple[list[str], list[dict]
         )
     rows: list[dict] = []
     for row in reader:
-        rows.append({h: (row.get(h) if row.get(h) is not None else "") for h in headers})
+        rows.append(
+            {h: (row.get(h) if row.get(h) is not None else "") for h in headers}
+        )
     if not rows:
         raise HTTPException(
             status_code=400,
@@ -2182,8 +2181,11 @@ def _build_csv_statements_media_entry(
         "csv_text_column": metadata.get("csv_text_column"),
         "csv_target_column": metadata.get("csv_target_column"),
         "csv_row_count": metadata.get("csv_row_count"),
-        "namespace_filename": source_filename if not "." in source_filename else _namespace_safe_formatted_filename(source_filename),
+        "namespace_filename": source_filename
+        if not "." in source_filename
+        else _namespace_safe_formatted_filename(source_filename),
     }
+
 
 @app.get("/avatar_reference_image")
 async def get_avatar_reference_image(
@@ -2219,12 +2221,10 @@ async def get_avatar_reference_image(
         value = item.get("value") or {}
     else:
         value = getattr(item, "value", None) or {}
-    return JSONResponse(
-        {"reference_image_data": value.get("reference_image_data")}
-    )
-    
-from typing import Optional
+    return JSONResponse({"reference_image_data": value.get("reference_image_data")})
 
+
+from typing import Optional
 
 _MANIFEST_TEXT_MIMES = frozenset(
     {"text/plain", "text/markdown", "application/octet-stream"}
@@ -2271,7 +2271,11 @@ def _extract_manifest_urls(raw: bytes) -> List[str]:
             parsed = urlparse(candidate)
         except Exception:
             continue
-        if parsed.scheme in ("http", "https") and parsed.netloc and " " not in candidate:
+        if (
+            parsed.scheme in ("http", "https")
+            and parsed.netloc
+            and " " not in candidate
+        ):
             if candidate not in seen:
                 seen.add(candidate)
                 urls.append(candidate)
@@ -2363,8 +2367,10 @@ async def _build_media_entries_for_file(
     file in a multi-file request. Raises ``HTTPException`` on unsupported types.
     """
     entries: list = []
-    if not reference_image and not reference_audio and _is_csv_upload(
-        raw_name, mime_type
+    if (
+        not reference_image
+        and not reference_audio
+        and _is_csv_upload(raw_name, mime_type)
     ):
         csv_payload = await _csv_to_statements_payload(
             raw=content, source_filename=raw_name
@@ -2394,7 +2400,9 @@ async def _build_media_entries_for_file(
                 "reference_audio": False,
                 "reference_image": True,
                 "base64_encoded_str": make_data_uri(mime, content),
-                "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                "namespace_filename": raw_name
+                if not "." in raw_name
+                else _namespace_safe_formatted_filename(raw_name),
             }
         )
     elif reference_audio:
@@ -2427,14 +2435,15 @@ async def _build_media_entries_for_file(
                 "reference_audio": True,
                 "reference_image": False,
                 "base64_encoded_str": make_data_uri(effective, content),
-                "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                "namespace_filename": raw_name
+                if not "." in raw_name
+                else _namespace_safe_formatted_filename(raw_name),
             }
         )
     else:
         sniff = _sniff_media_category_from_bytes(content[:512])
         if mime_type.startswith("image/") or (
-            mime_type == "application/octet-stream"
-            and sniff in ALLOWED_IMAGE_MIMES
+            mime_type == "application/octet-stream" and sniff in ALLOWED_IMAGE_MIMES
         ):
             mime = validate_upload_image_bytes(mime_type, content)
             entries.append(
@@ -2447,7 +2456,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         elif mime_type.startswith("audio/") or (
@@ -2456,9 +2467,7 @@ async def _build_media_entries_for_file(
             and sniff.startswith("audio/")
         ):
             effective = (
-                mime_type
-                if mime_type.startswith("audio/")
-                else (sniff or mime_type)
+                mime_type if mime_type.startswith("audio/") else (sniff or mime_type)
             )
             if not effective.startswith("audio/"):
                 raise HTTPException(
@@ -2475,7 +2484,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(effective, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         elif mime_type.startswith("video/"):
@@ -2489,7 +2500,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         elif mime_type == "application/pdf":
@@ -2503,17 +2516,22 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type in (
-            "text/plain",
-            "application/json",
-            "text/markdown",
-            "application/octet-stream",
-        ) or mime_type.startswith("text/") or (
-            raw_name or ""
-        ).lower().endswith(".log"):
+        elif (
+            mime_type
+            in (
+                "text/plain",
+                "application/json",
+                "text/markdown",
+                "application/octet-stream",
+            )
+            or mime_type.startswith("text/")
+            or (raw_name or "").lower().endswith(".log")
+        ):
             entries.append(
                 {
                     "filename": raw_name,
@@ -2524,7 +2542,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         else:
@@ -2672,7 +2692,11 @@ async def _build_media_entries_for_url(
                 "reference_audio": False,
                 "reference_image": True,
                 "base64_encoded_str": make_data_uri(img_mime, body),
-                "namespace_filename": namespace_safe_formatted_filename if not "." in namespace_safe_formatted_filename else _namespace_safe_formatted_filename(namespace_safe_formatted_filename),
+                "namespace_filename": namespace_safe_formatted_filename
+                if not "." in namespace_safe_formatted_filename
+                else _namespace_safe_formatted_filename(
+                    namespace_safe_formatted_filename
+                ),
             }
         )
     elif reference_audio:
@@ -2725,7 +2749,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": True,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(audio_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
     else:
@@ -2754,8 +2780,10 @@ async def _build_media_entries_for_url(
             pass
         elif _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
             body, _header_ct = await fetch_remote_url_bytes(url_clean)
-            csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
-                f"{namespace_safe_formatted_filename or 'remote_table'}.csv"
+            csv_filename = (
+                namespace_safe_formatted_filename
+                if namespace_safe_formatted_filename.endswith((".csv", ".tsv"))
+                else (f"{namespace_safe_formatted_filename or 'remote_table'}.csv")
             )
             csv_payload = await _csv_to_statements_payload(
                 raw=body, source_filename=csv_filename
@@ -2782,7 +2810,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(img_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         elif ct.startswith("audio/"):
@@ -2804,14 +2834,14 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(audio_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         elif ct.startswith("video/"):
             body, header_ct = await fetch_remote_url_bytes(url_clean)
-            video_mime = (
-                header_ct if header_ct.startswith("video/") else ct
-            )
+            video_mime = header_ct if header_ct.startswith("video/") else ct
             entries.append(
                 {
                     "filename": url_clean,
@@ -2823,7 +2853,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(video_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         elif ct.startswith("text/") or ct in (
@@ -2860,7 +2892,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(doc_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         else:
@@ -2941,7 +2975,7 @@ async def update_avatar_identity_with_media(
         assistant_meta = assistant.get("metadata") or {}
         creator_id = assistant_meta.get("user_id")
         if not creator_id:
-            raise HTTPException(  
+            raise HTTPException(
                 status_code=400,
                 detail=(
                     "Assistant metadata is missing the creator's user_id; "
@@ -2990,7 +3024,9 @@ async def update_avatar_identity_with_media(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
             )
-        if create_reference_media_from_playlist and (reference_image or reference_audio):
+        if create_reference_media_from_playlist and (
+            reference_image or reference_audio
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -3023,9 +3059,12 @@ async def update_avatar_identity_with_media(
             if non_empty_files:
                 uf = non_empty_files[0]
                 content = await uf.read()
-                mime_type = (uf.content_type or "application/octet-stream").split(
-                    ";"
-                )[0].strip().lower()
+                mime_type = (
+                    (uf.content_type or "application/octet-stream")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
                 media_files.extend(
                     await _build_media_entries_for_file(
                         uf.filename,
@@ -3060,9 +3099,12 @@ async def update_avatar_identity_with_media(
             for uf in non_empty_files:
                 content = await uf.read()
                 raw_name = uf.filename
-                mime_type = (uf.content_type or "application/octet-stream").split(
-                    ";"
-                )[0].strip().lower()
+                mime_type = (
+                    (uf.content_type or "application/octet-stream")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
                 # A .txt/.md (non-CSV) whose lines are bare URLs is a manifest:
                 # expand it into URLs instead of ingesting it as a text document.
                 if not _is_csv_upload(raw_name, mime_type) and (
@@ -3180,8 +3222,7 @@ async def update_avatar_identity_with_media(
         incoming_filenames = [
             name
             for name in (
-                (entry.get("namespace_filename") or "").strip()
-                for entry in media_files
+                (entry.get("namespace_filename") or "").strip() for entry in media_files
             )
             if name
         ]
@@ -3253,9 +3294,7 @@ async def update_avatar_identity_with_media(
                 config,
                 store,
                 app.state.context,
-                concurrency=max(
-                    1, app.state.context.media_processing_concurrency
-                ),
+                concurrency=max(1, app.state.context.media_processing_concurrency),
                 existing_namespaces=sorted(existing_namespaces),
                 registry=registry,
                 deferred_expanders=deferred_expanders,
@@ -3320,9 +3359,7 @@ async def media_job_status(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
     if job.user_id != user_id:
-        raise HTTPException(
-            status_code=403, detail="This job belongs to another user."
-        )
+        raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
     def _descriptor(j: MediaJob) -> dict:
         return {
@@ -3374,9 +3411,7 @@ async def media_job_progress(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
     if job.user_id != user_id:
-        raise HTTPException(
-            status_code=403, detail="This job belongs to another user."
-        )
+        raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
     def _with_timing(payload: dict) -> dict:
         """Return a copy of ``payload`` stamped with the job's start time and the
@@ -3510,9 +3545,7 @@ async def cancel_media_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
     if job.user_id != user_id:
-        raise HTTPException(
-            status_code=403, detail="This job belongs to another user."
-        )
+        raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
     # Flag + cancel the running task(s); returns the affected child jobs.
     targets = request_cancel(registry, job)
@@ -3564,7 +3597,9 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
     # what the upload endpoint's dedup uses.
     store = app.state.store
     try:
-        all_document_items = await store.asearch((user_id, assistant_id), limit=1_000_000)
+        all_document_items = await store.asearch(
+            (user_id, assistant_id), limit=1_000_000
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -3587,7 +3622,7 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
-    
+
     # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
     # leaving only the filename or already-derived namespace id.
     source_document_name = source_document_name.strip(" \t\n\r\"'`(),[]")
@@ -3620,9 +3655,7 @@ async def delete_avatar_documents(
             (user_id, assistant_id), limit=1_000_000
         )
         label_to_key = {
-            label: key
-            for label, key in _iter_document_labels(existing_items)
-            if key
+            label: key for label, key in _iter_document_labels(existing_items) if key
         }
     except Exception:
         label_to_key = {}
@@ -3711,7 +3744,9 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
             assistant_id, deleted_document_ids
         )
     except Exception as exc:  # pragma: no cover - operator log only
-        logger.warning("ground-truth feature prune failed for %s: %s", assistant_id, exc)
+        logger.warning(
+            "ground-truth feature prune failed for %s: %s", assistant_id, exc
+        )
 
     return JSONResponse(
         content=f"Successfully deleted: {display_name}", status_code=200
@@ -3748,7 +3783,10 @@ async def _prune_ground_truth_features_for_deleted_docs(
     store = app.state.store
 
     dict_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
-    threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
+    threshold_namespace = (
+        assistant_id,
+        "ground_truth_text_empirical_threshold_list_str",
+    )
     model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
     style_prompt_namespace = (assistant_id, "style_prompt")
 
@@ -3769,8 +3807,12 @@ async def _prune_ground_truth_features_for_deleted_docs(
     if not features_by_doc_id:
         # Corpus is now empty: clear all three derived keys.
         await store.adelete(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
-        await store.adelete(threshold_namespace, key="ground_truth_text_empirical_threshold_list_str")
-        await store.adelete(model_namespace, key="ground_truth_text_features_model_b64_pkl")
+        await store.adelete(
+            threshold_namespace, key="ground_truth_text_empirical_threshold_list_str"
+        )
+        await store.adelete(
+            model_namespace, key="ground_truth_text_features_model_b64_pkl"
+        )
         await store.adelete(style_prompt_namespace, key="style_prompt")
         return
 
@@ -3781,6 +3823,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
     )
 
     from src.anubis.utils.dataset.style_features import build_style_profile_str
+
     style_prompt_str = await build_style_profile_str(ground_truth_text_features_arr)
 
     await store.aput(
@@ -3799,10 +3842,9 @@ async def _prune_ground_truth_features_for_deleted_docs(
         value={"value": model_b64_pkl},
     )
     await store.aput(
-        style_prompt_namespace, 
-        key="style_prompt",
-        value={"value": style_prompt_str}
+        style_prompt_namespace, key="style_prompt", value={"value": style_prompt_str}
     )
+
 
 if __name__ == "__main__":
     import uvicorn

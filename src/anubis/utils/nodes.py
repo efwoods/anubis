@@ -1,22 +1,20 @@
-from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
-from src.anubis.utils.context import UserContext, AssistantContext
-from src.anubis.utils.state import GlobalState
-from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.utility import format_docs, reduce_docs
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
-import logging
-from pathlib import Path
-
+from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
+from src.anubis.utils.context import AssistantContext, GlobalContext, UserContext
 from src.anubis.utils.context_compression import (
     truncate_string_to_token_limit,
 )
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.utility import format_docs, reduce_docs
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +45,7 @@ def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
         return
     _DEV_SYSTEM_PROMPT_PATH.write_text(system_message_str, encoding="utf-8")
     logger.info("dev system prompt written to: %s", _DEV_SYSTEM_PROMPT_PATH)
+
 
 def _resolve_user_timezone(tz_name: str | None):
     """Resolve a client-supplied IANA timezone name to a ``tzinfo``.
@@ -180,10 +179,14 @@ async def _build_consciousness_system_message_update(
     LangGraph node (operates on ``GlobalState``) and the in-agent
     ``load_consciousness`` tool (operates on ``AvatarDeepAgentState``); both
     schemas expose the same keys this helper reads.
+
+
+    # TODO: REDUCE FP; There are hundreds of non-salient documents being retrieved
+
     """
 
     _RETRIEVAL_LIMIT = 10
-    _FILTER_SCORE = 0.1
+    _FILTER_SCORE = 0.5
 
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
@@ -250,10 +253,19 @@ async def _build_consciousness_system_message_update(
     if user_name is not None:
         state["user_state"].update({"user_name": user_name})
     else:
-        user_possible_name = await runtime.store.asearch(
-            (assistant_id, user_id, "identity"), query="name"
+        """ POSSIBLE IMPROVEMENT: CREATE A `NAME` NAMESPACE FOR STORAGE AND RETRIEVAL EXPLICITLY: """
+
+        _TASK_DESCRIPTION_USER_NAME = (
+            "Given the query, FIND THE ANSWER TO THE QUESTION WHAT IS YOUR NAME?"
         )
-        if len(user_possible_name) > 0:
+        user_possible_name = await runtime.store.asearch(
+            (assistant_id, user_id, "identity"),
+            query=f"Instruct: {_TASK_DESCRIPTION_USER_NAME}\nQuery: {'WHAT IS YOUR NAME?'}",
+            limit=_RETRIEVAL_LIMIT,
+        )
+        if len(user_possible_name) > 0 and (
+            getattr(user_possible_name, "score", 0) > _FILTER_SCORE
+        ):
             user_name = (
                 getattr(user_possible_name[0], "value")
                 .get("document", {})
@@ -267,8 +279,6 @@ async def _build_consciousness_system_message_update(
     if user_description is not None:
         state["user_state"].update({"user_description": user_description})
 
-    """ Load User Identity documents (always from store — checkpoint cache is not authoritative). """
-
     # The identity namespaces are contractually loaded in full every turn (see the
     # READ ME in identity_tools.py). ``asearch`` defaults to limit=10 and, with no
     # query, returns an arbitrary slice — which silently dropped media-ingested
@@ -276,40 +286,97 @@ async def _build_consciousness_system_message_update(
     # producing recall false-negatives. Pass the latest user message as the
     # relevance query and raise the limit to 1000 so every identity document is
     # surfaced (relevance-ranked only if the count ever exceeds the limit).
+
+    """
+
+    QUERY CREATION FOR SALIENT DOCUMENT RETRIEVAL
+
+    """
+    # embedding model microsoft/harrier-oss-v1-270m uses instructions in the query for retrieval as trained
+
     query = state["messages"][-1].content
     if isinstance(query, list):
-        query = query[0]["text"]
+        _TASK_DESCRIPTION = "Given the query, retrieve information that is salient to the conversation and semantically similar to the query text."
+        query = f"Instruct: {_TASK_DESCRIPTION}\nQuery: {query[0]['text']}"
+
+    """ 
+    
+    Load User Identity documents (always from store — checkpoint cache is not authoritative). 
+    
+    INFORMATION ABOUT THE USER SALIENT TO THE CONVERSATION
+    
+    """
 
     user_identity_namespace = (assistant_id, user_id, "identity")
     user_identity_document_items = await runtime.store.asearch(
-        user_identity_namespace, query=query, limit=1000
+        user_identity_namespace, query=query, limit=_RETRIEVAL_LIMIT
     )
+
+    # Filter the retrieved documents to a salience threshold
+    user_identity_document_items = [
+        item
+        for item in user_identity_document_items
+        if item.score and item.score > _FILTER_SCORE
+    ]
+
     user_identity = reduce_docs([], user_identity_document_items)
 
-    """ Load Assistant Identity documents """
+    """ 
+    
+    Load Assistant Identity documents 
+    
+    ASSISTANT IDENTITY DOCUMENTS ARE INFORMATION FROM A PRIMARY SOURCE (USES THE QUERY FOR CONVERSATION SALIENCE)
+    
+    """
     creator_id = config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
 
     assistant_identity_namespace = (creator_id, assistant_id, "identity")
     assistant_identity_document_items = await runtime.store.asearch(
-        assistant_identity_namespace, query=query,  
-        limit=_RETRIEVAL_LIMIT
+        assistant_identity_namespace, query=query, limit=_RETRIEVAL_LIMIT
     )
 
-    assistant_identity_document_items = [item for item in assistant_identity_document_items if item.score and item.score > _FILTER_SCORE]
+    # Filter the retrieved documents to a salience threshold
+
+    # IDENTITY RELATED FACTS ARE NOT FILTERED TO PERSIST FACTS OF THE AVATAR'S IDENTITY.
+    # assistant_identity_document_items = [item for item in assistant_identity_document_items if item.score and item.score > _FILTER_SCORE]
+
     assistant_identity = reduce_docs([], assistant_identity_document_items)
+
+    """ 
+
+    LEARNED INFORMATION ABOUT THE IDENTITY OF THE AVATAR THROUGH NATURAL LANGUAGE FROM THE USER-CREATOR
+    
+    PERSISTENT INFORMATION ABOUT THE AVATAR'S IDENTITY
+
+    """
 
     assistant_identity_memory_namespace = (
         creator_id,
         assistant_id,
         "identity_memory",
     )
+
     retrieved_identity_memories_items = await runtime.store.asearch(
-        assistant_identity_memory_namespace, limit=1000
+        assistant_identity_memory_namespace, query=query, limit=_RETRIEVAL_LIMIT
     )
+
+    # Filter the retrieved identity_memories to a salience threshold
+
+    # IDENTITY RELATED FACTS ARE NOT FILTERED TO PERSIST FACTS OF THE AVATAR'S IDENTITY.
+    # retrieved_identity_memories_items = [item for item in retrieved_identity_memories_items if item.score and item.score > _FILTER_SCORE]
+
     retrieved_identity_memories = reduce_docs([], retrieved_identity_memories_items)
     assistant_identity.extend(retrieved_identity_memories)
 
-    """ Always merge assistant reference image (creator namespace), including when identity docs are cached """
+    """ 
+    
+    Always merge assistant reference image (creator namespace), including when identity docs are cached 
+    
+    DESCRIPTIVE REFERENCE IMAGES ARE PERSISTENT INFORMATION ABOUT THE AVATAR'S IDENTITY
+
+    # TODO: THIS NEEDS TO BE CACHED and retrieved only once UNLESS THE REFERENCE IMAGE HAS BEEN UPDATED
+
+    """
     assistent_reference_image_identity_namespace = (
         creator_id,
         assistant_id,
@@ -336,12 +403,13 @@ async def _build_consciousness_system_message_update(
 
     logger.info("breakpoint")
 
-    # retrieved_memories = state['recalled_memory_documents']
-
-    # if len(retrieved_memories) == 0:
-    #     retrieved_memories = None
-
-    """ Retrieve memories """
+    """ 
+    
+    Retrieve memories 
+    
+    THESE ARE LEARNED MEMORIES SALIENT TO THE CONVERSATION (USES QUERY FOR SEARCH)
+    
+    """
 
     # ``query`` was extracted above (identity load) and is reused here.
     assistant_memory_namespace = (user_id, assistant_id, "memory")
@@ -350,72 +418,102 @@ async def _build_consciousness_system_message_update(
         query=query,
         limit=_RETRIEVAL_LIMIT,
     )
-    
-    retrieved_memories_items = [item for item in retrieved_memories_items if item.score and item.score > _FILTER_SCORE]
-    
+
+    # Filter the retrieved documents to a salience threshold
+    retrieved_memories_items = [
+        item
+        for item in retrieved_memories_items
+        if item.score and item.score > _FILTER_SCORE
+    ]
+
     # Coerce into document objects from Search Items
     retrieved_memories = reduce_docs([], retrieved_memories_items)
 
-    # retrieved_memories.extend(retrieved_identity_memories)
-    # if state['recalled_memory_documents'] is None or len(state['recalled_memory_documents']) == 0:
-    #     assistant_identity_namespace = (user_id, assistant_id, "memory")
-    #     query = state['messages'][-1].content
+    """ 
+    
+    Retrieve Direct Quotes 
+    
+    THIS IS WHAT THE AVATAR HAS SAID PRECISELY IN THE PAST (USES QUERY FOR CONVERSATION SALIENCE)
+    
+    """
 
-    #     retrieved_memories_items = await runtime.store.asearch(assistant_identity_namespace, query=query)
-
-    #     # Coerce into document objects from Search Items
-    #     retrieved_memories = reduce_docs([], retrieved_memories_items)
-    # else:
-    #     retrieved_memories = state['recalled_memory_documents']
-    """ Retrieve Direct Quotes """
-    logger.info("breakpoint quote")
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
     direct_quote_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "quote"), query=query,
+        (creator_id, assistant_id, "quote"),
+        query=query,
         limit=_RETRIEVAL_LIMIT,
     )
 
-    direct_quote_items = [item for item in direct_quote_items if item.score and item.score > _FILTER_SCORE]
+    # Filter the direct quotes to a salience threshold
+    direct_quote_items = [
+        item for item in direct_quote_items if item.score and item.score > _FILTER_SCORE
+    ]
 
     logger.info(f"direct_quote_items: {direct_quote_items}")
     direct_quotes = reduce_docs([], direct_quote_items)
-    
 
-    """ Retrieve Documents """
-    # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, etc.)
-    retrieved_knowledge_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "document"), query=query, limit=_RETRIEVAL_LIMIT,
-    )
+    """ 
     
+    Retrieve Documents 
+    
+    RETRIEVED REFERENCE MATERIAL MUST BE SALIENT TO THE CONVERSATION (USES QUERY FOR THE RETRIEVAL)
+    
+    """
+    # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, reference documentation, etc.)
+    retrieved_knowledge_items = await runtime.store.asearch(
+        (creator_id, assistant_id, "document"),
+        query=query,
+        limit=_RETRIEVAL_LIMIT,
+    )
+
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
-    retrieved_knowledge_items = [item for item in retrieved_knowledge_items if item.score and item.score > _FILTER_SCORE]
+    retrieved_knowledge_items = [
+        item
+        for item in retrieved_knowledge_items
+        if item.score and item.score > _FILTER_SCORE
+    ]
     retrieved_knowledge = reduce_docs([], retrieved_knowledge_items)
 
-    """ Retrieve Analyzed Latent Traits """
+    """ 
+    
+    Retrieve Analyzed Latent Traits 
+    
+    ANALYZED TRAITS MUST BE SALIENT TO THE CONVERSATION (USES QUERY IN RETRIEVAL)
+    
+    """
 
     # The analysis namespace holds psycho-analysis findings about the target
     # (beliefs, emotional triggers, relationships, OCEAN, etc.) produced by the
     # process_media_graph analysis stage. Retrieve those relevant to the current
     # conversation by similarity to the user's message.
     analyzed_trait_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "analysis"), query=query
+        (creator_id, assistant_id, "analysis"), query=query, limit=_RETRIEVAL_LIMIT
     )
     logger.info(f"analyzed_trait_items: {analyzed_trait_items}")
     analyzed_traits = reduce_docs([], analyzed_trait_items)
 
-    """ Retrieve Style Profile """
-    style_profile_namespace = (assistant_id, "style_profile")
-    style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
+    """
     
+    Retrieve Style Profile 
+     
+    PROFILE IS STATIC (UNCHANGING) 
+    # TODO: CACHE THE PROFILE UNLESS THE PROFILE HAS BEEN CHANGED SINCE THE LAST MESSAGE 
+
+    """
+    style_profile_namespace = (assistant_id, "style_profile")
+    style_profile_ITEM = await runtime.store.aget(
+        style_profile_namespace, "style_profile"
+    )
+
     # style_profile_str will be "" if the style profile does not exist
     style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")
 
     """ Retrieve Emotions """
 
     # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt
-    from src.anubis.utils.state import EmotionSummarization
+    # from src.anubis.utils.state import EmotionSummarization
 
     # if state['current_assistant_emotions'] is None or state['current_assistant_emotions'] == "":
     #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt

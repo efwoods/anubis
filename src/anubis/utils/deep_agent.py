@@ -26,13 +26,12 @@ import logging
 import operator
 from typing import Annotated, Any, Optional, Sequence
 
+from deepagents import create_deep_agent
+from deepagents.graph import DeepAgentState
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from typing_extensions import Required
-
-from deepagents import create_deep_agent
-from deepagents.graph import DeepAgentState
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.middleware.consciousness_refresh_gate import (

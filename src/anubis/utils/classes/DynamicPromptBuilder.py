@@ -63,6 +63,7 @@ class DynamicPromptBuilder:
         retrieved_memories: Optional[List[Document]] = None,
         analyzed_traits: Optional[List[Document]] = None,
         style_profile_str: Optional[str] = None,
+        key_phrases_str: Optional[str] = None,
         direct_quotes: Optional[List[Document]] = None,
         user_name: Optional[str] = None,
         user_description: Optional[str] = None,
@@ -158,6 +159,11 @@ class DynamicPromptBuilder:
             # user_emotions_str = "Unaware of the current emotions of the person or people you are addressing."
             user_emotions_str = ""
 
+        # Signature key phrases (the avatar's auto-discovered characteristic
+        # phrasings). Injected as its own section; empty string when none exist.
+        if key_phrases_str is None:
+            key_phrases_str = ""
+
         # Build system time
         if system_time is None:
             system_time = "Time information unavailable."
@@ -176,6 +182,7 @@ class DynamicPromptBuilder:
             "retrieved_memories": retrieved_memories_str,
             "analyzed_traits": analyzed_traits_str,
             "style_profile_str": style_profile_str,
+            "key_phrases_str": key_phrases_str,
             "direct_quotes": direct_quotes_str,
             "user_name": user_name, 
             "user_identity": user_identity_str,

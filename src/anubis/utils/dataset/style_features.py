@@ -1,22 +1,19 @@
 """Shared stylometric feature extractor — the single source of truth.
 
-This module computes a flat dictionary of **33 scalar stylometric features** for
-one text. The SAME function is called by
-
-* the production authenticity evaluator
-  (:mod:`src.anubis.utils.dataset.authenticity_evaluator`), and
-* the validation notebook (``style.ipynb``),
-
-so the notebook genuinely exercises the production code path rather than a
-parallel re-implementation that could drift.
+This module computes a flat dictionary of **28 scalar stylometric features** for
+one text (feature-vector version 3; see :data:`STYLE_FEATURE_VECTOR_VERSION`).
+The SAME function is called by the production authenticity evaluator
+(``graph._attach_analyzed_features``), the per-avatar calibration
+(``calibrate_ground_truth``), the bundled-baseline builder
+(``data/build_baseline_features_arr.py``), and the validation notebook
+(``style.ipynb``), so every path exercises the same code rather than a parallel
+re-implementation that could drift.
 
 Design constraints (from ``features/prompt_drafts/style/style.md``):
 
 * **No spaCy** — part-of-speech information comes from ``nltk.pos_tag`` only.
   Features that would require a dependency parse (clause density, parse-tree
-  depth, T-units) are intentionally omitted; in their place we use a
-  gzip-compressibility proxy of the POS-tag stream as a syntactic-diversity
-  signal, plus ``textstat`` readability indices.
+  depth, T-units) are intentionally omitted.
 * **No VADER / sentiment** — sentiment lives elsewhere (Go-Emotions on the
   reply); style is measured purely from form.
 * Every feature returns a finite ``float`` where possible and ``nan`` on texts
@@ -30,7 +27,6 @@ without a glossary.
 
 from __future__ import annotations
 
-import gzip
 import html
 import json
 import logging
@@ -47,15 +43,19 @@ logger = logging.getLogger(__name__)
 # the stored covariance / inverse-covariance matrices are indexed by it.
 # ---------------------------------------------------------------------------
 FEATURE_NAMES: List[str] = [
-    # ── Lexical diversity (7) ──────────────────────────────────────────────
-    "type_token_ratio",                    # unique words / total words (length-biased)
+    # ── Lexical diversity (3) ──────────────────────────────────────────────
+    # Only the length-ROBUST diversity indices are kept. Raw TTR, Maas a², and
+    # Yule's K were removed in vector version 3 as multicollinear: TTR is length-
+    # biased and its two raw components (vocabulary size, total word count) were
+    # also dropped, while Maas and Yule's K measure the same repetition signal
+    # MATTR/MTLD/HD-D already carry length-robustly.
     "moving_average_ttr",                  # TTR averaged over a sliding window (length-robust)
     "mtld_lexical_diversity",              # Measure of Textual Lexical Diversity
     "hdd_lexical_diversity",               # Hypergeometric Distribution Diversity (HD-D)
-    "maas_lexical_diversity",              # Maas index a^2 (log-curve fit of TTR vs length)
-    "yule_characteristic_k",               # Yule's K — vocabulary repetition, length-stable
     "lexical_density_content_word_ratio",  # content words / all words
-    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    # ── Part-of-speech density via nltk.pos_tag (7) ────────────────────────
+    # pos_sequence_compressibility was removed in v3 as redundant with
+    # lexical_entropy_bits (both measure sequence predictability/variety).
     "noun_density",                        # share of tokens tagged noun
     "verb_density",                        # share of tokens tagged verb
     "adjective_density",                   # share of tokens tagged adjective
@@ -63,7 +63,6 @@ FEATURE_NAMES: List[str] = [
     "pronoun_density",                     # share of tokens tagged pronoun
     "preposition_density",                 # share of tokens tagged preposition
     "noun_to_verb_ratio",                  # nominal (high) vs verbal/conversational (low) style
-    "pos_sequence_compressibility",        # gzip ratio of the POS-tag stream (template reuse proxy)
     # ── Sentence shape (4) ─────────────────────────────────────────────────
     "mean_sentence_length_words",          # average words per sentence
     "stdev_sentence_length_words",         # sentence-length variability (rhythm)
@@ -81,21 +80,23 @@ FEATURE_NAMES: List[str] = [
     "all_caps_word_ratio",                 # SHOUTING / emphasis habit
     "words_per_paragraph",                 # internet writing = short paragraphs
     "transition_word_rate_per_1k",         # logical-bridge words per 1k (however, therefore, …)
-    # ── Readability composites via textstat (3) ────────────────────────────
-    "flesch_kincaid_grade",                # words/sentence + syllables/word -> US grade
-    "gunning_fog_index",                   # sentence length + % complex words
-    "smog_index",                          # polysyllable-count grade estimate
+    # The readability composites (Flesch-Kincaid, Gunning Fog, SMOG) were removed
+    # in v3: all three are deterministic functions of sentence length + syllable/
+    # complex-word counts, so they are mutually collinear and add no signal beyond
+    # the sentence-shape and word-length features already present.
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits",                # Shannon entropy of the word distribution
-    # ── Word & vocabulary shape (3) ────────────────────────────────────────
-    # Added in vector version 2 (see STYLE_FEATURE_VECTOR_VERSION). These are the
-    # scalar half of the features requested in features/statistical_significance.md;
-    # the vector-valued requests (character/word n-grams, function-word frequency
-    # vectors, auto-discovered key phrases) live in the nested profile built by
-    # src.anubis.utils.dataset.stylistic_profile, not in this fixed vector.
+    # ── Word & vocabulary shape (1) ────────────────────────────────────────
+    # vocabulary_size_unique_words and total_word_count were removed in v3 (they
+    # are the raw numerator/denominator of TTR — captured, and length-dependent).
     "average_word_length_characters",      # mean characters per word (orthographic length habit)
-    "vocabulary_size_unique_words",        # count of distinct word types (raw "vocab size")
-    "total_word_count",                    # count of all word tokens (document length in words)
+    # ── Signature key phrases (1) ──────────────────────────────────────────
+    # Occurrences of the avatar's auto-discovered signature key-phrases per total
+    # word. Unlike the character n-grams / function-word vectors (which were
+    # capture-only and are now dropped), this collapses the key-phrase signal to a
+    # single scalar so it can enter the Mahalanobis vector. The phrase set is
+    # avatar-specific and passed into extract_style_features; see key_phrases.py.
+    "key_phrase_rate",
 ]
 
 # Bump whenever the composition or order of FEATURE_NAMES changes. The width of
@@ -108,9 +109,13 @@ FEATURE_NAMES: List[str] = [
 #   v1: the original 33 features.
 #   v2: appended average_word_length_characters, vocabulary_size_unique_words,
 #       total_word_count (width 33 -> 36).
-STYLE_FEATURE_VECTOR_VERSION = 2
+#   v3: removed 9 multicollinear features (type_token_ratio, maas_lexical_diversity,
+#       yule_characteristic_k, pos_sequence_compressibility, flesch_kincaid_grade,
+#       gunning_fog_index, smog_index, vocabulary_size_unique_words,
+#       total_word_count) and appended key_phrase_rate (width 36 -> 28).
+STYLE_FEATURE_VECTOR_VERSION = 3
 
-assert len(FEATURE_NAMES) == 36, f"expected 36 features, found {len(FEATURE_NAMES)}"
+assert len(FEATURE_NAMES) == 28, f"expected 28 features, found {len(FEATURE_NAMES)}"
 
 
 # Human-legible display title per feature. Keyed by the snake_case FEATURE_NAMES
@@ -118,15 +123,12 @@ assert len(FEATURE_NAMES) == 36, f"expected 36 features, found {len(FEATURE_NAME
 # LLM sees in the <STYLE> block, so they spell out acronyms (MATTR, HD-D, SMOG)
 # rather than leaving the raw variable name.
 FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
-    # ── Lexical diversity (7) ──────────────────────────────────────────────
-    "type_token_ratio": "Type-Token Ratio (TTR)",
+    # ── Lexical diversity (3) ──────────────────────────────────────────────
     "moving_average_ttr": "Moving-Average Type-Token Ratio (MATTR)",
     "mtld_lexical_diversity": "Measure of Textual Lexical Diversity (MTLD)",
     "hdd_lexical_diversity": "Hypergeometric Distribution Diversity (HD-D)",
-    "maas_lexical_diversity": "Maas Lexical Diversity Index (a²)",
-    "yule_characteristic_k": "Yule's Characteristic K",
     "lexical_density_content_word_ratio": "Lexical Density (Content-Word Ratio)",
-    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    # ── Part-of-speech density via nltk.pos_tag (7) ────────────────────────
     "noun_density": "Noun Density",
     "verb_density": "Verb Density",
     "adjective_density": "Adjective Density",
@@ -134,7 +136,6 @@ FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
     "pronoun_density": "Pronoun Density",
     "preposition_density": "Preposition Density",
     "noun_to_verb_ratio": "Noun-to-Verb Ratio",
-    "pos_sequence_compressibility": "Part-of-Speech Sequence Diversity",
     # ── Sentence shape (4) ─────────────────────────────────────────────────
     "mean_sentence_length_words": "Mean Sentence Length (words)",
     "stdev_sentence_length_words": "Sentence-Length Variability (std dev, words)",
@@ -152,16 +153,12 @@ FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
     "all_caps_word_ratio": "ALL-CAPS Word Ratio",
     "words_per_paragraph": "Words per Paragraph",
     "transition_word_rate_per_1k": "Transition Words per 1,000 Words",
-    # ── Readability composites via textstat (3) ────────────────────────────
-    "flesch_kincaid_grade": "Flesch-Kincaid Grade Level",
-    "gunning_fog_index": "Gunning Fog Index",
-    "smog_index": "SMOG Index",
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits": "Lexical Entropy (bits)",
-    # ── Word & vocabulary shape (3) ────────────────────────────────────────
+    # ── Word & vocabulary shape (1) ────────────────────────────────────────
     "average_word_length_characters": "Average Word Length (characters)",
-    "vocabulary_size_unique_words": "Vocabulary Size (unique words)",
-    "total_word_count": "Total Word Count",
+    # ── Signature key phrases (1) ──────────────────────────────────────────
+    "key_phrase_rate": "Signature Key-Phrase Rate (per word)",
 }
 
 assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
@@ -174,15 +171,12 @@ assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(F
 # extract_style_features (POS/diversity shares are 0–1, punctuation is per-1k,
 # Yule's K is scaled to 10⁴ words, etc.).
 FEATURE_DESCRIPTIONS: Dict[str, str] = {
-    # ── Lexical diversity (7) ──────────────────────────────────────────────
-    "type_token_ratio": "Unique words divided by total words. Ranges 0–1. Higher means more varied vocabulary, lower means more repetition. Length-biased (drops as a text grows), so it is most comparable at similar lengths.",
+    # ── Lexical diversity (3) ──────────────────────────────────────────────
     "moving_average_ttr": "Type-token ratio averaged over a sliding ~50-word window. Ranges 0–1. Higher means richer vocabulary. Length-robust, so it stays comparable across short and long texts.",
     "mtld_lexical_diversity": "Mean length of word runs that stay above a 0.72 type-token threshold. Unbounded above; typically ~20–120 (most prose 40–100). Higher means sustained lexical variety, lower means vocabulary that repeats quickly.",
     "hdd_lexical_diversity": "Hypergeometric (HD-D) diversity: the type-token ratio a random fixed-size sample is expected to show. Ranges 0–1, typically ~0.70–0.90. Higher means more diverse word choice.",
-    "maas_lexical_diversity": "Maas index a², a log-curve fit of type-token ratio versus length. Small positive value, typically ~0.0–0.2. Measure: LOWER means richer/more diverse vocabulary, HIGHER means more repetitive vocabulary (same words are used).",
-    "yule_characteristic_k": "Yule's K, vocabulary repetition rate scaled to 10⁴ words; length-stable. Greater than 0, typically ~50–200. Measure: HIGHER means more repetitive vocabulary, LOWER means more varied vocabulary (a variety of words are used).",
     "lexical_density_content_word_ratio": "Content words (noun/verb/adjective/adverb) over all tagged tokens. Ranges 0–1, typically ~0.4–0.6. Higher means dense, informational, nominal writing; lower means more function words and a conversational feel.",
-    # ── Part-of-speech density via nltk.pos_tag (8) ────────────────────────
+    # ── Part-of-speech density via nltk.pos_tag (7) ────────────────────────
     "noun_density": "Share of tokens tagged as nouns. Ranges 0–1, typically ~0.20–0.35. Higher means a nominal, topic-heavy style.",
     "verb_density": "Share of tokens tagged as verbs. Ranges 0–1, typically ~0.15–0.25. Higher means an active, event-driven style.",
     "adjective_density": "Share of tokens tagged as adjectives. Ranges 0–1, typically ~0.05–0.10. Higher means more descriptive, modifier-heavy writing.",
@@ -190,7 +184,6 @@ FEATURE_DESCRIPTIONS: Dict[str, str] = {
     "pronoun_density": "Share of tokens tagged as pronouns. Ranges 0–1, typically ~0.05–0.15. Higher means a personal, conversational voice (I/you/we).",
     "preposition_density": "Share of tokens tagged as prepositions (including 'to'). Ranges 0–1, typically ~0.10–0.15. Higher means more elaborated, phrase-stacked syntax.",
     "noun_to_verb_ratio": "Nouns divided by verbs (+1 smoothed so it stays finite). Greater than 0, typically ~1–3. Higher means a nominal, formal register; lower (near 1) means a verbal, conversational register.",
-    "pos_sequence_compressibility": "Inverse gzip-compression ratio of the part-of-speech tag stream. Roughly ~1–3. Higher means more varied sentence shapes; lower means a few repeated grammatical templates (more formulaic). Very short texts read low from compression overhead.",
     # ── Sentence shape (4) ─────────────────────────────────────────────────
     "mean_sentence_length_words": "Average words per sentence. Greater than 0, typically ~10–25. Higher means longer, more complex sentences; lower means short, punchy ones.",
     "stdev_sentence_length_words": "Standard deviation of sentence length, in words. 0 or greater, typically ~4–15. Higher means rhythmic variety (mixing long and short sentences); 0 means uniform sentence length.",
@@ -208,16 +201,12 @@ FEATURE_DESCRIPTIONS: Dict[str, str] = {
     "all_caps_word_ratio": "Fraction of multi-letter tokens written in ALL CAPS. Ranges 0–1, usually near 0. Higher means a habit of SHOUTING or capitalized emphasis.",
     "words_per_paragraph": "Words divided by number of paragraphs (blank-line separated). Greater than 0. Higher means long, blocky paragraphs; lower means short, internet-style chunks.",
     "transition_word_rate_per_1k": "Logical-bridge words (however, therefore, moreover, …) per 1,000 words. 0 or greater, typically ~0–20. Higher means explicit, essayistic argument structure.",
-    # ── Readability composites via textstat (3) ────────────────────────────
-    "flesch_kincaid_grade": "Flesch-Kincaid US grade level from words-per-sentence and syllables-per-word. Typically ~1–15 (can go negative for very simple text). Higher means harder to read / a more educated register.",
-    "gunning_fog_index": "Gunning Fog index: years of formal education a reader needs, from sentence length and the share of complex words. Typically ~6–17. Higher means denser, harder prose.",
-    "smog_index": "SMOG grade estimate from the count of polysyllabic words. Typically ~6–14. Higher means more complex, multi-syllable vocabulary.",
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits": "Shannon entropy of the word-frequency distribution, in bits. 0 or greater and grows with vocabulary size (~4–10+ bits common). Higher means less predictable, more varied word choice; lower means repetitive, predictable wording.",
-    # ── Word & vocabulary shape (3) ────────────────────────────────────────
+    # ── Word & vocabulary shape (1) ────────────────────────────────────────
     "average_word_length_characters": "Mean number of characters per word (apostrophes counted, e.g. \"it's\" is 4). Greater than 0, typically ~4–5 for English prose. Higher means a preference for longer, often more formal or Latinate words; lower means shorter, plainer words.",
-    "vocabulary_size_unique_words": "Count of DISTINCT word types in the text (the raw vocabulary size). 0 or greater and grows with both text length and word variety. Higher means a larger vocabulary was used; interpret alongside total word count, since a longer text has more room to accumulate types.",
-    "total_word_count": "Count of ALL word tokens in the text (its length in words). 0 or greater. Higher means a longer passage; for a fixed speaker this reflects how much they tend to write per message. Paired with vocabulary size, the two give the raw unique-vs-total lexical-richness comparison.",
+    # ── Signature key phrases (1) ──────────────────────────────────────────
+    "key_phrase_rate": "Occurrences of the avatar's auto-discovered signature key-phrases (2–4 word recurring expressions like 'you know', 'got it') per total word in the text. 0 or greater, usually small (~0.0–0.1). Higher means the writing leans on the speaker's characteristic fixed phrasings; 0 means none of the signature phrases appear.",
 }
 
 assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
@@ -318,28 +307,36 @@ def _nan_features() -> Dict[str, float]:
     return {name: math.nan for name in FEATURE_NAMES}
 
 
-def extract_style_features(text: str) -> Dict[str, float]:
-    """Return the 33 stylometric scalars for one document.
+def extract_style_features(
+    text: str, *, key_phrases: Sequence[str] | None = None
+) -> Dict[str, float]:
+    """Return the 28 stylometric scalars for one document.
 
     The returned dict is keyed by :data:`FEATURE_NAMES`. Values are floats; a
     metric that cannot be computed on the given text yields ``nan`` rather than
     raising, so a single short document never breaks a batch.
 
-    Coverage of the features requested in
-    ``features/statistical_significance.md`` (the "Detailed Features yet to be
-    used" list):
+    Args:
+        text: The document to fingerprint.
+        key_phrases: The avatar's auto-discovered signature phrases (from
+            :func:`src.anubis.utils.dataset.key_phrases.discover_key_phrases`).
+            Used ONLY to compute ``key_phrase_rate`` (occurrences per total word).
+            When ``None`` or empty — e.g. a text with no calibrated phrase set —
+            ``key_phrase_rate`` is ``0.0``. This is the one avatar-relative
+            feature in the vector; every other feature depends on ``text`` alone.
+
+    Coverage of the scalar features requested in
+    ``features/statistical_significance.md``:
 
     * average sentence length (words per sentence) — ``mean_sentence_length_words``.
     * average word length (characters per word) — ``average_word_length_characters``.
-    * lexical richness, unique vs total words — ``vocabulary_size_unique_words``
-      and ``total_word_count`` (plus the ratio ``type_token_ratio``).
     * punctuation frequencies — the seven ``*_rate_per_1k`` marks above.
+    * signature key-phrase reliance — ``key_phrase_rate``.
 
-    The remaining requested features are VECTOR-valued (they do not reduce to one
-    scalar) and are therefore captured in the nested profile built by
-    :mod:`src.anubis.utils.dataset.stylistic_profile`, NOT in this fixed vector:
-    character n-grams, word n-grams, function-word frequency vectors, and
-    auto-discovered key phrases (e.g. "you know", "got it", "what do ya mean").
+    The character n-gram and function-word VECTORS that used to be captured in the
+    nested :mod:`src.anubis.utils.dataset.stylistic_profile` profile were dropped;
+    the key-phrase signal is now carried here as the single ``key_phrase_rate``
+    scalar and, separately, as the prompt-injected signature-phrase list.
     """
     _ensure_nltk_resources()
 
@@ -363,11 +360,10 @@ def extract_style_features(text: str) -> Dict[str, float]:
     sentence_count = len(sentences) or 1
 
     # ── A. LEXICAL DIVERSITY ───────────────────────────────────────────────
-    # lexicalrichness implements the length-robust diversity indices; raw TTR is
-    # length-biased and kept only as a baseline. Short texts make several of
-    # these undefined, so each is guarded individually.
+    # Only the length-ROBUST diversity indices are kept (v3). Raw TTR, Maas a²,
+    # and Yule's K were removed as multicollinear with MATTR/MTLD/HD-D. Short
+    # texts make several of these undefined, so each is guarded individually.
     lex = LexicalRichness(cleaned)
-    features["type_token_ratio"] = _safe(lambda: lex.ttr)
     features["moving_average_ttr"] = _safe(
         lambda: lex.mattr(window_size=min(50, max(1, lex.words)))
     )
@@ -375,22 +371,13 @@ def extract_style_features(text: str) -> Dict[str, float]:
     features["hdd_lexical_diversity"] = _safe(
         lambda: lex.hdd(draws=min(42, max(1, lex.words)))
     )
-    features["maas_lexical_diversity"] = _safe(lambda: lex.Maas)
 
-    # Yule's K = 10^4 * (Σ m^2 · V_m − N) / N^2, where V_m is the number of word
-    # types occurring exactly m times. Length-stable measure of repetition.
+    # Word-frequency table, reused below for lexical entropy. (Yule's K, which
+    # also derived from this table, was removed in v3.)
     word_frequencies = Counter(alpha_words)
-    frequency_spectrum = Counter(word_frequencies.values())
-    yule_k = (
-        1e4
-        * (sum(m * m * v_m for m, v_m in frequency_spectrum.items()) - alpha_count)
-        / (alpha_count * alpha_count)
-    )
-    features["yule_characteristic_k"] = float(yule_k)
 
     # ── B. PART-OF-SPEECH DENSITY (nltk.pos_tag, Penn Treebank) ────────────
-    # One tagging pass feeds every POS feature plus lexical density and the
-    # POS-stream compressibility proxy.
+    # One tagging pass feeds every POS feature plus lexical density.
     pos_tags = [tag for _, tag in _safe_pos_tag(words)]
     pos_total = len(pos_tags) or 1
     noun_count = _count_tags(pos_tags, _NOUN_TAGS)
@@ -412,15 +399,6 @@ def extract_style_features(text: str) -> Dict[str, float]:
     # Lexical density = content words (noun/verb/adj/adv) / all tagged tokens.
     content_word_count = noun_count + verb_count + adjective_count + adverb_count
     features["lexical_density_content_word_ratio"] = content_word_count / pos_total
-
-    # POS-stream compressibility: LLM output reuses a few syntactic templates, so
-    # its tag stream compresses more than varied human prose. We report 1/ratio
-    # so HIGHER = more syntactically diverse (less template-y).
-    pos_blob = " ".join(pos_tags).encode()
-    compression_ratio = len(gzip.compress(pos_blob)) / (len(pos_blob) or 1)
-    features["pos_sequence_compressibility"] = (
-        1.0 / compression_ratio if compression_ratio else math.nan
-    )
 
     # ── C. SENTENCE SHAPE ──────────────────────────────────────────────────
     sentence_lengths = [len(_word_tokens(s)) for s in sentences]
@@ -452,41 +430,38 @@ def extract_style_features(text: str) -> Dict[str, float]:
         sum(1 for w in alpha_words if w in _TRANSITION_WORDS) * per_thousand
     )
 
-    # ── F. READABILITY COMPOSITES (textstat) ───────────────────────────────
-    import textstat
+    # (Readability composites — Flesch-Kincaid, Gunning Fog, SMOG — were removed
+    # in v3 as mutually collinear functions of sentence length + syllable counts.)
 
-    features["flesch_kincaid_grade"] = _safe(
-        lambda: float(textstat.flesch_kincaid_grade(cleaned))
-    )
-    features["gunning_fog_index"] = _safe(
-        lambda: float(textstat.gunning_fog(cleaned))
-    )
-    features["smog_index"] = _safe(lambda: float(textstat.smog_index(cleaned)))
-
-    # ── G. INFORMATION THEORY ──────────────────────────────────────────────
+    # ── F. INFORMATION THEORY ──────────────────────────────────────────────
     # Shannon entropy of the unigram distribution, in bits: how unpredictable the
-    # next word is. Computed from the same frequency table as Yule's K.
+    # next word is. Computed from the word-frequency table built above.
     entropy_bits = 0.0
     for count in word_frequencies.values():
         probability = count / alpha_count
         entropy_bits -= probability * math.log2(probability)
     features["lexical_entropy_bits"] = entropy_bits
 
-    # ── H. WORD & VOCABULARY SHAPE ─────────────────────────────────────────
+    # ── G. WORD SHAPE ──────────────────────────────────────────────────────
     # `total_words` is the TRUE token count (len(alpha_words)); `alpha_count`
     # above was floored to 1 only to guard divisions, so it must not be reused
     # here. Average word length divides total characters by that true count and
-    # is NaN when there are no word tokens (all-punctuation input). Vocabulary
-    # size is the number of distinct types; total word count is the raw length —
-    # together they are the requested unique-vs-total lexical-richness pair, of
-    # which type_token_ratio (computed above) is the normalised ratio.
+    # is NaN when there are no word tokens (all-punctuation input). (The raw
+    # vocabulary-size and total-word-count features were removed in v3 as the
+    # length-dependent components of TTR.)
     total_words = len(alpha_words)
     total_characters = sum(len(word) for word in alpha_words)
     features["average_word_length_characters"] = (
         total_characters / total_words if total_words else math.nan
     )
-    features["vocabulary_size_unique_words"] = float(len(word_frequencies))
-    features["total_word_count"] = float(total_words)
+
+    # ── H. SIGNATURE KEY-PHRASE RATE ───────────────────────────────────────
+    # Occurrences of the avatar's signature phrases per total word. The phrase set
+    # is avatar-specific (passed in); with no set the rate is 0.0. Delegated to
+    # key_phrases so the tokenisation matches how the phrases were discovered.
+    from src.anubis.utils.dataset.key_phrases import key_phrase_occurrence_rate
+
+    features["key_phrase_rate"] = key_phrase_occurrence_rate(cleaned, key_phrases)
 
     # Guarantee exactly the declared keys, in the declared order.
     return {name: float(features.get(name, math.nan)) for name in FEATURE_NAMES}
@@ -501,7 +476,7 @@ def _safe(metric_fn: Callable[[], Any], default: float = 0.0) -> float:
     """Run a metric, swallowing short-text / zero-division errors.
 
     Returns ``default`` on the ``ValueError`` / ``ZeroDivisionError`` that
-    lexicalrichness and textstat raise on tiny inputs.
+    lexicalrichness raises on tiny inputs.
     """
     try:
         value = metric_fn()
@@ -644,6 +619,10 @@ GROUND_TRUTH_FEATURES_DICT_KEY = "ground_truth_text_features_by_doc_id_dict_str"
 # ---------------------------------------------------------------------------
 BASELINE_FEATURES_ARR_PATH = "src/anubis/utils/dataset/baseline_features_arr.npy"
 BASELINE_FEATURES_MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
+# Pre-built SHAP KernelExplainer over the baseline IsolationForest, so the runtime
+# loads it instead of rebuilding a KernelExplainer (kmeans + repeated model.predict)
+# on first use. Regenerated alongside the model by build_baseline_features_arr.py.
+BASELINE_FEATURES_EXPLAINER_PATH = "src/anubis/utils/dataset/baseline_features_explainer_b64.pkl"
 
 
 def load_bundled_baseline_features_arr() -> Any:
@@ -754,7 +733,7 @@ MAX_CALIBRATION_ROWS = 1500
 def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tuple[str, str]:
     """Recalibrate the empirical threshold and IsolationForest from the corpus.
 
-    Given the reconstructed ``(n_docs, 33)`` corpus array, returns
+    Given the reconstructed ``(n_docs, len(FEATURE_NAMES))`` corpus array, returns
     ``(empirical_threshold_list_str, model_b64_pkl)`` serialized exactly as the
     store expects:
 

@@ -1876,6 +1876,7 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     import numpy as np
 
     from src.anubis.utils.dataset.style_features import (
+        BASELINE_FEATURES_EXPLAINER_PATH,
         BASELINE_FEATURES_MODEL_PATH,
         FEATURE_NAMES,
         baseline_feature_array_is_current,
@@ -1885,6 +1886,7 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     # Attempt to pull stored model and data from store
     baseline_features_namespace = ("baseline_features_arr_list_str",)
     baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
+    baseline_features_explainer_namespace = ("baseline_features_explainer_b64_pkl",)
 
     baseline_features_arr_list_str_ITEM = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
     baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
@@ -1937,7 +1939,48 @@ async def load_baseline_features_explainer_model(store: BaseStore):
             key="baseline_features_arr_list_str",
             value={"value": json.dumps(baseline_features_arr.tolist())})
 
-    explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+    # Load the pre-built SHAP explainer (base64 pickle) rather than rebuilding a
+    # KernelExplainer (kmeans + repeated model.predict) on every call. Cached in
+    # the store like the model/array, with a disk fallback. If the persisted
+    # explainer is missing, unreadable, or predates the current feature vector, we
+    # self-heal to a runtime rebuild so inference never breaks.
+    baseline_features_explainer_b64_pkl_ITEM = await store.aget(
+        baseline_features_explainer_namespace, key="baseline_features_explainer_b64_pkl")
+    baseline_features_explainer_b64_pkl = (getattr(baseline_features_explainer_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+
+    async def _load_bundled_explainer_b64() -> str:
+        """Read the bundled base64 explainer pickle from disk and cache it in the store."""
+        async with aiofiles.open(BASELINE_FEATURES_EXPLAINER_PATH, 'rb') as fp:
+            explainer_bytes = await fp.read()
+        explainer_b64_str = explainer_bytes.decode('utf-8')
+        await store.aput(
+            baseline_features_explainer_namespace,
+            key="baseline_features_explainer_b64_pkl",
+            value={"value": explainer_b64_str})
+        return explainer_b64_str
+
+    explainer = None
+    try:
+        if not baseline_features_explainer_b64_pkl:
+            baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
+        explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+
+        # Width self-heal: an explainer cached before the feature vector changed
+        # carries a stale-width background/model. Its SHAP background lives at
+        # explainer.data.data as an (n_background, F) array; reload the bundled
+        # explainer when F no longer matches the current vector.
+        explainer_background = np.asarray(getattr(getattr(explainer, "data", None), "data", np.empty((0, 0))))
+        if explainer_background.ndim != 2 or explainer_background.shape[1] != len(FEATURE_NAMES):
+            baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
+            explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+    except Exception:
+        # Missing/corrupt/incompatible persisted explainer — rebuild from the
+        # current-width model + background so the caller always gets a usable one.
+        explainer = None
+
+    if explainer is None:
+        explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+
     return explainer, model
 
 async def compute_shap_values_against_baseline(feature_values, store: BaseStore) -> dict:

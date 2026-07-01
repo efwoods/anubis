@@ -1,20 +1,17 @@
-"""Auto-discovered key phrases + function-word frequencies (capture-only).
+"""Auto-discovered signature key phrases.
 
-These are two of the VECTOR-valued stylometric features requested in
-``features/statistical_significance.md``. They do not reduce to a single scalar,
-so they live here (and are surfaced through the nested profile in
-:mod:`src.anubis.utils.dataset.stylistic_profile`) rather than in the fixed
-Mahalanobis vector of :mod:`src.anubis.utils.dataset.style_features`. Nothing in
-this module is wired into the authenticity evaluator yet — the goal for now is to
-CAPTURE and persist these signals per avatar so a later pass can score against
-them.
+Key phrases are the surviving key-phrase signal from
+``features/statistical_significance.md``. The character n-gram and function-word
+vectors that used to live here alongside them were dropped (they were
+capture-only and never scored); the key-phrase signal is now used two ways:
+
+* as the scalar ``key_phrase_rate`` in the fixed Mahalanobis vector of
+  :mod:`src.anubis.utils.dataset.style_features` (via
+  :func:`key_phrase_occurrence_rate`), and
+* as a separately-stored, separately prompt-injected list of the avatar's
+  signature phrases.
 
 Two public functions:
-
-* :func:`function_word_frequencies` — Mosteller-and-Wallace-style closed-class
-  function-word rates for one text. Function words (articles, pronouns,
-  prepositions, conjunctions, auxiliaries, particles) carry almost no topic, so
-  their relative rates are a classic, topic-independent authorship fingerprint.
 
 * :func:`discover_key_phrases` — over a corpus of the target's direct quotes,
   finds recurring multi-word expressions (2–4 words) that are OVER-REPRESENTED
@@ -26,61 +23,21 @@ Two public functions:
   independence predicts, they rise to the top — which is exactly the behaviour
   asked for. This is a pointwise-mutual-information keyness against a bundled
   generic baseline, so it needs no corpus download and is fully deterministic.
+
+* :func:`key_phrase_occurrence_rate` — given a text and a set of already-
+  discovered phrases, counts how many times those phrases occur (as contiguous
+  token runs) per total word. This is the scalar the avatar's ``key_phrase_rate``
+  feature is built from, so it tokenises with the SAME :func:`tokenize` the
+  discovery step uses to keep the two consistent.
 """
 
 from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 from src.anubis.utils.dataset.burrows_delta import tokenize
-
-# ---------------------------------------------------------------------------
-# Closed-class English function words (topic-free authorship signal).
-#
-# Deliberately a closed class — determiners, pronouns, prepositions,
-# conjunctions, auxiliary/modal verbs, wh-words, and common particles. Content
-# words are excluded on purpose so the rates reflect HOW someone writes, not WHAT
-# about. Apostrophe forms (it's, don't) are kept because contraction habits are
-# themselves stylistic.
-# ---------------------------------------------------------------------------
-FUNCTION_WORDS: frozenset = frozenset(
-    {
-        # Articles / determiners
-        "a", "an", "the", "this", "that", "these", "those", "some", "any",
-        "no", "every", "each", "either", "neither", "all", "both", "such",
-        # Personal / possessive / reflexive pronouns
-        "i", "me", "my", "mine", "myself", "we", "us", "our", "ours",
-        "ourselves", "you", "your", "yours", "yourself", "yourselves",
-        "he", "him", "his", "himself", "she", "her", "hers", "herself",
-        "it", "its", "itself", "they", "them", "their", "theirs",
-        "themselves", "who", "whom", "whose", "which", "what",
-        # Demonstratives / quantifiers already partly above; add indefinite
-        "one", "none", "many", "much", "more", "most", "few", "less", "least",
-        "other", "another", "someone", "somebody", "something", "anyone",
-        "anybody", "anything", "everyone", "everybody", "everything",
-        "nobody", "nothing",
-        # Prepositions
-        "of", "in", "on", "at", "by", "for", "with", "about", "against",
-        "between", "into", "through", "during", "before", "after", "above",
-        "below", "to", "from", "up", "down", "over", "under", "again",
-        "further", "then", "once", "out", "off", "near", "within", "without",
-        "toward", "towards", "upon", "among", "across", "behind", "beyond",
-        # Conjunctions
-        "and", "but", "or", "nor", "so", "yet", "because", "as", "until",
-        "while", "although", "though", "unless", "since", "whereas", "if",
-        "whether", "than",
-        # Auxiliary / modal verbs
-        "am", "is", "are", "was", "were", "be", "been", "being", "have",
-        "has", "had", "having", "do", "does", "did", "doing", "can", "could",
-        "will", "would", "shall", "should", "may", "might", "must", "ought",
-        # Common particles / adverbs of degree & negation
-        "not", "only", "just", "very", "too", "also", "even", "still", "here",
-        "there", "when", "where", "why", "how", "all", "both", "own", "same",
-    }
-)
-
 
 # ---------------------------------------------------------------------------
 # Bundled generic-English unigram relative frequencies (fraction of running
@@ -121,40 +78,46 @@ GENERIC_ENGLISH_UNIGRAM_RELATIVE_FREQUENCY: Dict[str, float] = {
 _GENERIC_FLOOR_RELATIVE_FREQUENCY = 5e-5
 
 
-def function_word_frequencies(text: str, *, per_thousand: bool = True) -> Dict[str, Any]:
-    """Closed-class function-word rates for one text (authorship fingerprint).
+def key_phrase_occurrence_rate(
+    text: str, key_phrases: Sequence[str] | None
+) -> float:
+    """Signature-phrase occurrences per total word in ``text``.
 
-    Returns a JSON-serialisable dict with the per-word rates (only for function
-    words that actually appear, to keep the payload compact), the overall share
-    of tokens that are function words, and the token total the rates were
-    computed over. Rates are per-1,000 tokens when ``per_thousand`` (the default),
-    else relative frequencies in ``[0, 1]``.
+    This is the scalar behind the ``key_phrase_rate`` stylometric feature. For
+    each phrase in ``key_phrases`` we count how many times it appears in ``text``
+    as a CONTIGUOUS run of tokens, sum those counts across all phrases, and divide
+    by the text's total token count. Overlapping/repeated matches are counted (the
+    "occurrence count" definition), so a text that leans heavily on the speaker's
+    fixed collocations scores high.
+
+    ``text`` is tokenised with the same :func:`tokenize` used by
+    :func:`discover_key_phrases`, so a stored phrase (whose words were produced by
+    that tokeniser and re-joined with single spaces) matches token-for-token here.
+
+    Returns ``0.0`` when ``key_phrases`` is empty/``None`` or the text has no
+    tokens — the neutral value for an avatar with no calibrated phrase set.
     """
     tokens = tokenize(text)
     token_total = len(tokens)
-    if token_total == 0:
-        return {
-            "token_total": 0,
-            "function_word_token_share": 0.0,
-            "rates_are_per_1k_tokens": per_thousand,
-            "function_word_rates": {},
-        }
+    if token_total == 0 or not key_phrases:
+        return 0.0
 
-    function_word_counts = Counter(t for t in tokens if t in FUNCTION_WORDS)
-    scale = 1000.0 if per_thousand else 1.0
-    rates = {
-        word: (count / token_total) * scale
-        for word, count in function_word_counts.items()
-    }
-    return {
-        "token_total": token_total,
-        "function_word_token_share": sum(function_word_counts.values()) / token_total,
-        "rates_are_per_1k_tokens": per_thousand,
-        # Sorted high-to-low so the dominant function words read first.
-        "function_word_rates": dict(
-            sorted(rates.items(), key=lambda kv: kv[1], reverse=True)
-        ),
-    }
+    # Pre-split each phrase into its token sequence once. Skip empties defensively.
+    phrase_token_sequences = [phrase.split() for phrase in key_phrases]
+    phrase_token_sequences = [seq for seq in phrase_token_sequences if seq]
+    if not phrase_token_sequences:
+        return 0.0
+
+    total_occurrences = 0
+    for phrase_tokens in phrase_token_sequences:
+        phrase_length = len(phrase_tokens)
+        if phrase_length > token_total:
+            continue
+        for start_index in range(token_total - phrase_length + 1):
+            if tokens[start_index : start_index + phrase_length] == phrase_tokens:
+                total_occurrences += 1
+
+    return total_occurrences / token_total
 
 
 def _generic_expected_relative_frequency(phrase_tokens: List[str]) -> float:

@@ -109,7 +109,18 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
 
-    features_dict = extract_style_features(avatar_response.content)
+    # The key_phrase_rate feature is measured against the avatar's discovered
+    # signature phrases (the same set calibrate_ground_truth used to build the
+    # ground-truth cloud), so the message's rate is consistent with that cloud.
+    # None/empty when no phrases have been discovered yet -> rate is 0.0.
+    key_phrase_profile_ITEM = await runtime.store.aget(
+        (assistant_id, "key_phrase_profile"), key="key_phrase_profile"
+    )
+    avatar_key_phrases = (getattr(key_phrase_profile_ITEM, "value", None) or {}).get("phrases", None)
+
+    features_dict = extract_style_features(
+        avatar_response.content, key_phrases=avatar_key_phrases
+    )
     avatar_response.response_metadata.update({"features": features_dict})
 
     features_arr = np.array(list(features_dict.values()))
@@ -189,7 +200,7 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
         ground_truth_text_empirical_threshold_list_str = (getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None) or {}).get("value", None)
 
-        # Reconstruct the (n_docs, 33) corpus array from the per-document dict.
+        # Reconstruct the (n_docs, len(FEATURE_NAMES)) corpus array from the per-document dict.
         ground_truth_text_features_arr = features_by_doc_id_to_arr(
             deserialize_features_by_doc_id(ground_truth_text_features_by_doc_id_str)
         )
@@ -242,9 +253,9 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             )
             explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, shap_background)
             ground_truth_shap_values = explainer.shap_values(features_arr.reshape(1,-1))
-            # shap_values for a single sample comes back shaped (1, 33); flatten to
-            # (33,) so it aligns with the 33-row FEATURE_NAMES index (the DataFrame
-            # expects (n_features, 1), not (1, n_features)).
+            # shap_values for a single sample comes back shaped (1, n_features);
+            # flatten to (n_features,) so it aligns with the FEATURE_NAMES index
+            # (the DataFrame expects (n_features, 1), not (1, n_features)).
             ground_truth_shap_values = np.asarray(ground_truth_shap_values).ravel()
             ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
 

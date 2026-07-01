@@ -1066,7 +1066,7 @@ async def process_text_to_document(
         )
         """ CALIBRATE GROUND TRUTH """
         from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-        await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents)
+        await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents, user_id=user_id)
         
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True

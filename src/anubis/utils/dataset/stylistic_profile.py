@@ -12,13 +12,6 @@ Feature families implemented today:
 * Authorship reference distribution (Burrows Delta inputs).
 * Lexicon: vocabulary set with frequencies, distinctive bigrams/trigrams,
   TF-IDF-ish keyness against a stored English unigram baseline.
-* Character n-grams: top character 2-/3-/4-grams (spelling, morphology, and
-  punctuation habits) — capture-only.
-* Function words: closed-class function-word rates (topic-free authorship
-  fingerprint, Mosteller-and-Wallace style) — capture-only.
-* Key phrases (corpus-level): auto-discovered recurring multi-word expressions
-  over-represented vs a generic-English baseline (e.g. "you know", "got it") —
-  capture-only. See :mod:`src.anubis.utils.dataset.key_phrases`.
 * Sentence: average length in tokens, length distribution moments,
   declarative/interrogative/exclamatory ratios.
 * Syntax (best-effort): POS ratios, average parse-tree depth, clausal
@@ -40,15 +33,11 @@ import logging
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List
 
 from src.anubis.utils.dataset.burrows_delta import (
     build_reference_distribution,
     tokenize,
-)
-from src.anubis.utils.dataset.style_features import (
-    FEATURE_NAMES,
-    extract_style_features,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,25 +97,6 @@ def _ngram_counts(tokens: List[str], n: int, top_k: int) -> List[List[Any]]:
     for i in range(len(tokens) - n + 1):
         counts[" ".join(tokens[i : i + n])] += 1
     return [list(item) for item in counts.most_common(top_k)]
-
-
-def _character_ngram_counts(text: str, n: int, top_k: int) -> List[List[Any]]:
-    """Top character ``n``-grams (with counts) over the lowercased raw text.
-
-    Character n-grams are computed over the raw text — spaces and punctuation
-    INCLUDED — because word boundaries, affixes, and punctuation habits are part
-    of the character-level fingerprint. Spaces are shown as the visible glyph
-    ``␣`` so the stored/serialised n-grams stay legible (e.g. ``"you␣"``).
-    """
-    normalized = (text or "").lower()
-    if len(normalized) < n:
-        return []
-    counts: Counter = Counter(
-        normalized[i : i + n] for i in range(len(normalized) - n + 1)
-    )
-    return [
-        [gram.replace(" ", "␣"), count] for gram, count in counts.most_common(top_k)
-    ]
 
 
 def _try_spacy():
@@ -190,27 +160,6 @@ def _lexical_features(text: str, top_k_ngrams: int = 50) -> Dict[str, Any]:
         "top_bigrams": _ngram_counts(tokens, 2, top_k_ngrams),
         "top_trigrams": _ngram_counts(tokens, 3, top_k_ngrams),
     }
-
-
-def _character_ngram_features(text: str, top_k: int = 50) -> Dict[str, Any]:
-    """Character-level n-gram fingerprint (top char 2-, 3-, and 4-grams).
-
-    A classic, robust authorship signal (character n-grams capture spelling,
-    morphology, and punctuation habits without a tokenizer). Capture-only: stored
-    in the profile, not yet scored by the authenticity evaluator.
-    """
-    return {
-        "top_char_bigrams": _character_ngram_counts(text, 2, top_k),
-        "top_char_trigrams": _character_ngram_counts(text, 3, top_k),
-        "top_char_quadgrams": _character_ngram_counts(text, 4, top_k),
-    }
-
-
-def _function_word_features(text: str) -> Dict[str, Any]:
-    """Closed-class function-word rates (topic-free authorship fingerprint)."""
-    from src.anubis.utils.dataset.key_phrases import function_word_frequencies
-
-    return function_word_frequencies(text)
 
 
 def _sentence_features(text: str) -> Dict[str, Any]:
@@ -430,7 +379,7 @@ def _consistency_features(corpus_documents: List[str]) -> Dict[str, Any]:
 def compute_features_for_text(
     text: str,
     *,
-    reference_distribution: Optional[Dict[str, Any]] = None,
+    reference_distribution: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Extract the same feature shape from a single candidate text.
 
@@ -442,8 +391,6 @@ def compute_features_for_text(
     """
     features: Dict[str, Any] = {
         "lexical": _lexical_features(text),
-        "character_ngrams": _character_ngram_features(text),
-        "function_words": _function_word_features(text),
         "sentence": _sentence_features(text),
         "style": _style_features(text),
         "syntax": _syntax_features(text),
@@ -472,7 +419,7 @@ def compute_features_for_text(
 def compute_profile_from_quotes(
     quote_documents: List[str],
     *,
-    target_name: Optional[str] = None,
+    target_name: str | None = None,
 ) -> Dict[str, Any]:
     """Build the stylistic profile JSON from a corpus of direct quotes.
 
@@ -485,20 +432,19 @@ def compute_profile_from_quotes(
     document_count = len(quotes)
     aggregate_text = "\n".join(quotes)
 
-    from src.anubis.utils.dataset.key_phrases import discover_key_phrases
-
+    # Note: key-phrase discovery no longer happens here. Signature key phrases are
+    # discovered, stored, and prompt-injected separately by calibrate_ground_truth
+    # (the (creator_id, assistant_id, "key_phrase") vectorstore + key_phrase_profile
+    # blob), and their scalar summary rides in style_features' key_phrase_rate. The
+    # character n-gram and function-word vectors were dropped entirely (capture-only,
+    # never scored).
     aggregate_features = {
         "lexical": _lexical_features(aggregate_text, top_k_ngrams=200),
-        "character_ngrams": _character_ngram_features(aggregate_text, top_k=100),
-        "function_words": _function_word_features(aggregate_text),
         "sentence": _sentence_features(aggregate_text),
         "style": _style_features(aggregate_text),
         "syntax": _syntax_features(aggregate_text),
         "prosody": _prosody_features(aggregate_text),
         "consistency": _consistency_features(quotes),
-        # Auto-discovered recurring phrases over-represented vs generic English
-        # (e.g. "you know", "got it"). Corpus-level: needs the whole quote set.
-        "key_phrases": discover_key_phrases(quotes),
     }
 
     reference = build_reference_distribution(quotes)

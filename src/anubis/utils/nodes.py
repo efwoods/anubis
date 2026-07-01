@@ -408,9 +408,19 @@ async def _build_consciousness_system_message_update(
     """ Retrieve Style Profile """
     style_profile_namespace = (assistant_id, "style_profile")
     style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
-    
+
     # style_profile_str will be "" if the style profile does not exist
     style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")
+
+    """ Retrieve Signature Key Phrases """
+    # The avatar's auto-discovered signature phrases (built by calibrate_ground_truth
+    # from the direct quotes). Retrieved like the style profile — a single blob read
+    # every turn — and prompt-injected as its own section. Empty string when none
+    # have been discovered yet.
+    key_phrase_profile_ITEM = await runtime.store.aget(
+        (assistant_id, "key_phrase_profile"), "key_phrase_profile"
+    )
+    key_phrases_str = getattr(key_phrase_profile_ITEM, "value", {}).get("value", "")
 
     """ Retrieve Emotions """
 
@@ -466,6 +476,7 @@ async def _build_consciousness_system_message_update(
         retrieved_knowledge=retrieved_knowledge,
         analyzed_traits=analyzed_traits,
         style_profile_str=style_profile_str,
+        key_phrases_str=key_phrases_str,
         direct_quotes=direct_quotes,
         user_name=user_name,
         user_description=user_description,

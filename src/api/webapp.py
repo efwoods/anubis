@@ -3602,7 +3602,7 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
         )
 
     # Prune the deleted documents' rows from the stylometric "direct quote"
-    # feature corpus (a {document_id: [33 floats]} dict in the store), then
+    # feature corpus (a {document_id: [len(FEATURE_NAMES) floats]} dict in the store), then
     # recalibrate the empirical threshold + IsolationForest from what remains.
     # Best-effort: a failure here must not fail the (already committed) delete.
     try:
@@ -3622,10 +3622,10 @@ async def _prune_ground_truth_features_for_deleted_docs(
 ) -> None:
     """Remove deleted documents from the per-document stylometric feature corpus.
 
-    Reads the ``{document_id: [33 floats]}`` dict the avatar's "direct quote"
+    Reads the ``{document_id: [len(FEATURE_NAMES) floats]}`` dict the avatar's "direct quote"
     corpus is stored under, drops every ``deleted_document_ids`` entry, then:
 
-    * if rows remain — rebuilds the ``(n_docs, 33)`` array and recalibrates the
+    * if rows remain — rebuilds the ``(n_docs, len(FEATURE_NAMES))`` array and recalibrates the
       empirical threshold + IsolationForest from it, persisting all three
       artifacts (dict, threshold, model);
     * if the corpus is now empty — deletes all three keys so a later re-upload

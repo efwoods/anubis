@@ -93,7 +93,7 @@ def test_recompute_ground_truth_artifacts_round_trips():
 
 
 """ ------------------------------------------------------------------ """
-""" Feature-vector composition (v2: word & vocabulary shape scalars)    """
+""" Feature-vector composition (v3: pruned collinear set + key phrases)  """
 """ ------------------------------------------------------------------ """
 
 
@@ -102,24 +102,43 @@ def test_feature_metadata_dicts_cover_every_feature():
     # build_style_profile_str never KeyErrors on a feature.
     assert set(FEATURE_NAMES_HUMAN_LEGIBLE) == set(FEATURE_NAMES)
     assert set(FEATURE_DESCRIPTIONS) == set(FEATURE_NAMES)
-    assert STYLE_FEATURE_VECTOR_VERSION >= 2
+    assert STYLE_FEATURE_VECTOR_VERSION >= 3
 
 
-def test_new_word_and_vocabulary_scalars_present_and_correct():
-    features = extract_style_features("Big cats run. Big cats run fast today.")
+def test_v3_removed_features_are_absent():
+    # The nine multicollinear features pruned in vector version 3 must no longer
+    # appear in the vector (nor in the metadata dicts).
+    features = extract_style_features("A short but real sentence to measure.")
     for name in (
-        "average_word_length_characters",
+        "type_token_ratio",
+        "maas_lexical_diversity",
+        "yule_characteristic_k",
+        "pos_sequence_compressibility",
+        "flesch_kincaid_grade",
+        "gunning_fog_index",
+        "smog_index",
         "vocabulary_size_unique_words",
         "total_word_count",
     ):
-        assert name in features
+        assert name not in features
+        assert name not in FEATURE_NAMES
 
-    # "big cats run big cats run fast today" -> 8 tokens, 5 unique types
-    # (big, cats, run, fast, today).
-    assert features["total_word_count"] == 8.0
-    assert features["vocabulary_size_unique_words"] == 5.0
+
+def test_average_word_length_present_and_correct():
+    features = extract_style_features("Big cats run. Big cats run fast today.")
+    assert "average_word_length_characters" in features
     # Average characters per word is finite and in a sane band for short words.
     assert 3.0 <= features["average_word_length_characters"] <= 5.0
+
+
+def test_key_phrase_rate_positive_with_matching_phrases_zero_without():
+    text = "you know I got it, you know what I mean."
+    # The avatar's signature phrase appears, so the rate is positive...
+    with_phrases = extract_style_features(text, key_phrases=["you know"])
+    assert with_phrases["key_phrase_rate"] > 0.0
+    # ...and it is 0.0 when there is no phrase set (or an empty one).
+    assert extract_style_features(text)["key_phrase_rate"] == 0.0
+    assert extract_style_features(text, key_phrases=[])["key_phrase_rate"] == 0.0
 
 
 def test_extract_returns_exactly_the_declared_vector_width():
@@ -133,7 +152,6 @@ def test_all_punctuation_input_yields_nan_word_length_not_crash():
     # vector width is still exactly N_FEATURES.
     features = extract_style_features("!!! ??? ...")
     assert np.isnan(features["average_word_length_characters"])
-    assert features["total_word_count"] == 0.0
     assert len(features) == N_FEATURES
 
 

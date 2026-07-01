@@ -2,20 +2,28 @@
 
 The production authenticity check in ``graph._attach_analyzed_features`` compares
 every avatar response against a fixed cloud of *unmodified ChatGPT* responses.
-That cloud is shipped as two bundled artifacts under
-``src/anubis/utils/dataset/``:
+That cloud is shipped as bundled artifacts under ``src/anubis/utils/dataset/``:
 
 * ``baseline_features_arr.npy`` — an ``(n_baseline_docs, F)`` matrix, one
-  :func:`extract_style_features` row per baseline assistant reply, and
+  :func:`extract_style_features` row per baseline assistant reply,
 * ``baseline_features_model_b64.pkl`` — an ``IsolationForest`` fit on that
   matrix, ``base64(pickle(model))`` written as raw bytes (the loader reads the
-  file, ``.decode('utf-8')``s it, then ``base64.b64decode`` + ``pickle.loads``).
+  file, ``.decode('utf-8')``s it, then ``base64.b64decode`` + ``pickle.loads``),
+* ``baseline_features_explainer_b64.pkl`` — a SHAP ``KernelExplainer`` over that
+  IsolationForest, same ``base64(pickle(...))`` encoding, so the runtime does not
+  rebuild the (expensive) explainer on every call, and
+* ``baseline_key_phrases.json`` — the signature key phrases self-discovered from
+  the ChatGPT baseline corpus. The ``key_phrase_rate`` feature is avatar-relative,
+  so the baseline rows are measured against the baseline's OWN discovered phrases
+  (giving that column real, non-degenerate variance) rather than against an
+  avatar's phrase set, which does not exist at baseline-build time.
 
-Both bake in the feature-vector WIDTH ``F = len(FEATURE_NAMES)``. Whenever
-:data:`STYLE_FEATURE_VECTOR_VERSION` changes (a feature is added/removed/reordered)
-these artifacts must be rebuilt at the new width, or the runtime Mahalanobis /
-IsolationForest calls will raise on the shape mismatch. This script rebuilds both
-from the baseline corpus so the regeneration is reproducible and reviewable.
+Both matrix and model bake in the feature-vector WIDTH ``F = len(FEATURE_NAMES)``.
+Whenever :data:`STYLE_FEATURE_VECTOR_VERSION` changes (a feature is
+added/removed/reordered) these artifacts must be rebuilt at the new width, or the
+runtime Mahalanobis / IsolationForest calls will raise on the shape mismatch. This
+script rebuilds all of them from the baseline corpus so the regeneration is
+reproducible and reviewable.
 
 Source corpus: ``data/synthetic_gpt-5-4-nano-baseline-full.jsonl`` — OpenAI
 fine-tuning JSONL, one conversation per line, whose final ``assistant`` message
@@ -36,6 +44,7 @@ from typing import List
 
 import numpy as np
 
+from src.anubis.utils.dataset.key_phrases import discover_key_phrases
 from src.anubis.utils.dataset.style_features import (
     FEATURE_NAMES,
     STYLE_FEATURE_VECTOR_VERSION,
@@ -48,6 +57,14 @@ _BASELINE_JSONL = _REPO_ROOT / "data" / "synthetic_gpt-5-4-nano-baseline-full.js
 _DATASET_DIR = _REPO_ROOT / "src" / "anubis" / "utils" / "dataset"
 _ARR_PATH = _DATASET_DIR / "baseline_features_arr.npy"
 _MODEL_PATH = _DATASET_DIR / "baseline_features_model_b64.pkl"
+_EXPLAINER_PATH = _DATASET_DIR / "baseline_features_explainer_b64.pkl"
+_KEY_PHRASES_PATH = _DATASET_DIR / "baseline_key_phrases.json"
+# Stale, orphaned explainer from before the artifact moved under the dataset dir.
+_STALE_EXPLAINER_PATH = _REPO_ROOT / "data" / "baseline_features_explainer_b64.pkl"
+
+# SHAP background summary size — kmeans centroids used as the reference the
+# KernelExplainer perturbs against. Matches the runtime rebuild in utility.py.
+_SHAP_BACKGROUND_SIZE = 100
 
 
 def _baseline_assistant_texts() -> List[str]:
@@ -70,15 +87,34 @@ def _baseline_assistant_texts() -> List[str]:
 
 
 def build() -> None:
-    """Rebuild and write both bundled baseline artifacts at the current width."""
+    """Rebuild and write all bundled baseline artifacts at the current width."""
+    import shap
     from sklearn.ensemble import IsolationForest
 
     texts = _baseline_assistant_texts()
     print(f"Loaded {len(texts)} baseline assistant replies from {_BASELINE_JSONL.name}")
 
+    # Self-discover the baseline's own signature phrases so the key_phrase_rate
+    # column is measured against the SAME phrase set the rows will be scored under
+    # at baseline-build time (there is no avatar phrase set here). Persist the
+    # phrase list for transparency/reproducibility.
+    baseline_key_phrases = [
+        phrase["phrase"] for phrase in discover_key_phrases(texts)
+    ]
+    _KEY_PHRASES_PATH.write_text(
+        json.dumps(baseline_key_phrases, indent=2), encoding="utf-8"
+    )
+    print(
+        f"Discovered {len(baseline_key_phrases)} baseline key phrases -> "
+        f"{_KEY_PHRASES_PATH.relative_to(_REPO_ROOT)}"
+    )
+
     feature_rows = [
         [features[name] for name in FEATURE_NAMES]
-        for features in (extract_style_features(text) for text in texts)
+        for features in (
+            extract_style_features(text, key_phrases=baseline_key_phrases)
+            for text in texts
+        )
     ]
     feature_matrix = np.asarray(feature_rows, dtype=np.float64)  # (n_docs, F)
 
@@ -104,6 +140,24 @@ def build() -> None:
     model_b64 = base64.b64encode(pickle.dumps(model))
     _MODEL_PATH.write_bytes(model_b64)
     print(f"Wrote {_MODEL_PATH.relative_to(_REPO_ROOT)}")
+
+    # Pre-build and persist the SHAP explainer so the runtime loads it instead of
+    # rebuilding a KernelExplainer (kmeans + repeated model.predict) on first use.
+    # Background = kmeans centroids of the matrix, same shape the runtime expects.
+    background = (
+        shap.kmeans(feature_matrix, _SHAP_BACKGROUND_SIZE)
+        if feature_matrix.shape[0] > _SHAP_BACKGROUND_SIZE
+        else feature_matrix
+    )
+    explainer = shap.KernelExplainer(model.predict, background)
+    explainer_b64 = base64.b64encode(pickle.dumps(explainer))
+    _EXPLAINER_PATH.write_bytes(explainer_b64)
+    print(f"Wrote {_EXPLAINER_PATH.relative_to(_REPO_ROOT)}")
+
+    # Remove the pre-move orphan so there is a single source of truth.
+    if _STALE_EXPLAINER_PATH.exists():
+        _STALE_EXPLAINER_PATH.unlink()
+        print(f"Removed stale {_STALE_EXPLAINER_PATH.relative_to(_REPO_ROOT)}")
 
 
 if __name__ == "__main__":

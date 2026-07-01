@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional
 from langgraph.store.base import BaseStore
 
 from src.anubis.utils.context import GlobalContext
-from src.anubis.utils.dataset.stylistic_profile import compute_feature_matrix_profile
 
 logger = logging.getLogger(__name__)
 

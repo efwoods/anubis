@@ -98,10 +98,12 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
     """
     from src.anubis.utils.dataset.style_features import (
         GROUND_TRUTH_FEATURES_DICT_KEY,
+        baseline_feature_array_is_current,
         compute_mahalanobis_distance,
         deserialize_features_by_doc_id,
         extract_style_features,
         features_by_doc_id_to_arr,
+        load_bundled_baseline_features_arr,
     )
     import json
 
@@ -134,6 +136,18 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         # Convert from str to np.array
         if isinstance(baseline_features_arr_list_str, str):
             baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
+
+        # Feature-version self-heal: an existing deployment may have cached a
+        # previous-width baseline matrix in the store. Comparing a current-width
+        # candidate row against it would raise on the shape mismatch, so reload
+        # the freshly-bundled .npy and overwrite the stale cache.
+        if not baseline_feature_array_is_current(baseline_features_arr):
+            baseline_features_arr = load_bundled_baseline_features_arr()
+            await runtime.store.aput(
+                baseline_features_namespace,
+                key="baseline_features_arr_list_str",
+                value={"value": json.dumps(baseline_features_arr.tolist())},
+            )
 
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
         M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(features_arr, baseline_features_arr)
@@ -190,7 +204,27 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 ground_truth_text_empirical_threshold = np.array(ground_truth_text_empirical_threshold_list_str).flatten()
 
             ground_truth_text_features_model = pickle.loads(base64.b64decode(ground_truth_text_features_model_b64_pkl))
-            
+
+            # Feature-version self-heal: this per-avatar IsolationForest may have
+            # been fit under a previous vector width and cached in the store. Unlike
+            # the bundled ChatGPT baseline there is nothing to reload it from — it is
+            # rebuilt only on the next media upload (calibrate_ground_truth) once the
+            # corpus reaches MIN_ROWS_FOR_CALIBRATION current-width rows. Until then,
+            # scoring a current-width candidate against it would raise, so skip the
+            # ground-truth comparison cleanly rather than tripping the best-effort
+            # handler with a noisy error every turn.
+            ground_truth_model_feature_width = getattr(
+                ground_truth_text_features_model, "n_features_in_", len(FEATURE_NAMES)
+            )
+            if ground_truth_model_feature_width != len(FEATURE_NAMES):
+                logger.info(
+                    "skipping ground-truth comparison: cached model width %s != "
+                    "current %s; will rebuild on next media upload.",
+                    ground_truth_model_feature_width,
+                    len(FEATURE_NAMES),
+                )
+                return
+
             # Compute the difference between the synthetic text and the direct quotes.
             M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(features_arr, ground_truth_text_features_arr)
 

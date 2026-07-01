@@ -10,6 +10,37 @@ lexical richness (vocab size): unique_words vs. total_words
 average sentence length (words_per_sentence)
 average word length (characters per word)
 
+
+
+# Detailed Features — implementation status
+
+Scalar features (now part of the fixed Mahalanobis vector in
+`src/anubis/utils/dataset/style_features.py`, `STYLE_FEATURE_VECTOR_VERSION = 2`,
+width 33 → 36):
+- average sentence length (words per sentence) — `mean_sentence_length_words` (pre-existing).
+- average word length (characters per word) — `average_word_length_characters` ✅ added.
+- lexical richness, unique vs total words — `vocabulary_size_unique_words` +
+  `total_word_count` ✅ added (the ratio is the pre-existing `type_token_ratio`).
+- punctuation frequencies — the seven `*_rate_per_1k` marks (pre-existing).
+
+Vector-valued features (CAPTURE-ONLY for now — persisted in the nested profile
+built by `src/anubis/utils/dataset/stylistic_profile.py`; NOT yet wired into the
+authenticity evaluator):
+- character n-grams — `_character_ngram_features` (top char 2/3/4-grams) ✅ added.
+- word n-grams — `_lexical_features` top uni/bi/trigrams (pre-existing).
+- function word frequencies — `key_phrases.function_word_frequencies`
+  (closed-class function-word rates) ✅ added.
+- key phrases such as "you know", "got it", "what do ya mean" —
+  `key_phrases.discover_key_phrases`, auto-discovered statistically as recurring
+  multi-word expressions over-represented vs a bundled generic-English baseline
+  (a pointwise-mutual-information keyness score) ✅ added.
+
+Migration note: growing the scalar vector bumped `STYLE_FEATURE_VECTOR_VERSION`
+to 2. The bundled ChatGPT baseline artifacts were regenerated at the new width
+(`data/build_baseline_features_arr.py`); stored per-avatar corpora and cached
+baseline arrays/models at the old width are dropped/reloaded on read so existing
+deployments self-heal.
+
 # Best to implement open-set attribution: requires a rejection threshold to determine if zero or more authors wrote this document
 
 

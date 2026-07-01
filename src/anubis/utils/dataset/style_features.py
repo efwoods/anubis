@@ -33,10 +33,13 @@ from __future__ import annotations
 import gzip
 import html
 import json
+import logging
 import math
 import re
 from collections import Counter
 from typing import Any, Callable, Dict, List, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Canonical, ORDERED feature list. The order is the column order of every
@@ -84,9 +87,30 @@ FEATURE_NAMES: List[str] = [
     "smog_index",                          # polysyllable-count grade estimate
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits",                # Shannon entropy of the word distribution
+    # ── Word & vocabulary shape (3) ────────────────────────────────────────
+    # Added in vector version 2 (see STYLE_FEATURE_VECTOR_VERSION). These are the
+    # scalar half of the features requested in features/statistical_significance.md;
+    # the vector-valued requests (character/word n-grams, function-word frequency
+    # vectors, auto-discovered key phrases) live in the nested profile built by
+    # src.anubis.utils.dataset.stylistic_profile, not in this fixed vector.
+    "average_word_length_characters",      # mean characters per word (orthographic length habit)
+    "vocabulary_size_unique_words",        # count of distinct word types (raw "vocab size")
+    "total_word_count",                    # count of all word tokens (document length in words)
 ]
 
-assert len(FEATURE_NAMES) == 33, f"expected 33 features, found {len(FEATURE_NAMES)}"
+# Bump whenever the composition or order of FEATURE_NAMES changes. The width of
+# this vector is baked into persisted artifacts (the per-document ground-truth
+# corpus rows, the bundled ChatGPT baseline matrix + IsolationForest, and any
+# stored covariance matrices). Readers use `len(FEATURE_NAMES)` to detect and
+# discard rows written under an older version — see deserialize_features_by_doc_id
+# and the baseline staleness guards in graph._attach_analyzed_features /
+# utility.load_baseline_features_explainer_model.
+#   v1: the original 33 features.
+#   v2: appended average_word_length_characters, vocabulary_size_unique_words,
+#       total_word_count (width 33 -> 36).
+STYLE_FEATURE_VECTOR_VERSION = 2
+
+assert len(FEATURE_NAMES) == 36, f"expected 36 features, found {len(FEATURE_NAMES)}"
 
 
 # Human-legible display title per feature. Keyed by the snake_case FEATURE_NAMES
@@ -134,6 +158,10 @@ FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
     "smog_index": "SMOG Index",
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits": "Lexical Entropy (bits)",
+    # ── Word & vocabulary shape (3) ────────────────────────────────────────
+    "average_word_length_characters": "Average Word Length (characters)",
+    "vocabulary_size_unique_words": "Vocabulary Size (unique words)",
+    "total_word_count": "Total Word Count",
 }
 
 assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
@@ -186,6 +214,10 @@ FEATURE_DESCRIPTIONS: Dict[str, str] = {
     "smog_index": "SMOG grade estimate from the count of polysyllabic words. Typically ~6–14. Higher means more complex, multi-syllable vocabulary.",
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits": "Shannon entropy of the word-frequency distribution, in bits. 0 or greater and grows with vocabulary size (~4–10+ bits common). Higher means less predictable, more varied word choice; lower means repetitive, predictable wording.",
+    # ── Word & vocabulary shape (3) ────────────────────────────────────────
+    "average_word_length_characters": "Mean number of characters per word (apostrophes counted, e.g. \"it's\" is 4). Greater than 0, typically ~4–5 for English prose. Higher means a preference for longer, often more formal or Latinate words; lower means shorter, plainer words.",
+    "vocabulary_size_unique_words": "Count of DISTINCT word types in the text (the raw vocabulary size). 0 or greater and grows with both text length and word variety. Higher means a larger vocabulary was used; interpret alongside total word count, since a longer text has more room to accumulate types.",
+    "total_word_count": "Count of ALL word tokens in the text (its length in words). 0 or greater. Higher means a longer passage; for a fixed speaker this reflects how much they tend to write per message. Paired with vocabulary size, the two give the raw unique-vs-total lexical-richness comparison.",
 }
 
 assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
@@ -293,16 +325,21 @@ def extract_style_features(text: str) -> Dict[str, float]:
     metric that cannot be computed on the given text yields ``nan`` rather than
     raising, so a single short document never breaks a batch.
 
-    FUTURE DIRECTION asdf : 
-        character n-grams
-        word n-grams
-        function word frequencies
-        punctuation frequencies 
-        lexical richness (vocab size): unique_words vs. total_words
-        (FIND AND STORE KEY PHRASES) such as "you know" "got it." "what do ya mean?"
-        average sentence length (words_per_sentence)
-        average word length (characters per word)
+    Coverage of the features requested in
+    ``features/statistical_significance.md`` (the "Detailed Features yet to be
+    used" list):
 
+    * average sentence length (words per sentence) — ``mean_sentence_length_words``.
+    * average word length (characters per word) — ``average_word_length_characters``.
+    * lexical richness, unique vs total words — ``vocabulary_size_unique_words``
+      and ``total_word_count`` (plus the ratio ``type_token_ratio``).
+    * punctuation frequencies — the seven ``*_rate_per_1k`` marks above.
+
+    The remaining requested features are VECTOR-valued (they do not reduce to one
+    scalar) and are therefore captured in the nested profile built by
+    :mod:`src.anubis.utils.dataset.stylistic_profile`, NOT in this fixed vector:
+    character n-grams, word n-grams, function-word frequency vectors, and
+    auto-discovered key phrases (e.g. "you know", "got it", "what do ya mean").
     """
     _ensure_nltk_resources()
 
@@ -435,6 +472,22 @@ def extract_style_features(text: str) -> Dict[str, float]:
         entropy_bits -= probability * math.log2(probability)
     features["lexical_entropy_bits"] = entropy_bits
 
+    # ── H. WORD & VOCABULARY SHAPE ─────────────────────────────────────────
+    # `total_words` is the TRUE token count (len(alpha_words)); `alpha_count`
+    # above was floored to 1 only to guard divisions, so it must not be reused
+    # here. Average word length divides total characters by that true count and
+    # is NaN when there are no word tokens (all-punctuation input). Vocabulary
+    # size is the number of distinct types; total word count is the raw length —
+    # together they are the requested unique-vs-total lexical-richness pair, of
+    # which type_token_ratio (computed above) is the normalised ratio.
+    total_words = len(alpha_words)
+    total_characters = sum(len(word) for word in alpha_words)
+    features["average_word_length_characters"] = (
+        total_characters / total_words if total_words else math.nan
+    )
+    features["vocabulary_size_unique_words"] = float(len(word_frequencies))
+    features["total_word_count"] = float(total_words)
+
     # Guarantee exactly the declared keys, in the declared order.
     return {name: float(features.get(name, math.nan)) for name in FEATURE_NAMES}
 
@@ -481,10 +534,11 @@ def _population_stdev(values: Sequence[float], mean: float) -> float:
         return 0.0
     return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
 
-from sklearn.preprocessing import StandardScaler
 import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
+from sklearn.preprocessing import StandardScaler
+
 
 def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
     """Compute Mahalanobis distance between synthetic features and reference features of a dataset.
@@ -560,11 +614,13 @@ def compute_empirical_distribution(reference_dataset_arr):
 # Ground-truth corpus persistence helpers.
 #
 # The "direct quote" corpus is persisted in the LangGraph store as a dict
-# {document_id: [33 floats]} rather than a flat (n_docs, 33) array, so that an
-# individual source document's rows can be pruned when that document is deleted.
-# Wherever the corpus is consumed (Mahalanobis distance, IsolationForest fit,
-# SHAP background) it is reconstructed into a single (n_docs, 33) array; those
-# consumers are all set-based, so ROW ORDER is irrelevant.
+# {document_id: [len(FEATURE_NAMES) floats]} rather than a flat (n_docs, F) array,
+# so that an individual source document's rows can be pruned when that document is
+# deleted. Wherever the corpus is consumed (Mahalanobis distance, IsolationForest
+# fit, SHAP background) it is reconstructed into a single (n_docs, F) array; those
+# consumers are all set-based, so ROW ORDER is irrelevant. F is the current vector
+# width (see STYLE_FEATURE_VECTOR_VERSION); rows stored at an older width are
+# dropped on read by deserialize_features_by_doc_id.
 # ---------------------------------------------------------------------------
 
 # Store key (and second namespace element) for the per-document feature dict.
@@ -574,8 +630,43 @@ def compute_empirical_distribution(reference_dataset_arr):
 GROUND_TRUTH_FEATURES_DICT_KEY = "ground_truth_text_features_by_doc_id_dict_str"
 
 
+# ---------------------------------------------------------------------------
+# Bundled ChatGPT-baseline artifacts (the "unmodified LLM" cloud).
+#
+# These are regenerated by data/build_baseline_features_arr.py whenever the
+# feature vector width changes (see STYLE_FEATURE_VECTOR_VERSION). Both readers
+# (graph._attach_analyzed_features and utility.load_baseline_features_explainer_model)
+# cache the array/model in the LangGraph store on first use. On an EXISTING
+# deployment that store still holds the previous-width artifacts, so both readers
+# call baseline_feature_array_is_current() and, when it is stale, reload from the
+# freshly-bundled .npy/.pkl and overwrite the store — the deployment self-heals
+# without a manual store wipe. Paths are cwd-relative (the app runs from repo root).
+# ---------------------------------------------------------------------------
+BASELINE_FEATURES_ARR_PATH = "src/anubis/utils/dataset/baseline_features_arr.npy"
+BASELINE_FEATURES_MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
+
+
+def load_bundled_baseline_features_arr() -> Any:
+    """Load the current-width baseline feature matrix from the bundled ``.npy``."""
+    return np.load(BASELINE_FEATURES_ARR_PATH, allow_pickle=False)
+
+
+def baseline_feature_array_is_current(baseline_features_arr: Any) -> bool:
+    """True when a baseline matrix has this build's feature-vector WIDTH.
+
+    A matrix cached under an older :data:`STYLE_FEATURE_VECTOR_VERSION` has the
+    wrong number of columns; feeding it to StandardScaler / IsolationForest /
+    Mahalanobis against a current candidate row raises on the shape mismatch, so
+    callers must detect the staleness and reload the bundled artifact first.
+    """
+    return (
+        getattr(baseline_features_arr, "ndim", 0) == 2
+        and baseline_features_arr.shape[1] == len(FEATURE_NAMES)
+    )
+
+
 def serialize_features_by_doc_id(features_by_doc_id: Dict[str, Any]) -> str:
-    """Serialize ``{document_id: 1-D 33-feature row}`` to a JSON string.
+    """Serialize ``{document_id: 1-D feature row}`` (width ``len(FEATURE_NAMES)``) to a JSON string.
 
     Each row is coerced via ``.tolist()`` (numpy) or ``list`` so the whole dict
     is JSON-serializable for the store's ``{"value": <str>}`` envelope.
@@ -594,19 +685,52 @@ def deserialize_features_by_doc_id(features_by_doc_id_str: Any) -> Dict[str, Any
     Returns ``{}`` for any falsy input (key missing / never written) so callers
     can treat "no corpus yet" and "empty corpus" identically. Each value is
     rehydrated into a 1-D numpy array.
+
+    **Feature-version migration.** Rows are dropped whenever their width does not
+    match the CURRENT feature vector (``len(FEATURE_NAMES)``). A corpus persisted
+    under an older :data:`STYLE_FEATURE_VECTOR_VERSION` (e.g. 33-wide rows before
+    the width grew to 36) can no longer be stacked with, or compared against,
+    new rows, so those stale rows are discarded here — the single chokepoint
+    every reader (calibrate_ground_truth, graph._attach_analyzed_features,
+    webapp.delete_avatar_documents) passes through. The corpus then re-accumulates
+    at the new width as fresh quotes are ingested, and the merge/re-serialize in
+    calibrate_ground_truth persists the pruning. Callers that reach an empty dict
+    simply skip ground-truth comparison until enough new-width rows exist.
     """
     if not features_by_doc_id_str:
         return {}
     raw = json.loads(features_by_doc_id_str)
-    return {doc_id: np.array(row) for doc_id, row in raw.items()}
+    expected_width = len(FEATURE_NAMES)
+    kept: Dict[str, Any] = {}
+    dropped = 0
+    for doc_id, row in raw.items():
+        row_array = np.array(row)
+        if row_array.shape == (expected_width,):
+            kept[doc_id] = row_array
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(
+            "deserialize_features_by_doc_id: dropped %d/%d stored feature rows "
+            "whose width != current %d-feature vector (stale "
+            "STYLE_FEATURE_VECTOR_VERSION); the corpus will recalibrate as new "
+            "quotes are ingested.",
+            dropped,
+            len(raw),
+            expected_width,
+        )
+    return kept
 
 
 def features_by_doc_id_to_arr(features_by_doc_id: Dict[str, Any]) -> Any:
-    """Recombine per-document feature rows into one ``(n_docs, 33)`` array.
+    """Recombine per-document feature rows into one ``(n_docs, F)`` array.
 
     Row order is irrelevant: every downstream consumer (empirical distribution,
     Mahalanobis covariance, IsolationForest) is a set statistic over the rows.
-    Returns an empty ``(0, 33)`` array when the dict is empty.
+    ``F`` is the current vector width ``len(FEATURE_NAMES)``; the dict passed in
+    has already been width-filtered by :func:`deserialize_features_by_doc_id`, so
+    every row is guaranteed to have this width. Returns an empty ``(0, F)`` array
+    when the dict is empty.
     """
     if not features_by_doc_id:
         return np.empty((0, len(FEATURE_NAMES)))
@@ -680,8 +804,8 @@ async def build_style_profile_str(ground_truth_text_features_arr) -> str:
     target to influence the writing of the avatar. 
     Allows the features to be LLM legible. 
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     ground_truth_text_features_median = np.array(list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values))
     

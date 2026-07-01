@@ -12,6 +12,13 @@ Feature families implemented today:
 * Authorship reference distribution (Burrows Delta inputs).
 * Lexicon: vocabulary set with frequencies, distinctive bigrams/trigrams,
   TF-IDF-ish keyness against a stored English unigram baseline.
+* Character n-grams: top character 2-/3-/4-grams (spelling, morphology, and
+  punctuation habits) — capture-only.
+* Function words: closed-class function-word rates (topic-free authorship
+  fingerprint, Mosteller-and-Wallace style) — capture-only.
+* Key phrases (corpus-level): auto-discovered recurring multi-word expressions
+  over-represented vs a generic-English baseline (e.g. "you know", "got it") —
+  capture-only. See :mod:`src.anubis.utils.dataset.key_phrases`.
 * Sentence: average length in tokens, length distribution moments,
   declarative/interrogative/exclamatory ratios.
 * Syntax (best-effort): POS ratios, average parse-tree depth, clausal
@@ -103,6 +110,25 @@ def _ngram_counts(tokens: List[str], n: int, top_k: int) -> List[List[Any]]:
     return [list(item) for item in counts.most_common(top_k)]
 
 
+def _character_ngram_counts(text: str, n: int, top_k: int) -> List[List[Any]]:
+    """Top character ``n``-grams (with counts) over the lowercased raw text.
+
+    Character n-grams are computed over the raw text — spaces and punctuation
+    INCLUDED — because word boundaries, affixes, and punctuation habits are part
+    of the character-level fingerprint. Spaces are shown as the visible glyph
+    ``␣`` so the stored/serialised n-grams stay legible (e.g. ``"you␣"``).
+    """
+    normalized = (text or "").lower()
+    if len(normalized) < n:
+        return []
+    counts: Counter = Counter(
+        normalized[i : i + n] for i in range(len(normalized) - n + 1)
+    )
+    return [
+        [gram.replace(" ", "␣"), count] for gram, count in counts.most_common(top_k)
+    ]
+
+
 def _try_spacy():
     """Return a loaded spaCy pipeline or ``None`` if unavailable."""
     try:
@@ -164,6 +190,27 @@ def _lexical_features(text: str, top_k_ngrams: int = 50) -> Dict[str, Any]:
         "top_bigrams": _ngram_counts(tokens, 2, top_k_ngrams),
         "top_trigrams": _ngram_counts(tokens, 3, top_k_ngrams),
     }
+
+
+def _character_ngram_features(text: str, top_k: int = 50) -> Dict[str, Any]:
+    """Character-level n-gram fingerprint (top char 2-, 3-, and 4-grams).
+
+    A classic, robust authorship signal (character n-grams capture spelling,
+    morphology, and punctuation habits without a tokenizer). Capture-only: stored
+    in the profile, not yet scored by the authenticity evaluator.
+    """
+    return {
+        "top_char_bigrams": _character_ngram_counts(text, 2, top_k),
+        "top_char_trigrams": _character_ngram_counts(text, 3, top_k),
+        "top_char_quadgrams": _character_ngram_counts(text, 4, top_k),
+    }
+
+
+def _function_word_features(text: str) -> Dict[str, Any]:
+    """Closed-class function-word rates (topic-free authorship fingerprint)."""
+    from src.anubis.utils.dataset.key_phrases import function_word_frequencies
+
+    return function_word_frequencies(text)
 
 
 def _sentence_features(text: str) -> Dict[str, Any]:
@@ -395,6 +442,8 @@ def compute_features_for_text(
     """
     features: Dict[str, Any] = {
         "lexical": _lexical_features(text),
+        "character_ngrams": _character_ngram_features(text),
+        "function_words": _function_word_features(text),
         "sentence": _sentence_features(text),
         "style": _style_features(text),
         "syntax": _syntax_features(text),
@@ -436,13 +485,20 @@ def compute_profile_from_quotes(
     document_count = len(quotes)
     aggregate_text = "\n".join(quotes)
 
+    from src.anubis.utils.dataset.key_phrases import discover_key_phrases
+
     aggregate_features = {
         "lexical": _lexical_features(aggregate_text, top_k_ngrams=200),
+        "character_ngrams": _character_ngram_features(aggregate_text, top_k=100),
+        "function_words": _function_word_features(aggregate_text),
         "sentence": _sentence_features(aggregate_text),
         "style": _style_features(aggregate_text),
         "syntax": _syntax_features(aggregate_text),
         "prosody": _prosody_features(aggregate_text),
         "consistency": _consistency_features(quotes),
+        # Auto-discovered recurring phrases over-represented vs generic English
+        # (e.g. "you know", "got it"). Corpus-level: needs the whole quote set.
+        "key_phrases": discover_key_phrases(quotes),
     }
 
     reference = build_reference_distribution(quotes)
@@ -480,149 +536,3 @@ def compute_profile_from_quotes(
     }
 
 
-""" ------------------------------------------------------------------ """
-""" Flat feature-matrix profile (Mahalanobis-ready)                    """
-""" ------------------------------------------------------------------ """
-
-
-def compute_feature_matrix_profile(
-    documents: List[str],
-    *,
-    target_name: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Build the Mahalanobis-ready profile for a corpus, in ONE pass.
-
-    Unlike :func:`compute_profile_from_quotes` (which produces nested aggregate
-    features), this builder stores everything the authenticity evaluator needs
-    to place a *new* candidate text relative to this corpus's cloud:
-
-    * the per-feature **0-1 normalisation** parameters (min/max) — we use
-      min-max scaling, NOT z-scores, per ``style.md``;
-    * the **mean vector** of the normalised features (the cloud centroid);
-    * the **covariance** matrix and its **pseudo-inverse** (``pinv`` is robust to
-      the collinearity we expect between same-family features);
-    * a **per-feature chi-squared goodness-of-fit** (KS test) so callers know
-      whether the parametric Mahalanobis assumption is credible; and
-    * the **Mahalanobis outlier threshold** — the distance beyond which a point
-      is a distributional outlier — so the evaluator can report both the
-      threshold AND the actual distance.
-
-    The returned dict is JSON-serialisable (lists, not numpy arrays) so it can be
-    stored verbatim in the LangGraph store or on disk as the baseline artifact.
-    """
-    import numpy as np
-    from scipy import stats
-
-    cleaned_documents = [d for d in documents if (d or "").strip()]
-    document_count = len(cleaned_documents)
-
-    # ── 1. Feature matrix: one row of 33 scalars per document ──────────────
-    feature_rows: List[List[float]] = []
-    for document in cleaned_documents:
-        feature_dict = extract_style_features(document)
-        feature_rows.append([feature_dict[name] for name in FEATURE_NAMES])
-
-    feature_matrix = np.asarray(feature_rows, dtype=float)  # (n_docs, 33)
-
-    # Guard: an empty / single-document corpus cannot support a covariance.
-    if feature_matrix.shape[0] < 2:
-        logger.warning(
-            "compute_feature_matrix_profile: only %d usable documents; "
-            "covariance is undefined, returning an empty profile.",
-            feature_matrix.shape[0],
-        )
-        return {
-            "version": 2,
-            "target_name": target_name,
-            "document_count": document_count,
-            "feature_names": list(FEATURE_NAMES),
-            "feature_means": {},
-            "normalization_min": {},
-            "normalization_max": {},
-            "covariance_matrix": [],
-            "inverse_covariance_matrix": [],
-            "chi_squared_fit_per_feature": {},
-            "mahalanobis_outlier_threshold": None,
-            "reference_distribution": build_reference_distribution(cleaned_documents),
-        }
-
-    # ── 2. Impute NaNs with the per-column median ──────────────────────────
-    # A short document may leave a feature NaN; we fill it with the column median
-    # so it contributes neutrally instead of dropping the whole row.
-    column_medians = np.nanmedian(feature_matrix, axis=0)
-    column_medians = np.where(np.isnan(column_medians), 0.0, column_medians)
-    nan_positions = np.isnan(feature_matrix)
-    feature_matrix[nan_positions] = np.take(column_medians, np.where(nan_positions)[1])
-
-    # ── 3. Min-max 0-1 normalisation (store params for candidate scaling) ──
-    feature_min = feature_matrix.min(axis=0)
-    feature_max = feature_matrix.max(axis=0)
-    feature_range = feature_max - feature_min
-    # A constant feature has zero range; scale it to 0 and use range 1 so the
-    # same transform applied to a candidate never divides by zero.
-    safe_range = np.where(feature_range == 0.0, 1.0, feature_range)
-    normalized_matrix = (feature_matrix - feature_min) / safe_range
-
-    # ── 4. Cloud centroid + covariance + pseudo-inverse ────────────────────
-    normalized_mean = normalized_matrix.mean(axis=0)
-    covariance_matrix = np.cov(normalized_matrix, rowvar=False)
-    inverse_covariance_matrix = np.linalg.pinv(covariance_matrix)
-
-    # ── 5. Per-feature chi-squared goodness-of-fit (KS test) ───────────────
-    # chi2 has support x > 0, so we shift each feature to be strictly positive
-    # before fitting. p > alpha => we do NOT reject chi2 => assumption credible.
-    chi_squared_fit: Dict[str, Dict[str, Any]] = {}
-    for column_index, feature_name in enumerate(FEATURE_NAMES):
-        values = feature_matrix[:, column_index]
-        shifted = values - values.min() + 1e-6
-        try:
-            dof, location, scale = stats.chi2.fit(shifted)
-            ks_statistic, ks_p_value = stats.kstest(
-                shifted, "chi2", args=(dof, location, scale)
-            )
-            is_chi_squared = bool(ks_p_value > _CHI_SQUARED_FIT_ALPHA)
-        except Exception:
-            ks_statistic, ks_p_value, is_chi_squared = float("nan"), float("nan"), False
-        chi_squared_fit[feature_name] = {
-            "ks_statistic": float(ks_statistic),
-            "ks_p_value": float(ks_p_value),
-            "distribution_is_chi_squared": is_chi_squared,
-        }
-
-    # ── 6. Mahalanobis outlier threshold ───────────────────────────────────
-    # Distance (not squared) at the upper-tail chi-squared quantile for this
-    # dimensionality. Distances above it are distributional outliers.
-    degrees_of_freedom = len(FEATURE_NAMES)
-    outlier_threshold = float(
-        np.sqrt(stats.chi2.ppf(_OUTLIER_TAIL_PROBABILITY, df=degrees_of_freedom))
-    )
-
-    return {
-        "version": 2,
-        "target_name": target_name,
-        "document_count": document_count,
-        "feature_names": list(FEATURE_NAMES),
-        # Raw (pre-normalisation) means are handy for human inspection / reports.
-        "feature_means": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, feature_matrix.mean(axis=0))
-        },
-        "normalization_min": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, feature_min)
-        },
-        "normalization_max": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, feature_max)
-        },
-        # Centroid in NORMALISED space — what the candidate distance is measured to.
-        "normalized_feature_mean": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, normalized_mean)
-        },
-        "covariance_matrix": covariance_matrix.tolist(),
-        "inverse_covariance_matrix": inverse_covariance_matrix.tolist(),
-        "chi_squared_fit_per_feature": chi_squared_fit,
-        "chi_squared_consistent_feature_count": sum(
-            1 for fit in chi_squared_fit.values() if fit["distribution_is_chi_squared"]
-        ),
-        "mahalanobis_outlier_threshold": outlier_threshold,
-        # Burrows Delta reference kept as a secondary authorship signal.
-        "reference_distribution": build_reference_distribution(cleaned_documents),
-    }

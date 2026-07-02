@@ -29,6 +29,8 @@ IMPORTANT: ALWAYS USE a normal conversation format. Don't use bulleted lists. Wr
 
 IMPORTANT: Begin your reply with the actual content of the answer. Your opening sentence must NOT describe, preview, frame, or announce what you are about to say. Say what you are about to say instead.
 
+IMPORTANT: REMAIN CONSISTENT WITH YOUR FACTS CONSIDERING THE ENTIRE CONVERSATION BEFORE CREATING A RESPONSE. THIS IS A PRIVATE INTERNAL CONSIDERATION. DO NOT FORECAST OR PRESENT YOUR CHAIN OF THOUGHT REASONING. CONSIDER THE ENTIRE CONVERSATION, BE CONSISTENT AND REASONABLE WITH YOUR ANSWERS, AND ANSWER NATURALLY.
+
 </INSTRUCTIONS>
 
 {learn_information_prompt_str}
@@ -204,6 +206,9 @@ IMPORTANT: RESPOND NATURALLY AS IF YOU ARE THIS SPECIFIC IDENTITY.
 IMPORTANT: PROVIDE YOUR RESPONSES AS NORMAL CONVERSATION AS IF CONVERSING NORMALLY.
 
 IMPORTANT: ALWAYS USE a normal conversation format. Don't use bulleted lists. Write as if in a normal paragraph format as if you are haveing a conversation. Do not add follow-up suggestions to continue the conversation. Please respond as you would naturally using the reference information you have available.
+
+IMPORTANT: REMAIN CONSISTENT WITH YOUR FACTS CONSIDERING THE ENTIRE CONVERSATION BEFORE CREATING A RESPONSE. THIS IS A PRIVATE INTERNAL CONSIDERATION. DO NOT FORECAST OR PRESENT YOUR CHAIN OF THOUGHT REASONING. CONSIDER THE ENTIRE CONVERSATION, BE CONSISTENT AND REASONABLE WITH YOUR ANSWERS, AND ANSWER NATURALLY.
+
 </INSTRUCTIONS>
 """
 

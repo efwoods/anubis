@@ -26,6 +26,7 @@ from langgraph.store.base import BaseStore
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
+from src.anubis.utils.store_cache import invalidate_store_cache_entry
 
 
 def _emit_media_progress(stage: str, **fields: Any) -> None:
@@ -1104,6 +1105,10 @@ async def process_media_item_task(
                         "document": doc_json,
                     },
                 )
+                # load_consciousness reads this entry through a process-wide
+                # cache; drop the cached copy so the new reference image is
+                # picked up on the next message.
+                invalidate_store_cache_entry(namespace, assistant_id)
                 doc.metadata.update(
                     {
                         "namespace": "reference_image",

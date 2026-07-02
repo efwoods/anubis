@@ -3,6 +3,8 @@ from typing import List
 from langchain_core.documents import Document
 from langgraph.store.base import BaseStore
 
+from src.anubis.utils.store_cache import invalidate_store_cache_entry
+
 # Minimum number of corpus rows required before the leave-one-out empirical
 # distribution + IsolationForest can be calibrated. The leave-one-out step
 # (compute_empirical_distribution) drops one row and fits StandardScaler +
@@ -122,6 +124,10 @@ async def calibrate_ground_truth(
     await store.aput(
         style_profile_namespace, key="style_profile", value={"value": style_profile_str}
     )
+    # load_consciousness reads the style profile through a process-wide cache;
+    # drop the cached copy so the recalibrated profile is picked up on the
+    # next message.
+    invalidate_store_cache_entry(style_profile_namespace, "style_profile")
 
     ground_truth_text_empirical_threshold_namespace = (
         assistant_id,

@@ -55,6 +55,10 @@ from pydantic import BaseModel, BeforeValidator
 from src.anubis.graph import message_workflow
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
+from src.anubis.utils.store_cache import (
+    invalidate_store_cache_entry,
+    invalidate_store_cache_for_assistant,
+)
 from src.api.media_jobs import (
     MediaJob,
     create_child_job,
@@ -884,6 +888,11 @@ async def delete_avatar(
             detail="Error deleting items from store and store vectors during delete avatar.",
             status_code=500,
         )
+
+    # Every store row mentioning the assistant was just removed by raw SQL,
+    # bypassing the store client — drop every cached entry for the assistant
+    # from the load_consciousness read-through cache.
+    invalidate_store_cache_for_assistant(assistant_id)
 
     try:
         await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
@@ -3761,6 +3770,15 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
             detail=f"No stored rows matched document: {display_name}",
         )
 
+    # The raw SQL above can remove the avatar's reference image (the
+    # ``reference_%`` prefix clause) without going through the store client, so
+    # drop the reference-image entry from the load_consciousness read-through
+    # cache. Unconditional because the deleted rows are not inspected per
+    # namespace; the invalidation is a dictionary pop either way.
+    invalidate_store_cache_entry(
+        (user_id, assistant_id, "reference_image"), assistant_id
+    )
+
     # Prune the deleted documents' rows from the stylometric "direct quote"
     # feature corpus (a {document_id: [33 floats]} dict in the store), then
     # recalibrate the empirical threshold + IsolationForest from what remains.
@@ -3814,7 +3832,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
         "ground_truth_text_empirical_threshold_list_str",
     )
     model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
-    style_prompt_namespace = (assistant_id, "style_prompt")
+    style_profile_namespace = (assistant_id, "style_profile")
 
     item = await store.aget(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
     features_by_doc_id_str = (getattr(item, "value", None) or {}).get("value", None)
@@ -3839,7 +3857,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
         await store.adelete(
             model_namespace, key="ground_truth_text_features_model_b64_pkl"
         )
-        await store.adelete(style_prompt_namespace, key="style_prompt")
+        await store.adelete(style_profile_namespace, key="style_profile")
         return
 
     # Rebuild the corpus array and recalibrate the derived artifacts.
@@ -3850,7 +3868,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
 
     from src.anubis.utils.dataset.style_features import build_style_profile_str
 
-    style_prompt_str = await build_style_profile_str(ground_truth_text_features_arr)
+    style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
 
     await store.aput(
         dict_namespace,
@@ -3868,7 +3886,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
         value={"value": model_b64_pkl},
     )
     await store.aput(
-        style_prompt_namespace, key="style_prompt", value={"value": style_prompt_str}
+        style_profile_namespace, key="style_profile", value={"value": style_profile_str}
     )
 
 

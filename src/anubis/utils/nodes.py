@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from src.anubis.utils.context_compression import (
     truncate_string_to_token_limit,
 )
 from src.anubis.utils.state import GlobalState
+from src.anubis.utils.store_cache import aget_through_cache
 from src.anubis.utils.utility import (
     format_docs,
     merge_dedup_threshold_documents,
@@ -233,53 +235,10 @@ async def _build_consciousness_system_message_update(
         user_name = config.get("user_ctx", {}).get("name", None)
         user_description = config.get("user_ctx", {}).get("description", None)
 
-    if assistant_name is not None:
-        state["assistant_state"].update({"assistant_name": assistant_name})
-    else:
-        assistant_possible_name = await runtime.store.asearch(
-            (user_id, assistant_id, "identity"), query="name"
-        )
-        if len(assistant_possible_name) > 0:
-            assistant_name = (
-                getattr(assistant_possible_name[0], "value")
-                .get("document", {})
-                .get("kwargs", {})
-                .get("metadata", {})
-                .get("fact", "")
-            )
-        else:
-            assistant_name = ""
-
     if assistant_description is not None:
         state["assistant_state"].update(
             {"assistant_description": assistant_description}
         )
-
-    if user_name is not None:
-        state["user_state"].update({"user_name": user_name})
-    else:
-        """ POSSIBLE IMPROVEMENT: CREATE A `NAME` NAMESPACE FOR STORAGE AND RETRIEVAL EXPLICITLY: """
-
-        _TASK_DESCRIPTION_USER_NAME = (
-            "Given the query, FIND THE ANSWER TO THE QUESTION WHAT IS YOUR NAME?"
-        )
-        user_possible_name = await runtime.store.asearch(
-            (assistant_id, user_id, "identity"),
-            query=f"Instruct: {_TASK_DESCRIPTION_USER_NAME}\nQuery: {'WHAT IS YOUR NAME?'}",
-            limit=_RETRIEVAL_LIMIT,
-        )
-        if len(user_possible_name) > 0 and (
-            getattr(user_possible_name, "score", 0) > _FILTER_SCORE
-        ):
-            user_name = (
-                getattr(user_possible_name[0], "value")
-                .get("document", {})
-                .get("kwargs", {})
-                .get("metadata", {})
-                .get("fact", "")
-            )
-        else:
-            user_name = ""
 
     if user_description is not None:
         state["user_state"].update({"user_description": user_description})
@@ -304,6 +263,139 @@ async def _build_consciousness_system_message_update(
         _TASK_DESCRIPTION = "Given the query, retrieve information that is salient to the conversation and semantically similar to the query text."
         query = f"Instruct: {_TASK_DESCRIPTION}\nQuery: {query[0]['text']}"
 
+    creator_id = config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
+
+    user_identity_namespace = (assistant_id, user_id, "identity")
+    assistant_identity_namespace = (creator_id, assistant_id, "identity")
+    assistant_identity_memory_namespace = (
+        creator_id,
+        assistant_id,
+        "identity_memory",
+    )
+    assistent_reference_image_identity_namespace = (
+        creator_id,
+        assistant_id,
+        "reference_image",
+    )
+    assistant_memory_namespace = (user_id, assistant_id, "memory")
+    style_profile_namespace = (assistant_id, "style_profile")
+
+    """
+
+    CONCURRENT VECTORSTORE RETRIEVAL
+
+    Every store lookup below depends only on the identifiers and the query
+    computed above — no lookup depends on another lookup's result — so all the
+    lookups are dispatched together through ``asyncio.gather`` and the total
+    store latency collapses from the sum of every round-trip to the single
+    slowest round-trip.
+
+    """
+
+    async def _skip_fallback_name_search() -> list:
+        """Stand-in coroutine for when a fallback name search is unnecessary.
+
+        Returning an empty list keeps the ``asyncio.gather`` result tuple
+        positional when the name already arrived via the runtime context.
+        """
+        return []
+
+    """ POSSIBLE IMPROVEMENT: CREATE A `NAME` NAMESPACE FOR STORAGE AND RETRIEVAL EXPLICITLY: """
+    _TASK_DESCRIPTION_USER_NAME = (
+        "Given the query, FIND THE ANSWER TO THE QUESTION WHAT IS YOUR NAME?"
+    )
+
+    (
+        assistant_possible_name,
+        user_possible_name,
+        user_identity_document_items,
+        assistant_identity_document_items,
+        retrieved_identity_memories_items,
+        reference_image_items,
+        retrieved_memories_items,
+        direct_quote_items,
+        retrieved_knowledge_items,
+        analyzed_trait_items,
+        style_profile_ITEM,
+    ) = await asyncio.gather(
+        # Fallback name searches only run when the context did not provide a name
+        (
+            runtime.store.asearch((user_id, assistant_id, "identity"), query="name")
+            if assistant_name is None
+            else _skip_fallback_name_search()
+        ),
+        (
+            runtime.store.asearch(
+                (assistant_id, user_id, "identity"),
+                query=f"Instruct: {_TASK_DESCRIPTION_USER_NAME}\nQuery: {'WHAT IS YOUR NAME?'}",
+                limit=_RETRIEVAL_LIMIT,
+            )
+            if user_name is None
+            else _skip_fallback_name_search()
+        ),
+        runtime.store.asearch(
+            user_identity_namespace, query=query, limit=_RETRIEVAL_LIMIT
+        ),
+        runtime.store.asearch(
+            assistant_identity_namespace, query=query, limit=_RETRIEVAL_LIMIT
+        ),
+        runtime.store.asearch(
+            assistant_identity_memory_namespace, query=query, limit=_RETRIEVAL_LIMIT
+        ),
+        # Cached: the reference image only changes on upload or deletion; the
+        # write and delete sites invalidate the cache entry (see store_cache.py).
+        aget_through_cache(
+            runtime.store, assistent_reference_image_identity_namespace, assistant_id
+        ),
+        runtime.store.asearch(
+            assistant_memory_namespace, query=query, limit=_RETRIEVAL_LIMIT
+        ),
+        runtime.store.asearch(
+            (creator_id, assistant_id, "quote"), query=query, limit=_RETRIEVAL_LIMIT
+        ),
+        runtime.store.asearch(
+            (creator_id, assistant_id, "document"),
+            query=query,
+            limit=_RETRIEVAL_LIMIT,
+        ),
+        runtime.store.asearch(
+            (creator_id, assistant_id, "analysis"), query=query, limit=_RETRIEVAL_LIMIT
+        ),
+        # Cached: the style profile only changes on stylometric recalibration;
+        # the write and delete sites invalidate the cache entry (see store_cache.py).
+        aget_through_cache(runtime.store, style_profile_namespace, "style_profile"),
+    )
+
+    if assistant_name is not None:
+        state["assistant_state"].update({"assistant_name": assistant_name})
+    else:
+        if len(assistant_possible_name) > 0:
+            assistant_name = (
+                getattr(assistant_possible_name[0], "value")
+                .get("document", {})
+                .get("kwargs", {})
+                .get("metadata", {})
+                .get("fact", "")
+            )
+        else:
+            assistant_name = ""
+
+    if user_name is not None:
+        state["user_state"].update({"user_name": user_name})
+    else:
+        if len(user_possible_name) > 0 and (
+            getattr(user_possible_name[0], "score", 0) > _FILTER_SCORE
+        ):
+            user_name = (
+                getattr(user_possible_name[0], "value")
+                .get("document", {})
+                .get("kwargs", {})
+                .get("metadata", {})
+                .get("fact", "")
+            )
+        else:
+            user_name = ""
+
     """ 
     
     Load User Identity documents (always from store — checkpoint cache is not authoritative). 
@@ -311,11 +403,6 @@ async def _build_consciousness_system_message_update(
     INFORMATION ABOUT THE USER SALIENT TO THE CONVERSATION
     
     """
-
-    user_identity_namespace = (assistant_id, user_id, "identity")
-    user_identity_document_items = await runtime.store.asearch(
-        user_identity_namespace, query=query, limit=_RETRIEVAL_LIMIT
-    )
 
     # Filter the retrieved documents to a salience threshold
     user_identity_document_items = [
@@ -341,12 +428,6 @@ async def _build_consciousness_system_message_update(
     ASSISTANT IDENTITY DOCUMENTS ARE INFORMATION FROM A PRIMARY SOURCE (USES THE QUERY FOR CONVERSATION SALIENCE)
     
     """
-    creator_id = config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
-
-    assistant_identity_namespace = (creator_id, assistant_id, "identity")
-    assistant_identity_document_items = await runtime.store.asearch(
-        assistant_identity_namespace, query=query, limit=_RETRIEVAL_LIMIT
-    )
 
     # Filter the retrieved documents to a salience threshold
 
@@ -372,16 +453,6 @@ async def _build_consciousness_system_message_update(
 
     """
 
-    assistant_identity_memory_namespace = (
-        creator_id,
-        assistant_id,
-        "identity_memory",
-    )
-
-    retrieved_identity_memories_items = await runtime.store.asearch(
-        assistant_identity_memory_namespace, query=query, limit=_RETRIEVAL_LIMIT
-    )
-
     # Filter the retrieved identity_memories to a salience threshold
 
     # IDENTITY RELATED FACTS ARE NOT FILTERED TO PERSIST FACTS OF THE AVATAR'S IDENTITY.
@@ -402,17 +473,10 @@ async def _build_consciousness_system_message_update(
     
     DESCRIPTIVE REFERENCE IMAGES ARE PERSISTENT INFORMATION ABOUT THE AVATAR'S IDENTITY
 
-    # TODO: THIS NEEDS TO BE CACHED and retrieved only once UNLESS THE REFERENCE IMAGE HAS BEEN UPDATED
+    THE REFERENCE IMAGE LOOKUP IS CACHED (store_cache.py) AND ONLY RE-FETCHED WHEN
+    THE REFERENCE IMAGE HAS BEEN UPLOADED OR DELETED SINCE THE CACHED READ.
 
     """
-    assistent_reference_image_identity_namespace = (
-        creator_id,
-        assistant_id,
-        "reference_image",
-    )
-    reference_image_items = await runtime.store.aget(
-        assistent_reference_image_identity_namespace, assistant_id
-    )
 
     reference_image_items_list: list = []
     if reference_image_items is not None:
@@ -439,14 +503,6 @@ async def _build_consciousness_system_message_update(
     
     """
 
-    # ``query`` was extracted above (identity load) and is reused here.
-    assistant_memory_namespace = (user_id, assistant_id, "memory")
-    retrieved_memories_items = await runtime.store.asearch(
-        assistant_memory_namespace,
-        query=query,
-        limit=_RETRIEVAL_LIMIT,
-    )
-
     # STATEFUL + SALIENCE-PRUNED: episodic memory is the one channel that is
     # re-scored against the current query each turn. Persisted state memories are
     # merged with the fresh retrieval, de-duplicated (fresh copy wins), and every
@@ -472,12 +528,6 @@ async def _build_consciousness_system_message_update(
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
-    direct_quote_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "quote"),
-        query=query,
-        limit=_RETRIEVAL_LIMIT,
-    )
-
     # Filter the direct quotes to a salience threshold
     direct_quote_items = [
         item for item in direct_quote_items if item.score and item.score > _FILTER_SCORE
@@ -494,12 +544,6 @@ async def _build_consciousness_system_message_update(
     
     """
     # document namespace is reserved for non-quotes that the assistant has access to (bible, menu, reference documentation, etc.)
-    retrieved_knowledge_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "document"),
-        query=query,
-        limit=_RETRIEVAL_LIMIT,
-    )
-
     logger.info(f"retrieved_knowledge_items: {retrieved_knowledge_items}")
     retrieved_knowledge_items = [
         item
@@ -520,24 +564,19 @@ async def _build_consciousness_system_message_update(
     # (beliefs, emotional triggers, relationships, OCEAN, etc.) produced by the
     # process_media_graph analysis stage. Retrieve those relevant to the current
     # conversation by similarity to the user's message.
-    analyzed_trait_items = await runtime.store.asearch(
-        (creator_id, assistant_id, "analysis"), query=query, limit=_RETRIEVAL_LIMIT
-    )
     logger.info(f"analyzed_trait_items: {analyzed_trait_items}")
     analyzed_traits = reduce_docs([], analyzed_trait_items)
 
     """
     
-    Retrieve Style Profile 
-     
-    PROFILE IS STATIC (UNCHANGING) 
-    # TODO: CACHE THE PROFILE UNLESS THE PROFILE HAS BEEN CHANGED SINCE THE LAST MESSAGE 
+    Retrieve Style Profile
+
+    PROFILE IS STATIC (UNCHANGING)
+
+    THE STYLE PROFILE LOOKUP IS CACHED (store_cache.py) AND ONLY RE-FETCHED WHEN
+    THE PROFILE HAS BEEN RECALIBRATED OR DELETED SINCE THE CACHED READ.
 
     """
-    style_profile_namespace = (assistant_id, "style_profile")
-    style_profile_ITEM = await runtime.store.aget(
-        style_profile_namespace, "style_profile"
-    )
 
     # style_profile_str will be "" if the style profile does not exist
     style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")

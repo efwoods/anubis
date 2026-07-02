@@ -19,7 +19,7 @@ from src.anubis.utils.utility import extract_user_id_assistant_id
 
 logger = logging.getLogger(__name__)
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -409,6 +409,98 @@ async def _user_message_grounds_fact(fact: str, user_message_text: str) -> bool:
         return True
 
 
+class _ProposedFactStoredFactRelationship(BaseModel):
+    """How a proposed new identity fact relates to facts already stored about the assistant.
+
+    Routes ``update_self_identity_mem_from_user_txt`` between three outcomes: store the
+    proposed fact (new information), refuse the proposed fact as a duplicate (already
+    stored), or redirect the model to ``edit_identity_fact`` (the proposed fact alters a
+    stored fact). A plain similarity threshold cannot make this decision: "My favorite
+    color is blue" and "I don't have a favorite color" are near-identical by cosine yet
+    must be resolved as an edit, never as a duplicate.
+    """
+
+    relationship: Literal[
+        "already_stored", "conflicts_with_stored_fact", "new_information"
+    ] = Field(
+        description=(
+            "'already_stored' when a stored fact conveys the same information as the "
+            "proposed fact; 'conflicts_with_stored_fact' when a stored fact makes a claim "
+            "about the same attribute, event, or subject that the proposed fact changes, "
+            "contradicts, or negates; 'new_information' when no stored fact covers the "
+            "information in the proposed fact."
+        )
+    )
+    conflicting_stored_fact: str = Field(
+        default="",
+        description=(
+            "The stored fact the proposed fact conflicts with, VERBATIM as given in "
+            "STORED_FACTS. Required when the relationship is 'conflicts_with_stored_fact'; "
+            "empty otherwise."
+        ),
+    )
+    reason: str = Field(description="One short sentence explaining the decision.")
+
+
+_STORED_FACT_RELATIONSHIP_SYSTEM_PROMPT = """You compare one PROPOSED_FACT about the \
+assistant against STORED_FACTS the assistant already holds, and you decide how the proposed \
+fact relates to the stored facts.
+
+Answer with exactly one relationship:
+- "already_stored": at least one stored fact conveys the same information as the proposed \
+fact — storing the proposed fact would create a duplicate.
+- "conflicts_with_stored_fact": at least one stored fact makes a claim about the same \
+attribute, event, or subject that the proposed fact changes, contradicts, or negates — a \
+different value ("I was born in Toronto" vs "I was born in Ottawa"), a reversed claim \
+("I wore braces" vs "I never wore braces"), or an absence claim on either side ("I don't \
+have a favorite color" vs "My favorite color is blue"). Set `conflicting_stored_fact` to \
+that stored fact verbatim.
+- "new_information": no stored fact covers the information in the proposed fact. Sharing a \
+topic is not a conflict — a stored fact must repeat or dispute the proposed fact's actual \
+claim to count as anything other than new information.
+
+Judge by information content, not wording. When a stored fact repeats one part of the \
+proposed fact and disputes another part, answer "conflicts_with_stored_fact".
+"""
+
+
+# Upper bound on stored facts sent to the relationship check — the strongest matches
+# carry the decision; weaker topical neighbors only add noise and tokens.
+_MAX_RELATED_STORED_FACTS = 5
+
+
+async def _classify_proposed_fact_against_stored_facts(
+    proposed_fact: str, stored_facts: list[str]
+) -> _ProposedFactStoredFactRelationship | None:
+    """Decide whether ``proposed_fact`` duplicates, alters, or extends ``stored_facts``.
+
+    Returns ``None`` on a model error so the caller can fall back to the plain
+    similarity-threshold duplicate rule instead of blocking the tool.
+    """
+    numbered_stored_facts = "\n".join(
+        f"{index + 1}. {stored_fact}" for index, stored_fact in enumerate(stored_facts)
+    )
+    try:
+        model = init_model(response_format=_ProposedFactStoredFactRelationship)
+        return await model.ainvoke(
+            [
+                SystemMessage(content=_STORED_FACT_RELATIONSHIP_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"PROPOSED_FACT: {proposed_fact}\n\n"
+                        f"STORED_FACTS:\n{numbered_stored_facts}"
+                    )
+                ),
+            ]
+        )
+    except Exception:
+        logger.exception(
+            "update_self_identity_mem_from_user_txt: stored-fact relationship check "
+            "failed; falling back to the similarity-threshold duplicate rule"
+        )
+        return None
+
+
 class AssistantFactAndContext(BaseModel):
     """
     Extract Facts about the ASSISTANT and the context of that fact given the most recently shared message ONLY shared FROM THE USER.
@@ -485,7 +577,46 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
 
     DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN.
 
+    <TOOL ROUTING - CREATE vs EDIT vs DELETE>
+    This tool CREATES a fact that is not yet stored. Route by whether the fact already
+    exists in your stored identity (the vectorstore), never by surface words alone:
+    - The user's most recent message restates information you already hold, unchanged
+      -> call NO tool; nothing needs to be created, edited, or deleted.
+    - The user's most recent message CHANGES or CONTRADICTS a stored fact (a new value
+      for the same attribute, or a reversal — e.g. you hold "I don't have a favorite
+      color" and the user now says "Your favorite color is blue") -> call
+      ``edit_identity_fact`` with the stored fact as ``inaccurate_information`` and the
+      user's new information as ``corrected_information``. Do NOT call this tool.
+    - The user says a stored fact never happened or must be forgotten, with no
+      replacement -> call ``delete_identity_fact``.
+    - No stored fact covers the information -> call THIS tool.
+    This tool verifies the vectorstore before storing. When the proposed fact conflicts
+    with a stored fact, the tool refuses and replies with a redirect naming the exact
+    ``edit_identity_fact`` arguments to use — follow that redirect.
+    </TOOL ROUTING - CREATE vs EDIT vs DELETE>
+
     DO NOT CALL THIS TOOL ON INFORMATION THAT WAS PRESENTED FROM THE ASSISTANT IN EARLIER CONTEXT OF THE CONVERSATION (INFORMATION YOU PRESENTED YOURSELF)
+
+    THE FACT NEEDS TO LOGICALLY BE SUPPORTED FROM THE FACT_CONTEXT:
+
+    <COUNTER EXAMPLE>
+    THE FACT SHARED ABOUT THE ASSISTANT NEEDS TO BE IN ALIGNMENT WITH THE CONTEXT OF THE FACT. THIS IS AN EXAMPLE OF A FAILURE:
+    
+    USER: "Your favorite color is blue"
+    fact_context: The user said: "Your favorite color is blue."
+    fact_shared_about_the_assistant_from_the_user: I don’t have a favorite color.
+
+    </COUNTER EXAMPLE>
+
+    <EXAMPLE>
+    THE FACT SHARED ABOUT THE ASSISTANT NEEDS TO BE IN ALIGNMENT WITH THE CONTEXT OF THE FACT. 
+    THIS IS AN EXAMPLE OF A SUCCESS:
+    
+    USER: "Your favorite color is blue"
+    fact_context: The user said: "Your favorite color is blue."
+    fact_shared_about_the_assistant_from_the_user: My favorite color is blue.
+
+    </EXAMPLE>
 
     <FACTCONTEXT>
     THE CONTEXT OF THE FACTS ARE SUCH THAT YOU HAVE BEEN INFORMED OF THIS INFORMATION.
@@ -561,6 +692,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
             example, the user saying "You picked up your glasses before seeing the
             movie Crouching Tiger, Hidden Dragon" is stored as:
             "I picked up my glasses before seeing the movie Crouching Tiger, Hidden Dragon."
+
         fact_context: A concise summary of the original background context of the message in which the user shared the fact.
             Use the SAME summary for every fact extracted from the same message. For example:
             "On the day I went to get my first glasses, I picked them up before seeing
@@ -596,7 +728,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # words, or an earlier turn — before storing anything.
     latest_user_message_text = _latest_user_message_text(runtime.state.get("messages"))
 
-    _SIMILARITY_THRESHOLD = 0.6
+    _SIMILARITY_THRESHOLD = 0.9
 
     def _compute_message_fact_similarity() -> float:
         from src.anubis.utils.runtime_handles import get_sentence_embedder
@@ -626,7 +758,10 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
                     ToolMessage(
                         content=(
                             f'Not learned: "{fact_shared_about_the_assistant_from_the_user}" was '
-                            "not shared by the user in their most recent message."
+                            "not shared by the user in their most recent message. "
+                            "Re-extract the fact ONLY from the user's most recent message — "
+                            "never from retrieved documents, your own earlier statements, "
+                            "or older messages in the conversation."
                         ),
                         tool_call_id=tool_call_id,
                     )
@@ -645,8 +780,8 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # namespace the consciousness loader reads from.
     assistant_memory_namespace = (user_id, assistant_id, "identity_memory")
 
-    # VERIFY FACT DOES NOT ALREADY EXIST.
-    # Dedup against (a) the identity docs already loaded into state this turn and
+    # VERIFY HOW THE PROPOSED FACT RELATES TO WHAT IS ALREADY STORED.
+    # Compare against (a) the identity docs already loaded into state this turn and
     # (b) a live similarity search of the same namespace. We compare against
     # ``assistant_identity_documents`` — the field ``load_consciousness`` fills from
     # this exact ``identity_memory`` namespace — NOT ``recalled_memory_documents``,
@@ -654,34 +789,115 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # here. The store search must run unconditionally (the previous code gated it on
     # recalled memories being present, so duplicates slipped through on any turn
     # with no recalled memories). Mirrors ``learn_information_about_the_user``.
+    #
+    # A related stored fact is NOT automatically a duplicate: a stored "I don't have a
+    # favorite color" scores near-identical by cosine to a proposed "My favorite color
+    # is blue", yet storing nothing (the old behavior for any hit above threshold)
+    # leaves the avatar holding the contradicted fact. The relationship check below
+    # resolves each case: an identical fact is refused as previously learned, a
+    # conflicting fact redirects the model to ``edit_identity_fact``, and unrelated
+    # topical neighbors fall through to a normal create.
     assistant_identity_documents_text_list = [
         document.metadata.get("fact")
         for document in runtime.state.get("assistant_identity_documents", [])
     ]
-    assistant_content_store_query_results = await runtime.store.asearch(
-        assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user
-    )
-    assistant_content_store_query_results_significant = [
-        item
-        for item in assistant_content_store_query_results
-        if item.score and item.score > 0.8
-    ]
     if (
         fact_shared_about_the_assistant_from_the_user
         in assistant_identity_documents_text_list
-        or len(assistant_content_store_query_results_significant) > 0
     ):
-        # Fact already exists:
-        tool_call_id = runtime.tool_call_id
-        update = {
-            "messages": [
-                ToolMessage(
-                    content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
-                    tool_call_id=tool_call_id,
+        # Verbatim copy already loaded in state this turn — refuse without any model call.
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    assistant_content_store_query_results = await runtime.store.asearch(
+        assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user
+    )
+
+    # The store index embeds the whole wrapped page_content, whose long <FACT_CONTEXT>
+    # dilutes a short fact's cosine, so the proposed fact is re-scored against each hit's
+    # CLEAN <FACT> text (same method as ``find_fact_matches``) and gated at the same
+    # ``_CORRECTION_MATCH_THRESHOLD`` — so a conflict redirect below always names a fact
+    # that ``edit_identity_fact``'s own search can find again.
+    candidate_stored_facts = [
+        clean_fact
+        for item in assistant_content_store_query_results
+        if (clean_fact := _extract_clean_fact(item))
+    ]
+    candidate_scores = await _score_sentences(
+        fact_shared_about_the_assistant_from_the_user, candidate_stored_facts
+    )
+    related_stored_facts = [
+        clean_fact
+        for score, clean_fact in sorted(
+            zip(candidate_scores, candidate_stored_facts),
+            key=lambda scored_fact: scored_fact[0],
+            reverse=True,
+        )
+        if score > _CORRECTION_MATCH_THRESHOLD
+    ][:_MAX_RELATED_STORED_FACTS]
+
+    if related_stored_facts:
+        relationship_result = await _classify_proposed_fact_against_stored_facts(
+            fact_shared_about_the_assistant_from_the_user, related_stored_facts
+        )
+        if relationship_result is None:
+            # Relationship model unavailable — fall back to the plain similarity rule the
+            # tool used before: a very strong clean-fact hit is treated as a duplicate, so
+            # a model outage never floods the namespace with near-copies.
+            if any(score > 0.8 for score in candidate_scores):
+                return Command(
+                    update={
+                        "messages": [
+                            ToolMessage(
+                                content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                                tool_call_id=runtime.tool_call_id,
+                            )
+                        ]
+                    }
                 )
-            ]
-        }
-        return Command(update=update)
+        elif relationship_result.relationship == "already_stored":
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                            tool_call_id=runtime.tool_call_id,
+                        )
+                    ]
+                }
+            )
+        elif relationship_result.relationship == "conflicts_with_stored_fact":
+            conflicting_stored_fact = (
+                relationship_result.conflicting_stored_fact.strip()
+                or related_stored_facts[0]
+            )
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=(
+                                f'Not learned: the proposed fact "{fact_shared_about_the_assistant_from_the_user}" '
+                                f'conflicts with the stored fact "{conflicting_stored_fact}". '
+                                "Call edit_identity_fact with "
+                                f'inaccurate_information="{conflicting_stored_fact}", '
+                                f'corrected_information="{fact_shared_about_the_assistant_from_the_user}", '
+                                "and a correction_context summarizing the user's most "
+                                "recent message."
+                            ),
+                            tool_call_id=runtime.tool_call_id,
+                        )
+                    ]
+                }
+            )
+        # "new_information" falls through to storing the proposed fact.
 
     searchable_page_content = wrap_fact_with_context(
         fact_shared_about_the_assistant_from_the_user, fact_context
@@ -1173,9 +1389,20 @@ class ProposedFactEdit(BaseModel):
     )
     corrected_context: str = Field(
         default="",
-        description="The text's ORIGINAL background context, minimally edited so it stays "
-        "accurate — preserve the parts that are still true, change only what the correction "
-        "touches. Do NOT blanket-overwrite the whole context with the new fact.",
+        description="The text's ORIGINAL background context, minimally edited so the context "
+        "SUPPORTS the corrected text — preserve the parts that are still true, change only "
+        "what the correction touches. Do NOT blanket-overwrite the whole context with the new "
+        "fact. When the original context states or attributes the inaccurate fact (including "
+        'provenance phrasing such as The user said: "<the inaccurate fact>"), rewrite that '
+        "portion so the context records the correction instead (draw on "
+        "USER_CORRECTION_CONTEXT) — the stored context grounds the fact for future recall and "
+        "must never contradict the corrected text.",
+    )
+    context_asserts_inaccurate_fact: bool = Field(
+        default=False,
+        description="True when ORIGINAL_CONTEXT itself states or attributes the inaccurate "
+        'fact — including provenance phrasing such as The user said: "<the inaccurate fact>". '
+        "When true, `corrected_context` MUST differ from ORIGINAL_CONTEXT.",
     )
 
 
@@ -1190,6 +1417,8 @@ the event never happened).
 - MATCHED_TEXT: the specific stored sentence/fact that was matched and may need editing.
 - FULL_DOCUMENT: the surrounding text MATCHED_TEXT came from (for context only — do NOT return it).
 - ORIGINAL_CONTEXT: the stored background context for MATCHED_TEXT.
+- USER_CORRECTION_CONTEXT: the background context of the correction — how the user just now \
+corrected the fact (may be empty).
 
 Rules:
 - Decide `asserts_inaccurate_fact`: is MATCHED_TEXT actually stating INACCURATE_FACT? If it is \
@@ -1205,6 +1434,13 @@ Return an empty `corrected_text` ONLY when MATCHED_TEXT stated nothing but the i
 event (nothing true is left to keep) — that signals the whole document should be removed.
 - Edit ORIGINAL_CONTEXT the same way: keep the still-true parts, change only what the \
 correction affects. Never replace the whole context with just the new fact.
+- `corrected_context` must SUPPORT `corrected_text` after the edit. When ORIGINAL_CONTEXT \
+states or attributes the inaccurate fact — including provenance phrasing such as \
+The user said: "<the inaccurate fact>" — set `context_asserts_inaccurate_fact` true and \
+rewrite that portion so the context records the correction instead, drawing on \
+USER_CORRECTION_CONTEXT. A context is NOT "still true" merely because the outdated statement \
+was once said: the stored context grounds the fact for future recall, so the returned \
+`corrected_context` must never state, attribute, or imply the inaccurate fact.
 """
 
 
@@ -1242,6 +1478,7 @@ async def _suggest_correction(
                 f"USER_CORRECTION: {corrected_information or '(remove — the user says this is simply wrong)'}\n"
                 f"MATCHED_TEXT: {match.matched_text}\n"
                 f"ORIGINAL_CONTEXT: {original_context}\n"
+                f"USER_CORRECTION_CONTEXT: {correction_context}\n"
                 f"FULL_DOCUMENT: {full_document[:4000]}"
             )
         )
@@ -1262,6 +1499,17 @@ async def _suggest_correction(
         if not is_deletion and not corrected_text.strip():
             corrected_text = corrected_information
         corrected_context = result.corrected_context or correction_context
+        # BACKSTOP: the model flagged the stored context as asserting the inaccurate fact
+        # yet returned the context unchanged. Provenance phrasing makes this failure easy —
+        # 'The user said: "You don't have a favorite color."' reads as "still true" under a
+        # minimal-edit instruction, but keeping that context beside the corrected fact leaves
+        # the document contradicting the very edit being suggested. Prefer the fresh
+        # correction context (how the user just corrected the fact) over the stale one.
+        if (
+            result.context_asserts_inaccurate_fact
+            and (corrected_context or "").strip() == (original_context or "").strip()
+        ):
+            corrected_context = correction_context or corrected_context
         return corrected_text, corrected_context, bool(result.asserts_inaccurate_fact)
     except Exception:
         logger.exception(
@@ -2123,6 +2371,7 @@ async def edit_identity_fact(
     safe), accept the suggested in-place edit, rewrite it themselves, or remove it. They may
     also cancel the whole correction. Nothing is saved without the owner's per-document
     approval, so you do not need to enumerate the documents yourself.
+
     </INSTRUCTIONS>
 
     <RESTRICTIONS>

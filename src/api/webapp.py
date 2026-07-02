@@ -781,28 +781,41 @@ async def share_avatar(
     )
 
 
-@app.post("/user_is_creator")
-async def user_is_creator(
-    assistant_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    context = app.state.context
-    user_id = current_user["identities"][0]["user_id"]
-    if user_id == context.admin_user_id:
-        try:
-            token = current_user["API_KEY"]
-            client = get_client(headers={"API-KEY": f"{token}"})
-            namespace = (assistant_id, 'creator_id')
-            await client.store.put_item(namespace, key='creator_id', value={"value": user_id}) 
-            return JSONResponse(content="stored creator_id", status_code=200)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Error during update of sharing avatar: {e}"
-            )
+# @app.post("/user_is_creator")
+# async def user_is_creator(
+#     assistant_id: str,
+#     current_user: dict = Depends(get_current_user),
+# ):
+#     """Used to establish creator in vectorstore due to update in code. Unnecessary, already implemented.
+
+#     Args:
+#         assistant_id (str): _description_
+#         current_user (dict, optional): _description_. Defaults to Depends(get_current_user).
+
+#     Raises:
+#         HTTPException: _description_
+#         HTTPException: _description_
+
+#     Returns:
+#         _type_: _description_
+#     """
+#     context = app.state.context
+#     user_id = current_user["identities"][0]["user_id"]
+#     if user_id == context.admin_user_id:
+#         try:
+#             token = current_user["API_KEY"]
+#             client = get_client(headers={"API-KEY": f"{token}"})
+#             namespace = (assistant_id, 'creator_id')
+#             await client.store.put_item(namespace, key='creator_id', value={"value": user_id}) 
+#             return JSONResponse(content="stored creator_id", status_code=200)
+#         except Exception as e:
+#             raise HTTPException(
+#                 status_code=500, detail=f"Error during update of sharing avatar: {e}"
+#             )
         
-    raise HTTPException(
-        status_code=401, detail="Users may only share avatars of themselves."
-    )
+#     raise HTTPException(
+#         status_code=401, detail="Users may only share avatars of themselves."
+#     )
 
 @app.patch("/modify_avatar")
 async def modify_avatar(

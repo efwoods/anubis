@@ -183,7 +183,7 @@ async def _build_consciousness_system_message_update(
     """
 
     _RETRIEVAL_LIMIT = 10
-    _FILTER_SCORE = 0.5
+    _FILTER_SCORE = 0.1
 
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
@@ -367,8 +367,8 @@ async def _build_consciousness_system_message_update(
     #     retrieved_memories = reduce_docs([], retrieved_memories_items)
     # else:
     #     retrieved_memories = state['recalled_memory_documents']
-    logger.info("breakpoint")
     """ Retrieve Direct Quotes """
+    logger.info("breakpoint quote")
     # Few Shot Example of Quotes and Writing style directly from the real-world assistant
     # The QUOTE namespace holds direct quotes from the real-world assistant
 
@@ -404,6 +404,42 @@ async def _build_consciousness_system_message_update(
     )
     logger.info(f"analyzed_trait_items: {analyzed_trait_items}")
     analyzed_traits = reduce_docs([], analyzed_trait_items)
+
+    """ Retrieve Style Profile """
+    # Owner-scoped like every other per-avatar artifact: calibrate_ground_truth
+    # writes it under (creator_id, assistant_id, "style_profile").
+    style_profile_namespace = (creator_id, assistant_id, "style_profile")
+    style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
+
+    # style_profile_str will be "" if the style profile does not exist
+    style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")
+
+    """ Retrieve Signature Key Phrases """
+    # The avatar's auto-discovered signature phrases (built by calibrate_ground_truth
+    # from the direct quotes). Stored owner-scoped at
+    # (creator_id, assistant_id, "key_phrase_profile") as a JSON list; rendered
+    # here into the LLM-legible block injected as the <SIGNATURE PHRASES> section.
+    # Empty string when none have been discovered yet.
+    import json as _json
+
+    key_phrase_profile_ITEM = await runtime.store.aget(
+        (creator_id, assistant_id, "key_phrase_profile"), "key_phrase_profile"
+    )
+    key_phrase_list_str = getattr(key_phrase_profile_ITEM, "value", {}).get("value", "")
+    try:
+        key_phrase_list = _json.loads(key_phrase_list_str) if key_phrase_list_str else []
+    except (TypeError, ValueError):
+        key_phrase_list = []
+    # Render-time guard: phrase sets stored before discovery cleaned its corpus
+    # contain markup debris ("https t co ...") — never show those to the model.
+    # The stored set itself heals on the avatar's next calibration.
+    from src.anubis.utils.dataset.key_phrases import phrase_is_well_formed
+
+    key_phrases_str = "\n".join(
+        f'- "{phrase}"'
+        for phrase in key_phrase_list
+        if phrase_is_well_formed(phrase)
+    )
 
     """ Retrieve Emotions """
 
@@ -458,6 +494,8 @@ async def _build_consciousness_system_message_update(
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
         analyzed_traits=analyzed_traits,
+        style_profile_str=style_profile_str,
+        key_phrases_str=key_phrases_str,
         direct_quotes=direct_quotes,
         user_name=user_name,
         user_description=user_description,

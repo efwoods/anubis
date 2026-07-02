@@ -6,6 +6,7 @@ Super-Graph with a central Langchain Agent and subgraph tool use.
 """
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -92,31 +93,76 @@ def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
     avatar_response.response_metadata.update({"sentiment": sentiment})
 
 
-async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime[GlobalContext], assistant_id: str) -> None:
+async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime[GlobalContext], assistant_id: str, user_id: str) -> None:
     """ analyze the avatar_response features, compare against unmodified chatgpt responses and any existing direct quotes if possible.
     Update the metadata with the feature analysis and the results of comparison.
     """
     from src.anubis.utils.dataset.style_features import (
         GROUND_TRUTH_FEATURES_DICT_KEY,
+        baseline_feature_array_is_current,
         compute_mahalanobis_distance,
         deserialize_features_by_doc_id,
         extract_style_features,
         features_by_doc_id_to_arr,
+        load_bundled_baseline_features_arr,
+        sanitize_ground_truth_feature_matrix,
     )
     import json
 
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
 
-    features_dict = extract_style_features(avatar_response.content)
-    avatar_response.response_metadata.update({"features": features_dict})
+    # BASELINE KEY PHRASES: the ChatGPT baseline's self-discovered signature
+    # phrases (the reference set the baseline matrix's key_phrase_rate column was
+    # measured against). Cached under the namespace-root pattern the other
+    # baseline artifacts use — ("baseline_key_phrase_profile",) with the same
+    # key — as {"value": json.dumps(list)}; bundled JSON on disk is the fallback.
+    baseline_key_phrase_profile_ITEM = await runtime.store.aget(
+        ("baseline_key_phrase_profile",), key="baseline_key_phrase_profile"
+    )
+    baseline_key_phrases_str = (getattr(baseline_key_phrase_profile_ITEM, "value", None) or {}).get("value", None)
+
+    if baseline_key_phrases_str:
+        baseline_key_phrases = json.loads(baseline_key_phrases_str)
+    else:
+        # Load the bundled baseline key phrases from disk and cache in the store.
+        from src.anubis.utils.dataset.style_features import BASELINE_KEY_PHRASES_PATH
+
+        with open(BASELINE_KEY_PHRASES_PATH, encoding="utf-8") as fp:
+            baseline_key_phrases = json.load(fp)
+        await runtime.store.aput(
+            ("baseline_key_phrase_profile",),
+            key="baseline_key_phrase_profile",
+            value={"value": json.dumps(baseline_key_phrases)},
+        )
+
+    features_dict = extract_style_features(
+        text=avatar_response.content,
+        key_phrases=baseline_key_phrases,
+    )
+    # The metadata copy must be STRICT JSON: a degenerate reply (emoji-only,
+    # all-punctuation) legitimately carries NaN cells, but json.dumps would
+    # emit the bare NaN token, producing an invalid SSE "done" event. The raw
+    # dict (NaN intact) still feeds the comparison math below.
+    avatar_response.response_metadata.update(
+        {
+            "features": {
+                name: (value if math.isfinite(value) else None)
+                for name, value in features_dict.items()
+            }
+        }
+    )
 
     features_arr = np.array(list(features_dict.values()))
+
     baseline_response_threshold = runtime.context.baseline_response_threshold
 
     try:
+        # Baseline artifacts live at their namespace ROOT (namespace = key); the
+        # per-avatar ground-truth artifacts are owner-scoped under
+        # (user_id, assistant_id, <artifact_name>) with the artifact name as key.
         baseline_features_namespace = ("baseline_features_arr_list_str",)
-        ground_truth_text_features_by_doc_id_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
-        ground_truth_text_empirical_threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
+        ground_truth_text_features_by_doc_id_namespace = (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
+        ground_truth_text_empirical_threshold_namespace = (user_id, assistant_id, "ground_truth_text_empirical_threshold_list_str")
 
         baseline_features_arr_list_str_ITEM = await runtime.store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
 
@@ -135,6 +181,18 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         if isinstance(baseline_features_arr_list_str, str):
             baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
 
+        # Feature-version self-heal: an existing deployment may have cached a
+        # previous-width baseline matrix in the store. Comparing a current-width
+        # candidate row against it would raise on the shape mismatch, so reload
+        # the freshly-bundled .npy and overwrite the stale cache.
+        if not baseline_feature_array_is_current(baseline_features_arr):
+            baseline_features_arr = load_bundled_baseline_features_arr()
+            await runtime.store.aput(
+                baseline_features_namespace,
+                key="baseline_features_arr_list_str",
+                value={"value": json.dumps(baseline_features_arr.tolist())},
+            )
+
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
         M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(features_arr, baseline_features_arr)
 
@@ -151,8 +209,56 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         }
         avatar_response.response_metadata.update({"comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis})
 
+        # SIGNATURE KEY-PHRASE RATES — one rate per reference phrase set. The
+        # ``features`` block's key_phrase_rate was measured against the ChatGPT
+        # BASELINE's phrases (matching the baseline cloud it is compared to);
+        # here the same reply is additionally measured against the AVATAR's own
+        # discovered phrases so both rates are visible side by side. Loaded
+        # OUTSIDE the ground-truth-artifacts gate because the phrase profile is
+        # written on every calibration, before the corpus reaches the
+        # calibration floor. Stored phrases pass through phrase_is_well_formed
+        # so sets polluted before discovery cleaned its corpus never score here.
+        from src.anubis.utils.dataset.key_phrases import phrase_is_well_formed
+
+        key_phrase_profile_ITEM = await runtime.store.aget(
+            (user_id, assistant_id, "key_phrase_profile"), key="key_phrase_profile"
+        )
+        avatar_key_phrases_str = (getattr(key_phrase_profile_ITEM, "value", None) or {}).get("value", None)
+        avatar_key_phrases = json.loads(avatar_key_phrases_str) if avatar_key_phrases_str else None
+        if avatar_key_phrases:
+            avatar_key_phrases = [
+                phrase for phrase in avatar_key_phrases if phrase_is_well_formed(phrase)
+            ]
+
+        # Swap ONLY key_phrase_rate to the avatar-referenced value; every other
+        # feature is text-only and carries over from the baseline-scored dict.
+        ground_truth_features_dict = extract_style_features(
+            avatar_response.content,
+            key_phrases=avatar_key_phrases,
+            update_key_phrases_only=True,
+            features_dict=features_dict,
+        )
+        avatar_response.response_metadata.update(
+            {
+                "key_phrase_rates": {
+                    "avatar_signature_phrases_rate": (
+                        ground_truth_features_dict["key_phrase_rate"]
+                        if avatar_key_phrases
+                        else None
+                    ),
+                    "chatgpt_baseline_phrases_rate": features_dict["key_phrase_rate"],
+                    "key_phrase_rates_description": (
+                        "Occurrences of signature phrases per word in this reply, "
+                        "measured once against the avatar's own discovered phrase "
+                        "set (null when no avatar phrases are discovered yet) and "
+                        "once against the bundled ChatGPT baseline's phrase set."
+                    ),
+                }
+            }
+        )
+
         # Compare against ground truth quotes if available:
-        ground_truth_text_features_model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+        ground_truth_text_features_model_namespace = (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl")
 
         ground_truth_text_features_model_b64_pkl_ITEM = await runtime.store.aget(
             ground_truth_text_features_model_namespace, 
@@ -175,12 +281,24 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
         ground_truth_text_empirical_threshold_list_str = (getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None) or {}).get("value", None)
 
-        # Reconstruct the (n_docs, 33) corpus array from the per-document dict.
-        ground_truth_text_features_arr = features_by_doc_id_to_arr(
-            deserialize_features_by_doc_id(ground_truth_text_features_by_doc_id_str)
+        # Reconstruct the (n_docs, len(FEATURE_NAMES)) corpus array from the
+        # per-document dict, then sanitize: a corpus persisted before the
+        # write-time all-NaN filter existed can still hold NaN cells, and the
+        # StandardScaler inside compute_mahalanobis_distance (plus the
+        # IsolationForest predict below) raises on NaN input.
+        ground_truth_text_features_arr = sanitize_ground_truth_feature_matrix(
+            features_by_doc_id_to_arr(
+                deserialize_features_by_doc_id(ground_truth_text_features_by_doc_id_str)
+            )
         )
 
         if ground_truth_text_features_arr.shape[0] > 0 and ground_truth_text_empirical_threshold_list_str and ground_truth_text_features_model_b64_pkl:
+            # The ground-truth cloud's key_phrase_rate column was measured against
+            # the AVATAR's discovered signature phrases, so the candidate row uses
+            # the avatar-referenced dict computed above (key_phrase_rate swapped,
+            # every other feature carried over from the baseline-scored dict).
+            ground_truth_candidate_arr = np.array(list(ground_truth_features_dict.values()))
+
             import base64, shap, pandas as pd
             from src.anubis.utils.dataset.style_features import FEATURE_NAMES
 
@@ -190,12 +308,32 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 ground_truth_text_empirical_threshold = np.array(ground_truth_text_empirical_threshold_list_str).flatten()
 
             ground_truth_text_features_model = pickle.loads(base64.b64decode(ground_truth_text_features_model_b64_pkl))
-            
+
+            # Feature-version self-heal: this per-avatar IsolationForest may have
+            # been fit under a previous vector width and cached in the store. Unlike
+            # the bundled ChatGPT baseline there is nothing to reload it from — it is
+            # rebuilt only on the next media upload (calibrate_ground_truth) once the
+            # corpus reaches MIN_ROWS_FOR_CALIBRATION current-width rows. Until then,
+            # scoring a current-width candidate against it would raise, so skip the
+            # ground-truth comparison cleanly rather than tripping the best-effort
+            # handler with a noisy error every turn.
+            ground_truth_model_feature_width = getattr(
+                ground_truth_text_features_model, "n_features_in_", len(FEATURE_NAMES)
+            )
+            if ground_truth_model_feature_width != len(FEATURE_NAMES):
+                logger.info(
+                    "skipping ground-truth comparison: cached model width %s != "
+                    "current %s; will rebuild on next media upload.",
+                    ground_truth_model_feature_width,
+                    len(FEATURE_NAMES),
+                )
+                return
+
             # Compute the difference between the synthetic text and the direct quotes.
-            M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(features_arr, ground_truth_text_features_arr)
+            M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(ground_truth_candidate_arr, ground_truth_text_features_arr)
 
             # Predict and explain the classification
-            ground_truth_prediction = bool(ground_truth_text_features_model.predict(features_arr.reshape(1,-1))==1)
+            ground_truth_prediction = bool(ground_truth_text_features_model.predict(ground_truth_candidate_arr.reshape(1,-1))==1)
 
             # KernelExplainer weights model.predict over EVERY background row per
             # explanation, so passing the full corpus (which can be thousands of
@@ -207,10 +345,10 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 else ground_truth_text_features_arr
             )
             explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, shap_background)
-            ground_truth_shap_values = explainer.shap_values(features_arr.reshape(1,-1))
-            # shap_values for a single sample comes back shaped (1, 33); flatten to
-            # (33,) so it aligns with the 33-row FEATURE_NAMES index (the DataFrame
-            # expects (n_features, 1), not (1, n_features)).
+            ground_truth_shap_values = explainer.shap_values(ground_truth_candidate_arr.reshape(1,-1))
+            # shap_values for a single sample comes back shaped (1, n_features);
+            # flatten to (n_features,) so it aligns with the FEATURE_NAMES index
+            # (the DataFrame expects (n_features, 1), not (1, n_features)).
             ground_truth_shap_values = np.asarray(ground_truth_shap_values).ravel()
             ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
 
@@ -441,7 +579,22 @@ async def think(
     # TODO: Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata. The
     # user has seen the reply by now, so this adds no perceived latency.
-        await _attach_analyzed_features(final_message, runtime=runtime, assistant_id=state['assistant_state']['assistant_id'])
+    if config.get("configurable", {}).get("include_metrics", False):
+        # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
+        # owner-scoped, so pass the avatar OWNER's id — the same first namespace
+        # element calibrate_ground_truth wrote under — not the conversing user.
+        creator_id = (
+            config.get("configurable", {})
+            .get("assistant_ctx", {})
+            .get("metadata", {})
+            .get("user_id")
+        ) or state["user_state"]["user_id"]
+        await _attach_analyzed_features(
+            final_message,
+            runtime=runtime,
+            assistant_id=state["assistant_state"]["assistant_id"],
+            user_id=creator_id,
+        )
 
 
     update: dict[str, Any] = {

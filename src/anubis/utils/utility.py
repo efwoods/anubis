@@ -1306,6 +1306,7 @@ def _select_dominant_speaker_segments(
     diarized_segments: list,
     *,
     short_fallback_s: float = 1.0,
+    allow_single_speaker: bool = False,
 ) -> Optional[tuple[str, list[dict], dict[str, float], float]]:
     """Pure selection logic: filter text-bearing segments, pick the speaker
     with the largest total speech time, return that speaker's segments.
@@ -1314,6 +1315,14 @@ def _select_dominant_speaker_segments(
     or ``None`` when the input has no text-bearing segments, only one speaker,
     or the dominant speaker's combined speech is shorter than
     ``short_fallback_s``. Tie-break for the dominant pick is first-seen label.
+
+    ``allow_single_speaker`` keeps a single-speaker input instead of returning
+    ``None``. The default (False) is for isolating one voice out of a
+    conversation, where a single speaker means "nothing to separate, pass the
+    clip through". Reference-audio extraction passes ``True``: a reference clip
+    is the target talking alone, so a single speaker is the desired case and
+    must still yield that speaker's segments (and therefore a transcript) rather
+    than falling through to the empty-text passthrough.
     """
     speech_segs: list[dict] = []
     for seg in diarized_segments:
@@ -1346,9 +1355,12 @@ def _select_dominant_speaker_segments(
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
 
-    # Only one distinct speaker: there is no "dominant" speaker to isolate, so
-    # signal the caller to fall through to passthrough (use the whole clip).
-    if len(totals) <= 1:
+    # Only one distinct speaker: for dominant-speaker isolation there is nothing
+    # to separate, so signal passthrough (use the whole clip). For reference
+    # audio a single speaker is the expected, desired case, so keep that speaker
+    # rather than bailing — otherwise the reference document is stored with an
+    # empty transcript.
+    if len(totals) <= 1 and not allow_single_speaker:
         return None
 
     target_speaker = sorted(
@@ -1454,6 +1466,7 @@ async def isolate_dominant_speaker_audio_b64(
         selection = _select_dominant_speaker_segments(
             (diar or {}).get("segments") or [],
             short_fallback_s=short_fallback_s,
+            allow_single_speaker=bool(reference_audio),
         )
         if selection is None:
             logger.info(
@@ -1478,18 +1491,44 @@ async def isolate_dominant_speaker_audio_b64(
             clip_for_crop = AudioFileClip(work_path)
             try:
                 if reference_audio:
-                    # Reference clip: single longest contiguous target segment,
-                    # capped at reference_audio_clip_max_seconds.
-                    longest = max(target_segs, key=lambda s: s["end"] - s["start"])
-                    seg_start = float(longest["start"])
-                    seg_end = float(longest["end"])
+                    # Reference clip: OpenAI's known_speaker_references must be a
+                    # single-speaker clip between 1.2 s and 10 s, so we keep one
+                    # contiguous window of the target capped at
+                    # reference_audio_clip_max_seconds. Anchor on the target's
+                    # longest contiguous segment (the cleanest sustained speech),
+                    # then extend through the immediately-adjacent following
+                    # target segments while the window stays under the cap.
+                    # ``text`` is the concatenation of exactly the segments inside
+                    # the kept window, so the stored transcript matches the stored
+                    # audio (the previous code paired a single segment's *full*
+                    # text with an audio clip that could be hard-truncated to the
+                    # cap, leaving text and audio out of sync). Extension stops at
+                    # any real gap so the subclip can't swallow an intervening
+                    # other-speaker turn — the reference must stay single-speaker.
+                    _ref_max_gap_s = 0.5
+                    ordered = sorted(target_segs, key=lambda s: float(s["start"]))
+                    anchor = max(ordered, key=lambda s: s["end"] - s["start"])
+                    anchor_idx = ordered.index(anchor)
+                    seg_start = float(anchor["start"])
+                    seg_end = float(anchor["end"])
+                    kept = [anchor]
+                    for nxt in ordered[anchor_idx + 1:]:
+                        if (float(nxt["start"]) - seg_end) > _ref_max_gap_s:
+                            break
+                        if (float(nxt["end"]) - seg_start) > target_clip_max_s:
+                            break
+                        seg_end = float(nxt["end"])
+                        kept.append(nxt)
+                    # Hard cap covers a single anchor segment longer than the cap
+                    # (one continuous utterance): the audio is truncated to the
+                    # cap; ``text`` then over-covers slightly, which is the only
+                    # case the segment granularity can't keep perfectly in sync.
                     if (seg_end - seg_start) > target_clip_max_s:
                         seg_end = seg_start + target_clip_max_s
-                    # Floor the clip at OpenAI's 1.2 s minimum: if the longest
-                    # contiguous target segment is too short, widen the window
-                    # into the surrounding audio (it still centers on the
-                    # target) rather than emit a sub-1.2 s reference the
-                    # diarizer will reject.
+                    # Floor the clip at OpenAI's 1.2 s minimum: if the kept window
+                    # is too short, widen it into the surrounding audio (it still
+                    # centers on the target) rather than emit a sub-1.2 s
+                    # reference the diarizer will reject.
                     clip_total = float(clip_for_crop.duration or 0.0)
                     if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
                         seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
@@ -1501,11 +1540,14 @@ async def isolate_dominant_speaker_audio_b64(
                     finally:
                         sub.close()
                     clip_duration = float(seg_end - seg_start)
-                    clip_content = (longest.get("text") or "").strip()
+                    clip_content = " ".join(
+                        (s.get("text") or "").strip() for s in kept
+                    ).strip()
                     logger.info(
-                        "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
-                        longest["end"] - longest["start"],
+                        "isolate_dominant_speaker_audio_b64[ref]: kept %d target segment(s) %.2fs (cap %.2fs)",
+                        len(kept),
                         clip_duration,
+                        target_clip_max_s,
                     )
                 else:
                     # Non-reference: concatenate all target segments with short
@@ -1583,18 +1625,16 @@ async def transcribe_audio_diarize(
     suffix = Path(orig_name).suffix or ".mp4"
     is_audio = _upload_is_audio_for_diarize(filename, content_type)
 
-    # Preprocess audio or video — pass through without truncation. The
-    # diarizer needs to see the full clip; inputs that exceed
-    # ``whisper_max_bytes`` are sliced into chunks below and diarized in
-    # sequence with timestamps aggregated onto the original timeline. The
-    # ``reference_audio`` parameter on this function is informational and
-    # does not gate preprocessing (``preprocess_audio``'s
-    # ``reference_audio=True`` would truncate the input to a few seconds,
-    # which would defeat full-clip diarization).
+    # asdf
+
     source_path = None
     audio_path = None
     if is_audio:
-        preprocessed_audio = await preprocess_audio(
+        # Handle Audio
+        # Identify the longest up to 9 second audio clip for reference audio. 
+        # Preprocess as necessary to improve quality otherwise.
+
+        preprocessed_audio = await preprocess_audio( # Convert to MP3 Codec
             media_base64,
             truncate_only=False,
             reference_audio=False,
@@ -1625,6 +1665,7 @@ async def transcribe_audio_diarize(
             b64_encoded_reference_audio = (
                 f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
             )
+            # Create 
             preprocessed_audio = await preprocess_audio(
                 b64_encoded_reference_audio,
                 truncate_only=False,
@@ -1640,6 +1681,8 @@ async def transcribe_audio_diarize(
         temp_audio.flush()
         audio_path = temp_audio.name # Preprocessed audio
     
+    
+    ##### Diarize content using reference audio   
     try:
         size_bytes = len(raw)
         diarize_upload_name = (
@@ -1832,44 +1875,113 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     import base64, pickle, shap, aiofiles, json
     import numpy as np
 
+    from src.anubis.utils.dataset.style_features import (
+        BASELINE_FEATURES_EXPLAINER_PATH,
+        BASELINE_FEATURES_MODEL_PATH,
+        FEATURE_NAMES,
+        baseline_feature_array_is_current,
+        load_bundled_baseline_features_arr,
+    )
+
     # Attempt to pull stored model and data from store
     baseline_features_namespace = ("baseline_features_arr_list_str",)
     baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
-
+    baseline_features_explainer_namespace = ("baseline_features_explainer_b64_pkl",)
+    # basline_features_keyword_namespace = ("basline_features_keyword_namespace", )
+    
     baseline_features_arr_list_str_ITEM = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
     baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
 
     baseline_features_model_b64_pkl_ITEM = await store.aget(baseline_features_model_namespace, key="baseline_features_model_b64_pkl")
     baseline_features_model_b64_pkl = (getattr(baseline_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
 
+    async def _load_bundled_model_b64() -> str:
+        """Read the bundled base64 model pickle from disk and cache it in the store."""
+        async with aiofiles.open(BASELINE_FEATURES_MODEL_PATH, 'rb') as fp:
+            model_bytes = await fp.read()
+        model_b64_str = model_bytes.decode('utf-8')
+        await store.aput(
+            baseline_features_model_namespace,
+            key="baseline_features_model_b64_pkl",
+            value={"value": model_b64_str})
+        return model_b64_str
+
     # If the baseline_features_model has not yet been stored, load from disk and store the model:
     if not baseline_features_model_b64_pkl:
-        _MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
-        # Load model
-        async with aiofiles.open(_MODEL_PATH, 'rb') as fp:
-            baseline_features_model_b64_pkl = await fp.read()
-        baseline_features_model_b64_pkl_str = (baseline_features_model_b64_pkl).decode('utf-8')
-        await store.aput(
-            baseline_features_model_namespace, 
-            key="baseline_features_model_b64_pkl", 
-            value={"value":baseline_features_model_b64_pkl_str})        
+        baseline_features_model_b64_pkl = await _load_bundled_model_b64()
 
     # Convert from pickled string to Isolation Forest model
     model = pickle.loads(base64.b64decode(baseline_features_model_b64_pkl))
 
+    # Feature-version self-heal: a deployment that cached the model before the
+    # feature vector grew holds an IsolationForest of the wrong width, which would
+    # raise when scoring a current-width candidate. Reload the freshly-bundled
+    # model (regenerated by data/build_baseline_features_arr.py) and overwrite the
+    # stale cache.
+    if getattr(model, "n_features_in_", len(FEATURE_NAMES)) != len(FEATURE_NAMES):
+        baseline_features_model_b64_pkl = await _load_bundled_model_b64()
+        model = pickle.loads(base64.b64decode(baseline_features_model_b64_pkl))
+
     # If the baseline_features_arr has not yet been stored, load from disk and store the array:
     if not baseline_features_arr_list_str:
-        _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
-        baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
-
+        baseline_features_arr = load_bundled_baseline_features_arr()
         baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
-
         await store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
 
     # Convert from str to np.array
     baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
-    
-    explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+
+    # Same self-heal for the cached background matrix: a stale-width array would
+    # not align with the current model in the KernelExplainer below.
+    if not baseline_feature_array_is_current(baseline_features_arr):
+        baseline_features_arr = load_bundled_baseline_features_arr()
+        await store.aput(
+            baseline_features_namespace,
+            key="baseline_features_arr_list_str",
+            value={"value": json.dumps(baseline_features_arr.tolist())})
+
+    # Load the pre-built SHAP explainer (base64 pickle) rather than rebuilding a
+    # KernelExplainer (kmeans + repeated model.predict) on every call. Cached in
+    # the store like the model/array, with a disk fallback. If the persisted
+    # explainer is missing, unreadable, or predates the current feature vector, we
+    # self-heal to a runtime rebuild so inference never breaks.
+    baseline_features_explainer_b64_pkl_ITEM = await store.aget(
+        baseline_features_explainer_namespace, key="baseline_features_explainer_b64_pkl")
+    baseline_features_explainer_b64_pkl = (getattr(baseline_features_explainer_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+
+    async def _load_bundled_explainer_b64() -> str:
+        """Read the bundled base64 explainer pickle from disk and cache it in the store."""
+        async with aiofiles.open(BASELINE_FEATURES_EXPLAINER_PATH, 'rb') as fp:
+            explainer_bytes = await fp.read()
+        explainer_b64_str = explainer_bytes.decode('utf-8')
+        await store.aput(
+            baseline_features_explainer_namespace,
+            key="baseline_features_explainer_b64_pkl",
+            value={"value": explainer_b64_str})
+        return explainer_b64_str
+
+    explainer = None
+    try:
+        if not baseline_features_explainer_b64_pkl:
+            baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
+        explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+
+        # Width self-heal: an explainer cached before the feature vector changed
+        # carries a stale-width background/model. Its SHAP background lives at
+        # explainer.data.data as an (n_background, F) array; reload the bundled
+        # explainer when F no longer matches the current vector.
+        explainer_background = np.asarray(getattr(getattr(explainer, "data", None), "data", np.empty((0, 0))))
+        if explainer_background.ndim != 2 or explainer_background.shape[1] != len(FEATURE_NAMES):
+            baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
+            explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+    except Exception:
+        # Missing/corrupt/incompatible persisted explainer — rebuild from the
+        # current-width model + background so the caller always gets a usable one.
+        explainer = None
+
+    if explainer is None:
+        explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+
     return explainer, model
 
 async def compute_shap_values_against_baseline(feature_values, store: BaseStore) -> dict:

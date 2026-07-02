@@ -16,7 +16,6 @@ from src.anubis.utils.context import GlobalContext
 from src.subgraphs.process_media_graph.utils.nodes import (
     analyze_documents,
     convert_media_list_to_text_document,
-    build_stylistic_fingerprint,
     process_adapter_documents,
     process_uploaded_files_and_label_media_type,
 )
@@ -35,12 +34,10 @@ workflow.add_node("convert_media_list_to_text_document", convert_media_list_to_t
 workflow.add_node("analyze_documents", analyze_documents)
 workflow.add_node("process_adapter_documents", process_adapter_documents)
 workflow.add_node("index_docs", index_docs)
-workflow.add_node("build_stylistic_fingerprint", build_stylistic_fingerprint)
 
 # Define Edges
 workflow.add_edge(START, "process_uploaded_files")
 workflow.add_edge("process_uploaded_files", "convert_media_list_to_text_document")
-
 
 workflow.add_edge("convert_media_list_to_text_document", "index_docs") # Send vectorstore_documents_to_be_indexed to index_docs
 
@@ -51,14 +48,9 @@ workflow.add_edge("convert_media_list_to_text_document", "index_docs") # Send ve
 workflow.add_edge("convert_media_list_to_text_document", "analyze_documents") # analyze analysis_acceptable documents
 workflow.add_edge("analyze_documents", "index_docs") # Send analysis_documents to index_docs
 
-# workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
+workflow.add_edge("convert_media_list_to_text_document", "process_adapter_documents")
+workflow.add_edge("process_adapter_documents", END)
 
-# workflow.add_edge("index_docs", "build_stylistic_fingerprint")
-
-# workflow.add_edge("process_adapter_documents", "build_stylistic_fingerprint")
-# workflow.add_edge("build_stylistic_fingerprint", "analyze_documents")
-
-# workflow.add_edge("build_stylistic_fingerprint", END)
 workflow.add_edge("index_docs", END)
 
 process_media_graph_api_endpoint = workflow.compile()

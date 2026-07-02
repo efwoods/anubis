@@ -518,7 +518,7 @@ def build_all_speakers_quote_documents(
     multi_speaker: bool,
 ) -> List[Document]:
     """One verbatim ``quote`` Document per statement when EVERY speaker is the
-    avatar (the ``treat_every_speaker_as_target`` path only).
+    avatar (the ``create_reference_media_from_playlist`` path only).
 
     This is a standalone builder: it never calls — and is never called by — the
     standard dialogue/quote/monologue helpers, so it cannot change any behaviour
@@ -578,7 +578,7 @@ def build_all_speakers_quote_documents(
                     "is_target": True,
                     "target_name": target_name,
                     "adapter_prompt": adapter_prompt,
-                    "treat_every_speaker_as_target": True,
+                    "create_reference_media_from_playlist": True,
                     "start": seg.get("start"),
                     "end": seg.get("end"),
                 },
@@ -794,6 +794,8 @@ async def process_dialogue_json_to_documents(
     # non-target turn as ``adapter_prompt``. Spec Step 2 prep: stamp the scene
     # summary and a guaranteed user-context (synthetic when the target led) onto
     # each so the per-target analyzers run with that context.
+
+    """ Direct Quotes and Question and Answer Dataset """
     target_quote_docs = _build_target_quote_documents_from_dialogue(
         segments,
         user_id=user_id,
@@ -807,6 +809,8 @@ async def process_dialogue_json_to_documents(
     documents.extend(target_quote_docs)
 
     # Full role-converted dialogue under ``adapter``.
+
+    """ Create Multi-Turn Dialogue for adapter training """
     adapter_doc = _build_adapter_dialogue_document(
         segments,
         user_id=user_id,
@@ -823,6 +827,8 @@ async def process_dialogue_json_to_documents(
     # non-target statement says nothing about the target, so empty statements
     # produce no Documents and non-target speech never lands in the quote
     # namespace.
+
+    """ Biographical Documents from non-target """
     for seg in segments:
         if seg.get("is_target"):
             continue
@@ -1059,9 +1065,18 @@ async def process_text_to_document(
             classification_metadata=classification_metadata,
         )
         """ CALIBRATE GROUND TRUTH """
+        # Calibration is derived state (threshold + IsolationForest); a failure
+        # here must degrade to "no ground-truth comparison yet", never abort the
+        # upload — the quote Documents below must still reach the vectorstore.
         from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-        await calibrate_ground_truth(store=store, assitant_id=assistant_id, documents=documents)
-        
+        try:
+            await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents, user_id=user_id)
+        except Exception as calibration_error:  # noqa: BLE001 - best-effort derived artifacts
+            logger.warning(
+                "calibrate_ground_truth failed (%s); continuing ingestion without recalibration",
+                calibration_error,
+            )
+
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True
         # adapter_acceptable: True

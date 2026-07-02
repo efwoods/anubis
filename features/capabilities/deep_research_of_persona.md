@@ -8,3 +8,8 @@ or collect all information about a persona (Curie fallout wiki etc. or Jester fr
 crawl link trees (ev0ra)
 
 https://docs.langchain.com/oss/python/deepagents/deep-research
+
+
+
+#  "Deep Research â standalone, source-verified identity creation & stored-fact verification."
+<!-- /home/user/.claude/plans/https-www-youtube-com-watch-v-tqwzhhjavi-luminous-flamingo.md -->

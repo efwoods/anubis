@@ -1,3 +1,4 @@
+!training_lora_adapters.ipynb
 _.json
 progress_summary.txt
 progress.txt
@@ -37,6 +38,9 @@ data/elon-musk-dataset
 # Tracked source modules that live under data/ (the rest of data/ is runtime output)
 !data/__init__.py
 !data/standardized_questions.py
+# Regenerates the bundled baseline stylometry artifacts when the feature vector
+# width changes (STYLE_FEATURE_VECTOR_VERSION); its input dataset stays untracked.
+!data/build_baseline_features_arr.py
 .langgraph_api
 
 # Byte-compiled / optimized / DLL files

@@ -1145,6 +1145,7 @@ async def message_selected_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
+    include_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1194,6 +1195,7 @@ async def message_selected_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    config['configurable']['include_metrics'] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
@@ -1276,8 +1278,6 @@ async def message_selected_avatar(
     return JSONResponse(response_data, status_code=200)
 
 
-from time import sleep
-
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,
@@ -1293,6 +1293,7 @@ async def message_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
+    include_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1366,6 +1367,7 @@ async def message_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    config['configurable']['include_metrics'] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
@@ -1449,7 +1451,6 @@ async def message_avatar(
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
     return JSONResponse(response_data, status_code=200)
-
 
 @app.get("/conversations")
 async def get_all_conversations(
@@ -1913,11 +1914,28 @@ async def _csv_to_statements_payload(
             }
         }
     """
+    headers, rows = _parse_csv_to_rows(raw, source_filename)
+    return await _rows_to_statements_payload(
+        headers=headers, rows=rows, source_filename=source_filename
+    )
+
+
+async def _rows_to_statements_payload(
+    *, headers: list[str], rows: list[dict], source_filename: str
+) -> dict[str, Any]:
+    """Convert parsed tabular ``(headers, rows)`` into the statements document.
+
+    The shared core behind every tabular upload format (CSV/TSV bytes via
+    ``_parse_csv_to_rows``, tabular JSON via ``_normalize_tabular_json_to_rows``):
+    build per-column stats, have ``CSVUserTextColumnIdentificationClass`` pick
+    the free-text and target-name columns once per upload, then emit one
+    statement per non-empty row. Output shape documented on
+    ``_csv_to_statements_payload``.
+    """
     from src.anubis.utils.classes.CSVUserTextColumnIdentificationClass import (
         CSVUserTextColumnIdentificationClass,
     )
 
-    headers, rows = _parse_csv_to_rows(raw, source_filename)
     column_stats = _build_csv_column_stats(headers, rows)
 
     sample_rows = rows[:_CSV_PREVIEW_ROW_LIMIT]
@@ -1935,7 +1953,7 @@ async def _csv_to_statements_payload(
             status_code=422,
             detail=(
                 f"Could not identify a text column in {source_filename!r}; "
-                "the CSV does not appear to contain a free-text column."
+                "the tabular upload does not appear to contain a free-text column."
             ),
         )
 
@@ -1976,8 +1994,8 @@ async def _csv_to_statements_payload(
         raise HTTPException(
             status_code=422,
             detail=(
-                f"CSV {source_filename!r} produced no non-empty rows in "
-                f"column {text_column!r}."
+                f"Tabular upload {source_filename!r} produced no non-empty rows "
+                f"in column {text_column!r}."
             ),
         )
 
@@ -2026,6 +2044,161 @@ def _build_csv_statements_media_entry(
         "csv_row_count": metadata.get("csv_row_count"),
         "namespace_filename": source_filename if not "." in source_filename else _namespace_safe_formatted_filename(source_filename),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tabular JSON ingest preprocessing
+#
+# A JSON upload can be the SAME table a CSV would carry — e.g. a pandas
+# ``DataFrame.to_json()`` dump (orient="columns": ``{column: {row_key: value}}``)
+# or orient="records" (a list of flat dicts). Those are detected here and pushed
+# through the exact CSV pipeline (``_rows_to_statements_payload``) so the
+# process_media graph only ever sees the ``{"statements": [...]}`` contract.
+# JSON that is already contract-shaped (``{"statements": [...]}`` or
+# ``{"messages": [...]}``, including JSON-Lines files of statement objects)
+# passes through untouched — the graph's JSON handler owns those shapes.
+# ---------------------------------------------------------------------------
+
+_JSON_MIME_HINTS = frozenset(
+    {
+        "application/json",
+        "application/x-ndjson",
+        "application/jsonl",
+        "application/json-lines",
+    }
+)
+
+
+def _is_json_upload(filename: str, content_type: str) -> bool:
+    """True when the upload looks like JSON / JSON-Lines by MIME type or filename."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in _JSON_MIME_HINTS:
+        return True
+    name = (filename or "").strip().lower()
+    return name.endswith((".json", ".jsonl", ".ndjson"))
+
+
+def _is_tabular_scalar(value: Any) -> bool:
+    """True for cell values a table can hold (no nested containers)."""
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _tabular_cell_to_str(value: Any) -> str:
+    """Render a scalar cell the way ``_parse_csv_to_rows`` renders CSV cells."""
+    return "" if value is None else str(value)
+
+
+def _normalize_tabular_json_to_rows(
+    parsed: Any,
+) -> Optional[tuple[list[str], list[dict]]]:
+    """Return ``(headers, rows)`` when ``parsed`` JSON is a flat table, else None.
+
+    Recognized tabular shapes (both produced by ``pandas.DataFrame.to_json``):
+
+    * orient="columns" — ``{column_name: {row_key: scalar}}``;
+    * orient="records" — ``[{column_name: scalar}, ...]``.
+
+    A dict carrying the avatar-identity contract keys (``statements`` /
+    ``messages`` lists) is never treated as a table, and any nested container
+    cell disqualifies the shape — those payloads pass through to the
+    process_media graph unchanged.
+    """
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("statements"), list) or isinstance(
+            parsed.get("messages"), list
+        ):
+            return None
+        if not parsed or not all(
+            isinstance(column_values, dict) for column_values in parsed.values()
+        ):
+            return None
+        for column_values in parsed.values():
+            if not all(
+                _is_tabular_scalar(cell_value)
+                for cell_value in column_values.values()
+            ):
+                return None
+        headers = [str(column_name) for column_name in parsed.keys()]
+        # Row keys in first-seen order across columns (columns may be sparse).
+        row_keys: list[Any] = []
+        seen_row_keys: set[Any] = set()
+        for column_values in parsed.values():
+            for row_key in column_values.keys():
+                if row_key not in seen_row_keys:
+                    seen_row_keys.add(row_key)
+                    row_keys.append(row_key)
+        if not row_keys:
+            return None
+        rows = [
+            {
+                header: _tabular_cell_to_str(column_values.get(row_key))
+                for header, column_values in zip(headers, parsed.values())
+            }
+            for row_key in row_keys
+        ]
+        return headers, rows
+
+    if isinstance(parsed, list):
+        if not parsed or not all(isinstance(record, dict) for record in parsed):
+            return None
+        headers = []
+        seen_headers: set[str] = set()
+        for record in parsed:
+            for column_name, cell_value in record.items():
+                if not _is_tabular_scalar(cell_value):
+                    return None
+                if column_name not in seen_headers:
+                    seen_headers.add(column_name)
+                    headers.append(str(column_name))
+        if not headers:
+            return None
+        rows = [
+            {header: _tabular_cell_to_str(record.get(header)) for header in headers}
+            for record in parsed
+        ]
+        return headers, rows
+
+    return None
+
+
+async def _tabular_json_to_statements_payload(
+    *, raw: bytes, source_filename: str
+) -> Optional[dict[str, Any]]:
+    """Convert a tabular JSON / JSON-Lines upload into the statements document.
+
+    Returns None when the payload is not a flat table (contract-shaped JSON,
+    arbitrary JSON, undecodable bytes) so the caller passes the file through to
+    the process_media graph unchanged.
+    """
+    text = _decode_csv_bytes(raw)
+    parsed: Any
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Possibly JSON-Lines: one object per line. A records-of-scalars file is
+        # a table; statement-shaped lines come back None from the normalizer and
+        # the graph's JSON-Lines parser handles them instead.
+        line_objects: list[Any] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                line_objects.append(json.loads(line))
+            except json.JSONDecodeError:
+                return None
+        if not line_objects:
+            return None
+        parsed = line_objects
+
+    normalized = _normalize_tabular_json_to_rows(parsed)
+    if normalized is None:
+        return None
+    headers, rows = normalized
+    return await _rows_to_statements_payload(
+        headers=headers, rows=rows, source_filename=source_filename
+    )
+
 
 @app.get("/avatar_reference_image")
 async def get_avatar_reference_image(
@@ -2219,6 +2392,40 @@ async def _build_media_entries_for_file(
                 assistant_id=assistant_id,
             )
         )
+    elif not reference_image and not reference_audio and _is_json_upload(
+        raw_name, mime_type
+    ):
+        # A JSON upload may be the same table a CSV would carry (a pandas
+        # to_json dump). Convert tabular shapes through the CSV statements
+        # pipeline; anything else (contract-shaped statements/messages JSON,
+        # JSON-Lines of statement objects, arbitrary JSON) passes through as a
+        # plain upload for the process_media graph's JSON handler.
+        tabular_statements_payload = await _tabular_json_to_statements_payload(
+            raw=content, source_filename=raw_name
+        )
+        if tabular_statements_payload is not None:
+            entries.append(
+                _build_csv_statements_media_entry(
+                    payload=tabular_statements_payload,
+                    source_filename=raw_name,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                )
+            )
+        else:
+            entries.append(
+                {
+                    "filename": raw_name,
+                    "content_type": mime_type,
+                    "content": content,
+                    "user_id": user_id,
+                    "assistant_id": assistant_id,
+                    "reference_audio": False,
+                    "reference_image": False,
+                    "base64_encoded_str": make_data_uri(mime_type, content),
+                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                }
+            )
     elif reference_image:
         if mime_type.startswith("audio/"):
             raise HTTPException(
@@ -2394,7 +2601,7 @@ async def _expand_youtube_playlist_to_media_entries(
     *,
     user_id: str,
     assistant_id: str,
-    treat_every_speaker_as_target: bool = False,
+    create_reference_media_from_playlist: bool = False,
 ) -> Optional[list]:
     """Expand a YouTube **playlist** URL into one media entry per video.
 
@@ -2450,7 +2657,7 @@ async def _expand_youtube_playlist_to_media_entries(
                 "assistant_id": assistant_id,
                 "reference_audio": False,
                 "reference_image": False,
-                "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                "create_reference_media_from_playlist": create_reference_media_from_playlist,
                 # Single opaque uuid5 over the composite so the store key carries
                 # no ``::`` separator. The playlist a video belongs to is recovered
                 # from playlist_namespace_filename below (and from playlist_url /
@@ -2720,7 +2927,7 @@ async def update_avatar_identity_with_media(
     assistant_id: Annotated[Optional[str], Form()] = None,
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
-    treat_every_speaker_as_target: Annotated[bool, Form()] = False,
+    create_reference_media_from_playlist: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -2752,7 +2959,7 @@ async def update_avatar_identity_with_media(
     **exactly one** file or URL (a reference clip/image is a single item): the file
     or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
 
-    With **treat_every_speaker_as_target=true** the batch has **no single target speaker**:
+    With **create_reference_media_from_playlist=true** the batch has **no single target speaker**:
     every detected speaker is the avatar. Audio/video items are still diarized (so
     no stored reference-audio clip is required and known-speaker labelling is
     skipped). With **multiple speakers**, each statement becomes one ``quote``
@@ -2832,13 +3039,13 @@ async def update_avatar_identity_with_media(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
             )
-        if treat_every_speaker_as_target and (reference_image or reference_audio):
+        if create_reference_media_from_playlist and (reference_image or reference_audio):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "treat_every_speaker_as_target cannot be combined with "
+                    "create_reference_media_from_playlist cannot be combined with "
                     "reference_image/reference_audio: a reference clip designates a "
-                    "single target, while treat_every_speaker_as_target treats every detected "
+                    "single target, while create_reference_media_from_playlist treats every detected "
                     "speaker as the target."
                 ),
             )
@@ -2971,9 +3178,9 @@ async def update_avatar_identity_with_media(
         # level, alongside reference_audio/reference_image). convert_uploaded_
         # files_to_media reads it for audio/video/url items and threads it into
         # their metadata; expanded playlist children inherit it downstream.
-        if treat_every_speaker_as_target:
+        if create_reference_media_from_playlist:
             for entry in media_files:
-                entry["treat_every_speaker_as_target"] = True
+                entry["create_reference_media_from_playlist"] = True
 
         store = app.state.store
 
@@ -3083,7 +3290,7 @@ async def update_avatar_identity_with_media(
                 playlist_url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                treat_every_speaker_as_target=treat_every_speaker_as_target,
+                create_reference_media_from_playlist=create_reference_media_from_playlist,
             )
             for playlist_url in playlist_urls
         ]
@@ -3140,6 +3347,62 @@ async def update_avatar_identity_with_media(
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing media: {str(e)}")
+
+
+@app.get("/media_jobs")
+async def list_media_jobs(
+    include_finished: bool = False,
+    assistant_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the current user's media jobs — by default only the **active** ones.
+
+    Returns one entry per top-level batch (the **master** job each upload creates),
+    newest first, with rolled-up child status counts so a client can render an
+    "uploads in progress" view without polling every ``/media_job/{job_id}``. A job
+    is "active" while it is still ``queued`` or ``running`` (``done`` not yet set);
+    finished jobs linger in the registry for ``_FINISHED_TTL_SECONDS`` and are only
+    included when ``include_finished=true``. Pass ``assistant_id`` to scope the list
+    to one avatar. The registry is per-process (see media_jobs.py), so this reflects
+    jobs owned by the worker handling the request.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    registry = app.state.media_jobs
+
+    masters = [
+        job
+        for job in registry.values()
+        if job.is_master
+        and job.user_id == user_id
+        and (assistant_id is None or job.assistant_id == assistant_id)
+        and (include_finished or not job.done.is_set())
+    ]
+    masters.sort(key=lambda j: j.created_at, reverse=True)
+
+    def _summary(job: MediaJob) -> dict:
+        children = [registry[cid] for cid in job.child_ids if cid in registry]
+        statuses = [c.status for c in children]
+        return {
+            "job_id": job.job_id,
+            "assistant_id": job.assistant_id,
+            "status": job.status,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "duration_seconds": job.duration_seconds,
+            "children_total": len(children),
+            "children_completed": statuses.count("completed"),
+            "children_error": statuses.count("error"),
+            "children_cancelled": statuses.count("cancelled"),
+            "children_running": statuses.count("running"),
+            "children_queued": statuses.count("queued"),
+            "status_url": f"/media_job/{job.job_id}",
+            "progress_url": f"/media_job/{job.job_id}/progress",
+            "cancel_url": f"/media_job/{job.job_id}/cancel",
+        }
+
+    jobs = [_summary(job) for job in masters]
+    return {"count": len(jobs), "jobs": jobs}
 
 
 @app.get("/media_job/{job_id}")
@@ -3545,12 +3808,12 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
         )
 
     # Prune the deleted documents' rows from the stylometric "direct quote"
-    # feature corpus (a {document_id: [33 floats]} dict in the store), then
+    # feature corpus (a {document_id: [len(FEATURE_NAMES) floats]} dict in the store), then
     # recalibrate the empirical threshold + IsolationForest from what remains.
     # Best-effort: a failure here must not fail the (already committed) delete.
     try:
         await _prune_ground_truth_features_for_deleted_docs(
-            assistant_id, deleted_document_ids
+            user_id, assistant_id, deleted_document_ids
         )
     except Exception as exc:  # pragma: no cover - operator log only
         logger.warning("ground-truth feature prune failed for %s: %s", assistant_id, exc)
@@ -3561,22 +3824,24 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
 
 
 async def _prune_ground_truth_features_for_deleted_docs(
-    assistant_id: str | None, deleted_document_ids: set[str]
+    user_id: str | None, assistant_id: str | None, deleted_document_ids: set[str]
 ) -> None:
     """Remove deleted documents from the per-document stylometric feature corpus.
 
-    Reads the ``{document_id: [33 floats]}`` dict the avatar's "direct quote"
+    Reads the ``{document_id: [len(FEATURE_NAMES) floats]}`` dict the avatar's "direct quote"
     corpus is stored under, drops every ``deleted_document_ids`` entry, then:
 
-    * if rows remain — rebuilds the ``(n_docs, 33)`` array and recalibrates the
-      empirical threshold + IsolationForest from it, persisting all three
-      artifacts (dict, threshold, model);
-    * if the corpus is now empty — deletes all three keys so a later re-upload
+    * if rows remain — rebuilds the ``(n_docs, len(FEATURE_NAMES))`` array and recalibrates the
+      empirical threshold + IsolationForest from it, persisting all the derived
+      artifacts (dict, threshold, model, style profile);
+    * if the corpus is now empty — deletes those keys so a later re-upload
       starts clean.
 
-    No-op when there is no assistant or nothing was deleted.
+    All artifacts live under the owner-scoped ``(user_id, assistant_id,
+    <artifact_name>)`` namespaces that ``calibrate_ground_truth`` writes.
+    No-op when there is no user/assistant or nothing was deleted.
     """
-    if not assistant_id or not deleted_document_ids:
+    if not user_id or not assistant_id or not deleted_document_ids:
         return
 
     from src.anubis.utils.dataset.style_features import (
@@ -3589,9 +3854,10 @@ async def _prune_ground_truth_features_for_deleted_docs(
 
     store = app.state.store
 
-    dict_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
-    threshold_namespace = (assistant_id, "ground_truth_text_empirical_threshold_list_str")
-    model_namespace = (assistant_id, "ground_truth_text_features_model_b64_pkl")
+    dict_namespace = (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
+    threshold_namespace = (user_id, assistant_id, "ground_truth_text_empirical_threshold_list_str")
+    model_namespace = (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl")
+    style_profile_namespace = (user_id, assistant_id, "style_profile")
 
     item = await store.aget(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
     features_by_doc_id_str = (getattr(item, "value", None) or {}).get("value", None)
@@ -3608,10 +3874,11 @@ async def _prune_ground_truth_features_for_deleted_docs(
         return
 
     if not features_by_doc_id:
-        # Corpus is now empty: clear all three derived keys.
+        # Corpus is now empty: clear the derived keys.
         await store.adelete(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
         await store.adelete(threshold_namespace, key="ground_truth_text_empirical_threshold_list_str")
         await store.adelete(model_namespace, key="ground_truth_text_features_model_b64_pkl")
+        await store.adelete(style_profile_namespace, key="style_profile")
         return
 
     # Rebuild the corpus array and recalibrate the derived artifacts.
@@ -3619,6 +3886,9 @@ async def _prune_ground_truth_features_for_deleted_docs(
     threshold_list_str, model_b64_pkl = recompute_ground_truth_artifacts(
         ground_truth_text_features_arr
     )
+
+    from src.anubis.utils.dataset.style_features import build_style_profile_str
+    style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
 
     await store.aput(
         dict_namespace,
@@ -3634,6 +3904,11 @@ async def _prune_ground_truth_features_for_deleted_docs(
         model_namespace,
         key="ground_truth_text_features_model_b64_pkl",
         value={"value": model_b64_pkl},
+    )
+    await store.aput(
+        style_profile_namespace,
+        key="style_profile",
+        value={"value": style_profile_str},
     )
 
 if __name__ == "__main__":

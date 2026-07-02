@@ -636,7 +636,7 @@ index 0000000..07d352e
 +  --form 'assistant_id=9549b243-4774-45fa-8234-5137d6dd5bcc' \
 +  --form 'reference_audio=true' \
 +  --form 'reference_image=false' \
-+  --form 'treat_every_speaker_as_target=false'
++  --form 'create_reference_media_from_playlist=false'
 +
 +
 +
@@ -654,7 +654,7 @@ index 0000000..07d352e
 +  --form 'assistant_id=9549b243-4774-45fa-8234-5137d6dd5bcc' \
 +  --form 'reference_audio=false' \
 +  --form 'reference_image=false' \
-+  --form 'treat_every_speaker_as_target=false'
++  --form 'create_reference_media_from_playlist=false'
 +
 +# Test multi-media upload (pdf, url to grokipedia (biographical information))
 +curl /update_avatar_identity_with_media \
@@ -666,7 +666,7 @@ index 0000000..07d352e
 +  --form 'assistant_id=9549b243-4774-45fa-8234-5137d6dd5bcc' \
 +  --form 'reference_audio=false' \
 +  --form 'reference_image=false' \
-+  --form 'treat_every_speaker_as_target=false' \
++  --form 'create_reference_media_from_playlist=false' \
 +  --form 'files=@confirmed_search_results_list.txt'
 +
 +
@@ -727,7 +727,7 @@ index 0000000..80829eb
 +  --form 'assistant_id=a6cdfa75-928d-4c23-a9f2-3495663db544' \
 +  --form 'reference_audio=false' \
 +  --form 'reference_image=false' \
-+  --form 'treat_every_speaker_as_target=true' \2
++  --form 'create_reference_media_from_playlist=true' \2
 +  --form 'url=https://www.youtube.com/watch?v=gSNFJbgoaHI&list=PLQ-uHSnFig5M9fW16o2l35jrfdsxGknNB'
 \ No newline at end of file
 diff --git a/_ts_data_qa.md b/_ts_data_qa.md
@@ -8925,7 +8925,7 @@ index 0318d3c..fa01b4a 100644
 +    *,
 +    user_id: str,
 +    assistant_id: str,
-+    treat_every_speaker_as_target: bool = False,
++    create_reference_media_from_playlist: bool = False,
 +) -> Optional[list]:
 +    """Expand a YouTube **playlist** URL into one media entry per video.
 +
@@ -8981,7 +8981,7 @@ index 0318d3c..fa01b4a 100644
 +                "assistant_id": assistant_id,
 +                "reference_audio": False,
 +                "reference_image": False,
-+                "treat_every_speaker_as_target": treat_every_speaker_as_target,
++                "create_reference_media_from_playlist": create_reference_media_from_playlist,
 +                # Single opaque uuid5 over the composite so the store key carries
 +                # no ``::`` separator. The playlist a video belongs to is recovered
 +                # from playlist_namespace_filename below (and from playlist_url /
@@ -9252,7 +9252,7 @@ index 0318d3c..fa01b4a 100644
      assistant_id: Annotated[Optional[str], Form()] = None,
      reference_audio: Annotated[bool, Form()] = False,
      reference_image: Annotated[bool, Form()] = False,
-+    treat_every_speaker_as_target: Annotated[bool, Form()] = False,
++    create_reference_media_from_playlist: Annotated[bool, Form()] = False,
      current_user: dict = Depends(get_current_user),
  ):
      # Context user_id, assistant_id
@@ -9287,7 +9287,7 @@ index 0318d3c..fa01b4a 100644
 +    **exactly one** file or URL (a reference clip/image is a single item): the file
 +    or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
 +
-+    With **treat_every_speaker_as_target=true** the batch has **no single target speaker**:
++    With **create_reference_media_from_playlist=true** the batch has **no single target speaker**:
 +    every detected speaker is the avatar. Audio/video items are still diarized (so
 +    no stored reference-audio clip is required and known-speaker labelling is
 +    skipped). With **multiple speakers**, each statement becomes one ``quote``
@@ -9329,14 +9329,14 @@ index 0318d3c..fa01b4a 100644
 +                detail="Use only one of reference_image or reference_audio.",
              )
 -        if not url_clean and len(non_empty_files) != 1:
-+        if treat_every_speaker_as_target and (reference_image or reference_audio):
++        if create_reference_media_from_playlist and (reference_image or reference_audio):
              raise HTTPException(
                  status_code=400,
 -                detail="Send exactly one file, or use the url field instead.",
 +                detail=(
-+                    "treat_every_speaker_as_target cannot be combined with "
++                    "create_reference_media_from_playlist cannot be combined with "
 +                    "reference_image/reference_audio: a reference clip designates a "
-+                    "single target, while treat_every_speaker_as_target treats every detected "
++                    "single target, while create_reference_media_from_playlist treats every detected "
 +                    "speaker as the target."
 +                ),
              )
@@ -9899,9 +9899,9 @@ index 0318d3c..fa01b4a 100644
 +        # level, alongside reference_audio/reference_image). convert_uploaded_
 +        # files_to_media reads it for audio/video/url items and threads it into
 +        # their metadata; expanded playlist children inherit it downstream.
-+        if treat_every_speaker_as_target:
++        if create_reference_media_from_playlist:
 +            for entry in media_files:
-+                entry["treat_every_speaker_as_target"] = True
++                entry["create_reference_media_from_playlist"] = True
  
 -            duplicates = sorted(
 -                {name for name in incoming_filenames if name in existing_filenames}
@@ -10031,7 +10031,7 @@ index 0318d3c..fa01b4a 100644
 +                playlist_url,
 +                user_id=user_id,
 +                assistant_id=assistant_id,
-+                treat_every_speaker_as_target=treat_every_speaker_as_target,
++                create_reference_media_from_playlist=create_reference_media_from_playlist,
 +            )
 +            for playlist_url in playlist_urls
 +        ]
@@ -10523,7 +10523,7 @@ index 7ab6b46..e471750 100644
 +    multi_speaker: bool,
 +) -> List[Document]:
 +    """One verbatim ``quote`` Document per statement when EVERY speaker is the
-+    avatar (the ``treat_every_speaker_as_target`` path only).
++    avatar (the ``create_reference_media_from_playlist`` path only).
 +
 +    This is a standalone builder: it never calls — and is never called by — the
 +    standard dialogue/quote/monologue helpers, so it cannot change any behaviour
@@ -10583,7 +10583,7 @@ index 7ab6b46..e471750 100644
 +                    "is_target": True,
 +                    "target_name": target_name,
 +                    "adapter_prompt": adapter_prompt,
-+                    "treat_every_speaker_as_target": True,
++                    "create_reference_media_from_playlist": True,
 +                    "start": seg.get("start"),
 +                    "end": seg.get("end"),
 +                },
@@ -10780,7 +10780,7 @@ index 3aa3b1b..872cc1f 100644
              assistant_id = file_data.get("assistant_id")
              reference_image = file_data.get("reference_image")
              reference_audio = file_data.get("reference_audio")
-+            treat_every_speaker_as_target = file_data.get("treat_every_speaker_as_target", False)
++            create_reference_media_from_playlist = file_data.get("create_reference_media_from_playlist", False)
              namespace_filename = file_data.get("namespace_filename")
          
              logger.info(f"Processing file: {filename} ({content_type})")
@@ -10788,7 +10788,7 @@ index 3aa3b1b..872cc1f 100644
                          "user_id": user_id,
                          "assistant_id": assistant_id,
                          "reference_audio": reference_audio,
-+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
++                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                          "namespace_filename": namespace_filename,
                      },
                  }
@@ -10797,7 +10797,7 @@ index 3aa3b1b..872cc1f 100644
                          "user_id": user_id,
                          "assistant_id": assistant_id,
 +                        "reference_audio": reference_audio,
-+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
++                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                          "namespace_filename": namespace_filename,
                      },
                  }
@@ -10811,7 +10811,7 @@ index 3aa3b1b..872cc1f 100644
 +                    "size": 0,
 +                    "user_id": user_id,
 +                    "assistant_id": assistant_id,
-+                    "treat_every_speaker_as_target": treat_every_speaker_as_target,
++                    "create_reference_media_from_playlist": create_reference_media_from_playlist,
 +                    "namespace_filename": namespace_filename,
 +                }
 +                # Carry playlist context when the upload endpoint expanded a
@@ -10851,7 +10851,7 @@ index 3aa3b1b..872cc1f 100644
 -                        "assistant_id": assistant_id, 
 +                        "assistant_id": assistant_id,
                          "reference_audio": reference_audio,
-+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
++                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                          "namespace_filename": namespace_filename
                      }
                  })
@@ -10859,7 +10859,7 @@ index 3aa3b1b..872cc1f 100644
                          "size": len(file_bytes or b""),
                          "user_id": user_id,
                          "reference_audio": reference_audio,
-+                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
++                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                          "assistant_id": assistant_id,
                          "namespace_filename": namespace_filename
                      }
@@ -11359,8 +11359,8 @@ index 3aa3b1b..872cc1f 100644
 +            # Batch-wide "no single target": every detected speaker is the avatar.
 +            # Diarization still runs, but no stored reference clip is required and
 +            # known-speaker labelling is skipped (every turn is forced is_target).
-+            treat_every_speaker_as_target = bool(metadata.get("treat_every_speaker_as_target", False))
-+            if not reference_audio and not treat_every_speaker_as_target:
++            create_reference_media_from_playlist = bool(metadata.get("create_reference_media_from_playlist", False))
++            if not reference_audio and not create_reference_media_from_playlist:
                  reference_namespace = (user_id, assistant_id, "reference_audio")
                  ref_item = await store.aget(reference_namespace, key=assistant_id)
                  if not ref_item and not reference_audio:
@@ -11389,7 +11389,7 @@ index 3aa3b1b..872cc1f 100644
 -                    ).get("reference_audio_data") or None
 -            except Exception as exc:
 -                logger.debug("Reference audio lookup failed (continuing): %s", exc)
-+            if not treat_every_speaker_as_target:
++            if not create_reference_media_from_playlist:
 +                try:
 +                    ref_item = await store.aget(
 +                        (user_id, assistant_id, "reference_audio"), assistant_id
@@ -11408,7 +11408,7 @@ index 3aa3b1b..872cc1f 100644
              )
  
 +            # ---------------------------------------------------------------
-+            # treat_every_speaker_as_target: no single target speaker, so EVERY detected
++            # create_reference_media_from_playlist: no single target speaker, so EVERY detected
 +            # speaker is the avatar. Routed only through standalone helpers / the
 +            # normal text classifier so the established dialogue path is never
 +            # touched. This branch returns early.
@@ -11422,7 +11422,7 @@ index 3aa3b1b..872cc1f 100644
 +            #     stores it in the vectorstore, marks it analysis-acceptable, and
 +            #     makes it adapter-acceptable with a synthesized prompt.
 +            # ---------------------------------------------------------------
-+            if treat_every_speaker_as_target:
++            if create_reference_media_from_playlist:
 +                statements: List[Dict[str, Any]] = []
 +                for seg in (diar_response or {}).get("segments") or []:
 +                    if not isinstance(seg, dict):
@@ -11452,7 +11452,7 @@ index 3aa3b1b..872cc1f 100644
 +                        plain_text = (plain.get("text") or "").strip()
 +                    except Exception as e:
 +                        logger.exception(
-+                            "treat_every_speaker_as_target transcription failed for %s: %s",
++                            "create_reference_media_from_playlist transcription failed for %s: %s",
 +                            filename,
 +                            e,
 +                        )
@@ -11663,8 +11663,8 @@ index 3aa3b1b..872cc1f 100644
 +    # forces the YouTube loader past its subtitles fast-path onto the audio +
 +    # diarization path so the avatar's voice is actually transcribed (subtitles
 +    # carry no speaker turns), and is inherited by every expanded child below.
-+    parent_treat_every_speaker_as_target = bool(
-+        (media_item.get("metadata") or {}).get("treat_every_speaker_as_target")
++    parent_create_reference_media_from_playlist = bool(
++        (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
 +    )
 +
 +    loader = URLDocumentLoaderClass()
@@ -11674,14 +11674,14 @@ index 3aa3b1b..872cc1f 100644
 +                url,
 +                user_id=user_id,
 +                assistant_id=assistant_id,
-+                expect_multispeaker=parent_treat_every_speaker_as_target,
++                expect_multispeaker=parent_create_reference_media_from_playlist,
 +            )
 +    else:
 +        expanded_items = await loader.load(
 +            url,
 +            user_id=user_id,
 +            assistant_id=assistant_id,
-+            expect_multispeaker=parent_treat_every_speaker_as_target,
++            expect_multispeaker=parent_create_reference_media_from_playlist,
 +        )
 +
 +    if not expanded_items:
@@ -11708,8 +11708,8 @@ index 3aa3b1b..872cc1f 100644
 +    pending: List[Dict[str, Any]] = []
 +    for item in expanded_items:
 +        child_meta = item.setdefault("metadata", {})
-+        if parent_treat_every_speaker_as_target:
-+            child_meta.setdefault("treat_every_speaker_as_target", True)
++        if parent_create_reference_media_from_playlist:
++            child_meta.setdefault("create_reference_media_from_playlist", True)
 +        child_ns = child_meta.get("namespace_filename")
 +        if not child_ns:
 +            # A keyless child is the single logical content of THIS url item
@@ -13629,8 +13629,8 @@ index 1837d96..7f7798d 100644
 +
 +
 +@pytest.mark.asyncio
-+async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(monkeypatch):
-+    """A URL item flagged ``treat_every_speaker_as_target`` must call the loader with
++async def test_create_reference_media_from_playlist_forces_multispeaker_and_inherits(monkeypatch):
++    """A URL item flagged ``create_reference_media_from_playlist`` must call the loader with
 +    ``expect_multispeaker=True`` (forcing the audio/diarize path over subtitles)
 +    and stamp the flag onto every expanded child so playlist videos inherit it."""
 +    from langchain_core.documents import Document
@@ -13643,7 +13643,7 @@ index 1837d96..7f7798d 100644
 +        "metadata": {
 +            "filename": "https://www.youtube.com/watch?v=aaa",
 +            "namespace_filename": "NS",
-+            "treat_every_speaker_as_target": True,
++            "create_reference_media_from_playlist": True,
 +        },
 +    }
 +
@@ -13659,8 +13659,8 @@ index 1837d96..7f7798d 100644
 +    monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
 +
 +    async def _fake_process(item, runtime, config, store, **kwargs):
-+        captured["child_treat_every_speaker_as_target"] = item["metadata"].get(
-+            "treat_every_speaker_as_target"
++        captured["child_create_reference_media_from_playlist"] = item["metadata"].get(
++            "create_reference_media_from_playlist"
 +        )
 +        return [Document(page_content="hi", metadata={"namespace": "quote"})]
 +
@@ -13679,7 +13679,7 @@ index 1837d96..7f7798d 100644
 +    )
 +
 +    assert captured["expect_multispeaker"] is True
-+    assert captured["child_treat_every_speaker_as_target"] is True
++    assert captured["child_create_reference_media_from_playlist"] is True
 +
 +
 +def _make_runtime():
@@ -13701,13 +13701,13 @@ index 1837d96..7f7798d 100644
 +            "assistant_id": "a",
 +            "namespace_filename": "NS",
 +            "reference_audio": False,
-+            "treat_every_speaker_as_target": True,
++            "create_reference_media_from_playlist": True,
 +        },
 +    }
 +
 +
 +@pytest.mark.asyncio
-+async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement(monkeypatch):
++async def test_create_reference_media_from_playlist_dialogue_reuses_preceding_statement(monkeypatch):
 +    """Multiple speakers (all target): one ``quote`` Document per statement, each
 +    later turn reusing the PRECEDING statement as ``adapter_prompt`` (the genuine
 +    question); the first statement has no predecessor (synthesized downstream).
@@ -13730,7 +13730,7 @@ index 1837d96..7f7798d 100644
 +        }
 +
 +    async def _fail_dialogue(*args, **kwargs):  # must NOT be called
-+        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
++        raise AssertionError("dialogue path must not run in create_reference_media_from_playlist mode")
 +
 +    monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", _fake_diarize)
 +    monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", _fail_dialogue)
@@ -13758,7 +13758,7 @@ index 1837d96..7f7798d 100644
 +
 +
 +@pytest.mark.asyncio
-+async def test_treat_every_speaker_as_target_single_speaker_classified_normally(monkeypatch):
++async def test_create_reference_media_from_playlist_single_speaker_classified_normally(monkeypatch):
 +    """A single speaker is classified normally (monologue / tweets_or_quotes):
 +    the full transcript is routed through ``process_text_to_document`` rather than
 +    the per-statement / dialogue paths."""
@@ -13779,7 +13779,7 @@ index 1837d96..7f7798d 100644
 +        }
 +
 +    async def _fail_dialogue(*args, **kwargs):
-+        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
++        raise AssertionError("dialogue path must not run in create_reference_media_from_playlist mode")
 +
 +    async def _fake_classify(*, metadata, user_id, assistant_id, media_item):
 +        captured["classify_text"] = media_item.get("content")

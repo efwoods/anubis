@@ -52,6 +52,79 @@ def _namespace_for(source: str) -> str:
     """
     return str(uuid5(NAMESPACE_URL, source))
 
+
+# ``nodes.py`` → ``utils`` → ``process_media_graph`` → ``subgraphs`` → ``src`` → repo root
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _sanitize_for_filename(source: str, *, max_len: int = 120) -> str:
+    """Make ``source`` (a filename or URL) safe to use as a single path component.
+
+    Keep ``[A-Za-z0-9._-]``; replace everything else (path separators, URL
+    punctuation, whitespace) with ``_`` and truncate to ``max_len``.
+    """
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (source or ""))
+    safe = safe.strip("._-") or "source"
+    return safe[:max_len]
+
+
+def _write_dev_diarization_transcript(
+    diar_response: dict,
+    *,
+    source: str,
+    filename: Optional[str],
+    assistant_id: Optional[str],
+    runtime,
+) -> None:
+    """Dump the diarized transcript (labeled speakers) when ``DEV=TRUE`` (dev-only aid).
+
+    Mirrors the ``_write_dev_system_prompt`` convention: gated on
+    ``context.dev.upper() == "TRUE"``. Writes a clean, human-readable JSON view
+    (speaker-labeled segments + full text) to
+    ``<repo_root>/data/<assistant_id>/transcriptions/<source>_<timestamp>.json``.
+    The large ``encoded_audio_base64`` blob is intentionally dropped. Never raises —
+    a dev-artifact write must not break the upload pipeline.
+    """
+    try:
+        context = getattr(runtime, "context", None) or GlobalContext()
+        if str(getattr(context, "dev", "") or "").upper() != "TRUE":
+            return
+
+        out_dir = os.path.join(
+            _PROJECT_ROOT, "data", str(assistant_id or "anonymous"), "transcriptions"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        from time import time_ns
+
+        out_path = os.path.join(
+            out_dir, f"{_sanitize_for_filename(source)}_{time_ns()}.json"
+        )
+
+        payload = {
+            "source": source,
+            "filename": filename,
+            "model": diar_response.get("model"),
+            "duration": diar_response.get("duration"),
+            "text": diar_response.get("text"),
+            "segments": [
+                {
+                    "speaker": str(seg.get("speaker") or "unknown"),
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                    "text": seg.get("text"),
+                }
+                for seg in (diar_response.get("segments") or [])
+                if isinstance(seg, dict)
+            ],
+        }
+
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+        logger.info("dev diarization transcript written to: %s", out_path)
+    except Exception:  # pragma: no cover - dev aid must never break processing
+        logger.exception("failed to write dev diarization transcript")
+
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
     build_all_speakers_quote_documents,
@@ -122,6 +195,75 @@ def _is_full_audio_data_uri(value: str) -> bool:
     return normalized.startswith("data:audio/") and ";base64," in normalized
 
 
+def _parse_json_lines_to_statements_payload(raw_text: str, filename: str) -> Dict[str, Any]:
+    """Parse JSON-Lines text (one JSON object per line) into the statements contract.
+
+    Each parsed line object is expected to already be one avatar-identity
+    statement — ``{"messages": [{"role": "assistant", "content": "..."}],
+    "metadata": {...}}`` — so the lines are wrapped verbatim as
+    ``{"statements": [<line>, ...]}``, the exact shape the JSON media handler in
+    ``process_media_item_task`` already consumes. Unparsable or non-object lines
+    are skipped with a warning rather than failing the file (mirrors the
+    one-bad-item-must-not-abort-the-batch policy of media conversion).
+
+    Raises ``ValueError`` when NO line parses to an object, so the caller's
+    existing per-file error handling reports the file as unprocessable.
+    """
+    statements: List[Dict[str, Any]] = []
+    skipped_line_count = 0
+    for line_number, line in enumerate(raw_text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            line_object = json.loads(line)
+        except json.JSONDecodeError as line_error:
+            skipped_line_count += 1
+            logger.warning(
+                "Skipping unparsable JSON line %d in %s: %s",
+                line_number,
+                filename,
+                line_error,
+            )
+            continue
+        if isinstance(line_object, dict):
+            statements.append(line_object)
+        else:
+            skipped_line_count += 1
+            logger.warning(
+                "Skipping non-object JSON line %d in %s", line_number, filename
+            )
+    if not statements:
+        raise ValueError(
+            f"{filename}: no line parsed to a JSON object; not a JSON-Lines file"
+        )
+    if skipped_line_count:
+        logger.warning(
+            "Parsed %s as JSON-Lines with %d line(s) skipped",
+            filename,
+            skipped_line_count,
+        )
+    return {"statements": statements}
+
+
+def _parse_json_or_json_lines_upload(
+    *, raw_text: str, filename: str, suffix: str
+) -> Any:
+    """Parse an uploaded ``.json`` / ``.jsonl`` file into the JSON media payload.
+
+    ``.jsonl`` files are parsed line-by-line into the ``{"statements": [...]}``
+    contract. ``.json`` files are parsed as one document first; when that fails
+    with ``Extra data`` (the signature of concatenated per-line objects saved
+    under a ``.json`` name) the JSON-Lines parse is retried as a fallback.
+    """
+    if suffix == ".jsonl":
+        return _parse_json_lines_to_statements_payload(raw_text, filename)
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return _parse_json_lines_to_statements_payload(raw_text, filename)
+
+
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
@@ -157,7 +299,7 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
-            treat_every_speaker_as_target = file_data.get("treat_every_speaker_as_target", False)
+            create_reference_media_from_playlist = file_data.get("create_reference_media_from_playlist", False)
             namespace_filename = file_data.get("namespace_filename")
         
             logger.info(f"Processing file: {filename} ({content_type})")
@@ -208,7 +350,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -235,7 +377,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -253,7 +395,7 @@ async def process_uploaded_files_and_label_media_type(
                     "size": 0,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
-                    "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                    "create_reference_media_from_playlist": create_reference_media_from_playlist,
                     "namespace_filename": namespace_filename,
                 }
                 # Carry playlist context when the upload endpoint expanded a
@@ -361,7 +503,7 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "namespace_filename": namespace_filename
                     }
                 })
@@ -389,7 +531,7 @@ async def process_uploaded_files_and_label_media_type(
                         "size": len(file_bytes or b""),
                         "user_id": user_id,
                         "reference_audio": reference_audio,
-                        "treat_every_speaker_as_target": treat_every_speaker_as_target,
+                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
                         "assistant_id": assistant_id,
                         "namespace_filename": namespace_filename
                     }
@@ -446,9 +588,11 @@ async def process_uploaded_files_and_label_media_type(
                         raw = _decode_data_uri_base64_payload(
                             full_payload_uri
                         ).decode("utf-8")
-                        text_content = json.loads(raw)
                     else:
-                        text_content = json.loads(file_bytes.decode('utf-8'))
+                        raw = file_bytes.decode('utf-8')
+                    text_content = _parse_json_or_json_lines_upload(
+                        raw_text=raw, filename=filename, suffix=suffix
+                    )
                     media_list.append({
                         "type": "json",
                         "content": text_content,
@@ -651,7 +795,7 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     media_list = state.get('media_list', [])
 
     if not media_list:
-        logger.info(f"No Meida to process")
+        logger.info(f"No Media to process")
         return {
             "media_list": []
         }
@@ -1087,6 +1231,7 @@ async def process_media_item_task(
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
+                store = store, 
             )
             return documents
         elif media_type == "log":
@@ -1204,20 +1349,67 @@ async def process_media_item_task(
 
                         # FINAL DOCUMENTS ARE USED TO CALIBRATE THE GROUND_TRUTH_FEATURES
                 """ CALIBRATE GROUND TRUTH """
+                # Calibration is derived state (threshold + IsolationForest); a
+                # failure here must degrade to "no ground-truth comparison yet",
+                # never abort the upload — the statement Documents must still
+                # reach the vectorstore.
                 from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-                await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=final_documents)
+                try:
+                    await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=final_documents, user_id=user_id)
+                except Exception as calibration_error:  # noqa: BLE001 - best-effort derived artifacts
+                    logger.warning(
+                        "calibrate_ground_truth failed (%s); continuing ingestion without recalibration",
+                        calibration_error,
+                    )
 
                 return final_documents
 
-            # Existing single-conversation shape: ``{"messages": [...]}``
+            # Existing single-conversation shape: ``{"messages": [...]}``. Any
+            # other shape is unrecognized — return a clear error Document
+            # instead of raising KeyError so one malformed JSON file cannot
+            # crash the batch (tabular JSON is converted to statements at the
+            # API edge before this handler ever sees the file).
+            messages = (
+                content.get("messages") if isinstance(content, dict) else None
+            )
+            if not isinstance(messages, list):
+                logger.warning(
+                    "Unrecognized JSON shape in %s: expected a dict with a "
+                    "'statements' or 'messages' list",
+                    filename,
+                )
+                return [
+                    Document(
+                        page_content=(
+                            "[Unrecognized JSON shape: expected an object with a "
+                            "'statements' or 'messages' list]"
+                        ),
+                        metadata={
+                            "status": "error",
+                            "error": (
+                                "unrecognized_json_shape: expected 'statements' "
+                                "or 'messages'"
+                            ),
+                            "filename": filename,
+                        },
+                    )
+                ]
             classification_metadata = {
                 "classified_situation": "conversation_facts",
                 "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
             }
-            messages = media_item['content']['messages']
             final_documents = []
             for message in messages:
-                media_item['content'] = message['content']
+                message_content = (
+                    message.get("content") if isinstance(message, dict) else None
+                )
+                if not message_content:
+                    logger.warning(
+                        "Skipping malformed message entry (no content) in %s",
+                        filename,
+                    )
+                    continue
+                media_item['content'] = message_content
                 documents = await process_text_media_item_target_for_vectorstore(
                     media_item=media_item,
                     user_id=user_id,
@@ -1290,6 +1482,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=page_media_item,
+                    store=store
                 )
                 for d in documents:
                     d.metadata.setdefault("pdf_page_index", page_idx)
@@ -1312,8 +1505,8 @@ async def process_media_item_task(
             # Batch-wide "no single target": every detected speaker is the avatar.
             # Diarization still runs, but no stored reference clip is required and
             # known-speaker labelling is skipped (every turn is forced is_target).
-            treat_every_speaker_as_target = bool(metadata.get("treat_every_speaker_as_target", False))
-            if not reference_audio and not treat_every_speaker_as_target:
+            create_reference_media_from_playlist = bool(metadata.get("create_reference_media_from_playlist", False))
+            if not reference_audio and not create_reference_media_from_playlist:
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
                 if not ref_item and not reference_audio:
@@ -1403,7 +1596,7 @@ async def process_media_item_task(
                 # dominant speaker's clip, its duration, and the transcript
                 # ``text`` that matches that clip (same key as the OpenAI
                 # transcription API and ``transcribe_audio_diarize``).
-                ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "")
+                ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "") 
                 transcription_text = transcription_dict.get("text") or ""
                 ref_duration = transcription_dict.get("duration")
 
@@ -1483,7 +1676,7 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
-            if not treat_every_speaker_as_target:
+            if not create_reference_media_from_playlist: # Every entity is the target during create_reference_media_from_playlist
                 try:
                     ref_item = await store.aget(
                         (user_id, assistant_id, "reference_audio"), assistant_id
@@ -1537,12 +1730,28 @@ async def process_media_item_task(
                 )
                 diar_response = None
 
+            if diar_response:
+                # DEV-only: persist the full diarized transcript (labeled speakers)
+                # to disk for inspection. Placed here so it captures every routing
+                # branch below, all of which consume this same diar_response.
+                _write_dev_diarization_transcript(
+                    diar_response,
+                    source=(
+                        metadata.get("source")
+                        or filename
+                        or f"{media_type}_transcription"
+                    ),
+                    filename=filename,
+                    assistant_id=assistant_id,
+                    runtime=runtime,
+                )
+
             target_speaker_label = (
                 runtime.context.audio_diarization_known_speaker_name or "avatar"
             )
 
             # ---------------------------------------------------------------
-            # treat_every_speaker_as_target: no single target speaker, so EVERY detected
+            # create_reference_media_from_playlist: no single target speaker, so EVERY detected
             # speaker is the avatar. Routed only through standalone helpers / the
             # normal text classifier so the established dialogue path is never
             # touched. This branch returns early.
@@ -1556,7 +1765,7 @@ async def process_media_item_task(
             #     stores it in the vectorstore, marks it analysis-acceptable, and
             #     makes it adapter-acceptable with a synthesized prompt.
             # ---------------------------------------------------------------
-            if treat_every_speaker_as_target:
+            if create_reference_media_from_playlist:
                 statements: List[Dict[str, Any]] = []
                 for seg in (diar_response or {}).get("segments") or []:
                     if not isinstance(seg, dict):
@@ -1586,7 +1795,7 @@ async def process_media_item_task(
                         plain_text = (plain.get("text") or "").strip()
                     except Exception as e:
                         logger.exception(
-                            "treat_every_speaker_as_target transcription failed for %s: %s",
+                            "create_reference_media_from_playlist transcription failed for %s: %s",
                             filename,
                             e,
                         )
@@ -1695,6 +1904,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=single_media_item,
+                    store=store,
                 )
                 for d in documents:
                     d.metadata.setdefault("audio_filename", filename)
@@ -1825,6 +2035,7 @@ async def process_media_item_task(
                         user_id=user_id,
                         assistant_id=assistant_id,
                         media_item=single_media_item,
+                        store=store,
                     )
                 else:
                     # A non-target lone speaker: only biographical facts about
@@ -1932,6 +2143,7 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=transcript_media_item,
+                    store=store,
                 )
             else:
                 documents = await process_nontarget_text_to_identity_documents(
@@ -2011,8 +2223,8 @@ async def _expand_url_media_item(
     # forces the YouTube loader past its subtitles fast-path onto the audio +
     # diarization path so the avatar's voice is actually transcribed (subtitles
     # carry no speaker turns), and is inherited by every expanded child below.
-    parent_treat_every_speaker_as_target = bool(
-        (media_item.get("metadata") or {}).get("treat_every_speaker_as_target")
+    parent_create_reference_media_from_playlist = bool(
+        (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
     )
 
     loader = URLDocumentLoaderClass()
@@ -2022,14 +2234,14 @@ async def _expand_url_media_item(
                 url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                expect_multispeaker=parent_treat_every_speaker_as_target,
+                expect_multispeaker=parent_create_reference_media_from_playlist,
             )
     else:
         expanded_items = await loader.load(
             url,
             user_id=user_id,
             assistant_id=assistant_id,
-            expect_multispeaker=parent_treat_every_speaker_as_target,
+            expect_multispeaker=parent_create_reference_media_from_playlist,
         )
 
     if not expanded_items:
@@ -2056,8 +2268,8 @@ async def _expand_url_media_item(
     pending: List[Dict[str, Any]] = []
     for item in expanded_items:
         child_meta = item.setdefault("metadata", {})
-        if parent_treat_every_speaker_as_target:
-            child_meta.setdefault("treat_every_speaker_as_target", True)
+        if parent_create_reference_media_from_playlist:
+            child_meta.setdefault("create_reference_media_from_playlist", True)
         child_ns = child_meta.get("namespace_filename")
         if not child_ns:
             # A keyless child is the single logical content of THIS url item
@@ -2230,25 +2442,35 @@ async def process_adapter_documents(
     config: RunnableConfig,
     store: BaseStore,
 ) -> Dict[str, Any]:
-    """Persist adapter-training rows for any newly-classified Documents.
+    """Build and persist the three adapter datasets into the runtime store.
 
-    Two source kinds:
+    Datasets are written to the LangGraph cross-thread store (NOT disk), one
+    entry per source file, keyed by ``source_uuid5 = uuid5(NAMESPACE_URL,
+    source_filename)``. Each value is a wrapped dict holding the dataset as a
+    JSONL string: ``{"jsonl", "source_filename", "row_count", "created_at"}``.
 
-    * Dialogue Documents (``namespace == "adapter"``): the page_content is
-      already a ``{"messages": [...]}`` JSON blob produced by
-      :func:`process_dialogue_json_to_documents`. We append it to
-      ``data/<assistant_id>/adapter_training.jsonl`` as-is and write the
-      same row to the LangGraph store under ``(user_id, assistant_id,
-      "adapter")`` so retrieval can later use it.
+    Source kinds and outputs:
 
     * Quote Documents (``namespace == "quote"``, ``adapter_acceptable=True``):
-      grouped by source filename, each group produces single-turn
-      ``(synthetic_question, verbatim_quote)`` adapter rows plus matching
-      LangSmith dataset rows via :func:`build_adapter_and_langsmith_for_quotes`.
+      grouped by source filename. Each verbatim target quote is paired with its
+      genuine preceding non-target turn (carried as ``adapter_prompt``); a
+      synthetic prompt is generated ONLY where no genuine prompt exists. Via
+      :func:`build_adapter_and_langsmith_for_quotes` this yields:
+        - single-turn Q&A adapter rows -> ``(user_id, assistant_id,
+          "q_and_a_adapter", source_uuid5)`` (for training adapters), and
+        - LangSmith example rows -> ``(user_id, assistant_id,
+          "langsmith_factual_q_and_a", source_uuid5)`` (for factual testing).
 
-    The node is idempotent because each adapter Document carries its own
-    ``document_id``; rerunning over the same input simply rewrites the JSONL
-    line for that id.
+    * Dialogue Documents (``namespace == "adapter"``): the page_content is the
+      role-converted ``{"messages": [...]}`` conversation. Genuine preceding
+      user turns are reused as prompts (synthetic only where the target led) via
+      :func:`pairs_from_conversation`, then formatted with
+      :func:`llm_multiturn_dataset_one_conversation` into one conversation row ->
+      ``(user_id, assistant_id, "multi_turn_dataset_adapter", source_uuid5)``
+      (to attune adapter behaviour).
+
+    Idempotent per source: the store key is the source uuid5, so rerunning a
+    source overwrites its dataset entry rather than duplicating it.
     """
 
     logger.info("process_adapter_documents NODE")
@@ -2260,72 +2482,69 @@ async def process_adapter_documents(
         logger.info("No adapter Documents queued; skipping")
         return {}
 
-    user_id, assistant_id = await extract_user_id_assistant_id(config)
+    # extract_user_id_assistant_id returns ({"user_id": ...}, {"assistant_id": ...}).
+    user_state, assistant_state = await extract_user_id_assistant_id(config)
+    user_id = user_state.get("user_id")
+    assistant_id = assistant_state.get("assistant_id")
 
     # Lazy import so optional helpers don't slow the graph cold start.
     from src.anubis.utils.dataset.formatting import (
         build_adapter_and_langsmith_for_quotes,
-        build_langsmith_for_conversation,
-        llm_single_turn_dataset,
+        llm_multiturn_dataset_one_conversation,
+        pairs_from_conversation,
     )
 
-    out_dir = os.path.join("data", assistant_id)
-    os.makedirs(out_dir, exist_ok=True)
-    adapter_jsonl = os.path.join(out_dir, "adapter_training.jsonl")
-    langsmith_jsonl = os.path.join(out_dir, "langsmith_eval_dataset.jsonl")
+    def _source_of(d: Document) -> str:
+        """Source-file label that ties a doc's datasets to one store key."""
+        return (
+            d.metadata.get("filename")
+            or d.metadata.get("original_source")
+            or d.metadata.get("source")
+            or "unknown"
+        )
 
-    adapter_rows_total: List[Dict[str, Any]] = []
-    langsmith_rows_total: List[Dict[str, Any]] = []
-
-    # ------------------------------------------------------------------
-    # 1) Dialogue conversations: pass-through (already role-converted).
-    # ------------------------------------------------------------------
-    dialogue_docs = [
-        d for d in adapter_docs if d.metadata.get("namespace") == "adapter"
-    ]
-    for d in dialogue_docs:
+    async def _store_dataset(
+        dataset_type: str,
+        source_filename: str,
+        source_uuid5: str,
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        """Persist one dataset as a JSONL-in-dict value under its namespace."""
+        if not rows:
+            return
+        jsonl = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
         try:
-            payload = json.loads(d.page_content)
-        except Exception:
-            payload = {"messages": d.metadata.get("messages") or []}
-        messages = payload.get("messages") or []
-        if not messages:
-            continue
-        # (1) Multi-turn conversation row for adapter training (pass-through).
-        adapter_rows_total.append(payload)
-        # (3) Conversation-level LangSmith Q&A pairs derived from the same
-        #     role-converted messages.
-        try:
-            conv_source = (
-                d.metadata.get("filename")
-                or d.metadata.get("source")
-                or "unknown"
-            )
-            conversation_langsmith_rows = await build_langsmith_for_conversation(
-                messages=messages,
-                dataset_source_filename=conv_source,
-            )
-            langsmith_rows_total.extend(conversation_langsmith_rows)
-        except Exception as exc:
-            logger.warning(
-                "Conversation LangSmith build failed for %s: %s",
-                d.metadata.get("filename", ""),
-                exc,
-            )
-        try:
-            ns = (user_id, assistant_id, "adapter")
             await store.aput(
-                ns,
-                key=str(d.metadata.get("document_id") or uuid4()),
-                value={"document": d.to_json()},
+                (user_id, assistant_id, dataset_type, source_uuid5),
+                key=source_uuid5,
+                value={
+                    "jsonl": jsonl,
+                    "source_filename": source_filename,
+                    "row_count": len(rows),
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+            logger.info(
+                "Stored %d %s rows -> (%s, %s, %s, %s)",
+                len(rows),
+                dataset_type,
+                user_id,
+                assistant_id,
+                dataset_type,
+                source_uuid5,
             )
         except Exception as exc:  # pragma: no cover - operator log only
-            logger.warning("Failed to put adapter dialogue Document: %s", exc)
+            logger.warning(
+                "Failed to store %s dataset for %s: %s",
+                dataset_type,
+                source_filename,
+                exc,
+            )
 
     # ------------------------------------------------------------------
-    # 2) Quote-shaped Documents: synthesize a question per quote and emit
-    #    single-turn adapter + langsmith rows. Group by filename so each
-    #    source file becomes one ``langsmith_eval_dataset`` source label.
+    # 1) Quote Documents -> Q&A adapter dataset + LangSmith factual dataset.
+    #    Grouped by source so each file becomes one store entry per dataset.
+    #    Genuine ``adapter_prompt`` is reused; synthetic prompts fill only gaps.
     # ------------------------------------------------------------------
     quote_docs = [
         d
@@ -2334,62 +2553,80 @@ async def process_adapter_documents(
         and d.metadata.get("adapter_acceptable") is True
         and (d.page_content or "").strip()
     ]
-    grouped: Dict[str, List[Document]] = {}
+    grouped_quotes: Dict[str, List[Document]] = {}
     for d in quote_docs:
-        key = (
-            d.metadata.get("filename")
-            or d.metadata.get("original_source")
-            or d.metadata.get("source")
-            or "unknown"
-        )
-        grouped.setdefault(key, []).append(d)
+        grouped_quotes.setdefault(_source_of(d), []).append(d)
 
-    for source_key, docs_for_source in grouped.items():
+    for source_filename, docs_for_source in grouped_quotes.items():
+        source_uuid5 = str(uuid5(NAMESPACE_URL, source_filename))
         quotes = [d.page_content.strip() for d in docs_for_source]
-        # Use the real preceding non-target turn as the prompt when present
-        # (carried as ``adapter_prompt`` by diarized target quotes); otherwise
-        # the builder synthesizes a question per quote.
         prompts = [d.metadata.get("adapter_prompt") for d in docs_for_source]
         try:
             adapter_rows, langsmith_rows = await build_adapter_and_langsmith_for_quotes(
                 quotes=quotes,
-                dataset_source_filename=source_key,
+                dataset_source_filename=source_filename,
                 prompts=prompts,
             )
         except Exception as exc:
             logger.exception(
-                "Adapter+LangSmith builder failed for %s: %s; falling back to no-question pairs",
-                source_key,
+                "Adapter+LangSmith builder failed for %s: %s; skipping source",
+                source_filename,
                 exc,
             )
-            adapter_rows = await llm_single_turn_dataset(
-                question_list=[""] * len(quotes), answer_list=quotes
-            )
-            langsmith_rows = []
-        adapter_rows_total.extend(adapter_rows)
-        langsmith_rows_total.extend(langsmith_rows)
-
-    # ------------------------------------------------------------------
-    # 3) Persist to disk (append-only JSONL).
-    # ------------------------------------------------------------------
-    if adapter_rows_total:
-        with open(adapter_jsonl, "a", encoding="utf-8") as fh:
-            for row in adapter_rows_total:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        logger.info(
-            "Wrote %d adapter rows -> %s",
-            len(adapter_rows_total),
-            adapter_jsonl,
+            continue
+        await _store_dataset(
+            "q_and_a_adapter", source_filename, source_uuid5, adapter_rows
+        )
+        await _store_dataset(
+            "langsmith_factual_q_and_a",
+            source_filename,
+            source_uuid5,
+            langsmith_rows,
         )
 
-    if langsmith_rows_total:
-        with open(langsmith_jsonl, "a", encoding="utf-8") as fh:
-            for row in langsmith_rows_total:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        logger.info(
-            "Wrote %d langsmith eval rows -> %s",
-            len(langsmith_rows_total),
-            langsmith_jsonl,
+    # ------------------------------------------------------------------
+    # 2) Dialogue Documents -> multi-turn adapter dataset (one conversation).
+    #    Each role-converted conversation reuses genuine user turns as prompts;
+    #    a synthetic prompt is generated only where the target led.
+    # ------------------------------------------------------------------
+    dialogue_docs = [
+        d for d in adapter_docs if d.metadata.get("namespace") == "adapter"
+    ]
+    grouped_dialogue: Dict[str, List[Document]] = {}
+    for d in dialogue_docs:
+        grouped_dialogue.setdefault(_source_of(d), []).append(d)
+
+    for source_filename, docs_for_source in grouped_dialogue.items():
+        source_uuid5 = str(uuid5(NAMESPACE_URL, source_filename))
+        conversation_rows: List[Dict[str, Any]] = []
+        for d in docs_for_source:
+            try:
+                payload = json.loads(d.page_content)
+            except Exception:
+                payload = {"messages": d.metadata.get("messages") or []}
+            messages = payload.get("messages") or []
+            if not messages:
+                continue
+            try:
+                question_list, answer_list = await pairs_from_conversation(messages)
+                if not answer_list:
+                    continue
+                conversation_rows.append(
+                    llm_multiturn_dataset_one_conversation(
+                        question_list=question_list, answer_list=answer_list
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Multi-turn build failed for %s: %s",
+                    source_filename,
+                    exc,
+                )
+        await _store_dataset(
+            "multi_turn_dataset_adapter",
+            source_filename,
+            source_uuid5,
+            conversation_rows,
         )
 
     # Clear the adapter buffer of what we just processed (append-reducer
@@ -2397,57 +2634,3 @@ async def process_adapter_documents(
     return {
         "documents_to_be_processed_for_adapter_training": "delete",
     }
-
-
-# ---------------------------------------------------------------------------
-# Profile build trigger node
-# ---------------------------------------------------------------------------
-
-async def build_stylistic_fingerprint(
-    state: GlobalState,
-    runtime: Runtime[GlobalContext],
-    config: RunnableConfig,
-    store: BaseStore,
-) -> Dict[str, Any]:
-    """Build / refresh the per-avatar stylistic + knowledge profiles.
-
-    Threshold logic lives in
-    :mod:`src.anubis.utils.dataset.build_profile` and
-    :mod:`src.anubis.utils.dataset.build_knowledge_profile`. This node
-    delegates to them; the corpus is touched only here, never at evaluation
-    time.
-    """
-    logger.info("build_stylistic_fingerprint NODE")
-    try:
-        user_id, assistant_id = await extract_user_id_assistant_id(config)
-    except Exception as exc:
-        logger.warning("Could not resolve user/assistant id: %s", exc)
-        return {}
-
-    from src.anubis.utils.dataset.build_profile import maybe_build_stylistic_profile
-    from src.anubis.utils.dataset.build_knowledge_profile import (
-        maybe_build_knowledge_profile,
-    )
-
-    try:
-        await maybe_build_stylistic_profile(
-            user_id=user_id,
-            assistant_id=assistant_id,
-            store=store,
-            context=runtime.context,
-        )
-    except Exception as exc:
-        logger.exception("Stylistic profile build failed: %s", exc)
-
-    try:
-        await maybe_build_knowledge_profile(
-            user_id=user_id,
-            assistant_id=assistant_id,
-            store=store,
-            context=runtime.context,
-        )
-    except Exception as exc:
-        logger.exception("Knowledge profile build failed: %s", exc)
-
-    return {}
-

@@ -11,5 +11,5 @@ curl /update_avatar_identity_with_media \
   --form 'assistant_id=a6cdfa75-928d-4c23-a9f2-3495663db544' \
   --form 'reference_audio=false' \
   --form 'reference_image=false' \
-  --form 'treat_every_speaker_as_target=true' \2
+  --form 'create_reference_media_from_playlist=true' \2
   --form 'url=https://www.youtube.com/watch?v=gSNFJbgoaHI&list=PLQ-uHSnFig5M9fW16o2l35jrfdsxGknNB'

@@ -52,7 +52,3 @@ def make_rollout_fn(setup):
 
 https://huggingface.co/docs/trl/en/grpo_trainer 
 https://app.fireworks.ai/
-
-
-
-https://learn.deeplearning.ai/courses/reinforcement-fine-tuning-llms-grpo/lesson/sjbja/introduction?startTime=0

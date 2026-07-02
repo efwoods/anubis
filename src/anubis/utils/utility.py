@@ -223,6 +223,42 @@ def remove_docs_update(docs: Sequence[Document]) -> dict[str, Any]:
     return {"op": "remove", "keys": [_doc_dedup_key(d) for d in docs]}
 
 
+def _coerce_to_documents(items: Sequence[Any]) -> list[Document]:
+    """Coerce a mixed sequence (str / dict / SearchItem / Document) to Documents.
+
+    Same coercion the ``reduce_docs`` append path performs; shared so the
+    ``"replace"`` op and :func:`merge_dedup_threshold_documents` build documents
+    with identical identity semantics.
+    """
+    coerced: list[Document] = []
+    for item in items:
+        if isinstance(item, str):
+            coerced.append(
+                Document(page_content=item, metadata={"document_id": str(uuid.uuid4())})
+            )
+        elif isinstance(item, dict):
+            coerced.append(Document(**item))
+        elif isinstance(item, SearchItem) or isinstance(item, Item):
+            page_content = (
+                getattr(item, "value", {})
+                .get("document", {})
+                .get("kwargs", {})
+                .get("page_content", "")
+            )
+            document_metadata = (
+                getattr(item, "value", {})
+                .get("document", {})
+                .get("kwargs", {})
+                .get("metadata", {})
+            )
+            coerced.append(
+                Document(page_content=page_content, metadata=document_metadata)
+            )
+        else:
+            coerced.append(item)
+    return coerced
+
+
 def reduce_docs(
     existing: Sequence[Document] | None,
     new: Union[
@@ -250,6 +286,11 @@ def reduce_docs(
           :func:`remove_docs_update`) — removes only the listed docs, leaving
           everything else. Prefer this over ``"delete"`` when other nodes may
           write the same channel in the same superstep.
+        * a replacement instruction ``{"op": "replace", "docs": [...]}`` — the
+          buffer becomes exactly the given docs (coerced + de-duped), discarding
+          whatever was there before. Used by ``load_consciousness`` to write an
+          authoritative merged/pruned snapshot each turn without disturbing the
+          default append semantics that incremental tool writes rely on.
 
     De-duplication by stable document identity (:func:`_doc_dedup_key`) keeps
     the append idempotent: re-emitting a doc already on the buffer does not grow
@@ -288,6 +329,27 @@ def reduce_docs(
         # endregion
         return []
 
+    # Full replacement: the buffer becomes exactly the given docs (coerced + deduped),
+    # discarding whatever was there before. Emitted by ``load_consciousness`` as the
+    # authoritative merged/pruned per-turn snapshot.
+    if isinstance(new, dict) and new.get("op") == "replace":
+        replacement: list[Document] = []
+        replacement_seen: set[str] = set()
+        for doc in _coerce_to_documents(new.get("docs") or []):
+            key = _doc_dedup_key(doc)
+            if key in replacement_seen:
+                continue
+            replacement_seen.add(key)
+            replacement.append(doc)
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=replace",
+            {"existing_len": _existing_len, "result_len": len(replacement)},
+            hypothesis_id="H2",
+        )
+        # endregion
+        return replacement
+
     # Targeted removal: drop only the processed docs, keep the rest.
     if isinstance(new, dict) and new.get("op") == "remove":
         to_remove = set(new.get("keys") or [])
@@ -311,33 +373,7 @@ def reduce_docs(
             Document(page_content=new, metadata={"document_id": str(uuid.uuid4())})
         )
     elif isinstance(new, list):
-        for item in new:
-            if isinstance(item, str):
-                coerced.append(
-                    Document(
-                        page_content=item, metadata={"document_id": str(uuid.uuid4())}
-                    )
-                )
-            elif isinstance(item, dict):
-                coerced.append(Document(**item))
-            elif isinstance(item, SearchItem) or isinstance(item, Item):
-                page_content = (
-                    getattr(item, "value", {})
-                    .get("document", {})
-                    .get("kwargs", {})
-                    .get("page_content", "")
-                )
-                document_metadata = (
-                    getattr(item, "value", {})
-                    .get("document", {})
-                    .get("kwargs", {})
-                    .get("metadata", {})
-                )
-                coerced.append(
-                    Document(page_content=page_content, metadata=document_metadata)
-                )
-            else:
-                coerced.append(item)
+        coerced.extend(_coerce_to_documents(new))
     else:
         # region agent log
         _agent_debug_log(
@@ -388,6 +424,83 @@ def reduce_docs(
     )
     # endregion
     return result
+
+
+async def merge_dedup_threshold_documents(
+    prior_docs: Sequence[Document] | None,
+    retrieved_items: Sequence[Any],
+    query: str,
+    *,
+    apply_threshold: bool = False,
+    threshold: float = 0.5,
+) -> list[Document]:
+    """Merge persisted state docs with a fresh store retrieval into one clean snapshot.
+
+    Implements the document-statefulness contract for ``load_consciousness``: documents
+    persist in graph state across turns rather than being rebuilt from scratch, so each
+    turn the prior state docs are
+
+    * **unioned** with that turn's freshly retrieved store items,
+    * **de-duplicated** by stable document identity (:func:`_doc_dedup_key`) — on an id
+      collision the FRESHLY RETRIEVED copy wins, so an in-place store edit's new content
+      replaces the stale state copy, and
+    * optionally **salience-thresholded** against the current ``query``: freshly
+      retrieved items reuse their store search score; prior-only docs are re-scored with
+      the process-wide cached sentence embedder (the store's own embedding model, so
+      scores are on the retrieval scale); docs at/below ``threshold`` are dropped.
+
+    ``apply_threshold=False`` (identity channels) still merges + dedups + reconciles to
+    the store copy but never prunes — the avatar must not forget its own identity.
+    """
+    fresh_docs = _coerce_to_documents(list(retrieved_items or []))
+    fresh_scores = [getattr(item, "score", None) for item in (retrieved_items or [])]
+
+    # Union keyed by stable identity; insertion order = prior first, fresh appended.
+    # A fresh doc with a colliding key OVERWRITES the prior (stale) copy in place.
+    merged: dict[str, Document] = {}
+    score_by_key: dict[str, float | None] = {}
+    for doc in prior_docs or []:
+        key = _doc_dedup_key(doc)
+        merged[key] = doc
+        score_by_key[key] = None  # prior docs carry no score → re-scored below
+    for doc, score in zip(fresh_docs, fresh_scores):
+        key = _doc_dedup_key(doc)
+        merged[key] = doc
+        score_by_key[key] = float(score) if isinstance(score, (int, float)) else None
+
+    if not apply_threshold:
+        return list(merged.values())
+
+    # Re-score only the docs without a store score (prior-state docs and any retrieval
+    # that returned no score) against the current query, on the retrieval scale.
+    unscored = [(key, doc) for key, doc in merged.items() if score_by_key[key] is None]
+    if unscored:
+
+        def _compute() -> list[float]:
+            from src.anubis.utils.runtime_handles import get_sentence_embedder
+
+            model: Any = get_sentence_embedder()
+            query_embedding = model.encode([query], convert_to_numpy=True)
+            doc_embeddings = model.encode(
+                [doc.page_content or "" for _, doc in unscored],
+                convert_to_numpy=True,
+            )
+            similarities = model.similarity(query_embedding, doc_embeddings)[0]
+            return [float(score) for score in similarities]
+
+        try:
+            computed = await asyncio.to_thread(_compute)
+        except Exception:
+            # Scoring is best-effort: if the embedder is unavailable, keep the docs
+            # rather than silently dropping salient memories.
+            logger.exception("merge_dedup_threshold_documents: re-scoring failed")
+            computed = [threshold + 1.0] * len(unscored)
+        for (key, _doc), score in zip(unscored, computed):
+            score_by_key[key] = score
+
+    return [
+        doc for key, doc in merged.items() if (score_by_key[key] or 0.0) > threshold
+    ]
 
 
 from langchain_core.runnables import RunnableConfig

@@ -735,6 +735,9 @@ async def create_avatar(
             metadata=metadata,
         )
 
+        # store the creator of the assistant
+        await client.store.aput((assistant_id,'creator_id'), key="creator_id", value={"value": user_id})
+
         return JSONResponse(content=create_avatar_response, status_code=200)
     except Exception as e:
         return HTTPException(
@@ -773,6 +776,29 @@ async def share_avatar(
         status_code=401, detail="Users may only share avatars of themselves."
     )
 
+
+@app.post("/user_is_creator")
+async def user_is_creator(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    context = app.state.context
+    user_id = current_user["identities"][0]["user_id"]
+    if user_id == context.admin_user_id:
+        try:
+            token = current_user["API_KEY"]
+            client = get_client(headers={"API-KEY": f"{token}"})
+            namespace = (assistant_id, 'creator_id')
+            await client.store.put_item(namespace, key='creator_id', value={"value": user_id}) 
+            return JSONResponse(content="stored creator_id", status_code=200)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Error during update of sharing avatar: {e}"
+            )
+        
+    raise HTTPException(
+        status_code=401, detail="Users may only share avatars of themselves."
+    )
 
 @app.patch("/modify_avatar")
 async def modify_avatar(
@@ -1500,7 +1526,7 @@ async def resume_avatar_message(
     include_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
-    """Resume a run paused for human approval (e.g. ``correct_identity_fact``).
+    """Resume a run paused for human approval (edit/delete identity fact).
 
     ``decision`` is ``apply`` | ``cancel``. ``items`` (JSON list) carries the owner's
     per-document decisions — one entry per matched document with ``index`` and an ``action``

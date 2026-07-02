@@ -70,6 +70,7 @@ class DynamicPromptBuilder:
         user_identity: Optional[List[Document]] = None,
         user_emotions: Optional[List[Document]] = None,
         system_time: Optional[str] = None,
+        user_is_creator: Optional[bool] = False,
     ) -> ChatPromptTemplate:
         """
         Build a ChatPromptTemplate with optional components.
@@ -173,6 +174,15 @@ class DynamicPromptBuilder:
         if system_time is None:
             system_time = "Time information unavailable."
 
+
+        # Edit system prompt for learning information depending on whether the user is the creator or not:
+        if user_is_creator:
+            from src.anubis.utils.prompts.learn_information_user_creator_vs_public_prompt import LEARN_INFORMATION_CREATOR
+            learn_information_prompt_str = LEARN_INFORMATION_CREATOR
+        else:
+            from src.anubis.utils.prompts.learn_information_user_creator_vs_public_prompt import LEARN_INFORMATION_PUBLIC
+            learn_information_prompt_str = LEARN_INFORMATION_PUBLIC
+
         # Create the prompt template
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -194,6 +204,7 @@ class DynamicPromptBuilder:
             "user_identity": user_identity_str,
             "user_emotions": user_emotions_str,
             "system_time": system_time,
+            "learn_information_prompt_str": learn_information_prompt_str
         }
 
         populated_template = prompt.invoke(prompt_vars)

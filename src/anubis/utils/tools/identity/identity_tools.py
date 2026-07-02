@@ -1265,7 +1265,7 @@ async def _suggest_correction(
         return corrected_text, corrected_context, bool(result.asserts_inaccurate_fact)
     except Exception:
         logger.exception(
-            "correct_identity_fact: per-document suggestion failed; using global correction"
+            "identity fact correction: per-document suggestion failed; using global correction"
         )
         return fallback
 
@@ -1280,7 +1280,7 @@ def _match_preview(
     """Compact, JSON-serializable description of ONE editable pending change for the HITL panel.
 
     Each match is its own editable item. The owner chooses exactly one ``action`` per item
-    (see the resume contract in ``correct_identity_fact``):
+    (see the resume contract in ``_run_identity_fact_mutation``):
 
     - ``"skip"`` — leave this document completely unchanged (the DEFAULT for every item, so a
       falsely-retrieved doc is never touched unless the owner explicitly acts on it).
@@ -1436,7 +1436,9 @@ async def find_fact_matches(
         try:
             items = await store.asearch(namespace, query=query, limit=1000)
         except Exception:
-            logger.exception("correct_identity_fact: search failed for %s", namespace)
+            logger.exception(
+                "identity fact correction: search failed for %s", namespace
+            )
             continue
 
         if _namespace_is_long_text(namespace):
@@ -1714,47 +1716,85 @@ async def apply_fact_correction(
     return await apply_resolved_corrections(store, resolved)
 
 
-class FactCorrection(BaseModel):
-    """Update or delete a fact ALREADY STORED about the avatar in the vectorstore.
+# Store namespace kind (third namespace element) → persisted GlobalState document channel.
+# Long-text namespaces (quote/document/analysis) are retrieved per turn but are not
+# persisted document channels, so they have no entry here.
+_NAMESPACE_KIND_TO_STATE_CHANNEL = {
+    "memory": "recalled_memory_documents",
+    "identity": "assistant_identity_documents",
+    "identity_memory": "assistant_identity_documents",
+}
 
-    Call this tool whenever the user says a fact the avatar already holds is wrong,
-    inaccurate, or never happened:
-      - to FIX the fact, set ``correction_kind='update'`` and supply the first-person
-        replacement in ``corrected_information``;
-      - to REMOVE the fact, set ``correction_kind='delete'`` and leave
-        ``corrected_information`` empty.
+
+def _state_prune_updates(resolved: list["ResolvedCorrection"]) -> dict[str, dict]:
+    """Per-channel ``{"op": "remove", "keys": [...]}`` updates for applied corrections.
+
+    The edit/delete tools run BEFORE the middleware-driven consciousness refresh, so the
+    stale pre-correction copies must be pruned from the persisted state channels — otherwise
+    the refresh's merge (prior state + fresh retrieval) would re-add a just-deleted document
+    or keep an edited document's old content. Keys include both the document's stable
+    metadata id and the store key so the removal matches ``_doc_dedup_key`` regardless of
+    which one a state copy carries.
+    """
+    keys_by_channel: dict[str, set[str]] = {}
+    for resolved_edit in resolved:
+        if not resolved_edit.include:
+            continue
+        namespace = resolved_edit.match.namespace or ()
+        kind = str(namespace[2]) if len(namespace) >= 3 else ""
+        channel = _NAMESPACE_KIND_TO_STATE_CHANNEL.get(kind)
+        if channel is None:
+            continue
+        kwargs = _item_document_kwargs(resolved_edit.match.item)
+        metadata = kwargs.get("metadata") or {}
+        keys = keys_by_channel.setdefault(channel, set())
+        for candidate in (
+            metadata.get("document_id"),
+            metadata.get("id"),
+            kwargs.get("page_content"),
+            resolved_edit.match.key,
+        ):
+            if candidate:
+                keys.add(str(candidate))
+    return {
+        channel: {"op": "remove", "keys": sorted(keys)}
+        for channel, keys in keys_by_channel.items()
+    }
+
+
+class FactEdit(BaseModel):
+    """Edit a fact ALREADY STORED about the avatar in the vectorstore.
+
+    Call this tool when the user asserts a stored fact is incorrect and supplies the
+    replacement. The matched document is edited in place: only the inaccurate portion
+    changes; every other fact in the same document is preserved. If the document contains
+    only that one fact, the whole document is rewritten.
 
     This tool is for facts the avatar ALREADY HOLDS. A brand-new fact the avatar does not
     yet hold goes to ``update_self_identity_mem_from_user_txt`` instead. Decide by whether
     the fact already exists about the avatar, not by surface words like "wrong" or
     "nonsense".
 
-    Call this tool ONCE FOR EACH DISTINCT stored fact being changed or removed. A single
-    user message often corrects several independent facts ("my name is Shivon and I was
-    never at the University of Alberta" is TWO corrections); make one call per fact, never
-    bundle multiple distinct corrections into one call. Each call finds and edits every
-    stored copy of that ONE fact across all namespaces — so one call per fact, not one call
-    per stored document.
+    Call this tool ONCE FOR EACH DISTINCT stored fact being changed. A single user message
+    often corrects several independent facts ("my name is Shivon and I was never at the
+    University of Alberta" is TWO corrections); make one call per fact, never bundle
+    multiple distinct corrections into one call. Each call finds and edits every stored
+    copy of that ONE fact across all namespaces — so one call per fact, not one call per
+    stored document.
 
-    <Example update>
+    <Example edit>
     User: "Actually I was born in Ottawa, not Toronto."
       inaccurate_information: "I was born in Toronto."
       corrected_information:  "I was born in Ottawa."
       correction_context:     "I was told I was born in Ottawa, not Toronto."
-      correction_kind:        "update"
-    </Example update>
-    <Example delete>
-    User: "That never happened — I have no association with the University of Alberta."
-      inaccurate_information: "I've also worked with University of Alberta."
-      corrected_information:  ""
-      correction_context:     "I was told I have no association with University of Alberta."
-      correction_kind:        "delete"
-    </Example delete>
+    </Example edit>
 
     <Counterexample new fact — call update_self_identity_mem_from_user_txt instead>
     user: "I need you to learn your favorite color is nonsense."
     </Counterexample new fact>
-
+    <Counterexample removal — call delete_identity_fact instead>
+    user: "That never happened — forget it entirely."
+    </Counterexample removal>
     """
 
     inaccurate_information: str = Field(
@@ -1762,86 +1802,78 @@ class FactCorrection(BaseModel):
         "as the semantic search query to find the fact(s) to fix. e.g. 'I was born in Toronto.'"
     )
     corrected_information: str = Field(
-        default="",
         description="The corrected fact, REWRITTEN IN FIRST PERSON exactly like "
         "``update_self_identity_mem_from_user_txt`` (change only the grammatical "
-        "person, never other information). e.g. 'I was born in Ottawa.' Leave EMPTY when "
-        "``correction_kind`` is 'delete' (the user is removing a fact, not replacing it).",
+        "person, never other information). e.g. 'I was born in Ottawa.' REQUIRED — an edit "
+        "always has a replacement; to remove a fact with no replacement call "
+        "``delete_identity_fact`` instead."
     )
     correction_context: str = Field(
         description="A concise context summary for the corrected fact, same convention "
         "as ``fact_context`` (indicate you were told/corrected, not that you said it)."
     )
-    correction_kind: str = Field(
-        default="update",
-        description="'update' when the user supplies a replacement fact; 'delete' when "
-        "the user says the fact never happened / is simply wrong with NO replacement "
-        "(e.g. 'that never happened', 'I have no association with X').",
+
+
+class FactDeletion(BaseModel):
+    """Delete a fact ALREADY STORED about the avatar in the vectorstore.
+
+    Call this tool when the user says a stored fact never happened / must be forgotten,
+    with NO replacement (e.g. "that never happened", "please forget your height",
+    "delete the information about X").
+
+    When a matched document holds ONLY that fact, the document is removed. When it holds
+    the fact PLUS other facts, the offending portion is redacted (edited out) and the rest
+    survives — the owner may still elect to remove the whole document. When ambiguous,
+    lean toward an edit over a removal; the owner decides in the approval panel.
+
+    This tool is for facts the avatar ALREADY HOLDS. If the user presents new information
+    that does not exist as a stored document (even phrased negatively, e.g. "you never wore
+    braces" when nothing about braces is stored), call
+    ``update_self_identity_mem_from_user_txt`` to CREATE that fact instead.
+
+    Call this tool ONCE FOR EACH DISTINCT stored fact being removed.
+
+    <Example delete>
+    User: "That never happened — I have no association with the University of Alberta."
+      inaccurate_information: "I've also worked with University of Alberta."
+      correction_context:     "I was told I have no association with University of Alberta."
+    </Example delete>
+
+    <Counterexample replacement — call edit_identity_fact instead>
+    user: "That's wrong — I was born in Ottawa, not Toronto."
+    </Counterexample replacement>
+    """
+
+    inaccurate_information: str = Field(
+        description="The claim the user says never happened, phrased as the stored fact it "
+        "should match — used as the semantic search query to find the fact(s) to remove. "
+        "e.g. 'I was born in Toronto.'"
+    )
+    correction_context: str = Field(
+        description="A concise context summary for the removal, same convention as "
+        "``fact_context`` (indicate you were told the fact never happened)."
     )
 
 
-@tool("correct_identity_fact", args_schema=FactCorrection)
-async def correct_identity_fact(
+async def _run_identity_fact_mutation(
+    runtime: ToolRuntime,
+    *,
     inaccurate_information: str,
-    corrected_information: str = "",
-    correction_context: str = "",
-    correction_kind: str = "update",
-    # Hidden from the model.
-    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+    corrected_information: str,
+    correction_context: str,
+    is_deletion: bool,
 ) -> GlobalState:
+    """Shared body of ``edit_identity_fact`` / ``delete_identity_fact``.
+
+    Owner guard → multi-namespace ``find_fact_matches`` → per-match ``_suggest_correction``
+    fan-out → human-in-the-loop ``interrupt`` → per-item decision parse →
+    ``apply_resolved_corrections`` → summary ``Command``. The interrupt payload keeps the
+    ``kind: "fact_correction"`` shape (with ``correction_kind`` derived from ``is_deletion``)
+    so the ``/resume`` contract and the frontend approval panel are unchanged by the tool
+    split.
     """
-    <INSTRUCTIONS>
-    Update or delete a fact ALREADY STORED about you (the avatar) in the vectorstore. Call
-    this tool whenever the user says a fact you already hold is wrong, inaccurate, or never
-    happened: to FIX the fact, set ``correction_kind='update'`` with the first-person
-    replacement (change only the grammatical person, never other specifics); to REMOVE the
-    fact, set ``correction_kind='delete'`` and leave ``corrected_information`` empty.
-
-    This tool edits or deletes a fact you ALREADY HOLD. A brand-new fact you do not yet hold
-    goes to ``update_self_identity_mem_from_user_txt`` instead. Decide by whether the fact
-    already exists about you, not by surface words like "wrong" or "nonsense".
-
-    Call this ONCE PER DISTINCT stored fact. If the user corrects several independent facts
-    in one message (e.g. "my name is Shivon and I was never at the University of Alberta"),
-    make a SEPARATE call for each one. Each call finds and fixes every stored copy of that
-    one fact across your identity namespaces — including a single offending sentence buried
-    inside a long direct quote.
-
-    After you call this, the owner is shown each matched document individually and chooses,
-    per document, to leave it unchanged (the default — falsely-retrieved documents are kept
-    safe), accept the suggested in-place edit, rewrite it themselves, or remove it. They may
-    also cancel the whole correction. Nothing is saved without the owner's per-document
-    approval, so you do not need to enumerate the documents yourself.
-    </INSTRUCTIONS>
-
-    <RESTRICTIONS>
-    Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
-    Do NOT use this for facts about the USER.
-    Only the avatar's creator may correct its identity (enforced server-side).
-    </RESTRICTIONS>
-
-    <EXAMPLE update>
-    User: "That's wrong — I was actually born in Ottawa, not Toronto."
-      inaccurate_information: "I was born in Toronto."
-      corrected_information:  "I was born in Ottawa."
-      correction_context:     "I was told I was born in Ottawa, not Toronto."
-      correction_kind:        "update"
-    </EXAMPLE update>
-    <EXAMPLE delete>
-    User: "That never happened — I have no association with the University of Alberta."
-      inaccurate_information: "I've also worked with University of Alberta."
-      corrected_information:  ""
-      correction_context:     "I was told I have no association with University of Alberta."
-      correction_kind:        "delete"
-    </EXAMPLE delete>
-
-    Args:
-        inaccurate_information: The wrong claim (search query) phrased as the stored fact.
-        corrected_information: The corrected fact, rewritten in first person (empty for delete).
-        correction_context: Concise context for the corrected fact.
-        correction_kind: "update" to replace the fact, "delete" to remove it.
-    """
-    logger.info("correct_identity_fact breakpoint")
+    correction_kind = "delete" if is_deletion else "update"
+    logger.info("identity fact mutation breakpoint (%s)", correction_kind)
 
     # Owner guard — only the avatar's creator may rewrite its identity.
     assistant_owner_user_id = runtime.config["configurable"]["assistant_ctx"][
@@ -1866,15 +1898,6 @@ async def correct_identity_fact(
     user_id = updated_user_state.get("user_id")
     assistant_id = updated_assistant_state.get("assistant_id")
     creator_id = assistant_owner_user_id
-
-    # TODO The misinformation may not be in recent context, this is a stateless application that does not persist document ids; after a single question, the previous system_prompt and documents are lost.
-    # state_docs = [
-    #     *(runtime.state.get("assistant_identity_documents") or []),
-    #     *(runtime.state.get("recalled_memory_documents") or []),
-    #     *(runtime.state.get("user_identity_documents") or []),
-    # ]
-
-    is_deletion = correction_kind == "delete"
 
     matches = await find_fact_matches(
         runtime.store,
@@ -2044,7 +2067,6 @@ async def correct_identity_fact(
             }
         )
 
-    corrected_documents = [c.document for c in changes if c.document is not None]
     verb = {"rewrite": "Corrected", "redact": "Redacted", "delete": "Deleted"}
     summary = "; ".join(
         f"{verb.get(c.action, 'Changed')} '{c.old_text}'"
@@ -2052,16 +2074,144 @@ async def correct_identity_fact(
         for c in changes
         if c.old_text
     )
-    return Command(
-        update={
-            "assistant_identity_documents": corrected_documents,
-            "messages": [
-                ToolMessage(
-                    content=f"Applied {len(changes)} change(s): {summary}",
-                    tool_call_id=runtime.tool_call_id,
-                )
-            ],
-        }
+    # Prune the stale pre-correction copies from the persisted document channels. The
+    # post-tool consciousness refresh (ConsciousnessRefreshGate) then merges prior state
+    # with a fresh store retrieval and writes the authoritative snapshot — without this
+    # prune, a just-deleted document would be re-added from prior state and an edited
+    # document would keep its old content (the append reducer dedups by id, so a fresh
+    # copy of the same document never replaces a stale one).
+    update: dict[str, object] = dict(_state_prune_updates(resolved))
+    update["messages"] = [
+        ToolMessage(
+            content=f"Applied {len(changes)} change(s): {summary}",
+            tool_call_id=runtime.tool_call_id,
+        )
+    ]
+    return Command(update=update)
+
+
+@tool("edit_identity_fact", args_schema=FactEdit)
+async def edit_identity_fact(
+    inaccurate_information: str,
+    corrected_information: str,
+    correction_context: str = "",
+    # Hidden from the model.
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+) -> GlobalState:
+    """
+    <INSTRUCTIONS>
+    EDIT a fact ALREADY STORED about you (the avatar) in the vectorstore. Call this tool
+    whenever the user says a fact you already hold is wrong or inaccurate AND supplies the
+    replacement. Provide the first-person replacement in ``corrected_information`` (change
+    only the grammatical person, never other specifics). The matched document is edited in
+    place: only the inaccurate portion changes, every other fact in the document survives;
+    a document holding only that one fact is rewritten wholesale.
+
+    This tool edits a fact you ALREADY HOLD. A brand-new fact you do not yet hold goes to
+    ``update_self_identity_mem_from_user_txt`` instead; removing a fact with NO replacement
+    goes to ``delete_identity_fact``. Decide by whether the fact already exists about you,
+    not by surface words like "wrong" or "nonsense".
+
+    Call this ONCE PER DISTINCT stored fact. If the user corrects several independent facts
+    in one message (e.g. "my name is Shivon and I was never at the University of Alberta"),
+    make a SEPARATE call for each one. Each call finds and fixes every stored copy of that
+    one fact across your identity namespaces — including a single offending sentence buried
+    inside a long direct quote.
+
+    After you call this, the owner is shown each matched document individually and chooses,
+    per document, to leave it unchanged (the default — falsely-retrieved documents are kept
+    safe), accept the suggested in-place edit, rewrite it themselves, or remove it. They may
+    also cancel the whole correction. Nothing is saved without the owner's per-document
+    approval, so you do not need to enumerate the documents yourself.
+    </INSTRUCTIONS>
+
+    <RESTRICTIONS>
+    Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
+    Do NOT use this to remove a fact with no replacement — use ``delete_identity_fact``.
+    Do NOT use this for facts about the USER.
+    Only the avatar's creator may correct its identity (enforced server-side).
+    </RESTRICTIONS>
+
+    <EXAMPLE edit>
+    User: "That's wrong — I was actually born in Ottawa, not Toronto."
+      inaccurate_information: "I was born in Toronto."
+      corrected_information:  "I was born in Ottawa."
+      correction_context:     "I was told I was born in Ottawa, not Toronto."
+    </EXAMPLE edit>
+
+    Args:
+        inaccurate_information: The wrong claim (search query) phrased as the stored fact.
+        corrected_information: The corrected fact, rewritten in first person.
+        correction_context: Concise context for the corrected fact.
+    """
+    return await _run_identity_fact_mutation(
+        runtime,
+        inaccurate_information=inaccurate_information,
+        corrected_information=corrected_information,
+        correction_context=correction_context,
+        is_deletion=False,
+    )
+
+
+@tool("delete_identity_fact", args_schema=FactDeletion)
+async def delete_identity_fact(
+    inaccurate_information: str,
+    correction_context: str = "",
+    # Hidden from the model.
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+) -> GlobalState:
+    """
+    <INSTRUCTIONS>
+    DELETE a fact ALREADY STORED about you (the avatar) in the vectorstore. Call this tool
+    when the user says a stored fact never happened or must be forgotten, with NO
+    replacement (e.g. "that never happened", "please forget your height", "delete the
+    information about X").
+
+    When a matched document holds ONLY that fact, the document is removed. When it holds
+    the fact PLUS other facts, the offending portion is redacted (edited out) and the other
+    facts survive — the owner may still elect to remove the whole document. When it is
+    ambiguous whether to edit or remove, the suggestion leans toward an edit; the owner
+    decides in the approval panel.
+
+    This tool deletes a fact you ALREADY HOLD. If the user presents information you do not
+    yet hold (even phrased negatively, e.g. "you never wore braces" when nothing about
+    braces is stored), call ``update_self_identity_mem_from_user_txt`` to CREATE that fact
+    instead; replacing a fact with a correction goes to ``edit_identity_fact``.
+
+    Call this ONCE PER DISTINCT stored fact. Each call finds every stored copy of that one
+    fact across your identity namespaces — including a single offending sentence buried
+    inside a long direct quote.
+
+    After you call this, the owner is shown each matched document individually and chooses,
+    per document, to leave it unchanged (the default — falsely-retrieved documents are kept
+    safe), accept the suggested redaction, rewrite it themselves, or remove it entirely.
+    They may also cancel the whole correction. Nothing is saved without the owner's
+    per-document approval.
+    </INSTRUCTIONS>
+
+    <RESTRICTIONS>
+    Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
+    Do NOT use this to replace a fact with a correction — use ``edit_identity_fact``.
+    Do NOT use this for facts about the USER.
+    Only the avatar's creator may correct its identity (enforced server-side).
+    </RESTRICTIONS>
+
+    <EXAMPLE delete>
+    User: "That never happened — I have no association with the University of Alberta."
+      inaccurate_information: "I've also worked with University of Alberta."
+      correction_context:     "I was told I have no association with University of Alberta."
+    </EXAMPLE delete>
+
+    Args:
+        inaccurate_information: The claim the user says never happened (search query).
+        correction_context: Concise context for the removal.
+    """
+    return await _run_identity_fact_mutation(
+        runtime,
+        inaccurate_information=inaccurate_information,
+        corrected_information="",
+        correction_context=correction_context,
+        is_deletion=True,
     )
 
 

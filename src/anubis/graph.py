@@ -68,7 +68,6 @@ from src.anubis.utils.utility import format_docs
 
 """ NODES """
 
-
 def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
     """Merge streamed chunks into a single AIMessage for graph state."""
     if isinstance(full, AIMessage):
@@ -329,11 +328,26 @@ async def message_interface(
 
     user_state.update(updated_user_state)
     assistant_state.update(updated_assistant_state)
+    
+    assistant_id = assistant_state.get("assistant_id", None)
+    user_id = user_state.get("user_id", None)
+    user_is_creator = state.get("user_is_creator", None)
+
+    # verify the user is creator
+    if (
+        assistant_id is not None 
+        and user_id is not None 
+        and user_is_creator is None
+    ):
+        creator_id_dict = await runtime.store.aget((assistant_id, 'creator_id'), key='creator_id')
+        creator_id = getattr(creator_id_dict,"value", {}).get("value", "")
+        user_is_creator = user_id == creator_id
 
     return {
         "messages": state["messages"],
         "assistant_state": assistant_state,
         "user_state": user_state,
+        "user_is_creator": user_is_creator
     }
 
 
@@ -526,7 +540,7 @@ async def think(
           deep agent's final state so the outer state stays in sync.
     """
     # The deep agent is checkpointed on its own deterministic thread so a
-    # human-in-the-loop ``interrupt`` raised mid-tool (e.g. ``correct_identity_fact``)
+    # human-in-the-loop ``interrupt`` raised mid-tool (e.g. ``edit_identity_fact``)
     # is durable. ``store`` is passed explicitly because under its own checkpointer the
     # agent no longer inherits it implicitly from the parent run.
     checkpointer = get_deep_agent_checkpointer()
@@ -623,14 +637,20 @@ async def think(
         "internal_thoughts": [*intermediate, final_message],
     }
 
+    # ``system_message`` replaces via its pinned UUID (add_messages). The document
+    # channels are forwarded as replace-snapshots: the deep agent's final lists are
+    # already merged/deduped/pruned by ``load_consciousness``, so the outer state must
+    # adopt them verbatim — the default append reducer would resurrect stale copies
+    # (e.g. a document the edit/delete tools just removed).
+    if final_output.get("system_message") is not None:
+        update["system_message"] = final_output["system_message"]
     for key in (
-        "system_message",
         "user_identity_documents",
         "assistant_identity_documents",
         "recalled_memory_documents",
     ):
         if key in final_output and final_output[key] is not None:
-            update[key] = final_output[key]
+            update[key] = {"op": "replace", "docs": list(final_output[key])}
 
     return update
 

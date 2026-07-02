@@ -14,7 +14,11 @@ from src.anubis.utils.context_compression import (
     truncate_string_to_token_limit,
 )
 from src.anubis.utils.state import GlobalState
-from src.anubis.utils.utility import format_docs, reduce_docs
+from src.anubis.utils.utility import (
+    format_docs,
+    merge_dedup_threshold_documents,
+    reduce_docs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +194,7 @@ async def _build_consciousness_system_message_update(
 
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
+    user_is_creator = state.get('user_is_creator', False)
 
     # Update Name and Description of User and Assistant if provided in the context
     logger.info(f"conscioussness breakpoint")
@@ -319,7 +324,15 @@ async def _build_consciousness_system_message_update(
         if item.score and item.score > _FILTER_SCORE
     ]
 
-    user_identity = reduce_docs([], user_identity_document_items)
+    # STATEFUL: merge the docs persisted in graph state with this turn's retrieval,
+    # de-duplicated by stable id (the fresh store copy wins, so edits are reflected).
+    # Identity channels are never salience-pruned — the avatar must not forget identity.
+    user_identity = await merge_dedup_threshold_documents(
+        state.get("user_identity_documents"),
+        user_identity_document_items,
+        query,
+        apply_threshold=False,
+    )
 
     """ 
     
@@ -340,7 +353,16 @@ async def _build_consciousness_system_message_update(
     # IDENTITY RELATED FACTS ARE NOT FILTERED TO PERSIST FACTS OF THE AVATAR'S IDENTITY.
     # assistant_identity_document_items = [item for item in assistant_identity_document_items if item.score and item.score > _FILTER_SCORE]
 
-    assistant_identity = reduce_docs([], assistant_identity_document_items)
+    # STATEFUL: merge the persisted assistant identity docs with this turn's retrieval
+    # (fresh store copy wins on id collision so in-place edits show new content; docs
+    # deleted from the store were pruned from state by the edit/delete tools). Never
+    # salience-pruned — the avatar must not forget its own identity.
+    assistant_identity = await merge_dedup_threshold_documents(
+        state.get("assistant_identity_documents"),
+        assistant_identity_document_items,
+        query,
+        apply_threshold=False,
+    )
 
     """ 
 
@@ -365,8 +387,14 @@ async def _build_consciousness_system_message_update(
     # IDENTITY RELATED FACTS ARE NOT FILTERED TO PERSIST FACTS OF THE AVATAR'S IDENTITY.
     # retrieved_identity_memories_items = [item for item in retrieved_identity_memories_items if item.score and item.score > _FILTER_SCORE]
 
-    retrieved_identity_memories = reduce_docs([], retrieved_identity_memories_items)
-    assistant_identity.extend(retrieved_identity_memories)
+    # Merged into the same persisted channel: prior state already holds identity_memory
+    # docs, so union via the dedup helper instead of a blind extend (fresh copy wins).
+    assistant_identity = await merge_dedup_threshold_documents(
+        assistant_identity,
+        retrieved_identity_memories_items,
+        query,
+        apply_threshold=False,
+    )
 
     """ 
     
@@ -419,15 +447,19 @@ async def _build_consciousness_system_message_update(
         limit=_RETRIEVAL_LIMIT,
     )
 
-    # Filter the retrieved documents to a salience threshold
-    retrieved_memories_items = [
-        item
-        for item in retrieved_memories_items
-        if item.score and item.score > _FILTER_SCORE
-    ]
-
-    # Coerce into document objects from Search Items
-    retrieved_memories = reduce_docs([], retrieved_memories_items)
+    # STATEFUL + SALIENCE-PRUNED: episodic memory is the one channel that is
+    # re-scored against the current query each turn. Persisted state memories are
+    # merged with the fresh retrieval, de-duplicated (fresh copy wins), and every
+    # surviving doc must clear the salience threshold — freshly retrieved items
+    # reuse their store score, prior-state docs are re-embedded against the query —
+    # so stale low-salience memories fall out of state instead of accumulating.
+    retrieved_memories = await merge_dedup_threshold_documents(
+        state.get("recalled_memory_documents"),
+        retrieved_memories_items,
+        query,
+        apply_threshold=True,
+        threshold=_FILTER_SCORE,
+    )
 
     """ 
     
@@ -569,6 +601,7 @@ async def _build_consciousness_system_message_update(
         user_description=user_description,
         user_identity=user_identity,
         system_time=system_time,
+        user_is_creator=user_is_creator
     )
 
     logger.info(f"populated_template: {populated_identity_template}")
@@ -580,10 +613,13 @@ async def _build_consciousness_system_message_update(
 
     _write_dev_system_prompt(system_message_str, runtime)
 
+    # Replace-snapshots: each persisted doc channel becomes exactly the merged,
+    # de-duplicated, (memory-only) salience-pruned set built above — instead of the
+    # default append, which would accumulate stale/edited/deleted copies across turns.
     input_update = {
-        "user_identity_documents": user_identity,
-        "assistant_identity_documents": assistant_identity,
-        "recalled_memory_documents": retrieved_memories,
+        "user_identity_documents": {"op": "replace", "docs": user_identity},
+        "assistant_identity_documents": {"op": "replace", "docs": assistant_identity},
+        "recalled_memory_documents": {"op": "replace", "docs": retrieved_memories},
         "system_message": [
             SystemMessage(
                 content=system_message_str, id="00000000-0000-0000-0000-0000000000000"

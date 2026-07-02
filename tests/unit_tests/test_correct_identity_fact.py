@@ -1,11 +1,14 @@
-"""Unit tests for the conversational fact-correction tool.
+"""Unit tests for the conversational fact-correction tools.
 
-Covers the deterministic core — multi-namespace search (whole-document for atomic facts,
-sentence-level for long verbatim documents), in-place rewrite, sentence redaction, and
-deletion — plus the tool's human-in-the-loop decision handling (accept / remove / skip +
-owner guard). The LangGraph ``interrupt`` is monkeypatched to a canned decision, and the
-runtime sentence embedder is monkeypatched to a deterministic bag-of-words scorer, so the
-tool can be exercised without a live agent/checkpointer or a model download.
+``edit_identity_fact`` (replace a stored fact with a correction) and
+``delete_identity_fact`` (remove a fact the user says never happened) share one body
+(``_run_identity_fact_mutation``). Covers the deterministic core — multi-namespace search
+(whole-document for atomic facts, sentence-level for long verbatim documents), in-place
+rewrite, sentence redaction, and deletion — plus the human-in-the-loop decision handling
+(accept / remove / skip + owner guard). The LangGraph ``interrupt`` is monkeypatched to a
+canned decision, and the runtime sentence embedder is monkeypatched to a deterministic
+bag-of-words scorer, so the tools can be exercised without a live agent/checkpointer or a
+model download.
 """
 
 import math
@@ -20,7 +23,8 @@ from langgraph.store.memory import InMemoryStore
 import src.anubis.utils.tools.identity.identity_tools as identity_tools
 from src.anubis.utils.tools.identity.identity_tools import (
     apply_fact_correction,
-    correct_identity_fact,
+    delete_identity_fact,
+    edit_identity_fact,
     find_fact_matches,
     wrap_fact_with_context,
 )
@@ -173,9 +177,13 @@ class _FakeRuntime:
         }
 
 
-def _tool_coroutine():
+def _edit_coroutine():
     # The @tool wrapper exposes the async implementation on ``.coroutine``.
-    return correct_identity_fact.coroutine
+    return edit_identity_fact.coroutine
+
+
+def _delete_coroutine():
+    return delete_identity_fact.coroutine
 
 
 async def _read_doc(store, namespace, key):
@@ -401,13 +409,12 @@ async def test_delete_flow_removes_context_diluted_media_fact(monkeypatch):
         }
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
-    cmd = await _tool_coroutine()(
+    cmd = await _delete_coroutine()(
         inaccurate_information=phone_fact,
-        corrected_information="",
         correction_context="That is not my number.",
-        correction_kind="delete",
         runtime=_FakeRuntime(store),
     )
+    assert captured["payload"]["correction_kind"] == "delete"
     assert captured["payload"]["matches"][0]["recommended_action"] == "remove"
     assert await store.aget((CREATOR, ASSISTANT, "identity"), key) is None
     assert "Deleted" in cmd.update["messages"][0].content
@@ -499,15 +506,17 @@ async def test_tool_approve_corrects_fact_and_redacts_quote(monkeypatch):
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
 
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="I was told I was born in Ottawa.",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
 
     assert captured["payload"]["kind"] == "fact_correction"
+    # The split tools keep the interrupt payload shape byte-compatible: the edit tool
+    # always reports correction_kind "update" (the delete tool reports "delete").
+    assert captured["payload"]["correction_kind"] == "update"
     kinds = {m["kind"] for m in captured["payload"]["matches"]}
     assert kinds == {"fact", "sentence"}
 
@@ -516,6 +525,9 @@ async def test_tool_approve_corrects_fact_and_redacts_quote(monkeypatch):
     assert QUOTE_OFFENDING not in quote_kwargs["page_content"]
     assert RIGHT_FACT in quote_kwargs["page_content"]
     assert "Applied 2 change(s)" in cmd.update["messages"][0].content
+    # The stale pre-edit copy is pruned from the persisted identity channel; the
+    # post-tool consciousness refresh re-adds the fresh (edited) store copy.
+    assert cmd.update["assistant_identity_documents"]["op"] == "remove"
 
 
 @pytest.mark.asyncio
@@ -533,15 +545,18 @@ async def test_tool_delete_removes_atomic_fact(monkeypatch):
         },
     )
 
-    cmd = await _tool_coroutine()(
+    cmd = await _delete_coroutine()(
         inaccurate_information=WRONG_FACT,
-        corrected_information="",
         correction_context="That never happened.",
-        correction_kind="delete",
         runtime=_FakeRuntime(store),
     )
     assert await store.aget((CREATOR, ASSISTANT, "identity"), key) is None
     assert "Deleted" in cmd.update["messages"][0].content
+    # The stale state copy is pruned from the persisted channel so the post-tool
+    # consciousness refresh cannot re-add the just-deleted document from prior state.
+    prune = cmd.update["assistant_identity_documents"]
+    assert prune["op"] == "remove"
+    assert key in prune["keys"]
 
 
 @pytest.mark.asyncio
@@ -566,11 +581,10 @@ async def test_tool_accept_uses_owner_revision(monkeypatch):
             ],
         },
     )
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
@@ -599,11 +613,10 @@ async def test_legacy_edit_action_aliases_accept(monkeypatch):
             ],
         },
     )
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
@@ -615,11 +628,10 @@ async def test_tool_reject_leaves_store_untouched(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     monkeypatch.setattr(identity_tools, "interrupt", lambda payload: {"type": "reject"})
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
@@ -636,11 +648,10 @@ async def test_tool_owner_guard_blocks_non_creator(monkeypatch):
         raise AssertionError("interrupt must not be reached for a non-owner")
 
     monkeypatch.setattr(identity_tools, "interrupt", _should_not_run)
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store, requester="someone-else"),
     )
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
@@ -667,11 +678,10 @@ async def test_payload_exposes_one_editable_item_per_match(monkeypatch):
         return {"type": "cancel"}
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     payload = captured["payload"]
@@ -724,11 +734,10 @@ async def test_per_document_edits_apply_distinct_text(monkeypatch):
         }
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     meta_a = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key_a))[
@@ -771,11 +780,10 @@ async def test_excluded_document_is_left_untouched(monkeypatch):
         }
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     included_key = captured["payload"]["matches"][0]["key"]
@@ -799,11 +807,10 @@ async def test_default_skip_leaves_everything_untouched(monkeypatch):
     store = _make_store()
     key = await _seed(store, (CREATOR, ASSISTANT, "identity"), WRONG_FACT)
     monkeypatch.setattr(identity_tools, "interrupt", lambda payload: {"type": "apply"})
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
@@ -827,11 +834,10 @@ async def test_accept_applies_model_suggestion(monkeypatch):
             ],
         },
     )
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,  # echoed by the fake per-document suggester
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
@@ -856,11 +862,10 @@ async def test_remove_on_update_deletes_the_fact(monkeypatch):
             ],
         },
     )
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     assert await store.aget((CREATOR, ASSISTANT, "identity"), key) is None
@@ -895,11 +900,10 @@ async def test_loose_match_recommends_leave_unchanged_with_empty_suggestion(
         return {"type": "cancel"}
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     item = captured["payload"]["matches"][0]
@@ -921,11 +925,10 @@ async def test_update_recommends_accept_with_populated_suggestion(monkeypatch):
         return {"type": "cancel"}
 
     monkeypatch.setattr(identity_tools, "interrupt", _fake_interrupt)
-    await _tool_coroutine()(
+    await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,  # echoed by the fake suggester
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     item = captured["payload"]["matches"][0]
@@ -952,11 +955,9 @@ async def test_delete_recommends_remove_only_when_nothing_true_remains(monkeypat
         return ("", "I was told that never happened.", True)
 
     monkeypatch.setattr(identity_tools, "_suggest_correction", _suggest_strip_all)
-    await _tool_coroutine()(
+    await _delete_coroutine()(
         inaccurate_information=WRONG_FACT,
-        corrected_information="",
         correction_context="That never happened.",
-        correction_kind="delete",
         runtime=_FakeRuntime(store),
     )
     assert captured["payload"]["matches"][0]["recommended_action"] == "remove"
@@ -967,11 +968,9 @@ async def test_delete_recommends_remove_only_when_nothing_true_remains(monkeypat
         return ("I love hockey.", "ctx", True)
 
     monkeypatch.setattr(identity_tools, "_suggest_correction", _suggest_keep_rest)
-    await _tool_coroutine()(
+    await _delete_coroutine()(
         inaccurate_information=WRONG_FACT,
-        corrected_information="",
         correction_context="That never happened.",
-        correction_kind="delete",
         runtime=_FakeRuntime(store),
     )
     item = captured["payload"]["matches"][0]
@@ -1038,11 +1037,10 @@ async def test_accept_with_empty_window_leaves_document_unchanged(monkeypatch):
             ],
         },
     )
-    cmd = await _tool_coroutine()(
+    cmd = await _edit_coroutine()(
         inaccurate_information=WRONG_FACT,
         corrected_information=RIGHT_FACT,
         correction_context="ctx",
-        correction_kind="update",
         runtime=_FakeRuntime(store),
     )
     # The document still exists and is unchanged (not deleted by the empty accept).

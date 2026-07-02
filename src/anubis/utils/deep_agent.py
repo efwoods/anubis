@@ -47,8 +47,9 @@ from src.anubis.utils.tools.consciousness import (
     load_consciousness_tool,
 )
 from src.anubis.utils.tools.identity.identity_tools import (
-    correct_identity_fact,
     create_episodic_memory,
+    delete_identity_fact,
+    edit_identity_fact,
     learn_information_about_the_user,
     recall_memories,
     update_self_identity_mem_from_user_txt,
@@ -63,7 +64,8 @@ IDENTITY_TOOLS = [
     recall_memories,
     update_self_identity_mem_from_user_txt,
     learn_information_about_the_user,
-    correct_identity_fact,
+    edit_identity_fact,
+    delete_identity_fact,
 ]
 """Tools whose successful execution should trigger a ``load_consciousness`` refresh.
 
@@ -132,7 +134,8 @@ def build_avatar_deep_agent(
             of the identity tool suite + ``load_consciousness_tool``.
             Reserved for future analysis / OS-query / report tools.
         checkpointer: Optional persistent checkpointer. Required for
-            human-in-the-loop tools (``correct_identity_fact``) so an
+            human-in-the-loop tools (``edit_identity_fact`` /
+            ``delete_identity_fact``) so an
             ``interrupt`` raised mid-tool is durable and resumable. When
             ``None`` the agent runs without its own persistence (the outer
             workflow owns it) — the legacy behavior for non-interrupting turns.

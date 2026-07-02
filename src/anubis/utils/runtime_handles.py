@@ -2,7 +2,8 @@
 
 The avatar deep agent is rebuilt inside the ``think`` node on every turn, but a
 human-in-the-loop ``interrupt`` raised by a deep-agent tool (e.g.
-``correct_identity_fact``) must survive across the outer graph's interrupt → resume
+``edit_identity_fact`` / ``delete_identity_fact``) must survive across the outer
+graph's interrupt → resume
 passes. That requires the deep agent to be compiled with ONE persistent
 checkpointer shared across ``think`` invocations — not a fresh in-memory one each
 call. The FastAPI lifespan owns the ``AsyncPostgresSaver`` (built on the shared

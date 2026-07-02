@@ -6,30 +6,30 @@ vector store backends, specifically Elasticsearch, Pinecone, and MongoDB.
 The retrievers support filtering results by user_id to ensure data isolation between users.
 """
 
+import asyncio
+import logging
 import os
-from contextlib import contextmanager, asynccontextmanager
-from typing import Generator, AsyncGenerator
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncGenerator, Generator
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStoreRetriever
 
-import asyncio
-
-import logging
 logger = logging.getLogger(__name__)
+
 
 ## Encoder constructors
 async def make_text_encoder(model: str = "microsoft/harrier-oss-v1-270m") -> Embeddings:
     """Connect to the configured text encoder."""
     from langchain_huggingface import HuggingFaceEmbeddings
+
     logger.info(f"Make text encoder  ENTRYPOINT")
     embeddings = await asyncio.to_thread(
         HuggingFaceEmbeddings,
         model_name=model,
         model_kwargs={"local_files_only": False, "trust_remote_code": False},
         # Optional: specify exact cache path
-        cache_folder="src/models/"
+        cache_folder="src/models/",
     )
 
     return embeddings
-

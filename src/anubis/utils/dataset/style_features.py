@@ -170,7 +170,9 @@ FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
     "key_phrase_rate": "Signature Key-Phrase Rate (per word)",
 }
 
-assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
+assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), (
+    f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_NAMES_HUMAN_LEGIBLE)}"
+)
 
 # One-line plain-language description per feature, written for the LLM that reads
 # the style profile. Each states the unit/range, the typical band, and crucially
@@ -218,7 +220,9 @@ FEATURE_DESCRIPTIONS: Dict[str, str] = {
     "key_phrase_rate": "Occurrences of the avatar's auto-discovered signature key-phrases (2–4 word recurring expressions like 'you know', 'got it') per total word in the text. 0 or greater, usually small (~0.0–0.1). Higher means the writing leans on the speaker's characteristic fixed phrasings; 0 means none of the signature phrases appear.",
 }
 
-assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
+assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), (
+    f"expected {len(FEATURE_NAMES)} features, found {len(FEATURE_DESCRIPTIONS)}"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -228,20 +232,32 @@ assert len(FEATURE_NAMES) == len(FEATURE_DESCRIPTIONS), f"expected {len(FEATURE_
 # Logical "bridge" words counted for transition density.
 _TRANSITION_WORDS = frozenset(
     {
-        "however", "therefore", "furthermore", "moreover", "nevertheless",
-        "consequently", "meanwhile", "conversely", "thus", "hence",
-        "accordingly", "additionally", "similarly", "instead", "otherwise",
+        "however",
+        "therefore",
+        "furthermore",
+        "moreover",
+        "nevertheless",
+        "consequently",
+        "meanwhile",
+        "conversely",
+        "thus",
+        "hence",
+        "accordingly",
+        "additionally",
+        "similarly",
+        "instead",
+        "otherwise",
         "subsequently",
     }
 )
 
 # Penn-Treebank tag prefixes -> coarse POS class. nltk.pos_tag emits PTB tags.
-_NOUN_TAGS = ("NN",)                       # NN, NNS, NNP, NNPS
-_VERB_TAGS = ("VB",)                       # VB, VBD, VBG, VBN, VBP, VBZ
-_ADJECTIVE_TAGS = ("JJ",)                  # JJ, JJR, JJS
-_ADVERB_TAGS = ("RB",)                     # RB, RBR, RBS
-_PRONOUN_TAGS = ("PRP", "WP")              # PRP, PRP$, WP, WP$
-_PREPOSITION_TAGS = ("IN", "TO")           # IN (prep/subord-conj), TO
+_NOUN_TAGS = ("NN",)  # NN, NNS, NNP, NNPS
+_VERB_TAGS = ("VB",)  # VB, VBD, VBG, VBN, VBP, VBZ
+_ADJECTIVE_TAGS = ("JJ",)  # JJ, JJR, JJS
+_ADVERB_TAGS = ("RB",)  # RB, RBR, RBS
+_PRONOUN_TAGS = ("PRP", "WP")  # PRP, PRP$, WP, WP$
+_PREPOSITION_TAGS = ("IN", "TO")  # IN (prep/subord-conj), TO
 
 _URL_RE = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\w+")
@@ -312,7 +328,9 @@ def _sentences(text: str) -> List[str]:
 
         sents = [s for s in sent_tokenize(text or "") if s.strip()]
     except Exception:
-        sents = [s.strip() for s in _SENTENCE_FALLBACK_RE.split(text or "") if s.strip()]
+        sents = [
+            s.strip() for s in _SENTENCE_FALLBACK_RE.split(text or "") if s.strip()
+        ]
     return sents or ([text.strip()] if (text or "").strip() else [])
 
 
@@ -574,18 +592,30 @@ def compute_mahalanobis_distance(synthetic_features, reference_feature_array):
     if synthetic_features.ndim > 1:
         for synthetic_feature_index in range(0, synthetic_features.shape[0]):
             synthetic_feature = synthetic_features[synthetic_feature_index, :]
-            synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
+            synth_scaled = scaler.transform(synthetic_feature.reshape(1, -1))
             synth_scaled_flattened = synth_scaled.flatten()
             synth_scaled_series = pd.Series(synth_scaled_flattened)
 
-            M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
+            M_d = np.dot(
+                np.dot(
+                    (synth_scaled_series - corpus_scaled_mean_series).T,
+                    corpus_scaled_reg_cov_inv,
+                ),
+                (synth_scaled_series - corpus_scaled_mean_series),
+            )
             M_d_arr.append(M_d)
     else:
         synthetic_feature = synthetic_features
-        synth_scaled = scaler.transform(synthetic_feature.reshape(1,-1))
+        synth_scaled = scaler.transform(synthetic_feature.reshape(1, -1))
         synth_scaled_flattened = synth_scaled.flatten()
         synth_scaled_series = pd.Series(synth_scaled_flattened)
-        M_d = np.dot(np.dot((synth_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (synth_scaled_series - corpus_scaled_mean_series))
+        M_d = np.dot(
+            np.dot(
+                (synth_scaled_series - corpus_scaled_mean_series).T,
+                corpus_scaled_reg_cov_inv,
+            ),
+            (synth_scaled_series - corpus_scaled_mean_series),
+        )
         M_d_arr.append(M_d)
 
     return M_d_arr
@@ -605,10 +635,10 @@ def compute_empirical_distribution(reference_dataset_arr):
 
     for i in range(0, reference_dataset_df.values.shape[0]):
         data = reference_dataset_df.values[i, :]
-        corpus = reference_dataset_df.drop(reference_dataset_df.index[i])    
+        corpus = reference_dataset_df.drop(reference_dataset_df.index[i])
         corpus_scaled = scaler.fit_transform(corpus.values)
         corpus_scaled_mean = np.mean(corpus_scaled, axis=0)
-        corpus_scaled_reg = LedoitWolf().fit(corpus_scaled)    
+        corpus_scaled_reg = LedoitWolf().fit(corpus_scaled)
         corpus_scaled_reg_cov_inv = np.linalg.inv(corpus_scaled_reg.covariance_)
 
         data_scaled = scaler.transform(data.reshape(1, -1))
@@ -616,8 +646,16 @@ def compute_empirical_distribution(reference_dataset_arr):
 
         data_scaled_series = pd.Series(data_scaled)
         corpus_scaled_mean_series = pd.Series(corpus_scaled_mean)
-        
-        M_d_squared_arr.append(np.dot(np.dot((data_scaled_series - corpus_scaled_mean_series).T, corpus_scaled_reg_cov_inv), (data_scaled_series - corpus_scaled_mean_series)))
+
+        M_d_squared_arr.append(
+            np.dot(
+                np.dot(
+                    (data_scaled_series - corpus_scaled_mean_series).T,
+                    corpus_scaled_reg_cov_inv,
+                ),
+                (data_scaled_series - corpus_scaled_mean_series),
+            )
+        )
 
     return M_d_squared_arr
 
@@ -908,7 +946,9 @@ def sanitize_ground_truth_feature_matrix(feature_matrix: Any) -> Any:
 MAX_CALIBRATION_ROWS = 1500
 
 
-def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tuple[str, str]:
+def recompute_ground_truth_artifacts(
+    ground_truth_text_features_arr: Any,
+) -> Tuple[str, str]:
     """Recalibrate the empirical threshold and IsolationForest from the corpus.
 
     Given the reconstructed ``(n_docs, len(FEATURE_NAMES))`` corpus array, returns
@@ -951,7 +991,9 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
     ground_truth_empirical_arr = compute_empirical_distribution(calibration_arr)
     ground_truth_Q3 = np.percentile(ground_truth_empirical_arr, 75)
     ground_truth_Q1 = np.percentile(ground_truth_empirical_arr, 25)
-    ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (ground_truth_Q3 - ground_truth_Q1)
+    ground_truth_text_empirical_threshold = ground_truth_Q3 + 1.5 * (
+        ground_truth_Q3 - ground_truth_Q1
+    )
 
     # Recalibrate the Isolation Forest for prediction and explainable values.
     model = IsolationForest().fit(calibration_arr)
@@ -964,23 +1006,25 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
     return ground_truth_text_empirical_threshold_list_str, model_b64_pkl
 
 async def build_style_profile_str(ground_truth_text_features_arr) -> str:
-    """ Build the LLM interpretable string to allow for the 
-    median calculated features of the direct quotes of the 
-    target to influence the writing of the avatar. 
-    Allows the features to be LLM legible. 
+    """Build the LLM interpretable string to allow for the
+    median calculated features of the direct quotes of the
+    target to influence the writing of the avatar.
+    Allows the features to be LLM legible.
     """
     import numpy as np
     import pandas as pd
 
-    ground_truth_text_features_median = np.array(list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values))
-    
+    ground_truth_text_features_median = np.array(
+        list(pd.DataFrame(ground_truth_text_features_arr).median(axis=0).values)
+    )
+
     # ground_truth_text_features_median expected shape: (n_features, )
-    
+
     style_profile_str = ""
 
     idx = 0
     for name in FEATURE_NAMES:
         style_profile_str += f"{FEATURE_NAMES_HUMAN_LEGIBLE[name]}: {ground_truth_text_features_median[idx]}; Description: {FEATURE_DESCRIPTIONS[name]}\n\n"
-        idx +=1
+        idx += 1
 
     return style_profile_str

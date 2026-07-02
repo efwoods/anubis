@@ -10,30 +10,28 @@ import math
 
 logger = logging.getLogger(__name__)
 
-from langgraph.graph import StateGraph, START, END
-
 # NOTE: ``retrieval_graph`` was imported here but never referenced in this module.
 # Runtime logs showed ``from ... retrieval_graph import retrieval_graph`` alone took
 # ~13 s per cold webapp worker because ``retrieval_graph`` pulls heavy retrieval deps.
-
 from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
 
 load_dotenv()
 
-from langchain_core.runnables import RunnableConfig, Runnable
-from src.anubis.utils.utility import (
-    extract_user_id_assistant_id,
-    configure_assistant_context,
-)
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Literal
+
+from langchain_core.runnables import Runnable, RunnableConfig
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field
 
 from src.anubis.utils.schema import RouteDecision
-
-from pydantic import BaseModel, Field
-from typing import Literal
-from langgraph.types import Command
-
-import logging
-from datetime import datetime, timezone
+from src.anubis.utils.utility import (
+    configure_assistant_context,
+    extract_user_id_assistant_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,30 +39,33 @@ logger = logging.getLogger(__name__)
 # imported here and below but never referenced in this file (the only
 # ``create_agent(...)`` site is commented out at ~line 313).  Removed to skip the
 # eager ``langchain.agents`` package load on every cold start.
+import pickle
 from typing import Any
 
+import numpy as np
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+)
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk
-from langgraph.runtime import Runtime
 from langgraph.config import get_stream_writer
+from langgraph.graph import MessagesState
+from langgraph.runtime import Runtime
 
-from src.anubis.utils.model import init_model
-
-from src.anubis.utils.state import GlobalState
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.deep_agent import build_avatar_deep_agent
+from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
 from src.anubis.utils.huggingface_prefetch import (
     ensure_huggingface_models_cached,
 )
-from src.anubis.utils.utility import format_docs
-
-from langgraph.graph import MessagesState
-
+from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
 from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
-from src.anubis.utils.deep_agent import build_avatar_deep_agent
-from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
-from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE, PRIVACY_POLICY
-import numpy as np
-import pickle
+from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
+from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.utility import format_docs
 
 """ NODES """
 
@@ -97,6 +98,8 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
     """ analyze the avatar_response features, compare against unmodified chatgpt responses and any existing direct quotes if possible.
     Update the metadata with the feature analysis and the results of comparison.
     """
+    import json
+
     from src.anubis.utils.dataset.style_features import (
         GROUND_TRUTH_FEATURES_DICT_KEY,
         baseline_feature_array_is_current,
@@ -107,7 +110,6 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         load_bundled_baseline_features_arr,
         sanitize_ground_truth_feature_matrix,
     )
-    import json
 
     avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
 
@@ -164,18 +166,30 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         ground_truth_text_features_by_doc_id_namespace = (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
         ground_truth_text_empirical_threshold_namespace = (user_id, assistant_id, "ground_truth_text_empirical_threshold_list_str")
 
-        baseline_features_arr_list_str_ITEM = await runtime.store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
+        baseline_features_arr_list_str_ITEM = await runtime.store.aget(
+            baseline_features_namespace, key="baseline_features_arr_list_str"
+        )
 
-        baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
+        baseline_features_arr_list_str = (
+            getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}
+        ).get("value", None)
 
         # If the baseline_features_arr has not yet been stored, store the array:
         if not baseline_features_arr_list_str:
-            _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
-            baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
+            _BASELINE_ANSWERS_RESPONSES_ARR_DIR = (
+                "src/anubis/utils/dataset/baseline_features_arr.npy"
+            )
+            baseline_features_arr = np.load(
+                _BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False
+            )
 
             baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
 
-            await runtime.store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
+            await runtime.store.aput(
+                baseline_features_namespace,
+                key="baseline_features_arr_list_str",
+                value={"value": baseline_features_arr_list_str},
+            )
 
         # Convert from str to np.array
         if isinstance(baseline_features_arr_list_str, str):
@@ -194,20 +208,30 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             )
 
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
-        M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(features_arr, baseline_features_arr)
+        M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(
+            features_arr, baseline_features_arr
+        )
 
         # Explain the result
         from src.anubis.utils.utility import compute_shap_values_against_baseline
 
-        shap_values_dict = await compute_shap_values_against_baseline(features_arr, runtime.store)
+        shap_values_dict = await compute_shap_values_against_baseline(
+            features_arr, runtime.store
+        )
 
         # Nest the distance verdict together with the SHAP explanation under a single key
         # (verdict first to match the documented output order).
         comparison_to_unmodified_llm_response_analysis = {
-            "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_baseline_chatgpt[0] <= baseline_response_threshold),
+            "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(
+                M_d_square_synth_from_baseline_chatgpt[0] <= baseline_response_threshold
+            ),
             **shap_values_dict,
         }
-        avatar_response.response_metadata.update({"comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis})
+        avatar_response.response_metadata.update(
+            {
+                "comparison_to_unmodified_llm_response_analysis": comparison_to_unmodified_llm_response_analysis
+            }
+        )
 
         # SIGNATURE KEY-PHRASE RATES — one rate per reference phrase set. The
         # ``features`` block's key_phrase_rate was measured against the ChatGPT
@@ -261,25 +285,32 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         ground_truth_text_features_model_namespace = (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl")
 
         ground_truth_text_features_model_b64_pkl_ITEM = await runtime.store.aget(
-            ground_truth_text_features_model_namespace, 
-            key="ground_truth_text_features_model_b64_pkl"
+            ground_truth_text_features_model_namespace,
+            key="ground_truth_text_features_model_b64_pkl",
         )
 
         ground_truth_text_features_by_doc_id_ITEM = await runtime.store.aget(
             ground_truth_text_features_by_doc_id_namespace,
-            key=GROUND_TRUTH_FEATURES_DICT_KEY
+            key=GROUND_TRUTH_FEATURES_DICT_KEY,
         )
 
         ground_truth_text_empirical_threshold_list_str_ITEM = await runtime.store.aget(
-            ground_truth_text_empirical_threshold_namespace, 
-            key="ground_truth_text_empirical_threshold_list_str"
+            ground_truth_text_empirical_threshold_namespace,
+            key="ground_truth_text_empirical_threshold_list_str",
         )
 
-        ground_truth_text_features_model_b64_pkl = (getattr(ground_truth_text_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_features_model_b64_pkl = (
+            getattr(ground_truth_text_features_model_b64_pkl_ITEM, "value", None) or {}
+        ).get("value", None)
 
-        ground_truth_text_features_by_doc_id_str = (getattr(ground_truth_text_features_by_doc_id_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_features_by_doc_id_str = (
+            getattr(ground_truth_text_features_by_doc_id_ITEM, "value", None) or {}
+        ).get("value", None)
 
-        ground_truth_text_empirical_threshold_list_str = (getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None) or {}).get("value", None)
+        ground_truth_text_empirical_threshold_list_str = (
+            getattr(ground_truth_text_empirical_threshold_list_str_ITEM, "value", None)
+            or {}
+        ).get("value", None)
 
         # Reconstruct the (n_docs, len(FEATURE_NAMES)) corpus array from the
         # per-document dict, then sanitize: a corpus persisted before the
@@ -303,9 +334,17 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             from src.anubis.utils.dataset.style_features import FEATURE_NAMES
 
             if isinstance(ground_truth_text_empirical_threshold_list_str, str):
-                ground_truth_text_empirical_threshold = np.array(json.loads(ground_truth_text_empirical_threshold_list_str)).flatten()
+                ground_truth_text_empirical_threshold = np.array(
+                    json.loads(ground_truth_text_empirical_threshold_list_str)
+                ).flatten()
             else:
-                ground_truth_text_empirical_threshold = np.array(ground_truth_text_empirical_threshold_list_str).flatten()
+                ground_truth_text_empirical_threshold = np.array(
+                    ground_truth_text_empirical_threshold_list_str
+                ).flatten()
+
+            ground_truth_text_features_model = pickle.loads(
+                base64.b64decode(ground_truth_text_features_model_b64_pkl)
+            )
 
             ground_truth_text_features_model = pickle.loads(base64.b64decode(ground_truth_text_features_model_b64_pkl))
 
@@ -350,18 +389,31 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             # flatten to (n_features,) so it aligns with the FEATURE_NAMES index
             # (the DataFrame expects (n_features, 1), not (1, n_features)).
             ground_truth_shap_values = np.asarray(ground_truth_shap_values).ravel()
-            ground_truth_shap_values_df = pd.DataFrame(data=ground_truth_shap_values, index=FEATURE_NAMES, columns=["ground_truth_shap_values"])
+            ground_truth_shap_values_df = pd.DataFrame(
+                data=ground_truth_shap_values,
+                index=FEATURE_NAMES,
+                columns=["ground_truth_shap_values"],
+            )
 
-            ground_truth_shap_values_dict = ground_truth_shap_values_df[ground_truth_shap_values_df['ground_truth_shap_values']!=0].to_dict()
+            ground_truth_shap_values_dict = ground_truth_shap_values_df[
+                ground_truth_shap_values_df["ground_truth_shap_values"] != 0
+            ].to_dict()
 
             # Nest the distance verdict, SHAP explanation, and isolation-forest verdict under a single key.
             comparison_to_direct_quote_response_analysis = {
-                "no_statistically_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(M_d_square_synth_from_ground_truth_corpus[0] < ground_truth_text_empirical_threshold),
+                "no_statistically_significant_difference_from_direct_quotes_using_squared_mahalanobis_distance": bool(
+                    M_d_square_synth_from_ground_truth_corpus[0]
+                    < ground_truth_text_empirical_threshold
+                ),
                 "no_statisically_significant_difference_between_sample_and_direct_quotes_dataset_according_to_isolation_forest": ground_truth_prediction,
                 "ground_truth_comparison_isolation_forest_shap_values_description": "Negative values indicate dissimilarity from direct quotes dataset. Positive values indicate similarity to direct quotes. Scale is -1 to 1.",
                 **ground_truth_shap_values_dict,
             }
-            avatar_response.response_metadata.update({"comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis})
+            avatar_response.response_metadata.update(
+                {
+                    "comparison_to_direct_quote_response_analysis": comparison_to_direct_quote_response_analysis
+                }
+            )
 
     except Exception as e:
         # Post-stream analysis is best-effort: the user has already received the
@@ -388,11 +440,26 @@ async def message_interface(
 
     user_state.update(updated_user_state)
     assistant_state.update(updated_assistant_state)
+    
+    assistant_id = assistant_state.get("assistant_id", None)
+    user_id = user_state.get("user_id", None)
+    user_is_creator = state.get("user_is_creator", None)
+
+    # verify the user is creator
+    if (
+        assistant_id is not None 
+        and user_id is not None 
+        and user_is_creator is None
+    ):
+        creator_id_dict = await runtime.store.aget((assistant_id, 'creator_id'), key='creator_id')
+        creator_id = getattr(creator_id_dict,"value", {}).get("value", "")
+        user_is_creator = user_id == creator_id
 
     return {
         "messages": state["messages"],
         "assistant_state": assistant_state,
         "user_state": user_state,
+        "user_is_creator": user_is_creator
     }
 
 
@@ -471,6 +538,93 @@ async def terms_and_services_content_moderation(
     }
     return {"moderation_response": moderation_response}
 
+
+def _deep_agent_config(
+    config: RunnableConfig, turn_key: int
+) -> tuple[RunnableConfig, str | None]:
+    """Derive the deep agent's own config + thread id from the outer config.
+
+    The deep agent is checkpointed on a deterministic per-turn thread derived from
+    ``"<outer-thread>::deepagent::<turn_key>"``. The ``turn_key`` (the outer
+    conversation length) makes the thread **unique per turn** — so checkpointed
+    deep-agent state doesn't accumulate across turns — while staying **stable across
+    the interrupt → resume of the same turn** (no message is added while paused).
+    The outer ``checkpoint_id``/``checkpoint_ns`` are dropped so the inner run isn't
+    pinned to an outer checkpoint.
+
+    The derived value is hashed through ``uuid5`` because the shared
+    ``AsyncPostgresSaver`` (langgraph-api managed schema) types its ``thread_id``
+    column as ``uuid`` — a raw ``"<uuid>::deepagent::<n>"`` string fails on the first
+    ``aget_state`` with ``InvalidTextRepresentation``. ``uuid5`` is deterministic, so
+    it preserves the "stable while paused, unique per turn" property while yielding a
+    valid UUID.
+    """
+    outer_configurable = dict((config or {}).get("configurable", {}) or {})
+    outer_thread = outer_configurable.get("thread_id")
+    deep_agent_configurable = dict(outer_configurable)
+    deep_agent_configurable.pop("checkpoint_id", None)
+    deep_agent_configurable.pop("checkpoint_ns", None)
+    if outer_thread:
+        deep_agent_configurable["thread_id"] = str(
+            uuid.uuid5(uuid.NAMESPACE_OID, f"{outer_thread}::deepagent::{turn_key}")
+        )
+    deep_agent_config: RunnableConfig = {"configurable": deep_agent_configurable}
+    return deep_agent_config, outer_thread
+
+
+async def _stream_deep_agent(
+    deep_agent, agent_input, deep_agent_config, context, writer
+):
+    """Run the deep agent (fresh input or ``Command(resume=...)``), streaming only
+    the final user-visible reply's tokens. Returns the deep agent's terminal state
+    dict (carrying ``messages`` + identity-doc snapshots), or ``None`` if it produced
+    no terminal output (e.g. it paused on an interrupt).
+
+    Same streaming heuristic as the legacy ``think`` body: tokens are emitted per
+    LLM call only while the running merged chunk shows no ``tool_calls``; once a tool
+    call appears, that call is a tool-planning turn and its tokens are dropped.
+    """
+    stream_buffers: dict[str, dict[str, Any]] = {}
+    final_output: dict[str, Any] | None = None
+
+    async for event in deep_agent.astream_events(
+        agent_input,
+        config=deep_agent_config,
+        context=context,
+        version="v2",
+    ):
+        ev_name = event.get("event")
+        if ev_name == "on_chat_model_stream":
+            # Skip internal structured-output calls (e.g. the per-document fact-correction
+            # ``ProposedFactEdit`` analyses, run concurrently inside tools). Their tokens are
+            # raw JSON, not a reply — streaming them leaks interleaved JSON into the chat.
+            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                continue
+            run_id = event.get("run_id")
+            chunk = event["data"].get("chunk")
+            if chunk is None or run_id is None:
+                continue
+            buf = stream_buffers.setdefault(
+                run_id, {"merged": None, "streamed_text": False}
+            )
+            merged_prev = buf["merged"]
+            buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
+            if not (getattr(buf["merged"], "tool_calls", None) or []):
+                delta = chunk.content
+                if isinstance(delta, str) and delta:
+                    writer({"type": "assistant_token", "text": delta})
+                    buf["streamed_text"] = True
+        elif ev_name == "on_chat_model_end":
+            stream_buffers.pop(event.get("run_id"), None)
+        elif ev_name == "on_chain_end":
+            data = event.get("data") or {}
+            output = data.get("output")
+            if isinstance(output, dict) and "messages" in output:
+                final_output = output
+
+    return final_output
+
+
 async def think(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
@@ -497,7 +651,17 @@ async def think(
         - ``system_message`` / identity-doc snapshots forwarded from the
           deep agent's final state so the outer state stays in sync.
     """
-    deep_agent = build_avatar_deep_agent(runtime.context)
+    # The deep agent is checkpointed on its own deterministic thread so a
+    # human-in-the-loop ``interrupt`` raised mid-tool (e.g. ``edit_identity_fact``)
+    # is durable. ``store`` is passed explicitly because under its own checkpointer the
+    # agent no longer inherits it implicitly from the parent run.
+    checkpointer = get_deep_agent_checkpointer()
+    # Key the deep-agent thread on the conversation length so each turn is isolated
+    # but the interrupt/resume of one turn shares a thread (stable while paused).
+    deep_agent_config, outer_thread = _deep_agent_config(config, len(state["messages"]))
+    deep_agent = build_avatar_deep_agent(
+        runtime.context, checkpointer=checkpointer, store=runtime.store
+    )
 
     deep_agent_input = {
         "messages": list(state["messages"]),
@@ -506,56 +670,50 @@ async def think(
         "assistant_identity_documents": list(
             state.get("assistant_identity_documents") or []
         ),
-        "recalled_memory_documents": list(
-            state.get("recalled_memory_documents") or []
-        ),
+        "recalled_memory_documents": list(state.get("recalled_memory_documents") or []),
         "user_state": state["user_state"],
         "assistant_state": state["assistant_state"],
         "internal_thoughts": [],
     }
-    input_messages_count = len(deep_agent_input["messages"])
+    # Slice new messages from the deep agent's persisted conversation against the
+    # outer conversation length — stable across the interrupt/resume re-run.
+    input_messages_count = len(state["messages"])
 
     writer = get_stream_writer()
-    # Per-LLM-call streaming buffers keyed by `run_id`. We emit tokens
-    # incrementally as long as the running merged chunk shows no
-    # tool_calls — once one appears, we know this call is a tool-planning
-    # turn and silently drop the rest. Same heuristic the legacy node used,
-    # applied independently to each LLM call in the deep agent's loop.
-    stream_buffers: dict[str, dict[str, Any]] = {}
-    final_output: dict[str, Any] | None = None
 
-    async for event in deep_agent.astream_events(
-        deep_agent_input,
-        config=config,
-        context=runtime.context,
-        version="v2",
-    ):
-        ev_name = event.get("event")
-        if ev_name == "on_chat_model_stream":
-            run_id = event.get("run_id")
-            chunk = event["data"].get("chunk")
-            if chunk is None or run_id is None:
-                continue
-            buf = stream_buffers.setdefault(
-                run_id, {"merged": None, "streamed_text": False}
+    # Idempotency guard: this whole node re-runs when the OUTER graph resumes. If the
+    # deep-agent thread is already paused mid-interrupt, skip the fresh run (which
+    # would re-stream the same tokens) and go straight to resuming it below.
+    can_persist = checkpointer is not None and bool(outer_thread)
+    already_paused = False
+    if can_persist:
+        snapshot = await deep_agent.aget_state(deep_agent_config)
+        already_paused = bool(snapshot.next)
+
+    final_output: dict[str, Any] | None = None
+    if not already_paused:
+        final_output = await _stream_deep_agent(
+            deep_agent, deep_agent_input, deep_agent_config, runtime.context, writer
+        )
+
+    # If the deep agent paused on an interrupt, surface it through the OUTER graph so
+    # its ``AsyncPostgresSaver`` persists the pause and the API can present the
+    # approve/edit/reject preview. On resume, the outer ``interrupt`` returns the
+    # owner's decision, which we forward into the deep agent on its own thread.
+    if can_persist:
+        snapshot = await deep_agent.aget_state(deep_agent_config)
+        pending_interrupts = [
+            intr for task in snapshot.tasks for intr in task.interrupts
+        ]
+        if pending_interrupts:
+            decision = interrupt(pending_interrupts[0].value)
+            final_output = await _stream_deep_agent(
+                deep_agent,
+                Command(resume=decision),
+                deep_agent_config,
+                runtime.context,
+                writer,
             )
-            merged_prev = buf["merged"]
-            buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
-            if not (getattr(buf["merged"], "tool_calls", None) or []):
-                delta = chunk.content
-                if isinstance(delta, str) and delta:
-                    writer({"type": "assistant_token", "text": delta})
-                    buf["streamed_text"] = True
-        elif ev_name == "on_chat_model_end":
-            stream_buffers.pop(event.get("run_id"), None)
-        elif ev_name == "on_chain_end":
-            # Capture the outermost graph's terminal output. The deep
-            # agent's compiled graph is the chain we're streaming; its
-            # final on_chain_end event carries the resulting state.
-            data = event.get("data") or {}
-            output = data.get("output")
-            if isinstance(output, dict) and "messages" in output:
-                final_output = output
 
     if final_output is None:
         logger.warning(
@@ -583,7 +741,7 @@ async def think(
         # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
         # owner-scoped, so pass the avatar OWNER's id — the same first namespace
         # element calibrate_ground_truth wrote under — not the conversing user.
-        creator_id = (
+        retrieved_user_id = (
             config.get("configurable", {})
             .get("assistant_ctx", {})
             .get("metadata", {})
@@ -593,7 +751,7 @@ async def think(
             final_message,
             runtime=runtime,
             assistant_id=state["assistant_state"]["assistant_id"],
-            user_id=creator_id,
+            user_id=retrieved_user_id,
         )
 
 
@@ -602,16 +760,23 @@ async def think(
         "internal_thoughts": [*intermediate, final_message],
     }
 
+    # ``system_message`` replaces via its pinned UUID (add_messages). The document
+    # channels are forwarded as replace-snapshots: the deep agent's final lists are
+    # already merged/deduped/pruned by ``load_consciousness``, so the outer state must
+    # adopt them verbatim — the default append reducer would resurrect stale copies
+    # (e.g. a document the edit/delete tools just removed).
+    if final_output.get("system_message") is not None:
+        update["system_message"] = final_output["system_message"]
     for key in (
-        "system_message",
         "user_identity_documents",
         "assistant_identity_documents",
         "recalled_memory_documents",
     ):
         if key in final_output and final_output[key] is not None:
-            update[key] = final_output[key]
+            update[key] = {"op": "replace", "docs": list(final_output[key])}
 
     return update
+
 
 """ GRAPH """
 
@@ -653,9 +818,7 @@ message_workflow = StateGraph(
 
 # workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
-message_workflow.add_node(
-    "resolve_human_message_images", resolve_human_message_images
-)
+message_workflow.add_node("resolve_human_message_images", resolve_human_message_images)
 message_workflow.add_node("anubis", anubis)
 
 message_workflow.add_edge(START, "chat")

@@ -1,34 +1,31 @@
-# Nodes for Identifying and Handling each media type 
+# Nodes for Identifying and Handling each media type
 
 import asyncio
-from curses import napms
-import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from langchain_core.documents import Document
-from uuid import NAMESPACE_URL, uuid4, uuid5
-import logging
+
 logger = logging.getLogger(__name__)
 import base64
-from pathlib import Path
 import json
-
-from langchain_community.document_loaders import PyPDFLoader
-import tempfile, os
-
+import os
 
 # At top of file
 import tempfile
+from pathlib import Path
 
-import base64
-from src.anubis.utils.state import GlobalState
-from src.anubis.utils.context import GlobalContext
+from langchain_community.document_loaders import PyPDFLoader
+from langgraph.config import get_stream_writer
 
 # from langgraph.config import get_store
-
 from langgraph.store.base import BaseStore
-from langgraph.config import get_stream_writer
+
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.store_cache import invalidate_store_cache_entry
 
 
 def _emit_media_progress(stage: str, **fields: Any) -> None:
@@ -125,6 +122,28 @@ def _write_dev_diarization_transcript(
     except Exception:  # pragma: no cover - dev aid must never break processing
         logger.exception("failed to write dev diarization transcript")
 
+
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.runtime import Runtime
+
+from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
+    ReferenceDocumentClassificationClass,
+)
+from src.anubis.utils.classes.URLDocumentLoaderClass import URLDocumentLoaderClass
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.model import init_image_description_model, init_model
+from src.anubis.utils.state import GlobalState
+from src.anubis.utils.utility import (
+    extract_user_id_assistant_id,
+    extract_video_audio_b64,
+    isolate_dominant_speaker_audio_b64,
+    transcribe_audio,
+    transcribe_audio_diarize,
+    transcribe_video,
+)
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
     build_all_speakers_quote_documents,
@@ -132,34 +151,11 @@ from src.subgraphs.process_media_graph.utils.helper_functions import (
     process_dialogue_json_to_documents,
     process_nontarget_text_to_identity_documents,
     process_text_media_item_target_for_vectorstore,
+    process_text_to_document,
 )
-from src.anubis.utils.classes.ReferenceDocumentClassificationClass import (
-    ReferenceDocumentClassificationClass,
+from src.subgraphs.process_media_graph.utils.utility import (
+    extract_personality_from_image,
 )
-from src.anubis.utils.classes.URLDocumentLoaderClass import URLDocumentLoaderClass
-from src.anubis.utils.utility import (
-    transcribe_audio,
-    transcribe_audio_diarize,
-    isolate_dominant_speaker_audio_b64,
-    extract_video_audio_b64,
-)
-
-from src.anubis.utils.state import GlobalState
-from src.anubis.utils.context import GlobalContext
-from langgraph.runtime import Runtime
-
-from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
-from src.anubis.utils.model import init_model, init_image_description_model
-
-from langchain.tools import tool
-
-
-from langchain_core.runnables import RunnableConfig
-from src.anubis.utils.utility import extract_user_id_assistant_id, transcribe_video
-from src.subgraphs.process_media_graph.utils.utility import extract_personality_from_image
-from src.subgraphs.process_media_graph.utils.helper_functions import process_text_to_document
 
 _ALLOWED_STILL_IMAGE_MIMES = frozenset(
     {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -265,43 +261,45 @@ def _parse_json_or_json_lines_upload(
 
 
 async def process_uploaded_files_and_label_media_type(
-    state: GlobalState, 
-    runtime: Runtime[GlobalContext], 
+    state: GlobalState,
+    runtime: Runtime[GlobalContext],
     config: RunnableConfig,
-    store: BaseStore
+    store: BaseStore,
 ) -> Dict[str, Any]:
     """
     Convert FastAPI UploadFile objects into standardized media format.
     This is the entry point for direct file uploads (not from messages).
     """
-    
+
     logger.info(f"Process uploaded files NODE")
     user_id, assistant_id = await extract_user_id_assistant_id(config)
 
-    media_files = state.get('media_files', [])
-    
+    media_files = state.get("media_files", [])
+
     if not media_files:
         logger.info("No media files to process")
         return {"media_list": []}
-    
+
     logger.info(f"Processing {len(media_files)} uploaded files")
-    
+
     media_list = []
-    
+
     for file_data in media_files:
         try:
             file_start_idx = len(media_list)
-            filename = file_data.get('filename', 'unknown')
+            filename = file_data.get("filename", "unknown")
             suffix = Path(filename).suffix
-            content_type = file_data.get('content_type', '')
-            file_bytes = file_data.get('content')
+            content_type = file_data.get("content_type", "")
+            file_bytes = file_data.get("content")
             user_id = file_data.get("user_id")
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
-            create_reference_media_from_playlist = file_data.get("create_reference_media_from_playlist", False)
+            create_reference_media_from_playlist = file_data.get(
+                "create_reference_media_from_playlist", False
+            )
             namespace_filename = file_data.get("namespace_filename")
-        
+
             logger.info(f"Processing file: {filename} ({content_type})")
 
             full_payload_uri = _full_data_uri_from_media_dict(file_data)
@@ -336,9 +334,7 @@ async def process_uploaded_files_and_label_media_type(
             if audio_url_remote:
                 mime = content_type.split(";")[0].strip().lower()
                 if not mime.startswith("audio/"):
-                    logger.warning(
-                        "Skipping remote audio with non-audio MIME %s", mime
-                    )
+                    logger.warning("Skipping remote audio with non-audio MIME %s", mime)
                     continue
                 entry = {
                     "type": "audio",
@@ -363,9 +359,7 @@ async def process_uploaded_files_and_label_media_type(
             if video_url_remote:
                 mime = content_type.split(";")[0].strip().lower()
                 if not mime.startswith("video/"):
-                    logger.warning(
-                        "Skipping remote video with non-video MIME %s", mime
-                    )
+                    logger.warning("Skipping remote video with non-video MIME %s", mime)
                     continue
                 entry = {
                     "type": "video",
@@ -422,33 +416,35 @@ async def process_uploaded_files_and_label_media_type(
                     entry["base64_encoded_str"] = full_payload_uri
                 media_list.append(entry)
                 continue
-            
+
             # Log files are captured verbatim as a single reference document
             # (no classification, no chunking), regardless of the declared
             # content type the client sent for the ``.log`` upload.
-            if suffix.lower() == '.log':
+            if suffix.lower() == ".log":
                 if full_payload_uri:
-                    log_text = _decode_data_uri_base64_payload(
-                        full_payload_uri
-                    ).decode("utf-8", errors="replace")
+                    log_text = _decode_data_uri_base64_payload(full_payload_uri).decode(
+                        "utf-8", errors="replace"
+                    )
                 else:
                     log_text = (file_bytes or b"").decode("utf-8", errors="replace")
-                media_list.append({
-                    "type": "log",
-                    "content": log_text,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size": len(file_bytes or b""),
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "namespace_filename": namespace_filename
+                media_list.append(
+                    {
+                        "type": "log",
+                        "content": log_text,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename,
+                        },
                     }
-                })
+                )
                 continue
 
             # Determine media type and convert to standardized format
-            if content_type.startswith('image/'):
+            if content_type.startswith("image/"):
                 mime = _normalize_declared_image_mime(content_type)
                 if mime not in _ALLOWED_STILL_IMAGE_MIMES:
                     logger.warning("Skipping image with disallowed MIME %s", mime)
@@ -465,21 +461,23 @@ async def process_uploaded_files_and_label_media_type(
                         f"data:{mime};base64,"
                         f"{base64.b64encode(file_bytes).decode('ascii')}"
                     )
-                media_list.append({
-                    "type": "image",
-                    "base64_encoded_str": payload_uri,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": mime,
-                        "size": len(file_bytes or b""),
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_image": reference_image,
-                        "namespace_filename": namespace_filename,
+                media_list.append(
+                    {
+                        "type": "image",
+                        "base64_encoded_str": payload_uri,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": mime,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_image": reference_image,
+                            "namespace_filename": namespace_filename,
+                        },
                     }
-                })
-            
-            elif content_type.startswith('audio/'):
+                )
+
+            elif content_type.startswith("audio/"):
                 mime = content_type.split(";")[0].strip().lower()
                 payload_uri = full_payload_uri
                 if not payload_uri:
@@ -493,22 +491,24 @@ async def process_uploaded_files_and_label_media_type(
                         f"data:{mime};base64,"
                         f"{base64.b64encode(file_bytes).decode('ascii')}"
                     )
-                media_list.append({
-                    "type": "audio",
-                    "base64_encoded_str": payload_uri,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size": len(file_bytes or b""),
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "reference_audio": reference_audio,
-                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
-                        "namespace_filename": namespace_filename
+                media_list.append(
+                    {
+                        "type": "audio",
+                        "base64_encoded_str": payload_uri,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "reference_audio": reference_audio,
+                            "create_reference_media_from_playlist": create_reference_media_from_playlist,
+                            "namespace_filename": namespace_filename,
+                        },
                     }
-                })
-            
-            elif content_type.startswith('video/'):
+                )
+
+            elif content_type.startswith("video/"):
                 mime = content_type.split(";")[0].strip().lower()
                 payload_uri = full_payload_uri
                 if not payload_uri:
@@ -522,68 +522,74 @@ async def process_uploaded_files_and_label_media_type(
                         f"data:{mime};base64,"
                         f"{base64.b64encode(file_bytes).decode('ascii')}"
                     )
-                media_list.append({
-                    "type": "video",
-                    "base64_encoded_str": payload_uri,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size": len(file_bytes or b""),
-                        "user_id": user_id,
-                        "reference_audio": reference_audio,
-                        "create_reference_media_from_playlist": create_reference_media_from_playlist,
-                        "assistant_id": assistant_id,
-                        "namespace_filename": namespace_filename
+                media_list.append(
+                    {
+                        "type": "video",
+                        "base64_encoded_str": payload_uri,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(file_bytes or b""),
+                            "user_id": user_id,
+                            "reference_audio": reference_audio,
+                            "create_reference_media_from_playlist": create_reference_media_from_playlist,
+                            "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename,
+                        },
                     }
-                })
-            
+                )
+
             elif content_type in [
-                'text/plain', 
-            'application/json', 
-            'text/markdown', 
-            'application/octet-stream', 
-            'text/csv'
+                "text/plain",
+                "application/json",
+                "text/markdown",
+                "application/octet-stream",
+                "text/csv",
             ]:
                 # Handle text files — prefer webapp base64_encoded_str (full data URI)
-                if suffix == '.txt':
+                if suffix == ".txt":
                     if full_payload_uri:
                         text_content = _decode_data_uri_base64_payload(
                             full_payload_uri
                         ).decode("utf-8", errors="replace")
                     else:
-                        text_content = file_bytes.decode('utf-8')
-                    media_list.append({
-                        "type": "text",
-                        "content": text_content,
-                        "metadata": {
-                            "filename": filename,
-                            "content_type": content_type,
-                            "size": len(file_bytes or b""),
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "namespace_filename": namespace_filename
+                        text_content = file_bytes.decode("utf-8")
+                    media_list.append(
+                        {
+                            "type": "text",
+                            "content": text_content,
+                            "metadata": {
+                                "filename": filename,
+                                "content_type": content_type,
+                                "size": len(file_bytes or b""),
+                                "user_id": user_id,
+                                "assistant_id": assistant_id,
+                                "namespace_filename": namespace_filename,
+                            },
                         }
-                    })
-                elif suffix == '.log':
+                    )
+                elif suffix == ".log":
                     if full_payload_uri:
                         text_content = _decode_data_uri_base64_payload(
                             full_payload_uri
                         ).decode("utf-8", errors="replace")
                     else:
-                        text_content = file_bytes.decode('utf-8', errors="replace")
-                    media_list.append({
-                        "type": "log",
-                        "content": text_content,
-                        "metadata": {
-                            "filename": filename,
-                            "content_type": content_type,
-                            "size": len(file_bytes or b""),
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "namespace_filename": namespace_filename
+                        text_content = file_bytes.decode("utf-8", errors="replace")
+                    media_list.append(
+                        {
+                            "type": "log",
+                            "content": text_content,
+                            "metadata": {
+                                "filename": filename,
+                                "content_type": content_type,
+                                "size": len(file_bytes or b""),
+                                "user_id": user_id,
+                                "assistant_id": assistant_id,
+                                "namespace_filename": namespace_filename,
+                            },
                         }
-                    })
-                elif suffix == '.json' or suffix == '.jsonl':
+                    )
+                elif suffix == ".json" or suffix == ".jsonl":
                     if full_payload_uri:
                         raw = _decode_data_uri_base64_payload(
                             full_payload_uri
@@ -605,27 +611,29 @@ async def process_uploaded_files_and_label_media_type(
                             "namespace_filename": namespace_filename
                         }
                     })
-                else: # handle markdown
+                else:  # handle markdown
                     if full_payload_uri:
-                        text_content = _decode_data_uri_base64_payload(
-                            full_payload_uri
-                        )
+                        text_content = _decode_data_uri_base64_payload(full_payload_uri)
                     else:
                         text_content = file_bytes
-                    media_list.append({ # if content_type is application_json, then the type needs to be json
-                        "type": content_type.split("/")[-1] if content_type.split("/")[-1] != "" else "text",
-                        "content": text_content,
-                        "metadata": {
-                            "filename": filename,
-                            "content_type": content_type,
-                            "size": len(file_bytes or b""),
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "namespace_filename": namespace_filename
+                    media_list.append(
+                        {  # if content_type is application_json, then the type needs to be json
+                            "type": content_type.split("/")[-1]
+                            if content_type.split("/")[-1] != ""
+                            else "text",
+                            "content": text_content,
+                            "metadata": {
+                                "filename": filename,
+                                "content_type": content_type,
+                                "size": len(file_bytes or b""),
+                                "user_id": user_id,
+                                "assistant_id": assistant_id,
+                                "namespace_filename": namespace_filename,
+                            },
                         }
-                    })
-            
-            elif content_type == 'application/pdf':
+                    )
+
+            elif content_type == "application/pdf":
                 if full_payload_uri:
                     pdf_bytes = _decode_data_uri_base64_payload(full_payload_uri)
                 elif file_bytes:
@@ -635,20 +643,22 @@ async def process_uploaded_files_and_label_media_type(
                         "Skipping PDF %s: no base64_encoded_str or bytes", filename
                     )
                     continue
-                media_list.append({
-                    "type": "pdf",
-                    "base64_encoded_str": full_payload_uri or "",
-                    "bytes": pdf_bytes,
-                    "metadata": {
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size": len(pdf_bytes),
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "namespace_filename": namespace_filename
+                media_list.append(
+                    {
+                        "type": "pdf",
+                        "base64_encoded_str": full_payload_uri or "",
+                        "bytes": pdf_bytes,
+                        "metadata": {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(pdf_bytes),
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "namespace_filename": namespace_filename,
+                        },
                     }
-                })
-            
+                )
+
             else:
                 logger.warning(f"Unsupported content type: {content_type}")
                 continue
@@ -656,14 +666,12 @@ async def process_uploaded_files_and_label_media_type(
         except Exception as e:
             logger.error(f"Error processing file {filename}: {e}")
             continue
-    
+
     logger.info(f"Converted {len(media_list)} files to media format")
     _emit_media_progress("labeling", total=len(media_list))
 
-    return {
-        "media_list": media_list,
-        "media_files": []
-    }
+    return {"media_list": media_list, "media_files": []}
+
 
 async def analyze_documents(
     state: GlobalState,
@@ -688,7 +696,7 @@ async def analyze_documents(
     # standardized questions, narrative analyzers) when disabled. Documents are
     # still indexed via the direct convert->index_docs edge; only the analysis
     # branch is short-circuited. Clearing the queue keeps state consistent.
-    if (GlobalContext().enable_document_analysis or "TRUE").upper() != "TRUE":
+    if (GlobalContext().enable_document_analysis or "FALSE").upper() != "TRUE":
         logger.info(
             "analyze_documents: disabled via ENABLE_DOCUMENT_ANALYSIS; skipping"
         )
@@ -745,6 +753,7 @@ async def analyze_documents(
     # region agent log
     try:
         from src.anubis.utils.utility import _agent_debug_log as _adl
+
         _adl(
             "analyze_documents:return",
             {
@@ -752,7 +761,8 @@ async def analyze_documents(
                 "analyzed_documents_len": len(analyzed_documents),
                 "sample_doc_id": (
                     (analyzed_documents[0].metadata or {}).get("document_id")
-                    if analyzed_documents else None
+                    if analyzed_documents
+                    else None
                 ),
             },
             hypothesis_id="H1",
@@ -767,9 +777,14 @@ async def analyze_documents(
     }
 
 
-async def convert_media_list_to_text_document(state: GlobalState, runtime: Runtime[GlobalContext], store: BaseStore, config: RunnableConfig) -> Dict[str, Any]:
-    """ 
-    Media type in media list is determined at this point: 
+async def convert_media_list_to_text_document(
+    state: GlobalState,
+    runtime: Runtime[GlobalContext],
+    store: BaseStore,
+    config: RunnableConfig,
+) -> Dict[str, Any]:
+    """
+    Media type in media list is determined at this point:
     Convert the media in a list of one or more media to text in parallel.
     media items must have user_id and assistant_id as metadata.
     Exptected format:
@@ -781,24 +796,22 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
             "metadata":{
                 fields may include mime-type or the metadata may not exists at all
                 }
-        }, 
+        },
         ...
     ]
-    I want to keep the media in a list and queue tasks for each item in the list 
-    then I want to execute those tasks in parallel and update the final state 
+    I want to keep the media in a list and queue tasks for each item in the list
+    then I want to execute those tasks in parallel and update the final state
     with the list of text Documents from the media:
     async def determine_media_type(state: GlobalState, context: GlobalContext, media_list: List[Dict]):
     """
-    
+
     logging.info(f"DETERMINE_MEDIA_TYPE NODE")
 
-    media_list = state.get('media_list', [])
+    media_list = state.get("media_list", [])
 
     if not media_list:
         logger.info(f"No Media to process")
-        return {
-            "media_list": []
-        }
+        return {"media_list": []}
 
     # namespace_filename values already indexed for this avatar. Items whose key
     # is present are skipped (top-level here; expanded playlist/linktree children
@@ -943,16 +956,25 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
     # These documents have been formatted for analysis but have not yet been analyzed.
     # NOTE: Using non-target information will indicate triggers or responses. This information must not be lost. For analysis, keep both the User and other speakers but focus on the target.
 
-    analysis_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("analysis_acceptable", False) == True]
+    analysis_document_list_formatted = [
+        doc
+        for doc in all_documents
+        if doc.metadata.get("analysis_acceptable", False) == True
+    ]
 
     # # Adapter list (needs a node)
     # documents_to_be_processed_for_adapter_training: List[Sequence[Document]] UPDATED RETURN VALUES IN RETURN processed into adapter training format and uploaded to storage
 
-    adapter_document_list_formatted = [doc for doc in all_documents if doc.metadata.get("adapter_acceptable", False) == True]
+    adapter_document_list_formatted = [
+        doc
+        for doc in all_documents
+        if doc.metadata.get("adapter_acceptable", False) == True
+    ]
 
     # region agent log
     try:
         from src.anubis.utils.utility import _agent_debug_log as _adl
+
         _adl(
             "convert_media_list_to_text_document:return",
             {
@@ -960,8 +982,11 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
                 "analysis_len": len(analysis_document_list_formatted),
                 "adapter_len": len(adapter_document_list_formatted),
                 "sample_vs_doc_id": (
-                    (vector_store_document_list_formatted[0].metadata or {}).get("document_id")
-                    if vector_store_document_list_formatted else None
+                    (vector_store_document_list_formatted[0].metadata or {}).get(
+                        "document_id"
+                    )
+                    if vector_store_document_list_formatted
+                    else None
                 ),
             },
             hypothesis_id="H1",
@@ -974,8 +999,9 @@ async def convert_media_list_to_text_document(state: GlobalState, runtime: Runti
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": analysis_document_list_formatted,
         "documents_to_be_processed_for_adapter_training": adapter_document_list_formatted,
-        "media_list": [] # Clear processed media list in the state
+        "media_list": [],  # Clear processed media list in the state
     }
+
 
 async def process_media_item_task(
     media_item: Dict[str, Any],
@@ -1009,7 +1035,7 @@ async def process_media_item_task(
     logger.info(f"extracted user_id: {user_id}")
     logger.info(f"extracted assistant_id: {assistant_id}")
 
-    filename = media_item['metadata']['filename']
+    filename = media_item["metadata"]["filename"]
     logger.info(f"Processing file: {filename}")
     namespace_filename = metadata.get("namespace_filename")
     if not namespace_filename:
@@ -1100,7 +1126,7 @@ async def process_media_item_task(
                 user_id=user_id,
                 assistant_id=assistant_id,
                 context=runtime.context,
-                reference_image=reference_image
+                reference_image=reference_image,
             )
 
             doc.metadata.update(
@@ -1112,17 +1138,15 @@ async def process_media_item_task(
                     "reference_image": reference_image,
                     "filename": filename,
                     "analysis_acceptable": True,
-                    "namespace_filename": namespace_filename, 
+                    "namespace_filename": namespace_filename,
                 }
             )
 
             if reference_image:
-                
                 # I need a function to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
                 # the function should take in the reference image and the emotion and return a base64_encoded_str
                 # the function should be called for each emotion
                 # the base64_encoded_str is passed into the extract_personality_from_image function
-
 
                 # Use the reference image to create generative images of different emotions: happiness, sadness, anger, surprise, fear, disgust, pondering
                 # namespace is (user_id, assistant_id, "identity")
@@ -1137,11 +1161,10 @@ async def process_media_item_task(
                 # append to the list of documents
                 # an api endpoint provides an endpoint to allow for the search of the store for metadata for "emotion", "content_type", and "synthetic" to display the images on load of the avatar once and caches all results then uses the results on emotion trigger.
                 # The frontend searches the metadata for "emotion", "content_type", and "synthetic" to display the images
-                
-                
+
                 namespace = (user_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
-                
+
                 await store.aput(
                     namespace,
                     key=assistant_id,
@@ -1150,6 +1173,10 @@ async def process_media_item_task(
                         "document": doc_json,
                     },
                 )
+                # load_consciousness reads this entry through a process-wide
+                # cache; drop the cached copy so the new reference image is
+                # picked up on the next message.
+                invalidate_store_cache_entry(namespace, assistant_id)
                 doc.metadata.update(
                     {
                         "namespace": "reference_image",
@@ -1231,7 +1258,7 @@ async def process_media_item_task(
                 user_id=user_id,
                 assistant_id=assistant_id,
                 media_item=media_item,
-                store = store, 
+                store=store,
             )
             return documents
         elif media_type == "log":
@@ -1263,8 +1290,10 @@ async def process_media_item_task(
                     }
                 )
             return documents
-        elif media_type == "json": # formatted proprietary llm content (chatgpt, claude, grok, etc.)
-            content = media_item.get('content')
+        elif (
+            media_type == "json"
+        ):  # formatted proprietary llm content (chatgpt, claude, grok, etc.)
+            content = media_item.get("content")
 
             # CSV preprocessing in webapp.py emits ``{"statements": [...]}``
             # where each statement is the avatar-identity contract shape:
@@ -1273,15 +1302,14 @@ async def process_media_item_task(
             # Treat these as quote-namespace Documents so they feed both
             # retrieval and adapter training, with per-statement target /
             # source metadata flowing to each Document.
-            if isinstance(content, bytes): 
+            if isinstance(content, bytes):
                 content = json.loads(content)
 
-            if (
-                isinstance(content, dict)
-                and isinstance(content.get("statements"), list)
+            if isinstance(content, dict) and isinstance(
+                content.get("statements"), list
             ):
                 final_documents: List[Document] = []
-                base_metadata = dict(media_item.get('metadata') or {})
+                base_metadata = dict(media_item.get("metadata") or {})
                 for statement in content["statements"]:
                     if not isinstance(statement, dict):
                         continue
@@ -1326,13 +1354,15 @@ async def process_media_item_task(
                             "content": text,
                             "metadata": statement_metadata,
                         }
-                        documents = await process_text_media_item_target_for_vectorstore(
-                            media_item=statement_media_item,
-                            user_id=user_id,
-                            assistant_id=assistant_id,
-                            classification_metadata=classification_metadata,
-                            use_semantic_chunks=False,
-                            namespace="quote",
+                        documents = (
+                            await process_text_media_item_target_for_vectorstore(
+                                media_item=statement_media_item,
+                                user_id=user_id,
+                                assistant_id=assistant_id,
+                                classification_metadata=classification_metadata,
+                                use_semantic_chunks=False,
+                                namespace="quote",
+                            )
                         )
                         for document in documents:
                             document.metadata.update(
@@ -1396,7 +1426,7 @@ async def process_media_item_task(
                 ]
             classification_metadata = {
                 "classified_situation": "conversation_facts",
-                "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
+                "classification_reasoning": "user_selected_classification_of_ai_human_conversation",
             }
             final_documents = []
             for message in messages:
@@ -1415,12 +1445,17 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     classification_metadata=classification_metadata,
-                    use_semantic_chunks=False
+                    use_semantic_chunks=False,
                 )
 
                 for document in documents:
-                            document.metadata.update({"vectorstore_acceptable": True, "namespace_filename": namespace_filename})
-                            final_documents.append(document)
+                    document.metadata.update(
+                        {
+                            "vectorstore_acceptable": True,
+                            "namespace_filename": namespace_filename,
+                        }
+                    )
+                    final_documents.append(document)
 
             return final_documents
         # NOTE: ``type == "url"`` is handled before the leaf semaphore guard by
@@ -1482,15 +1517,15 @@ async def process_media_item_task(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     media_item=page_media_item,
-                    store=store
+                    store=store,
                 )
                 for d in documents:
                     d.metadata.setdefault("pdf_page_index", page_idx)
-                    d.metadata["namespace_filename"]=namespace_filename
+                    d.metadata["namespace_filename"] = namespace_filename
                 final_documents.extend(documents)
 
             return final_documents
-           
+
         elif media_type in ("audio", "video"):
             """Diarize audio (or audio extracted from video) using the hosted
             ``transcribe_audio_diarize`` helper and route the structured
@@ -1505,7 +1540,9 @@ async def process_media_item_task(
             # Batch-wide "no single target": every detected speaker is the avatar.
             # Diarization still runs, but no stored reference clip is required and
             # known-speaker labelling is skipped (every turn is forced is_target).
-            create_reference_media_from_playlist = bool(metadata.get("create_reference_media_from_playlist", False))
+            create_reference_media_from_playlist = bool(
+                metadata.get("create_reference_media_from_playlist", False)
+            )
             if not reference_audio and not create_reference_media_from_playlist:
                 reference_namespace = (user_id, assistant_id, "reference_audio")
                 ref_item = await store.aget(reference_namespace, key=assistant_id)
@@ -1542,7 +1579,12 @@ async def process_media_item_task(
                     )
                 ]
 
-            if media_type == "audio" and reference_audio and payload_uri and not _is_full_audio_data_uri(payload_uri):
+            if (
+                media_type == "audio"
+                and reference_audio
+                and payload_uri
+                and not _is_full_audio_data_uri(payload_uri)
+            ):
                 return [
                     Document(
                         page_content=(
@@ -1589,14 +1631,16 @@ async def process_media_item_task(
                     context=runtime.context,
                     filename=audio_name,
                     content_type="audio/mp3",
-                    reference_audio=reference_audio
+                    reference_audio=reference_audio,
                 )
 
                 # The helper returns a coherent triple: the encoded mp3 of the
                 # dominant speaker's clip, its duration, and the transcript
                 # ``text`` that matches that clip (same key as the OpenAI
                 # transcription API and ``transcribe_audio_diarize``).
-                ref_payload_uri = transcription_dict.get("audio_base64_preprocessed", "") 
+                ref_payload_uri = transcription_dict.get(
+                    "audio_base64_preprocessed", ""
+                )
                 transcription_text = transcription_dict.get("text") or ""
                 ref_duration = transcription_dict.get("duration")
 
@@ -1630,6 +1674,7 @@ async def process_media_item_task(
                 all_documents.append(doc)
 
                 """ Compare the approximate embedding of the transcription to the reference audio embedding """
+
                 # Run the synchronous SentenceTransformer load + encode + similarity
                 # off the event loop: it is CPU/GPU-bound and would otherwise freeze
                 # the single asyncio loop, starving the media-job SSE stream and any
@@ -1639,7 +1684,9 @@ async def process_media_item_task(
 
                     model = SentenceTransformer(runtime.context.embedding_model)
                     embedding = model.encode(transcription_text)
-                    reference_audio_sentence = "The quick fox jumped over the brown lazy dog."
+                    reference_audio_sentence = (
+                        "The quick fox jumped over the brown lazy dog."
+                    )
                     reference_audio_embedding = model.encode(reference_audio_sentence)
                     return model.similarity(embedding, reference_audio_embedding)
 
@@ -1676,7 +1723,9 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
-            if not create_reference_media_from_playlist: # Every entity is the target during create_reference_media_from_playlist
+            if (
+                not create_reference_media_from_playlist
+            ):  # Every entity is the target during create_reference_media_from_playlist
                 try:
                     ref_item = await store.aget(
                         (user_id, assistant_id, "reference_audio"), assistant_id
@@ -1805,7 +1854,9 @@ async def process_media_item_task(
                                 metadata={
                                     "user_id": user_id,
                                     "assistant_id": assistant_id,
-                                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                                    "created_at": datetime.now(
+                                        tz=timezone.utc
+                                    ).isoformat(),
                                     "type": media_type,
                                     "filename": filename,
                                     "vectorstore_acceptable": False,
@@ -1846,9 +1897,7 @@ async def process_media_item_task(
                     return all_documents
 
                 source_label = (
-                    metadata.get("source")
-                    or filename
-                    or f"{media_type}_transcription"
+                    metadata.get("source") or filename or f"{media_type}_transcription"
                 )
                 multi_speaker = len({s["speaker"] for s in statements}) > 1
 
@@ -2022,7 +2071,9 @@ async def process_media_item_task(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "source": (
-                            metadata.get("source") or filename or f"{media_type}_transcription"
+                            metadata.get("source")
+                            or filename
+                            or f"{media_type}_transcription"
                         ),
                         "namespace_filename": namespace_filename,
                     },
@@ -2125,7 +2176,9 @@ async def process_media_item_task(
                     "user_id": user_id,
                     "assistant_id": assistant_id,
                     "source": (
-                        metadata.get("source") or filename or f"{media_type}_transcription"
+                        metadata.get("source")
+                        or filename
+                        or f"{media_type}_transcription"
                     ),
                     "namespace_filename": namespace_filename,
                 },
@@ -2161,19 +2214,27 @@ async def process_media_item_task(
 
         else:
             logger.warning(f"Unsupported media type: {media_type}")
-            docs = [Document(
-                page_content=f"[Unsupported media type: {media_type}]",
-                metadata={"type": media_type, "status": "unsupported", "namespace_filename": namespace_filename}
-            )]
+            docs = [
+                Document(
+                    page_content=f"[Unsupported media type: {media_type}]",
+                    metadata={
+                        "type": media_type,
+                        "status": "unsupported",
+                        "namespace_filename": namespace_filename,
+                    },
+                )
+            ]
             return docs
-    
+
     except Exception as e:
         # ERROR DOCUMENT
         logger.error(f"Error processing media item: {e}")
-        documents =  [Document(
-            page_content=f"[Error processing media: {str(e)}]",
-            metadata={"type": media_type, "status": "error", "error": str(e)}
-        )]
+        documents = [
+            Document(
+                page_content=f"[Error processing media: {str(e)}]",
+                metadata={"type": media_type, "status": "error", "error": str(e)},
+            )
+        ]
         return documents
     finally:
         if leaf_acquired:
@@ -2353,8 +2414,10 @@ async def _expand_url_media_item(
     return collected
 
 
-async def extract_media_from_message(state: GlobalState, runtime: Runtime[GlobalContext]):
-    
+async def extract_media_from_message(
+    state: GlobalState, runtime: Runtime[GlobalContext]
+):
+
     logger.info(f"Extract_media_from_message NODE")
     if isinstance(runtime.context.user_ctx, dict):
         user_id = runtime.context.user_ctx.get("user_id", "")
@@ -2366,12 +2429,12 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
     else:
         assistant_id = getattr(runtime.context.assistant_ctx, "assistant_id", "")
 
-    messages = state.get('messages', [])
+    messages = state.get("messages", [])
 
     if not messages:
         logger.warning("No messages found in state")
         return {"media_list": []}
-    
+
     logger.info(f"Processing {len(messages)} messages")
 
     # Get the most recent HumanMessage
@@ -2380,7 +2443,7 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
         if isinstance(msg, HumanMessage):
             recent_message = msg
             break
-    
+
     if not recent_message:
         logger.info("No HumanMessage found")
         return {"media_list": []}
@@ -2391,14 +2454,14 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
     if isinstance(content, str):
         logger.info("Message contains only text, no media")
         return {"media_list": []}
-    
+
     # Handle list content (may contain media)
     if isinstance(content, list):
         logger.info(f"Message content has {len(content)} items")
 
         # Extract media (skip first item if it's text)
         media_list = []
-        for item in content: 
+        for item in content:
             if isinstance(item, dict):
                 item_type = item.get("type", "")
 
@@ -2410,9 +2473,10 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
                 if item_type in ["image", "image_url", "audio", "video", "url"]:
                     normalized = dict(item)
                     legacy_payload = normalized.pop("data", None)
-                    if legacy_payload is not None and not (
-                        normalized.get("base64_encoded_str") or ""
-                    ).strip():
+                    if (
+                        legacy_payload is not None
+                        and not (normalized.get("base64_encoded_str") or "").strip()
+                    ):
                         normalized["base64_encoded_str"] = legacy_payload
                     if "metadata" not in normalized or not isinstance(
                         normalized.get("metadata"), dict
@@ -2424,7 +2488,7 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
                     # EACH ITEM NEEDS USER_ID AND ASSISTANT_ID FROM CONTEXT
                     # user_id
                     # assistant_id
-            
+
         logger.info(f"Extracted {len(media_list)} media items")
         return {"media_list": media_list}
 
@@ -2435,6 +2499,7 @@ async def extract_media_from_message(state: GlobalState, runtime: Runtime[Global
 # ---------------------------------------------------------------------------
 # Adapter dataset writer
 # ---------------------------------------------------------------------------
+
 
 async def process_adapter_documents(
     state: GlobalState,

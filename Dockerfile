@@ -1,8 +1,8 @@
 FROM anubis-base:latest
- 
+
 # -- Add full source (replaces the stub left by the base image) --
 ADD . /deps/anubis
- 
+
 # -- Install only net-new / changed deps; uv skips already-satisfied packages --
 #    No --no-deps: full resolution is required so uv can diff against the
 #    already-installed base layer and fetch only what's missing.
@@ -10,7 +10,7 @@ RUN for dep in /deps/*; do \
         if [ -d "$dep" ]; then \
             echo "Installing $dep"; \
             (cd "$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir \
-                -c /api/constraints.txt -e .); \
+                --link-mode=copy -c /api/constraints.txt -e .); \
         fi; \
     done
  

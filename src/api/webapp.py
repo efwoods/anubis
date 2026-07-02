@@ -1,75 +1,64 @@
 # src/anubis/webapp.py
 
 import asyncio
+import base64
 import functools
 import json
 import os
 import re
-from typing import List
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Form,
-    HTTPException,
-    Response,
-    Depends,
-    Request,
-)
-
-import httpx
+import tempfile
+import uuid
+from collections.abc import Iterator
+from contextlib import asynccontextmanager
 
 # from src.url_loading_graph.graph import url_loading_graph
 from datetime import datetime, timezone
-from langchain_core.messages import AIMessage, HumanMessage
-from src.anubis.utils.context import GlobalContext
-from psycopg_pool import AsyncConnectionPool
-
 
 # Add metrics imports
 from time import time_ns
-import uuid
-from uuid import UUID
-from uuid import uuid4
+from typing import Annotated, Any, List, Optional
+from uuid import UUID, uuid4
 
-import base64
-import tempfile
+import httpx
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.store.base import IndexConfig
+from langgraph.store.postgres import AsyncPostgresStore
+from langgraph_sdk import get_client
 
 # NOTE: ``PyPDFLoader`` is imported lazily inside ``process_files_for_message``
 # (the only call site) — eager import of ``langchain_community`` adds ~7.3 s to
 # every cold start because the umbrella package eagerly registers many
 # integrations. The first PDF upload pays the import cost once.
-
-
 # Prometheus metrics
 from prometheus_client import (
-    Counter,
-    Histogram,
-    Gauge,
-    generate_latest,
     CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
 )
-from prometheus_client import CollectorRegistry
-from contextlib import asynccontextmanager
-from langgraph.store.postgres import AsyncPostgresStore
+from psycopg_pool import AsyncConnectionPool
+from pydantic import BaseModel, BeforeValidator
 
-from langgraph.store.base import IndexConfig
-
-from typing import Annotated, Optional
-from langgraph_sdk import get_client
-
-from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.graph import message_workflow
-
-from src.security.auth import security_route
-from src.security.auth import get_current_user
-from src.security.auth import update_assistant_config
-from src.security.auth import check_subscription_status
-
-from src.security.auth import (
-    get_current_user_or_anonymous_user,
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
+from src.anubis.utils.store_cache import (
+    invalidate_store_cache_entry,
+    invalidate_store_cache_for_assistant,
 )
-
 from src.api.media_jobs import (
     MediaJob,
     create_child_job,
@@ -78,12 +67,13 @@ from src.api.media_jobs import (
     request_cancel,
     run_batch_media_job,
 )
-
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
-
-from pydantic import BaseModel, BeforeValidator
-from typing import Any
-from collections.abc import Iterator
+from src.security.auth import (
+    check_subscription_status,
+    get_current_user,
+    get_current_user_or_anonymous_user,
+    security_route,
+    update_assistant_config,
+)
 
 
 def _drop_empty_file_fields(value: Any) -> Any:
@@ -111,24 +101,25 @@ OptionalUploadFiles = Annotated[
     File(),
 ]
 
+import logging
+from urllib.parse import quote
+
+import stripe
+from dotenv import load_dotenv
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.types import Command
 from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
 
-from urllib.parse import quote
+from src.anubis.utils import runtime_handles
 
-
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-import stripe
-
-import logging
-
-from dotenv import load_dotenv
 load_dotenv()
 
 
 logger = logging.getLogger(__name__)
 
-from uuid import uuid5, NAMESPACE_URL
+from uuid import NAMESPACE_URL, uuid5
+
 
 def _namespace_safe_formatted_filename(u: str) -> str:
     formatted_name = str(uuid5(NAMESPACE_URL, u))
@@ -153,7 +144,11 @@ def _document_label_and_key(metadata: dict) -> tuple[str | None, str | None]:
     """
     filename = metadata.get("filename")
     namespace_filename = metadata.get("namespace_filename")
-    key = namespace_filename if isinstance(namespace_filename, str) and namespace_filename else None
+    key = (
+        namespace_filename
+        if isinstance(namespace_filename, str) and namespace_filename
+        else None
+    )
     playlist_url = metadata.get("playlist_url")
     if isinstance(playlist_url, str) and playlist_url:
         playlist_label = (metadata.get("playlist_title") or playlist_url).strip()
@@ -181,7 +176,9 @@ def _iter_document_labels(store_items) -> Iterator[tuple[str, str | None]]:
             continue
         document = value.get("document")
         kwargs_blob = document.get("kwargs") if isinstance(document, dict) else None
-        metadata = kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+        metadata = (
+            kwargs_blob.get("metadata") if isinstance(kwargs_blob, dict) else None
+        )
         if not isinstance(metadata, dict):
             continue
         label, key = _document_label_and_key(metadata)
@@ -204,6 +201,19 @@ def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     return last_ai
 
 
+def _collect_pending_interrupts(snapshot) -> list:
+    """Return any Interrupt objects pending on a graph StateSnapshot.
+
+    Newer LangGraph exposes ``snapshot.interrupts``; older surfaces them per task.
+    """
+    interrupts = list(getattr(snapshot, "interrupts", None) or [])
+    if interrupts:
+        return interrupts
+    for task in getattr(snapshot, "tasks", None) or []:
+        interrupts.extend(getattr(task, "interrupts", None) or [])
+    return interrupts
+
+
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -217,13 +227,24 @@ async def message_graph_sse(
     start_time_ns: int,
     request_id: str,
     langgraph_client_headers: dict,
+    resume_command: Optional[Command] = None,
 ):
-    """Stream assistant tokens (SSE) then a final ``done`` event with full metadata."""
+    """Stream assistant tokens (SSE) then a terminal event with full metadata.
+
+    Terminal event is ``done`` on completion, or ``interrupt`` when the graph pauses
+    for human approval (carrying the approve/edit/reject preview payload). Pass
+    ``resume_command`` (``Command(resume=...)``) to continue a paused run instead of
+    sending a fresh ``human_message``.
+    """
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
 
+    graph_input = (
+        resume_command if resume_command is not None else {"messages": [human_message]}
+    )
+
     async for item in graph.astream(
-        input={"messages": [human_message]},
+        input=graph_input,
         config=config,
         context=context,
         stream_mode=["custom", "updates"],
@@ -253,11 +274,22 @@ async def message_graph_sse(
     langgraph_client = get_client(headers=langgraph_client_headers)
     await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
 
-    content = (
-        last_ai.content
-        if last_ai is not None
-        else "".join(accumulated_chunks)
-    )
+    # If the graph paused for human approval, surface the preview instead of ``done``.
+    # The client resumes via ``POST /message/{assistant_id}/resume`` on this thread_id.
+    snapshot = await graph.aget_state(config)
+    pending_interrupts = _collect_pending_interrupts(snapshot)
+    if pending_interrupts:
+        interrupt_event: dict = {
+            "type": "interrupt",
+            "thread_id": thread_id,
+            "request_id": request_id,
+            "interrupt": getattr(pending_interrupts[0], "value", None),
+            "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
+        }
+        yield f"data: {json.dumps(interrupt_event, default=str)}\n\n"
+        return
+
+    content = last_ai.content if last_ai is not None else "".join(accumulated_chunks)
     done: dict = {
         "type": "done",
         "content": content,
@@ -542,6 +574,9 @@ async def lifespan(app: FastAPI):
         checkpointer = AsyncPostgresSaver(app.state.pool)
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
+        # Publish the shared checkpointer so the deep agent (rebuilt each turn inside
+        # the ``think`` node) can reuse it and make HITL ``interrupt``s durable.
+        runtime_handles.set_deep_agent_checkpointer(checkpointer)
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
@@ -549,6 +584,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await pool.close()
+
 
 app = FastAPI(
     title="Neural Nexus API",
@@ -658,7 +694,7 @@ async def verify_subscription_status(
 ):
     status = await check_subscription_status(request=request, current_user=current_user)
     if status["status"] == None:
-        return {"subscription_status:" "Not Subscribed"}
+        return {"subscription_status:Not Subscribed"}
     return status
 
 
@@ -703,6 +739,9 @@ async def create_avatar(
             metadata=metadata,
         )
 
+        # store the creator of the assistant
+        await client.store.aput((assistant_id,'creator_id'), key="creator_id", value={"value": user_id})
+
         return JSONResponse(content=create_avatar_response, status_code=200)
     except Exception as e:
         return HTTPException(
@@ -741,6 +780,29 @@ async def share_avatar(
         status_code=401, detail="Users may only share avatars of themselves."
     )
 
+
+@app.post("/user_is_creator")
+async def user_is_creator(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    context = app.state.context
+    user_id = current_user["identities"][0]["user_id"]
+    if user_id == context.admin_user_id:
+        try:
+            token = current_user["API_KEY"]
+            client = get_client(headers={"API-KEY": f"{token}"})
+            namespace = (assistant_id, 'creator_id')
+            await client.store.put_item(namespace, key='creator_id', value={"value": user_id}) 
+            return JSONResponse(content="stored creator_id", status_code=200)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Error during update of sharing avatar: {e}"
+            )
+        
+    raise HTTPException(
+        status_code=401, detail="Users may only share avatars of themselves."
+    )
 
 @app.patch("/modify_avatar")
 async def modify_avatar(
@@ -827,6 +889,11 @@ async def delete_avatar(
             status_code=500,
         )
 
+    # Every store row mentioning the assistant was just removed by raw SQL,
+    # bypassing the store client — drop every cached entry for the assistant
+    # from the load_consciousness read-through cache.
+    invalidate_store_cache_for_assistant(assistant_id)
+
     try:
         await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
     except Exception as e:
@@ -850,9 +917,7 @@ async def list_user_avatars(
     logger.info("breakpoint")
     if not current_user:
         public_avatars_result = await get_public_avatars()
-        return [
-            _assistant_without_metadata_if_public(a) for a in public_avatars_result
-        ]
+        return [_assistant_without_metadata_if_public(a) for a in public_avatars_result]
     try:
         public_avatars_result = await get_public_avatars(
             user_id=current_user["identities"][0]["user_id"]
@@ -1195,15 +1260,17 @@ async def message_selected_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config['configurable']['include_metrics'] = include_metrics
+    config["configurable"]["include_metrics"] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
 
     # Process any uploaded files
-    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
-        files, message=message
-    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
 
     # Create the human message content
     if multimodal_content:
@@ -1367,15 +1434,17 @@ async def message_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config['configurable']['include_metrics'] = include_metrics
+    config["configurable"]["include_metrics"] = include_metrics
 
     # store = app.state.store
     graph = app.state.graph
 
     # Process any uploaded files
-    file_text_content, multimodal_content, image_filenames = await process_files_for_message(
-        files, message=message
-    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
 
     # Create the human message content
     if multimodal_content:
@@ -1451,6 +1520,119 @@ async def message_avatar(
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
     return JSONResponse(response_data, status_code=200)
+
+
+@app.post("/message/{assistant_id}/resume")
+async def resume_avatar_message(
+    request: Request,
+    assistant_id: str,
+    thread_id: str = Form(...),
+    decision: str = Form("apply"),
+    items: Optional[str] = Form(None),
+    your_name: Optional[str] = Form(None),
+    your_description: Optional[str] = Form(None),
+    user_timezone: Optional[str] = Form(None),
+    include_metrics: bool = Form(True),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Resume a run paused for human approval (edit/delete identity fact).
+
+    ``decision`` is ``apply`` | ``cancel``. ``items`` (JSON list) carries the owner's
+    per-document decisions — one entry per matched document with ``index`` and an ``action``
+    ∈ ``skip`` | ``accept`` | ``edit`` | ``remove`` (plus ``corrected_text`` /
+    ``correction_context`` when the action is ``edit``). Any matched document the owner did
+    not act on defaults to ``skip`` in the tool, so a missing/empty list changes nothing.
+    Older clients' ``approve`` / ``reject`` are accepted as aliases for ``apply`` / ``cancel``.
+    Streams the continuation as SSE (same ``assistant_token`` → ``done``/``interrupt`` shape as
+    ``/message/{assistant_id}``).
+    """
+    start_time = time_ns()
+
+    # Map legacy spellings so an older panel still resolves to the current vocabulary.
+    decision_aliases = {"approve": "apply", "reject": "cancel"}
+    raw_decision = (decision or "apply").strip().lower()
+    decision_value = decision_aliases.get(raw_decision, raw_decision)
+    if decision_value not in ("apply", "cancel"):
+        raise HTTPException(status_code=400, detail="decision must be apply or cancel.")
+
+    config = current_user.get("app_metadata", {}).get("assistant_config", {})
+    if not config:
+        raise HTTPException(
+            detail="Error retrieving assistant information.", status_code=400
+        )
+
+    user_id = current_user["identities"][0]["user_id"]
+    if request.headers.get("api-key", "") != "":
+        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
+        try:
+            langgraph_client = get_client(headers=langgraph_client_headers)
+            assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Error selecting avatar.")
+        config_update = {
+            "configurable": {
+                "user_ctx": {"name": your_name, "description": your_description},
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "assistant_ctx": {
+                    "name": assistant.get("name", None),
+                    "description": assistant.get("description", None),
+                    "metadata": assistant.get("metadata", {}),
+                },
+            }
+        }
+    else:
+        langgraph_client_headers = {"API-KEY": app.state.context.anonymous_api_key}
+        config_update = {
+            "configurable": {
+                "user_ctx": {"name": your_name, "description": your_description},
+            }
+        }
+
+    config_update["configurable"]["thread_id"] = thread_id
+    config["configurable"].update(config_update["configurable"])
+    config["configurable"]["user_timezone"] = user_timezone
+    config["configurable"]["include_metrics"] = include_metrics
+
+    graph = app.state.graph
+
+    # The resume value is the decision dict the paused tool's ``interrupt`` expects; it flows
+    # outer-``interrupt`` → ``think`` → the deep-agent tool unchanged. ``cancel`` abandons the
+    # whole correction; ``apply`` carries the owner's per-item decisions. The tool defaults any
+    # un-acted item to ``skip``, so an empty/missing list is a safe no-op.
+    resume_payload: dict = {"type": decision_value}
+    if items:
+        try:
+            parsed_items = json.loads(items)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="items must be a JSON list.")
+        if not isinstance(parsed_items, list):
+            raise HTTPException(status_code=400, detail="items must be a JSON list.")
+        resume_payload["items"] = parsed_items
+
+    return StreamingResponse(
+        message_graph_sse(
+            graph,
+            None,
+            config,
+            app.state.context,
+            thread_id=thread_id,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            conversation_title_value=None,
+            start_time_ns=start_time,
+            request_id=request.state.request_id,
+            langgraph_client_headers=langgraph_client_headers,
+            resume_command=Command(resume=resume_payload),
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @app.get("/conversations")
 async def get_all_conversations(
@@ -1639,7 +1821,9 @@ async def probe_remote_url_content_type(url: str) -> str:
         head_ct = ""
         try:
             head = await client.head(url)
-            head_ct = (head.headers.get("content-type") or "").split(";")[0].strip().lower()
+            head_ct = (
+                (head.headers.get("content-type") or "").split(";")[0].strip().lower()
+            )
         except Exception:
             pass
         if head_ct and head_ct != "application/octet-stream":
@@ -1664,8 +1848,9 @@ async def require_url_content_type_prefix(url: str, prefix: str, label: str) -> 
 
 def _is_youtube_url(url: str) -> bool:
     """Recognize URLs whose Content-Type is HTML but whose payload is video/audio."""
-    from src.anubis.utils.classes.URLDocumentLoaderClass import _YOUTUBE_HOSTS
     from urllib.parse import urlparse
+
+    from src.anubis.utils.classes.URLDocumentLoaderClass import _YOUTUBE_HOSTS
 
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -1675,6 +1860,7 @@ def _is_youtube_url(url: str) -> bool:
 
 
 MAX_REMOTE_URL_DOWNLOAD_BYTES = 25 * 1024 * 1024
+
 
 async def fetch_remote_url_bytes(
     url: str,
@@ -1694,6 +1880,7 @@ async def fetch_remote_url_bytes(
             )
         header_ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
         return body, header_ct or "application/octet-stream"
+
 
 def make_data_uri(mime: str, body: bytes) -> str:
     """RFC 2397 data URI: ``data:<mime>;base64,<payload>``."""
@@ -1727,9 +1914,11 @@ _CSV_MIME_HINTS = frozenset(
         "application/x-csv",
     }
 )
-_CSV_NAME_HINT_RE = re.compile(r"\b(user[_-]?name|user|name|author|screen[_-]?name|"
-                               r"handle|username|creator|speaker|full[_-]?name)\b",
-                               re.IGNORECASE)
+_CSV_NAME_HINT_RE = re.compile(
+    r"\b(user[_-]?name|user|name|author|screen[_-]?name|"
+    r"handle|username|creator|speaker|full[_-]?name)\b",
+    re.IGNORECASE,
+)
 _CSV_BOOLEAN_VALUES = frozenset({"true", "false", "yes", "no", "0", "1"})
 _CSV_PREVIEW_ROW_LIMIT = 8
 _CSV_STATS_SAMPLE_VALUES = 3
@@ -1795,7 +1984,9 @@ def _parse_csv_to_rows(raw: bytes, filename: str) -> tuple[list[str], list[dict]
         )
     rows: list[dict] = []
     for row in reader:
-        rows.append({h: (row.get(h) if row.get(h) is not None else "") for h in headers})
+        rows.append(
+            {h: (row.get(h) if row.get(h) is not None else "") for h in headers}
+        )
     if not rows:
         raise HTTPException(
             status_code=400,
@@ -2042,7 +2233,9 @@ def _build_csv_statements_media_entry(
         "csv_text_column": metadata.get("csv_text_column"),
         "csv_target_column": metadata.get("csv_target_column"),
         "csv_row_count": metadata.get("csv_row_count"),
-        "namespace_filename": source_filename if not "." in source_filename else _namespace_safe_formatted_filename(source_filename),
+        "namespace_filename": source_filename
+        if not "." in source_filename
+        else _namespace_safe_formatted_filename(source_filename),
     }
 
 
@@ -2234,12 +2427,10 @@ async def get_avatar_reference_image(
         value = item.get("value") or {}
     else:
         value = getattr(item, "value", None) or {}
-    return JSONResponse(
-        {"reference_image_data": value.get("reference_image_data")}
-    )
-    
-from typing import Optional
+    return JSONResponse({"reference_image_data": value.get("reference_image_data")})
 
+
+from typing import Optional
 
 _MANIFEST_TEXT_MIMES = frozenset(
     {"text/plain", "text/markdown", "application/octet-stream"}
@@ -2286,7 +2477,11 @@ def _extract_manifest_urls(raw: bytes) -> List[str]:
             parsed = urlparse(candidate)
         except Exception:
             continue
-        if parsed.scheme in ("http", "https") and parsed.netloc and " " not in candidate:
+        if (
+            parsed.scheme in ("http", "https")
+            and parsed.netloc
+            and " " not in candidate
+        ):
             if candidate not in seen:
                 seen.add(candidate)
                 urls.append(candidate)
@@ -2378,8 +2573,10 @@ async def _build_media_entries_for_file(
     file in a multi-file request. Raises ``HTTPException`` on unsupported types.
     """
     entries: list = []
-    if not reference_image and not reference_audio and _is_csv_upload(
-        raw_name, mime_type
+    if (
+        not reference_image
+        and not reference_audio
+        and _is_csv_upload(raw_name, mime_type)
     ):
         csv_payload = await _csv_to_statements_payload(
             raw=content, source_filename=raw_name
@@ -2443,7 +2640,9 @@ async def _build_media_entries_for_file(
                 "reference_audio": False,
                 "reference_image": True,
                 "base64_encoded_str": make_data_uri(mime, content),
-                "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                "namespace_filename": raw_name
+                if not "." in raw_name
+                else _namespace_safe_formatted_filename(raw_name),
             }
         )
     elif reference_audio:
@@ -2476,14 +2675,15 @@ async def _build_media_entries_for_file(
                 "reference_audio": True,
                 "reference_image": False,
                 "base64_encoded_str": make_data_uri(effective, content),
-                "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                "namespace_filename": raw_name
+                if not "." in raw_name
+                else _namespace_safe_formatted_filename(raw_name),
             }
         )
     else:
         sniff = _sniff_media_category_from_bytes(content[:512])
         if mime_type.startswith("image/") or (
-            mime_type == "application/octet-stream"
-            and sniff in ALLOWED_IMAGE_MIMES
+            mime_type == "application/octet-stream" and sniff in ALLOWED_IMAGE_MIMES
         ):
             mime = validate_upload_image_bytes(mime_type, content)
             entries.append(
@@ -2496,7 +2696,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         elif mime_type.startswith("audio/") or (
@@ -2505,9 +2707,7 @@ async def _build_media_entries_for_file(
             and sniff.startswith("audio/")
         ):
             effective = (
-                mime_type
-                if mime_type.startswith("audio/")
-                else (sniff or mime_type)
+                mime_type if mime_type.startswith("audio/") else (sniff or mime_type)
             )
             if not effective.startswith("audio/"):
                 raise HTTPException(
@@ -2524,7 +2724,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(effective, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         elif mime_type.startswith("video/"):
@@ -2538,7 +2740,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         elif mime_type == "application/pdf":
@@ -2552,17 +2756,22 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type in (
-            "text/plain",
-            "application/json",
-            "text/markdown",
-            "application/octet-stream",
-        ) or mime_type.startswith("text/") or (
-            raw_name or ""
-        ).lower().endswith(".log"):
+        elif (
+            mime_type
+            in (
+                "text/plain",
+                "application/json",
+                "text/markdown",
+                "application/octet-stream",
+            )
+            or mime_type.startswith("text/")
+            or (raw_name or "").lower().endswith(".log")
+        ):
             entries.append(
                 {
                     "filename": raw_name,
@@ -2573,7 +2782,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
         else:
@@ -2721,7 +2932,11 @@ async def _build_media_entries_for_url(
                 "reference_audio": False,
                 "reference_image": True,
                 "base64_encoded_str": make_data_uri(img_mime, body),
-                "namespace_filename": namespace_safe_formatted_filename if not "." in namespace_safe_formatted_filename else _namespace_safe_formatted_filename(namespace_safe_formatted_filename),
+                "namespace_filename": namespace_safe_formatted_filename
+                if not "." in namespace_safe_formatted_filename
+                else _namespace_safe_formatted_filename(
+                    namespace_safe_formatted_filename
+                ),
             }
         )
     elif reference_audio:
@@ -2774,7 +2989,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": True,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(audio_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
     else:
@@ -2803,8 +3020,10 @@ async def _build_media_entries_for_url(
             pass
         elif _is_csv_upload(namespace_safe_formatted_filename or url_clean, ct):
             body, _header_ct = await fetch_remote_url_bytes(url_clean)
-            csv_filename = namespace_safe_formatted_filename if namespace_safe_formatted_filename.endswith((".csv", ".tsv")) else (
-                f"{namespace_safe_formatted_filename or 'remote_table'}.csv"
+            csv_filename = (
+                namespace_safe_formatted_filename
+                if namespace_safe_formatted_filename.endswith((".csv", ".tsv"))
+                else (f"{namespace_safe_formatted_filename or 'remote_table'}.csv")
             )
             csv_payload = await _csv_to_statements_payload(
                 raw=body, source_filename=csv_filename
@@ -2831,7 +3050,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(img_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         elif ct.startswith("audio/"):
@@ -2853,14 +3074,14 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(audio_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         elif ct.startswith("video/"):
             body, header_ct = await fetch_remote_url_bytes(url_clean)
-            video_mime = (
-                header_ct if header_ct.startswith("video/") else ct
-            )
+            video_mime = header_ct if header_ct.startswith("video/") else ct
             entries.append(
                 {
                     "filename": url_clean,
@@ -2872,7 +3093,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(video_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         elif ct.startswith("text/") or ct in (
@@ -2909,7 +3132,9 @@ async def _build_media_entries_for_url(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(doc_mime, body),
-                    "namespace_filename": url_clean if not "." in url_clean else _namespace_safe_formatted_filename(url_clean),
+                    "namespace_filename": url_clean
+                    if not "." in url_clean
+                    else _namespace_safe_formatted_filename(url_clean),
                 }
             )
         else:
@@ -2990,7 +3215,7 @@ async def update_avatar_identity_with_media(
         assistant_meta = assistant.get("metadata") or {}
         creator_id = assistant_meta.get("user_id")
         if not creator_id:
-            raise HTTPException(  
+            raise HTTPException(
                 status_code=400,
                 detail=(
                     "Assistant metadata is missing the creator's user_id; "
@@ -3039,7 +3264,9 @@ async def update_avatar_identity_with_media(
                 status_code=400,
                 detail="Use only one of reference_image or reference_audio.",
             )
-        if create_reference_media_from_playlist and (reference_image or reference_audio):
+        if create_reference_media_from_playlist and (
+            reference_image or reference_audio
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -3072,9 +3299,12 @@ async def update_avatar_identity_with_media(
             if non_empty_files:
                 uf = non_empty_files[0]
                 content = await uf.read()
-                mime_type = (uf.content_type or "application/octet-stream").split(
-                    ";"
-                )[0].strip().lower()
+                mime_type = (
+                    (uf.content_type or "application/octet-stream")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
                 media_files.extend(
                     await _build_media_entries_for_file(
                         uf.filename,
@@ -3109,9 +3339,12 @@ async def update_avatar_identity_with_media(
             for uf in non_empty_files:
                 content = await uf.read()
                 raw_name = uf.filename
-                mime_type = (uf.content_type or "application/octet-stream").split(
-                    ";"
-                )[0].strip().lower()
+                mime_type = (
+                    (uf.content_type or "application/octet-stream")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
                 # A .txt/.md (non-CSV) whose lines are bare URLs is a manifest:
                 # expand it into URLs instead of ingesting it as a text document.
                 if not _is_csv_upload(raw_name, mime_type) and (
@@ -3229,8 +3462,7 @@ async def update_avatar_identity_with_media(
         incoming_filenames = [
             name
             for name in (
-                (entry.get("namespace_filename") or "").strip()
-                for entry in media_files
+                (entry.get("namespace_filename") or "").strip() for entry in media_files
             )
             if name
         ]
@@ -3302,9 +3534,7 @@ async def update_avatar_identity_with_media(
                 config,
                 store,
                 app.state.context,
-                concurrency=max(
-                    1, app.state.context.media_processing_concurrency
-                ),
+                concurrency=max(1, app.state.context.media_processing_concurrency),
                 existing_namespaces=sorted(existing_namespaces),
                 registry=registry,
                 deferred_expanders=deferred_expanders,
@@ -3425,9 +3655,7 @@ async def media_job_status(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
     if job.user_id != user_id:
-        raise HTTPException(
-            status_code=403, detail="This job belongs to another user."
-        )
+        raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
     def _descriptor(j: MediaJob) -> dict:
         return {
@@ -3479,9 +3707,7 @@ async def media_job_progress(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
     if job.user_id != user_id:
-        raise HTTPException(
-            status_code=403, detail="This job belongs to another user."
-        )
+        raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
     def _with_timing(payload: dict) -> dict:
         """Return a copy of ``payload`` stamped with the job's start time and the
@@ -3615,9 +3841,7 @@ async def cancel_media_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
     if job.user_id != user_id:
-        raise HTTPException(
-            status_code=403, detail="This job belongs to another user."
-        )
+        raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
     # Flag + cancel the running task(s); returns the affected child jobs.
     targets = request_cancel(registry, job)
@@ -3669,7 +3893,9 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
     # what the upload endpoint's dedup uses.
     store = app.state.store
     try:
-        all_document_items = await store.asearch((user_id, assistant_id), limit=1_000_000)
+        all_document_items = await store.asearch(
+            (user_id, assistant_id), limit=1_000_000
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -3692,7 +3918,7 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 async def delete_avatar_documents(
     source_document_name: str, current_user: dict = Depends(get_current_user)
 ):
-    
+
     # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
     # leaving only the filename or already-derived namespace id.
     source_document_name = source_document_name.strip(" \t\n\r\"'`(),[]")
@@ -3725,9 +3951,7 @@ async def delete_avatar_documents(
             (user_id, assistant_id), limit=1_000_000
         )
         label_to_key = {
-            label: key
-            for label, key in _iter_document_labels(existing_items)
-            if key
+            label: key for label, key in _iter_document_labels(existing_items) if key
         }
     except Exception:
         label_to_key = {}
@@ -3807,6 +4031,15 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
             detail=f"No stored rows matched document: {display_name}",
         )
 
+    # The raw SQL above can remove the avatar's reference image (the
+    # ``reference_%`` prefix clause) without going through the store client, so
+    # drop the reference-image entry from the load_consciousness read-through
+    # cache. Unconditional because the deleted rows are not inspected per
+    # namespace; the invalidation is a dictionary pop either way.
+    invalidate_store_cache_entry(
+        (user_id, assistant_id, "reference_image"), assistant_id
+    )
+
     # Prune the deleted documents' rows from the stylometric "direct quote"
     # feature corpus (a {document_id: [len(FEATURE_NAMES) floats]} dict in the store), then
     # recalibrate the empirical threshold + IsolationForest from what remains.
@@ -3816,7 +4049,9 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
             user_id, assistant_id, deleted_document_ids
         )
     except Exception as exc:  # pragma: no cover - operator log only
-        logger.warning("ground-truth feature prune failed for %s: %s", assistant_id, exc)
+        logger.warning(
+            "ground-truth feature prune failed for %s: %s", assistant_id, exc
+        )
 
     return JSONResponse(
         content=f"Successfully deleted: {display_name}", status_code=200
@@ -3910,6 +4145,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
         key="style_profile",
         value={"value": style_profile_str},
     )
+
 
 if __name__ == "__main__":
     import uvicorn

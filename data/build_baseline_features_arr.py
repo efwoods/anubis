@@ -48,6 +48,7 @@ from src.anubis.utils.dataset.key_phrases import discover_key_phrases
 from src.anubis.utils.dataset.style_features import (
     FEATURE_NAMES,
     STYLE_FEATURE_VECTOR_VERSION,
+    compute_empirical_distribution,
     extract_style_features,
 )
 
@@ -158,6 +159,23 @@ def build() -> None:
     if _STALE_EXPLAINER_PATH.exists():
         _STALE_EXPLAINER_PATH.unlink()
         print(f"Removed stale {_STALE_EXPLAINER_PATH.relative_to(_REPO_ROOT)}")
+
+    # Recalibrate BASELINE_RESPONSE_THRESHOLD: the Tukey upper fence
+    # (Q3 + 1.5*IQR) of the leave-one-out squared-Mahalanobis empirical
+    # distribution over the baseline matrix — the same calibration
+    # recompute_ground_truth_artifacts uses for the per-avatar cloud. The
+    # Mahalanobis scale shifts whenever the feature-vector width changes, so this
+    # must be re-derived on every rebuild and copied into the
+    # BASELINE_RESPONSE_THRESHOLD env var (.env / .env.dev) and the
+    # GlobalContext.baseline_response_threshold default.
+    empirical_distribution = compute_empirical_distribution(feature_matrix)
+    q3 = np.percentile(empirical_distribution, 75)
+    q1 = np.percentile(empirical_distribution, 25)
+    baseline_response_threshold = float(q3 + 1.5 * (q3 - q1))
+    print(
+        f"Recalibrated BASELINE_RESPONSE_THRESHOLD = {baseline_response_threshold!r} "
+        "(update .env / .env.dev and the GlobalContext default to this value)"
+    )
 
 
 if __name__ == "__main__":

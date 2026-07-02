@@ -195,6 +195,75 @@ def _is_full_audio_data_uri(value: str) -> bool:
     return normalized.startswith("data:audio/") and ";base64," in normalized
 
 
+def _parse_json_lines_to_statements_payload(raw_text: str, filename: str) -> Dict[str, Any]:
+    """Parse JSON-Lines text (one JSON object per line) into the statements contract.
+
+    Each parsed line object is expected to already be one avatar-identity
+    statement — ``{"messages": [{"role": "assistant", "content": "..."}],
+    "metadata": {...}}`` — so the lines are wrapped verbatim as
+    ``{"statements": [<line>, ...]}``, the exact shape the JSON media handler in
+    ``process_media_item_task`` already consumes. Unparsable or non-object lines
+    are skipped with a warning rather than failing the file (mirrors the
+    one-bad-item-must-not-abort-the-batch policy of media conversion).
+
+    Raises ``ValueError`` when NO line parses to an object, so the caller's
+    existing per-file error handling reports the file as unprocessable.
+    """
+    statements: List[Dict[str, Any]] = []
+    skipped_line_count = 0
+    for line_number, line in enumerate(raw_text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            line_object = json.loads(line)
+        except json.JSONDecodeError as line_error:
+            skipped_line_count += 1
+            logger.warning(
+                "Skipping unparsable JSON line %d in %s: %s",
+                line_number,
+                filename,
+                line_error,
+            )
+            continue
+        if isinstance(line_object, dict):
+            statements.append(line_object)
+        else:
+            skipped_line_count += 1
+            logger.warning(
+                "Skipping non-object JSON line %d in %s", line_number, filename
+            )
+    if not statements:
+        raise ValueError(
+            f"{filename}: no line parsed to a JSON object; not a JSON-Lines file"
+        )
+    if skipped_line_count:
+        logger.warning(
+            "Parsed %s as JSON-Lines with %d line(s) skipped",
+            filename,
+            skipped_line_count,
+        )
+    return {"statements": statements}
+
+
+def _parse_json_or_json_lines_upload(
+    *, raw_text: str, filename: str, suffix: str
+) -> Any:
+    """Parse an uploaded ``.json`` / ``.jsonl`` file into the JSON media payload.
+
+    ``.jsonl`` files are parsed line-by-line into the ``{"statements": [...]}``
+    contract. ``.json`` files are parsed as one document first; when that fails
+    with ``Extra data`` (the signature of concatenated per-line objects saved
+    under a ``.json`` name) the JSON-Lines parse is retried as a fallback.
+    """
+    if suffix == ".jsonl":
+        return _parse_json_lines_to_statements_payload(raw_text, filename)
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return _parse_json_lines_to_statements_payload(raw_text, filename)
+
+
 async def process_uploaded_files_and_label_media_type(
     state: GlobalState, 
     runtime: Runtime[GlobalContext], 
@@ -519,9 +588,11 @@ async def process_uploaded_files_and_label_media_type(
                         raw = _decode_data_uri_base64_payload(
                             full_payload_uri
                         ).decode("utf-8")
-                        text_content = json.loads(raw)
                     else:
-                        text_content = json.loads(file_bytes.decode('utf-8'))
+                        raw = file_bytes.decode('utf-8')
+                    text_content = _parse_json_or_json_lines_upload(
+                        raw_text=raw, filename=filename, suffix=suffix
+                    )
                     media_list.append({
                         "type": "json",
                         "content": text_content,
@@ -1278,20 +1349,67 @@ async def process_media_item_task(
 
                         # FINAL DOCUMENTS ARE USED TO CALIBRATE THE GROUND_TRUTH_FEATURES
                 """ CALIBRATE GROUND TRUTH """
+                # Calibration is derived state (threshold + IsolationForest); a
+                # failure here must degrade to "no ground-truth comparison yet",
+                # never abort the upload — the statement Documents must still
+                # reach the vectorstore.
                 from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-                await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=final_documents, user_id=user_id)
+                try:
+                    await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=final_documents, user_id=user_id)
+                except Exception as calibration_error:  # noqa: BLE001 - best-effort derived artifacts
+                    logger.warning(
+                        "calibrate_ground_truth failed (%s); continuing ingestion without recalibration",
+                        calibration_error,
+                    )
 
                 return final_documents
 
-            # Existing single-conversation shape: ``{"messages": [...]}``
+            # Existing single-conversation shape: ``{"messages": [...]}``. Any
+            # other shape is unrecognized — return a clear error Document
+            # instead of raising KeyError so one malformed JSON file cannot
+            # crash the batch (tabular JSON is converted to statements at the
+            # API edge before this handler ever sees the file).
+            messages = (
+                content.get("messages") if isinstance(content, dict) else None
+            )
+            if not isinstance(messages, list):
+                logger.warning(
+                    "Unrecognized JSON shape in %s: expected a dict with a "
+                    "'statements' or 'messages' list",
+                    filename,
+                )
+                return [
+                    Document(
+                        page_content=(
+                            "[Unrecognized JSON shape: expected an object with a "
+                            "'statements' or 'messages' list]"
+                        ),
+                        metadata={
+                            "status": "error",
+                            "error": (
+                                "unrecognized_json_shape: expected 'statements' "
+                                "or 'messages'"
+                            ),
+                            "filename": filename,
+                        },
+                    )
+                ]
             classification_metadata = {
                 "classified_situation": "conversation_facts",
                 "classification_reasoning": "user_selected_classification_of_ai_human_conversation"
             }
-            messages = media_item['content']['messages']
             final_documents = []
             for message in messages:
-                media_item['content'] = message['content']
+                message_content = (
+                    message.get("content") if isinstance(message, dict) else None
+                )
+                if not message_content:
+                    logger.warning(
+                        "Skipping malformed message entry (no content) in %s",
+                        filename,
+                    )
+                    continue
+                media_item['content'] = message_content
                 documents = await process_text_media_item_target_for_vectorstore(
                     media_item=media_item,
                     user_id=user_id,

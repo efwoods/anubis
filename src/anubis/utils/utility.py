@@ -1887,7 +1887,8 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     baseline_features_namespace = ("baseline_features_arr_list_str",)
     baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
     baseline_features_explainer_namespace = ("baseline_features_explainer_b64_pkl",)
-
+    # basline_features_keyword_namespace = ("basline_features_keyword_namespace", )
+    
     baseline_features_arr_list_str_ITEM = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
     baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
 

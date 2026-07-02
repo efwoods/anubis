@@ -406,7 +406,9 @@ async def _build_consciousness_system_message_update(
     analyzed_traits = reduce_docs([], analyzed_trait_items)
 
     """ Retrieve Style Profile """
-    style_profile_namespace = (assistant_id, "style_profile")
+    # Owner-scoped like every other per-avatar artifact: calibrate_ground_truth
+    # writes it under (creator_id, assistant_id, "style_profile").
+    style_profile_namespace = (creator_id, assistant_id, "style_profile")
     style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
 
     # style_profile_str will be "" if the style profile does not exist
@@ -414,13 +416,30 @@ async def _build_consciousness_system_message_update(
 
     """ Retrieve Signature Key Phrases """
     # The avatar's auto-discovered signature phrases (built by calibrate_ground_truth
-    # from the direct quotes). Retrieved like the style profile — a single blob read
-    # every turn — and prompt-injected as its own section. Empty string when none
-    # have been discovered yet.
+    # from the direct quotes). Stored owner-scoped at
+    # (creator_id, assistant_id, "key_phrase_profile") as a JSON list; rendered
+    # here into the LLM-legible block injected as the <SIGNATURE PHRASES> section.
+    # Empty string when none have been discovered yet.
+    import json as _json
+
     key_phrase_profile_ITEM = await runtime.store.aget(
-        (assistant_id, "key_phrase_profile"), "key_phrase_profile"
+        (creator_id, assistant_id, "key_phrase_profile"), "key_phrase_profile"
     )
-    key_phrases_str = getattr(key_phrase_profile_ITEM, "value", {}).get("value", "")
+    key_phrase_list_str = getattr(key_phrase_profile_ITEM, "value", {}).get("value", "")
+    try:
+        key_phrase_list = _json.loads(key_phrase_list_str) if key_phrase_list_str else []
+    except (TypeError, ValueError):
+        key_phrase_list = []
+    # Render-time guard: phrase sets stored before discovery cleaned its corpus
+    # contain markup debris ("https t co ...") — never show those to the model.
+    # The stored set itself heals on the avatar's next calibration.
+    from src.anubis.utils.dataset.key_phrases import phrase_is_well_formed
+
+    key_phrases_str = "\n".join(
+        f'- "{phrase}"'
+        for phrase in key_phrase_list
+        if phrase_is_well_formed(phrase)
+    )
 
     """ Retrieve Emotions """
 

@@ -77,6 +77,67 @@ GENERIC_ENGLISH_UNIGRAM_RELATIVE_FREQUENCY: Dict[str, float] = {
 # enough that a phrase built from distinctive/content words gets a high keyness.
 _GENERIC_FLOOR_RELATIVE_FREQUENCY = 5e-5
 
+# The only single-character tokens that are real English words. Any other
+# single-character token inside a candidate phrase is tokenizer shrapnel
+# (URL path characters, stray initials from stripped handles) — such phrases
+# are rejected by phrase_is_well_formed.
+_VALID_SINGLE_CHARACTER_TOKENS = frozenset({"a", "i"})
+
+# Tokens that only ever appear as debris of stripped markup, never as speech.
+# "https"/"http"/"co" cover the ``https://t.co/...`` link shrapnel that
+# dominated discovery before the corpus was cleaned; "amp" is the unescaped
+# ``&amp;``. Kept as a read-time guard so phrase sets stored BEFORE the
+# corpus-cleaning fix self-heal when reloaded and re-unioned.
+_MARKUP_DEBRIS_TOKENS = frozenset({"https", "http", "www", "co", "amp"})
+
+
+def build_corpus_phrase_attestation_set(
+    documents: Sequence[str], *, ngram_sizes: tuple = (2, 3, 4)
+) -> set:
+    """Every 2–4-word phrase that actually occurs in the CLEANED corpus.
+
+    Used to validate a previously-stored signature-phrase set against the
+    current quote corpus: a signature phrase, by definition, must occur in the
+    avatar's own quotes. Phrase sets stored before discovery cleaned its corpus
+    hold artifacts of RAW text (@mention chains such as "cb doge tesla
+    mayemusk") whose tokens look like real words, so no shape-based filter can
+    reject them — but they never occur in the cleaned corpus, so attestation
+    drops them. Tokenisation matches :func:`discover_key_phrases` exactly
+    (clean_text then tokenize), so any discovered phrase is attested by
+    construction.
+    """
+    from src.anubis.utils.dataset.style_features import clean_text
+
+    attested_phrases: set = set()
+    for document in documents:
+        tokens = tokenize(clean_text(document))
+        for ngram_size in ngram_sizes:
+            for start_index in range(len(tokens) - ngram_size + 1):
+                attested_phrases.add(
+                    " ".join(tokens[start_index : start_index + ngram_size])
+                )
+    return attested_phrases
+
+
+def phrase_is_well_formed(phrase: str) -> bool:
+    """True when a signature phrase looks like real speech, not markup debris.
+
+    Applied in three places so the same rule governs the phrase set everywhere:
+    on the output of :func:`discover_key_phrases`, when a previously-stored
+    phrase set is reloaded for re-union (healing sets polluted before the
+    corpus-cleaning fix), and when the set is rendered into the
+    <SIGNATURE PHRASES> system prompt section.
+    """
+    tokens = (phrase or "").split()
+    if not tokens:
+        return False
+    for token in tokens:
+        if token in _MARKUP_DEBRIS_TOKENS:
+            return False
+        if len(token) == 1 and token not in _VALID_SINGLE_CHARACTER_TOKENS:
+            return False
+    return True
+
 
 def key_phrase_occurrence_rate(
     text: str, key_phrases: Sequence[str] | None
@@ -159,7 +220,19 @@ def discover_key_phrases(
         means "as frequent as generic English predicts", positive means
         over-represented (the interesting direction), larger means more distinctive.
     """
-    corpus_tokens: List[List[str]] = [tokenize(document) for document in documents]
+    # Discovery must mine the SAME text the key_phrase_rate feature is later
+    # measured on: extract_style_features scores clean_text()'d text, so the
+    # corpus is cleaned identically here (HTML entities unescaped, URLs and
+    # @mentions dropped, apostrophes normalized). Mining raw tweets instead is
+    # what produced the "https t co ..." / "amp ..." junk phrase sets — phrases
+    # that could then NEVER match cleaned text, pinning key_phrase_rate to 0.
+    # Imported lazily: style_features lazily imports this module in the other
+    # direction, so a module-scope import here would be circular.
+    from src.anubis.utils.dataset.style_features import clean_text
+
+    corpus_tokens: List[List[str]] = [
+        tokenize(clean_text(document)) for document in documents
+    ]
     token_grand_total = sum(len(tokens) for tokens in corpus_tokens)
     if token_grand_total == 0:
         return []
@@ -174,6 +247,8 @@ def discover_key_phrases(
 
         for phrase_tokens, count in phrase_counts.items():
             if count < min_count:
+                continue
+            if not phrase_is_well_formed(" ".join(phrase_tokens)):
                 continue
             # Normalise by the corpus token total (not the per-n phrase total) so
             # keyness is comparable across the different n-gram sizes.

@@ -28,10 +28,18 @@ from typing import Dict, Iterable, List, Tuple
 _DEFAULT_TOP_N = 150
 _TOKEN_RE = re.compile(r"[A-Za-z']+")
 
+# LLM and word-processor text uses the Unicode curly apostrophe family; the
+# ASCII-only token pattern above would split "don’t" into "don" + "t" (which is
+# how apostrophe-less phrases like "don t" leaked into the discovered
+# key-phrase lists). Normalize every variant to the ASCII apostrophe BEFORE
+# tokenising so "don't" / "don’t" produce the identical single token.
+_APOSTROPHE_VARIANTS_RE = re.compile(r"[‘’ʼ`´]")
+
 
 def tokenize(text: str) -> List[str]:
     """Lowercase alpha tokens; apostrophes preserved (function words like ``it's``)."""
-    return [t.lower() for t in _TOKEN_RE.findall(text or "")]
+    normalized = _APOSTROPHE_VARIANTS_RE.sub("'", text or "")
+    return [t.lower() for t in _TOKEN_RE.findall(normalized)]
 
 
 def _document_word_distribution(text: str, vocabulary: List[str]) -> Dict[str, float]:

@@ -1065,9 +1065,18 @@ async def process_text_to_document(
             classification_metadata=classification_metadata,
         )
         """ CALIBRATE GROUND TRUTH """
+        # Calibration is derived state (threshold + IsolationForest); a failure
+        # here must degrade to "no ground-truth comparison yet", never abort the
+        # upload — the quote Documents below must still reach the vectorstore.
         from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-        await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents, user_id=user_id)
-        
+        try:
+            await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents, user_id=user_id)
+        except Exception as calibration_error:  # noqa: BLE001 - best-effort derived artifacts
+            logger.warning(
+                "calibrate_ground_truth failed (%s); continuing ingestion without recalibration",
+                calibration_error,
+            )
+
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True
         # adapter_acceptable: True

@@ -6,7 +6,6 @@ profile blob), and recalibrates the empirical threshold + IsolationForest.
 """
 
 import logging
-import uuid
 from typing import Any, Dict, List
 
 from langchain_core.documents import Document
@@ -31,21 +30,41 @@ MIN_ROWS_FOR_CALIBRATION = 10
 # separately at MAX_CALIBRATION_ROWS inside recompute_ground_truth_artifacts.
 _QUOTE_CORPUS_READ_LIMIT = 10000
 
-# LangGraph store locations for the signature key phrases. The vectorstore
-# namespace mirrors the "quote" namespace so phrases can be retrieved the same
-# way; the profile blob mirrors the "style_profile" blob (a single value read
-# every turn) and additionally carries the raw phrase list the key_phrase_rate
-# feature needs.
-KEY_PHRASE_NAMESPACE_TAG = "key_phrase"
+# Store key for the signature key-phrase profile blob: a JSON-encoded list of
+# the avatar's signature phrases, stored ONCE per avatar at
+# ``(user_id, assistant_id, KEY_PHRASE_PROFILE_KEY)`` under the same key
+# (mirroring the "style_profile" blob). The list is consumed two ways: parsed
+# for the key_phrase_rate feature, and rendered into the <SIGNATURE PHRASES>
+# system prompt section. Each calibration unions the newly-discovered phrases
+# with the previously-stored ones, then keeps only the phrases ATTESTED in the
+# current cleaned quote corpus — a signature phrase must occur in the avatar's
+# own quotes (this also purges artifacts stored before discovery cleaned its
+# corpus, e.g. @mention-chain phrases).
 KEY_PHRASE_PROFILE_KEY = "key_phrase_profile"
 
 
 def _quote_text_from_store_value(value: Any) -> str | None:
-    """Pull page_content out of a stored quote item's value envelope."""
+    """Pull page_content out of a stored quote item's value envelope.
+
+    The indexer persists each quote as a LangChain-serialized Document —
+    ``{"document": {"kwargs": {"page_content": ..., "metadata": ...}}}`` (the
+    same shape ``langgraph.json`` points the store's vector index at:
+    ``document.kwargs.page_content``). The two flatter shapes are kept as
+    fallbacks for values written by other paths. Missing the ``kwargs`` level
+    here previously made every stored quote extract as None, so the corpus
+    read-back silently produced an EMPTY prior corpus.
+    """
     value = value or {}
-    content = value.get("page_content")
-    if not content and isinstance(value.get("document"), dict):
-        content = (value["document"] or {}).get("page_content")
+    document_envelope = value.get("document")
+    content = None
+    if isinstance(document_envelope, dict):
+        kwargs_envelope = document_envelope.get("kwargs")
+        if isinstance(kwargs_envelope, dict):
+            content = kwargs_envelope.get("page_content")
+        if not content:
+            content = document_envelope.get("page_content")
+    if not content:
+        content = value.get("page_content")
     if isinstance(content, str) and content.strip():
         return content.strip()
     return None
@@ -86,68 +105,60 @@ async def _load_quote_corpus_by_doc_id(
 
     return doc_id_to_text
 
-
 async def _store_signature_key_phrases(
     store: BaseStore,
     user_id: str,
     assistant_id: str,
-    key_phrases_detailed: List[Dict[str, Any]],
+    phrase_list: List[str],
 ) -> None:
-    """Persist the discovered signature phrases two ways.
+    """Persist the signature-phrase list as the single ``key_phrase_profile`` blob.
 
-    1. One Document per phrase in the ``(user_id, assistant_id, "key_phrase")``
-       vectorstore namespace, keyed by a deterministic uuid5 of the phrase so
-       re-discovery on later uploads UPDATES rather than duplicates (the phrase
-       vectorstore "expands" as more direct quotes arrive).
-    2. A single ``key_phrase_profile`` blob at ``(assistant_id, KEY_PHRASE_...)``
-       holding the raw phrase list (consumed by the key_phrase_rate feature) and a
-       rendered, LLM-legible string (prompt-injected as the signature-phrase
-       section), mirroring how the "style_profile" blob is stored/retrieved.
+    Stored at ``(user_id, assistant_id, KEY_PHRASE_PROFILE_KEY)`` under the same
+    key, as ``{"value": json.dumps(phrase_list)}`` — mirroring how the
+    "style_profile" blob is stored/retrieved. The caller passes the already-
+    unioned (previous ∪ newly-discovered) and corpus-attested list, so writing
+    here upserts the reconciled set.
     """
-    key_phrase_namespace = (user_id, assistant_id, KEY_PHRASE_NAMESPACE_TAG)
-    for phrase in key_phrases_detailed:
-        phrase_text = phrase["phrase"]
-        phrase_document = Document(
-            page_content=phrase_text,
-            metadata={
-                "namespace": KEY_PHRASE_NAMESPACE_TAG,
-                "count": phrase.get("count"),
-                "keyness_log2_over_generic_english": phrase.get(
-                    "keyness_log2_over_generic_english"
-                ),
-            },
-        )
-        phrase_key = str(uuid.uuid5(uuid.NAMESPACE_URL, phrase_text))
-        await store.aput(
-            key_phrase_namespace,
-            key=phrase_key,
-            value={"document": phrase_document.to_json()},
-        )
+    import json
 
-    phrase_list = [phrase["phrase"] for phrase in key_phrases_detailed]
-    rendered = _render_key_phrase_profile_str(phrase_list)
     await store.aput(
-        (assistant_id, KEY_PHRASE_PROFILE_KEY),
+        (user_id, assistant_id, KEY_PHRASE_PROFILE_KEY),
         key=KEY_PHRASE_PROFILE_KEY,
-        value={"value": rendered, "phrases": phrase_list},
+        value={"value": json.dumps(phrase_list)},
     )
 
 
-def _render_key_phrase_profile_str(phrase_list: List[str]) -> str:
-    """Render the phrase list as the LLM-legible signature-phrase block."""
-    if not phrase_list:
-        return ""
-    return "\n".join(f'- "{phrase}"' for phrase in phrase_list)
-
-
 async def _load_previous_key_phrases(
-    store: BaseStore, assistant_id: str
+    store: BaseStore, user_id: str, assistant_id: str
 ) -> List[str]:
-    """Return the phrase list from the last calibration (empty if none yet)."""
-    item = await store.aget((assistant_id, KEY_PHRASE_PROFILE_KEY), key=KEY_PHRASE_PROFILE_KEY)
-    value = getattr(item, "value", None) or {}
-    phrases = value.get("phrases")
-    return list(phrases) if isinstance(phrases, list) else []
+    """Return the phrase list from the last calibration (empty if none yet).
+
+    The list is passed through ``phrase_is_well_formed`` on load: phrase sets
+    stored BEFORE discovery cleaned its corpus are full of markup debris
+    ("https t co ...", "amp ...") that would otherwise re-enter the union every
+    calibration. Shape-based filtering here catches the obvious debris cheaply;
+    the corpus-attestation filter in ``calibrate_ground_truth`` then removes
+    anything that no longer occurs in the cleaned quote corpus (dropping
+    phrases changes the set, which routes calibration down the full-recompute
+    path so every row's key_phrase_rate is re-measured against the healed set).
+    """
+    import json
+
+    from src.anubis.utils.dataset.key_phrases import phrase_is_well_formed
+
+    item = await store.aget(
+        (user_id, assistant_id, KEY_PHRASE_PROFILE_KEY), key=KEY_PHRASE_PROFILE_KEY
+    )
+    phrase_list_str = (getattr(item, "value", None) or {}).get("value", None)
+    if not phrase_list_str:
+        return []
+    try:
+        phrases = json.loads(phrase_list_str)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(phrases, list):
+        return []
+    return [phrase for phrase in phrases if phrase_is_well_formed(phrase)]
 
 
 async def calibrate_ground_truth(
@@ -162,23 +173,30 @@ async def calibrate_ground_truth(
     Beyond the per-document stylometric features it always maintained, this now:
 
     * discovers the avatar's SIGNATURE KEY PHRASES over the full quote corpus and
-      stores them (vectorstore namespace + prompt-injectable profile blob), and
+      stores the (previous ∪ new) union as the ``key_phrase_profile`` blob, and
     * keeps every per-document feature row's ``key_phrase_rate`` measured against
       the CURRENT phrase set.
 
-    Because ``key_phrase_rate`` is measured against the discovered phrase set, that
+    Because ``key_phrase_rate`` is measured against the stored phrase set, that
     set changing invalidates previously-computed rows. So when the phrase set is
     unchanged we take the cheap incremental path (extract only the new documents
-    and merge); when it changes we fully recompute every row from the quote corpus.
+    and merge); when it grows we fully recompute every row from the quote corpus.
     Both feed ``recompute_ground_truth_artifacts`` (empirical threshold +
     IsolationForest) and rebuild the LLM-legible ``style_profile`` string.
+
+    Every artifact this function writes lives under the owner-scoped
+    ``(user_id, assistant_id, <artifact_name>)`` namespace with the artifact
+    name as the key: ``key_phrase_profile``, the per-document feature dict
+    (``GROUND_TRUTH_FEATURES_DICT_KEY``), ``style_profile``,
+    ``ground_truth_text_empirical_threshold_list_str``, and
+    ``ground_truth_text_features_model_b64_pkl``.
 
     Args:
         store: LangGraph cross-thread store.
         assistant_id: The avatar whose cloud is being calibrated.
         documents: The new quote Documents from this upload.
-        user_id: The avatar owner id (the first element of the owner-scoped
-            ``quote`` / ``key_phrase`` namespaces).
+        user_id: The avatar owner id (the first element of every owner-scoped
+            namespace above, matching the ``quote`` namespace).
     """
     import asyncio
 
@@ -191,8 +209,10 @@ async def calibrate_ground_truth(
         build_style_profile_str,
         deserialize_features_by_doc_id,
         extract_style_features,
+        feature_row_is_all_nan,
         features_by_doc_id_to_arr,
         recompute_ground_truth_artifacts,
+        sanitize_ground_truth_feature_matrix,
         serialize_features_by_doc_id,
     )
 
@@ -205,17 +225,34 @@ async def calibrate_ground_truth(
         store, user_id, assistant_id, documents
     )
     key_phrases_detailed = discover_key_phrases(list(doc_id_to_text.values()))
-    key_phrases = [phrase["phrase"] for phrase in key_phrases_detailed]
+    discovered_key_phrases = [phrase["phrase"] for phrase in key_phrases_detailed]
 
-    # Persist the phrases (vectorstore + profile blob) before feature work so the
-    # signature-phrase section and the key_phrase_rate reference set are in sync.
-    previous_key_phrases = await _load_previous_key_phrases(store, assistant_id)
-    await _store_signature_key_phrases(
-        store, user_id, assistant_id, key_phrases_detailed
+    # Union the newly-discovered phrases with the previously-stored ones, then
+    # keep only phrases ATTESTED in the current cleaned corpus (a signature
+    # phrase must occur in the avatar's own quotes; discovered phrases are
+    # attested by construction, stale artifacts from pre-cleaning phrase sets
+    # are not). Persisted BEFORE feature work so the signature-phrase section
+    # and the key_phrase_rate reference set stay in sync. Sorted for a
+    # deterministic stored order.
+    from src.anubis.utils.dataset.key_phrases import (
+        build_corpus_phrase_attestation_set,
     )
 
+    previous_key_phrases = await _load_previous_key_phrases(
+        store, user_id, assistant_id
+    )
+    attested_phrases = build_corpus_phrase_attestation_set(
+        list(doc_id_to_text.values())
+    )
+    key_phrases = sorted(
+        phrase
+        for phrase in set(discovered_key_phrases) | set(previous_key_phrases)
+        if phrase in attested_phrases
+    )
+    await _store_signature_key_phrases(store, user_id, assistant_id, key_phrases)
+
     # ── 2. Rebuild the per-document feature dict. ──────────────────────────────
-    ground_truth_namespace = (assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
+    ground_truth_namespace = (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
     existing_item = await store.aget(
         ground_truth_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY
     )
@@ -236,20 +273,39 @@ async def calibrate_ground_truth(
             lambda: [_feature_row(text, key_phrases) for _, text in new_items]
         )
         features_by_doc_id = dict(existing_features_by_doc_id)
+        # All-NaN rows (URL-only / emoji-only lines) carry no stylometric
+        # signal — keep them out of the persisted corpus entirely.
         features_by_doc_id.update(
-            {doc_id: row for (doc_id, _), row in zip(new_items, new_rows)}
+            {
+                doc_id: row
+                for (doc_id, _), row in zip(new_items, new_rows)
+                if not feature_row_is_all_nan(row)
+            }
         )
     else:
-        # Slow path: the phrase set changed (or there is no prior corpus), so every
-        # row's key_phrase_rate must be re-measured against the new phrases. Rebuild
-        # the whole dict from the full quote corpus, keyed by document_id.
+        # Slow path: the phrase set changed (or there is no prior corpus), so
+        # every row's key_phrase_rate must be re-measured against the new set.
+        # Rebuild from the full quote corpus, keyed by document_id — but MERGE
+        # over the existing dict rather than replace: an existing row whose
+        # source text cannot be re-read this pass (indexing lag, the corpus
+        # read limit, or a read-back fault) is RETAINED with its stale
+        # key_phrase_rate column. One stale column in one row is a far smaller
+        # error than silently discarding the row — a replace here once wiped a
+        # ~6k-row corpus down to a single upload's rows when the store
+        # read-back came back empty.
         corpus_items = list(doc_id_to_text.items())
         rows = await asyncio.to_thread(
             lambda: [_feature_row(text, key_phrases) for _, text in corpus_items]
         )
-        features_by_doc_id = {
-            doc_id: row for (doc_id, _), row in zip(corpus_items, rows)
-        }
+        features_by_doc_id = dict(existing_features_by_doc_id)
+        features_by_doc_id.update(
+            {
+                doc_id: row
+                for (doc_id, _), row in zip(corpus_items, rows)
+                if not feature_row_is_all_nan(row)
+            }
+        )
+
 
     # Persist the dict FIRST and unconditionally — the corpus must keep
     # accumulating even when it is still too small to calibrate against.
@@ -260,7 +316,12 @@ async def calibrate_ground_truth(
     )
 
     # ── 3. Defer threshold/model until the corpus is large enough. ─────────────
-    ground_truth_text_features_arr = features_by_doc_id_to_arr(features_by_doc_id)
+    # Sanitize BEFORE the row-count floor so the count reflects rows that are
+    # actually usable for calibration (a legacy corpus may still hold all-NaN
+    # rows persisted before the write-time filter above existed).
+    ground_truth_text_features_arr = sanitize_ground_truth_feature_matrix(
+        features_by_doc_id_to_arr(features_by_doc_id)
+    )
     if ground_truth_text_features_arr.shape[0] < MIN_ROWS_FOR_CALIBRATION:
         return
 
@@ -276,19 +337,20 @@ async def calibrate_ground_truth(
     # Rebuild and store the LLM-legible style profile string.
     style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
     await store.aput(
-        (assistant_id, "style_profile"),
+        (user_id, assistant_id, "style_profile"),
         key="style_profile",
         value={"value": style_profile_str},
     )
 
     await store.aput(
-        (assistant_id, "ground_truth_text_empirical_threshold_list_str"),
+        (user_id, assistant_id, "ground_truth_text_empirical_threshold_list_str"),
         key="ground_truth_text_empirical_threshold_list_str",
         value={"value": ground_truth_text_empirical_threshold_list_str},
     )
 
     await store.aput(
-        (assistant_id, "ground_truth_text_features_model_b64_pkl"),
+        (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl"),
         key="ground_truth_text_features_model_b64_pkl",
         value={"value": model_str_pkl},
     )
+

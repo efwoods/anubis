@@ -10,8 +10,6 @@ lexical richness (vocab size): unique_words vs. total_words
 average sentence length (words_per_sentence)
 average word length (characters per word)
 
-
-
 # Detailed Features — implementation status
 
 The fixed Mahalanobis vector in `src/anubis/utils/dataset/style_features.py` is

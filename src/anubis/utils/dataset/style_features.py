@@ -33,7 +33,7 @@ import logging
 import math
 import re
 from collections import Counter
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,10 @@ _PREPOSITION_TAGS = ("IN", "TO")           # IN (prep/subord-conj), TO
 _URL_RE = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\w+")
 _WORD_RE = re.compile(r"[A-Za-z']+")
+# Unicode curly-apostrophe family -> ASCII, so "don’t" stays ONE word token
+# under the ASCII-only _WORD_RE instead of splitting into "don" + "t" (mirrors
+# burrows_delta._APOSTROPHE_VARIANTS_RE — the two tokenisers must agree).
+_APOSTROPHE_VARIANTS_RE = re.compile(r"[‘’ʼ`´]")
 _SENTENCE_FALLBACK_RE = re.compile(r"(?<=[.!?])\s+")
 
 # Punctuation fingerprint: label -> the character(s) that count toward it.
@@ -281,6 +285,7 @@ def clean_text(text: str) -> str:
     ARE the stylistic signal we want to measure.
     """
     text = html.unescape(text or "")
+    text = _APOSTROPHE_VARIANTS_RE.sub("'", text)
     text = _URL_RE.sub("", text)
     text = _MENTION_RE.sub("", text)
     return text.strip()
@@ -306,9 +311,12 @@ def _nan_features() -> Dict[str, float]:
     """All-NaN feature row for empty/degenerate input (callers impute later)."""
     return {name: math.nan for name in FEATURE_NAMES}
 
-
 def extract_style_features(
-    text: str, *, key_phrases: Sequence[str] | None = None
+    text: str,
+    *,
+    key_phrases: Sequence[str] | None = None,
+    update_key_phrases_only: bool = False,
+    features_dict: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Return the 28 stylometric scalars for one document.
 
@@ -324,6 +332,15 @@ def extract_style_features(
             When ``None`` or empty — e.g. a text with no calibrated phrase set —
             ``key_phrase_rate`` is ``0.0``. This is the one avatar-relative
             feature in the vector; every other feature depends on ``text`` alone.
+        update_key_phrases_only: Recompute ONLY ``key_phrase_rate`` against the
+            given ``key_phrases``, reusing every other value from
+            ``features_dict``. Used when the same text must be scored against a
+            second phrase set (e.g. baseline phrases first, then the avatar's)
+            without paying for a full re-extraction. Returns a NEW dict; the
+            passed ``features_dict`` is not mutated.
+        features_dict: Pre-computed features dictionary the update-only path
+            copies its non-key-phrase values from. Required when
+            ``update_key_phrases_only`` is True.
 
     Coverage of the scalar features requested in
     ``features/statistical_significance.md``:
@@ -338,122 +355,133 @@ def extract_style_features(
     the key-phrase signal is now carried here as the single ``key_phrase_rate``
     scalar and, separately, as the prompt-injected signature-phrase list.
     """
-    _ensure_nltk_resources()
 
-    cleaned = clean_text(text)
-    if not cleaned:
-        return _nan_features()
+    if update_key_phrases_only:
+        if not features_dict:
+            raise ValueError(
+                "Must send a pre-computed features_dict from which to update key_phrase_rate."
+            )
+        # Copy (never mutate the caller's dict) and re-measure only the
+        # key-phrase rate against the new phrase set below.
+        features: Dict[str, float] = dict(features_dict)
+        cleaned = clean_text(text)
+    else:
+        _ensure_nltk_resources()
 
-    from lexicalrichness import LexicalRichness
-    from nltk.tokenize import word_tokenize
+        cleaned = clean_text(text)
+        if not cleaned:
+            return _nan_features()
 
-    features: Dict[str, float] = {}
+        from lexicalrichness import LexicalRichness
+        from nltk.tokenize import word_tokenize
 
-    # Token views: `words` keeps punctuation as separate tokens (needed for
-    # ALL-CAPS detection); `alpha_words` is the lowercased alphabetic stream
-    # that most lexical metrics operate on.
-    words = word_tokenize(cleaned)
-    alpha_words = _word_tokens(cleaned)
-    alpha_count = len(alpha_words) or 1            # guard divisions by zero
-    per_thousand = 1000.0 / alpha_count
-    sentences = _sentences(cleaned)
-    sentence_count = len(sentences) or 1
+        features: Dict[str, float] = {}
 
-    # ── A. LEXICAL DIVERSITY ───────────────────────────────────────────────
-    # Only the length-ROBUST diversity indices are kept (v3). Raw TTR, Maas a²,
-    # and Yule's K were removed as multicollinear with MATTR/MTLD/HD-D. Short
-    # texts make several of these undefined, so each is guarded individually.
-    lex = LexicalRichness(cleaned)
-    features["moving_average_ttr"] = _safe(
-        lambda: lex.mattr(window_size=min(50, max(1, lex.words)))
-    )
-    features["mtld_lexical_diversity"] = _safe(lambda: lex.mtld(threshold=0.72))
-    features["hdd_lexical_diversity"] = _safe(
-        lambda: lex.hdd(draws=min(42, max(1, lex.words)))
-    )
+        # Token views: `words` keeps punctuation as separate tokens (needed for
+        # ALL-CAPS detection); `alpha_words` is the lowercased alphabetic stream
+        # that most lexical metrics operate on.
+        words = word_tokenize(cleaned)
+        alpha_words = _word_tokens(cleaned)
+        alpha_count = len(alpha_words) or 1            # guard divisions by zero
+        per_thousand = 1000.0 / alpha_count
+        sentences = _sentences(cleaned)
+        sentence_count = len(sentences) or 1
 
-    # Word-frequency table, reused below for lexical entropy. (Yule's K, which
-    # also derived from this table, was removed in v3.)
-    word_frequencies = Counter(alpha_words)
-
-    # ── B. PART-OF-SPEECH DENSITY (nltk.pos_tag, Penn Treebank) ────────────
-    # One tagging pass feeds every POS feature plus lexical density.
-    pos_tags = [tag for _, tag in _safe_pos_tag(words)]
-    pos_total = len(pos_tags) or 1
-    noun_count = _count_tags(pos_tags, _NOUN_TAGS)
-    verb_count = _count_tags(pos_tags, _VERB_TAGS)
-    adjective_count = _count_tags(pos_tags, _ADJECTIVE_TAGS)
-    adverb_count = _count_tags(pos_tags, _ADVERB_TAGS)
-    pronoun_count = _count_tags(pos_tags, _PRONOUN_TAGS)
-    preposition_count = _count_tags(pos_tags, _PREPOSITION_TAGS)
-
-    features["noun_density"] = noun_count / pos_total
-    features["verb_density"] = verb_count / pos_total
-    features["adjective_density"] = adjective_count / pos_total
-    features["adverb_density"] = adverb_count / pos_total
-    features["pronoun_density"] = pronoun_count / pos_total
-    features["preposition_density"] = preposition_count / pos_total
-    # +1 smoothing keeps the ratio finite when a class is absent.
-    features["noun_to_verb_ratio"] = (noun_count + 1) / (verb_count + 1)
-
-    # Lexical density = content words (noun/verb/adj/adv) / all tagged tokens.
-    content_word_count = noun_count + verb_count + adjective_count + adverb_count
-    features["lexical_density_content_word_ratio"] = content_word_count / pos_total
-
-    # ── C. SENTENCE SHAPE ──────────────────────────────────────────────────
-    sentence_lengths = [len(_word_tokens(s)) for s in sentences]
-    mean_sentence_length = sum(sentence_lengths) / sentence_count
-    features["mean_sentence_length_words"] = mean_sentence_length
-    features["stdev_sentence_length_words"] = _population_stdev(
-        sentence_lengths, mean_sentence_length
-    )
-    features["interrogative_sentence_ratio"] = (
-        sum(1 for s in sentences if s.rstrip().endswith("?")) / sentence_count
-    )
-    features["exclamatory_sentence_ratio"] = (
-        sum(1 for s in sentences if s.rstrip().endswith("!")) / sentence_count
-    )
-
-    # ── D. PUNCTUATION FINGERPRINT (marks per 1,000 words) ─────────────────
-    for feature_name, characters in _PUNCTUATION_MARKS.items():
-        features[feature_name] = (
-            sum(cleaned.count(ch) for ch in characters) * per_thousand
+        # ── A. LEXICAL DIVERSITY ───────────────────────────────────────────────
+        # Only the length-ROBUST diversity indices are kept (v3). Raw TTR, Maas a²,
+        # and Yule's K were removed as multicollinear with MATTR/MTLD/HD-D. Short
+        # texts make several of these undefined, so each is guarded individually.
+        lex = LexicalRichness(cleaned)
+        features["moving_average_ttr"] = _safe(
+            lambda: lex.mattr(window_size=min(50, max(1, lex.words)))
+        )
+        features["mtld_lexical_diversity"] = _safe(lambda: lex.mtld(threshold=0.72))
+        features["hdd_lexical_diversity"] = _safe(
+            lambda: lex.hdd(draws=min(42, max(1, lex.words)))
         )
 
-    # ── E. SURFACE / FLOW ──────────────────────────────────────────────────
-    features["all_caps_word_ratio"] = (
-        sum(1 for w in words if w.isupper() and len(w) > 1) / (len(words) or 1)
-    )
-    paragraphs = [p for p in re.split(r"\n\s*\n", cleaned) if p.strip()] or [cleaned]
-    features["words_per_paragraph"] = alpha_count / len(paragraphs)
-    features["transition_word_rate_per_1k"] = (
-        sum(1 for w in alpha_words if w in _TRANSITION_WORDS) * per_thousand
-    )
+        # Word-frequency table, reused below for lexical entropy. (Yule's K, which
+        # also derived from this table, was removed in v3.)
+        word_frequencies = Counter(alpha_words)
 
-    # (Readability composites — Flesch-Kincaid, Gunning Fog, SMOG — were removed
-    # in v3 as mutually collinear functions of sentence length + syllable counts.)
+        # ── B. PART-OF-SPEECH DENSITY (nltk.pos_tag, Penn Treebank) ────────────
+        # One tagging pass feeds every POS feature plus lexical density.
+        pos_tags = [tag for _, tag in _safe_pos_tag(words)]
+        pos_total = len(pos_tags) or 1
+        noun_count = _count_tags(pos_tags, _NOUN_TAGS)
+        verb_count = _count_tags(pos_tags, _VERB_TAGS)
+        adjective_count = _count_tags(pos_tags, _ADJECTIVE_TAGS)
+        adverb_count = _count_tags(pos_tags, _ADVERB_TAGS)
+        pronoun_count = _count_tags(pos_tags, _PRONOUN_TAGS)
+        preposition_count = _count_tags(pos_tags, _PREPOSITION_TAGS)
 
-    # ── F. INFORMATION THEORY ──────────────────────────────────────────────
-    # Shannon entropy of the unigram distribution, in bits: how unpredictable the
-    # next word is. Computed from the word-frequency table built above.
-    entropy_bits = 0.0
-    for count in word_frequencies.values():
-        probability = count / alpha_count
-        entropy_bits -= probability * math.log2(probability)
-    features["lexical_entropy_bits"] = entropy_bits
+        features["noun_density"] = noun_count / pos_total
+        features["verb_density"] = verb_count / pos_total
+        features["adjective_density"] = adjective_count / pos_total
+        features["adverb_density"] = adverb_count / pos_total
+        features["pronoun_density"] = pronoun_count / pos_total
+        features["preposition_density"] = preposition_count / pos_total
+        # +1 smoothing keeps the ratio finite when a class is absent.
+        features["noun_to_verb_ratio"] = (noun_count + 1) / (verb_count + 1)
 
-    # ── G. WORD SHAPE ──────────────────────────────────────────────────────
-    # `total_words` is the TRUE token count (len(alpha_words)); `alpha_count`
-    # above was floored to 1 only to guard divisions, so it must not be reused
-    # here. Average word length divides total characters by that true count and
-    # is NaN when there are no word tokens (all-punctuation input). (The raw
-    # vocabulary-size and total-word-count features were removed in v3 as the
-    # length-dependent components of TTR.)
-    total_words = len(alpha_words)
-    total_characters = sum(len(word) for word in alpha_words)
-    features["average_word_length_characters"] = (
-        total_characters / total_words if total_words else math.nan
-    )
+        # Lexical density = content words (noun/verb/adj/adv) / all tagged tokens.
+        content_word_count = noun_count + verb_count + adjective_count + adverb_count
+        features["lexical_density_content_word_ratio"] = content_word_count / pos_total
+
+        # ── C. SENTENCE SHAPE ──────────────────────────────────────────────────
+        sentence_lengths = [len(_word_tokens(s)) for s in sentences]
+        mean_sentence_length = sum(sentence_lengths) / sentence_count
+        features["mean_sentence_length_words"] = mean_sentence_length
+        features["stdev_sentence_length_words"] = _population_stdev(
+            sentence_lengths, mean_sentence_length
+        )
+        features["interrogative_sentence_ratio"] = (
+            sum(1 for s in sentences if s.rstrip().endswith("?")) / sentence_count
+        )
+        features["exclamatory_sentence_ratio"] = (
+            sum(1 for s in sentences if s.rstrip().endswith("!")) / sentence_count
+        )
+
+        # ── D. PUNCTUATION FINGERPRINT (marks per 1,000 words) ─────────────────
+        for feature_name, characters in _PUNCTUATION_MARKS.items():
+            features[feature_name] = (
+                sum(cleaned.count(ch) for ch in characters) * per_thousand
+            )
+
+        # ── E. SURFACE / FLOW ──────────────────────────────────────────────────
+        features["all_caps_word_ratio"] = (
+            sum(1 for w in words if w.isupper() and len(w) > 1) / (len(words) or 1)
+        )
+        paragraphs = [p for p in re.split(r"\n\s*\n", cleaned) if p.strip()] or [cleaned]
+        features["words_per_paragraph"] = alpha_count / len(paragraphs)
+        features["transition_word_rate_per_1k"] = (
+            sum(1 for w in alpha_words if w in _TRANSITION_WORDS) * per_thousand
+        )
+
+        # (Readability composites — Flesch-Kincaid, Gunning Fog, SMOG — were removed
+        # in v3 as mutually collinear functions of sentence length + syllable counts.)
+
+        # ── F. INFORMATION THEORY ──────────────────────────────────────────────
+        # Shannon entropy of the unigram distribution, in bits: how unpredictable the
+        # next word is. Computed from the word-frequency table built above.
+        entropy_bits = 0.0
+        for count in word_frequencies.values():
+            probability = count / alpha_count
+            entropy_bits -= probability * math.log2(probability)
+        features["lexical_entropy_bits"] = entropy_bits
+
+        # ── G. WORD SHAPE ──────────────────────────────────────────────────────
+        # `total_words` is the TRUE token count (len(alpha_words)); `alpha_count`
+        # above was floored to 1 only to guard divisions, so it must not be reused
+        # here. Average word length divides total characters by that true count and
+        # is NaN when there are no word tokens (all-punctuation input). (The raw
+        # vocabulary-size and total-word-count features were removed in v3 as the
+        # length-dependent components of TTR.)
+        total_words = len(alpha_words)
+        total_characters = sum(len(word) for word in alpha_words)
+        features["average_word_length_characters"] = (
+            total_characters / total_words if total_words else math.nan
+        )
 
     # ── H. SIGNATURE KEY-PHRASE RATE ───────────────────────────────────────
     # Occurrences of the avatar's signature phrases per total word. The phrase set
@@ -598,8 +626,9 @@ def compute_empirical_distribution(reference_dataset_arr):
 # dropped on read by deserialize_features_by_doc_id.
 # ---------------------------------------------------------------------------
 
-# Store key (and second namespace element) for the per-document feature dict.
-# The writer (process_text_to_document), the reader
+# Store key (and final namespace element) for the per-document feature dict,
+# stored owner-scoped at (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY).
+# The writer (calibrate_ground_truth), the reader
 # (graph._attach_analyzed_features), and the deleter (delete_avatar_documents)
 # must all agree on this name.
 GROUND_TRUTH_FEATURES_DICT_KEY = "ground_truth_text_features_by_doc_id_dict_str"
@@ -623,6 +652,11 @@ BASELINE_FEATURES_MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model
 # loads it instead of rebuilding a KernelExplainer (kmeans + repeated model.predict)
 # on first use. Regenerated alongside the model by build_baseline_features_arr.py.
 BASELINE_FEATURES_EXPLAINER_PATH = "src/anubis/utils/dataset/baseline_features_explainer_b64.pkl"
+# The ChatGPT baseline's self-discovered signature phrases — the reference set
+# the baseline matrix's key_phrase_rate column was measured against. The runtime
+# loads these to score a candidate message's key_phrase_rate consistently with
+# the baseline cloud (store-cached as "baseline_key_phrase_profile").
+BASELINE_KEY_PHRASES_PATH = "src/anubis/utils/dataset/baseline_key_phrases.json"
 
 
 def load_bundled_baseline_features_arr() -> Any:
@@ -649,10 +683,26 @@ def serialize_features_by_doc_id(features_by_doc_id: Dict[str, Any]) -> str:
 
     Each row is coerced via ``.tolist()`` (numpy) or ``list`` so the whole dict
     is JSON-serializable for the store's ``{"value": <str>}`` envelope.
+
+    Non-finite cells (the NaN a partial-NaN feature row legitimately carries —
+    see ``extract_style_features``) are written as ``null`` so the blob is
+    STRICT JSON: Python's ``json.dumps`` would otherwise emit the bare ``NaN``
+    token, which strict parsers (PostgreSQL ``::jsonb``, orjson) reject —
+    breaking any SQL diagnostics over the stored corpus.
+    ``deserialize_features_by_doc_id`` maps ``null`` back to ``nan``.
     """
+
+    def _strict_json_cell(cell_value: Any) -> Any:
+        return cell_value if math.isfinite(cell_value) else None
+
     return json.dumps(
         {
-            doc_id: (row.tolist() if hasattr(row, "tolist") else list(row))
+            doc_id: [
+                _strict_json_cell(cell_value)
+                for cell_value in (
+                    row.tolist() if hasattr(row, "tolist") else list(row)
+                )
+            ]
             for doc_id, row in features_by_doc_id.items()
         }
     )
@@ -683,7 +733,13 @@ def deserialize_features_by_doc_id(features_by_doc_id_str: Any) -> Dict[str, Any
     kept: Dict[str, Any] = {}
     dropped = 0
     for doc_id, row in raw.items():
-        row_array = np.array(row)
+        # ``null`` cells are the strict-JSON encoding of NaN (see
+        # serialize_features_by_doc_id); legacy blobs may instead hold bare NaN
+        # tokens, which json.loads already parsed to float('nan').
+        row_array = np.array(
+            [math.nan if cell_value is None else cell_value for cell_value in row],
+            dtype=np.float64,
+        )
         if row_array.shape == (expected_width,):
             kept[doc_id] = row_array
         else:
@@ -714,6 +770,65 @@ def features_by_doc_id_to_arr(features_by_doc_id: Dict[str, Any]) -> Any:
     if not features_by_doc_id:
         return np.empty((0, len(FEATURE_NAMES)))
     return np.vstack([np.asarray(row) for row in features_by_doc_id.values()])
+
+
+def feature_row_is_all_nan(feature_row: Any) -> bool:
+    """True when every value in a single feature row is NaN.
+
+    ``extract_style_features`` returns an all-NaN row for text that
+    ``clean_text`` reduces to nothing (a URL-only or emoji-only quote line, for
+    example). Such a row carries no stylometric signal at all, so writers use
+    this predicate to keep the row out of the persisted corpus entirely.
+    """
+    row_array = np.asarray(feature_row, dtype=np.float64)
+    return bool(np.isnan(row_array).all())
+
+
+def sanitize_ground_truth_feature_matrix(feature_matrix: Any) -> Any:
+    """Make a feature matrix safe for StandardScaler / LedoitWolf / IsolationForest.
+
+    ``extract_style_features`` deliberately yields ``nan`` for metrics that
+    cannot be computed on a given text ("callers impute later" — see
+    ``_nan_features``); this function is that promised imputation chokepoint.
+    scikit-learn's StandardScaler / LedoitWolf / IsolationForest all raise
+    ``ValueError: Input X contains NaN`` otherwise.
+
+    Method:
+
+    * rows where EVERY value is NaN (empty/degenerate source text) are dropped —
+      such a row describes nothing and would only drag the imputed medians;
+    * each remaining NaN cell is imputed with the column's ``np.nanmedian`` —
+      the median is the same location statistic ``build_style_profile_str``
+      summarizes the corpus with, so imputation cannot shift a column's median;
+    * a column that is NaN in every remaining row falls back to ``0.0`` (there
+      is no observed value to take a median of).
+
+    Returns a new ``(n_kept_rows, n_features)`` float array; the input is not
+    mutated. An empty input passes through unchanged.
+    """
+    matrix = np.asarray(feature_matrix, dtype=np.float64)
+    if matrix.size == 0:
+        return matrix
+
+    kept_row_mask = ~np.isnan(matrix).all(axis=1)
+    sanitized_matrix = matrix[kept_row_mask].copy()
+    if sanitized_matrix.size == 0:
+        return sanitized_matrix
+
+    nan_cell_mask = np.isnan(sanitized_matrix)
+    if nan_cell_mask.any():
+        # Suppress the "All-NaN slice" RuntimeWarning for columns with no
+        # observed values; those medians come back NaN and are floored to 0.0.
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            column_medians = np.nanmedian(sanitized_matrix, axis=0)
+        column_medians = np.nan_to_num(column_medians, nan=0.0)
+        sanitized_matrix[nan_cell_mask] = np.broadcast_to(
+            column_medians, sanitized_matrix.shape
+        )[nan_cell_mask]
+    return sanitized_matrix
 
 
 # Cap on the number of corpus rows used to (re)calibrate the empirical threshold
@@ -750,10 +865,18 @@ def recompute_ground_truth_artifacts(ground_truth_text_features_arr: Any) -> Tup
 
     from sklearn.ensemble import IsolationForest
 
+    # NaN-proof the corpus first (drop all-NaN rows, median-impute the rest):
+    # StandardScaler / LedoitWolf / IsolationForest below all raise on NaN, and
+    # both callers (calibrate_ground_truth and
+    # webapp._prune_ground_truth_features_for_deleted_docs) can hold rows from
+    # degenerate quote lines. This chokepoint covers them both.
+    calibration_arr = sanitize_ground_truth_feature_matrix(
+        ground_truth_text_features_arr
+    )
+
     # Bound the O(n^2) leave-one-out calibration: above MAX_CALIBRATION_ROWS use a
     # deterministic random subsample (fixed seed so re-uploads of the same corpus
     # stay stable) instead of the full accumulated corpus.
-    calibration_arr = ground_truth_text_features_arr
     if calibration_arr.shape[0] > MAX_CALIBRATION_ROWS:
         rng = np.random.default_rng(0)
         sample_idx = rng.choice(

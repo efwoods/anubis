@@ -67,12 +67,15 @@ def test_features_by_doc_id_to_arr_empty_shape():
     assert arr.shape == (0, N_FEATURES)
 
 
-def test_serialize_is_json_object_keyed_by_doc_id():
+def test_serialize_is_version_tagged_envelope_keyed_by_doc_id():
     corpus = _make_corpus(3, seed=7)
     raw = json.loads(serialize_features_by_doc_id(corpus))
-    assert set(raw) == set(corpus)
-    # Each value is a plain JSON list of N_FEATURES floats (store-safe).
-    for row in raw.values():
+    # The blob is a version-tagged envelope: {version, rows}.
+    assert raw["style_feature_vector_version"] == STYLE_FEATURE_VECTOR_VERSION
+    rows = raw["rows"]
+    assert set(rows) == set(corpus)
+    # Each row is a plain JSON list of N_FEATURES floats (store-safe).
+    for row in rows.values():
         assert isinstance(row, list)
         assert len(row) == N_FEATURES
 
@@ -189,18 +192,39 @@ def test_all_punctuation_input_yields_nan_word_length_not_crash():
 """ ------------------------------------------------------------------ """
 
 
-def test_deserialize_drops_stale_width_rows_keeps_current():
-    # A corpus persisted under an older vector width must be pruned on read so it
-    # cannot be stacked with (or scored against) current-width rows.
-    stale_width = N_FEATURES - 3
-    mixed = {
-        "old-a": list(range(stale_width)),
-        "old-b": list(range(stale_width)),
-        "new": list(range(N_FEATURES)),
+def test_deserialize_drops_untagged_legacy_corpus():
+    # A legacy bare {doc_id: [row]} blob (written before version tagging) has no
+    # version tag and must be dropped wholesale — even at the current width its
+    # cells may be on an incompatible scale (v3 per-1k vs v4 per-word).
+    legacy_bare = {
+        "old-a": list(range(N_FEATURES)),
+        "old-b": list(range(N_FEATURES)),
     }
-    rebuilt = deserialize_features_by_doc_id(json.dumps(mixed))
+    assert deserialize_features_by_doc_id(json.dumps(legacy_bare)) == {}
 
-    assert set(rebuilt) == {"new"}
+
+def test_deserialize_drops_mismatched_version_envelope():
+    # A version-tagged envelope from a DIFFERENT feature-vector version is dropped
+    # wholesale (scales/widths may differ even when the width happens to match).
+    stale_envelope = {
+        "style_feature_vector_version": STYLE_FEATURE_VECTOR_VERSION - 1,
+        "rows": {"old": list(range(N_FEATURES))},
+    }
+    assert deserialize_features_by_doc_id(json.dumps(stale_envelope)) == {}
+
+
+def test_deserialize_drops_wrong_width_rows_within_current_version():
+    # Within a matching-version envelope, a row of the wrong width is still
+    # dropped defensively while correct-width rows survive.
+    mixed_envelope = {
+        "style_feature_vector_version": STYLE_FEATURE_VECTOR_VERSION,
+        "rows": {
+            "bad": list(range(N_FEATURES - 3)),
+            "good": list(range(N_FEATURES)),
+        },
+    }
+    rebuilt = deserialize_features_by_doc_id(json.dumps(mixed_envelope))
+    assert set(rebuilt) == {"good"}
     assert features_by_doc_id_to_arr(rebuilt).shape == (1, N_FEATURES)
 
 
@@ -284,7 +308,7 @@ def test_serialize_nan_cells_as_strict_json_null_and_round_trip():
     assert "NaN" not in serialized
     # Strict parse (json.loads with the NaN constant rejected) must succeed.
     strict = json.loads(serialized, parse_constant=lambda token: pytest.fail(token))
-    assert strict["doc-0"][4] is None
+    assert strict["rows"]["doc-0"][4] is None
 
     rebuilt = deserialize_features_by_doc_id(serialized)
     assert np.isnan(rebuilt["doc-0"][4])

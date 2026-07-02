@@ -1,3 +1,18 @@
+# User logs in: new user detected with facial recognition, walks through onboarding, scans for connected accounts, asks for permission for integration, informs how the avatar may triage requests on your behalf. 
+- Centralized interface for notifications from all platforms 
+  - (responses required; 
+  - ongoing conversations and messages handled on your behalf; 
+  - personal analytics dashboard; 
+  - queryable interface for:
+    -  dm with self to ask about the current state of affairs of anything, 
+    - handle any request, 
+    - answer any unhandled message, 
+    - view for avatar documents for identity/ update manually)
+  - switch to any avatar
+  - settings and connect accounts
+
+
+
 # Better UI: Login
 # Improvement of response quality
 

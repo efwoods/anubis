@@ -68,18 +68,20 @@ FEATURE_NAMES: List[str] = [
     "stdev_sentence_length_words",         # sentence-length variability (rhythm)
     "interrogative_sentence_ratio",        # share of sentences ending in '?'
     "exclamatory_sentence_ratio",          # share of sentences ending in '!'
-    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
-    "comma_rate_per_1k",
-    "semicolon_rate_per_1k",
-    "colon_rate_per_1k",
-    "dash_rate_per_1k",
-    "ellipsis_rate_per_1k",
-    "exclamation_rate_per_1k",
-    "question_mark_rate_per_1k",
+    # ── Punctuation fingerprint, marks per word (7) ────────────────────────
+    # Renamed from *_rate_per_1k in v4: the same counts normalized per WORD
+    # (the per-1k value divided by 1,000) so every rate lives on a 0–1 scale.
+    "comma_rate_per_word",
+    "semicolon_rate_per_word",
+    "colon_rate_per_word",
+    "dash_rate_per_word",
+    "ellipsis_rate_per_word",
+    "exclamation_rate_per_word",
+    "question_mark_rate_per_word",
     # ── Surface / flow (3) ─────────────────────────────────────────────────
     "all_caps_word_ratio",                 # SHOUTING / emphasis habit
     "words_per_paragraph",                 # internet writing = short paragraphs
-    "transition_word_rate_per_1k",         # logical-bridge words per 1k (however, therefore, …)
+    "transition_word_rate_per_word",       # logical-bridge words per word (however, therefore, …)
     # The readability composites (Flesch-Kincaid, Gunning Fog, SMOG) were removed
     # in v3: all three are deterministic functions of sentence length + syllable/
     # complex-word counts, so they are mutually collinear and add no signal beyond
@@ -113,7 +115,14 @@ FEATURE_NAMES: List[str] = [
 #       yule_characteristic_k, pos_sequence_compressibility, flesch_kincaid_grade,
 #       gunning_fog_index, smog_index, vocabulary_size_unique_words,
 #       total_word_count) and appended key_phrase_rate (width 36 -> 28).
-STYLE_FEATURE_VECTOR_VERSION = 3
+#   v4: renamed the eight *_rate_per_1k features to *_rate_per_word and rescaled
+#       their VALUES from marks-per-1,000-words to marks-per-word (divided by
+#       1,000, a 0–1 scale). Width unchanged (28) — which is exactly why the
+#       persisted corpus is now VERSION-TAGGED by serialize_features_by_doc_id:
+#       a width check alone cannot tell v3 rows (per-1k scale) from v4 rows
+#       (per-word scale), and mixing the two scales in one Mahalanobis /
+#       IsolationForest corpus silently corrupts both comparisons.
+STYLE_FEATURE_VECTOR_VERSION = 4
 
 assert len(FEATURE_NAMES) == 28, f"expected 28 features, found {len(FEATURE_NAMES)}"
 
@@ -141,18 +150,18 @@ FEATURE_NAMES_HUMAN_LEGIBLE: Dict[str, str] = {
     "stdev_sentence_length_words": "Sentence-Length Variability (std dev, words)",
     "interrogative_sentence_ratio": "Question-Sentence Ratio",
     "exclamatory_sentence_ratio": "Exclamation-Sentence Ratio",
-    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
-    "comma_rate_per_1k": "Commas per 1,000 Words",
-    "semicolon_rate_per_1k": "Semicolons per 1,000 Words",
-    "colon_rate_per_1k": "Colons per 1,000 Words",
-    "dash_rate_per_1k": "Dashes per 1,000 Words",
-    "ellipsis_rate_per_1k": "Ellipses per 1,000 Words",
-    "exclamation_rate_per_1k": "Exclamation Marks per 1,000 Words",
-    "question_mark_rate_per_1k": "Question Marks per 1,000 Words",
+    # ── Punctuation fingerprint, marks per word (7) ────────────────────────
+    "comma_rate_per_word": "Commas per Word",
+    "semicolon_rate_per_word": "Semicolons per Word",
+    "colon_rate_per_word": "Colons per Word",
+    "dash_rate_per_word": "Dashes per Word",
+    "ellipsis_rate_per_word": "Ellipses per Word",
+    "exclamation_rate_per_word": "Exclamation Marks per Word",
+    "question_mark_rate_per_word": "Question Marks per Word",
     # ── Surface / flow (3) ─────────────────────────────────────────────────
     "all_caps_word_ratio": "ALL-CAPS Word Ratio",
     "words_per_paragraph": "Words per Paragraph",
-    "transition_word_rate_per_1k": "Transition Words per 1,000 Words",
+    "transition_word_rate_per_word": "Transition Words per Word",
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits": "Lexical Entropy (bits)",
     # ── Word & vocabulary shape (1) ────────────────────────────────────────
@@ -168,8 +177,8 @@ assert len(FEATURE_NAMES) == len(FEATURE_NAMES_HUMAN_LEGIBLE), f"expected {len(F
 # which DIRECTION means what — because the numbers alone are meaningless to the
 # model (and several features are inverse: Maas and Yule's K go DOWN as vocabulary
 # gets richer). Ranges are read straight off the computations in
-# extract_style_features (POS/diversity shares are 0–1, punctuation is per-1k,
-# Yule's K is scaled to 10⁴ words, etc.).
+# extract_style_features (POS/diversity shares are 0–1, punctuation is per-word
+# on a 0–1 scale, etc.).
 FEATURE_DESCRIPTIONS: Dict[str, str] = {
     # ── Lexical diversity (3) ──────────────────────────────────────────────
     "moving_average_ttr": "Type-token ratio averaged over a sliding ~50-word window. Ranges 0–1. Higher means richer vocabulary. Length-robust, so it stays comparable across short and long texts.",
@@ -189,18 +198,18 @@ FEATURE_DESCRIPTIONS: Dict[str, str] = {
     "stdev_sentence_length_words": "Standard deviation of sentence length, in words. 0 or greater, typically ~4–15. Higher means rhythmic variety (mixing long and short sentences); 0 means uniform sentence length.",
     "interrogative_sentence_ratio": "Fraction of sentences ending in '?'. Ranges 0–1. Higher means a questioning, rhetorical, engaging style.",
     "exclamatory_sentence_ratio": "Fraction of sentences ending in '!'. Ranges 0–1. Higher means an emphatic, excited tone.",
-    # ── Punctuation fingerprint, marks per 1,000 words (7) ─────────────────
-    "comma_rate_per_1k": "Commas per 1,000 words. 0 or greater, typically ~40–80. Higher means more clause-chaining and parenthetical phrasing.",
-    "semicolon_rate_per_1k": "Semicolons per 1,000 words. 0 or greater, usually ~0–5 (rare). Higher means deliberate, formal joining of independent clauses.",
-    "colon_rate_per_1k": "Colons per 1,000 words. 0 or greater, typically ~0–10. Higher means frequent setups, lists, or explanatory pauses.",
-    "dash_rate_per_1k": "Em dashes, en dashes, and hyphens per 1,000 words. 0 or greater, typically ~0–30. Higher means an interruptive, aside-heavy, informal rhythm.",
-    "ellipsis_rate_per_1k": "Ellipsis characters ('…') per 1,000 words. 0 or greater, typically ~0–10. Higher means trailing-off, hesitant, or suspenseful phrasing. Counts only the single '…' glyph, not three dots.",
-    "exclamation_rate_per_1k": "Exclamation marks per 1,000 words. 0 or greater. Higher means an emphatic, high-energy tone.",
-    "question_mark_rate_per_1k": "Question marks per 1,000 words. 0 or greater. Higher means a more inquisitive, rhetorical style.",
+    # ── Punctuation fingerprint, marks per word (7) ────────────────────────
+    "comma_rate_per_word": "Commas per word (occurrences divided by total words). Ranges 0–1, typically ~0.04–0.08. Higher means more clause-chaining and parenthetical phrasing.",
+    "semicolon_rate_per_word": "Semicolons per word (occurrences divided by total words). Ranges 0–1, usually ~0.0–0.005 (rare). Higher means deliberate, formal joining of independent clauses.",
+    "colon_rate_per_word": "Colons per word (occurrences divided by total words). Ranges 0–1, typically ~0.0–0.01. Higher means frequent setups, lists, or explanatory pauses.",
+    "dash_rate_per_word": "Em dashes, en dashes, and hyphens per word (occurrences divided by total words). Ranges 0–1, typically ~0.0–0.03. Higher means an interruptive, aside-heavy, informal rhythm.",
+    "ellipsis_rate_per_word": "Ellipsis characters ('…') per word (occurrences divided by total words). Ranges 0–1, typically ~0.0–0.01. Higher means trailing-off, hesitant, or suspenseful phrasing. Counts only the single '…' glyph, not three dots.",
+    "exclamation_rate_per_word": "Exclamation marks per word (occurrences divided by total words). Ranges 0–1. Higher means an emphatic, high-energy tone.",
+    "question_mark_rate_per_word": "Question marks per word (occurrences divided by total words). Ranges 0–1. Higher means a more inquisitive, rhetorical style.",
     # ── Surface / flow (3) ─────────────────────────────────────────────────
     "all_caps_word_ratio": "Fraction of multi-letter tokens written in ALL CAPS. Ranges 0–1, usually near 0. Higher means a habit of SHOUTING or capitalized emphasis.",
     "words_per_paragraph": "Words divided by number of paragraphs (blank-line separated). Greater than 0. Higher means long, blocky paragraphs; lower means short, internet-style chunks.",
-    "transition_word_rate_per_1k": "Logical-bridge words (however, therefore, moreover, …) per 1,000 words. 0 or greater, typically ~0–20. Higher means explicit, essayistic argument structure.",
+    "transition_word_rate_per_word": "Logical-bridge words (however, therefore, moreover, …) per word (occurrences divided by total words). Ranges 0–1, typically ~0.0–0.02. Higher means explicit, essayistic argument structure.",
     # ── Information theory (1) ─────────────────────────────────────────────
     "lexical_entropy_bits": "Shannon entropy of the word-frequency distribution, in bits. 0 or greater and grows with vocabulary size (~4–10+ bits common). Higher means less predictable, more varied word choice; lower means repetitive, predictable wording.",
     # ── Word & vocabulary shape (1) ────────────────────────────────────────
@@ -245,13 +254,13 @@ _SENTENCE_FALLBACK_RE = re.compile(r"(?<=[.!?])\s+")
 
 # Punctuation fingerprint: label -> the character(s) that count toward it.
 _PUNCTUATION_MARKS: Dict[str, str] = {
-    "comma_rate_per_1k": ",",
-    "semicolon_rate_per_1k": ";",
-    "colon_rate_per_1k": ":",
-    "dash_rate_per_1k": "—–-",   # em dash, en dash, hyphen-minus
-    "ellipsis_rate_per_1k": "…",
-    "exclamation_rate_per_1k": "!",
-    "question_mark_rate_per_1k": "?",
+    "comma_rate_per_word": ",",
+    "semicolon_rate_per_word": ";",
+    "colon_rate_per_word": ":",
+    "dash_rate_per_word": "—–-",   # em dash, en dash, hyphen-minus
+    "ellipsis_rate_per_word": "…",
+    "exclamation_rate_per_word": "!",
+    "question_mark_rate_per_word": "?",
 }
 
 
@@ -347,7 +356,7 @@ def extract_style_features(
 
     * average sentence length (words per sentence) — ``mean_sentence_length_words``.
     * average word length (characters per word) — ``average_word_length_characters``.
-    * punctuation frequencies — the seven ``*_rate_per_1k`` marks above.
+    * punctuation frequencies — the seven ``*_rate_per_word`` marks above.
     * signature key-phrase reliance — ``key_phrase_rate``.
 
     The character n-gram and function-word VECTORS that used to be captured in the
@@ -383,7 +392,7 @@ def extract_style_features(
         words = word_tokenize(cleaned)
         alpha_words = _word_tokens(cleaned)
         alpha_count = len(alpha_words) or 1            # guard divisions by zero
-        per_thousand = 1000.0 / alpha_count
+        per_word = 1.0 / alpha_count                   # marks-per-word (0–1 scale)
         sentences = _sentences(cleaned)
         sentence_count = len(sentences) or 1
 
@@ -442,10 +451,10 @@ def extract_style_features(
             sum(1 for s in sentences if s.rstrip().endswith("!")) / sentence_count
         )
 
-        # ── D. PUNCTUATION FINGERPRINT (marks per 1,000 words) ─────────────────
+        # ── D. PUNCTUATION FINGERPRINT (marks per word, 0–1 scale) ─────────────
         for feature_name, characters in _PUNCTUATION_MARKS.items():
             features[feature_name] = (
-                sum(cleaned.count(ch) for ch in characters) * per_thousand
+                sum(cleaned.count(ch) for ch in characters) * per_word
             )
 
         # ── E. SURFACE / FLOW ──────────────────────────────────────────────────
@@ -454,8 +463,8 @@ def extract_style_features(
         )
         paragraphs = [p for p in re.split(r"\n\s*\n", cleaned) if p.strip()] or [cleaned]
         features["words_per_paragraph"] = alpha_count / len(paragraphs)
-        features["transition_word_rate_per_1k"] = (
-            sum(1 for w in alpha_words if w in _TRANSITION_WORDS) * per_thousand
+        features["transition_word_rate_per_word"] = (
+            sum(1 for w in alpha_words if w in _TRANSITION_WORDS) * per_word
         )
 
         # (Readability composites — Flesch-Kincaid, Gunning Fog, SMOG — were removed
@@ -678,18 +687,35 @@ def baseline_feature_array_is_current(baseline_features_arr: Any) -> bool:
     )
 
 
+# Envelope keys for the version-tagged serialized corpus. The blob is
+# ``{VERSION_ENVELOPE_KEY: <int>, ROWS_ENVELOPE_KEY: {document_id: [cells]}}``.
+# Version tagging is REQUIRED (not just a width check) because two feature-vector
+# versions can share the same WIDTH while carrying incompatible SCALES — v3 stored
+# punctuation as marks-per-1,000-words and v4 stores marks-per-word (÷1000), both
+# 28 wide. Mixing the two scales in one Mahalanobis / IsolationForest corpus
+# silently corrupts every comparison, so a version mismatch drops the whole
+# stored corpus (it rebuilds at the current version as quotes are re-ingested).
+_VECTOR_VERSION_ENVELOPE_KEY = "style_feature_vector_version"
+_ROWS_ENVELOPE_KEY = "rows"
+
+
 def serialize_features_by_doc_id(features_by_doc_id: Dict[str, Any]) -> str:
-    """Serialize ``{document_id: 1-D feature row}`` (width ``len(FEATURE_NAMES)``) to a JSON string.
+    """Serialize ``{document_id: 1-D feature row}`` to a version-tagged JSON string.
 
-    Each row is coerced via ``.tolist()`` (numpy) or ``list`` so the whole dict
-    is JSON-serializable for the store's ``{"value": <str>}`` envelope.
+    Output shape: ``{"style_feature_vector_version": <int>, "rows":
+    {document_id: [cells]}}``. The version tag lets
+    :func:`deserialize_features_by_doc_id` reject a corpus written under a
+    different :data:`STYLE_FEATURE_VECTOR_VERSION` even when the row WIDTH is
+    unchanged (a width check alone cannot distinguish v3's per-1k scale from v4's
+    per-word scale).
 
-    Non-finite cells (the NaN a partial-NaN feature row legitimately carries —
-    see ``extract_style_features``) are written as ``null`` so the blob is
-    STRICT JSON: Python's ``json.dumps`` would otherwise emit the bare ``NaN``
-    token, which strict parsers (PostgreSQL ``::jsonb``, orjson) reject —
-    breaking any SQL diagnostics over the stored corpus.
-    ``deserialize_features_by_doc_id`` maps ``null`` back to ``nan``.
+    Each row is coerced via ``.tolist()`` (numpy) or ``list``. Non-finite cells
+    (the NaN a partial-NaN feature row legitimately carries — see
+    ``extract_style_features``) are written as ``null`` so the blob is STRICT
+    JSON: Python's ``json.dumps`` would otherwise emit the bare ``NaN`` token,
+    which strict parsers (PostgreSQL ``::jsonb``, orjson) reject — breaking any
+    SQL diagnostics over the stored corpus. ``deserialize_features_by_doc_id``
+    maps ``null`` back to ``nan``.
     """
 
     def _strict_json_cell(cell_value: Any) -> Any:
@@ -697,13 +723,16 @@ def serialize_features_by_doc_id(features_by_doc_id: Dict[str, Any]) -> str:
 
     return json.dumps(
         {
-            doc_id: [
-                _strict_json_cell(cell_value)
-                for cell_value in (
-                    row.tolist() if hasattr(row, "tolist") else list(row)
-                )
-            ]
-            for doc_id, row in features_by_doc_id.items()
+            _VECTOR_VERSION_ENVELOPE_KEY: STYLE_FEATURE_VECTOR_VERSION,
+            _ROWS_ENVELOPE_KEY: {
+                doc_id: [
+                    _strict_json_cell(cell_value)
+                    for cell_value in (
+                        row.tolist() if hasattr(row, "tolist") else list(row)
+                    )
+                ]
+                for doc_id, row in features_by_doc_id.items()
+            },
         }
     )
 
@@ -715,27 +744,63 @@ def deserialize_features_by_doc_id(features_by_doc_id_str: Any) -> Dict[str, Any
     can treat "no corpus yet" and "empty corpus" identically. Each value is
     rehydrated into a 1-D numpy array.
 
-    **Feature-version migration.** Rows are dropped whenever their width does not
-    match the CURRENT feature vector (``len(FEATURE_NAMES)``). A corpus persisted
-    under an older :data:`STYLE_FEATURE_VECTOR_VERSION` (e.g. 33-wide rows before
-    the width grew to 36) can no longer be stacked with, or compared against,
-    new rows, so those stale rows are discarded here — the single chokepoint
-    every reader (calibrate_ground_truth, graph._attach_analyzed_features,
-    webapp.delete_avatar_documents) passes through. The corpus then re-accumulates
-    at the new width as fresh quotes are ingested, and the merge/re-serialize in
-    calibrate_ground_truth persists the pruning. Callers that reach an empty dict
-    simply skip ground-truth comparison until enough new-width rows exist.
+    **Feature-version migration.** The whole stored corpus is discarded unless
+    it was written under the CURRENT :data:`STYLE_FEATURE_VECTOR_VERSION`:
+
+    * A version-tagged envelope (v4+) whose ``style_feature_vector_version`` does
+      not match the current version is dropped wholesale — its cells may be on an
+      incompatible SCALE (v3 per-1k vs v4 per-word) even at the same width.
+    * A legacy bare ``{document_id: [row]}`` blob (written before version tagging
+      existed, i.e. v3 or earlier) has no version tag, so it is treated as
+      pre-current and dropped wholesale.
+    * Within a matching-version envelope, any row whose WIDTH is not
+      ``len(FEATURE_NAMES)`` is still dropped defensively.
+
+    This is the single chokepoint every reader (calibrate_ground_truth,
+    graph._attach_analyzed_features, webapp deletion pruning) passes through. The
+    corpus re-accumulates at the current version as fresh quotes are ingested,
+    and the merge/re-serialize in calibrate_ground_truth persists the pruning.
+    Callers that reach an empty dict simply skip ground-truth comparison until
+    enough current-version rows exist.
     """
     if not features_by_doc_id_str:
         return {}
     raw = json.loads(features_by_doc_id_str)
+
+    # Distinguish the version-tagged envelope from a legacy bare doc_id dict. Only
+    # the envelope carries the version key; a legacy blob's keys are all
+    # document_ids, so a missing/mismatched version tag means "not the current
+    # version" and the entire corpus is dropped.
+    is_versioned_envelope = (
+        isinstance(raw, dict) and _VECTOR_VERSION_ENVELOPE_KEY in raw
+    )
+    if not is_versioned_envelope:
+        logger.warning(
+            "deserialize_features_by_doc_id: dropping untagged (pre-v%d) stored "
+            "corpus; it predates version tagging and may be on an incompatible "
+            "scale. The corpus will recalibrate as new quotes are ingested.",
+            STYLE_FEATURE_VECTOR_VERSION,
+        )
+        return {}
+
+    stored_version = raw.get(_VECTOR_VERSION_ENVELOPE_KEY)
+    if stored_version != STYLE_FEATURE_VECTOR_VERSION:
+        logger.warning(
+            "deserialize_features_by_doc_id: dropping stored corpus written under "
+            "feature-vector version %r (current is %d); scales/widths may differ. "
+            "The corpus will recalibrate as new quotes are ingested.",
+            stored_version,
+            STYLE_FEATURE_VECTOR_VERSION,
+        )
+        return {}
+
+    rows_by_doc_id = raw.get(_ROWS_ENVELOPE_KEY) or {}
     expected_width = len(FEATURE_NAMES)
     kept: Dict[str, Any] = {}
     dropped = 0
-    for doc_id, row in raw.items():
+    for doc_id, row in rows_by_doc_id.items():
         # ``null`` cells are the strict-JSON encoding of NaN (see
-        # serialize_features_by_doc_id); legacy blobs may instead hold bare NaN
-        # tokens, which json.loads already parsed to float('nan').
+        # serialize_features_by_doc_id).
         row_array = np.array(
             [math.nan if cell_value is None else cell_value for cell_value in row],
             dtype=np.float64,
@@ -747,11 +812,9 @@ def deserialize_features_by_doc_id(features_by_doc_id_str: Any) -> Dict[str, Any
     if dropped:
         logger.warning(
             "deserialize_features_by_doc_id: dropped %d/%d stored feature rows "
-            "whose width != current %d-feature vector (stale "
-            "STYLE_FEATURE_VECTOR_VERSION); the corpus will recalibrate as new "
-            "quotes are ingested.",
+            "whose width != current %d-feature vector.",
             dropped,
-            len(raw),
+            len(rows_by_doc_id),
             expected_width,
         )
     return kept

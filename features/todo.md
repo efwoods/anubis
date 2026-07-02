@@ -1,3 +1,14 @@
+# BASELINE CHANGES TO BE USEFUL
+- [ ] Preprocessing of data needs to be acceptable (document processing; transcriptions)
+- [ ] Pulling of data needs to be deduplicated
+- [ ] facts need to be editable when incorrect
+
+# Integrations (use cases for actual use of the avatar)
+
+# metering and subscriptions to prevent collapse
+
+# Adapters for increased quality
+# Users and investors
 
 # Metering 72 tokens
 # tiered and pay per use to support adapters training to improve authenticity; higher tiers allow for adapters and different forms of media; stories are free, 
@@ -29,18 +40,13 @@
   
 The data is inaccurate; duplicated, responses are incorrect and inauthentic.
 
-
 # Goal: Accurate relevant data and correct authentic responses.
 
 - [ ] edit memories
 - [ ] twitter login: https://x.com/shivon
 - [ ] fragments in dataset from PDF: 11/5/25, 11:46 PM; Page 14 of 10; Machine Intelligence - Shivon Zilis.pdf
 - [ ] transcription fragments from youtube: "so you're"; https://www.youtube.com/watch?v=WV329HQvzUw
-- [ ] 
 
-
-# COMPARING AUTHENTICITY OF GENERATED RESPONSES
-data/elon-musk-dataset/elon_musk_tweets.csv
 
 URL processing is unclean
 pdf processing is unclean
@@ -62,7 +68,6 @@ https://www.google.com/search?client=firefox-b-1-m&q=mahalanobis+plot+i+need+to+
 ##############
 
 Iterate through a playlist: https://www.youtube.com/watch?v=gIF_D6iUusU&list=PL9rU625vkl4XSOQDZxdFhVZgows3FJiKH&index=6
-
 
 Tuning style (so the avatar does not feel like a Fact Machine; does not use Chatgpt phrasing)
 Evaluating generated text for style and factual correctness and consistency within a thread

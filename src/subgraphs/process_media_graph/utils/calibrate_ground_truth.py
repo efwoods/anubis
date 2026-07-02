@@ -12,6 +12,7 @@ from langchain_core.documents import Document
 from langgraph.store.base import BaseStore
 
 logger = logging.getLogger(__name__)
+from src.anubis.utils.store_cache import invalidate_store_cache_entry
 
 # Minimum number of corpus rows required before the leave-one-out empirical
 # distribution + IsolationForest can be calibrated. The leave-one-out step
@@ -334,23 +335,35 @@ async def calibrate_ground_truth(
         recompute_ground_truth_artifacts, ground_truth_text_features_arr
     )
 
-    # Rebuild and store the LLM-legible style profile string.
-    style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
-    await store.aput(
-        (user_id, assistant_id, "style_profile"),
-        key="style_profile",
-        value={"value": style_profile_str},
-    )
+    # BUILD AND STORE STYLE PROFILE
+    from src.anubis.utils.dataset.style_features import build_style_profile_str
 
+    style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
+    style_profile_namespace = (user_id, assistant_id, "style_profile")
     await store.aput(
-        (user_id, assistant_id, "ground_truth_text_empirical_threshold_list_str"),
+        style_profile_namespace, key="style_profile", value={"value": style_profile_str}
+    )
+    # load_consciousness reads the style profile through a process-wide cache;
+    # drop the cached copy so the recalibrated profile is picked up on the
+    # next message.
+    invalidate_store_cache_entry(style_profile_namespace, "style_profile")
+
+    ground_truth_text_empirical_threshold_namespace = (
+        assistant_id,
+        "ground_truth_text_empirical_threshold_list_str",
+    )
+    await store.aput(
+        ground_truth_text_empirical_threshold_namespace,
         key="ground_truth_text_empirical_threshold_list_str",
         value={"value": ground_truth_text_empirical_threshold_list_str},
     )
 
+    ground_truth_text_features_model_namespace = (
+        assistant_id,
+        "ground_truth_text_features_model_b64_pkl",
+    )
     await store.aput(
-        (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl"),
+        ground_truth_text_features_model_namespace,
         key="ground_truth_text_features_model_b64_pkl",
         value={"value": model_str_pkl},
     )
-

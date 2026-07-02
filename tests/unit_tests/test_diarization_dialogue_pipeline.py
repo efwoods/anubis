@@ -13,13 +13,15 @@ deterministic and offline.
 """
 
 import pytest
+from langchain_core.documents import Document
 
 import src.anubis.utils.dataset.formatting as formatting
+import src.subgraphs.process_media_graph.utils.helper_functions as helper_functions
 from src.anubis.utils.dataset.formatting import (
     build_adapter_and_langsmith_for_quotes,
     build_langsmith_for_conversation,
 )
-import src.subgraphs.process_media_graph.utils.helper_functions as helper_functions
+from src.anubis.utils.utility import _select_dominant_speaker_segments
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     _attach_target_analysis_context,
     _build_adapter_dialogue_document,
@@ -28,8 +30,6 @@ from src.subgraphs.process_media_graph.utils.helper_functions import (
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
 )
-from src.anubis.utils.utility import _select_dominant_speaker_segments
-from langchain_core.documents import Document
 
 
 @pytest.fixture
@@ -39,9 +39,7 @@ def stub_synthetic_questions(monkeypatch):
     async def _fake_create_question_list(messages):
         return [f"SYNTH::{m}" for m in messages]
 
-    monkeypatch.setattr(
-        formatting, "create_question_list", _fake_create_question_list
-    )
+    monkeypatch.setattr(formatting, "create_question_list", _fake_create_question_list)
 
 
 # --------------------------------------------------------------------------- #
@@ -291,7 +289,9 @@ def stub_biographical_identity(monkeypatch):
     """Stub ``_build_biographical_identity_documents`` to return one Document
     per call so per-statement emission becomes directly observable."""
 
-    async def _fake(*, text_content, user_id, assistant_id, media_item, target_name=None):
+    async def _fake(
+        *, text_content, user_id, assistant_id, media_item, target_name=None
+    ):
         return [
             Document(
                 page_content=text_content,
@@ -319,9 +319,27 @@ async def test_each_nontarget_statement_emits_its_own_identity_document(
     """
     payload = {
         "segments": [
-            {"speaker": "A", "text": "Grant built robots.", "is_target": False, "start": 0.0, "end": 1.5},
-            {"speaker": "T", "text": "Yes, several.", "is_target": True, "start": 1.5, "end": 2.5},
-            {"speaker": "B", "text": "Grant won championships.", "is_target": False, "start": 2.5, "end": 4.0},
+            {
+                "speaker": "A",
+                "text": "Grant built robots.",
+                "is_target": False,
+                "start": 0.0,
+                "end": 1.5,
+            },
+            {
+                "speaker": "T",
+                "text": "Yes, several.",
+                "is_target": True,
+                "start": 1.5,
+                "end": 2.5,
+            },
+            {
+                "speaker": "B",
+                "text": "Grant won championships.",
+                "is_target": False,
+                "start": 2.5,
+                "end": 4.0,
+            },
         ],
         "target_name": "T",
     }
@@ -458,12 +476,48 @@ def test_select_dominant_speaker_ignores_invalid_timestamps():
 # The Miranda scene from OVERALL_PREPROCESSING_PROCESS.md, already coalesced into
 # alternating two-speaker turns (the form produced after coalescence).
 _MIRANDA_SEGMENTS = [
-    {"speaker": "other", "text": "Agent Miranda?", "is_target": False, "start": 0.0, "end": 1.0},
-    {"speaker": "Miranda", "text": "Speaking.", "is_target": True, "start": 1.0, "end": 2.0},
-    {"speaker": "other", "text": "Denny Carmichael. See that plane across the way?", "is_target": False, "start": 2.0, "end": 4.0},
-    {"speaker": "Miranda", "text": "Yeah. Hard to miss.", "is_target": True, "start": 4.0, "end": 5.0},
-    {"speaker": "other", "text": "Get on it. You're meeting me in Berlin.", "is_target": False, "start": 5.0, "end": 7.0},
-    {"speaker": "Miranda", "text": "I'm supposed to be in Singapore.", "is_target": True, "start": 7.0, "end": 9.0},
+    {
+        "speaker": "other",
+        "text": "Agent Miranda?",
+        "is_target": False,
+        "start": 0.0,
+        "end": 1.0,
+    },
+    {
+        "speaker": "Miranda",
+        "text": "Speaking.",
+        "is_target": True,
+        "start": 1.0,
+        "end": 2.0,
+    },
+    {
+        "speaker": "other",
+        "text": "Denny Carmichael. See that plane across the way?",
+        "is_target": False,
+        "start": 2.0,
+        "end": 4.0,
+    },
+    {
+        "speaker": "Miranda",
+        "text": "Yeah. Hard to miss.",
+        "is_target": True,
+        "start": 4.0,
+        "end": 5.0,
+    },
+    {
+        "speaker": "other",
+        "text": "Get on it. You're meeting me in Berlin.",
+        "is_target": False,
+        "start": 5.0,
+        "end": 7.0,
+    },
+    {
+        "speaker": "Miranda",
+        "text": "I'm supposed to be in Singapore.",
+        "is_target": True,
+        "start": 7.0,
+        "end": 9.0,
+    },
 ]
 
 
@@ -507,8 +561,13 @@ async def test_attach_context_uses_preceding_user_turn(stub_synthetic_questions)
         assert q.metadata["scene_summary"] == "SCENE::redirected"
     # user_context == the immediately preceding non-target turn (the "user").
     assert quotes[0].metadata["user_context"] == "Agent Miranda?"
-    assert quotes[1].metadata["user_context"] == "Denny Carmichael. See that plane across the way?"
-    assert quotes[2].metadata["user_context"] == "Get on it. You're meeting me in Berlin."
+    assert (
+        quotes[1].metadata["user_context"]
+        == "Denny Carmichael. See that plane across the way?"
+    )
+    assert (
+        quotes[2].metadata["user_context"] == "Get on it. You're meeting me in Berlin."
+    )
     # No synthesis happened (every target turn had a real predecessor).
     assert all("user_context_synthetic" not in q.metadata for q in quotes)
 
@@ -519,12 +578,34 @@ async def test_attach_context_synthesizes_when_target_leads(stub_synthetic_quest
     synthetic 'user' statement is generated (spec: there must always be a
     target statement with a previous user input)."""
     segments = [
-        {"speaker": "Miranda", "text": "Speaking.", "is_target": True, "start": 0.0, "end": 1.0},
-        {"speaker": "other", "text": "Meet me in Berlin.", "is_target": False, "start": 1.0, "end": 2.0},
-        {"speaker": "Miranda", "text": "I'm supposed to be in Singapore.", "is_target": True, "start": 2.0, "end": 3.0},
+        {
+            "speaker": "Miranda",
+            "text": "Speaking.",
+            "is_target": True,
+            "start": 0.0,
+            "end": 1.0,
+        },
+        {
+            "speaker": "other",
+            "text": "Meet me in Berlin.",
+            "is_target": False,
+            "start": 1.0,
+            "end": 2.0,
+        },
+        {
+            "speaker": "Miranda",
+            "text": "I'm supposed to be in Singapore.",
+            "is_target": True,
+            "start": 2.0,
+            "end": 3.0,
+        },
     ]
     quotes = _build_target_quote_documents_from_dialogue(
-        segments, user_id="u", assistant_id="a", media_item=_media_item(), target_name="Miranda",
+        segments,
+        user_id="u",
+        assistant_id="a",
+        media_item=_media_item(),
+        target_name="Miranda",
     )
     await _attach_target_analysis_context(quotes, scene_summary="SCENE::x")
 

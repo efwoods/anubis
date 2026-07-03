@@ -26,13 +26,12 @@ import logging
 import operator
 from typing import Annotated, Any, Optional, Sequence
 
+from deepagents import create_deep_agent
+from deepagents.graph import DeepAgentState
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from typing_extensions import Required
-
-from deepagents import create_deep_agent
-from deepagents.graph import DeepAgentState
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.middleware.consciousness_refresh_gate import (
@@ -49,6 +48,8 @@ from src.anubis.utils.tools.consciousness import (
 )
 from src.anubis.utils.tools.identity.identity_tools import (
     create_episodic_memory,
+    delete_identity_fact,
+    edit_identity_fact,
     learn_information_about_the_user,
     recall_memories,
     update_self_identity_mem_from_user_txt,
@@ -63,6 +64,8 @@ IDENTITY_TOOLS = [
     recall_memories,
     update_self_identity_mem_from_user_txt,
     learn_information_about_the_user,
+    edit_identity_fact,
+    delete_identity_fact,
 ]
 """Tools whose successful execution should trigger a ``load_consciousness`` refresh.
 
@@ -118,6 +121,8 @@ def build_avatar_deep_agent(
     context: Optional[GlobalContext] = None,
     *,
     extra_tools: Sequence[Any] | None = None,
+    checkpointer: Any | None = None,
+    store: Any | None = None,
 ):
     """Construct the avatar's deep agent.
 
@@ -128,10 +133,19 @@ def build_avatar_deep_agent(
         extra_tools: Additional tools to expose to the deep agent on top
             of the identity tool suite + ``load_consciousness_tool``.
             Reserved for future analysis / OS-query / report tools.
+        checkpointer: Optional persistent checkpointer. Required for
+            human-in-the-loop tools (``edit_identity_fact`` /
+            ``delete_identity_fact``) so an
+            ``interrupt`` raised mid-tool is durable and resumable. When
+            ``None`` the agent runs without its own persistence (the outer
+            workflow owns it) — the legacy behavior for non-interrupting turns.
+        store: Optional cross-thread store. When ``None`` the store
+            propagates from the parent runtime (legacy behavior); ``think``
+            passes ``runtime.store`` explicitly so the agent under its own
+            checkpointer can still reach identity facts.
 
     Returns:
-        A compiled deep-agent graph. The graph is not checkpointed; the
-        outer LangGraph workflow owns persistence.
+        A compiled deep-agent graph.
     """
     context = context or GlobalContext()
 
@@ -175,6 +189,8 @@ def build_avatar_deep_agent(
         system_prompt=None,
         middleware=[refresh_gate, dynamic_prompt],
         state_schema=AvatarDeepAgentState,
+        checkpointer=checkpointer,
+        store=store,
     ).with_config(
         {
             "recursion_limit": context.deep_agent_recursion_limit,

@@ -1,3 +1,24 @@
+# hide unused api endpoints
+# coalesce and use select avatar into single endpoints
+
+# QR code geo located per use case to share, onboard, and connect with application use cases (deep research on the individual to identify accounts, geo located per business to integrate with the business)
+
+# User logs in: new user detected with facial recognition, walks through onboarding, scans for connected accounts, asks for permission for integration, informs how the avatar may triage requests on your behalf. 
+- Centralized interface for notifications from all platforms 
+  - (responses required; 
+  - ongoing conversations and messages handled on your behalf; 
+  - personal analytics dashboard; 
+  - queryable interface for:
+    - dm with self to ask about the current state of affairs of anything, 
+    - notifications of the following
+    - handle any request, 
+    - answer any unhandled message, 
+    - view for avatar documents for identity/ update manually)
+  - switch to any avatar
+  - settings and connect accounts
+
+
+
 # Better UI: Login
 # Improvement of response quality
 # Geo located Avatars (memorials real-world with basic facts)
@@ -6,12 +27,12 @@
 <!-- - [x] I need to chunk the logs -->
 - [ ] I need to work on git_log_all.sh additional update to the log file
 
-- [ ] I need to build a stylistic profile
-- [ ] I need diarization completed
+- [x] I need to build a stylistic profile
+- [x] I need diarization completed
 - [ ] I need metering of responses
 
-- [ ] I need summarization middleware
-- [ ] I need to test using a deep-agent in lieu of a model
+- [x] I need summarization middleware
+- [x] I need to test using a deep-agent in lieu of a model
 - [ ] I need to work on analysis (IMAP, playwright login, pull)
 
 - [ ] Generative query retrieval to improve responses
@@ -53,10 +74,7 @@ What I can do for you depends on what you’re trying to build or solve. A few c
 
 If you tell me what you want to accomplish—like “I want a model that writes like X,” or “I want to add image/audio input,” or “I’m building the backend”—I’ll tailor the next steps.
 
-# Measure Authenticity
-authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?) (use a baseline of questions, generate responses to the baseline of questions and compare)
-
-
+# upload media
 add optional context to media upload 
 allow the process media graph to be used as a tool triggered in conversation
 
@@ -65,7 +83,6 @@ allow the process media graph to be used as a tool triggered in conversation
 # Tuning Prompts to reduce false positives
 # Tuning Behaviors in Threads
 # Train-Attach-Evaluate Adapter Lifecycle
-
 
 # Scan and pull data from scripts after setting an explicit target
 # Scan and parse quotes and biographical information from websites (curie)
@@ -77,7 +94,7 @@ allow the process media graph to be used as a tool triggered in conversation
 # get reference audio file and reference image file url endpoints
 # CRUD memories/identity_memories endpoints
 
-# I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present; verify that the requester is the creator
+# I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present: verify that the requester is the creator in the endpoint
 
 # Moving forward
 
@@ -89,3 +106,13 @@ allow the process media graph to be used as a tool triggered in conversation
 # MCP Server to access data as an integration
 # save transcriptions for parsing from calls or video meetings
 
+# MCP servers for connecting accounts and pulling information
+
+
+------
+# 
+# geo located assistant (each ) for ordering creates "fast-pass" experience to skip lines and enter orders via llm into a queue for local fast food restaurants and services; 
+# twitch moderators/personal avatars for personalized responses (@ev0ra_bot) to receive a response akin to and based on the likeness of that person
+# frontend experience with a gallery view of avatars; use facial recognition login, communicate privacy policy and terms of service, interesting visualization, capture reference image and reference audio, onboarding process -> create your own avatar, suggest integrations (slack, discord, twitch, MCP for data analysis) select if your avatar is private or public (share your avatar with the world!). Create your own avatar, select a variety of avatars to communicate with (public avatars). 
+# Video game/fictional characters (realtime-interaction using audio files to establish the experience of creation of the entity and translate that same experience to other real-people). communicate with the likeness (generate audio profiles etc.) based on the available data.
+# Augmented reality full-body avatars; neural data driven media;

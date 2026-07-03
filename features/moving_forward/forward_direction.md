@@ -2,12 +2,9 @@ image description error
 fp/fn recall in system prompt
 
 training (fine-tuning) on the adapters to capture variance in syntax
-applying syntax measurement and pipeline
 
 data analysis (functional) for everyday use
 psycho analysis (inspect prompts to discover features)
-
-duplicate (facts are echoing in response)
 
 both these avatars present inaccurate factual information
 

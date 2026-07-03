@@ -1,55 +1,55 @@
 # src/anubis/utils/helper_functions
 
 # Vectore store helper functions
-from typing import Sequence
-
-from langchain_core.documents import Document
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage
-
-
-from src.anubis.utils.model import init_model
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate
-from src.anubis.utils.context import GlobalContext
-
-from langgraph.store.base import BaseStore
-
-
-
-import logging
-import re
-
-from datetime import datetime
-from datetime import timezone
-
-from src.anubis.utils.prompts.system_prompts import TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
-from typing import Optional
-
 import asyncio
+import base64
+import io
+import logging
 import math
 import random
+import re
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from moviepy import AudioFileClip, VideoFileClip
 from time import time_ns
+from typing import Optional, Sequence
+
+from langchain_core.documents import Document
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.store.base import BaseStore
+from moviepy import AudioFileClip, VideoFileClip
 from openai import OpenAI
 from openai.types.audio.transcription_diarized import TranscriptionDiarized
-import base64
-
-import io
 from PIL import Image
+
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.model import init_model
+from src.anubis.utils.prompts.system_prompts import (
+    TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION,
+)
 
 logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel
+
+
 class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
+
     query: str
 
-def add_queries(existing: Sequence[str], new:Sequence[str]) -> Sequence[str]:
+
+def add_queries(existing: Sequence[str], new: Sequence[str]) -> Sequence[str]:
     """Combine existing queries with new queries for the vectorstore.
 
     Args:
@@ -110,7 +110,7 @@ def _format_doc(doc: Document) -> str:
     # metadata = doc.metadata or {}
     # meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
     # if meta:
-        # meta = f" {meta}"
+    # meta = f" {meta}"
     # f"<document{meta}>\n{doc.page_content}\n</document>"
     return f"<document>\n{doc.page_content}\n</document>"
 
@@ -148,14 +148,18 @@ def format_docs(docs: list[Document] | None) -> str:
 {formatted}
 </documents>"""
 
+
 ############################  Doc Indexing State  #############################
 import uuid
-from typing import Union, Any, Literal
+from typing import Any, Literal, Union
 
-from langgraph.store.base import SearchItem, Item
+from langgraph.store.base import Item, SearchItem
+
 
 # region agent log
-def _agent_debug_log(message: str, data: dict | None = None, hypothesis_id: str = "") -> None:
+def _agent_debug_log(
+    message: str, data: dict | None = None, hypothesis_id: str = ""
+) -> None:
     """Append one NDJSON line to the debug session log.
 
     Picks the in-container bind-mount path when present, falls back to the
@@ -166,9 +170,14 @@ def _agent_debug_log(message: str, data: dict | None = None, hypothesis_id: str 
         import json as _json
         import os as _os
         import time as _time
+
         _container_path = "/deps/anubis/.cursor/debug-aaf3d3.log"
-        _host_path = "/home/user/gh/anubis-project/wt/f-psycho-analysis/.cursor/debug-aaf3d3.log"
-        _path = _container_path if _os.path.isdir("/deps/anubis/.cursor") else _host_path
+        _host_path = (
+            "/home/user/gh/anubis-project/wt/f-psycho-analysis/.cursor/debug-aaf3d3.log"
+        )
+        _path = (
+            _container_path if _os.path.isdir("/deps/anubis/.cursor") else _host_path
+        )
         _payload = {
             "sessionId": "aaf3d3",
             "timestamp": int(_time.time() * 1000),
@@ -181,6 +190,8 @@ def _agent_debug_log(message: str, data: dict | None = None, hypothesis_id: str 
             _f.write(_json.dumps(_payload, default=str) + "\n")
     except Exception:
         pass
+
+
 # endregion
 
 
@@ -212,6 +223,42 @@ def remove_docs_update(docs: Sequence[Document]) -> dict[str, Any]:
     return {"op": "remove", "keys": [_doc_dedup_key(d) for d in docs]}
 
 
+def _coerce_to_documents(items: Sequence[Any]) -> list[Document]:
+    """Coerce a mixed sequence (str / dict / SearchItem / Document) to Documents.
+
+    Same coercion the ``reduce_docs`` append path performs; shared so the
+    ``"replace"`` op and :func:`merge_dedup_threshold_documents` build documents
+    with identical identity semantics.
+    """
+    coerced: list[Document] = []
+    for item in items:
+        if isinstance(item, str):
+            coerced.append(
+                Document(page_content=item, metadata={"document_id": str(uuid.uuid4())})
+            )
+        elif isinstance(item, dict):
+            coerced.append(Document(**item))
+        elif isinstance(item, SearchItem) or isinstance(item, Item):
+            page_content = (
+                getattr(item, "value", {})
+                .get("document", {})
+                .get("kwargs", {})
+                .get("page_content", "")
+            )
+            document_metadata = (
+                getattr(item, "value", {})
+                .get("document", {})
+                .get("kwargs", {})
+                .get("metadata", {})
+            )
+            coerced.append(
+                Document(page_content=page_content, metadata=document_metadata)
+            )
+        else:
+            coerced.append(item)
+    return coerced
+
+
 def reduce_docs(
     existing: Sequence[Document] | None,
     new: Union[
@@ -239,6 +286,11 @@ def reduce_docs(
           :func:`remove_docs_update`) — removes only the listed docs, leaving
           everything else. Prefer this over ``"delete"`` when other nodes may
           write the same channel in the same superstep.
+        * a replacement instruction ``{"op": "replace", "docs": [...]}`` — the
+          buffer becomes exactly the given docs (coerced + de-duped), discarding
+          whatever was there before. Used by ``load_consciousness`` to write an
+          authoritative merged/pruned snapshot each turn without disturbing the
+          default append semantics that incremental tool writes rely on.
 
     De-duplication by stable document identity (:func:`_doc_dedup_key`) keeps
     the append idempotent: re-emitting a doc already on the buffer does not grow
@@ -277,6 +329,27 @@ def reduce_docs(
         # endregion
         return []
 
+    # Full replacement: the buffer becomes exactly the given docs (coerced + deduped),
+    # discarding whatever was there before. Emitted by ``load_consciousness`` as the
+    # authoritative merged/pruned per-turn snapshot.
+    if isinstance(new, dict) and new.get("op") == "replace":
+        replacement: list[Document] = []
+        replacement_seen: set[str] = set()
+        for doc in _coerce_to_documents(new.get("docs") or []):
+            key = _doc_dedup_key(doc)
+            if key in replacement_seen:
+                continue
+            replacement_seen.add(key)
+            replacement.append(doc)
+        # region agent log
+        _agent_debug_log(
+            "reduce_docs:branch=replace",
+            {"existing_len": _existing_len, "result_len": len(replacement)},
+            hypothesis_id="H2",
+        )
+        # endregion
+        return replacement
+
     # Targeted removal: drop only the processed docs, keep the rest.
     if isinstance(new, dict) and new.get("op") == "remove":
         to_remove = set(new.get("keys") or [])
@@ -296,21 +369,11 @@ def reduce_docs(
 
     coerced: list[Document] = []
     if isinstance(new, str):
-        coerced.append(Document(page_content=new, metadata={"document_id": str(uuid.uuid4())}))
+        coerced.append(
+            Document(page_content=new, metadata={"document_id": str(uuid.uuid4())})
+        )
     elif isinstance(new, list):
-        for item in new:
-            if isinstance(item, str):
-                coerced.append(
-                    Document(page_content=item, metadata={"document_id": str(uuid.uuid4())})
-                )
-            elif isinstance(item, dict):
-                coerced.append(Document(**item))
-            elif isinstance(item, SearchItem) or isinstance(item, Item):
-                page_content = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("page_content", "")
-                document_metadata = getattr(item, 'value', {}).get("document", {}).get("kwargs", {}).get("metadata", {})
-                coerced.append(Document(page_content=page_content, metadata=document_metadata))
-            else:
-                coerced.append(item)
+        coerced.extend(_coerce_to_documents(new))
     else:
         # region agent log
         _agent_debug_log(
@@ -362,8 +425,87 @@ def reduce_docs(
     # endregion
     return result
 
+
+async def merge_dedup_threshold_documents(
+    prior_docs: Sequence[Document] | None,
+    retrieved_items: Sequence[Any],
+    query: str,
+    *,
+    apply_threshold: bool = False,
+    threshold: float = 0.5,
+) -> list[Document]:
+    """Merge persisted state docs with a fresh store retrieval into one clean snapshot.
+
+    Implements the document-statefulness contract for ``load_consciousness``: documents
+    persist in graph state across turns rather than being rebuilt from scratch, so each
+    turn the prior state docs are
+
+    * **unioned** with that turn's freshly retrieved store items,
+    * **de-duplicated** by stable document identity (:func:`_doc_dedup_key`) — on an id
+      collision the FRESHLY RETRIEVED copy wins, so an in-place store edit's new content
+      replaces the stale state copy, and
+    * optionally **salience-thresholded** against the current ``query``: freshly
+      retrieved items reuse their store search score; prior-only docs are re-scored with
+      the process-wide cached sentence embedder (the store's own embedding model, so
+      scores are on the retrieval scale); docs at/below ``threshold`` are dropped.
+
+    ``apply_threshold=False`` (identity channels) still merges + dedups + reconciles to
+    the store copy but never prunes — the avatar must not forget its own identity.
+    """
+    fresh_docs = _coerce_to_documents(list(retrieved_items or []))
+    fresh_scores = [getattr(item, "score", None) for item in (retrieved_items or [])]
+
+    # Union keyed by stable identity; insertion order = prior first, fresh appended.
+    # A fresh doc with a colliding key OVERWRITES the prior (stale) copy in place.
+    merged: dict[str, Document] = {}
+    score_by_key: dict[str, float | None] = {}
+    for doc in prior_docs or []:
+        key = _doc_dedup_key(doc)
+        merged[key] = doc
+        score_by_key[key] = None  # prior docs carry no score → re-scored below
+    for doc, score in zip(fresh_docs, fresh_scores):
+        key = _doc_dedup_key(doc)
+        merged[key] = doc
+        score_by_key[key] = float(score) if isinstance(score, (int, float)) else None
+
+    if not apply_threshold:
+        return list(merged.values())
+
+    # Re-score only the docs without a store score (prior-state docs and any retrieval
+    # that returned no score) against the current query, on the retrieval scale.
+    unscored = [(key, doc) for key, doc in merged.items() if score_by_key[key] is None]
+    if unscored:
+
+        def _compute() -> list[float]:
+            from src.anubis.utils.runtime_handles import get_sentence_embedder
+
+            model: Any = get_sentence_embedder()
+            query_embedding = model.encode([query], convert_to_numpy=True)
+            doc_embeddings = model.encode(
+                [doc.page_content or "" for _, doc in unscored],
+                convert_to_numpy=True,
+            )
+            similarities = model.similarity(query_embedding, doc_embeddings)[0]
+            return [float(score) for score in similarities]
+
+        try:
+            computed = await asyncio.to_thread(_compute)
+        except Exception:
+            # Scoring is best-effort: if the embedder is unavailable, keep the docs
+            # rather than silently dropping salient memories.
+            logger.exception("merge_dedup_threshold_documents: re-scoring failed")
+            computed = [threshold + 1.0] * len(unscored)
+        for (key, _doc), score in zip(unscored, computed):
+            score_by_key[key] = score
+
+    return [
+        doc for key, doc in merged.items() if (score_by_key[key] or 0.0) > threshold
+    ]
+
+
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
+
 from src.anubis.utils.context import GlobalContext
 
 
@@ -371,103 +513,136 @@ async def extract_user_id_assistant_id(config: RunnableConfig):
     user_state = {}
     assistant_state = {}
 
-    user_id = config.get("configurable",{}).get("user_id", '')
+    user_id = config.get("configurable", {}).get("user_id", "")
 
-    if user_id != '':
+    if user_id != "":
         user_state.update({"user_id": user_id})
     else:
         """anonymous_user_id is 'str(uuid5(NAMESPACE_URL, 'anonymous_user_id"""
-        user_state.update({"user_id":'9977df19-9ceb-5f87-a130-55f6a6282069'})
-        
+        user_state.update({"user_id": "9977df19-9ceb-5f87-a130-55f6a6282069"})
+
     assistant_id = config.get("configurable", {}).get("assistant_id", "")
 
     if assistant_id != "":
-        assistant_state.update({"assistant_id":assistant_id})
+        assistant_state.update({"assistant_id": assistant_id})
     else:
-        raise Exception("Assistant does not have an id from the context. Provide an assistant_id in config['configurable']['assistant_id'].")
+        raise Exception(
+            "Assistant does not have an id from the context. Provide an assistant_id in config['configurable']['assistant_id']."
+        )
 
     return user_state, assistant_state
 
+
 async def configure_assistant_context(config: RunnableConfig, store: BaseStore):
-        user_id, assistant_id = await extract_user_id_assistant_id(config)
-        
-        namespace=(user_id, assistant_id, "assistant_ctx")
-        ai_context_item = await store.aget(namespace, key=assistant_id)
-        logger.info(f"ai_context_item: {ai_context_item}")
+    user_id, assistant_id = await extract_user_id_assistant_id(config)
 
-        # Load/UPDATE AI SELF IDENTITY
-        logger.info("item object breakpoint")
+    namespace = (user_id, assistant_id, "assistant_ctx")
+    ai_context_item = await store.aget(namespace, key=assistant_id)
+    logger.info(f"ai_context_item: {ai_context_item}")
 
-        # get the current assistant context as a dict
+    # Load/UPDATE AI SELF IDENTITY
+    logger.info("item object breakpoint")
 
-        configurable_assistant_ctx = config.get("configurable", {}).get("assistant_ctx", None)
+    # get the current assistant context as a dict
 
-        if configurable_assistant_ctx is not None:
-            if ai_context_item is not None:
-                for key, value in configurable_assistant_ctx:
-                    if (value != "" and value != None) and key != "metadata":
-                        ai_context_item.value['assistant_ctx'].update({key: value})
-                if configurable_assistant_ctx.get("metadata", None) is not None:
-                    update_metadata = configurable_assistant_ctx.get("metadata")
-                    ai_context_item.value['assistant_ctx']['metadata'].update(update_metadata)                 
+    configurable_assistant_ctx = config.get("configurable", {}).get(
+        "assistant_ctx", None
+    )
 
-                await store.aput(namespace, key=assistant_id, value={"assistant_ctx":ai_context_item.value["assistant_ctx"]})
-            else:
-                init_assistant_ctx = {
-                    "user_id":user_id,
-                    "assistant_id":assistant_id,
-                    "name":configurable_assistant_ctx.get("name", ""),
-                    "description":configurable_assistant_ctx.get("description", ""),
-                    "metadata": configurable_assistant_ctx.get("metadata", {})
-                }
-                await store.aput(namespace, key=assistant_id, value={"assistant_ctx":init_assistant_ctx})
+    if configurable_assistant_ctx is not None:
+        if ai_context_item is not None:
+            for key, value in configurable_assistant_ctx:
+                if (value != "" and value != None) and key != "metadata":
+                    ai_context_item.value["assistant_ctx"].update({key: value})
+            if configurable_assistant_ctx.get("metadata", None) is not None:
+                update_metadata = configurable_assistant_ctx.get("metadata")
+                ai_context_item.value["assistant_ctx"]["metadata"].update(
+                    update_metadata
+                )
+
+            await store.aput(
+                namespace,
+                key=assistant_id,
+                value={"assistant_ctx": ai_context_item.value["assistant_ctx"]},
+            )
         else:
-            if ai_context_item is None:
-                init_assistant_ctx = {
-                    "user_id":user_id,
-                    "assistant_id":assistant_id,
-                    "name": "",
-                    "description": "",
-                    "metadata": {}
-                }
-                await store.aput(namespace, key=assistant_id, value={"assistant_ctx":init_assistant_ctx})
+            init_assistant_ctx = {
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "name": configurable_assistant_ctx.get("name", ""),
+                "description": configurable_assistant_ctx.get("description", ""),
+                "metadata": configurable_assistant_ctx.get("metadata", {}),
+            }
+            await store.aput(
+                namespace, key=assistant_id, value={"assistant_ctx": init_assistant_ctx}
+            )
+    else:
+        if ai_context_item is None:
+            init_assistant_ctx = {
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "name": "",
+                "description": "",
+                "metadata": {},
+            }
+            await store.aput(
+                namespace, key=assistant_id, value={"assistant_ctx": init_assistant_ctx}
+            )
 
-        ai_context_item = await store.aget(namespace, key=assistant_id)
+    ai_context_item = await store.aget(namespace, key=assistant_id)
 
-        return ai_context_item
+    return ai_context_item
 
 
-async def image_to_text(target_image_url: str, 
-                        reference_image_url: Optional[str] = None, 
-                        ):
+async def image_to_text(
+    target_image_url: str,
+    reference_image_url: Optional[str] = None,
+):
     """
     Convert an image of a target to text.
-    Describe the target individual to the best of your ability. 
+    Describe the target individual to the best of your ability.
     args:
         target_image_url: base64 encoded string or a url to an image to describe.
-        reference_image_url (Optional[str]): base64 encoded string or a url to an image. 
+        reference_image_url (Optional[str]): base64 encoded string or a url to an image.
             Expected to only have a single individual. Used to identify the target to describe in the target image.
-    
-    Returns: 
+
+    Returns:
         description (str): This is the description of the target with respect to the individual. The description is of the target from the FIRST PERSON PERSPECTIVE.
     """
 
     if reference_image_url is not None:
         if "." in reference_image_url:
             # url
-            reference_message = {"type": "image_url", "image_url":{"url":reference_image_url}}
+            reference_message = {
+                "type": "image_url",
+                "image_url": {"url": reference_image_url},
+            }
         else:
             # base 64 encoding
-            reference_message = {"type": "image_url", "image_url":{"url":f"data:image/jpeg;base64,{reference_image_url}"}}
+            reference_message = {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{reference_image_url}"},
+            }
 
     if "." in target_image_url:
-        target_message = {"type": "image_url", "image_url": {"url":target_image_url}}
+        target_message = {"type": "image_url", "image_url": {"url": target_image_url}}
     else:
-        target_message = {"type": "image_url", "image_url": {"url":f"data:image/jpeg;base64,{target_image_url}"}}
+        target_message = {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{target_image_url}"},
+        }
 
     # Compile the message
-    content = [reference_message, target_message] if reference_image_url is not None else [target_message]
-    system_message = [SystemMessage(content=TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION)]
+    content = (
+        [reference_message, target_message]
+        if reference_image_url is not None
+        else [target_message]
+    )
+    system_message = [
+        SystemMessage(
+            content=TEXT_PROMPT_FOR_IMAGE_TO_TEXT_CONTEXT_FOR_FIRST_PERSON_PERSPECTIVE_DESCRIPTION
+        )
+    ]
     human_message = [{"role": "user", "content": content}]
 
     messages = system_message + human_message
@@ -477,21 +652,23 @@ async def image_to_text(target_image_url: str,
 
     response = await model.ainvoke(input=messages)
 
-    description  = response.content
+    description = response.content
 
-    return description 
+    return description
 
 
 from typing import Optional
 
-
 """ YOUTUBE HELPER FUNCTIONS """
-import yt_dlp
 import os
 import re
 
+import yt_dlp
 
-async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True, output_dir: Optional[str] = None) -> str:
+
+async def download_transcript(
+    url: str, lang: str = "en", auto_subs: bool = True, output_dir: Optional[str] = None
+) -> str:
     """
     Download transcript/subtitles from a YouTube video.
 
@@ -524,9 +701,17 @@ async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True
     # yt_dlp.YoutubeDL is a *synchronous* context manager and extract_info blocks,
     # so run it off the event loop in a worker thread (the same pattern used by
     # the audio-download and playlist-extraction paths).
+    #
+    # ``download=True`` is what actually writes the subtitle files: yt_dlp only
+    # runs the subtitle-download phase during a "download", so ``download=False``
+    # returned the info dict but never produced a ``.vtt`` on disk — the loop
+    # below then found nothing and raised FileNotFoundError, silently forcing the
+    # caller onto the (slower, reference-audio-dependent) diarization path. The
+    # video media itself is still skipped: ``skip_download=True`` in ``ydl_opts``
+    # downloads only the requested subtitles, not the audio/video stream.
     def _extract() -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
             return info.get("title", "video")
 
     title = await asyncio.to_thread(_extract)
@@ -536,8 +721,9 @@ async def download_transcript(url: str, lang: str = "en", auto_subs: bool = True
         if f.endswith(".vtt"):
             return os.path.join(out_dir, f)
 
-    raise FileNotFoundError(f"No subtitle file found for '{title}'. "
-                            "Try listing available languages first.")
+    raise FileNotFoundError(
+        f"No subtitle file found for '{title}'. Try listing available languages first."
+    )
 
 
 def parse_vtt(vtt_path: str) -> str:
@@ -696,7 +882,7 @@ def _speech_call_with_retry(make_call, context: GlobalContext, *, description: s
             last_exc = exc
 
         if attempt < attempts - 1:
-            delay = base * (2 ** attempt) + random.uniform(0, base or 0.0)
+            delay = base * (2**attempt) + random.uniform(0, base or 0.0)
             logger.warning(
                 "%s: transient OpenAI failure (attempt %d/%d), retrying in %.2fs: %s",
                 description,
@@ -809,7 +995,9 @@ def _transcribe_one_segment_path(
     }
 
 
-def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalContext) -> dict:
+def _transcribe_saved_path(
+    path: str, upload_filename: str, context: GlobalContext
+) -> dict:
     """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit.
 
     Fully synchronous (moviepy chunking + the blocking OpenAI speech client +
@@ -860,26 +1048,33 @@ def _transcribe_saved_path(path: str, upload_filename: str, context: GlobalConte
             "latency_ms": inner_latency,
             "whisper_chunk_count": n,
             "model": context.audio_transcription_model,
-            "inference_type": "transcription"
+            "inference_type": "transcription",
         }
     finally:
         clip.close()
 
 
 async def transcribe_audio(
-    audio_base64: str, context: GlobalContext, filename: Optional[str] = None, 
+    audio_base64: str,
+    context: GlobalContext,
+    filename: Optional[str] = None,
     reference_audio: bool = False,
     max_duration_seconds: Optional[float] = 9.0,
 ) -> dict:
 
     # Remove noise and isolate the vocals; if reference audio, truncate to 9 seconds:
-    preprocessed_audio = await preprocess_audio(audio_base64, truncate_only=False, reference_audio=reference_audio, max_duration_seconds=max_duration_seconds)
+    preprocessed_audio = await preprocess_audio(
+        audio_base64,
+        truncate_only=False,
+        reference_audio=reference_audio,
+        max_duration_seconds=max_duration_seconds,
+    )
     audio_base64 = preprocessed_audio["audio_base64"]
 
     raw = _decode_base64_media_payload(audio_base64)
-    
+
     # Update preprocessed filename to mp3 codec
-    suffix = ".mp3" # mp3 after preprocessing to mp3 codec
+    suffix = ".mp3"  # mp3 after preprocessing to mp3 codec
 
     filename = Path(filename).stem + ".mp3"
 
@@ -889,7 +1084,7 @@ async def transcribe_audio(
     try:
         name = Path(filename or f"audio{suffix}").name
         result = await asyncio.to_thread(_transcribe_saved_path, path, name, context)
-        result['audio_base64_preprocessed'] = audio_base64
+        result["audio_base64_preprocessed"] = audio_base64
         return result
 
     finally:
@@ -898,9 +1093,11 @@ async def transcribe_audio(
         except OSError:
             pass
 
+
 async def get_file_size_MB(audio_base64: str) -> float:
     raw = _decode_base64_media_payload(audio_base64)
     return len(raw) / 1048576
+
 
 async def preprocess_audio(
     audio_base64: str,
@@ -938,10 +1135,10 @@ async def preprocess_audio(
     imported lazily inside the enhancement branch and are not paid for on the
     fast path.
     """
-# TODO: This function needs to separate the noise removal and the energy estimation of the audio file. The largest energy in the audio file may contain noise or multiple speakers. This requires VAD afterwards. This function will only perform the following: ensure the format is mp3, the noise is optionally removed and voice enhanced, and the entire duration is clipped to max seconds.
-# 
-# 
-#  Either implement custom VAD in a separate function after this or transcribe all the audio, truncate using the VAD from the diarization in combination with energy analysis (transcription must match the segment that is truncated for reference)
+    # TODO: This function needs to separate the noise removal and the energy estimation of the audio file. The largest energy in the audio file may contain noise or multiple speakers. This requires VAD afterwards. This function will only perform the following: ensure the format is mp3, the noise is optionally removed and voice enhanced, and the entire duration is clipped to max seconds.
+    #
+    #
+    #  Either implement custom VAD in a separate function after this or transcribe all the audio, truncate using the VAD from the diarization in combination with energy analysis (transcription must match the segment that is truncated for reference)
 
     raw = _decode_base64_media_payload(audio_base64)
     in_suffix = Path(filename or "audio.mp3").suffix or ".mp3"
@@ -1017,7 +1214,7 @@ async def preprocess_audio(
         #     if enhance_vocals_and_remove_noise:
         #         logger.info(f"preprocess_audio noisereduce sr: {sample_rate}")
         #         waveform = nr.reduce_noise(y=mono, sr=sample_rate).astype(np.float32)
-        #     else: 
+        #     else:
         #         waveform = mono
 
         #     # Identify the longest window of audio that contains potential speech
@@ -1164,6 +1361,7 @@ def _diarize_token_cost(usage_dict: dict, context: GlobalContext) -> float:
         + out * context.audio_diarization_price_per_million_tokens_output
     )
 
+
 def _diarize_one_mp3_path(
     mp3_path: str,
     upload_name: str,
@@ -1235,6 +1433,7 @@ def _merge_diarized_segments_from_chunks(
             )
     return merged
 
+
 def extract_video_audio_b64(
     video_base64: str, filename: Optional[str] = None
 ) -> tuple[str, str]:
@@ -1251,7 +1450,9 @@ def extract_video_audio_b64(
     source_path: Optional[str] = None
     audio_path: Optional[str] = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=src_suffix, delete=False) as temp_upload:
+        with tempfile.NamedTemporaryFile(
+            suffix=src_suffix, delete=False
+        ) as temp_upload:
             temp_upload.write(raw)
             temp_upload.flush()
             source_path = temp_upload.name
@@ -1265,10 +1466,9 @@ def extract_video_audio_b64(
             video.close()
 
         with open(audio_path, "rb") as audio_f:
-            data_uri = (
-                "data:audio/mp3;base64,"
-                + base64.b64encode(audio_f.read()).decode("utf-8")
-            )
+            data_uri = "data:audio/mp3;base64," + base64.b64encode(
+                audio_f.read()
+            ).decode("utf-8")
         return data_uri, Path(orig_name).stem + ".mp3"
     finally:
         for pth in (source_path, audio_path):
@@ -1297,6 +1497,7 @@ async def transcribe_video(
         max_duration_seconds=max_duration_seconds,
     )
 
+
 # TODO: when chunking, the total tokens, and input and output tokens should be calculated and returned in the response (aggregated from all chunks)
 
 # TODO: when diarizing The model cost needs to be calculated and returned in the response (using total aggregated tokens from all chunks for input and output tokens)
@@ -1306,6 +1507,7 @@ def _select_dominant_speaker_segments(
     diarized_segments: list,
     *,
     short_fallback_s: float = 1.0,
+    allow_single_speaker: bool = False,
 ) -> Optional[tuple[str, list[dict], dict[str, float], float]]:
     """Pure selection logic: filter text-bearing segments, pick the speaker
     with the largest total speech time, return that speaker's segments.
@@ -1314,6 +1516,14 @@ def _select_dominant_speaker_segments(
     or ``None`` when the input has no text-bearing segments, only one speaker,
     or the dominant speaker's combined speech is shorter than
     ``short_fallback_s``. Tie-break for the dominant pick is first-seen label.
+
+    ``allow_single_speaker`` keeps a single-speaker input instead of returning
+    ``None``. The default (False) is for isolating one voice out of a
+    conversation, where a single speaker means "nothing to separate, pass the
+    clip through". Reference-audio extraction passes ``True``: a reference clip
+    is the target talking alone, so a single speaker is the desired case and
+    must still yield that speaker's segments (and therefore a transcript) rather
+    than falling through to the empty-text passthrough.
     """
     speech_segs: list[dict] = []
     for seg in diarized_segments:
@@ -1346,9 +1556,12 @@ def _select_dominant_speaker_segments(
             first_seen.append(spk)
         totals[spk] += seg["end"] - seg["start"]
 
-    # Only one distinct speaker: there is no "dominant" speaker to isolate, so
-    # signal the caller to fall through to passthrough (use the whole clip).
-    if len(totals) <= 1:
+    # Only one distinct speaker: for dominant-speaker isolation there is nothing
+    # to separate, so signal passthrough (use the whole clip). For reference
+    # audio a single speaker is the expected, desired case, so keep that speaker
+    # rather than bailing — otherwise the reference document is stored with an
+    # empty transcript.
+    if len(totals) <= 1 and not allow_single_speaker:
         return None
 
     target_speaker = sorted(
@@ -1356,7 +1569,9 @@ def _select_dominant_speaker_segments(
     )[0]
     target_segs = [s for s in speech_segs if s["speaker"] == target_speaker]
     target_total = sum(s["end"] - s["start"] for s in target_segs)
-    if target_total < short_fallback_s: # This needs to indicate that the reference audio is too short and must be at least 1 second
+    if (
+        target_total < short_fallback_s
+    ):  # This needs to indicate that the reference audio is too short and must be at least 1 second
         return None
     return target_speaker, target_segs, totals, target_total
 
@@ -1454,6 +1669,7 @@ async def isolate_dominant_speaker_audio_b64(
         selection = _select_dominant_speaker_segments(
             (diar or {}).get("segments") or [],
             short_fallback_s=short_fallback_s,
+            allow_single_speaker=bool(reference_audio),
         )
         if selection is None:
             logger.info(
@@ -1478,18 +1694,44 @@ async def isolate_dominant_speaker_audio_b64(
             clip_for_crop = AudioFileClip(work_path)
             try:
                 if reference_audio:
-                    # Reference clip: single longest contiguous target segment,
-                    # capped at reference_audio_clip_max_seconds.
-                    longest = max(target_segs, key=lambda s: s["end"] - s["start"])
-                    seg_start = float(longest["start"])
-                    seg_end = float(longest["end"])
+                    # Reference clip: OpenAI's known_speaker_references must be a
+                    # single-speaker clip between 1.2 s and 10 s, so we keep one
+                    # contiguous window of the target capped at
+                    # reference_audio_clip_max_seconds. Anchor on the target's
+                    # longest contiguous segment (the cleanest sustained speech),
+                    # then extend through the immediately-adjacent following
+                    # target segments while the window stays under the cap.
+                    # ``text`` is the concatenation of exactly the segments inside
+                    # the kept window, so the stored transcript matches the stored
+                    # audio (the previous code paired a single segment's *full*
+                    # text with an audio clip that could be hard-truncated to the
+                    # cap, leaving text and audio out of sync). Extension stops at
+                    # any real gap so the subclip can't swallow an intervening
+                    # other-speaker turn — the reference must stay single-speaker.
+                    _ref_max_gap_s = 0.5
+                    ordered = sorted(target_segs, key=lambda s: float(s["start"]))
+                    anchor = max(ordered, key=lambda s: s["end"] - s["start"])
+                    anchor_idx = ordered.index(anchor)
+                    seg_start = float(anchor["start"])
+                    seg_end = float(anchor["end"])
+                    kept = [anchor]
+                    for nxt in ordered[anchor_idx + 1 :]:
+                        if (float(nxt["start"]) - seg_end) > _ref_max_gap_s:
+                            break
+                        if (float(nxt["end"]) - seg_start) > target_clip_max_s:
+                            break
+                        seg_end = float(nxt["end"])
+                        kept.append(nxt)
+                    # Hard cap covers a single anchor segment longer than the cap
+                    # (one continuous utterance): the audio is truncated to the
+                    # cap; ``text`` then over-covers slightly, which is the only
+                    # case the segment granularity can't keep perfectly in sync.
                     if (seg_end - seg_start) > target_clip_max_s:
                         seg_end = seg_start + target_clip_max_s
-                    # Floor the clip at OpenAI's 1.2 s minimum: if the longest
-                    # contiguous target segment is too short, widen the window
-                    # into the surrounding audio (it still centers on the
-                    # target) rather than emit a sub-1.2 s reference the
-                    # diarizer will reject.
+                    # Floor the clip at OpenAI's 1.2 s minimum: if the kept window
+                    # is too short, widen it into the surrounding audio (it still
+                    # centers on the target) rather than emit a sub-1.2 s
+                    # reference the diarizer will reject.
                     clip_total = float(clip_for_crop.duration or 0.0)
                     if clip_total and (seg_end - seg_start) < _OPENAI_REF_MIN_S:
                         seg_end = min(clip_total, seg_start + _OPENAI_REF_MIN_S)
@@ -1501,11 +1743,14 @@ async def isolate_dominant_speaker_audio_b64(
                     finally:
                         sub.close()
                     clip_duration = float(seg_end - seg_start)
-                    clip_content = (longest.get("text") or "").strip()
+                    clip_content = " ".join(
+                        (s.get("text") or "").strip() for s in kept
+                    ).strip()
                     logger.info(
-                        "isolate_dominant_speaker_audio_b64[ref]: longest target segment %.2fs (kept %.2fs after cap)",
-                        longest["end"] - longest["start"],
+                        "isolate_dominant_speaker_audio_b64[ref]: kept %d target segment(s) %.2fs (cap %.2fs)",
+                        len(kept),
                         clip_duration,
+                        target_clip_max_s,
                     )
                 else:
                     # Non-reference: concatenate all target segments with short
@@ -1520,7 +1765,9 @@ async def isolate_dominant_speaker_audio_b64(
                             sub = clip_for_crop.subclipped(seg["start"], seg["end"])
                             f = min(fade_s, seg_dur / 4)
                             if f > 0:
-                                sub = sub.with_effects([AudioFadeIn(f), AudioFadeOut(f)])
+                                sub = sub.with_effects(
+                                    [AudioFadeIn(f), AudioFadeOut(f)]
+                                )
                             subs.append(sub)
                         glued = concatenate_audioclips(subs)
                         try:
@@ -1546,10 +1793,9 @@ async def isolate_dominant_speaker_audio_b64(
                 clip_for_crop.close()
 
             with open(output_path, "rb") as fh:
-                final_audio_b64 = (
-                    "data:audio/mp3;base64,"
-                    + base64.b64encode(fh.read()).decode("utf-8")
-                )
+                final_audio_b64 = "data:audio/mp3;base64," + base64.b64encode(
+                    fh.read()
+                ).decode("utf-8")
             return {
                 "audio_base64_preprocessed": final_audio_b64,
                 "duration": clip_duration,
@@ -1573,28 +1819,26 @@ async def transcribe_audio_diarize(
     encoded_reference_audio: Optional[str] = None,
     filename: Optional[str] = None,
     content_type: Optional[str] = None,
-    reference_audio: Optional[bool] = False
+    reference_audio: Optional[bool] = False,
 ) -> dict:
     """Diarize video or audio from base64 (chunked when audio exceeds whisper_max_bytes)."""
     start_time = time_ns()
     client = _openai_client_for_speech(context)
-    
+
     orig_name = filename or "upload.mp4"
     suffix = Path(orig_name).suffix or ".mp4"
     is_audio = _upload_is_audio_for_diarize(filename, content_type)
 
-    # Preprocess audio or video — pass through without truncation. The
-    # diarizer needs to see the full clip; inputs that exceed
-    # ``whisper_max_bytes`` are sliced into chunks below and diarized in
-    # sequence with timestamps aggregated onto the original timeline. The
-    # ``reference_audio`` parameter on this function is informational and
-    # does not gate preprocessing (``preprocess_audio``'s
-    # ``reference_audio=True`` would truncate the input to a few seconds,
-    # which would defeat full-clip diarization).
+    # asdf
+
     source_path = None
     audio_path = None
     if is_audio:
-        preprocessed_audio = await preprocess_audio(
+        # Handle Audio
+        # Identify the longest up to 9 second audio clip for reference audio.
+        # Preprocess as necessary to improve quality otherwise.
+
+        preprocessed_audio = await preprocess_audio(  # Convert to MP3 Codec
             media_base64,
             truncate_only=False,
             reference_audio=False,
@@ -1622,28 +1866,28 @@ async def transcribe_audio_diarize(
         await asyncio.to_thread(_extract_audio)
 
         with open(audio_path, "rb") as audio_f:
-            b64_encoded_reference_audio = (
-                f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
-            )
+            b64_encoded_reference_audio = f"data:audio/mp3;base64,{base64.b64encode(audio_f.read()).decode('utf-8')}"
+            # Create
             preprocessed_audio = await preprocess_audio(
                 b64_encoded_reference_audio,
                 truncate_only=False,
                 reference_audio=False,
             )
 
-    raw = _decode_base64_media_payload(preprocessed_audio['audio_base64'])
+    raw = _decode_base64_media_payload(preprocessed_audio["audio_base64"])
     if not is_audio:
-        os.unlink(audio_path) # Non preprocessed audio from video
+        os.unlink(audio_path)  # Non preprocessed audio from video
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
         temp_audio.write(raw)
         temp_audio.flush()
-        audio_path = temp_audio.name # Preprocessed audio
-    
+        audio_path = temp_audio.name  # Preprocessed audio
+
+    ##### Diarize content using reference audio
     try:
         size_bytes = len(raw)
         diarize_upload_name = (
-            Path(orig_name).stem + ".mp3" # Preprocessed audio codec
+            Path(orig_name).stem + ".mp3"  # Preprocessed audio codec
         )
 
         if size_bytes <= context.whisper_max_bytes:
@@ -1721,10 +1965,7 @@ async def transcribe_audio_diarize(
 
                 chunk_responses = list(
                     await asyncio.gather(
-                        *[
-                            _diarize_chunk_async(i, p)
-                            for i, p in enumerate(chunk_paths)
-                        ]
+                        *[_diarize_chunk_async(i, p) for i, p in enumerate(chunk_paths)]
                     )
                 )
             finally:
@@ -1774,9 +2015,7 @@ async def transcribe_audio_diarize(
             )
 
         model = context.audio_diarization_model or "gpt-4o-transcribe-diarize"
-        response_dict.update(
-            {"inference_type": "diarization", "model": model}
-        )
+        response_dict.update({"inference_type": "diarization", "model": model})
         inp = usage_d.get("input_tokens")
         out = usage_d.get("output_tokens")
         tot = usage_d.get("total_tokens")
@@ -1791,7 +2030,7 @@ async def transcribe_audio_diarize(
         )
 
         response_dict["latency_ms"] = (time_ns() - start_time) / 1e6
-        response_dict['encoded_audio_base64'] = preprocessed_audio['audio_base64']
+        response_dict["encoded_audio_base64"] = preprocessed_audio["audio_base64"]
         return response_dict
     finally:
         for pth in (source_path, audio_path):
@@ -1801,11 +2040,14 @@ async def transcribe_audio_diarize(
                 except OSError:
                     pass
 
+
 async def extract_base64_str_from_image(image_base64: str, filename: str) -> str:
     """Build a ``data:image/...;base64,...`` URI from raw or data-URI base64 input."""
     suffix = Path(filename).suffix
     if suffix not in [".png", ".jpeg", ".jpg", ".webp"]:
-        raise ValueError("Unsupported file type. Only PNG, JPEG, JPG, and WEBP are allowed.")
+        raise ValueError(
+            "Unsupported file type. Only PNG, JPEG, JPG, and WEBP are allowed."
+        )
     raw = _decode_base64_media_payload(image_base64)
     base64_image = base64.b64encode(raw).decode("utf-8")
     return f"data:image/{suffix.lstrip('.')};base64,{base64_image}"
@@ -1828,61 +2070,155 @@ async def resize_image_bytes(image_bytes: bytes) -> tuple[bytes, Optional[str]]:
         image.save(out, format="JPEG", quality=85, optimize=True)
         return out.getvalue(), "image/jpeg"
 
+
 async def load_baseline_features_explainer_model(store: BaseStore):
-    import base64, pickle, shap, aiofiles, json
+    import base64
+    import json
+    import pickle
+
+    import aiofiles
     import numpy as np
+    import shap
+
+    from src.anubis.utils.dataset.style_features import (
+        BASELINE_FEATURES_EXPLAINER_PATH,
+        BASELINE_FEATURES_MODEL_PATH,
+        FEATURE_NAMES,
+        baseline_feature_array_is_current,
+        load_bundled_baseline_features_arr,
+    )
 
     # Attempt to pull stored model and data from store
     baseline_features_namespace = ("baseline_features_arr_list_str",)
     baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
-
+    baseline_features_explainer_namespace = ("baseline_features_explainer_b64_pkl",)
+    # basline_features_keyword_namespace = ("basline_features_keyword_namespace", )
+    
     baseline_features_arr_list_str_ITEM = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
     baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
 
-    baseline_features_model_b64_pkl_ITEM = await store.aget(baseline_features_model_namespace, key="baseline_features_model_b64_pkl")
-    baseline_features_model_b64_pkl = (getattr(baseline_features_model_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+    baseline_features_model_b64_pkl_ITEM = await store.aget(
+        baseline_features_model_namespace, key="baseline_features_model_b64_pkl"
+    )
+    baseline_features_model_b64_pkl = (
+        getattr(baseline_features_model_b64_pkl_ITEM, "value", None) or {}
+    ).get("value", None)
+
+    async def _load_bundled_model_b64() -> str:
+        """Read the bundled base64 model pickle from disk and cache it in the store."""
+        async with aiofiles.open(BASELINE_FEATURES_MODEL_PATH, 'rb') as fp:
+            model_bytes = await fp.read()
+        model_b64_str = model_bytes.decode('utf-8')
+        await store.aput(
+            baseline_features_model_namespace,
+            key="baseline_features_model_b64_pkl",
+            value={"value": model_b64_str})
+        return model_b64_str
 
     # If the baseline_features_model has not yet been stored, load from disk and store the model:
     if not baseline_features_model_b64_pkl:
-        _MODEL_PATH = "src/anubis/utils/dataset/baseline_features_model_b64.pkl"
-        # Load model
-        async with aiofiles.open(_MODEL_PATH, 'rb') as fp:
-            baseline_features_model_b64_pkl = await fp.read()
-        baseline_features_model_b64_pkl_str = (baseline_features_model_b64_pkl).decode('utf-8')
-        await store.aput(
-            baseline_features_model_namespace, 
-            key="baseline_features_model_b64_pkl", 
-            value={"value":baseline_features_model_b64_pkl_str})        
+        baseline_features_model_b64_pkl = await _load_bundled_model_b64()
 
     # Convert from pickled string to Isolation Forest model
     model = pickle.loads(base64.b64decode(baseline_features_model_b64_pkl))
 
+    # Feature-version self-heal: a deployment that cached the model before the
+    # feature vector grew holds an IsolationForest of the wrong width, which would
+    # raise when scoring a current-width candidate. Reload the freshly-bundled
+    # model (regenerated by data/build_baseline_features_arr.py) and overwrite the
+    # stale cache.
+    if getattr(model, "n_features_in_", len(FEATURE_NAMES)) != len(FEATURE_NAMES):
+        baseline_features_model_b64_pkl = await _load_bundled_model_b64()
+        model = pickle.loads(base64.b64decode(baseline_features_model_b64_pkl))
+
     # If the baseline_features_arr has not yet been stored, load from disk and store the array:
     if not baseline_features_arr_list_str:
-        _BASELINE_ANSWERS_RESPONSES_ARR_DIR = "src/anubis/utils/dataset/baseline_features_arr.npy"
-        baseline_features_arr = np.load(_BASELINE_ANSWERS_RESPONSES_ARR_DIR, allow_pickle=False)
-
+        baseline_features_arr = load_bundled_baseline_features_arr()
         baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
-
         await store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
 
     # Convert from str to np.array
     baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
-    
-    explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+
+    # Same self-heal for the cached background matrix: a stale-width array would
+    # not align with the current model in the KernelExplainer below.
+    if not baseline_feature_array_is_current(baseline_features_arr):
+        baseline_features_arr = load_bundled_baseline_features_arr()
+        await store.aput(
+            baseline_features_namespace,
+            key="baseline_features_arr_list_str",
+            value={"value": json.dumps(baseline_features_arr.tolist())})
+
+    # Load the pre-built SHAP explainer (base64 pickle) rather than rebuilding a
+    # KernelExplainer (kmeans + repeated model.predict) on every call. Cached in
+    # the store like the model/array, with a disk fallback. If the persisted
+    # explainer is missing, unreadable, or predates the current feature vector, we
+    # self-heal to a runtime rebuild so inference never breaks.
+    baseline_features_explainer_b64_pkl_ITEM = await store.aget(
+        baseline_features_explainer_namespace, key="baseline_features_explainer_b64_pkl")
+    baseline_features_explainer_b64_pkl = (getattr(baseline_features_explainer_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+
+    async def _load_bundled_explainer_b64() -> str:
+        """Read the bundled base64 explainer pickle from disk and cache it in the store."""
+        async with aiofiles.open(BASELINE_FEATURES_EXPLAINER_PATH, 'rb') as fp:
+            explainer_bytes = await fp.read()
+        explainer_b64_str = explainer_bytes.decode('utf-8')
+        await store.aput(
+            baseline_features_explainer_namespace,
+            key="baseline_features_explainer_b64_pkl",
+            value={"value": explainer_b64_str})
+        return explainer_b64_str
+
+    explainer = None
+    try:
+        if not baseline_features_explainer_b64_pkl:
+            baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
+        explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+
+        # Width self-heal: an explainer cached before the feature vector changed
+        # carries a stale-width background/model. Its SHAP background lives at
+        # explainer.data.data as an (n_background, F) array; reload the bundled
+        # explainer when F no longer matches the current vector.
+        explainer_background = np.asarray(getattr(getattr(explainer, "data", None), "data", np.empty((0, 0))))
+        if explainer_background.ndim != 2 or explainer_background.shape[1] != len(FEATURE_NAMES):
+            baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
+            explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+    except Exception:
+        # Missing/corrupt/incompatible persisted explainer — rebuild from the
+        # current-width model + background so the caller always gets a usable one.
+        explainer = None
+
+    if explainer is None:
+        explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+
     return explainer, model
 
-async def compute_shap_values_against_baseline(feature_values, store: BaseStore) -> dict:
-    from src.anubis.utils.dataset.style_features import FEATURE_NAMES
+
+async def compute_shap_values_against_baseline(
+    feature_values, store: BaseStore
+) -> dict:
     import pandas as pd
+
+    from src.anubis.utils.dataset.style_features import FEATURE_NAMES
+
     _explainer, _model = await load_baseline_features_explainer_model(store)
-    prediction = bool(_model.predict(feature_values.reshape(1,-1))==1)
+    prediction = bool(_model.predict(feature_values.reshape(1, -1)) == 1)
 
-    shap_values = _explainer.shap_values(feature_values.reshape(1,-1))
+    shap_values = _explainer.shap_values(feature_values.reshape(1, -1))
 
-    df = pd.DataFrame(shap_values.flatten(), index = FEATURE_NAMES, columns = ['unmodified_llm_comparison_isolation_forest_shap_values'])
-    shap_dict = df[df['unmodified_llm_comparison_isolation_forest_shap_values']!=0.0].to_dict()
-    shap_dict['unmodified_llm_comparison_isolation_forest_shap_values_description'] = "Negative values indicate dissimilarity from unmodified llm dataset. Positive values indicate similarity to unmodified llm responses. Scale is -1 to 1."
-    shap_dict['no_statistically_significant_difference_between_sample_and_unmodified_llm_according_to_isolation_forest'] = prediction
+    df = pd.DataFrame(
+        shap_values.flatten(),
+        index=FEATURE_NAMES,
+        columns=["unmodified_llm_comparison_isolation_forest_shap_values"],
+    )
+    shap_dict = df[
+        df["unmodified_llm_comparison_isolation_forest_shap_values"] != 0.0
+    ].to_dict()
+    shap_dict["unmodified_llm_comparison_isolation_forest_shap_values_description"] = (
+        "Negative values indicate dissimilarity from unmodified llm dataset. Positive values indicate similarity to unmodified llm responses. Scale is -1 to 1."
+    )
+    shap_dict[
+        "no_statistically_significant_difference_between_sample_and_unmodified_llm_according_to_isolation_forest"
+    ] = prediction
 
     return shap_dict

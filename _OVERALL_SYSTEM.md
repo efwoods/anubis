@@ -171,9 +171,6 @@ Analysis pipeline to scan for answers to those questions (predetermined along wi
 Models with structured output to determine factual correctness of the generated responses to the identified answers found from the Analysis pipeline in the ground-truth data if those answers exist
 Improvement (find more data, train adapters, modify the system prompt, improve retrieval)
 
-
-
-
 https://www.deeplearning.ai/courses/evaluating-debugging-generative-ai
 
 

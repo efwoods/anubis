@@ -47,7 +47,11 @@ class _FakeCompiled:
         self._failed_files = failed_files
 
     async def astream(self, _input, *, config, context, stream_mode, subgraphs):
-        yield (("ns",), "custom", {"type": "media_progress", "stage": "labeling", "total": 1})
+        yield (
+            ("ns",),
+            "custom",
+            {"type": "media_progress", "stage": "labeling", "total": 1},
+        )
         yield (("ns",), "updates", {"some_node": {}})
         if self._failed_files is not None:
             yield (
@@ -69,16 +73,32 @@ class _FakeErrorCompiled:
     the graph swallows (partial success) rather than raising."""
 
     async def astream(self, _input, *, config, context, stream_mode, subgraphs):
-        yield (("ns",), "custom", {"type": "media_progress", "stage": "converting", "current": 1, "total": 1})
         yield (
             ("ns",),
             "custom",
-            {"type": "media_progress", "stage": "item_error", "filename": "v.mp4", "error": "missing_audio_reference_audio"},
+            {"type": "media_progress", "stage": "converting", "current": 1, "total": 1},
         )
         yield (
             ("ns",),
             "custom",
-            {"type": "media_progress", "stage": "converting_complete", "total": 1, "skipped": 0, "errors": 1, "indexed": 0},
+            {
+                "type": "media_progress",
+                "stage": "item_error",
+                "filename": "v.mp4",
+                "error": "missing_audio_reference_audio",
+            },
+        )
+        yield (
+            ("ns",),
+            "custom",
+            {
+                "type": "media_progress",
+                "stage": "converting_complete",
+                "total": 1,
+                "skipped": 0,
+                "errors": 1,
+                "indexed": 0,
+            },
         )
 
 
@@ -112,8 +132,12 @@ async def test_run_single_item_job_records_progress_and_result(monkeypatch):
     master, child = _master_and_child(registry)
 
     await run_single_item_job(
-        child, master, {"filename": "clip.mp3"}, config={"configurable": {}},
-        store=None, context=None,
+        child,
+        master,
+        {"filename": "clip.mp3"},
+        config={"configurable": {}},
+        store=None,
+        context=None,
     )
 
     assert child.status == "completed"
@@ -136,8 +160,12 @@ async def test_run_single_item_job_captures_failure(monkeypatch):
 
     # Must not raise — failures surface via the job, not the caller.
     await run_single_item_job(
-        child, master, {"filename": "x"}, config={"configurable": {}},
-        store=None, context=None,
+        child,
+        master,
+        {"filename": "x"},
+        config={"configurable": {}},
+        store=None,
+        context=None,
     )
 
     assert child.status == "error"
@@ -155,8 +183,12 @@ async def test_run_single_item_job_marks_swallowed_error(monkeypatch):
     master, child = _master_and_child(registry, filename="v.mp4")
 
     await run_single_item_job(
-        child, master, {"filename": "v.mp4"}, config={"configurable": {}},
-        store=None, context=None,
+        child,
+        master,
+        {"filename": "v.mp4"},
+        config={"configurable": {}},
+        store=None,
+        context=None,
     )
 
     assert child.status == "error"
@@ -183,7 +215,11 @@ async def test_run_batch_media_job_aggregates_children(monkeypatch):
         items.append({"child": child, "media_file": {"filename": name}})
 
     await run_batch_media_job(
-        master, items, config={"configurable": {}}, store=None, context=None,
+        master,
+        items,
+        config={"configurable": {}},
+        store=None,
+        context=None,
         concurrency=5,
     )
 
@@ -217,15 +253,27 @@ async def test_run_batch_media_job_expands_deferred_playlist(monkeypatch):
 
     async def _expander():
         return [
-            {"filename": "PL::Episode A", "namespace_filename": "PLNS::AAA",
-             "page_url": "https://www.youtube.com/watch?v=aaa"},
-            {"filename": "PL::Episode B", "namespace_filename": "PLNS::BBB",
-             "page_url": "https://www.youtube.com/watch?v=bbb"},
+            {
+                "filename": "PL::Episode A",
+                "namespace_filename": "PLNS::AAA",
+                "page_url": "https://www.youtube.com/watch?v=aaa",
+            },
+            {
+                "filename": "PL::Episode B",
+                "namespace_filename": "PLNS::BBB",
+                "page_url": "https://www.youtube.com/watch?v=bbb",
+            },
         ]
 
     await run_batch_media_job(
-        master, items, config={"configurable": {}}, store=None, context=None,
-        concurrency=5, registry=registry, deferred_expanders=[_expander],
+        master,
+        items,
+        config={"configurable": {}},
+        store=None,
+        context=None,
+        concurrency=5,
+        registry=registry,
+        deferred_expanders=[_expander],
     )
 
     # Master saw the ready item + two enumerated videos = three children.
@@ -234,7 +282,8 @@ async def test_run_batch_media_job_expands_deferred_playlist(monkeypatch):
     assert master.result["items_completed"] == 3
     # Two fresh child jobs were registered with the composite playlist keys.
     composite_children = [
-        j for j in registry.values()
+        j
+        for j in registry.values()
         if j.namespace_filename in ("PLNS::AAA", "PLNS::BBB")
     ]
     assert len(composite_children) == 2
@@ -243,7 +292,8 @@ async def test_run_batch_media_job_expands_deferred_playlist(monkeypatch):
     # The master stream announced each enumerated video.
     added = [e for e in master.events if e.get("stage") == "playlist_child_added"]
     assert sorted(e["item_filename"] for e in added) == [
-        "PL::Episode A", "PL::Episode B",
+        "PL::Episode A",
+        "PL::Episode B",
     ]
 
 
@@ -256,8 +306,12 @@ async def test_deferred_expander_failure_is_isolated(monkeypatch):
     registry: dict[str, MediaJob] = {}
     master = create_master_job(registry, user_id="u1", assistant_id="a1")
     ready_child = create_child_job(
-        registry, user_id="u1", assistant_id="a1", parent_id=master.job_id,
-        filename="ready.mp3", namespace_filename="ns::ready",
+        registry,
+        user_id="u1",
+        assistant_id="a1",
+        parent_id=master.job_id,
+        filename="ready.mp3",
+        namespace_filename="ns::ready",
     )
     master.child_ids.append(ready_child.job_id)
     items = [{"child": ready_child, "media_file": {"filename": "ready.mp3"}}]
@@ -266,8 +320,14 @@ async def test_deferred_expander_failure_is_isolated(monkeypatch):
         raise RuntimeError("yt_dlp exploded")
 
     await run_batch_media_job(
-        master, items, config={"configurable": {}}, store=None, context=None,
-        concurrency=5, registry=registry, deferred_expanders=[_boom],
+        master,
+        items,
+        config={"configurable": {}},
+        store=None,
+        context=None,
+        concurrency=5,
+        registry=registry,
+        deferred_expanders=[_boom],
     )
 
     assert master.status == "completed"
@@ -401,7 +461,15 @@ async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
     async def _fake_process(item, runtime, config, store, **kwargs):
         # The child must have inherited the parent's composite namespace_filename.
         captured["child_ns"] = item["metadata"].get("namespace_filename")
-        return [Document(page_content="hello", metadata={"namespace_filename": item["metadata"]["namespace_filename"], "namespace": "quote"})]
+        return [
+            Document(
+                page_content="hello",
+                metadata={
+                    "namespace_filename": item["metadata"]["namespace_filename"],
+                    "namespace": "quote",
+                },
+            )
+        ]
 
     monkeypatch.setattr(nodes_mod, "process_media_item_task", _fake_process)
 
@@ -428,8 +496,10 @@ async def test_expand_keyless_child_inherits_parent_namespace(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(monkeypatch):
-    """A URL item flagged ``treat_every_speaker_as_target`` must call the loader with
+async def test_create_reference_media_from_playlist_forces_multispeaker_and_inherits(
+    monkeypatch,
+):
+    """A URL item flagged ``create_reference_media_from_playlist`` must call the loader with
     ``expect_multispeaker=True`` (forcing the audio/diarize path over subtitles)
     and stamp the flag onto every expanded child so playlist videos inherit it."""
     from langchain_core.documents import Document
@@ -442,7 +512,7 @@ async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(mo
         "metadata": {
             "filename": "https://www.youtube.com/watch?v=aaa",
             "namespace_filename": "NS",
-            "treat_every_speaker_as_target": True,
+            "create_reference_media_from_playlist": True,
         },
     }
 
@@ -458,8 +528,8 @@ async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(mo
     monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
 
     async def _fake_process(item, runtime, config, store, **kwargs):
-        captured["child_treat_every_speaker_as_target"] = item["metadata"].get(
-            "treat_every_speaker_as_target"
+        captured["child_create_reference_media_from_playlist"] = item["metadata"].get(
+            "create_reference_media_from_playlist"
         )
         return [Document(page_content="hi", metadata={"namespace": "quote"})]
 
@@ -478,7 +548,7 @@ async def test_treat_every_speaker_as_target_forces_multispeaker_and_inherits(mo
     )
 
     assert captured["expect_multispeaker"] is True
-    assert captured["child_treat_every_speaker_as_target"] is True
+    assert captured["child_create_reference_media_from_playlist"] is True
 
 
 def _make_runtime():
@@ -500,13 +570,15 @@ def _audio_item():
             "assistant_id": "a",
             "namespace_filename": "NS",
             "reference_audio": False,
-            "treat_every_speaker_as_target": True,
+            "create_reference_media_from_playlist": True,
         },
     }
 
 
 @pytest.mark.asyncio
-async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement(monkeypatch):
+async def test_create_reference_media_from_playlist_dialogue_reuses_preceding_statement(
+    monkeypatch,
+):
     """Multiple speakers (all target): one ``quote`` Document per statement, each
     later turn reusing the PRECEDING statement as ``adapter_prompt`` (the genuine
     question); the first statement has no predecessor (synthesized downstream).
@@ -516,8 +588,9 @@ async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement
 
     captured = {}
 
-    async def _fake_diarize(*, media_base64, context, encoded_reference_audio,
-                            filename, content_type):
+    async def _fake_diarize(
+        *, media_base64, context, encoded_reference_audio, filename, content_type
+    ):
         captured["encoded_reference_audio"] = encoded_reference_audio
         return {
             "text": "Q1 A1 Q2",
@@ -529,7 +602,9 @@ async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement
         }
 
     async def _fail_dialogue(*args, **kwargs):  # must NOT be called
-        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
+        raise AssertionError(
+            "dialogue path must not run in create_reference_media_from_playlist mode"
+        )
 
     monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", _fake_diarize)
     monkeypatch.setattr(nodes_mod, "process_dialogue_json_to_documents", _fail_dialogue)
@@ -557,7 +632,9 @@ async def test_treat_every_speaker_as_target_dialogue_reuses_preceding_statement
 
 
 @pytest.mark.asyncio
-async def test_treat_every_speaker_as_target_single_speaker_classified_normally(monkeypatch):
+async def test_create_reference_media_from_playlist_single_speaker_classified_normally(
+    monkeypatch,
+):
     """A single speaker is classified normally (monologue / tweets_or_quotes):
     the full transcript is routed through ``process_text_to_document`` rather than
     the per-statement / dialogue paths."""
@@ -567,8 +644,9 @@ async def test_treat_every_speaker_as_target_single_speaker_classified_normally(
 
     captured = {}
 
-    async def _fake_diarize(*, media_base64, context, encoded_reference_audio,
-                            filename, content_type):
+    async def _fake_diarize(
+        *, media_base64, context, encoded_reference_audio, filename, content_type
+    ):
         return {
             "text": "Statement one. Statement two.",
             "segments": [
@@ -578,7 +656,9 @@ async def test_treat_every_speaker_as_target_single_speaker_classified_normally(
         }
 
     async def _fail_dialogue(*args, **kwargs):
-        raise AssertionError("dialogue path must not run in treat_every_speaker_as_target mode")
+        raise AssertionError(
+            "dialogue path must not run in create_reference_media_from_playlist mode"
+        )
 
     async def _fake_classify(*, metadata, user_id, assistant_id, media_item):
         captured["classify_text"] = media_item.get("content")

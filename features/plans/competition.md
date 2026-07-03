@@ -1,4 +1,4 @@
-please compile a report to compare and contrast the features and capabilities I have built/ am planning to build with the competitors. Please evaluate the strengths and weakness where the neural nexus covers features that are not presented in the competition and where the competition outperforms the current capabilities if the neuralnexus.
+please compile a report to compare and contrast the features and capabilities I have built/ am planning to build with the competitors. Please evaluate the strengths and weakness where the neural nexus covers features that are not presented in the competition and where the competition outperforms the current capabilities of the neuralnexus.
 
 James Vlahos (HereAfter AI) — https://www.linkedin.com/in/jamesavlahos/
 

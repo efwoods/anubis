@@ -394,6 +394,29 @@ def test_reduce_docs_appends_dedupes_and_deletes():
     assert reduce_docs(buf2, "delete") == []
 
 
+def test_reduce_docs_replace_op_swaps_buffer_verbatim():
+    """{"op": "replace", "docs": [...]} makes the buffer exactly the given docs (deduped),
+    discarding prior contents — the authoritative per-turn snapshot load_consciousness
+    writes — while plain lists keep the default append behavior."""
+    from src.anubis.utils.utility import reduce_docs
+
+    a = Document(page_content="A", metadata={"document_id": "1"})
+    b = Document(page_content="B", metadata={"document_id": "2"})
+    b_edited = Document(page_content="B (edited)", metadata={"document_id": "2"})
+    c = Document(page_content="C", metadata={"document_id": "3"})
+
+    buf = reduce_docs([], [a, b])
+    # Replace with an edited copy of b + a new c: a is gone, b shows the NEW content.
+    buf = reduce_docs(buf, {"op": "replace", "docs": [b_edited, c, c]})
+    assert [(d.metadata["document_id"], d.page_content) for d in buf] == [
+        ("2", "B (edited)"),
+        ("3", "C"),
+    ]
+    # Default append semantics are untouched after a replace.
+    buf = reduce_docs(buf, [a])
+    assert [d.metadata["document_id"] for d in buf] == ["2", "3", "1"]
+
+
 def test_reduce_docs_targeted_removal_keeps_unprocessed():
     """remove_docs_update drops only processed docs; the rest survive."""
     from src.anubis.utils.utility import reduce_docs, remove_docs_update

@@ -1,0 +1,6 @@
+- [ ] social media integration/bots Respond, Ignore, Notify for group messaging or personal assistants (email, twilio messaging, social media messaging)
+- [ ] Personal Analytics/Business Analytics, MCP server for querying local files, transcription analytics from meetings, analysis of state-of-affairs of your practice across the organization
+- [ ] Social Media direct communication for recreating likeness 
+- [ ] "Fast-Pass" experience for resaurants and/or local businesses (chat with llm to skip the line (any fast food restaurant/ mom-and-pop-shop); supplants/reduces costs of authentic avatars)
+- [ ] Neural Data-driven avatars (generative text and images dependent on neural signal to create motion that drives the avatar or drives the text)
+- [ ] Geo located avatars with augmented reality presence (AVINA; meet anyone; cherishes and celebrates the life of the person)

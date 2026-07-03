@@ -129,7 +129,6 @@ class UserState(TypedDict):
     user_name: str
     user_description: str
 
-
 from pydantic import BaseModel
 
 
@@ -207,6 +206,7 @@ class GlobalState(TypedDict):
 
     """ User Identity"""
     user_state: UserState
+    user_is_creator: str = None
 
     current_user_emotions: str
     # current_user_beliefs: str

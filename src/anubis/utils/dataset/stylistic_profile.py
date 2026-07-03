@@ -33,15 +33,11 @@ import logging
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List
 
 from src.anubis.utils.dataset.burrows_delta import (
     build_reference_distribution,
     tokenize,
-)
-from src.anubis.utils.dataset.style_features import (
-    FEATURE_NAMES,
-    extract_style_features,
 )
 
 logger = logging.getLogger(__name__)
@@ -383,7 +379,7 @@ def _consistency_features(corpus_documents: List[str]) -> Dict[str, Any]:
 def compute_features_for_text(
     text: str,
     *,
-    reference_distribution: Optional[Dict[str, Any]] = None,
+    reference_distribution: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Extract the same feature shape from a single candidate text.
 
@@ -423,7 +419,7 @@ def compute_features_for_text(
 def compute_profile_from_quotes(
     quote_documents: List[str],
     *,
-    target_name: Optional[str] = None,
+    target_name: str | None = None,
 ) -> Dict[str, Any]:
     """Build the stylistic profile JSON from a corpus of direct quotes.
 
@@ -436,6 +432,12 @@ def compute_profile_from_quotes(
     document_count = len(quotes)
     aggregate_text = "\n".join(quotes)
 
+    # Note: key-phrase discovery no longer happens here. Signature key phrases are
+    # discovered, stored, and prompt-injected separately by calibrate_ground_truth
+    # (the (creator_id, assistant_id, "key_phrase") vectorstore + key_phrase_profile
+    # blob), and their scalar summary rides in style_features' key_phrase_rate. The
+    # character n-gram and function-word vectors were dropped entirely (capture-only,
+    # never scored).
     aggregate_features = {
         "lexical": _lexical_features(aggregate_text, top_k_ngrams=200),
         "sentence": _sentence_features(aggregate_text),
@@ -480,149 +482,3 @@ def compute_profile_from_quotes(
     }
 
 
-""" ------------------------------------------------------------------ """
-""" Flat feature-matrix profile (Mahalanobis-ready)                    """
-""" ------------------------------------------------------------------ """
-
-
-def compute_feature_matrix_profile(
-    documents: List[str],
-    *,
-    target_name: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Build the Mahalanobis-ready profile for a corpus, in ONE pass.
-
-    Unlike :func:`compute_profile_from_quotes` (which produces nested aggregate
-    features), this builder stores everything the authenticity evaluator needs
-    to place a *new* candidate text relative to this corpus's cloud:
-
-    * the per-feature **0-1 normalisation** parameters (min/max) — we use
-      min-max scaling, NOT z-scores, per ``style.md``;
-    * the **mean vector** of the normalised features (the cloud centroid);
-    * the **covariance** matrix and its **pseudo-inverse** (``pinv`` is robust to
-      the collinearity we expect between same-family features);
-    * a **per-feature chi-squared goodness-of-fit** (KS test) so callers know
-      whether the parametric Mahalanobis assumption is credible; and
-    * the **Mahalanobis outlier threshold** — the distance beyond which a point
-      is a distributional outlier — so the evaluator can report both the
-      threshold AND the actual distance.
-
-    The returned dict is JSON-serialisable (lists, not numpy arrays) so it can be
-    stored verbatim in the LangGraph store or on disk as the baseline artifact.
-    """
-    import numpy as np
-    from scipy import stats
-
-    cleaned_documents = [d for d in documents if (d or "").strip()]
-    document_count = len(cleaned_documents)
-
-    # ── 1. Feature matrix: one row of 33 scalars per document ──────────────
-    feature_rows: List[List[float]] = []
-    for document in cleaned_documents:
-        feature_dict = extract_style_features(document)
-        feature_rows.append([feature_dict[name] for name in FEATURE_NAMES])
-
-    feature_matrix = np.asarray(feature_rows, dtype=float)  # (n_docs, 33)
-
-    # Guard: an empty / single-document corpus cannot support a covariance.
-    if feature_matrix.shape[0] < 2:
-        logger.warning(
-            "compute_feature_matrix_profile: only %d usable documents; "
-            "covariance is undefined, returning an empty profile.",
-            feature_matrix.shape[0],
-        )
-        return {
-            "version": 2,
-            "target_name": target_name,
-            "document_count": document_count,
-            "feature_names": list(FEATURE_NAMES),
-            "feature_means": {},
-            "normalization_min": {},
-            "normalization_max": {},
-            "covariance_matrix": [],
-            "inverse_covariance_matrix": [],
-            "chi_squared_fit_per_feature": {},
-            "mahalanobis_outlier_threshold": None,
-            "reference_distribution": build_reference_distribution(cleaned_documents),
-        }
-
-    # ── 2. Impute NaNs with the per-column median ──────────────────────────
-    # A short document may leave a feature NaN; we fill it with the column median
-    # so it contributes neutrally instead of dropping the whole row.
-    column_medians = np.nanmedian(feature_matrix, axis=0)
-    column_medians = np.where(np.isnan(column_medians), 0.0, column_medians)
-    nan_positions = np.isnan(feature_matrix)
-    feature_matrix[nan_positions] = np.take(column_medians, np.where(nan_positions)[1])
-
-    # ── 3. Min-max 0-1 normalisation (store params for candidate scaling) ──
-    feature_min = feature_matrix.min(axis=0)
-    feature_max = feature_matrix.max(axis=0)
-    feature_range = feature_max - feature_min
-    # A constant feature has zero range; scale it to 0 and use range 1 so the
-    # same transform applied to a candidate never divides by zero.
-    safe_range = np.where(feature_range == 0.0, 1.0, feature_range)
-    normalized_matrix = (feature_matrix - feature_min) / safe_range
-
-    # ── 4. Cloud centroid + covariance + pseudo-inverse ────────────────────
-    normalized_mean = normalized_matrix.mean(axis=0)
-    covariance_matrix = np.cov(normalized_matrix, rowvar=False)
-    inverse_covariance_matrix = np.linalg.pinv(covariance_matrix)
-
-    # ── 5. Per-feature chi-squared goodness-of-fit (KS test) ───────────────
-    # chi2 has support x > 0, so we shift each feature to be strictly positive
-    # before fitting. p > alpha => we do NOT reject chi2 => assumption credible.
-    chi_squared_fit: Dict[str, Dict[str, Any]] = {}
-    for column_index, feature_name in enumerate(FEATURE_NAMES):
-        values = feature_matrix[:, column_index]
-        shifted = values - values.min() + 1e-6
-        try:
-            dof, location, scale = stats.chi2.fit(shifted)
-            ks_statistic, ks_p_value = stats.kstest(
-                shifted, "chi2", args=(dof, location, scale)
-            )
-            is_chi_squared = bool(ks_p_value > _CHI_SQUARED_FIT_ALPHA)
-        except Exception:
-            ks_statistic, ks_p_value, is_chi_squared = float("nan"), float("nan"), False
-        chi_squared_fit[feature_name] = {
-            "ks_statistic": float(ks_statistic),
-            "ks_p_value": float(ks_p_value),
-            "distribution_is_chi_squared": is_chi_squared,
-        }
-
-    # ── 6. Mahalanobis outlier threshold ───────────────────────────────────
-    # Distance (not squared) at the upper-tail chi-squared quantile for this
-    # dimensionality. Distances above it are distributional outliers.
-    degrees_of_freedom = len(FEATURE_NAMES)
-    outlier_threshold = float(
-        np.sqrt(stats.chi2.ppf(_OUTLIER_TAIL_PROBABILITY, df=degrees_of_freedom))
-    )
-
-    return {
-        "version": 2,
-        "target_name": target_name,
-        "document_count": document_count,
-        "feature_names": list(FEATURE_NAMES),
-        # Raw (pre-normalisation) means are handy for human inspection / reports.
-        "feature_means": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, feature_matrix.mean(axis=0))
-        },
-        "normalization_min": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, feature_min)
-        },
-        "normalization_max": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, feature_max)
-        },
-        # Centroid in NORMALISED space — what the candidate distance is measured to.
-        "normalized_feature_mean": {
-            name: float(value) for name, value in zip(FEATURE_NAMES, normalized_mean)
-        },
-        "covariance_matrix": covariance_matrix.tolist(),
-        "inverse_covariance_matrix": inverse_covariance_matrix.tolist(),
-        "chi_squared_fit_per_feature": chi_squared_fit,
-        "chi_squared_consistent_feature_count": sum(
-            1 for fit in chi_squared_fit.values() if fit["distribution_is_chi_squared"]
-        ),
-        "mahalanobis_outlier_threshold": outlier_threshold,
-        # Burrows Delta reference kept as a secondary authorship signal.
-        "reference_distribution": build_reference_distribution(cleaned_documents),
-    }

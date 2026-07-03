@@ -348,7 +348,7 @@ async def calibrate_ground_truth(
     # next message.
     invalidate_store_cache_entry(style_profile_namespace, "style_profile")
 
-    ground_truth_text_empirical_threshold_namespace = (
+    ground_truth_text_empirical_threshold_namespace = (user_id,
         assistant_id,
         "ground_truth_text_empirical_threshold_list_str",
     )
@@ -358,7 +358,7 @@ async def calibrate_ground_truth(
         value={"value": ground_truth_text_empirical_threshold_list_str},
     )
 
-    ground_truth_text_features_model_namespace = (
+    ground_truth_text_features_model_namespace = (user_id,
         assistant_id,
         "ground_truth_text_features_model_b64_pkl",
     )

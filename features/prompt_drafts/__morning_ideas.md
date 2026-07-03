@@ -1,4 +1,3 @@
-# rename of files back to original filenames from "trigger"
 # hide unused api endpoints
 # coalesce and use select avatar into single endpoints
 
@@ -10,7 +9,8 @@
   - ongoing conversations and messages handled on your behalf; 
   - personal analytics dashboard; 
   - queryable interface for:
-    -  dm with self to ask about the current state of affairs of anything, 
+    - dm with self to ask about the current state of affairs of anything, 
+    - notifications of the following
     - handle any request, 
     - answer any unhandled message, 
     - view for avatar documents for identity/ update manually)

@@ -740,12 +740,17 @@ async def create_avatar(
         )
 
         # store the creator of the assistant
-        await client.store.aput((assistant_id,'creator_id'), key="creator_id", value={"value": user_id})
+        # The langgraph_sdk StoreClient exposes put_item (HTTP API), not the
+        # BaseStore aput method used elsewhere on in-process store objects.
+        await client.store.put_item(
+            (assistant_id, "creator_id"), key="creator_id", value={"value": user_id}
+        )
 
         return JSONResponse(content=create_avatar_response, status_code=200)
-    except Exception as e:
-        return HTTPException(
-            detail="Error creating avatar {name}: {e}", status_code=500
+    except Exception as creation_error:
+        logger.exception(f"Error creating avatar {name}")
+        raise HTTPException(
+            detail=f"Error creating avatar {name}: {creation_error}", status_code=500
         )
 
 

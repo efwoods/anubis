@@ -701,9 +701,17 @@ async def download_transcript(
     # yt_dlp.YoutubeDL is a *synchronous* context manager and extract_info blocks,
     # so run it off the event loop in a worker thread (the same pattern used by
     # the audio-download and playlist-extraction paths).
+    #
+    # ``download=True`` is what actually writes the subtitle files: yt_dlp only
+    # runs the subtitle-download phase during a "download", so ``download=False``
+    # returned the info dict but never produced a ``.vtt`` on disk — the loop
+    # below then found nothing and raised FileNotFoundError, silently forcing the
+    # caller onto the (slower, reference-audio-dependent) diarization path. The
+    # video media itself is still skipped: ``skip_download=True`` in ``ydl_opts``
+    # downloads only the requested subtitles, not the audio/video stream.
     def _extract() -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
             return info.get("title", "video")
 
     title = await asyncio.to_thread(_extract)

@@ -3,7 +3,7 @@
 ``load_consciousness`` re-reads two effectively static store entries on every
 message: the avatar's descriptive reference image
 (``(creator_user_id, assistant_id, "reference_image")``) and the stylometric
-style profile (``(assistant_id, "style_profile")``). Both entries change only
+style profile (``(user_id, assistant_id, "style_profile")``). Both entries change only
 when media is uploaded, recalibrated, or deleted — never during normal
 conversation — so re-fetching both entries per message wastes one store
 round-trip each.

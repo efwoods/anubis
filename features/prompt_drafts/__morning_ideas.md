@@ -1,3 +1,7 @@
+# rename of files back to original filenames from "trigger"
+# hide unused api endpoints
+# coalesce and use select avatar into single endpoints
+
 # QR code geo located per use case to share, onboard, and connect with application use cases (deep research on the individual to identify accounts, geo located per business to integrate with the business)
 
 # User logs in: new user detected with facial recognition, walks through onboarding, scans for connected accounts, asks for permission for integration, informs how the avatar may triage requests on your behalf. 

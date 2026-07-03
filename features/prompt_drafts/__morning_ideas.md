@@ -1,3 +1,5 @@
+# QR code geo located per use case to share, onboard, and connect with application use cases (deep research on the individual to identify accounts, geo located per business to integrate with the business)
+
 # User logs in: new user detected with facial recognition, walks through onboarding, scans for connected accounts, asks for permission for integration, informs how the avatar may triage requests on your behalf. 
 - Centralized interface for notifications from all platforms 
   - (responses required; 
@@ -19,11 +21,7 @@
 <!-- - [x] I need to chunk the logs -->
 - [ ] I need to work on git_log_all.sh additional update to the log file
 
-<<<<<<< Updated upstream
 - [x] I need to build a stylistic profile
-=======
-- [x] I need to build a stylistic profilex
->>>>>>> Stashed changes
 - [x] I need diarization completed
 - [ ] I need metering of responses
 
@@ -38,9 +36,6 @@ drag and drop zip files and have all the media processed
 data analysis/slack bot
 
 add and process a list of urls and zip files
-
-authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?)
-
 ----
 
 # Frontend response should be cached and hidden unless the response completes before a message is sent; otherwise the message request is cancelled in lieu of the user's sent response; The user may type immediately, there is a "thinking" indicator; 
@@ -68,9 +63,7 @@ What I can do for you depends on what you’re trying to build or solve. A few c
 
 If you tell me what you want to accomplish—like “I want a model that writes like X,” or “I want to add image/audio input,” or “I’m building the backend”—I’ll tailor the next steps.
 
-# Measure Authenticity
-authenticity score against baseline chatgpt output (how unalike is the content style from base chatgpt; then after a threshold of ground truth, how alike is the content to the ground truth data?) (use a baseline of questions, generate responses to the baseline of questions and compare)
-
+# upload media
 add optional context to media upload 
 allow the process media graph to be used as a tool triggered in conversation
 
@@ -90,7 +83,7 @@ allow the process media graph to be used as a tool triggered in conversation
 # get reference audio file and reference image file url endpoints
 # CRUD memories/identity_memories endpoints
 
-# I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present; verify that the requester is the creator
+# I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present: verify that the requester is the creator in the endpoint
 
 # Moving forward
 

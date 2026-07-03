@@ -40,7 +40,7 @@ And yeah—you’re right. I was lucky to grow up with memories like that.
 
 
 
-# are these being called sequentially
+# are these being called sequentially; these should be called concurrently to optimize efficiency
 Batches: 100%|██████████| 1/1 [00:00<00:00,  9.64it/s]6f65 api_variant=licensed langgraph_api_version=0.8.7 langgraph_node=tools thread_name=MainThread
 Batches: 100%|██████████| 1/1 [00:01<00:00,  1.05s/it]
 Batches: 100%|██████████| 1/1 [00:00<00:00,  7.66it/s]

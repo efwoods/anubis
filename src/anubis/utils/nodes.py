@@ -278,7 +278,7 @@ async def _build_consciousness_system_message_update(
         "reference_image",
     )
     assistant_memory_namespace = (user_id, assistant_id, "memory")
-    style_profile_namespace = (assistant_id, "style_profile")
+    style_profile_namespace = (user_id, assistant_id, "style_profile")
 
     """
 

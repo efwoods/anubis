@@ -145,11 +145,25 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
     # all-punctuation) legitimately carries NaN cells, but json.dumps would
     # emit the bare NaN token, producing an invalid SSE "done" event. The raw
     # dict (NaN intact) still feeds the comparison math below.
+    # key_phrase_rate is the one reference-set-relative feature, and the
+    # reference set differs per comparison, so the features block carries a
+    # description pair spelling out which phrase set applies where — the same
+    # convention the two *_shap_values_description keys follow.
     avatar_response.response_metadata.update(
         {
             "features": {
-                name: (value if math.isfinite(value) else None)
-                for name, value in features_dict.items()
+                **{
+                    name: (value if math.isfinite(value) else None)
+                    for name, value in features_dict.items()
+                },
+                "key_phrase_rate_description": (
+                    "The key_phrase_rate is the rate of detected avatar "
+                    "signature key phrases per total word when compared "
+                    "against the ground truth dataset (direct quotes of the "
+                    "avatar), and is the rate of baseline ChatGPT signature "
+                    "key phrases per total word when compared against the "
+                    "baseline ChatGPT dataset."
+                ),
             }
         }
     )
@@ -222,7 +236,7 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
         # Nest the distance verdict together with the SHAP explanation under a single key
         # (verdict first to match the documented output order).
         comparison_to_unmodified_llm_response_analysis = {
-            "no_statistically_significantly_different_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(
+            "no_statistically_significantly_difference_from_unmodified_llm_response_using_squared_mahalanobis_distance": bool(
                 M_d_square_synth_from_baseline_chatgpt[0] <= baseline_response_threshold
             ),
             **shap_values_dict,
@@ -233,15 +247,16 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             }
         )
 
-        # SIGNATURE KEY-PHRASE RATES — one rate per reference phrase set. The
-        # ``features`` block's key_phrase_rate was measured against the ChatGPT
-        # BASELINE's phrases (matching the baseline cloud it is compared to);
-        # here the same reply is additionally measured against the AVATAR's own
-        # discovered phrases so both rates are visible side by side. Loaded
-        # OUTSIDE the ground-truth-artifacts gate because the phrase profile is
-        # written on every calibration, before the corpus reaches the
-        # calibration floor. Stored phrases pass through phrase_is_well_formed
-        # so sets polluted before discovery cleaned its corpus never score here.
+        # AVATAR SIGNATURE KEY PHRASES — the ``features`` block's
+        # key_phrase_rate was measured against the ChatGPT BASELINE's phrases
+        # (matching the baseline cloud it is compared to); here the same reply
+        # is re-measured against the AVATAR's own discovered phrases to build
+        # the ground-truth candidate row (matching the direct-quote cloud).
+        # Loaded OUTSIDE the ground-truth-artifacts gate because the phrase
+        # profile is written on every calibration, before the corpus reaches
+        # the calibration floor. Stored phrases pass through
+        # phrase_is_well_formed so sets polluted before discovery cleaned its
+        # corpus never score here.
         from src.anubis.utils.dataset.key_phrases import phrase_is_well_formed
 
         key_phrase_profile_ITEM = await runtime.store.aget(
@@ -262,25 +277,6 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             update_key_phrases_only=True,
             features_dict=features_dict,
         )
-        avatar_response.response_metadata.update(
-            {
-                "key_phrase_rates": {
-                    "avatar_signature_phrases_rate": (
-                        ground_truth_features_dict["key_phrase_rate"]
-                        if avatar_key_phrases
-                        else None
-                    ),
-                    "chatgpt_baseline_phrases_rate": features_dict["key_phrase_rate"],
-                    "key_phrase_rates_description": (
-                        "Occurrences of signature phrases per word in this reply, "
-                        "measured once against the avatar's own discovered phrase "
-                        "set (null when no avatar phrases are discovered yet) and "
-                        "once against the bundled ChatGPT baseline's phrase set."
-                    ),
-                }
-            }
-        )
-
         # Compare against ground truth quotes if available:
         ground_truth_text_features_model_namespace = (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl")
 
@@ -346,7 +342,6 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 base64.b64decode(ground_truth_text_features_model_b64_pkl)
             )
 
-            ground_truth_text_features_model = pickle.loads(base64.b64decode(ground_truth_text_features_model_b64_pkl))
 
             # Feature-version self-heal: this per-avatar IsolationForest may have
             # been fit under a previous vector width and cached in the store. Unlike

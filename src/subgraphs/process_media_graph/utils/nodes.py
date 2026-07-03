@@ -1319,6 +1319,25 @@ async def process_media_item_task(
                     statement_metadata.update(
                         {k: v for k, v in stmt_meta_raw.items() if v is not None}
                     )
+                    # The uploaded file's identity is authoritative: a per-line
+                    # ``metadata`` block inside a .json/.jsonl statement must not be
+                    # able to rename the document. Without this, a line carrying
+                    # ``{"metadata": {"filename": ...}}`` (or "namespace_filename")
+                    # silently overrode the upload name, so /list_avatar_documents
+                    # and /delete_avatar_document would show and key a name the user
+                    # never uploaded — breaking "the original filename must be
+                    # persisted on upload". Re-assert the upload-derived identity
+                    # fields after the merge; only descriptive fields (``source``,
+                    # ``target``) below are still enriched from in-file metadata.
+                    for upload_authoritative_key in (
+                        "filename",
+                        "namespace_filename",
+                        "filename_uuid5",
+                    ):
+                        if upload_authoritative_key in base_metadata:
+                            statement_metadata[upload_authoritative_key] = (
+                                base_metadata[upload_authoritative_key]
+                            )
                     target_name = (
                         stmt_meta_raw.get("target")
                         or statement_metadata.get("target")
@@ -2574,16 +2593,17 @@ async def process_adapter_documents(
         source_uuid5: str,
         rows: List[Dict[str, Any]],
     ) -> None:
-        """Persist one dataset as a JSONL-in-dict value under its namespace."""
+        """Persist one dataset as a JSON string value under its namespace."""
         if not rows:
             return
-        jsonl = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+        # jsonl = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+        json_str = json.dumps(rows)
         try:
             await store.aput(
                 (user_id, assistant_id, dataset_type, source_uuid5),
                 key=source_uuid5,
                 value={
-                    "jsonl": jsonl,
+                    "value": json_str,
                     "source_filename": source_filename,
                     "row_count": len(rows),
                     "created_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -2639,8 +2659,11 @@ async def process_adapter_documents(
                 exc,
             )
             continue
+
+        adapter_rows_prompt_completion_format = [{'prompt': message['messages'][0]['content'], 'completion': message['messages'][1]['content']} for message in adapter_rows]
+
         await _store_dataset(
-            "q_and_a_adapter", source_filename, source_uuid5, adapter_rows
+            "q_and_a_adapter", source_filename, source_uuid5, adapter_rows_prompt_completion_format
         )
         await _store_dataset(
             "langsmith_factual_q_and_a",

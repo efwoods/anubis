@@ -18,7 +18,6 @@ https://www.together.ai/fine-tuning
 
 # Risk: the benefits of training GRPO, SFT, DPO on a multi-billion parameter LLM with respect to the advantage of quality is uncertain and costly with respect to time and financial-resources. 
 
-
 # Fireworks.ai GRPO with custom reward function: 
 https://docs.fireworks.ai/fine-tuning/training-api/cookbook/rl
 https://github.com/fw-ai/cookbook/tree/main/training

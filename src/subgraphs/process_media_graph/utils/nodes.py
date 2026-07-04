@@ -2307,6 +2307,7 @@ async def _expand_url_media_item(
         (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
     )
 
+
     loader = URLDocumentLoaderClass()
     if semaphore is not None:
         async with semaphore:
@@ -2314,14 +2315,12 @@ async def _expand_url_media_item(
                 url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                expect_multispeaker=parent_create_reference_media_from_playlist,
             )
     else:
         expanded_items = await loader.load(
             url,
             user_id=user_id,
             assistant_id=assistant_id,
-            expect_multispeaker=parent_create_reference_media_from_playlist,
         )
 
     if not expanded_items:
@@ -2391,12 +2390,26 @@ async def _expand_url_media_item(
                 semaphore=semaphore,
             )
         except Exception as exc:
+            child_filename = item.get("metadata", {}).get("filename") or url
             logger.exception(
                 "URL child item processing failed for %s: %s",
-                item.get("metadata", {}).get("filename") or url,
+                child_filename,
                 exc,
             )
-            return []
+            # Surface the failure as an error Document (the same contract the
+            # top-level _convert_one handler uses) so determine_media_type emits
+            # an item_error progress event and the media job reports "error"
+            # instead of silently completing with zero indexed documents.
+            return [
+                Document(
+                    page_content=f"[Error processing URL child item: {exc}]",
+                    metadata={
+                        "status": "error",
+                        "error": str(exc),
+                        "filename": child_filename,
+                    },
+                )
+            ]
 
     results = await asyncio.gather(
         *(_run_child(i, item) for i, item in enumerate(pending))

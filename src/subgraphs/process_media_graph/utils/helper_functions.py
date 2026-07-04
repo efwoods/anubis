@@ -943,8 +943,13 @@ async def process_text_to_document(
             - ``monologue`` -> verbatim chunked Document(s)
               under ``quote``.
             - ``dialogue`` -> caller is expected to supply diarized JSON via
-              :func:`process_dialogue_json_to_documents`. The text branch here
-              falls back to chunking under ``quote`` (best-effort).
+              :func:`process_dialogue_json_to_documents`. Plain dialogue text
+              WITHOUT diarized segments returns an error Document (speaker
+              attribution is impossible until named-speaker formatting lands),
+              so the media job reports the failure instead of silently
+              completing or misattributing every speaker's words to the avatar.
+            - any other / failed classification -> chunked Documents under the
+              resolved namespace, never adapter-acceptable.
         * ``namespace_hint`` overrides reference/biographical when supplied
           (e.g. predetermined identity content from images).
     """
@@ -1059,6 +1064,11 @@ async def process_text_to_document(
             )
             # Fall through to chunked path so we still capture content.
 
+    # Every routing branch below assigns ``documents``; initialize so a failed
+    # classification (empty ``classified_situation``) or the biographical-facts
+    # fallthrough cannot raise UnboundLocalError at the shared return below.
+    documents: List[Document] = []
+
     # Handle quotes-per-line text document
     item_metadata = media_item.get("metadata", {}) or {}
     explicit_quotes_per_line = bool(item_metadata.get("quotes_per_line"))
@@ -1130,10 +1140,32 @@ async def process_text_to_document(
             )
 
     elif classified_situation == "dialogue":
-        # TODO: Verify and test
-        # Dialogue -> dialogue namespace
-        # This will need to create quotes documents of what the target said
-        # This will need to create the entire conversation document for the adapter namespace
+        # ``process_dialogue_json_to_documents`` consumes DIARIZED segments
+        # (``{"segments": [...]}``). A plain-text dialogue (for example a pasted
+        # transcript, or YouTube subtitles for an avatar with no stored
+        # reference-audio clip) has no speaker attribution: passing the raw text
+        # through would either produce zero documents silently (no segments) or
+        # credit every speaker's words to the avatar. Until named-speaker
+        # formatting (media-pipeline Phase 3) converts plain-text dialogue into
+        # attributed turns, surface an explicit error Document so the media job
+        # reports the failure instead of silently completing.
+        if not isinstance(media_item.get("segments"), list):
+            return [
+                Document(
+                    page_content=(
+                        "[Dialogue text without diarized speaker segments cannot "
+                        "be attributed to the avatar. Upload a reference-audio "
+                        "clip for this avatar so multi-speaker media is diarized "
+                        "with known-speaker labelling, then re-upload this item.]"
+                    ),
+                    metadata={
+                        "status": "error",
+                        "error": "dialogue_text_requires_diarized_segments",
+                        "filename": item_metadata.get("filename", ""),
+                        "namespace_filename": namespace_filename,
+                    },
+                )
+            ]
         documents = await process_dialogue_json_to_documents(
             dialogue_payload=media_item,
             user_id=user_id,
@@ -1146,6 +1178,38 @@ async def process_text_to_document(
                     "vectorstore_acceptable": True,
                     "adapter_acceptable": True,
                     "adapter_formatted": False,
+                    "synthetic": False,
+                    "namespace_filename": namespace_filename,
+                }
+            )
+
+    else:
+        # Classification failed (empty label) or a handled label fell through
+        # (for example the biographical-facts rewriter pipeline failed above).
+        # Capture the content as plain chunked Documents under the resolved
+        # namespace so the upload still lands, but never mark the chunks
+        # adapter-acceptable: unattributed text must not enter the quote /
+        # adapter training data.
+        logger.warning(
+            "No routing branch matched classified_situation=%r; "
+            "chunking into namespace=%s as a fallback",
+            classified_situation,
+            target_namespace,
+        )
+        documents = await process_text_media_item_target_for_vectorstore(
+            media_item=media_item,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            classification_metadata=classification_metadata,
+            use_semantic_chunks=False,
+            namespace=target_namespace,
+        )
+        for document in documents:
+            document.metadata.update(
+                {
+                    "vectorstore_acceptable": True,
+                    "adapter_acceptable": False,
+                    "analysis_acceptable": False,
                     "synthetic": False,
                     "namespace_filename": namespace_filename,
                 }

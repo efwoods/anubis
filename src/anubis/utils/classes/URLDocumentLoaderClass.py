@@ -108,7 +108,6 @@ class URLDocumentLoaderClass:
         *,
         user_id: Optional[str] = None,
         assistant_id: Optional[str] = None,
-        expect_multispeaker: bool = False,
     ) -> List[Dict[str, Any]]:
         """Expand ``url`` into media items consumable by ``process_media_item_task``."""
         url = (url or "").strip()
@@ -123,7 +122,7 @@ class URLDocumentLoaderClass:
                 )
             if kind == "youtube":
                 return await self._load_youtube(
-                    url, user_id, assistant_id, expect_multispeaker
+                    url, user_id, assistant_id,
                 )
             if kind == "linktree":
                 return await self._load_linktree(
@@ -341,38 +340,8 @@ class URLDocumentLoaderClass:
         url: str,
         user_id: Optional[str],
         assistant_id: Optional[str],
-        expect_multispeaker: bool,
     ) -> List[Dict[str, Any]]:
         """Subtitles fast-path; otherwise download audio for diarization."""
-        if not expect_multispeaker:
-            try:
-                # get_transcript / download_transcript are async (they run yt_dlp in
-                # a worker thread internally). Awaiting directly was the missing
-                # piece: the old run_in_executor(_get_transcript_sync) called the
-                # coroutine without awaiting it, so this branch always raised and
-                # silently fell back to the audio path (which then needed a
-                # reference-audio clip and failed).
-                transcript = await get_transcript(url, lang="en", save_txt=False)
-                if (transcript or "").strip():
-                    return [
-                        {
-                            "type": "text",
-                            "content": transcript.strip(),
-                            "metadata": {
-                                "filename": url,
-                                "source": url,
-                                "user_id": user_id,
-                                "assistant_id": assistant_id,
-                                "url_kind": "youtube_subs",
-                            },
-                        }
-                    ]
-            except Exception as exc:
-                logger.info(
-                    "YouTube subs unavailable for %s, falling back to audio: %s",
-                    url,
-                    exc,
-                )
 
         # Multi-speaker path or subs unavailable: download audio and let the
         # audio branch use OpenAI's hosted gpt-4o-transcribe-diarize.

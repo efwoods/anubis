@@ -26,7 +26,50 @@ WHAT IS THE COST OF TRAINING THE ADAPTER:
 HOW LONG DOES IT TAKE TO TRAIN AN ADAPTER:
 
 WHAT IS THE COST OF INFERENCE WITH THE ADAPTER:
-WHAT IS THE COST OF HOUSING THE BASEMODEL: $70.00
+
+
+WHAT IS THE COST OF HOUSING THE BASEMODEL: 
+
+Total per month Maverick 4 quantized 4 bit: 202.5 GB
+250 GB
+$17.50/mo
+
+$0.07 per GB
+---
+Total per month Maverick 4 base model: 800 GB
+1000 GB
+$70.00/mo
+
+----
+
+<!-- 
+
+# Adapter compute per hour: 
+
+Runpod Pytorch 2.8.0
+3x A100 PCIe
+240GB VRAM · 375 GB RAM · 36 vCPU
+Total / hour
+$4.21 USD
+Billed per millisecond
+Total disk
+300 GB
+GPU cost
+$4.17/hour
+Container disk cost
+$0.035/hour
+Volume disk cost
+$0.007/hour
+Stopped cost
+$0.014/hour 
+
+# model storage: 
+Amazon S3 pricing is heavily dependent on the specific storage class you select for your 250GB:S3 Standard (Frequent Access): ~$0.022 per GB → ~$5.50 / month
+
+IDLE COST $0.33/day
+
+-->
+
 
 WHAT IS THE TIME TO FIRST TOKEN WHEN USING THE ADAPTER:
 

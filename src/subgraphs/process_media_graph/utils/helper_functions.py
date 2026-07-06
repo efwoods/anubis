@@ -436,15 +436,20 @@ def coalesce_segments_by_speaker(
                 seg.get("is_target")
             )
         else:
-            turns.append(
-                {
-                    "speaker": speaker,
-                    "text": text,
-                    "start": seg.get("start"),
-                    "end": seg.get("end"),
-                    "is_target": bool(seg.get("is_target")),
-                }
-            )
+            new_turn = {
+                "speaker": speaker,
+                "text": text,
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "is_target": bool(seg.get("is_target")),
+            }
+            # Carry the opening segment's chunk index onto the turn when present
+            # (consecutive same-label segments are always from the same chunk
+            # after per-chunk label namespacing). Absent for text-sourced
+            # segments, which never set chunk_idx.
+            if seg.get("chunk_idx") is not None:
+                new_turn["chunk_idx"] = seg.get("chunk_idx")
+            turns.append(new_turn)
     return turns
 
 
@@ -963,6 +968,61 @@ async def process_text_to_document(
         logger.warning("Empty text content in media_item; returning no documents")
         return []
 
+    # Structured web page. When the source retained raw HTML and the page parses
+    # as a single-subject page (a character wiki, a personal homepage), extract
+    # the subject's biography and verbatim direct quotes with the parser-first
+    # path instead of flattening to plain text. Falls through to the normal text
+    # classifiers below when the page is not a subject page or extraction is
+    # disabled. namespace_hint (predetermined identity content) bypasses this.
+    raw_html = (media_item.get("metadata", {}) or {}).get("raw_html")
+    if raw_html and namespace_hint is None:
+        from src.anubis.utils.context import GlobalContext
+
+        if str(
+            getattr(GlobalContext(), "structured_web_extraction_enabled", "TRUE")
+            or "TRUE"
+        ).upper() == "TRUE":
+            try:
+                from src.subgraphs.process_media_graph.utils.structured_web_extraction import (
+                    convert_structured_web_page_to_documents,
+                    page_looks_like_subject_page,
+                    parse_html_into_structured_blocks,
+                )
+
+                source_url = (media_item.get("metadata", {}) or {}).get(
+                    "source"
+                ) or (media_item.get("metadata", {}) or {}).get("filename", "")
+                parsed_page = parse_html_into_structured_blocks(
+                    raw_html, url=source_url
+                )
+                if page_looks_like_subject_page(parsed_page):
+                    structured_documents = (
+                        await convert_structured_web_page_to_documents(
+                            raw_html,
+                            url=source_url,
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                            media_item=media_item,
+                        )
+                    )
+                    if not (
+                        len(structured_documents) == 1
+                        and structured_documents[0].metadata.get("status")
+                        == "error"
+                    ):
+                        for document in structured_documents:
+                            document.metadata.setdefault(
+                                "namespace_filename", namespace_filename
+                            )
+                        return structured_documents
+            except Exception as structured_error:  # noqa: BLE001 - fall through
+                logger.warning(
+                    "structured web extraction failed for %s (%s); falling back "
+                    "to plain-text routing",
+                    (media_item.get("metadata", {}) or {}).get("filename", ""),
+                    structured_error,
+                )
+
     reference_classifier = ReferenceDocumentClassificationClass()
     reference_response = await reference_classifier.classify(classification_input)
     is_menu_or_religious_text = bool(
@@ -994,6 +1054,49 @@ async def process_text_to_document(
                     "namespace_filename": namespace_filename,
                 }
             )
+
+        # Scripture-style narrative reaches this reference gate and returns
+        # before the dialogue classifier below, but it still contains a named
+        # speaker's direct quotes ("And Jesus said unto them, ..."). When
+        # enabled, ALSO segment the text with an inferred target so those quotes
+        # and the target's biographical facts are captured, in ADDITION to the
+        # document-namespace chunks. Best-effort: a failure here must never fail
+        # the reference storage that already succeeded.
+        from src.anubis.utils.context import GlobalContext
+
+        if str(
+            getattr(GlobalContext(), "narrative_speech_extraction_enabled", "TRUE")
+            or "TRUE"
+        ).upper() == "TRUE":
+            try:
+                from src.subgraphs.process_media_graph.utils.text_dialogue_segmentation import (
+                    convert_text_dialogue_to_documents,
+                )
+
+                narrative_documents = await convert_text_dialogue_to_documents(
+                    text_content,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_item=media_item,
+                    classification_target_name=None,
+                )
+                # Skip the single error Document (no inferable target); append
+                # only real quote / adapter / biographical Documents.
+                if not (
+                    len(narrative_documents) == 1
+                    and narrative_documents[0].metadata.get("status") == "error"
+                ):
+                    for document in narrative_documents:
+                        document.metadata.setdefault(
+                            "namespace_filename", namespace_filename
+                        )
+                    documents.extend(narrative_documents)
+            except Exception as narrative_error:  # noqa: BLE001 - add-on only
+                logger.warning(
+                    "narrative speech extraction failed for reference document "
+                    "(%s); keeping document-namespace chunks only",
+                    narrative_error,
+                )
         return documents
 
     situation_classifier = ContentSituationClassificationClass()
@@ -1141,37 +1244,40 @@ async def process_text_to_document(
 
     elif classified_situation == "dialogue":
         # ``process_dialogue_json_to_documents`` consumes DIARIZED segments
-        # (``{"segments": [...]}``). A plain-text dialogue (for example a pasted
-        # transcript, or YouTube subtitles for an avatar with no stored
-        # reference-audio clip) has no speaker attribution: passing the raw text
-        # through would either produce zero documents silently (no segments) or
-        # credit every speaker's words to the avatar. Until named-speaker
-        # formatting (media-pipeline Phase 3) converts plain-text dialogue into
-        # attributed turns, surface an explicit error Document so the media job
-        # reports the failure instead of silently completing.
-        if not isinstance(media_item.get("segments"), list):
-            return [
-                Document(
-                    page_content=(
-                        "[Dialogue text without diarized speaker segments cannot "
-                        "be attributed to the avatar. Upload a reference-audio "
-                        "clip for this avatar so multi-speaker media is diarized "
-                        "with known-speaker labelling, then re-upload this item.]"
-                    ),
-                    metadata={
-                        "status": "error",
-                        "error": "dialogue_text_requires_diarized_segments",
-                        "filename": item_metadata.get("filename", ""),
-                        "namespace_filename": namespace_filename,
-                    },
-                )
-            ]
-        documents = await process_dialogue_json_to_documents(
-            dialogue_payload=media_item,
-            user_id=user_id,
-            assistant_id=assistant_id,
-            media_item=media_item,
-        )
+        # (``{"segments": [...]}``). When the payload already carries attributed
+        # segments (the audio branch), use that path unchanged. Plain-text
+        # dialogue (a pasted transcript, a film or interview script) has no
+        # speaker attribution, so segment the text into golden-format speaker
+        # turns with the target inferred from content, then route the SAME
+        # dialogue pipeline over the produced segments.
+        if isinstance(media_item.get("segments"), list):
+            documents = await process_dialogue_json_to_documents(
+                dialogue_payload=media_item,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+            )
+        else:
+            from src.subgraphs.process_media_graph.utils.text_dialogue_segmentation import (
+                convert_text_dialogue_to_documents,
+            )
+
+            documents = await convert_text_dialogue_to_documents(
+                text_content,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+                classification_target_name=(
+                    target_name
+                    if situation_response.get("has_identifiable_target")
+                    else None
+                ),
+            )
+            # The segmenter returns a single error Document when no target can
+            # be inferred; surface it directly without the acceptable-flags
+            # stamping below.
+            if len(documents) == 1 and documents[0].metadata.get("status") == "error":
+                return documents
         for document in documents:
             document.metadata.update(
                 {

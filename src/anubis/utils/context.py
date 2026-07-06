@@ -254,10 +254,45 @@ class GlobalContext:
         },
     )
 
-    reference_audio_diarize_max_seconds: int = field(
-        default=180,
+    enable_target_speaker_attribution: str = field(
+        default="TRUE",
         metadata={
-            "description": "Cap on audio length fed to dominant-speaker diarization for reference uploads, in seconds. Keeps the input to a single non-chunked diarizer call so speaker labels stay unified. Env REFERENCE_AUDIO_DIARIZE_MAX_SECONDS."
+            "description": "When TRUE, run the post-diarization LLM target-attribution pass that recovers the target's turns scattered across per-chunk speaker labels. Env ENABLE_TARGET_SPEAKER_ATTRIBUTION."
+        },
+    )
+
+    target_speaker_attribution_transcript_character_limit: int = field(
+        default=100000,
+        metadata={
+            "description": "Max rendered transcript characters passed to the target-attribution pass in one call; above this the transcript is adjudicated per diarization chunk. Env TARGET_SPEAKER_ATTRIBUTION_TRANSCRIPT_CHARACTER_LIMIT."
+        },
+    )
+
+    text_dialogue_segmentation_window_characters: int = field(
+        default=4000,
+        metadata={
+            "description": "Character size of each window when segmenting long-form text into speaker turns (the model echoes the window, so output length is the binding constraint). Env TEXT_DIALOGUE_SEGMENTATION_WINDOW_CHARACTERS."
+        },
+    )
+
+    text_dialogue_segmentation_max_characters: int = field(
+        default=250000,
+        metadata={
+            "description": "Cap on total text characters segmented into speaker turns; content beyond the cap is skipped with a warning. Env TEXT_DIALOGUE_SEGMENTATION_MAX_CHARACTERS."
+        },
+    )
+
+    narrative_speech_extraction_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "When TRUE, reference documents (scripture / menus) additionally run text dialogue segmentation to extract inferred-target quote and adapter documents alongside the plain document-namespace chunks. Env NARRATIVE_SPEECH_EXTRACTION_ENABLED."
+        },
+    )
+
+    structured_web_extraction_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "When TRUE, structured web pages (character wikis, personal homepages) are parsed with BeautifulSoup to extract the inferred subject's biographical prose and verbatim direct quotes. Env STRUCTURED_WEB_EXTRACTION_ENABLED."
         },
     )
 

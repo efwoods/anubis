@@ -1404,30 +1404,50 @@ def _diarize_one_mp3_path(
 def _merge_diarized_segments_from_chunks(
     chunk_responses: list[TranscriptionDiarized],
     time_offsets: list[float],
+    known_speaker_label: Optional[str] = None,
 ) -> list[dict]:
     """Flatten chunked diarization responses onto the original timeline.
 
     Segment timestamps are shifted by each chunk's start offset so they
-    reference the source audio. Speaker labels are kept verbatim — the
-    diarizer assigns labels per call, so the same raw label (e.g.
-    ``speaker_0``) across chunks usually refers to the most-prominent voice
-    in each chunk and is therefore the same person for interview-style
-    content. Callers that need strict cross-chunk speaker identity should
-    pass an ``encoded_reference_audio`` to ``transcribe_audio_diarize`` so
-    the diarizer labels the target with the known-speaker name (e.g.
-    ``"avatar"``) in every chunk. The ``chunk_idx`` field is kept on each
-    segment for diagnostic / debugging use.
+    reference the source audio. The ``chunk_idx`` field is kept on each merged
+    segment for downstream target attribution and for diagnostic use.
+
+    Speaker labels are assigned independently PER diarizer call, so the same
+    raw label (for example ``speaker_0``) can denote a different person in a
+    different chunk. When ``known_speaker_label`` is provided (the caller
+    supplied reference audio and the diarizer labels the target with that
+    known-speaker name, for example ``"avatar"``), this namespaces every OTHER
+    label with the chunk index (``chunk_0.speaker_0``) so no two chunks alias
+    distinct people under one label; segments the diarizer confidently matched
+    to the known speaker keep the known-speaker label verbatim so the target's
+    turns stay unified across the whole timeline. When ``known_speaker_label``
+    is None (no reference audio, including the create-reference-media-from-
+    playlist path where every speaker is treated as the target), labels are
+    kept verbatim as before.
     """
+    normalized_known_label = (
+        known_speaker_label.strip().lower()
+        if isinstance(known_speaker_label, str) and known_speaker_label.strip()
+        else None
+    )
     merged: list[dict] = []
     for idx, (resp, t0) in enumerate(zip(chunk_responses, time_offsets, strict=True)):
         for seg in resp.segments:
             sd = seg.model_dump()
+            raw_label = str(sd.get("speaker") or "unknown")
+            if (
+                normalized_known_label is not None
+                and raw_label.strip().lower() != normalized_known_label
+            ):
+                speaker_label = f"chunk_{idx}.{raw_label}"
+            else:
+                speaker_label = raw_label
             merged.append(
                 {
                     **sd,
                     "start": float(sd["start"]) + t0,
                     "end": float(sd["end"]) + t0,
-                    "speaker": str(sd.get("speaker") or "unknown"),
+                    "speaker": speaker_label,
                     "chunk_idx": idx,
                 }
             )
@@ -1991,7 +2011,13 @@ async def transcribe_audio_diarize(
                     "total_tokens": u_in + u_out,
                 }
             merged_segments = _merge_diarized_segments_from_chunks(
-                chunk_responses, offsets
+                chunk_responses,
+                offsets,
+                known_speaker_label=(
+                    context.audio_diarization_known_speaker_name
+                    if encoded_reference_audio
+                    else None
+                ),
             )
             response_dict = {
                 "duration": duration,

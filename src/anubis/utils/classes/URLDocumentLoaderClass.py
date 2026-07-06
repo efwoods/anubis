@@ -199,6 +199,16 @@ class URLDocumentLoaderClass:
         if not content:
             return []
 
+        # Retain the raw HTML so downstream structured-web extraction can parse
+        # the page's biography and quote structures with BeautifulSoup. The
+        # plain-text ``content`` above is the fallback when the page is not a
+        # subject page (or when this raw fetch fails, e.g. a bot-challenge host).
+        raw_html = ""
+        try:
+            raw_html = await _httpx_fallback_text(url, return_html=True)
+        except Exception as html_exc:
+            logger.debug("raw HTML fetch failed for %s (continuing): %s", url, html_exc)
+
         resolved_url_kind = url_kind or (
             "twitter" if quotes_per_line else "article"
         )
@@ -213,6 +223,7 @@ class URLDocumentLoaderClass:
                     "assistant_id": assistant_id,
                     "quotes_per_line": quotes_per_line,
                     "url_kind": resolved_url_kind,
+                    "raw_html": raw_html,
                 },
             }
         ]

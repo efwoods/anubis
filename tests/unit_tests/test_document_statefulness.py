@@ -128,3 +128,36 @@ async def test_deleted_doc_stays_gone_when_absent_from_state_and_retrieval():
         prior, fresh, "hockey", apply_threshold=False
     )
     assert [d.metadata["document_id"] for d in merged] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_identity_merge_collapses_duplicate_atomic_fact_content():
+    """Distinct store document ids with the same atomic fact collapse to one entry."""
+    wrapped = (
+        '<FACT_CONTEXT_AND_FACT> <FACT_CONTEXT>ctx</FACT_CONTEXT>'
+        "<FACT>I need you to be happy forever.</FACT></FACT_CONTEXT_AND_FACT>"
+    )
+    prior = [
+        Document(
+            page_content=wrapped,
+            metadata={"document_id": "dup-a", "fact": "I need you to be happy forever."},
+        )
+    ]
+    fresh = [
+        _search_item(
+            Document(
+                page_content=wrapped,
+                metadata={
+                    "document_id": "dup-b",
+                    "fact": "I need you to be happy forever.",
+                },
+            ),
+            0.95,
+        )
+    ]
+
+    merged = await merge_dedup_threshold_documents(
+        prior, fresh, "happy forever", apply_threshold=False
+    )
+    assert len(merged) == 1
+    assert merged[0].metadata["document_id"] == "dup-b"

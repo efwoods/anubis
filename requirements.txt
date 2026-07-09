@@ -58,3 +58,8 @@ librosa
 soundfile
 
 deepagents
+
+# MCP client (avatar-side data-analysis tools; server lives in src/mcp as a separate repo)
+langchain-mcp-adapters
+# SSE client for subscribing to the MCP server's /discovery announcement channel
+httpx-sse

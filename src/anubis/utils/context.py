@@ -412,6 +412,80 @@ class GlobalContext:
 
     """ </Deep Agent (think node) tuning> """
 
+    """ <Data Analysis (MCP filesystem -> deep agent) tuning> """
+
+    data_analysis_enabled: str = field(
+        default="FALSE",
+        metadata={
+            "description": "Set to TRUE to enable the data preprocessing pipeline. Env DATA_ANALYSIS_ENABLED. NOTE: this gates data PREPROCESSING only — it does NOT gate the avatar's MCP data-analysis capability, which is gated solely by a discovered+consented per-user MCP connection (see data_analysis_mcp_discovery_url)."
+        },
+    )
+
+    data_analysis_mcp_url: str = field(
+        default="http://localhost:8000/mcp",
+        metadata={
+            "description": "Fallback URL of the Model Context Protocol filesystem server's tool endpoint. Normally the avatar saves the URL supplied by the server's discovery announcement; this default is used only when an announcement omits one. Env DATA_ANALYSIS_MCP_URL."
+        },
+    )
+
+    data_analysis_mcp_discovery_url: str = field(
+        default="http://localhost:8000/discovery",
+        metadata={
+            "description": "Server-Sent-Events discovery endpoint the avatar subscribes to in order to discover an available Model Context Protocol filesystem server and its connection details. Env DATA_ANALYSIS_MCP_DISCOVERY_URL."
+        },
+    )
+
+    data_analysis_discovery_timeout_seconds: float = field(
+        default=2.0,
+        metadata={
+            "description": "Maximum seconds the avatar waits for a discovery announcement before proceeding without offering a connection this turn. Kept small so a missing server never stalls a conversation turn. Env DATA_ANALYSIS_DISCOVERY_TIMEOUT_SECONDS."
+        },
+    )
+
+    data_analysis_mcp_transport: str = field(
+        default="streamable_http",
+        metadata={
+            "description": "Transport for the Model Context Protocol filesystem server connection. streamable_http is the supported value; the Server-Sent-Events transport is deprecated by the Model Context Protocol specification. Env DATA_ANALYSIS_MCP_TRANSPORT."
+        },
+    )
+
+    data_analysis_mcp_server_name: str = field(
+        default="Ubuntu-OS-Filesystem",
+        metadata={
+            "description": "Registered name of the Model Context Protocol filesystem server inside the MultiServerMCPClient configuration. Env DATA_ANALYSIS_MCP_SERVER_NAME."
+        },
+    )
+
+    data_analysis_execution_backend: str = field(
+        default="local_shell",
+        metadata={
+            "description": "Execution backend for deep-agent data analysis. local_shell runs shell commands inside this container's per-turn temporary workspace; hosted sandbox provider names are reserved for the future. Env DATA_ANALYSIS_EXECUTION_BACKEND."
+        },
+    )
+
+    data_analysis_workspace_root: str = field(
+        default="/tmp/anubis-analysis",
+        metadata={
+            "description": "Root directory under which each analysis turn creates an ephemeral workspace; the workspace is deleted when the turn ends. Env DATA_ANALYSIS_WORKSPACE_ROOT."
+        },
+    )
+
+    data_analysis_store_max_bytes: int = field(
+        default=52428800,
+        metadata={
+            "description": "Per-user-per-avatar byte quota for the ingested-data store buffer; least-recently-updated items are evicted beyond this size. Default 50 MiB. Env DATA_ANALYSIS_STORE_MAX_BYTES."
+        },
+    )
+
+    data_analysis_store_max_age_days: int = field(
+        default=90,
+        metadata={
+            "description": "Maximum age in days for items in the ingested-data store buffer; older items are evicted as a backstop. Env DATA_ANALYSIS_STORE_MAX_AGE_DAYS."
+        },
+    )
+
+    """ </Data Analysis (MCP filesystem -> deep agent) tuning> """
+
     dev: str = field(
         default=None,
         metadata={

@@ -89,14 +89,17 @@ def _patch_sentence_scorer(monkeypatch):
 @pytest.fixture(autouse=True)
 def _patch_message_fact_similarity(monkeypatch):
     """Skip the message-grounding embedder (a live SentenceTransformer) by making the
-    threaded similarity computation report a perfect match — grounding is covered by
+    batched similarity scorer report a perfect match — grounding is covered by
     ``test_self_identity_fact_grounding.py``; these tests target the routing AFTER the
     grounding guard passes."""
 
-    async def _fake_to_thread(function, *args, **kwargs):
-        return 1.0
+    async def _fake_score_query(query: str, texts: list[str]) -> list[float]:
+        return [1.0] * len(texts)
 
-    monkeypatch.setattr(identity_tools.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(
+        "src.anubis.utils.runtime_handles.async_score_query_against_texts",
+        _fake_score_query,
+    )
 
 
 @pytest.fixture(autouse=True)

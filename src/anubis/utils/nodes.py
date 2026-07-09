@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -11,13 +11,9 @@ from langgraph.runtime import Runtime
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 from src.anubis.utils.context import AssistantContext, GlobalContext, UserContext
-from src.anubis.utils.context_compression import (
-    truncate_string_to_token_limit,
-)
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.store_cache import aget_through_cache
 from src.anubis.utils.utility import (
-    format_docs,
     merge_dedup_threshold_documents,
     reduce_docs,
 )
@@ -43,9 +39,9 @@ def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
     context = _global_context_from_runtime(runtime)
     logger.info(f"context.dev: {context.dev}")
     if context.dev.upper() == "TRUE":
-        logger.info(f"context.dev == TRUE: Writing dev system prompt")
+        logger.info("context.dev == TRUE: Writing dev system prompt")
     else:
-        logger.info(f"context.dev == FALSE: system prompt is not being written")
+        logger.info("context.dev == FALSE: system prompt is not being written")
 
     if context.dev.upper() != "TRUE":
         return
@@ -62,12 +58,12 @@ def _resolve_user_timezone(tz_name: str | None):
     when the value is missing or not a recognized zone.
     """
     if not tz_name:
-        return timezone.utc
+        return UTC
     try:
         return ZoneInfo(tz_name)
     except (ZoneInfoNotFoundError, ValueError):
         logger.warning("Unknown user timezone %r; falling back to UTC", tz_name)
-        return timezone.utc
+        return UTC
 
 
 def _image_url_from_content_block(block: dict) -> str | None:
@@ -190,7 +186,6 @@ async def _build_consciousness_system_message_update(
     # TODO: REDUCE FP; There are hundreds of non-salient documents being retrieved
 
     """
-
     _RETRIEVAL_LIMIT = 10
     _FILTER_SCORE = 0.5
 
@@ -199,7 +194,7 @@ async def _build_consciousness_system_message_update(
     user_is_creator = state.get('user_is_creator', False)
 
     # Update Name and Description of User and Assistant if provided in the context
-    logger.info(f"conscioussness breakpoint")
+    logger.info("conscioussness breakpoint")
     if getattr(runtime, "context"):
         if isinstance(runtime.context.assistant_ctx, AssistantContext):
             assistant_name = getattr(runtime.context.assistant_ctx, "name", None)
@@ -672,6 +667,42 @@ async def _build_consciousness_system_message_update(
     logger.info(f"state['messages']: {state['messages']}")
 
     system_message_str = populated_identity_template.messages[0].content
+
+    # Data-analysis capability guidance, mirroring the ``think`` node's tool
+    # gates exactly so the prompt never advertises tools the deep agent was
+    # not given:
+    # - connection bound to THIS avatar → full analysis guidance (the status
+    #   block deliberately carries NO server address or directory paths —
+    #   connection details must never surface in the conversation);
+    # - no connection but the conversing user OWNS this avatar → the small
+    #   connect-on-request section (the connect_data_server tool is attached);
+    # - otherwise (visitor on a shared avatar, or bound elsewhere) → nothing.
+    from src.anubis.utils.prompts.system_prompts import (
+        DATA_ANALYSIS_CAPABILITY_PROMPT,
+        DATA_SERVER_CONNECT_PROMPT,
+    )
+    from src.anubis.utils.tools.data_analysis import bound_connection_for
+
+    bound_mcp_connection = await bound_connection_for(
+        runtime.store, user_id, assistant_id
+    )
+    avatar_owner_id = (
+        config.get("configurable", {})
+        .get("assistant_ctx", {})
+        .get("metadata", {})
+        .get("user_id")
+    )
+    if bound_mcp_connection is not None:
+        system_message_str = system_message_str + DATA_ANALYSIS_CAPABILITY_PROMPT
+        system_message_str += (
+            "\n<MCP_CONNECTION_STATUS>\n"
+            "The Neural Nexus MCP data server is connected for this avatar — "
+            "confirm this plainly when asked. Never reveal the server's "
+            "address, transport, or host directory paths in a reply.\n"
+            "</MCP_CONNECTION_STATUS>\n"
+        )
+    elif avatar_owner_id is not None and avatar_owner_id == user_id:
+        system_message_str = system_message_str + DATA_SERVER_CONNECT_PROMPT
 
     _write_dev_system_prompt(system_message_str, runtime)
 

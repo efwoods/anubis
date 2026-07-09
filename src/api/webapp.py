@@ -54,6 +54,7 @@ from pydantic import BaseModel, BeforeValidator
 
 from src.anubis.graph import message_workflow
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.graph_interrupts import collect_pending_interrupts
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.utils.store_cache import (
     invalidate_store_cache_entry,
@@ -201,19 +202,6 @@ def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     return last_ai
 
 
-def _collect_pending_interrupts(snapshot) -> list:
-    """Return any Interrupt objects pending on a graph StateSnapshot.
-
-    Newer LangGraph exposes ``snapshot.interrupts``; older surfaces them per task.
-    """
-    interrupts = list(getattr(snapshot, "interrupts", None) or [])
-    if interrupts:
-        return interrupts
-    for task in getattr(snapshot, "tasks", None) or []:
-        interrupts.extend(getattr(task, "interrupts", None) or [])
-    return interrupts
-
-
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -242,6 +230,40 @@ async def message_graph_sse(
     graph_input = (
         resume_command if resume_command is not None else {"messages": [human_message]}
     )
+
+    # #region agent log
+    if resume_command is not None:
+        try:
+            import time
+            from pathlib import Path
+
+            _log_path = (
+                Path(__file__).resolve().parents[2] / ".cursor" / "debug-ba8488.log"
+            )
+            _log_path.parent.mkdir(parents=True, exist_ok=True)
+            with _log_path.open("a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "ba8488",
+                            "location": "webapp.py:message_graph_sse:resume_start",
+                            "message": "outer graph resume requested",
+                            "data": {
+                                "thread_id": thread_id,
+                                "resume_payload": getattr(
+                                    resume_command, "resume", None
+                                ),
+                            },
+                            "hypothesisId": "D",
+                            "timestamp": int(time.time() * 1000),
+                        },
+                        default=str,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+    # #endregion
 
     async for item in graph.astream(
         input=graph_input,
@@ -277,7 +299,7 @@ async def message_graph_sse(
     # If the graph paused for human approval, surface the preview instead of ``done``.
     # The client resumes via ``POST /message/{assistant_id}/resume`` on this thread_id.
     snapshot = await graph.aget_state(config)
-    pending_interrupts = _collect_pending_interrupts(snapshot)
+    pending_interrupts = collect_pending_interrupts(snapshot)
     if pending_interrupts:
         interrupt_event: dict = {
             "type": "interrupt",
@@ -872,6 +894,39 @@ async def modify_avatar(
             return JSONResponse(content=result, status_code=200)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error updating assistant.")
+
+
+@app.post("/disconnect_mcp")
+async def disconnect_mcp(
+    current_user: dict = Depends(get_current_user),
+):
+    """Forget the user's saved MCP data-server connection (disconnect).
+
+    Deletes the single per-user connection record. The next turn on any owned
+    avatar re-enters the discovery/consent flow, so the user can re-connect
+    (and re-bind the connection to whichever avatar they choose). There is no
+    enable/disable switch — removing the connection is the disconnect.
+    """
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_connection_namespace,
+    )
+    from src.anubis.utils.tools.data_analysis.discovery import CONNECTION_KEY
+
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    try:
+        await client.store.delete_item(
+            list(mcp_connection_namespace(user_id)), key=CONNECTION_KEY
+        )
+        return JSONResponse(
+            content={"disconnected": True, "user_id": user_id}, status_code=200
+        )
+    except Exception as disconnect_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error disconnecting MCP server: {disconnect_error}",
+        )
 
 
 @app.delete("/delete_avatar")
@@ -1628,6 +1683,8 @@ async def resume_avatar_message(
             raise HTTPException(status_code=400, detail="items must be a JSON list.")
         resume_payload["items"] = parsed_items
 
+    # The outer graph exposes a single think-level interrupt per pause. Multi-interrupt
+    # resume maps are built inside ``think`` for the checkpointed deep agent only.
     return StreamingResponse(
         message_graph_sse(
             graph,

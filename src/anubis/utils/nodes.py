@@ -686,13 +686,19 @@ async def _build_consciousness_system_message_update(
     bound_mcp_connection = await bound_connection_for(
         runtime.store, user_id, assistant_id
     )
-    avatar_owner_id = (
-        config.get("configurable", {})
-        .get("assistant_ctx", {})
-        .get("metadata", {})
-        .get("user_id")
+    assistant_metadata = (
+        config.get("configurable", {}).get("assistant_ctx", {}).get("metadata", {})
     )
-    if bound_mcp_connection is not None:
+    avatar_owner_id = assistant_metadata.get("user_id")
+    # The MCP capability is exclusive to the user's own personal avatar (owner
+    # match AND the is_personal_avatar_of_creator flag) — mirror the think-node
+    # gate so the prompt never claims a capability the tools will withhold.
+    is_personal_avatar = (
+        avatar_owner_id is not None
+        and avatar_owner_id == user_id
+        and assistant_metadata.get("is_personal_avatar_of_creator") is True
+    )
+    if bound_mcp_connection is not None and is_personal_avatar:
         system_message_str = system_message_str + DATA_ANALYSIS_CAPABILITY_PROMPT
         system_message_str += (
             "\n<MCP_CONNECTION_STATUS>\n"
@@ -701,7 +707,7 @@ async def _build_consciousness_system_message_update(
             "address, transport, or host directory paths in a reply.\n"
             "</MCP_CONNECTION_STATUS>\n"
         )
-    elif avatar_owner_id is not None and avatar_owner_id == user_id:
+    elif is_personal_avatar:
         system_message_str = system_message_str + DATA_SERVER_CONNECT_PROMPT
 
     _write_dev_system_prompt(system_message_str, runtime)

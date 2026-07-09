@@ -51,17 +51,26 @@ def build_mcp_client(connection: McpConnection):
 
     Construction is cheap (no network activity happens until a tool call),
     so a fresh client per use is fine.
+
+    When the connection carries a device secret (relay/tunnel installs), it is
+    attached as ``Authorization: Bearer <device_secret>`` on every request — the
+    scoped credential the local MCP server's token verifier requires, and, in
+    relay mode, what the ``/mcp/relay/<device_id>`` bridge checks before
+    tunneling the call. The co-located SSE-discovery dev path has no secret and
+    sends no header.
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    return MultiServerMCPClient(
-        {
-            connection.server_name: {
-                "transport": connection.transport,
-                "url": connection.url,
-            }
+    server_config: dict[str, Any] = {
+        "transport": connection.transport,
+        "url": connection.url,
+    }
+    if connection.device_secret:
+        server_config["headers"] = {
+            "Authorization": f"Bearer {connection.device_secret}"
         }
-    )
+
+    return MultiServerMCPClient({connection.server_name: server_config})
 
 
 async def get_mcp_filesystem_tools(connection: McpConnection) -> list[Any]:

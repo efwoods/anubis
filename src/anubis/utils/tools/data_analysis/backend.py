@@ -48,6 +48,7 @@ INGESTED_NAMESPACE_KIND = "data_ingested"
 CREATED_NAMESPACE_KIND = "data_created"
 MCP_CONNECTION_NAMESPACE_KIND = "mcp_connection"
 MCP_CONNECTION_DECLINED_NAMESPACE_KIND = "mcp_connection_declined"
+MCP_REGISTRATION_NAMESPACE_KIND = "mcp_registration"
 
 # Directory inside the workspace where ingested/hydrated source files land,
 # so shell commands use relative paths like ``work/health1.json``.
@@ -73,6 +74,19 @@ def mcp_connection_namespace(user_id: str) -> tuple[str, str]:
     records which single avatar the connection is bound to.
     """
     return (user_id, MCP_CONNECTION_NAMESPACE_KIND)
+
+
+def mcp_registration_namespace(user_id: str) -> tuple[str, str]:
+    """Store namespace for a user's pending MCP daemon registration.
+
+    Keyed by user only (a two-element tuple, like
+    :func:`mcp_connection_namespace`) so exactly one pending registration can
+    exist per user. The local MCP daemon writes this record by calling
+    ``POST /mcp/register``; ``mcp_discovery`` reads it to decide whether to
+    offer a connection, before the user has consented (that consent then
+    produces the separate, avatar-bound ``mcp_connection`` record).
+    """
+    return (user_id, MCP_REGISTRATION_NAMESPACE_KIND)
 
 
 def mcp_connection_declined_namespace(

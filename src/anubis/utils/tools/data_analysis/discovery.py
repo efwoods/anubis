@@ -33,6 +33,7 @@ from typing import Any
 from src.anubis.utils.tools.data_analysis.backend import (
     mcp_connection_declined_namespace,
     mcp_connection_namespace,
+    mcp_registration_namespace,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 # the same key this module writes.
 CONNECTION_KEY = "connection"
 _DECLINED_KEY = "declined"
+REGISTRATION_KEY = "registration"
 
 # Timestamp of the most recent failed/empty discovery attempt, keyed by
 # discovery URL, so an absent server is not re-dialed on every conversation
@@ -64,6 +66,11 @@ class McpConnection:
     transport: str
     server_name: str
     allowed_roots: tuple[str, ...] = ()
+    # Per-device secret the API presents to the MCP server as
+    # ``Authorization: Bearer <device_secret>`` on every tool call. Present for
+    # relay/tunnel installs (the daemon generates it locally and registers it);
+    # ``None`` for the co-located SSE-discovery dev path, which is unauthenticated.
+    device_secret: str | None = None
 
     def to_store_value(self, *, assistant_id: str) -> dict[str, Any]:
         """Serialize as the per-user connection record bound to one avatar."""
@@ -73,6 +80,7 @@ class McpConnection:
             "transport": self.transport,
             "server_name": self.server_name,
             "allowed_roots": list(self.allowed_roots),
+            "device_secret": self.device_secret,
             "assistant_id": assistant_id,
             "connected_at": datetime.now(UTC).isoformat(),
         }
@@ -85,6 +93,7 @@ class McpConnection:
             transport=value.get("transport", "streamable_http"),
             server_name=value.get("server_name", "Ubuntu-OS-Filesystem"),
             allowed_roots=tuple(value.get("allowed_roots", []) or []),
+            device_secret=value.get("device_secret"),
         )
 
 
@@ -152,6 +161,103 @@ async def discover_announced_server(
         connection.url,
     )
     return connection
+
+
+async def read_user_registration(store: Any, user_id: str) -> dict[str, Any] | None:
+    """Return the user's pending MCP daemon registration record, or ``None``.
+
+    Written by the daemon's ``POST /mcp/register`` call (see ``webapp.py``);
+    read by :func:`resolve_available_connection` to decide whether a server is
+    reachable this turn without dialing the co-located SSE endpoint.
+    """
+    if store is None:
+        return None
+    item = await store.aget(mcp_registration_namespace(user_id), REGISTRATION_KEY)
+    return None if item is None else (item.value or None)
+
+
+def _connection_from_registration(record: dict[str, Any]) -> McpConnection:
+    """Build a client :class:`McpConnection` from a stored registration record.
+
+    Every connection mode (relay / tunnel / local) is driven as a
+    ``streamable_http`` client: in relay mode ``mcp_url`` is this API's own
+    ``/mcp/relay/<device_id>`` bridge, in tunnel/local it is the directly
+    reachable server URL. The device secret rides along as the Bearer credential.
+    """
+    return McpConnection(
+        url=record["mcp_url"],
+        transport="streamable_http",
+        server_name=record.get("server_name", "Ubuntu-OS-Filesystem"),
+        allowed_roots=tuple(record.get("allowed_roots", []) or []),
+        device_secret=record.get("device_secret"),
+    )
+
+
+def _registration_is_fresh(record: dict[str, Any], stale_seconds: float) -> bool:
+    """Whether a registration's heartbeat is recent enough to trust as online.
+
+    Used for the tunnel/local modes, which have no live socket to prove
+    presence; the daemon heartbeats every ~30s via ``POST /mcp/heartbeat``.
+    """
+    last_seen = record.get("last_seen_at")
+    if not last_seen:
+        return False
+    try:
+        last_seen_at = datetime.fromisoformat(last_seen)
+    except ValueError:
+        return False
+    if last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - last_seen_at).total_seconds() <= stale_seconds
+
+
+async def resolve_available_connection(
+    store: Any,
+    user_id: str,
+    context: Any,
+    *,
+    ignore_failure_backoff: bool = False,
+) -> McpConnection | None:
+    """Find a currently-reachable MCP server for a user, or ``None``.
+
+    Resolution order, replacing the old single global SSE dial so that remote
+    (relay/tunnel) installs work, while co-located dev still functions:
+
+    1. **Pending registration** (the daemon pushed its presence to this API).
+       For ``relay`` mode the daemon holds a live outbound socket, so presence
+       is confirmed by the in-process relay registry; for ``tunnel``/``local``
+       modes presence is inferred from a fresh heartbeat. Either way the stored
+       ``mcp_url`` (relay bridge, or a directly reachable URL) becomes the
+       connection.
+    2. **SSE fallback** — only when no registration exists — dials the
+       co-located discovery endpoint (``discover_announced_server``) for the
+       same-machine development flow.
+    """
+    record = await read_user_registration(store, user_id)
+    if record is not None:
+        connection_mode = record.get("connection_mode", "relay")
+        device_id = record.get("device_id")
+        if connection_mode == "relay":
+            from src.anubis.utils.tools.data_analysis import relay
+
+            if relay.is_online(device_id):
+                return _connection_from_registration(record)
+            # Registered but the outbound socket is down: the server is not
+            # reachable this turn. Do not fall through to the unrelated SSE
+            # endpoint — report nothing available.
+            return None
+        stale_seconds = float(
+            getattr(context, "data_analysis_registration_stale_seconds", 120.0)
+        )
+        if _registration_is_fresh(record, stale_seconds):
+            return _connection_from_registration(record)
+        return None
+
+    return await discover_announced_server(
+        context.data_analysis_mcp_discovery_url,
+        float(context.data_analysis_discovery_timeout_seconds),
+        ignore_failure_backoff=ignore_failure_backoff,
+    )
 
 
 async def read_user_connection(store: Any, user_id: str) -> dict[str, Any] | None:

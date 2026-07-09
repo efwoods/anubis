@@ -2,11 +2,12 @@
 
 Drives the real ``mcp_discovery`` node through a minimal checkpointed outer
 graph (same pattern as ``test_think_interrupt_flow``), substituting a fake
-``discover_announced_server`` so no live Model Context Protocol server is
-needed. Covers: the consent interrupt is raised with the announced server;
+``resolve_available_connection`` so no live Model Context Protocol server is
+needed. Covers: the consent interrupt is raised with the resolved server;
 approving persists the single per-user connection bound to the answering
-avatar; declining records a per-avatar marker; and non-owned avatars are
-never offered a connection.
+avatar; declining records a per-avatar marker; and avatars that are not the
+user's own personal avatar (a visitor, or the user's non-personal avatars)
+are never offered a connection.
 """
 
 import pytest
@@ -35,12 +36,12 @@ _ANNOUNCED = McpConnection(
 
 @pytest.fixture
 def discovery_app(monkeypatch):
-    """A one-node graph running the real ``mcp_discovery`` with a fake discovery."""
+    """A one-node graph running the real ``mcp_discovery`` with a fake resolver."""
 
-    async def _fake_discover(discovery_url, timeout_seconds):
+    async def _fake_resolve(store, user_id, context, *, ignore_failure_backoff=False):
         return _ANNOUNCED
 
-    monkeypatch.setattr(graph_mod, "discover_announced_server", _fake_discover)
+    monkeypatch.setattr(graph_mod, "resolve_available_connection", _fake_resolve)
 
     store = InMemoryStore()
     outer = StateGraph(GlobalState)
@@ -60,13 +61,18 @@ def _input(user_id="u", assistant_id="a") -> dict:
 
 
 def _owned_config(thread_id, user_id="u", assistant_id="a") -> dict:
-    # The avatar's metadata.user_id == the conversing user_id ⇒ the user owns it.
+    # Owner match AND the personal-avatar flag ⇒ the MCP capability is offered.
     return {
         "configurable": {
             "thread_id": thread_id,
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "assistant_ctx": {"metadata": {"user_id": user_id}},
+            "assistant_ctx": {
+                "metadata": {
+                    "user_id": user_id,
+                    "is_personal_avatar_of_creator": True,
+                }
+            },
         }
     }
 
@@ -124,7 +130,29 @@ async def test_discovery_skips_non_owned_avatar(discovery_app):
             "thread_id": "notowned-1",
             "user_id": "u",
             "assistant_id": "a",
-            "assistant_ctx": {"metadata": {"user_id": "someone_else"}},
+            "assistant_ctx": {
+                "metadata": {
+                    "user_id": "someone_else",
+                    "is_personal_avatar_of_creator": True,
+                }
+            },
+        }
+    }
+    await app.ainvoke(_input(), config, context=GlobalContext())
+    assert _interrupts(app, config) == []
+
+
+@pytest.mark.asyncio
+async def test_discovery_skips_owned_non_personal_avatar(discovery_app):
+    app, _store = discovery_app
+    # The user owns the avatar, but it is NOT flagged as their personal avatar ⇒
+    # the desktop MCP capability is exclusive to the personal avatar ⇒ no offer.
+    config = {
+        "configurable": {
+            "thread_id": "notpersonal-1",
+            "user_id": "u",
+            "assistant_id": "a",
+            "assistant_ctx": {"metadata": {"user_id": "u"}},
         }
     }
     await app.ainvoke(_input(), config, context=GlobalContext())

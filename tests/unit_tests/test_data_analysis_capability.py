@@ -309,11 +309,11 @@ def test_connect_tool_saves_connection_and_clears_decline(context, monkeypatch):
         # …but an explicit natural-language connect always works.
         import src.anubis.utils.tools.data_analysis.analysis_tools as at
 
-        async def _fake_discover(url, timeout, *, ignore_failure_backoff=False):
+        async def _fake_resolve(store, user_id, context, *, ignore_failure_backoff=False):
             assert ignore_failure_backoff is True
             return _TEST_CONNECTION
 
-        monkeypatch.setattr(at, "discover_announced_server", _fake_discover)
+        monkeypatch.setattr(at, "resolve_available_connection", _fake_resolve)
         connect = build_connect_tool(context, "u1", "a1")
         result = await connect.coroutine(runtime=runtime)
         assert result["connected"] is True
@@ -374,10 +374,10 @@ def test_connect_tool_reports_unreachable_server(context, monkeypatch):
         runtime = _FakeToolRuntime(store)
         import src.anubis.utils.tools.data_analysis.analysis_tools as at
 
-        async def _fake_discover(url, timeout, *, ignore_failure_backoff=False):
+        async def _fake_resolve(store, user_id, context, *, ignore_failure_backoff=False):
             return None
 
-        monkeypatch.setattr(at, "discover_announced_server", _fake_discover)
+        monkeypatch.setattr(at, "resolve_available_connection", _fake_resolve)
         connect = build_connect_tool(context, "u1", "a1")
         result = await connect.coroutine(runtime=runtime)
         assert result["connected"] is False

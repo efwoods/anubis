@@ -48,8 +48,8 @@ from src.anubis.utils.tools.data_analysis.discovery import (
     McpConnection,
     clear_declined,
     clear_user_connection,
-    discover_announced_server,
     mark_declined,
+    resolve_available_connection,
     save_user_connection,
 )
 from src.anubis.utils.tools.data_analysis.mcp_client import call_mcp_filesystem_tool
@@ -507,9 +507,10 @@ def build_connect_tool(
         addresses or directory paths in the reply — confirm the connection by
         name only.
         """
-        connection = await discover_announced_server(
-            context.data_analysis_mcp_discovery_url,
-            float(context.data_analysis_discovery_timeout_seconds),
+        connection = await resolve_available_connection(
+            runtime.store,
+            user_id,
+            context,
             ignore_failure_backoff=True,
         )
         if connection is None:

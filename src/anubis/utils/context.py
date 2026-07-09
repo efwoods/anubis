@@ -484,6 +484,20 @@ class GlobalContext:
         },
     )
 
+    data_analysis_registration_stale_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Maximum age in seconds of a local MCP daemon's last heartbeat (POST /mcp/heartbeat) for its pushed registration to still count as online, for tunnel/local connection modes that have no live socket. Relay mode ignores this and uses live-socket presence instead. Env DATA_ANALYSIS_REGISTRATION_STALE_SECONDS."
+        },
+    )
+
+    data_analysis_relay_request_timeout_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Maximum seconds the /mcp/relay bridge waits for the local MCP daemon to return a proxy_response for one tunneled HTTP call before failing the request. Matches the daemon's own 120s local-proxy timeout. Env DATA_ANALYSIS_RELAY_REQUEST_TIMEOUT_SECONDS."
+        },
+    )
+
     """ </Data Analysis (MCP filesystem -> deep agent) tuning> """
 
     dev: str = field(

@@ -101,10 +101,10 @@ from src.anubis.utils.tools.data_analysis import (
     build_connect_tool,
     build_data_analysis_tools,
     cleanup_analysis_workspace,
-    discover_announced_server,
     is_declined,
     mark_declined,
     read_user_connection,
+    resolve_available_connection,
     save_user_connection,
 )
 from src.anubis.utils.utility import format_docs
@@ -726,12 +726,15 @@ async def think(
     # server degrades to a normal turn (empty tool list) inside the tools.
     analysis_bundle = None
     analysis_extra_tools: list[Any] | None = None
+    # Exclusive to the user's own personal avatar: a bound connection on a
+    # demoted (no-longer-personal) avatar must NOT re-enable live MCP access.
+    is_personal_avatar = _user_personal_avatar(config, state)
     connection = await bound_connection_for(
         runtime.store,
         state["user_state"]["user_id"],
         state["assistant_state"]["assistant_id"],
     )
-    if connection is not None:
+    if connection is not None and is_personal_avatar:
         analysis_bundle = build_analysis_backend(
             deep_agent_run_context,
             state["user_state"]["user_id"],
@@ -741,7 +744,7 @@ async def think(
         analysis_extra_tools = build_data_analysis_tools(
             deep_agent_run_context, analysis_bundle, connection
         )
-    elif runtime.store is not None and _user_owns_avatar(config, state):
+    elif runtime.store is not None and is_personal_avatar:
         # Unconnected owned avatar: carry only the explicit-connect tool so a
         # natural-language "connect to the Neural Nexus MCP server" always
         # works, even after a decline or disconnect suppressed the automatic
@@ -982,6 +985,24 @@ def _user_owns_avatar(config: RunnableConfig, state: GlobalState) -> bool:
     return owner_id is not None and owner_id == state["user_state"]["user_id"]
 
 
+def _user_personal_avatar(config: RunnableConfig, state: GlobalState) -> bool:
+    """Whether the conversing user is the creator AND this is their personal avatar.
+
+    The desktop MCP data server (and future personal analytics) are exclusive to
+    the one avatar a user has flagged ``PERSONAL_AVATAR_OF_THE_CREATOR`` — never a
+    visitor on someone else's avatar, and never the user's other, non-personal
+    avatars. Combines the owner check with the ``is_personal_avatar_of_creator``
+    metadata flag set by ``/create_avatar`` / ``/modify_avatar``.
+    """
+    metadata = (
+        config.get("configurable", {}).get("assistant_ctx", {}).get("metadata", {})
+    )
+    return (
+        _user_owns_avatar(config, state)
+        and metadata.get("is_personal_avatar_of_creator") is True
+    )
+
+
 async def mcp_discovery(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
@@ -992,8 +1013,9 @@ async def mcp_discovery(
     offers a connection only when ALL of the following hold, and otherwise
     returns an empty delta (a normal turn):
 
-    - the user OWNS this avatar (never attach a personal server to someone
-      else's shared/public avatar);
+    - this is the user's own PERSONAL avatar (owner match AND the
+      ``is_personal_avatar_of_creator`` flag) — never a visitor on someone
+      else's avatar, and never the user's other, non-personal avatars;
     - the user has NO connection yet (a user has at most one MCP connection —
       once established, bound to one avatar, no further offers are made);
     - this avatar has not previously DECLINED (a decline on one avatar never
@@ -1013,7 +1035,7 @@ async def mcp_discovery(
     user_id = state["user_state"]["user_id"]
     assistant_id = state["assistant_state"]["assistant_id"]
 
-    if not _user_owns_avatar(config, state):
+    if not _user_personal_avatar(config, state):
         return {}
 
     if await read_user_connection(store, user_id) is not None:
@@ -1022,10 +1044,7 @@ async def mcp_discovery(
         return {}
 
     context = runtime.context or GlobalContext()
-    connection = await discover_announced_server(
-        context.data_analysis_mcp_discovery_url,
-        float(context.data_analysis_discovery_timeout_seconds),
-    )
+    connection = await resolve_available_connection(store, user_id, context)
     if connection is None:
         return {}
 

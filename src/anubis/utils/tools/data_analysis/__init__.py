@@ -39,6 +39,8 @@ from src.anubis.utils.tools.data_analysis.discovery import (
     is_declined,
     mark_declined,
     read_user_connection,
+    read_user_registration,
+    resolve_available_connection,
     save_user_connection,
 )
 from src.anubis.utils.tools.data_analysis.mcp_client import (
@@ -61,5 +63,7 @@ __all__ = [
     "is_declined",
     "mark_declined",
     "read_user_connection",
+    "read_user_registration",
+    "resolve_available_connection",
     "save_user_connection",
 ]

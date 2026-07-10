@@ -234,40 +234,6 @@ async def message_graph_sse(
         resume_command if resume_command is not None else {"messages": [human_message]}
     )
 
-    # #region agent log
-    if resume_command is not None:
-        try:
-            import time
-            from pathlib import Path
-
-            _log_path = (
-                Path(__file__).resolve().parents[2] / ".cursor" / "debug-ba8488.log"
-            )
-            _log_path.parent.mkdir(parents=True, exist_ok=True)
-            with _log_path.open("a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "ba8488",
-                            "location": "webapp.py:message_graph_sse:resume_start",
-                            "message": "outer graph resume requested",
-                            "data": {
-                                "thread_id": thread_id,
-                                "resume_payload": getattr(
-                                    resume_command, "resume", None
-                                ),
-                            },
-                            "hypothesisId": "D",
-                            "timestamp": int(time.time() * 1000),
-                        },
-                        default=str,
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-    # #endregion
-
     async for item in graph.astream(
         input=graph_input,
         config=config,

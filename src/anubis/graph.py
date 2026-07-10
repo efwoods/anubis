@@ -41,32 +41,7 @@ logger = logging.getLogger(__name__)
 # eager ``langchain.agents`` package load on every cold start.
 import json
 import pickle
-import time
-from pathlib import Path
 from typing import Any
-
-_DEBUG_LOG_PATH = Path(__file__).resolve().parents[2] / ".cursor" / "debug-ba8488.log"
-
-
-def _agent_debug_log(
-    location: str, message: str, data: dict, hypothesis_id: str
-) -> None:
-    # #region agent log
-    try:
-        payload = {
-            "sessionId": "ba8488",
-            "location": location,
-            "message": message,
-            "data": data,
-            "hypothesisId": hypothesis_id,
-            "timestamp": int(time.time() * 1000),
-        }
-        _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, default=str) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
 import numpy as np
 from langchain_core.messages import (
@@ -808,8 +783,6 @@ async def _run_avatar_deep_agent_turn(
     # Slice new messages from the deep agent's persisted conversation against the
     # outer conversation length — stable across the interrupt/resume re-run.
     input_messages_count = len(state["messages"])
-    turn_key = input_messages_count
-    deep_thread_id = (deep_agent_config.get("configurable") or {}).get("thread_id")
 
     writer = get_stream_writer()
 
@@ -821,21 +794,6 @@ async def _run_avatar_deep_agent_turn(
     if can_persist:
         snapshot = await deep_agent.aget_state(deep_agent_config)
         already_paused = bool(snapshot.next)
-        # #region agent log
-        _agent_debug_log(
-            "graph.py:_run_avatar_deep_agent_turn:pre_run",
-            "deep agent snapshot before fresh run",
-            {
-                "outer_thread": outer_thread,
-                "deep_thread_id": deep_thread_id,
-                "turn_key": turn_key,
-                "already_paused": already_paused,
-                "snapshot_next": list(snapshot.next or []),
-                "task_count": len(snapshot.tasks or []),
-            },
-            "C",
-        )
-        # #endregion
 
     final_output: dict[str, Any] | None = None
     if not already_paused:
@@ -850,54 +808,11 @@ async def _run_avatar_deep_agent_turn(
     if can_persist:
         snapshot = await deep_agent.aget_state(deep_agent_config)
         pending_interrupts = collect_pending_interrupts(snapshot)
-        # #region agent log
-        _agent_debug_log(
-            "graph.py:_run_avatar_deep_agent_turn:pending_interrupts",
-            "deep agent pending interrupts before outer forward/resume",
-            {
-                "outer_thread": outer_thread,
-                "deep_thread_id": deep_thread_id,
-                "turn_key": turn_key,
-                "already_paused": already_paused,
-                "pending_count": len(pending_interrupts),
-                "pending_ids": [getattr(i, "id", None) for i in pending_interrupts],
-                "pending_kinds": [
-                    (getattr(i, "value", None) or {}).get("kind")
-                    if isinstance(getattr(i, "value", None), dict)
-                    else None
-                    for i in pending_interrupts
-                ],
-                "task_names": [getattr(t, "name", None) for t in (snapshot.tasks or [])],
-            },
-            "A",
-        )
-        # #endregion
         if pending_interrupts:
             decision = interrupt(pending_interrupts[0].value)
             resume_cmd = build_interrupt_resume_command(
                 pending_interrupts, decision
             )
-            # #region agent log
-            _agent_debug_log(
-                "graph.py:_run_avatar_deep_agent_turn:resume_deep_agent",
-                "resuming deep agent after outer interrupt returned",
-                {
-                    "pending_count": len(pending_interrupts),
-                    "resume_map_size": len(resume_cmd.resume)
-                    if isinstance(resume_cmd.resume, dict)
-                    else 1,
-                    "resume_map_keys": list(resume_cmd.resume.keys())
-                    if isinstance(resume_cmd.resume, dict)
-                    else None,
-                    "decision_type": decision.get("type")
-                    if isinstance(decision, dict)
-                    else type(decision).__name__,
-                    "target_interrupt_id": pending_interrupts[0].id,
-                    "runId": "post-fix-v2",
-                },
-                "A",
-            )
-            # #endregion
             final_output = await _stream_deep_agent(
                 deep_agent,
                 resume_cmd,

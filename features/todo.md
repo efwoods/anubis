@@ -1,7 +1,19 @@
+# Final updates before launch
+- [ ] preprocessing
+- [ ] adapter training and inference infastructure
+
+## Applicable now:
+- [ ] metering: message endpoint now; upload data later
+- [ ] social media connection: will not effect any upload or messaging endpoint (prevent uploading if not of the user)
+- [ ] integrations (wrappers around the current inference endpoint)
+
+- [ ] onboarding                                                                                                               
+
+
 # BASELINE CHANGES TO BE USEFUL
 - [ ] Preprocessing of data needs to be acceptable (document processing; transcriptions)
-- [ ] Pulling of data needs to be deduplicated
-- [ ] facts need to be editable when incorrect
+- [x] Pulling of data needs to be deduplicated
+- [x] facts need to be editable when incorrect
 
 # Integrations (use cases for actual use of the avatar)
 
@@ -42,10 +54,9 @@ The data is inaccurate; duplicated, responses are incorrect and inauthentic.
 
 # Goal: Accurate relevant data and correct authentic responses.
 
-status updates while thinking of WHAT the avatar is currently thinking (streamed messages)
-- [ ] edit memories
+- [x] edit memories
 - [ ] twitter login: https://x.com/shivon
-- [ ] fragments in dataset from PDF: 11/5/25, 11:46 PM; Page 14 of 10; Machine Intelligence - Shivon Zilis.pdf
+- [x] fragments in dataset from PDF: 11/5/25, 11:46 PM; Page 14 of 10; Machine Intelligence - Shivon Zilis.pdf
 - [ ] transcription fragments from youtube: "so you're"; https://www.youtube.com/watch?v=WV329HQvzUw
 
 

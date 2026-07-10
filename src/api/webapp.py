@@ -902,14 +902,18 @@ async def share_avatar(
 
 @app.patch("/modify_avatar")
 async def modify_avatar(
+    request: Request,
     assistant_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     new_avatar_name: Optional[str] = None,
     new_avatar_description: Optional[str] = None,
-    is_personal_avatar_of_creator: Optional[bool] = None,
+    is_personal_avatar_of_creator: bool = False,
 ):
     # Avatar name changes also need to be applied to the db for consistent identities
     logger.info("breakpoint")
+    update_personal_avatar_flag = (
+        "is_personal_avatar_of_creator" in request.query_params
+    )
     if not assistant_id:
         raise HTTPException(
             detail="Supply assistant_id for the assistant to modify.", status_code=400
@@ -917,7 +921,7 @@ async def modify_avatar(
     if (
         not new_avatar_name
         and not new_avatar_description
-        and is_personal_avatar_of_creator is None
+        and not update_personal_avatar_flag
     ):
         raise HTTPException(
             detail=(
@@ -946,7 +950,7 @@ async def modify_avatar(
         update_kwargs["name"] = new_avatar_name
     if new_avatar_description:
         update_kwargs["description"] = new_avatar_description
-    if is_personal_avatar_of_creator is not None:
+    if update_personal_avatar_flag:
         update_kwargs["metadata"] = {
             "is_personal_avatar_of_creator": is_personal_avatar_of_creator
         }
@@ -957,7 +961,7 @@ async def modify_avatar(
         raise HTTPException(status_code=500, detail="Error updating assistant.")
 
     # At most one personal avatar per user: flagging this one demotes any other.
-    if is_personal_avatar_of_creator is True:
+    if update_personal_avatar_flag and is_personal_avatar_of_creator:
         user_id = current_user["identities"][0]["user_id"]
         await _demote_other_personal_avatars(
             client, user_id, keep_assistant_id=assistant_id
@@ -1100,8 +1104,26 @@ async def mcp_relay_bridge(device_id: str, request: Request):
     secret (the publicly routable path must not be callable by anyone who merely
     guesses a device id). The request is re-pathed to the daemon's local MCP
     endpoint (``/mcp``) — the daemon forwards to ``local_mcp_url + path``.
+
+    A streamable-HTTP client also opens a *standalone* ``GET`` to this endpoint
+    to receive server-initiated (server→client) messages — an unbounded
+    Server-Sent-Events stream. The relay tunnels discrete request/response
+    pairs, not open-ended streams: a tunneled ``GET`` would block the daemon's
+    single WebSocket message loop reading a body that never ends, wedging the
+    whole relay for that device. The MCP specification allows a server to
+    decline the server-push stream by answering the standalone ``GET`` with
+    ``405 Method Not Allowed``; the client then operates request/response-only
+    (every filesystem tool call is a ``POST`` whose response is finite and
+    buffered), which the relay fully supports. So short-circuit ``GET`` here and
+    never forward it over the socket.
     """
     from src.anubis.utils.tools.data_analysis import relay as relay_registry
+
+    if request.method == "GET":
+        return JSONResponse(
+            content={"error": "Server-push stream is not offered over the relay."},
+            status_code=405,
+        )
 
     session = relay_registry.get_session(device_id)
     if session is None:

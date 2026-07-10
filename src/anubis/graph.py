@@ -734,6 +734,23 @@ async def think(
         state["user_state"]["user_id"],
         state["assistant_state"]["assistant_id"],
     )
+    # #region agent log
+    try:
+        import json as _json, time as _time
+        from src.anubis.utils.tools.data_analysis.discovery import read_user_registration as _read_reg
+        from src.anubis.utils.tools.data_analysis import relay as _relay
+        _reg = await _read_reg(runtime.store, state["user_state"]["user_id"]) if runtime.store else None
+        _dev = (_reg or {}).get("device_id") if isinstance(_reg, dict) else None
+        with open("/deps/anubis/.cursor/debug-7a1f58.log", "a") as _f:
+            _f.write(_json.dumps({"sessionId":"7a1f58","runId":"post-fix","hypothesisId":"A,C,D","location":"graph.py:think","message":"bound_vs_registration","data":{"bound_url":getattr(connection,"url",None),"bound_has_secret":bool(getattr(connection,"device_secret",None)),"is_personal":is_personal_avatar,"reg_mode":(_reg or {}).get("connection_mode") if isinstance(_reg,dict) else None,"reg_mcp_url":(_reg or {}).get("mcp_url") if isinstance(_reg,dict) else None,"reg_device_id":_dev,"relay_online":_relay.is_online(_dev) if _dev else None,"live_session_device":getattr(_relay.session_for_user(state["user_state"]["user_id"]),"device_id",None),"reg_last_seen":(_reg or {}).get("last_seen_at") if isinstance(_reg,dict) else None},"timestamp":int(_time.time()*1000)}) + "\n")
+    except Exception as _e:
+        try:
+            import json as _json, time as _time
+            with open("/deps/anubis/.cursor/debug-7a1f58.log", "a") as _f:
+                _f.write(_json.dumps({"sessionId":"7a1f58","hypothesisId":"A","location":"graph.py:think","message":"debug_log_failed","data":{"error":str(_e)},"timestamp":int(_time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+    # #endregion
     if connection is not None and is_personal_avatar:
         analysis_bundle = build_analysis_backend(
             deep_agent_run_context,

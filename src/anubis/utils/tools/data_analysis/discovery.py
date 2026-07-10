@@ -223,23 +223,30 @@ async def resolve_available_connection(
     Resolution order, replacing the old single global SSE dial so that remote
     (relay/tunnel) installs work, while co-located dev still functions:
 
-    1. **Pending registration** (the daemon pushed its presence to this API).
-       For ``relay`` mode the daemon holds a live outbound socket, so presence
-       is confirmed by the in-process relay registry; for ``tunnel``/``local``
-       modes presence is inferred from a fresh heartbeat. Either way the stored
-       ``mcp_url`` (relay bridge, or a directly reachable URL) becomes the
-       connection.
-    2. **SSE fallback** — only when no registration exists — dials the
+    1. **Live relay socket** for this user (authoritative). The in-process
+       registry wins over a stale store registration — e.g. when a new local
+       daemon reconnects under a different ``device_id`` while heartbeats only
+       refreshed ``last_seen_at`` on an older record.
+    2. **Pending registration** (the daemon pushed its presence to this API).
+       For ``relay`` mode presence still requires a live socket for the stored
+       ``device_id``; for ``tunnel``/``local`` modes presence is inferred from
+       a fresh heartbeat. Either way the stored ``mcp_url`` becomes the
+       connection when no live session was found above.
+    3. **SSE fallback** — only when no registration exists — dials the
        co-located discovery endpoint (``discover_announced_server``) for the
        same-machine development flow.
     """
+    from src.anubis.utils.tools.data_analysis import relay
+
+    live_session = relay.session_for_user(user_id)
+    if live_session is not None:
+        return relay.connection_from_session(live_session)
+
     record = await read_user_registration(store, user_id)
     if record is not None:
         connection_mode = record.get("connection_mode", "relay")
         device_id = record.get("device_id")
         if connection_mode == "relay":
-            from src.anubis.utils.tools.data_analysis import relay
-
             if relay.is_online(device_id):
                 return _connection_from_registration(record)
             # Registered but the outbound socket is down: the server is not
@@ -343,10 +350,31 @@ async def bound_connection_for(
     This is the sole gate for the data-analysis capability: no environment
     switch, no per-avatar enable flag — only a saved, consented connection
     whose bound avatar matches the avatar currently answering.
+
+    When a live relay socket exists for the user, the returned connection is
+    rebuilt from that session (loopback bridge URL + current device secret)
+    so a stale saved URL — e.g. ``host.docker.internal:8000`` from an older
+    local-mode consent — cannot keep data analysis permanently broken.
     """
     record = await read_user_connection(store, user_id)
     if record is None or record.get("status") != "connected":
         return None
     if record.get("assistant_id") != assistant_id:
         return None
+
+    from src.anubis.utils.tools.data_analysis import relay
+
+    live_session = relay.session_for_user(user_id)
+    if live_session is not None:
+        connection = relay.connection_from_session(live_session)
+        if (
+            record.get("url") != connection.url
+            or record.get("device_secret") != connection.device_secret
+            or list(record.get("allowed_roots") or []) != list(connection.allowed_roots)
+        ):
+            await save_user_connection(
+                store, user_id, connection=connection, assistant_id=assistant_id
+            )
+        return connection
+
     return McpConnection.from_mapping(record)

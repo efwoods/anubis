@@ -94,9 +94,25 @@ async def get_mcp_filesystem_tools(connection: McpConnection) -> list[Any]:
         return []
 
     try:
+        # #region agent log
+        try:
+            import json as _json
+            with open("/deps/anubis/.cursor/debug-7a1f58.log", "a") as _f:
+                _f.write(_json.dumps({"sessionId":"7a1f58","runId":"post-fix","hypothesisId":"A,B,E","location":"mcp_client.py:get_mcp_filesystem_tools","message":"dialing_mcp","data":{"url":connection.url,"transport":connection.transport,"server_name":connection.server_name,"has_device_secret":bool(connection.device_secret),"url_is_host_docker":"host.docker.internal" in (connection.url or ""),"url_is_relay":"/mcp/relay/" in (connection.url or "")},"timestamp":int(time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
         client = build_mcp_client(connection)
         tools = await client.get_tools()
-    except Exception:
+    except Exception as exc:
+        # #region agent log
+        try:
+            import json as _json
+            with open("/deps/anubis/.cursor/debug-7a1f58.log", "a") as _f:
+                _f.write(_json.dumps({"sessionId":"7a1f58","runId":"post-fix","hypothesisId":"B","location":"mcp_client.py:get_mcp_filesystem_tools","message":"mcp_dial_failed","data":{"url":connection.url,"exc_type":type(exc).__name__,"exc":str(exc)[:300]},"timestamp":int(time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
         _mcp_last_failure_monotonic[key] = time.monotonic()
         logger.warning(
             "Model Context Protocol filesystem server unreachable at %s; "

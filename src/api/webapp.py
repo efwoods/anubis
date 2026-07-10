@@ -1203,17 +1203,26 @@ async def mcp_register(
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
 
+    connection_mode = body.get("connection_mode") or "relay"
+    device_id = body.get("device_id")
+    # In relay mode the daemon's announced mcp_url may point at a different
+    # host (e.g. production) than the API instance that accepted the register
+    # call. Always rewrite to this request's own relay bridge so consent and
+    # tool calls stay on the same process that holds the WebSocket.
+    mcp_url = body.get("mcp_url")
+    if connection_mode == "relay" and device_id:
+        mcp_url = f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
+
     record = {
         "status": "pending_consent",
-        "connection_mode": body.get("connection_mode") or "relay",
+        "connection_mode": connection_mode,
         "server_name": body.get("server_name") or "Ubuntu-OS-Filesystem",
         # Every mode is driven as a streamable-HTTP client; in relay mode the
-        # ``mcp_url`` the daemon sent already points at this API's own
-        # ``/mcp/relay/<device_id>`` bridge.
+        # ``mcp_url`` points at this API's own ``/mcp/relay/<device_id>`` bridge.
         "transport": "streamable_http",
-        "device_id": body.get("device_id"),
+        "device_id": device_id,
         "device_secret": body.get("device_secret"),
-        "mcp_url": body.get("mcp_url"),
+        "mcp_url": mcp_url,
         "discovery_url": body.get("discovery_url"),
         "allowed_roots": body.get("allowed_roots") or [],
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
@@ -1240,7 +1249,14 @@ async def mcp_heartbeat(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Refresh a registration's ``last_seen_at`` so it keeps counting as online."""
+    """Refresh a registration's presence fields so it keeps counting as online.
+
+    Heartbeats also sync ``device_id`` / ``mcp_url`` / ``connection_mode`` /
+    ``device_secret`` from the daemon body. Without that, a new local daemon
+    (different device id) can keep an older registration's ``last_seen_at``
+    fresh while the live relay socket belongs to a different device — leaving
+    ``resolve_available_connection`` unable to see the online session.
+    """
     from src.anubis.utils.tools.data_analysis.backend import (
         mcp_registration_namespace,
     )
@@ -1249,6 +1265,13 @@ async def mcp_heartbeat(
     user_id = current_user["identities"][0]["user_id"]
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
 
     namespace = list(mcp_registration_namespace(user_id))
     try:
@@ -1265,6 +1288,20 @@ async def mcp_heartbeat(
 
     try:
         record["last_seen_at"] = datetime.now(timezone.utc).isoformat()
+        if body.get("device_id"):
+            record["device_id"] = body["device_id"]
+        if body.get("connection_mode"):
+            record["connection_mode"] = body["connection_mode"]
+        if body.get("device_secret"):
+            record["device_secret"] = body["device_secret"]
+        connection_mode = record.get("connection_mode") or "relay"
+        device_id = record.get("device_id")
+        if connection_mode == "relay" and device_id:
+            record["mcp_url"] = (
+                f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
+            )
+        elif body.get("mcp_url"):
+            record["mcp_url"] = body["mcp_url"]
         await client.store.put_item(namespace, key=REGISTRATION_KEY, value=record)
         return JSONResponse(content={"acknowledged": True}, status_code=200)
     except Exception as heartbeat_error:

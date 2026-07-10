@@ -26,7 +26,9 @@ from src.anubis.utils.tools.data_analysis import McpConnection
 from src.anubis.utils.tools.data_analysis.backend import mcp_registration_namespace
 from src.anubis.utils.tools.data_analysis.discovery import (
     REGISTRATION_KEY,
+    bound_connection_for,
     resolve_available_connection,
+    save_user_connection,
 )
 
 
@@ -238,8 +240,83 @@ def test_resolver_returns_relay_connection_when_online():
         resolve_available_connection(store, "u1", GlobalContext())
     )
     assert connection is not None
-    assert connection.url == "https://api.neuralnexus.site/mcp/relay/d1"
+    # Live session wins: loopback bridge URL for THIS process, not the stale
+    # production URL left in the registration record.
+    assert connection.url == relay.bridge_url_for_device("d1")
     assert connection.device_secret == "mcp_dev_secret"
+
+
+def test_resolver_prefers_live_session_over_stale_registration_device():
+    """A new daemon under a different device_id must still be discoverable.
+
+    Heartbeats used to refresh only ``last_seen_at`` on an older registration,
+    so ``is_online(old_device_id)`` was false while the live socket belonged to
+    the new device. Live ``session_for_user`` is the authoritative source.
+    """
+    store = InMemoryStore()
+    _put_registration(
+        store,
+        "u1",
+        {
+            "status": "pending_consent",
+            "connection_mode": "relay",
+            "server_name": "Ubuntu-OS-Filesystem",
+            "device_id": "stale-device",
+            "device_secret": "old_secret",
+            "mcp_url": "https://api.neuralnexus.site/mcp/relay/stale-device",
+            "allowed_roots": ["/old"],
+            "last_seen_at": "2026-07-09T00:00:00+00:00",
+        },
+    )
+    _register(
+        _FakeWebSocket(),
+        device_id="live-device",
+        user_id="u1",
+        secret="new_secret",
+    )
+
+    connection = asyncio.run(
+        resolve_available_connection(store, "u1", GlobalContext())
+    )
+    assert connection is not None
+    assert connection.url == relay.bridge_url_for_device("live-device")
+    assert connection.device_secret == "new_secret"
+    assert connection.allowed_roots == ("/data",)
+
+
+def test_bound_connection_refreshes_stale_url_from_live_relay():
+    """Consent saved a host-only URL; live relay must replace it each turn."""
+
+    async def run():
+        store = InMemoryStore()
+        stale = McpConnection(
+            url="http://host.docker.internal:8000/mcp",
+            transport="streamable_http",
+            server_name="Ubuntu-OS-Filesystem",
+            allowed_roots=("/old",),
+            device_secret=None,
+        )
+        await save_user_connection(
+            store, "u1", connection=stale, assistant_id="a1"
+        )
+        _register(
+            _FakeWebSocket(),
+            device_id="live-device",
+            user_id="u1",
+            secret="mcp_dev_live",
+        )
+
+        bound = await bound_connection_for(store, "u1", "a1")
+        assert bound is not None
+        assert bound.url == relay.bridge_url_for_device("live-device")
+        assert bound.device_secret == "mcp_dev_live"
+        # Store is rewritten so a brief relay blip still has a usable URL.
+        saved = await store.aget(("u1", "mcp_connection"), "connection")
+        assert saved is not None
+        assert saved.value["url"] == bound.url
+        assert saved.value["device_secret"] == "mcp_dev_live"
+
+    asyncio.run(run())
 
 
 def test_resolver_skips_relay_registration_when_offline():

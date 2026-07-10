@@ -37,6 +37,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -155,6 +156,34 @@ def session_for_user(user_id: str) -> RelaySession | None:
 def is_online(device_id: str | None) -> bool:
     """Whether a device currently holds a live relay socket."""
     return bool(device_id) and device_id in _sessions_by_device
+
+
+def bridge_url_for_device(device_id: str) -> str:
+    """Loopback URL for this process's ``/mcp/relay/{device_id}`` bridge.
+
+    The avatar graph and the FastAPI relay bridge share one process, so tool
+    calls must hit this container's own listen port — not a host-only address
+    like ``host.docker.internal`` and not a stale production URL left in the
+    store from an earlier daemon registration.
+    """
+    port = os.environ.get("PORT") or "8000"
+    return f"http://127.0.0.1:{port}/mcp/relay/{device_id}"
+
+
+def connection_from_session(session: RelaySession):
+    """Build an :class:`~discovery.McpConnection` from a live relay session.
+
+    Imported lazily to avoid a circular import with ``discovery``.
+    """
+    from src.anubis.utils.tools.data_analysis.discovery import McpConnection
+
+    return McpConnection(
+        url=bridge_url_for_device(session.device_id),
+        transport="streamable_http",
+        server_name=session.server_name,
+        allowed_roots=session.allowed_roots,
+        device_secret=session.device_secret,
+    )
 
 
 def handle_incoming(device_id: str, message: dict[str, Any]) -> None:

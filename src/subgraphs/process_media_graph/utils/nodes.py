@@ -750,27 +750,6 @@ async def analyze_documents(
             if result:
                 analyzed_documents.extend(result)
 
-    # region agent log
-    try:
-        from src.anubis.utils.utility import _agent_debug_log as _adl
-
-        _adl(
-            "analyze_documents:return",
-            {
-                "queue_len": len(queue),
-                "analyzed_documents_len": len(analyzed_documents),
-                "sample_doc_id": (
-                    (analyzed_documents[0].metadata or {}).get("document_id")
-                    if analyzed_documents
-                    else None
-                ),
-            },
-            hypothesis_id="H1",
-        )
-    except Exception:
-        pass
-    # endregion
-
     return {
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete",
         "vectorstore_documents_to_be_indexed": analyzed_documents,
@@ -970,30 +949,6 @@ async def convert_media_list_to_text_document(
         for doc in all_documents
         if doc.metadata.get("adapter_acceptable", False) == True
     ]
-
-    # region agent log
-    try:
-        from src.anubis.utils.utility import _agent_debug_log as _adl
-
-        _adl(
-            "convert_media_list_to_text_document:return",
-            {
-                "vectorstore_len": len(vector_store_document_list_formatted),
-                "analysis_len": len(analysis_document_list_formatted),
-                "adapter_len": len(adapter_document_list_formatted),
-                "sample_vs_doc_id": (
-                    (vector_store_document_list_formatted[0].metadata or {}).get(
-                        "document_id"
-                    )
-                    if vector_store_document_list_formatted
-                    else None
-                ),
-            },
-            hypothesis_id="H1",
-        )
-    except Exception:
-        pass
-    # endregion
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,
@@ -1742,6 +1697,11 @@ async def process_media_item_task(
             # label the target speaker via known_speaker_references.
             # ---------------------------------------------------------------
             encoded_reference_audio = None
+            # The reference clip's own transcription text, used by the target
+            # attribution pass as content evidence for which speaker labels
+            # belong to the target. Read from the stored reference Document
+            # (LangChain serialization nests page_content under kwargs).
+            reference_transcript_text = ""
             if (
                 not create_reference_media_from_playlist
             ):  # Every entity is the target during create_reference_media_from_playlist
@@ -1750,9 +1710,17 @@ async def process_media_item_task(
                         (user_id, assistant_id, "reference_audio"), assistant_id
                     )
                     if ref_item is not None:
+                        ref_value = getattr(ref_item, "value", {}) or {}
                         encoded_reference_audio = (
-                            getattr(ref_item, "value", {}) or {}
-                        ).get("reference_audio_data") or None
+                            ref_value.get("reference_audio_data") or None
+                        )
+                        reference_transcript_text = (
+                            (
+                                (ref_value.get("document") or {}).get("kwargs")
+                                or {}
+                            ).get("page_content")
+                            or ""
+                        )
                 except Exception as exc:
                     logger.debug("Reference audio lookup failed (continuing): %s", exc)
 
@@ -2016,33 +1984,134 @@ async def process_media_item_task(
                         "start": seg.get("start"),
                         "end": seg.get("end"),
                         "is_target": bool(is_target) or bool(reference_audio),
+                        # Per-chunk diarization: the chunk this segment came
+                        # from. Single-request (unchunked) diarization omits the
+                        # field, so default to 0.
+                        "chunk_idx": int(seg.get("chunk_idx") or 0),
                     }
                 )
 
             turns = coalesce_segments_by_speaker(normalized_segments)
             distinct_speakers = {t["speaker"] for t in turns}
 
-            # Lone-speaker promotion. If the diarizer returned exactly one
-            # speaker and we supplied a stored reference audio (i.e. the user
-            # previously registered their voice), the lone speaker is the
-            # target — even if the diarizer's label didn't literally contain
-            # ``target_speaker_label``. The reference audio is the only voice
-            # we have a sample of; if there's one speaker on this upload and
-            # we anchored them via known_speaker_references, the upload IS the
-            # target. This rescues the case where the diarizer ignores or
-            # mangles the provided ``known_speaker_names`` label.
+            # ---------------------------------------------------------------
+            # Target attribution. The diarizer only stamps the known-speaker
+            # label on segments it confidently voice-matched to the short
+            # reference clip, and per-chunk labels namespace the rest, so many
+            # of the target's own turns arrive under generic per-chunk labels.
+            # One structured-output pass reads the whole labeled transcript and
+            # decides which labels belong to the target; the result is applied
+            # as a UNION with the diarizer's votes (a label is only ever
+            # promoted to the target, never demoted), then the turns are
+            # re-coalesced so the target's speech merges under one label.
+            # ---------------------------------------------------------------
+            enable_target_speaker_attribution = (
+                str(
+                    getattr(
+                        runtime.context,
+                        "enable_target_speaker_attribution",
+                        "TRUE",
+                    )
+                    or "TRUE"
+                ).upper()
+                == "TRUE"
+            )
             if (
-                len(distinct_speakers) == 1
+                enable_target_speaker_attribution
+                and encoded_reference_audio is not None
+                and len(distinct_speakers) > 1
+            ):
+                try:
+                    from src.subgraphs.process_media_graph.utils.target_attribution import (
+                        adjudicate_target_speaker_labels,
+                    )
+
+                    attribution_map = await adjudicate_target_speaker_labels(
+                        turns,
+                        reference_transcript_text=reference_transcript_text,
+                        target_name=target_speaker_label,
+                        target_speaker_label=target_speaker_label,
+                        context=runtime.context,
+                    )
+                except Exception as attribution_error:  # noqa: BLE001
+                    attribution_map = None
+                    logger.warning(
+                        "target attribution raised (%s); keeping diarizer votes",
+                        attribution_error,
+                    )
+
+                if attribution_map is None:
+                    _emit_media_progress(
+                        "target_attribution_failed", filename=filename
+                    )
+                else:
+                    promoted_labels = [
+                        label
+                        for label, belongs in attribution_map.items()
+                        if belongs
+                    ]
+                    for turn in turns:
+                        if attribution_map.get(turn["speaker"]):
+                            turn["is_target"] = True
+                            turn["speaker"] = target_speaker_label
+                    # Re-coalesce so the newly unified target turns merge into
+                    # the golden-format long turns; recompute the speaker set.
+                    turns = coalesce_segments_by_speaker(turns)
+                    distinct_speakers = {t["speaker"] for t in turns}
+                    _emit_media_progress(
+                        "target_attribution",
+                        filename=filename,
+                        promoted_labels=promoted_labels,
+                        distinct_speakers=len(distinct_speakers),
+                    )
+                    if not any(t.get("is_target") for t in turns):
+                        logger.warning(
+                            "target attribution yielded zero target turns for "
+                            "%s; upload will produce only identity documents",
+                            filename,
+                        )
+
+            # Lone-speaker promotion (fallback after attribution). If a stored
+            # reference audio was supplied and the upload is really a single
+            # speaker, that speaker is the target even when the diarizer's label
+            # did not literally contain ``target_speaker_label``. Per-chunk
+            # namespacing means a genuinely single-speaker long upload no longer
+            # collapses to one distinct label (each chunk yields
+            # ``chunk_<n>.speaker_0``), so detect the single-speaker case by
+            # stripping the chunk prefix and checking that every chunk contains
+            # exactly one distinct raw label. This rescues the case where the
+            # diarizer ignores or mangles the provided ``known_speaker_names``
+            # label and attribution did not promote anyone.
+            def _strip_chunk_prefix(label: str) -> str:
+                text = str(label)
+                if text.startswith("chunk_") and "." in text:
+                    return text.split(".", 1)[1]
+                return text
+
+            raw_labels_by_chunk: Dict[int, set] = {}
+            for turn in turns:
+                raw_labels_by_chunk.setdefault(
+                    int(turn.get("chunk_idx") or 0), set()
+                ).add(_strip_chunk_prefix(turn["speaker"]))
+            single_raw_speaker = bool(raw_labels_by_chunk) and all(
+                len(raw_labels) == 1 for raw_labels in raw_labels_by_chunk.values()
+            )
+            if (
+                single_raw_speaker
                 and encoded_reference_audio is not None
                 and turns
-                and not turns[0].get("is_target")
+                and not any(t.get("is_target") for t in turns)
             ):
                 logger.info(
-                    "Lone speaker %r promoted to target via stored reference audio",
-                    turns[0].get("speaker"),
+                    "Single-speaker upload promoted to target via stored "
+                    "reference audio (%d chunk(s))",
+                    len(raw_labels_by_chunk),
                 )
                 for t in turns:
                     t["is_target"] = True
+                    t["speaker"] = target_speaker_label
+                turns = coalesce_segments_by_speaker(turns)
+                distinct_speakers = {t["speaker"] for t in turns}
 
             if len(distinct_speakers) > 1:
                 # Multiple speakers -> full dialogue processing. Outputs:
@@ -2307,6 +2376,7 @@ async def _expand_url_media_item(
         (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
     )
 
+
     loader = URLDocumentLoaderClass()
     if semaphore is not None:
         async with semaphore:
@@ -2314,14 +2384,12 @@ async def _expand_url_media_item(
                 url,
                 user_id=user_id,
                 assistant_id=assistant_id,
-                expect_multispeaker=parent_create_reference_media_from_playlist,
             )
     else:
         expanded_items = await loader.load(
             url,
             user_id=user_id,
             assistant_id=assistant_id,
-            expect_multispeaker=parent_create_reference_media_from_playlist,
         )
 
     if not expanded_items:
@@ -2391,12 +2459,26 @@ async def _expand_url_media_item(
                 semaphore=semaphore,
             )
         except Exception as exc:
+            child_filename = item.get("metadata", {}).get("filename") or url
             logger.exception(
                 "URL child item processing failed for %s: %s",
-                item.get("metadata", {}).get("filename") or url,
+                child_filename,
                 exc,
             )
-            return []
+            # Surface the failure as an error Document (the same contract the
+            # top-level _convert_one handler uses) so determine_media_type emits
+            # an item_error progress event and the media job reports "error"
+            # instead of silently completing with zero indexed documents.
+            return [
+                Document(
+                    page_content=f"[Error processing URL child item: {exc}]",
+                    metadata={
+                        "status": "error",
+                        "error": str(exc),
+                        "filename": child_filename,
+                    },
+                )
+            ]
 
     results = await asyncio.gather(
         *(_run_child(i, item) for i, item in enumerate(pending))

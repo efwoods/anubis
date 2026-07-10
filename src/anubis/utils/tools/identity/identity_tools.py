@@ -730,18 +730,13 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
 
     _SIMILARITY_THRESHOLD = 0.9
 
-    def _compute_message_fact_similarity() -> float:
-        from src.anubis.utils.runtime_handles import get_sentence_embedder
+    from src.anubis.utils.runtime_handles import async_score_query_against_texts
 
-        model = get_sentence_embedder()
-        message_embedding, fact_embedding = model.encode(
-            [latest_user_message_text, fact_shared_about_the_assistant_from_the_user],
-            convert_to_numpy=True,
-        )
-        scores = model.similarity(message_embedding, fact_embedding)
-        return float(scores[0][0])
-
-    similarity = await asyncio.to_thread(_compute_message_fact_similarity)
+    similarity_scores = await async_score_query_against_texts(
+        latest_user_message_text,
+        [fact_shared_about_the_assistant_from_the_user],
+    )
+    similarity = similarity_scores[0] if similarity_scores else 0.0
     if similarity < _SIMILARITY_THRESHOLD:
         """ 
             If the fact is not similar to the most recent user message 
@@ -801,9 +796,10 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
         document.metadata.get("fact")
         for document in runtime.state.get("assistant_identity_documents", [])
     ]
-    if (
-        fact_shared_about_the_assistant_from_the_user
-        in assistant_identity_documents_text_list
+    proposed_norm = _normalize_fact_text(fact_shared_about_the_assistant_from_the_user)
+    if any(
+        _normalize_fact_text(fact) == proposed_norm
+        for fact in assistant_identity_documents_text_list
     ):
         # Verbatim copy already loaded in state this turn — refuse without any model call.
         return Command(
@@ -820,6 +816,21 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     assistant_content_store_query_results = await runtime.store.asearch(
         assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user
     )
+
+    if _store_items_contain_fact(
+        assistant_content_store_query_results,
+        fact_shared_about_the_assistant_from_the_user,
+    ):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
 
     # The store index embeds the whole wrapped page_content, whose long <FACT_CONTEXT>
     # dilutes a short fact's cosine, so the proposed fact is re-scored against each hit's
@@ -918,6 +929,25 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     assistant_identity_memory_document_json = (
         assistant_identity_memory_document.to_json()
     )
+
+    # Final guard for parallel tool calls: a sibling invocation may have stored this
+    # fact between the initial search above and this write.
+    recheck_store_results = await runtime.store.asearch(
+        assistant_memory_namespace, query=fact_shared_about_the_assistant_from_the_user
+    )
+    if _store_items_contain_fact(
+        recheck_store_results, fact_shared_about_the_assistant_from_the_user
+    ):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
 
     await runtime.store.aput(
         assistant_memory_namespace,
@@ -1127,12 +1157,9 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     user_content_store_query_results = await runtime.store.asearch(
         user_identity_namespace, query=user_fact
     )
-    user_content_store_query_results_significant = [
-        item for item in user_content_store_query_results if item.score > 0.8
-    ]
     if (
         user_fact in user_identity_documents_text_list
-        or len(user_content_store_query_results_significant) > 0
+        or _store_items_contain_fact(user_content_store_query_results, user_fact)
     ):
         # Fact already exists:
 
@@ -1166,6 +1193,22 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
         page_content=searchable_page_content, metadata=document_metadata
     )
     user_identity_document_json = user_identity_document.to_json()
+
+    recheck_store_results = await runtime.store.asearch(
+        user_identity_namespace, query=user_fact
+    )
+    if _store_items_contain_fact(recheck_store_results, user_fact):
+        tool_call_id = runtime.tool_call_id
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=f"Fact: {user_fact} previously learned",
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
 
     await runtime.store.aput(
         user_identity_namespace,
@@ -1238,24 +1281,12 @@ async def _score_sentences(query: str, sentences: list[str]) -> list[float]:
     """Cosine similarity of ``query`` against each of ``sentences`` (same order).
 
     Embeds with the process-wide cached ``SentenceTransformer`` (same model as the store
-    index, so scores are on the retrieval scale). The blocking ``encode`` runs in a
-    worker thread so it does not stall the event loop — same pattern the media graph uses
-    (``process_media_graph/utils/nodes.py``). Returns ``[]`` for empty input.
+    index, so scores are on the retrieval scale). Concurrent callers are coalesced into
+    one batched ``encode`` via ``async_score_query_against_texts``.
     """
-    if not sentences:
-        return []
+    from src.anubis.utils.runtime_handles import async_score_query_against_texts
 
-    def _compute() -> list[float]:
-        from src.anubis.utils.runtime_handles import get_sentence_embedder
-
-        model = get_sentence_embedder()
-        query_embedding = model.encode([query], convert_to_numpy=True)
-        sentence_embeddings = model.encode(sentences, convert_to_numpy=True)
-        # Row 0 of the similarity matrix = query vs every sentence.
-        similarities = model.similarity(query_embedding, sentence_embeddings)[0]
-        return [float(score) for score in similarities]
-
-    return await asyncio.to_thread(_compute)
+    return await async_score_query_against_texts(query, sentences)
 
 
 def _item_document_kwargs(item) -> dict:
@@ -1304,6 +1335,21 @@ def _extract_clean_fact(item) -> str:
     if tag_match and tag_match.group(1).strip():
         return tag_match.group(1).strip()
     return page_content.strip()
+
+
+def _normalize_fact_text(fact: str | None) -> str:
+    return (fact or "").strip().casefold()
+
+
+def _store_items_contain_fact(items, proposed_fact: str) -> bool:
+    """True when any store item carries the same atomic fact text."""
+    proposed = _normalize_fact_text(proposed_fact)
+    if not proposed:
+        return False
+    for item in items or []:
+        if _normalize_fact_text(_extract_clean_fact(item)) == proposed:
+            return True
+    return False
 
 
 @dataclass
@@ -1680,31 +1726,44 @@ async def find_fact_matches(
     fact_matches: dict[tuple, FactMatch] = {}
     sentence_matches: dict[tuple, FactMatch] = {}
 
-    for namespace in _correction_namespaces(creator_id, assistant_id, user_id):
+    namespaces = _correction_namespaces(creator_id, assistant_id, user_id)
+
+    async def _search_namespace(namespace: tuple) -> tuple[tuple, list | None]:
         try:
             items = await store.asearch(namespace, query=query, limit=1000)
+            return namespace, items
         except Exception:
             logger.exception(
                 "identity fact correction: search failed for %s", namespace
             )
-            continue
+            return namespace, None
+
+    async def _score_namespace(
+        namespace: tuple, items: list
+    ) -> tuple[dict[tuple, FactMatch], dict[tuple, FactMatch]]:
+        namespace_fact_matches: dict[tuple, FactMatch] = {}
+        namespace_sentence_matches: dict[tuple, FactMatch] = {}
 
         if _namespace_is_long_text(namespace):
+            batched_sentences: list[str] = []
+            sentence_meta: list[tuple[object, str]] = []
             for item in items:
                 page_content = _item_document_kwargs(item).get("page_content") or ""
-                # Prefilter: skip docs sharing no salient token with the claim (very
-                # unlikely to assert it), unless the claim has no salient tokens at all.
                 if query_tokens and not (query_tokens & _salient_tokens(page_content)):
                     continue
-                sentences = _split_into_sentences(page_content)
-                scores = await _score_sentences(query, sentences)
-                for sentence, score in zip(sentences, scores):
+                for sentence in _split_into_sentences(page_content):
+                    batched_sentences.append(sentence)
+                    sentence_meta.append((item, sentence))
+
+            if batched_sentences:
+                scores = await _score_sentences(query, batched_sentences)
+                for (item, sentence), score in zip(sentence_meta, scores):
                     if score <= _SENTENCE_MATCH_THRESHOLD:
                         continue
                     dedup_key = (tuple(item.namespace), item.key, sentence)
-                    existing = sentence_matches.get(dedup_key)
+                    existing = namespace_sentence_matches.get(dedup_key)
                     if existing is None or score > existing.score:
-                        sentence_matches[dedup_key] = FactMatch(
+                        namespace_sentence_matches[dedup_key] = FactMatch(
                             item=item,
                             namespace=tuple(item.namespace),
                             key=item.key,
@@ -1712,43 +1771,60 @@ async def find_fact_matches(
                             matched_text=sentence,
                             score=score,
                         )
-            continue
+            return namespace_fact_matches, namespace_sentence_matches
 
-        # Atomic-fact namespace: the store index embeds the whole wrapped page_content, whose
-        # long <FACT_CONTEXT> dilutes a short claim's cosine below the gate. Score the query
-        # against the CLEAN <FACT> instead, so a fact buried in a long context is still found.
-        # ``asearch`` (limit=1000) is only the candidate generator; a namespace with >1000
-        # facts could drop the lowest-ranked blobs before re-scoring (acceptable headroom).
         atomic_candidates: list = []
         atomic_facts: list[str] = []
         for item in items:
             clean_fact = _extract_clean_fact(item)
             if not clean_fact:
                 continue
-            # Prefilter: skip facts sharing no salient token with the claim (unless the claim
-            # has none), bounding the on-the-fly embedding to plausibly-related facts.
             if query_tokens and not (query_tokens & _salient_tokens(clean_fact)):
                 continue
             atomic_candidates.append(item)
             atomic_facts.append(clean_fact)
 
-        atomic_scores = await _score_sentences(query, atomic_facts)
-        for item, clean_fact, score in zip(
-            atomic_candidates, atomic_facts, atomic_scores
-        ):
-            if score <= _CORRECTION_MATCH_THRESHOLD:
-                continue
-            dedup_key = (tuple(item.namespace), item.key)
+        if atomic_facts:
+            atomic_scores = await _score_sentences(query, atomic_facts)
+            for item, clean_fact, score in zip(
+                atomic_candidates, atomic_facts, atomic_scores
+            ):
+                if score <= _CORRECTION_MATCH_THRESHOLD:
+                    continue
+                dedup_key = (tuple(item.namespace), item.key)
+                existing = namespace_fact_matches.get(dedup_key)
+                if existing is None or score > existing.score:
+                    namespace_fact_matches[dedup_key] = FactMatch(
+                        item=item,
+                        namespace=tuple(item.namespace),
+                        key=item.key,
+                        kind="fact",
+                        matched_text=clean_fact,
+                        score=float(score),
+                    )
+
+        return namespace_fact_matches, namespace_sentence_matches
+
+    search_results = await asyncio.gather(
+        *(_search_namespace(namespace) for namespace in namespaces)
+    )
+    namespace_scores = await asyncio.gather(
+        *(
+            _score_namespace(namespace, items)
+            for namespace, items in search_results
+            if items is not None
+        )
+    )
+
+    for namespace_fact_matches, namespace_sentence_matches in namespace_scores:
+        for dedup_key, match in namespace_fact_matches.items():
             existing = fact_matches.get(dedup_key)
-            if existing is None or score > existing.score:
-                fact_matches[dedup_key] = FactMatch(
-                    item=item,
-                    namespace=tuple(item.namespace),
-                    key=item.key,
-                    kind="fact",
-                    matched_text=clean_fact,
-                    score=float(score),
-                )
+            if existing is None or match.score > existing.score:
+                fact_matches[dedup_key] = match
+        for dedup_key, match in namespace_sentence_matches.items():
+            existing = sentence_matches.get(dedup_key)
+            if existing is None or match.score > existing.score:
+                sentence_matches[dedup_key] = match
 
     all_matches = list(fact_matches.values()) + list(sentence_matches.values())
     # Greatest → least match score, so the owner reviews the strongest matches first.

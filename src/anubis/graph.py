@@ -39,8 +39,34 @@ logger = logging.getLogger(__name__)
 # imported here and below but never referenced in this file (the only
 # ``create_agent(...)`` site is commented out at ~line 313).  Removed to skip the
 # eager ``langchain.agents`` package load on every cold start.
+import json
 import pickle
+import time
+from pathlib import Path
 from typing import Any
+
+_DEBUG_LOG_PATH = Path(__file__).resolve().parents[2] / ".cursor" / "debug-ba8488.log"
+
+
+def _agent_debug_log(
+    location: str, message: str, data: dict, hypothesis_id: str
+) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "ba8488",
+            "location": location,
+            "message": message,
+            "data": data,
+            "hypothesisId": hypothesis_id,
+            "timestamp": int(time.time() * 1000),
+        }
+        _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 import numpy as np
 from langchain_core.messages import (
@@ -56,6 +82,10 @@ from langgraph.runtime import Runtime
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.deep_agent import build_avatar_deep_agent
+from src.anubis.utils.graph_interrupts import (
+    build_interrupt_resume_command,
+    collect_pending_interrupts,
+)
 from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
 from src.anubis.utils.huggingface_prefetch import (
     ensure_huggingface_models_cached,
@@ -65,6 +95,18 @@ from src.anubis.utils.nodes import load_consciousness, resolve_human_message_ima
 from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
 from src.anubis.utils.state import GlobalState
+from src.anubis.utils.tools.data_analysis import (
+    bound_connection_for,
+    build_analysis_backend,
+    build_connect_tool,
+    build_data_analysis_tools,
+    cleanup_analysis_workspace,
+    is_declined,
+    mark_declined,
+    read_user_connection,
+    resolve_available_connection,
+    save_user_connection,
+)
 from src.anubis.utils.utility import format_docs
 
 """ NODES """
@@ -636,6 +678,16 @@ async def think(
     that ultimately produces zero tool calls — i.e. the final reply.
     Token chunks for tool-planning LLM calls are silently dropped.
 
+    When the data-analysis capability is enabled (``DATA_ANALYSIS_ENABLED``)
+    and the Model Context Protocol filesystem server is reachable, the deep
+    agent additionally receives the analysis tool set and a
+    ``CompositeBackend`` (local-shell execution workspace + persistent
+    per-user-per-avatar store routes). The ephemeral workspace is cleaned in
+    the ``finally`` below — including when a human-in-the-loop ``interrupt``
+    pauses the turn: on resume this node re-runs and builds a fresh
+    workspace, and previously ingested data is recoverable from the
+    persistent store via the ``hydrate_ingested_data`` tool.
+
     Returns:
         Outer-graph state delta with:
 
@@ -654,10 +706,93 @@ async def think(
     # Key the deep-agent thread on the conversation length so each turn is isolated
     # but the interrupt/resume of one turn shares a thread (stable while paused).
     deep_agent_config, outer_thread = _deep_agent_config(config, len(state["messages"]))
-    deep_agent = build_avatar_deep_agent(
-        runtime.context, checkpointer=checkpointer, store=runtime.store
+
+    # The factory's ``with_config({"recursion_limit": ...})`` binding is honored
+    # by ``ainvoke`` but silently DROPPED by ``astream_events`` (verified against
+    # langgraph 1.x) — and ``_stream_deep_agent`` streams via ``astream_events``.
+    # Without this line the deep agent runs at langgraph's default limit of 25
+    # regardless of DEEP_AGENT_RECURSION_LIMIT, which multi-step analysis turns
+    # (discover → ingest → execute → persist) routinely exceed.
+    deep_agent_run_context = runtime.context or GlobalContext()
+    deep_agent_config["recursion_limit"] = (
+        deep_agent_run_context.deep_agent_recursion_limit
     )
 
+    # Data-analysis capability gate: the SOLE condition is a saved MCP
+    # connection that (a) the user established through the discovery/consent
+    # flow (the ``mcp_discovery`` node) and (b) is bound to THIS avatar. No
+    # environment switch, no per-avatar enable flag — the connection is the
+    # gate. Unbound avatars (e.g. a test avatar) get nothing; an unreachable
+    # server degrades to a normal turn (empty tool list) inside the tools.
+    analysis_bundle = None
+    analysis_extra_tools: list[Any] | None = None
+    # Exclusive to the user's own personal avatar: a bound connection on a
+    # demoted (no-longer-personal) avatar must NOT re-enable live MCP access.
+    is_personal_avatar = _user_personal_avatar(config, state)
+    connection = await bound_connection_for(
+        runtime.store,
+        state["user_state"]["user_id"],
+        state["assistant_state"]["assistant_id"],
+    )
+    if connection is not None and is_personal_avatar:
+        analysis_bundle = build_analysis_backend(
+            deep_agent_run_context,
+            state["user_state"]["user_id"],
+            state["assistant_state"]["assistant_id"],
+            store=runtime.store,
+        )
+        analysis_extra_tools = build_data_analysis_tools(
+            deep_agent_run_context, analysis_bundle, connection
+        )
+    elif runtime.store is not None and is_personal_avatar:
+        # Unconnected owned avatar: carry only the explicit-connect tool so a
+        # natural-language "connect to the Neural Nexus MCP server" always
+        # works, even after a decline or disconnect suppressed the automatic
+        # discovery offer.
+        analysis_extra_tools = [
+            build_connect_tool(
+                deep_agent_run_context,
+                state["user_state"]["user_id"],
+                state["assistant_state"]["assistant_id"],
+            )
+        ]
+
+    deep_agent = build_avatar_deep_agent(
+        runtime.context,
+        checkpointer=checkpointer,
+        store=runtime.store,
+        extra_tools=analysis_extra_tools,
+        backend=analysis_bundle.backend if analysis_bundle is not None else None,
+    )
+    try:
+        return await _run_avatar_deep_agent_turn(
+            state,
+            config,
+            runtime,
+            deep_agent,
+            deep_agent_config,
+            outer_thread,
+            checkpointer,
+        )
+    finally:
+        if analysis_bundle is not None:
+            cleanup_analysis_workspace(analysis_bundle)
+
+
+async def _run_avatar_deep_agent_turn(
+    state: GlobalState,
+    config: RunnableConfig,
+    runtime: Runtime[GlobalContext],
+    deep_agent: Any,
+    deep_agent_config: RunnableConfig,
+    outer_thread: str | None,
+    checkpointer: Any,
+):
+    """Body of one ``think`` turn: run/resume the deep agent, slice output.
+
+    Split out of ``think`` so the data-analysis workspace cleanup can wrap
+    the whole run in a ``try``/``finally`` without re-indenting the flow.
+    """
     deep_agent_input = {
         "messages": list(state["messages"]),
         "system_message": list(state.get("system_message") or []),
@@ -673,6 +808,8 @@ async def think(
     # Slice new messages from the deep agent's persisted conversation against the
     # outer conversation length — stable across the interrupt/resume re-run.
     input_messages_count = len(state["messages"])
+    turn_key = input_messages_count
+    deep_thread_id = (deep_agent_config.get("configurable") or {}).get("thread_id")
 
     writer = get_stream_writer()
 
@@ -684,6 +821,21 @@ async def think(
     if can_persist:
         snapshot = await deep_agent.aget_state(deep_agent_config)
         already_paused = bool(snapshot.next)
+        # #region agent log
+        _agent_debug_log(
+            "graph.py:_run_avatar_deep_agent_turn:pre_run",
+            "deep agent snapshot before fresh run",
+            {
+                "outer_thread": outer_thread,
+                "deep_thread_id": deep_thread_id,
+                "turn_key": turn_key,
+                "already_paused": already_paused,
+                "snapshot_next": list(snapshot.next or []),
+                "task_count": len(snapshot.tasks or []),
+            },
+            "C",
+        )
+        # #endregion
 
     final_output: dict[str, Any] | None = None
     if not already_paused:
@@ -697,14 +849,58 @@ async def think(
     # owner's decision, which we forward into the deep agent on its own thread.
     if can_persist:
         snapshot = await deep_agent.aget_state(deep_agent_config)
-        pending_interrupts = [
-            intr for task in snapshot.tasks for intr in task.interrupts
-        ]
+        pending_interrupts = collect_pending_interrupts(snapshot)
+        # #region agent log
+        _agent_debug_log(
+            "graph.py:_run_avatar_deep_agent_turn:pending_interrupts",
+            "deep agent pending interrupts before outer forward/resume",
+            {
+                "outer_thread": outer_thread,
+                "deep_thread_id": deep_thread_id,
+                "turn_key": turn_key,
+                "already_paused": already_paused,
+                "pending_count": len(pending_interrupts),
+                "pending_ids": [getattr(i, "id", None) for i in pending_interrupts],
+                "pending_kinds": [
+                    (getattr(i, "value", None) or {}).get("kind")
+                    if isinstance(getattr(i, "value", None), dict)
+                    else None
+                    for i in pending_interrupts
+                ],
+                "task_names": [getattr(t, "name", None) for t in (snapshot.tasks or [])],
+            },
+            "A",
+        )
+        # #endregion
         if pending_interrupts:
             decision = interrupt(pending_interrupts[0].value)
+            resume_cmd = build_interrupt_resume_command(
+                pending_interrupts, decision
+            )
+            # #region agent log
+            _agent_debug_log(
+                "graph.py:_run_avatar_deep_agent_turn:resume_deep_agent",
+                "resuming deep agent after outer interrupt returned",
+                {
+                    "pending_count": len(pending_interrupts),
+                    "resume_map_size": len(resume_cmd.resume)
+                    if isinstance(resume_cmd.resume, dict)
+                    else 1,
+                    "resume_map_keys": list(resume_cmd.resume.keys())
+                    if isinstance(resume_cmd.resume, dict)
+                    else None,
+                    "decision_type": decision.get("type")
+                    if isinstance(decision, dict)
+                    else type(decision).__name__,
+                    "target_interrupt_id": pending_interrupts[0].id,
+                    "runId": "post-fix-v2",
+                },
+                "A",
+            )
+            # #endregion
             final_output = await _stream_deep_agent(
                 deep_agent,
-                Command(resume=decision),
+                resume_cmd,
                 deep_agent_config,
                 runtime.context,
                 writer,
@@ -773,6 +969,111 @@ async def think(
     return update
 
 
+def _user_owns_avatar(config: RunnableConfig, state: GlobalState) -> bool:
+    """Whether the conversing user is the avatar's owner (creator).
+
+    A personal Neural Nexus MCP data server is only ever offered to — or
+    connectable by — the avatar's own creator, never a visitor conversing
+    with someone else's shared avatar.
+    """
+    owner_id = (
+        config.get("configurable", {})
+        .get("assistant_ctx", {})
+        .get("metadata", {})
+        .get("user_id")
+    )
+    return owner_id is not None and owner_id == state["user_state"]["user_id"]
+
+
+def _user_personal_avatar(config: RunnableConfig, state: GlobalState) -> bool:
+    """Whether the conversing user is the creator AND this is their personal avatar.
+
+    The desktop MCP data server (and future personal analytics) are exclusive to
+    the one avatar a user has flagged ``PERSONAL_AVATAR_OF_THE_CREATOR`` — never a
+    visitor on someone else's avatar, and never the user's other, non-personal
+    avatars. Combines the owner check with the ``is_personal_avatar_of_creator``
+    metadata flag set by ``/create_avatar`` / ``/modify_avatar``.
+    """
+    metadata = (
+        config.get("configurable", {}).get("assistant_ctx", {}).get("metadata", {})
+    )
+    return (
+        _user_owns_avatar(config, state)
+        and metadata.get("is_personal_avatar_of_creator") is True
+    )
+
+
+async def mcp_discovery(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+):
+    """Offer to connect a discovered MCP data server, and persist the choice.
+
+    Runs before ``load_consciousness`` so a just-approved connection is visible
+    to both the capability prompt and the ``think`` gate in the same turn. It
+    offers a connection only when ALL of the following hold, and otherwise
+    returns an empty delta (a normal turn):
+
+    - this is the user's own PERSONAL avatar (owner match AND the
+      ``is_personal_avatar_of_creator`` flag) — never a visitor on someone
+      else's avatar, and never the user's other, non-personal avatars;
+    - the user has NO connection yet (a user has at most one MCP connection —
+      once established, bound to one avatar, no further offers are made);
+    - this avatar has not previously DECLINED (a decline on one avatar never
+      suppresses the offer on the user's other avatars);
+    - a server actually ANNOUNCES itself over the discovery SSE channel.
+
+    When those hold, it raises a durable ``interrupt`` — surfaced to the client
+    as the SSE ``interrupt`` event and resolved via ``POST
+    /message/{assistant_id}/resume`` — deferring the connect decision to the
+    user. ``{"type": "apply"}`` saves the connection bound to this avatar;
+    anything else records a per-avatar decline.
+    """
+    store = runtime.store
+    if store is None:
+        return {}
+
+    user_id = state["user_state"]["user_id"]
+    assistant_id = state["assistant_state"]["assistant_id"]
+
+    if not _user_personal_avatar(config, state):
+        return {}
+
+    if await read_user_connection(store, user_id) is not None:
+        return {}
+    if await is_declined(store, user_id, assistant_id):
+        return {}
+
+    context = runtime.context or GlobalContext()
+    connection = await resolve_available_connection(store, user_id, context)
+    if connection is None:
+        return {}
+
+    decision = interrupt(
+        {
+            "kind": "mcp_connect_consent",
+            "prompt": (
+                "An MCP data server is available and not yet connected — "
+                "connect it to this avatar for data analysis?"
+            ),
+            "server": {
+                "server_name": connection.server_name,
+                "url": connection.url,
+                "transport": connection.transport,
+                "allowed_roots": list(connection.allowed_roots),
+            },
+        }
+    )
+
+    approved = isinstance(decision, dict) and decision.get("type") == "apply"
+    if approved:
+        await save_user_connection(
+            store, user_id, connection=connection, assistant_id=assistant_id
+        )
+    else:
+        await mark_declined(store, user_id, assistant_id, connection)
+    return {}
+
+
 """ GRAPH """
 
 # Build minimal graph: START -> load_consciousness -> think -> END
@@ -785,12 +1086,14 @@ anubis_workflow = StateGraph(
 
 """ ANUBIS WORKFLOW NODES """
 
+anubis_workflow.add_node("mcp_discovery", mcp_discovery)
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("think", think)
 
 """ ANUBIS WORKFLOW EDGES """
 
-anubis_workflow.add_edge(START, "load_consciousness")
+anubis_workflow.add_edge(START, "mcp_discovery")
+anubis_workflow.add_edge("mcp_discovery", "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "think")
 anubis_workflow.add_edge("think", END)
 

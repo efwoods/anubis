@@ -254,10 +254,45 @@ class GlobalContext:
         },
     )
 
-    reference_audio_diarize_max_seconds: int = field(
-        default=180,
+    enable_target_speaker_attribution: str = field(
+        default="TRUE",
         metadata={
-            "description": "Cap on audio length fed to dominant-speaker diarization for reference uploads, in seconds. Keeps the input to a single non-chunked diarizer call so speaker labels stay unified. Env REFERENCE_AUDIO_DIARIZE_MAX_SECONDS."
+            "description": "When TRUE, run the post-diarization LLM target-attribution pass that recovers the target's turns scattered across per-chunk speaker labels. Env ENABLE_TARGET_SPEAKER_ATTRIBUTION."
+        },
+    )
+
+    target_speaker_attribution_transcript_character_limit: int = field(
+        default=100000,
+        metadata={
+            "description": "Max rendered transcript characters passed to the target-attribution pass in one call; above this the transcript is adjudicated per diarization chunk. Env TARGET_SPEAKER_ATTRIBUTION_TRANSCRIPT_CHARACTER_LIMIT."
+        },
+    )
+
+    text_dialogue_segmentation_window_characters: int = field(
+        default=4000,
+        metadata={
+            "description": "Character size of each window when segmenting long-form text into speaker turns (the model echoes the window, so output length is the binding constraint). Env TEXT_DIALOGUE_SEGMENTATION_WINDOW_CHARACTERS."
+        },
+    )
+
+    text_dialogue_segmentation_max_characters: int = field(
+        default=250000,
+        metadata={
+            "description": "Cap on total text characters segmented into speaker turns; content beyond the cap is skipped with a warning. Env TEXT_DIALOGUE_SEGMENTATION_MAX_CHARACTERS."
+        },
+    )
+
+    narrative_speech_extraction_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "When TRUE, reference documents (scripture / menus) additionally run text dialogue segmentation to extract inferred-target quote and adapter documents alongside the plain document-namespace chunks. Env NARRATIVE_SPEECH_EXTRACTION_ENABLED."
+        },
+    )
+
+    structured_web_extraction_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "When TRUE, structured web pages (character wikis, personal homepages) are parsed with BeautifulSoup to extract the inferred subject's biographical prose and verbatim direct quotes. Env STRUCTURED_WEB_EXTRACTION_ENABLED."
         },
     )
 
@@ -376,6 +411,94 @@ class GlobalContext:
     )
 
     """ </Deep Agent (think node) tuning> """
+
+    """ <Data Analysis (MCP filesystem -> deep agent) tuning> """
+
+    data_analysis_enabled: str = field(
+        default="FALSE",
+        metadata={
+            "description": "Set to TRUE to enable the data preprocessing pipeline. Env DATA_ANALYSIS_ENABLED. NOTE: this gates data PREPROCESSING only — it does NOT gate the avatar's MCP data-analysis capability, which is gated solely by a discovered+consented per-user MCP connection (see data_analysis_mcp_discovery_url)."
+        },
+    )
+
+    data_analysis_mcp_url: str = field(
+        default="http://localhost:8000/mcp",
+        metadata={
+            "description": "Fallback URL of the Model Context Protocol filesystem server's tool endpoint. Normally the avatar saves the URL supplied by the server's discovery announcement; this default is used only when an announcement omits one. Env DATA_ANALYSIS_MCP_URL."
+        },
+    )
+
+    data_analysis_mcp_discovery_url: str = field(
+        default="http://localhost:8000/discovery",
+        metadata={
+            "description": "Server-Sent-Events discovery endpoint the avatar subscribes to in order to discover an available Model Context Protocol filesystem server and its connection details. Env DATA_ANALYSIS_MCP_DISCOVERY_URL."
+        },
+    )
+
+    data_analysis_discovery_timeout_seconds: float = field(
+        default=2.0,
+        metadata={
+            "description": "Maximum seconds the avatar waits for a discovery announcement before proceeding without offering a connection this turn. Kept small so a missing server never stalls a conversation turn. Env DATA_ANALYSIS_DISCOVERY_TIMEOUT_SECONDS."
+        },
+    )
+
+    data_analysis_mcp_transport: str = field(
+        default="streamable_http",
+        metadata={
+            "description": "Transport for the Model Context Protocol filesystem server connection. streamable_http is the supported value; the Server-Sent-Events transport is deprecated by the Model Context Protocol specification. Env DATA_ANALYSIS_MCP_TRANSPORT."
+        },
+    )
+
+    data_analysis_mcp_server_name: str = field(
+        default="Ubuntu-OS-Filesystem",
+        metadata={
+            "description": "Registered name of the Model Context Protocol filesystem server inside the MultiServerMCPClient configuration. Env DATA_ANALYSIS_MCP_SERVER_NAME."
+        },
+    )
+
+    data_analysis_execution_backend: str = field(
+        default="local_shell",
+        metadata={
+            "description": "Execution backend for deep-agent data analysis. local_shell runs shell commands inside this container's per-turn temporary workspace; hosted sandbox provider names are reserved for the future. Env DATA_ANALYSIS_EXECUTION_BACKEND."
+        },
+    )
+
+    data_analysis_workspace_root: str = field(
+        default="/tmp/anubis-analysis",
+        metadata={
+            "description": "Root directory under which each analysis turn creates an ephemeral workspace; the workspace is deleted when the turn ends. Env DATA_ANALYSIS_WORKSPACE_ROOT."
+        },
+    )
+
+    data_analysis_store_max_bytes: int = field(
+        default=52428800,
+        metadata={
+            "description": "Per-user-per-avatar byte quota for the ingested-data store buffer; least-recently-updated items are evicted beyond this size. Default 50 MiB. Env DATA_ANALYSIS_STORE_MAX_BYTES."
+        },
+    )
+
+    data_analysis_store_max_age_days: int = field(
+        default=90,
+        metadata={
+            "description": "Maximum age in days for items in the ingested-data store buffer; older items are evicted as a backstop. Env DATA_ANALYSIS_STORE_MAX_AGE_DAYS."
+        },
+    )
+
+    data_analysis_registration_stale_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Maximum age in seconds of a local MCP daemon's last heartbeat (POST /mcp/heartbeat) for its pushed registration to still count as online, for tunnel/local connection modes that have no live socket. Relay mode ignores this and uses live-socket presence instead. Env DATA_ANALYSIS_REGISTRATION_STALE_SECONDS."
+        },
+    )
+
+    data_analysis_relay_request_timeout_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Maximum seconds the /mcp/relay bridge waits for the local MCP daemon to return a proxy_response for one tunneled HTTP call before failing the request. Matches the daemon's own 120s local-proxy timeout. Env DATA_ANALYSIS_RELAY_REQUEST_TIMEOUT_SECONDS."
+        },
+    )
+
+    """ </Data Analysis (MCP filesystem -> deep agent) tuning> """
 
     dev: str = field(
         default=None,

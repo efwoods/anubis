@@ -77,3 +77,77 @@ python moderator_bot.py
 set OPENAI_API_KEY="your-openai-key"
 python moderator_bot.py
 Use code with caution.4. Code Architecture OverviewTwitchIO framework: The bot inherits from commands.Bot to establish an asynchronous architecture. It connects via an IRC WebSocket wrapper to stream the chat data in real-time.event_message hook: Every payload arriving from Twitch chat goes through this asynchronous function wrapper.OpenAI moderations.create: The bot makes a synchronous HTTP request over the network to OpenAI's server infrastructure. It evaluates the text for harassment, hate, self-harm, sexual content, and violence./timeout action command: If the payload parameter result.flagged resolves to True, the bot sends an active moderation text string back into the channel room chat interface. This triggers a server-side client timeout for the targeted violator.If you'd like to extend this setup, let me know if you want the bot to respond with customized AI warnings instead of an immediate timeout, or if you need help deploying it to run 24/7 using a free hosting platform.
+
+
+# TWITCH BOT INTEGRATION EXAMPLE:
+AI Overview                 To create a Twitch chatbot in Python that interfaces with the OpenAI ChatGPT API and streams responses back to chat, you will use the TwitchIO library for the Twitch connection and the openai Python SDK for the ChatGPT integration.Here is how you can set this up:For a visual guide on setting up the OpenAI ChatGPT API and authenticating your bot:1mAdd ChatGPT into your own Twitch chat in just 4 simple ...oSetinhasYouTube · Mar 24, 20231. Prerequisites & InstallationInstall the required asynchronous Python libraries via your terminal or command prompt:bashpip install twitchio openai
+Use code with caution.2. Configuration & AuthenticationYou will need credentials for both services:Twitch: Register a new application at the Twitch Developer Console to get your Client ID and generate an OAuth token for your bot account.OpenAI: Sign up at the OpenAI Platform to add billing credits and create a new secret API Key.3. Python Code ImplementationCreate a bot.py file and use the following script. This code sets up an asynchronous bot, listens for chat messages, sends the context to ChatGPT, and streams the AI's response in real-time back to the Twitch chat.pythonimport os
+from twitchio.ext import commands
+from openai import AsyncOpenAI
+
+# 1. Initialize API Clients
+twitch_token = os.environ.get("TWITCH_OAUTH_TOKEN")
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+
+# Initialize OpenAI
+client = AsyncOpenAI(api_key=openai_api_key)
+
+# 2. Define the Twitch Bot
+class Bot(commands.Bot):
+    def __init__(self):
+        # Initialize the bot with your OAuth, Client ID, and the target channels
+        super().__init__(
+            token=twitch_token,
+            prefix='!', # Bot command prefix
+            initial_channels=['#your_twitch_channel']
+        )
+
+    async def event_ready(self):
+        print(f'Logged in as | {self.nick}')
+        print(f'User ID | {self.user_id}')
+
+    async def event_message(self, message):
+        # Prevent the bot from responding to itself
+        if message.echo:
+            return
+
+        # Check if the message is directed at the bot (e.g., starts with !ask or directly pinged)
+        # For simplicity, we process all messages containing a specific trigger or command
+        if message.content.startswith('!ai'):
+            user_question = message.content.replace('!ai', '', 1).strip()
+            
+            # Send context to ChatGPT API with streaming
+            try:
+                stream = await client.chat.completions.create(
+                    model="gpt-4o", # Or gpt-4o-mini
+                    messages=[
+                        {"role": "system", "content": "You are a helpful and witty Twitch chatbot."},
+                        {"role": "user", "content": f"{message.author.name} asked: {user_question}"}
+                    ],
+                    stream=True,
+                )
+
+                response_chunks = []
+                # Stream the response back in chunks
+                async for chunk in stream:
+                    if chunk.choices[0].delta.content is not None:
+                        response_chunks.append(chunk.choices[0].delta.content)
+
+                full_response = "".join(response_chunks)
+                
+                # Split the full response to fit Twitch's character limit (500 chars)
+                # and send the stream back to the chat room
+                await message.channel.send(f"@{message.author.name} {full_response}")
+
+            except Exception as e:
+                print(f"Error fetching AI response: {e}")
+                await message.channel.send("Sorry, I'm having trouble thinking right now.")
+
+        # Process standard Twitch commands if you define any
+        await self.handle_commands(message)
+
+# 3. Run the Bot
+if __name__ == "__main__":
+    bot = Bot()
+    bot.run()
+Use code with caution.4. Important Considerations for Twitch & OpenAIRate Limits: Twitch restricts chat message frequency (typically 20 messages per 30 seconds for verified bots). If you expect heavy traffic, build in a command cooldown.Character Limits: Twitch chat has a message limit. If ChatGPT outputs a massive paragraph, you may need to chunk the final string via Python before calling .send().API Cost: Ensure you monitor your OpenAI billing, as streaming live responses to a highly active Twitch chat can deplete tokens quickly.Would you like help with:Setting up a message cooldown system to prevent API spam?Adding a prompt history / memory so the bot remembers the context of past messages?Handling message truncation to ensure long OpenAI responses don't get blocked by Twitch limits?

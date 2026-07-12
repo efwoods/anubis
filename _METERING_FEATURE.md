@@ -178,3 +178,6 @@ plink_1TKRnBLimk9GVb...
 Please use Model Context Protocol With stripe to begin the plan for metering. I need to know how to create three subscriptions with metered token usage per subscription as defined in this document'/home/user/gh/anubis-project/wt/f-metering/_METERING_FEATURE.md'. I have 3 products and I'm fairly certain these are
   not setup correctly for three subscriptions the users can change, free trial with pro, and metered token usage per tier: [Pasted text #1 +70 lines][Pasted text #2 +54 lines] '/home/user/gh/anubis-project/wt/f-metering/_METERING_FEATURE.md'; please investigate the current urls, documentation, and code to identity
   errors and adhere to the standards set in _METERING_FEATURE.md
+
+
+#[Plan](/home/user/.claude/plans/please-use-model-context-zippy-rossum.md)

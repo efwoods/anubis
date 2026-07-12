@@ -109,7 +109,6 @@ async def retry_async_httpx_request(
     """
     Async retry wrapper for httpx requests.
     """
-
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(max_retries):
             try:
@@ -195,6 +194,68 @@ async def _mgmt_headers(request: Request) -> dict:
     return {"Authorization": f"Bearer {access_token}"}
 
 
+async def _provision_stripe_customer_and_default_tier(
+    request: Request,
+    user_id: Optional[str],
+    email: Optional[str],
+    name: Optional[str] = None,
+) -> Optional[str]:
+    """Create a Stripe customer for a new signup and pin the account to free tier.
+
+    Establishes the single canonical ``app_metadata.stripe_customer_id`` (replacing
+    the historically inconsistent ``customer_dict``/``customer`` keys) and records a
+    default free-tier ``subscription_status`` so gating has a tier to read before the
+    user ever subscribes. Best-effort: a Stripe or Auth0 failure logs and returns
+    ``None`` rather than blocking signup, because the Stripe webhook and
+    ``check_subscription_status`` reconcile the record later.
+    """
+    stripe_client = request.app.state.stripe
+    try:
+        customer = stripe_client.Customer.create(
+            email=email,
+            name=name or None,
+            metadata={"auth0_user_id": user_id or ""},
+        )
+    except Exception as customer_error:
+        logger.error(
+            "Could not create Stripe customer for %s: %s", email, customer_error
+        )
+        return None
+
+    customer_id = customer["id"]
+    app_metadata_update = {
+        "stripe_customer_id": customer_id,
+        "subscription_status": {
+            "status": None,
+            "tier": "free",
+            "subscription_id": None,
+            "customer_id": customer_id,
+            "email": email,
+        },
+    }
+    if not user_id:
+        return customer_id
+    try:
+        headers = await _mgmt_headers(request)
+        provider_encoded_user_id = quote(user_id, safe="")
+        patch_response = await retry_async_httpx_request(
+            method="PATCH",
+            url=f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}",
+            headers=headers,
+            json={"app_metadata": app_metadata_update},
+        )
+        patch_response.raise_for_status()
+    except Exception as patch_error:
+        logger.error(
+            "Created Stripe customer %s but could not persist it to Auth0 app_metadata "
+            "for %s: %s",
+            customer_id,
+            user_id,
+            patch_error,
+        )
+    return customer_id
+
+
 # utility functions
 async def signup_user(
     email: str, password: str, request: Request, name: Optional[str] = None
@@ -223,6 +284,18 @@ async def signup_user(
         )
 
         response.raise_for_status()
+
+        # Provision a Stripe customer and default free tier for the new account so
+        # metering and tier gating have a canonical stripe_customer_id to work with.
+        created_user = response.json()
+        created_user_id = created_user.get("user_id") or created_user.get("_id")
+        await _provision_stripe_customer_and_default_tier(
+            request=request,
+            user_id=created_user_id,
+            email=email,
+            name=name if name else None,
+        )
+
         result = {
             "api_key": api_key,
             "message": "Save this key. This key is shown only once and used for every api request.",
@@ -861,7 +934,6 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
 #         raise HTTPException(detail = response.json(), status_code=response.status_code)
 
 
-import pandas as pd
 import stripe
 from datetime import datetime, timezone
 
@@ -876,6 +948,9 @@ class SubscriptionStatus:
     customer_id: str = None
     email: str = None
     last_updated: str = None
+    # The subscription tier (free / pro / premium). Defaults to free so that a
+    # missing or unsubscribed record grants only free-tier capabilities.
+    tier: str = "free"
 
     def to_dict(self):
         return {
@@ -883,12 +958,13 @@ class SubscriptionStatus:
             "subscription_id": self.subscription_id,
             "customer_id": self.customer_id,
             "email": self.email,
+            "tier": self.tier,
         }
 
     def update(
         self,
         field: Literal[
-            "status", "subscription_id", "customer_id", "email", "last_updated"
+            "status", "subscription_id", "customer_id", "email", "last_updated", "tier"
         ],
         value,
     ):
@@ -903,55 +979,112 @@ class SubscriptionStatus:
                 self.email = value
             case "last_updated":
                 self.last_updated = value
+            case "tier":
+                self.tier = value
         return self.to_dict()
+
+
+def _tier_from_subscription(stripe_client, subscription: dict) -> str:
+    """Resolve the tier of a Stripe subscription from its items' product metadata.
+
+    The provisioning script tags each tier product with a ``neural_nexus_tier``
+    metadata key. This reads that key off the first subscription item's product,
+    defaulting to ``free`` when the subscription is inactive or unrecognized so a
+    lookup can never accidentally grant a paid tier.
+    """
+    status = subscription.get("status")
+    if status not in ("active", "trialing", "past_due"):
+        return "free"
+    try:
+        items = subscription.get("items", {}).get("data", [])
+        for item in items:
+            product = item.get("price", {}).get("product")
+            if not product:
+                continue
+            if isinstance(product, dict):
+                product_metadata = product.get("metadata", {})
+            else:
+                product_metadata = (
+                    stripe_client.Product.retrieve(product).to_dict().get("metadata", {})
+                )
+            tier = product_metadata.get("neural_nexus_tier")
+            if tier:
+                return tier
+    except Exception as tier_error:
+        logger.error("Could not resolve tier from subscription: %s", tier_error)
+    return "free"
+
+
+async def update_user_subscription_status(
+    request: Request, auth0_user_id: str, subscription_status: dict
+) -> bool:
+    """Write a resolved ``subscription_status`` (incl. tier) into Auth0 app_metadata.
+
+    Called by the Stripe webhook to keep the cached tier/status in sync in real time.
+    Auth0 merges ``app_metadata`` at the top level, so patching just the
+    ``subscription_status`` key replaces that record without disturbing other
+    metadata. Best-effort: logs and returns ``False`` on failure.
+    """
+    if not auth0_user_id:
+        return False
+    try:
+        headers = await _mgmt_headers(request)
+        provider_encoded_user_id = quote(auth0_user_id, safe="")
+        response = await retry_async_httpx_request(
+            method="PATCH",
+            url=f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}",
+            headers=headers,
+            json={"app_metadata": {"subscription_status": subscription_status}},
+        )
+        response.raise_for_status()
+        return True
+    except Exception as sync_error:
+        logger.error(
+            "Could not sync subscription status to Auth0 for %s: %s",
+            auth0_user_id,
+            sync_error,
+        )
+        return False
 
 
 async def check_subscription_status(request: Request, current_user: dict) -> dict:
     stripe_client = request.app.state.stripe
     subscription_status = current_user["app_metadata"].get("subscription_status", None)
     email = current_user.get("email")
-    if not subscription_status:
-        # Identify Customer from email
-        customer_df = pd.DataFrame(stripe_client.Customer.list().to_dict()["data"])
-        if len(customer_df) == 0:
-            # Customer is not subscribed
-            customer_subscription_status = SubscriptionStatus()
-            return customer_subscription_status.to_dict()
-        customer_id_series = customer_df[customer_df["email"] == email]["id"].values
-        if len(customer_id_series) != 0:
-            customer_id = customer_id_series[0]
-        else:
-            # Customer is not subscribed
-            customer_subscription_status = SubscriptionStatus()
-            return customer_subscription_status.to_dict()
 
-        subscription_df = pd.DataFrame(
-            stripe_client.Subscription.list().to_dict()["data"]
-        )
-        customer_subscription = subscription_df[
-            subscription_df["customer"] == customer_id
-        ]
-        customer_subscription_status = SubscriptionStatus()
-        if len(customer_subscription) != 0:
-            _ = customer_subscription_status.update("email", email)
-            _ = customer_subscription_status.update(
-                "subscription_id", customer_subscription.id.values[0]
+    # Anonymous / email-less users are always the free tier and never have a Stripe
+    # subscription to look up, so short-circuit before touching Stripe.
+    if not email:
+        return SubscriptionStatus().to_dict()
+
+    if not subscription_status or not subscription_status.get("subscription_id"):
+        # Identify the customer server-side by email rather than scanning every
+        # customer/subscription in the account.
+        customers = stripe_client.Customer.list(email=email, limit=1).to_dict()["data"]
+        if not customers:
+            return SubscriptionStatus().to_dict()
+        customer_id = customers[0]["id"]
+
+        subscriptions = stripe_client.Subscription.list(
+            customer=customer_id, status="all", limit=1
+        ).to_dict()["data"]
+        customer_subscription_status = SubscriptionStatus(customer_id=customer_id, email=email)
+        if subscriptions:
+            subscription = subscriptions[0]
+            customer_subscription_status.update("subscription_id", subscription["id"])
+            customer_subscription_status.update("status", subscription["status"])
+            customer_subscription_status.update(
+                "tier", _tier_from_subscription(stripe_client, subscription)
             )
-            _ = customer_subscription_status.update("customer_id", customer_id)
-            _ = customer_subscription_status.update(
-                "status", customer_subscription.status[0]
-            )
-            _ = customer_subscription_status.update(
+            customer_subscription_status.update(
                 "last_updated", datetime.now(tz=timezone.utc).isoformat()
             )
-            # Update app_metadata
+            # Cache the resolved status back into app_metadata under the correct key.
             current_user["app_metadata"][
-                "subscription_stat s"
+                "subscription_status"
             ] = customer_subscription_status.to_dict()
             headers = await _mgmt_headers(request)
-
             payload = {"app_metadata": current_user["app_metadata"]}
-
             provider_encoded_user_id = quote(current_user["user_id"], safe="")
             try:
                 response = await retry_async_httpx_request(
@@ -960,7 +1093,6 @@ async def check_subscription_status(request: Request, current_user: dict) -> dic
                     headers=headers,
                     json=payload,
                 )
-
                 response.raise_for_status()
             except Exception as e:
                 raise HTTPException(
@@ -968,23 +1100,27 @@ async def check_subscription_status(request: Request, current_user: dict) -> dic
                 )
     else:
         customer_subscription_status = SubscriptionStatus(
-            email=subscription_status["email"],
-            subscription_id=subscription_status["subscription_id"],
-            customer_id=subscription_status["customer_id"],
+            email=subscription_status.get("email"),
+            subscription_id=subscription_status.get("subscription_id"),
+            customer_id=subscription_status.get("customer_id"),
+            tier=subscription_status.get("tier", "free"),
         )
 
         try:
             subscription = stripe.Subscription.retrieve(
                 id=subscription_status["subscription_id"]
+            ).to_dict()
+            customer_subscription_status.update(
+                "status", subscription.get("status", None)
             )
             customer_subscription_status.update(
-                "status", subscription.to_dict().get("status", None)
+                "tier", _tier_from_subscription(stripe_client, subscription)
             )
             customer_subscription_status.update(
                 "last_updated", datetime.now(tz=timezone.utc).isoformat()
             )
         except Exception as e:
-            customer_subscription_status.update("status", subscription_status["status"])
+            customer_subscription_status.update("status", subscription_status.get("status"))
 
     return customer_subscription_status.to_dict()
 

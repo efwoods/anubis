@@ -95,6 +95,8 @@ def init_model(
                 temperature=0.1,
                 top_p=0.1,
                 api_key=api_key,
+                # Report token usage on streamed responses for the metering layer.
+                stream_usage=True,
             ).bind_tools(
                 # method='json_schema',
                 tools=tools,
@@ -218,6 +220,13 @@ def init_chat_model_unbound(context: Optional[GlobalContext] = None):
             temperature=0.1,
             top_p=0.1,
             api_key=api_key,
+            # Include token usage on the final streamed chunk so per-turn
+            # usage_metadata reaches the metering layer (Stripe billing meters,
+            # api_metrics rows, Prometheus counters). Without stream_options the
+            # OpenAI streaming API omits usage entirely. Only set for the real
+            # OpenAI endpoint: OpenAI-compatible providers (META/Llama) may
+            # reject the stream_options parameter.
+            stream_usage=(model_provider == "OPEN_AI"),
         )
 
     if model_provider == "TOGETHER":

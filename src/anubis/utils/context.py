@@ -548,6 +548,56 @@ class GlobalContext:
         default=None, metadata={"description": "Payment URL for subscriptions."}
     )
 
+    stripe_publishable_key: str = field(
+        default=None,
+        metadata={
+            "description": "Stripe publishable (client-side) key used to render checkout."
+        },
+    )
+
+    stripe_manage_subscription_url: str = field(
+        default=None,
+        metadata={
+            "description": "Stripe customer-portal login URL for managing/cancelling a subscription."
+        },
+    )
+
+    stripe_webhook_secret: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Signing secret used to verify inbound Stripe webhook events "
+                "(Dashboard 'Your account' endpoint, or a fixed whsec_). "
+                "When empty, the API falls back to stripe_webhook_secret_file "
+                "(written by the docker-compose stripe-cli service)."
+            )
+        },
+    )
+
+    stripe_webhook_secret_file: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Path to a file containing a whsec_ signing secret. Used when "
+                "STRIPE_WEBHOOK_SECRET is unset — typically "
+                "/run/stripe/webhook_secret from the compose stripe-cli service. "
+                "Env STRIPE_WEBHOOK_SECRET_FILE."
+            )
+        },
+    )
+
+    stripe_billing_config_json: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "JSON emitted by scripts/provision_stripe_billing.py mapping the four "
+                "meter event names to meter ids and each tier to its flat base price id "
+                "and per-meter graduated price ids. Parsed via "
+                "src.anubis.utils.billing.config.load_stripe_billing_config."
+            )
+        },
+    )
+
     baseline_response_threshold: float = field(
         default=47.66322963655769,
         metadata={

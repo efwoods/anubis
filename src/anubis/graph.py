@@ -83,6 +83,41 @@ def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
     )
 
 
+def _attach_token_usage_metadata(
+    avatar_response: AIMessage, turn_messages: list
+) -> None:
+    """Fold the turn's aggregate token usage into ``response_metadata["token_usage"]``.
+
+    Sums ``usage_metadata`` across every AI message the deep agent produced this
+    turn (tool-planning calls consume tokens too, not just the final reply) and
+    writes the total onto the final message's ``response_metadata`` in the
+    ``token_usage`` shape the API metering layer reads (``prompt_tokens`` /
+    ``completion_tokens`` / ``total_tokens``). ``usage_metadata`` itself is a
+    message attribute that never survives the API layer's ``response_metadata``
+    serialization, which is why the fold is necessary.
+    """
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    for message in turn_messages:
+        usage = getattr(message, "usage_metadata", None)
+        if not usage:
+            continue
+        prompt_tokens += usage.get("input_tokens") or 0
+        completion_tokens += usage.get("output_tokens") or 0
+        total_tokens += usage.get("total_tokens") or 0
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if total_tokens <= 0:
+        return
+    avatar_response.response_metadata = dict(avatar_response.response_metadata or {})
+    avatar_response.response_metadata["token_usage"] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
     """Mutate ``avatar_response.response_metadata`` with Go Emotions classifier output."""
     from src.anubis.utils.emotion_classifier import classify_go_emotions
@@ -729,6 +764,12 @@ async def think(
 
     if isinstance(final_message, AIMessage) and not final_message.tool_calls:
         _attach_go_emotions_metadata(final_message)
+        _attach_token_usage_metadata(final_message, new_messages)
+        if config.get("configurable", {}).get("use_adapter_inference"):
+            final_message.response_metadata = dict(
+                final_message.response_metadata or {}
+            )
+            final_message.response_metadata["is_adapter_inference"] = True
     # TODO: Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata. The
     # user has seen the reply by now, so this adds no perceived latency.

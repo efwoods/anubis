@@ -5,6 +5,9 @@ volumes:
         driver: local
     redis-data:
         driver: local
+    # Shared whsec_ between stripe-cli and the API (local listen; not used in prod).
+    stripe-webhook-secret:
+        driver: local
 
 services:
     redis:
@@ -39,6 +42,10 @@ services:
             start_period: 10s
         env_file:
             - .env.dev
+        environment:
+            # Prefer Dashboard STRIPE_WEBHOOK_SECRET when set; otherwise the API
+            # reads the secret written by the stripe-cli service into this file.
+            STRIPE_WEBHOOK_SECRET_FILE: /run/stripe/webhook_secret
         depends_on:
             redis:
                 condition: service_healthy
@@ -46,3 +53,28 @@ services:
             - .:/deps/anubis
             # Prefetched Hub weights (see ``ensure_huggingface_models_cached``); survives container restarts.
             - ~/.cache/huggingface:/root/.cache/huggingface
+            - stripe-webhook-secret:/run/stripe
+
+    # Forwards Stripe *account* (not Connect) events to the API and publishes the
+    # signing secret to the shared volume. Leave STRIPE_WEBHOOK_SECRET empty in
+    # .env.dev — no manual whsec_ paste on each restart.
+    #
+    # Persistent Dashboard webhook: create under Developers → Webhooks →
+    # "Your account" (NOT "Connect"), point at your public HTTPS /stripe/webhook,
+    # then put that endpoint's signing secret in STRIPE_WEBHOOK_SECRET (prod .env).
+    stripe-cli:
+        image: stripe/stripe-cli:latest
+        env_file:
+            - .env.dev
+        environment:
+            STRIPE_WEBHOOK_SECRET_FILE: /run/stripe/webhook_secret
+            # In-compose DNS name + container listen port (same as PORT in .env.dev).
+            STRIPE_WEBHOOK_FORWARD_TO: http://langgraph-api-dev:${PORT:-8123}/stripe/webhook
+        depends_on:
+            langgraph-api-dev:
+                condition: service_healthy
+        volumes:
+            - ./scripts/stripe_listen_entrypoint.sh:/entrypoint.sh:ro
+            - stripe-webhook-secret:/run/stripe
+        entrypoint: ["/bin/sh", "/entrypoint.sh"]
+        restart: unless-stopped

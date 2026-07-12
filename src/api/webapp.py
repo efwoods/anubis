@@ -16,11 +16,12 @@ from datetime import datetime, timezone
 
 # Add metrics imports
 from time import time_ns
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, List, Literal, Optional
 from uuid import UUID, uuid4
 
 import httpx
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -53,6 +54,24 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, BeforeValidator
 
 from src.anubis.graph import message_workflow
+from src.anubis.utils.billing import (
+    TIER_DEFINITIONS,
+    SubscriptionTier,
+    TierCapability,
+    UsageMeter,
+    billable_tokens_from_metadata,
+    ensure_api_metrics_table,
+    estimate_upload_token_units,
+    fetch_month_to_date_usage,
+    load_stripe_billing_config,
+    persist_api_metrics_row,
+    report_meter_event,
+    resolve_metering_user_id,
+    resolve_stripe_customer_id,
+    resolve_tier,
+    resolve_use_adapter_inference,
+    tier_allotment_for_meter,
+)
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.utils.store_cache import (
@@ -68,12 +87,173 @@ from src.api.media_jobs import (
     run_batch_media_job,
 )
 from src.security.auth import (
+    _tier_from_subscription,
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
     security_route,
     update_assistant_config,
+    update_user_subscription_status,
 )
+
+
+def tier_from_value_or_400(value: str) -> SubscriptionTier:
+    """Coerce a request-supplied tier string into a SubscriptionTier or raise 400.
+
+    Unlike the defensive ``tier_from_value`` (which silently falls back to free),
+    an explicit tier chosen by the caller must be a real tier name, so an unknown
+    value is a client error rather than a silent downgrade.
+    """
+    try:
+        return SubscriptionTier(str(value).strip().lower())
+    except ValueError:
+        raise HTTPException(
+            detail=f"Unknown subscription tier '{value}'. Expected one of: "
+            + ", ".join(t.value for t in SubscriptionTier),
+            status_code=400,
+        )
+
+
+# Human-readable reason returned when a tier lacks a capability, so the client can
+# prompt the user to upgrade to the tier that unlocks it.
+_CAPABILITY_REQUIRED_TIER = {
+    TierCapability.UPLOAD: SubscriptionTier.PRO,
+    TierCapability.TRAIN_ADAPTER: SubscriptionTier.PREMIUM,
+}
+
+
+def enforce_tier_capability(current_user: dict, capability: TierCapability) -> SubscriptionTier:
+    """Raise HTTP 403 unless the user's resolved tier unlocks ``capability``.
+
+    This is the enforcement layer that gates billable work by tier: every tier can
+    message, pro adds uploads, premium adds adapter training. Anonymous users
+    resolve to free and therefore reach only the message capability. Returns the
+    resolved tier so callers can reuse it without recomputing.
+    """
+    tier = resolve_tier(current_user)
+    if capability in TIER_DEFINITIONS[tier].capabilities:
+        return tier
+    required = _CAPABILITY_REQUIRED_TIER.get(capability)
+    required_text = f" Upgrade to the {required.value} tier." if required else ""
+    raise HTTPException(
+        status_code=403,
+        detail=f"Your '{tier.value}' tier does not permit this action.{required_text}",
+    )
+
+
+async def enforce_remaining_allotment(
+    app_state, current_user: dict, meter: UsageMeter
+) -> None:
+    """Block a free-tier user whose monthly allotment for ``meter`` is exhausted.
+
+    Paid tiers are never blocked here: their subscription carries a graduated
+    metered price, so usage past the allotment simply bills as pay-per-use overage.
+    The free tier has no subscription and therefore no payable overage, so once the
+    month-to-date usage (read from the local ``api_metrics`` table, which also
+    covers anonymous users via their hashed-IP identifier) reaches the free
+    allotment the request is refused with HTTP 402 until the calendar month rolls
+    over or the user subscribes.
+    """
+    tier = resolve_tier(current_user)
+    if tier != SubscriptionTier.FREE:
+        return
+    allotment = tier_allotment_for_meter(tier, meter)
+    if allotment is None:
+        # The capability gate is the authority for dimensions the tier lacks.
+        return
+    metering_user_id = resolve_metering_user_id(current_user)
+    month_to_date_usage = await fetch_month_to_date_usage(
+        getattr(app_state, "pool", None), metering_user_id, meter.value
+    )
+    if month_to_date_usage >= allotment.monthly_allotment:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "Your free-tier monthly allotment of "
+                f"{allotment.monthly_allotment:,} {meter.value.replace('_', ' ')} "
+                "is exhausted. Subscribe to a paid tier to continue this month."
+            ),
+        )
+
+
+async def _meter_message_usage(
+    app_state,
+    current_user: dict,
+    response_metadata: Optional[dict],
+    thread_id: Optional[str],
+    assistant_id: Optional[str],
+    latency_ms: float,
+    request_id: Optional[str] = None,
+) -> None:
+    """Report messaging (or adapter-inference) token usage and persist a metrics row.
+
+    Best-effort and non-fatal: extracts billable tokens from the model response
+    metadata, reports them to the correct Stripe meter keyed on the customer,
+    increments the Prometheus token/cost counters (previously defined but never
+    used), and writes one ``api_metrics`` row. A ``None`` customer id (anonymous
+    user) makes the Stripe report a no-op while still recording local metrics.
+    """
+    try:
+        token_usage = (response_metadata or {}).get("token_usage") or {}
+        prompt_tokens = int(token_usage.get("prompt_tokens") or 0)
+        completion_tokens = int(token_usage.get("completion_tokens") or 0)
+        total_tokens = billable_tokens_from_metadata(response_metadata)
+        model_name = (response_metadata or {}).get("model_name")
+        cost_usd = float((response_metadata or {}).get("total_cost") or 0.0)
+
+        stripe_customer_id = resolve_stripe_customer_id(current_user)
+        tier = resolve_tier(current_user)
+
+        # Adapter inference is billed against a separate meter at a different rate;
+        # the think node sets is_adapter_inference when the client requested
+        # adapter=True and the user is Premium (see use_adapter_inference in config).
+        is_adapter_inference = bool((response_metadata or {}).get("is_adapter_inference"))
+        if is_adapter_inference and tier == SubscriptionTier.PREMIUM:
+            meter = UsageMeter.ADAPTER_INFERENCE_TOKENS
+            inference_type = "adapter_inference"
+        else:
+            meter = UsageMeter.MESSAGING_TOKENS
+            inference_type = "message"
+
+        # The request id keys Stripe's meter-event deduplication so a retried
+        # request cannot double-bill the same turn.
+        await report_meter_event(
+            app_state.stripe,
+            meter,
+            stripe_customer_id,
+            total_tokens,
+            idempotency_identifier=(
+                f"{request_id}:{meter.value}" if request_id else None
+            ),
+        )
+
+        if model_name and total_tokens > 0:
+            if prompt_tokens:
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="prompt").inc(prompt_tokens)
+            if completion_tokens:
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="completion").inc(
+                    completion_tokens
+                )
+            if cost_usd:
+                MODEL_COST_TOTAL.labels(model=model_name).inc(cost_usd)
+
+        await persist_api_metrics_row(
+            getattr(app_state, "pool", None),
+            inference_type=inference_type,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+            user_id=resolve_metering_user_id(current_user),
+            stripe_customer_id=stripe_customer_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            model_name=model_name,
+            meter_event_name=meter.value,
+        )
+    except Exception as metering_error:  # noqa: BLE001 - metering must never break a reply
+        logger.error("Failed to meter message usage: %s", metering_error)
 
 
 def _drop_empty_file_fields(value: Any) -> Any:
@@ -228,6 +408,8 @@ async def message_graph_sse(
     request_id: str,
     langgraph_client_headers: dict,
     resume_command: Optional[Command] = None,
+    app_state=None,
+    current_user: Optional[dict] = None,
 ):
     """Stream assistant tokens (SSE) then a terminal event with full metadata.
 
@@ -297,9 +479,26 @@ async def message_graph_sse(
         "request_id": request_id,
         "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
     }
-    if last_ai is not None and getattr(last_ai, "response_metadata", None):
-        done["response_metadata"] = last_ai.response_metadata
+    response_metadata = (
+        last_ai.response_metadata
+        if last_ai is not None and getattr(last_ai, "response_metadata", None)
+        else None
+    )
+    if response_metadata:
+        done["response_metadata"] = response_metadata
     yield f"data: {json.dumps(done, default=str)}\n\n"
+
+    # Meter the completed turn (best-effort; never affects the already-sent stream).
+    if app_state is not None and current_user is not None:
+        await _meter_message_usage(
+            app_state=app_state,
+            current_user=current_user,
+            response_metadata=response_metadata,
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            latency_ms=(time_ns() - start_time_ns) / 1_000_000,
+            request_id=request_id,
+        )
 
 
 class MessagePayload(BaseModel):
@@ -552,6 +751,17 @@ async def lifespan(app: FastAPI):
     )
     app.state.pool = pool
     await app.state.pool.open()
+
+    # Ensure the api_metrics table exists and cache the parsed Stripe billing config
+    # (meter + tier price ids) so metering and subscription endpoints can use them.
+    await ensure_api_metrics_table(app.state.pool)
+    try:
+        app.state.stripe_billing_config = load_stripe_billing_config(
+            app.state.context.stripe_billing_config_json
+        )
+    except ValueError as billing_config_error:
+        logger.error("Invalid STRIPE_BILLING_CONFIG_JSON: %s", billing_config_error)
+        app.state.stripe_billing_config = None
     try:
         embed = "huggingface:" + app.state.context.embedding_model
         # IndexConfig key must be ``fields`` (plural). Using ``field`` is ignored and
@@ -654,38 +864,387 @@ async def documentation():
 app.include_router(router=security_route)
 
 
-@app.get("/subscribe")
-async def subscribe(current_user: dict = Depends(get_current_user)):
-    """
-    Create a monthly subscription.
-    """
+def _checkout_line_items_for_tier(
+    billing_config, tier: SubscriptionTier
+) -> list[dict]:
+    """Build Stripe Checkout line items: the flat base price plus each metered price.
 
+    The licensed base price carries ``quantity=1``; metered prices are reported via
+    usage events and therefore carry no quantity.
+    """
+    identifiers = billing_config.identifiers_for_tier(tier)
+    line_items: list[dict] = [{"price": identifiers.base_price_id, "quantity": 1}]
+    for meter, price_id in identifiers.metered_price_ids.items():
+        line_items.append({"price": price_id})
+    return line_items
+
+
+from fastapi import Query
+from enum import StrEnum
+
+@app.get("/subscribe")
+async def subscribe(
+    request: Request,
+    tier: SubscriptionTier = Query(default=SubscriptionTier.PRO, description="Chosen subscription tier."),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a Stripe Checkout session for a paid tier (pro or premium).
+
+    Replaces the single legacy payment link: a subscription now bundles the tier's
+    flat base price with its metered (allotment + overage) prices, so a customer can
+    pick a tier and the metered billing is wired from the first invoice. Anonymous
+    users can never reach this endpoint — it requires a verified authenticated user.
+    """
     verified_email = current_user.get("email_verified", None)
     if not verified_email:
         raise HTTPException(
             detail="Please verify your email before subscribing.", status_code=401
         )
-    email = current_user.get("email")
-    user_id = current_user["app_metadata"]["customer_dict"]["id"]
-    redirect_url = f"{app.state.context.stripe_payment_url}?client_reference_id={user_id}&locked_prefilled_email={email}"
 
-    return {"url": redirect_url, "message": "Follow this link to subscribe."}
+    requested_tier = tier_from_value_or_400(tier.value if isinstance(tier, SubscriptionTier) else tier)
+    if requested_tier == SubscriptionTier.FREE:
+        raise HTTPException(
+            detail="The free tier requires no checkout; every account starts on it.",
+            status_code=400,
+        )
+
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    email = current_user.get("email")
+    if billing_config is None:
+        # Billing objects not provisioned yet — fall back to the legacy payment link.
+        redirect_url = (
+            f"{app.state.context.stripe_payment_url}"
+            f"?locked_prefilled_email={email}"
+        )
+        return {"url": redirect_url, "message": "Follow this link to subscribe."}
+
+    stripe_client = request.app.state.stripe
+    customer_id = resolve_stripe_customer_id(current_user)
+    tier_definition = TIER_DEFINITIONS[requested_tier]
+
+    # A customer with a live subscription must switch tiers rather than start a
+    # second overlapping subscription through Checkout.
+    existing_status = await check_subscription_status(
+        request=request, current_user=current_user
+    )
+    if existing_status.get("subscription_id") and existing_status.get("status") in (
+        "active",
+        "trialing",
+        "past_due",
+    ):
+        raise HTTPException(
+            detail=(
+                "You already have a subscription. Use POST /change_subscription_tier "
+                "to switch tiers."
+            ),
+            status_code=409,
+        )
+
+    subscription_data: dict = {}
+    if tier_definition.trial_period_days > 0:
+        subscription_data["trial_period_days"] = tier_definition.trial_period_days
+        # Stripe forbids the legacy payment link's "pause" end behavior on
+        # subscriptions containing metered prices; "cancel" achieves the same
+        # product outcome — the customer.subscription.deleted webhook pins the
+        # user back to the free tier when a trial lapses without a payment method.
+        subscription_data["trial_settings"] = {
+            "end_behavior": {"missing_payment_method": "cancel"}
+        }
+
+    base_url = str(request.base_url).rstrip("/")
+    checkout_kwargs: dict = {
+        "mode": "subscription",
+        "line_items": _checkout_line_items_for_tier(billing_config, requested_tier),
+        "success_url": f"{base_url}/verify_subscription_status",
+        "cancel_url": f"{base_url}/docs",
+        "metadata": {
+            "auth0_user_id": current_user.get("user_id", ""),
+            "neural_nexus_tier": requested_tier.value,
+        },
+    }
+    if subscription_data:
+        checkout_kwargs["subscription_data"] = subscription_data
+    if customer_id:
+        checkout_kwargs["customer"] = customer_id
+    elif email:
+        checkout_kwargs["customer_email"] = email
+
+    try:
+        session = stripe_client.checkout.Session.create(**checkout_kwargs)
+    except Exception as checkout_error:
+        logger.error("Could not create Checkout session: %s", checkout_error)
+        raise HTTPException(
+            detail="Could not start checkout. Please try again.", status_code=502
+        )
+    return {"url": session["url"], "message": "Follow this link to subscribe."}
+
+
+@app.post("/change_subscription_tier")
+async def change_subscription_tier(
+    request: Request,
+    tier: str = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+):
+    """Switch an existing subscription to a different tier via the Subscription API.
+
+    The Stripe customer portal cannot switch plans that contain metered prices, so
+    tier changes replace every subscription item's price with the target tier's
+    prices (base + metered) in a single update, prorating the difference. Downgrading
+    to free cancels the subscription at period end.
+    """
+    requested_tier = tier_from_value_or_400(tier)
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    if billing_config is None:
+        raise HTTPException(
+            detail="Billing is not configured; cannot change tier.", status_code=503
+        )
+
+    stripe_client = request.app.state.stripe
+    status = await check_subscription_status(request=request, current_user=current_user)
+    subscription_id = status.get("subscription_id")
+    if not subscription_id:
+        raise HTTPException(
+            detail="No active subscription to change. Use /subscribe first.",
+            status_code=404,
+        )
+    if status.get("tier") == requested_tier.value:
+        raise HTTPException(
+            detail=f"You are already on the {requested_tier.value} tier.",
+            status_code=400,
+        )
+
+    if requested_tier == SubscriptionTier.FREE:
+        try:
+            stripe_client.Subscription.modify(
+                subscription_id, cancel_at_period_end=True
+            )
+        except Exception as cancel_error:
+            logger.error("Could not schedule downgrade to free: %s", cancel_error)
+            raise HTTPException(detail="Could not change tier.", status_code=502)
+        return {
+            "message": "Subscription will end at the period boundary; you will drop to the free tier."
+        }
+
+    try:
+        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        existing_items = subscription.get("items", {}).get("data", [])
+        target_price_ids = billing_config.identifiers_for_tier(
+            requested_tier
+        ).all_price_ids()
+
+        # Stripe forbids changing a subscription item between licensed and metered
+        # usage types, so the safe universal move is: delete every existing item and
+        # add the target tier's prices in the same atomic modify call. Tier price ids
+        # never overlap across tiers (per-tier lookup keys), so a delete+add of the
+        # same price cannot occur; the same-tier case is rejected above.
+        #
+        # clear_usage applies only to classic-billing-mode subscriptions with legacy
+        # usage-record metered items; flexible-mode subscriptions (the default for
+        # newly created ones) reject the parameter, and Billing-Meter usage lives on
+        # the meter rather than the item, so nothing needs clearing there.
+        billing_mode_type = (subscription.get("billing_mode") or {}).get("type")
+        supports_clear_usage = billing_mode_type != "flexible"
+        items_payload: list[dict] = []
+        for existing_item in existing_items:
+            deletion: dict = {"id": existing_item["id"], "deleted": True}
+            usage_type = (
+                (existing_item.get("price") or {}).get("recurring") or {}
+            ).get("usage_type")
+            if usage_type == "metered" and supports_clear_usage:
+                deletion["clear_usage"] = True
+            items_payload.append(deletion)
+        for target_price_id in target_price_ids:
+            items_payload.append({"price": target_price_id})
+
+        stripe_client.Subscription.modify(
+            subscription_id,
+            items=items_payload,
+            proration_behavior="always_invoice",
+        )
+    except Exception as change_error:
+        logger.error("Could not change subscription tier: %s", change_error)
+        raise HTTPException(detail="Could not change tier.", status_code=502)
+
+    return {"message": f"Subscription changed to the {requested_tier.value} tier."}
 
 
 @app.get("/manage_subscription")
-async def manage_subscription(current_user: dict = Depends(get_current_user)):
+async def manage_subscription(
+    request: Request, current_user: dict = Depends(get_current_user)
+):
     return {
-        "url": "https://billing.stripe.com/p/login/eVq28s6XA53C5XpdqH1oI00",
+        "url": request.app.state.context.stripe_manage_subscription_url,
         "message": "Follow this link to manage your subscription.",
     }
 
 
 @app.get("/cancel_subscription")
-async def cancel_subscription(current_user: dict = Depends(get_current_user)):
+async def cancel_subscription(
+    request: Request, current_user: dict = Depends(get_current_user)
+):
     return {
-        "url": "https://billing.stripe.com/p/login/eVq28s6XA53C5XpdqH1oI00",
+        "url": request.app.state.context.stripe_manage_subscription_url,
         "message": "Follow this link to manage and cancel your subscription.",
     }
+
+
+def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Optional[str]:
+    """Look up the Auth0 user id stored on a Stripe customer's metadata."""
+    if not customer_id:
+        return None
+    try:
+        customer = stripe_client.Customer.retrieve(customer_id).to_dict()
+        return customer.get("metadata", {}).get("auth0_user_id") or None
+    except Exception as lookup_error:
+        logger.error("Could not retrieve Stripe customer %s: %s", customer_id, lookup_error)
+        return None
+
+
+async def _handle_stripe_event(
+    request: Request, stripe_client, event_type: str, data_object: dict
+) -> None:
+    """Sync tier/status into Auth0 for the subscription-lifecycle events we care about."""
+    if event_type == "checkout.session.completed":
+        customer_id = data_object.get("customer")
+        auth0_user_id = data_object.get("metadata", {}).get(
+            "auth0_user_id"
+        ) or _auth0_user_id_for_customer(stripe_client, customer_id)
+        subscription_id = data_object.get("subscription")
+        tier = data_object.get("metadata", {}).get("neural_nexus_tier", "free")
+        status_value = "active"
+        if subscription_id:
+            try:
+                subscription = stripe_client.Subscription.retrieve(
+                    subscription_id
+                ).to_dict()
+                status_value = subscription.get("status", "active")
+                tier = _tier_from_subscription(stripe_client, subscription)
+            except Exception as retrieve_error:
+                logger.error("Could not retrieve subscription: %s", retrieve_error)
+        await update_user_subscription_status(
+            request,
+            auth0_user_id,
+            {
+                "status": status_value,
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "email": data_object.get("customer_details", {}).get("email"),
+                "tier": tier,
+            },
+        )
+
+    elif event_type in (
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    ):
+        customer_id = data_object.get("customer")
+        auth0_user_id = _auth0_user_id_for_customer(stripe_client, customer_id)
+        if event_type == "customer.subscription.deleted":
+            tier = "free"
+            status_value = "canceled"
+        else:
+            tier = _tier_from_subscription(stripe_client, data_object)
+            status_value = data_object.get("status", "active")
+        await update_user_subscription_status(
+            request,
+            auth0_user_id,
+            {
+                "status": status_value,
+                "subscription_id": data_object.get("id"),
+                "customer_id": customer_id,
+                "email": None,
+                "tier": tier,
+            },
+        )
+
+    elif event_type == "invoice.payment_failed":
+        customer_id = data_object.get("customer")
+        auth0_user_id = _auth0_user_id_for_customer(stripe_client, customer_id)
+        await update_user_subscription_status(
+            request,
+            auth0_user_id,
+            {
+                "status": "past_due",
+                "subscription_id": data_object.get("subscription"),
+                "customer_id": customer_id,
+                "email": None,
+                "tier": "free",
+            },
+        )
+
+
+def _resolve_stripe_webhook_secret(context) -> Optional[str]:
+    """Return the webhook signing secret from env, or from the CLI-shared file.
+
+    Prod sets ``STRIPE_WEBHOOK_SECRET`` once from a Dashboard "Your account"
+    endpoint. Local docker-compose leaves that empty and the ``stripe-cli``
+    service writes ``STRIPE_WEBHOOK_SECRET_FILE`` on each start — read on every
+    request so the API can come up before the CLI finishes printing the secret.
+    """
+    explicit = getattr(context, "stripe_webhook_secret", None)
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    secret_file = getattr(context, "stripe_webhook_secret_file", None)
+    if not secret_file:
+        return None
+    try:
+        with open(secret_file, encoding="utf-8") as handle:
+            value = handle.read().strip()
+        return value or None
+    except OSError:
+        return None
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Verify and process Stripe subscription-lifecycle webhooks.
+
+    This is the real-time source of truth for a user's tier/status: it keeps the
+    cached ``app_metadata.subscription_status`` in sync on checkout completion,
+    subscription updates/cancellation, and payment failure. The endpoint verifies
+    the Stripe signature against ``stripe_webhook_secret`` before trusting any data.
+    """
+    stripe_client = request.app.state.stripe
+    webhook_secret = _resolve_stripe_webhook_secret(request.app.state.context)
+    if not webhook_secret:
+        logger.error(
+            "Stripe webhook secret not configured "
+            "(set STRIPE_WEBHOOK_SECRET or wait for STRIPE_WEBHOOK_SECRET_FILE); "
+            "rejecting webhook."
+        )
+        raise HTTPException(status_code=503, detail="Webhook not configured.")
+
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature")
+    try:
+        event = stripe_client.Webhook.construct_event(
+            payload, signature, webhook_secret
+        )
+    except Exception as verify_error:
+        logger.error("Stripe webhook verification failed: %s", verify_error)
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+
+    # construct_event returns a StripeObject (not a dict subclass in stripe-python
+    # 15, so ``.get`` is unavailable); convert once here so the handler works on
+    # plain dicts.
+    event_document = event.to_dict()
+    try:
+        await _handle_stripe_event(
+            request,
+            stripe_client,
+            event_document["type"],
+            event_document["data"]["object"],
+        )
+    except Exception as handling_error:
+        # Return 200 so Stripe does not retry indefinitely on a non-transient bug;
+        # the event is logged for manual reconciliation.
+        logger.error(
+            "Error handling Stripe event %s: %s",
+            event_document["type"],
+            handling_error,
+        )
+
+    return {"received": True}
 
 
 @app.get("/verify_subscription_status")
@@ -1229,6 +1788,7 @@ async def message_selected_avatar(
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
     include_metrics: bool = Form(True),
+    adapter: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1243,6 +1803,12 @@ async def message_selected_avatar(
         raise HTTPException(
             detail="Error retrieving assistant information.", status_code=400
         )
+
+    # Free-tier users (paid tiers bill overage instead) are blocked once their
+    # monthly messaging-token allotment is exhausted.
+    await enforce_remaining_allotment(
+        request.app.state, current_user, UsageMeter.MESSAGING_TOKENS
+    )
 
     user_name = your_name
     user_description = your_description
@@ -1279,6 +1845,9 @@ async def message_selected_avatar(
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
     config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
+        current_user, adapter
+    )
 
     # store = app.state.store
     graph = app.state.graph
@@ -1322,6 +1891,8 @@ async def message_selected_avatar(
                 start_time_ns=start_time,
                 request_id=request.state.request_id,
                 langgraph_client_headers=langgraph_client_headers,
+                app_state=request.app.state,
+                current_user=current_user,
             ),
             media_type="text/event-stream",
             headers={
@@ -1360,6 +1931,15 @@ async def message_selected_avatar(
     logger.warning(f"RESPONSE_DATA: {response_data}")
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    await _meter_message_usage(
+        app_state=request.app.state,
+        current_user=current_user,
+        response_metadata=response_metadata,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        latency_ms=(time_ns() - start_time) / 1_000_000,
+        request_id=request.state.request_id,
+    )
     return JSONResponse(response_data, status_code=200)
 
 
@@ -1379,6 +1959,7 @@ async def message_avatar(
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
     include_metrics: bool = Form(True),
+    adapter: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1395,6 +1976,12 @@ async def message_avatar(
         raise HTTPException(
             detail="Error retrieving assistant information.", status_code=400
         )
+
+    # Free-tier users (anonymous users resolve to free) are blocked once their
+    # monthly messaging-token allotment is exhausted; paid tiers bill overage.
+    await enforce_remaining_allotment(
+        request.app.state, current_user, UsageMeter.MESSAGING_TOKENS
+    )
 
     user_name = your_name
     user_description = your_description
@@ -1453,6 +2040,9 @@ async def message_avatar(
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
     config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
+        current_user, adapter
+    )
 
     # store = app.state.store
     graph = app.state.graph
@@ -1500,6 +2090,8 @@ async def message_avatar(
                 start_time_ns=start_time,
                 request_id=request.state.request_id,
                 langgraph_client_headers=langgraph_client_headers,
+                app_state=request.app.state,
+                current_user=current_user,
             ),
             media_type="text/event-stream",
             headers={
@@ -1537,6 +2129,15 @@ async def message_avatar(
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    await _meter_message_usage(
+        app_state=request.app.state,
+        current_user=current_user,
+        response_metadata=response_metadata,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        latency_ms=(time_ns() - start_time) / 1_000_000,
+        request_id=request.state.request_id,
+    )
     return JSONResponse(response_data, status_code=200)
 
 
@@ -1642,6 +2243,8 @@ async def resume_avatar_message(
             request_id=request.state.request_id,
             langgraph_client_headers=langgraph_client_headers,
             resume_command=Command(resume=resume_payload),
+            app_state=request.app.state,
+            current_user=current_user,
         ),
         media_type="text/event-stream",
         headers={
@@ -3218,9 +3821,44 @@ async def update_avatar_identity_with_media(
     in the request, including expanded playlist children.
     """
     try:
+        # Gate: only pro/premium tiers may update avatar identity with media.
+        enforce_tier_capability(current_user, TierCapability.UPLOAD)
+
         user_id = current_user["identities"][0]["user_id"]
         if not assistant_id:
             raise HTTPException(status_code=400, detail="assistant_id is required")
+
+        # Best-effort meter the upload against the document-upload budget. Uploads are
+        # distilled to a token-equivalent (transcription + analysis passes) so a heavy
+        # upload draws down the same monthly allotment it will cost to process. This is
+        # a submission-time estimate from file sizes and URL count; the media pipeline
+        # can later reconcile with the exact token counts it observes.
+        try:
+            uploaded_file_bytes = sum(
+                int(getattr(uploaded_file, "size", 0) or 0) for uploaded_file in (files or [])
+            )
+            url_count = len(url or [])
+            estimated_upload_tokens = estimate_upload_token_units(
+                text_character_count=uploaded_file_bytes,
+                url_count=url_count,
+            )
+            await report_meter_event(
+                app.state.stripe,
+                UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                resolve_stripe_customer_id(current_user),
+                estimated_upload_tokens,
+            )
+            await persist_api_metrics_row(
+                getattr(app.state, "pool", None),
+                inference_type="document_upload",
+                total_tokens=estimated_upload_tokens,
+                user_id=resolve_metering_user_id(current_user),
+                stripe_customer_id=resolve_stripe_customer_id(current_user),
+                assistant_id=assistant_id,
+                meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
+            )
+        except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
+            logger.error("Failed to meter upload usage: %s", upload_metering_error)
 
         token = current_user["API_KEY"]
         client = get_client(headers={"API-KEY": f"{token}"})

@@ -296,6 +296,34 @@ class GlobalContext:
         },
     )
 
+    browser_tools_enabled: str = field(
+        default="FALSE",
+        metadata={
+            "description": "Set to TRUE to expose the Playwright browser tool suite (navigate to URL, click element, extract text, extract hyperlinks, get elements, current page, navigate back) to the avatar deep agent for live web browsing. Env BROWSER_TOOLS_ENABLED."
+        },
+    )
+
+    browser_chromium_executable_path: str = field(
+        default=None,
+        metadata={
+            "description": "Filesystem path of a system-installed Chromium binary for the Playwright browser tools. The production wolfi image installs the apk chromium package and sets this variable to /usr/bin/chromium. When empty, Playwright launches the Playwright-managed Chromium download instead (requires `playwright install chromium` on the host). Env BROWSER_CHROMIUM_EXECUTABLE_PATH."
+        },
+    )
+
+    browser_conversation_idle_timeout_seconds: int = field(
+        default=900,
+        metadata={
+            "description": "Seconds a conversation's dedicated headless Chromium may sit unused before the browser tools close that browser (browsing state for the conversation is then lost; the next browsing turn starts a fresh browser). Env BROWSER_CONVERSATION_IDLE_TIMEOUT_SECONDS."
+        },
+    )
+
+    browser_max_concurrent_conversations: int = field(
+        default=4,
+        metadata={
+            "description": "Maximum number of conversations that may each hold a dedicated headless Chromium process at once (each idle Chromium is roughly 100-200 MiB resident). The least-recently-used conversation's browser is closed when a new conversation needs one beyond this cap. Env BROWSER_MAX_CONCURRENT_CONVERSATIONS."
+        },
+    )
+
     media_processing_concurrency: int = field(
         default=5,
         metadata={

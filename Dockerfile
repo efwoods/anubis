@@ -1,4 +1,4 @@
-FROM anubis-base:latest
+FROM anubis-base:0.0.1
 
 # -- Add full source (replaces the stub left by the base image) --
 ADD . /deps/anubis
@@ -6,6 +6,7 @@ ADD . /deps/anubis
 # -- Install only net-new / changed deps; uv skips already-satisfied packages --
 #    No --no-deps: full resolution is required so uv can diff against the
 #    already-installed base layer and fetch only what's missing.
+
 RUN for dep in /deps/*; do \
         if [ -d "$dep" ]; then \
             echo "Installing $dep"; \
@@ -13,7 +14,8 @@ RUN for dep in /deps/*; do \
                 --link-mode=copy -c /api/constraints.txt -e .); \
         fi; \
     done
- 
+
+    
 ENV LANGGRAPH_STORE='{"index": {"dims": 640, "embed": "huggingface:microsoft/harrier-oss-v1-270m", "fields": ["document.kwargs.page_content"]}}'
 ENV LANGGRAPH_HTTP='{"app": "/deps/anubis/src/api/webapp.py:app"}'
 ENV LANGSERVE_GRAPHS='{"Anubis": "/deps/anubis/src/anubis/graph.py:graph"}'
@@ -25,6 +27,13 @@ ENV LANGSERVE_GRAPHS='{"Anubis": "/deps/anubis/src/anubis/graph.py:graph"}'
 #              /api/langgraph_license/__init__.py
 # RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir --no-deps -e /api
 # -- End of ensuring user deps didn't inadvertently overwrite langgraph-api --
+
+# NOTE: no `playwright install` here — the Playwright-managed Chromium
+# download lacks the system shared libraries on wolfi (and `--with-deps`
+# is apt-based, unavailable under apk). The base image instead installs
+# the wolfi `chromium` apk package and sets
+# BROWSER_CHROMIUM_EXECUTABLE_PATH so the browser tools launch that binary
+# (see Dockerfile.anubis.base and src/anubis/utils/tools/browser/).
 
 # -- Removing build deps from the final image ~<:===~~~ --
 RUN pip uninstall -y pip setuptools wheel

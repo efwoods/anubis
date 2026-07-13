@@ -14,8 +14,10 @@ from src.anubis.utils.billing.config import (
     load_stripe_billing_config,
 )
 from src.anubis.utils.billing.gating import (
+    exhausted_allotment_block_reason,
     is_anonymous_user,
     resolve_metering_user_id,
+    resolve_pay_per_use_enabled,
     resolve_stripe_customer_id,
     resolve_tier,
     resolve_use_adapter_inference,
@@ -26,6 +28,7 @@ from src.anubis.utils.billing.metering import (
     ensure_api_metrics_table,
     estimate_upload_token_units,
     fetch_month_to_date_usage,
+    fetch_rolling_window_usage,
     persist_api_metrics_row,
     report_meter_event,
 )
@@ -57,7 +60,9 @@ __all__ = [
     "TierStripeIdentifiers",
     "load_stripe_billing_config",
     "is_anonymous_user",
+    "exhausted_allotment_block_reason",
     "resolve_metering_user_id",
+    "resolve_pay_per_use_enabled",
     "resolve_stripe_customer_id",
     "resolve_tier",
     "resolve_use_adapter_inference",
@@ -66,6 +71,7 @@ __all__ = [
     "billable_tokens_from_metadata",
     "estimate_upload_token_units",
     "fetch_month_to_date_usage",
+    "fetch_rolling_window_usage",
     "ensure_api_metrics_table",
     "persist_api_metrics_row",
 ]

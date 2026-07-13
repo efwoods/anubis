@@ -235,6 +235,47 @@ async def fetch_month_to_date_usage(
         return 0
 
 
+_ROLLING_WINDOW_USAGE_SQL = f"""
+SELECT COALESCE(SUM(total_tokens), 0)
+FROM {API_METRICS_TABLE_NAME}
+WHERE user_id = %s
+  AND created_at >= now() - make_interval(secs => %s);
+"""
+
+
+async def fetch_rolling_window_usage(
+    pool: Any, user_id: str | None, window_seconds: int
+) -> int:
+    """Return the user's total token usage across ALL meters in a rolling window.
+
+    Backs the per-period token rate limit: unlike the monthly allotment (which is
+    a billing budget), the rate limit is an abuse guard that caps how fast tokens
+    can be consumed regardless of tier or pay-per-use, so a runaway client cannot
+    burn an entire month's budget (or an unbounded overage bill) in minutes.
+
+    Best-effort and fail-open like ``fetch_month_to_date_usage``: a database error
+    returns zero so a metrics outage degrades to "not rate limited" rather than
+    refusing every request.
+    """
+    if pool is None or not user_id or window_seconds <= 0:
+        return 0
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    _ROLLING_WINDOW_USAGE_SQL, (user_id, int(window_seconds))
+                )
+                row = await cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+    except Exception as usage_error:  # noqa: BLE001 - fail-open rate limiting
+        logger.error(
+            "Could not read rolling-window usage for user %s: %s",
+            user_id,
+            usage_error,
+        )
+        return 0
+
+
 async def persist_api_metrics_row(
     pool: Any,
     inference_type: str,

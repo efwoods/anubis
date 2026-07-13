@@ -598,6 +598,32 @@ class GlobalContext:
         },
     )
 
+    rate_limit_window_seconds: int = field(
+        default=3600,
+        metadata={
+            "description": (
+                "Length, in seconds, of the rolling window used by the per-user "
+                "token rate limit. Combined with RATE_LIMIT_TOKENS_PER_WINDOW: a "
+                "request is refused with HTTP 429 when the user's summed token "
+                "usage across every meter within this window already meets the "
+                "cap. Zero or empty disables rate limiting."
+            )
+        },
+    )
+
+    rate_limit_tokens_per_window: int = field(
+        default=0,
+        metadata={
+            "description": (
+                "Maximum total tokens (all meters combined) one user may consume "
+                "inside each RATE_LIMIT_WINDOW_SECONDS rolling window. This is an "
+                "abuse guard independent of the monthly allotment and of "
+                "pay-per-use, so a runaway client cannot burn a month's budget "
+                "or an unbounded overage bill in minutes. Zero disables the limit."
+            )
+        },
+    )
+
     baseline_response_threshold: float = field(
         default=47.66322963655769,
         metadata={

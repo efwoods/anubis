@@ -23,6 +23,8 @@ from typing import Any, Mapping
 from src.anubis.utils.billing.tiers import (
     SubscriptionTier,
     TierCapability,
+    UsageMeter,
+    tier_allotment_for_meter,
     tier_from_value,
     tier_has_capability,
 )
@@ -116,6 +118,81 @@ def user_has_capability(
 ) -> bool:
     """Return whether the user's resolved tier unlocks ``capability``."""
     return tier_has_capability(resolve_tier(user), capability)
+
+
+def resolve_pay_per_use_enabled(user: Mapping[str, Any] | None) -> bool:
+    """Return whether this user may bill overage past a meter's monthly allotment.
+
+    The decision follows the expected-behavior matrix in
+    ``_METERING_FEATURE_TESTING.md``: a user *without* a payment method is
+    hard-limited at the allotment, while a user *with* a payment method bills
+    pay-per-use overage until the period resets — and premium users may
+    explicitly disable pay-per-use to cap their own spend.
+
+    Resolution order:
+
+    1. An explicit ``app_metadata.pay_per_use_enabled`` boolean (written by the
+       ``/set_pay_per_use`` endpoint, which verifies a payment method exists
+       before allowing ``true``) always wins.
+    2. Absent an explicit flag, pay-per-use is inferred from the cached
+       subscription status: ``"active"`` means Stripe has successfully invoiced
+       the customer (or completed a checkout that collected a payment method),
+       so overage is billable. ``"trialing"`` deliberately does NOT infer
+       pay-per-use — a trial started without a payment method must be limited
+       at the allotment, matching "free trial ending without payment ⇒ free".
+    3. Anonymous users can never bill overage.
+    """
+    if is_anonymous_user(user):
+        return False
+    app_metadata = (user or {}).get("app_metadata") or {}
+    explicit_flag = app_metadata.get("pay_per_use_enabled")
+    if isinstance(explicit_flag, bool):
+        return explicit_flag
+    subscription_status = app_metadata.get("subscription_status") or {}
+    return subscription_status.get("status") == "active"
+
+
+def exhausted_allotment_block_reason(
+    tier: SubscriptionTier,
+    meter: UsageMeter,
+    month_to_date_usage: int,
+    pay_per_use_enabled: bool,
+) -> str | None:
+    """Return a human-readable refusal reason when usage must be blocked, else ``None``.
+
+    Pure decision logic shared by every metered endpoint (messages, uploads):
+
+    * A tier without an allotment for ``meter`` is not decided here — the
+      capability gate (``enforce_tier_capability``) is the authority for
+      dimensions a tier lacks entirely.
+    * Usage under the monthly allotment is always allowed.
+    * Usage at or past the allotment is allowed only when pay-per-use is
+      enabled (which requires a payment method on file), because only then can
+      the Stripe graduated metered price actually bill the overage. Otherwise
+      the request is refused until the period resets, the user adds a payment
+      method and enables pay-per-use, or the user upgrades tiers.
+    """
+    allotment = tier_allotment_for_meter(tier, meter)
+    if allotment is None:
+        return None
+    if month_to_date_usage < allotment.monthly_allotment:
+        return None
+    if pay_per_use_enabled:
+        return None
+    meter_display_name = meter.value.replace("_", " ")
+    if tier == SubscriptionTier.FREE:
+        return (
+            f"Your free-tier monthly allotment of "
+            f"{allotment.monthly_allotment:,} {meter_display_name} is exhausted. "
+            "Subscribe to a paid tier, or add a payment method and enable "
+            "pay-per-use, to continue this month."
+        )
+    return (
+        f"Your {tier.value}-tier monthly allotment of "
+        f"{allotment.monthly_allotment:,} {meter_display_name} is exhausted. "
+        "Add a payment method and enable pay-per-use (POST /set_pay_per_use) "
+        "to bill overage, or wait for the monthly reset."
+    )
 
 
 def resolve_use_adapter_inference(

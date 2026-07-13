@@ -181,3 +181,4 @@ Please use Model Context Protocol With stripe to begin the plan for metering. I 
 
 
 #[Plan](/home/user/.claude/plans/please-use-model-context-zippy-rossum.md)
+

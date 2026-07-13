@@ -70,6 +70,10 @@ from src.anubis.utils.nodes import load_consciousness, resolve_human_message_ima
 from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
 from src.anubis.utils.state import GlobalState
+from src.anubis.utils.tools.browser import (
+    get_browser_toolkit_tools,
+    release_conversation_browser,
+)
 from src.anubis.utils.tools.data_analysis import (
     bound_connection_for,
     build_analysis_backend,
@@ -749,11 +753,23 @@ async def think(
             )
         ]
 
+    # Browser capability gate: a process-wide environment switch
+    # (BROWSER_TOOLS_ENABLED) rather than a per-user connection — the browser
+    # tools read the public web and carry no per-user credentials. Keyed on
+    # the outer workflow thread so each conversation browses in a dedicated
+    # Chromium process (isolated pages, cookies, history). Returns an empty
+    # list when the gate is off or Chromium is unavailable, so this line
+    # never degrades the turn.
+    browser_toolkit_tools = await get_browser_toolkit_tools(
+        deep_agent_run_context, conversation_key=outer_thread
+    )
+
+    extra_tools = [*(analysis_extra_tools or []), *browser_toolkit_tools]
     deep_agent = build_avatar_deep_agent(
         runtime.context,
         checkpointer=checkpointer,
         store=runtime.store,
-        extra_tools=analysis_extra_tools,
+        extra_tools=extra_tools or None,
         backend=analysis_bundle.backend if analysis_bundle is not None else None,
     )
     try:
@@ -769,6 +785,10 @@ async def think(
     finally:
         if analysis_bundle is not None:
             cleanup_analysis_workspace(analysis_bundle)
+        if browser_toolkit_tools:
+            # Drop the turn lease on the conversation's browser so idle /
+            # least-recently-used eviction may consider the browser again.
+            await release_conversation_browser(outer_thread)
 
 
 async def _run_avatar_deep_agent_turn(

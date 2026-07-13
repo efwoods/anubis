@@ -14,7 +14,18 @@ FROM langchain/langgraph-api:3.11-wolfi
 #   * libsndfile - backend for the `soundfile` package used by librosa.
 #   * libgomp    - GNU OpenMP runtime used by numba (a librosa dep) and as a
 #                  fallback for PyTorch's threading.
-RUN apk add --no-cache ffmpeg-7 libsndfile libgomp
+#   * chromium   - system Chromium for the Playwright browser tools
+#                  (src/anubis/utils/tools/browser/). Installed via apk so
+#                  every shared library Chromium dlopens is resolved by the
+#                  package manager; the Playwright-managed Chromium download
+#                  is NOT used because wolfi lacks the apt tooling that
+#                  `playwright install --with-deps` requires.
+RUN apk add --no-cache ffmpeg-7 libsndfile libgomp chromium
+
+# Points the Playwright browser tools at the apk-installed Chromium binary.
+# Overridable at runtime; when empty the tools fall back to the
+# Playwright-managed Chromium download (local-development path).
+ENV BROWSER_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 
 

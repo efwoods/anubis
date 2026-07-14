@@ -1,3 +1,5 @@
+# Integrate metering; use with free tier (any non-subscriber goes through free tier); create discord voice agent; upload audio file to clone and use voice;
+
 # MAVERICK 4 BASE MODEL WITH TRAINED ADAPTER USING GRPO RUNPOD FOR LEX FRIDMAN CHATBOT DATASET (PREPROCESS VIDEO TO PROMPT COMPLETION FORMAT) this will establish a baseline for the general public (preprocessing)
 # preprocess social media accounts
 # metering for three tiers

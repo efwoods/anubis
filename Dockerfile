@@ -1,4 +1,4 @@
-FROM anubis-base:0.0.1
+FROM anubis-base:latest
 
 # -- Add full source (replaces the stub left by the base image) --
 ADD . /deps/anubis

@@ -53,6 +53,9 @@ class StripeBillingConfig:
 
     meter_ids: Dict[UsageMeter, str]
     tiers: Dict[SubscriptionTier, TierStripeIdentifiers]
+    # Billing-portal configuration created by the provisioning script; optional so
+    # config JSON emitted before the portal existed still loads.
+    portal_configuration_id: str | None = None
 
     def identifiers_for_tier(
         self, tier: SubscriptionTier
@@ -88,7 +91,8 @@ def load_stripe_billing_config(
                         "metered_prices": {"messaging_tokens": "price_..."}},
             "pro":     {"base_price": "price_...", "metered_prices": {...}},
             "premium": {"base_price": "price_...", "metered_prices": {...}}
-          }
+          },
+          "portal_configuration": "bpc_..."   // optional
         }
     """
     if not stripe_billing_config_json or not stripe_billing_config_json.strip():
@@ -132,4 +136,13 @@ def load_stripe_billing_config(
             metered_price_ids=metered_price_ids,
         )
 
-    return StripeBillingConfig(meter_ids=meter_ids, tiers=tiers)
+    raw_portal_configuration = document.get("portal_configuration")
+    portal_configuration_id = (
+        str(raw_portal_configuration) if raw_portal_configuration else None
+    )
+
+    return StripeBillingConfig(
+        meter_ids=meter_ids,
+        tiers=tiers,
+        portal_configuration_id=portal_configuration_id,
+    )

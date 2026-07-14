@@ -18,6 +18,8 @@ by both the message path and the webhook/tier-sync path.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone, UTC
 from typing import Any, Mapping
 
 from src.anubis.utils.billing.tiers import (
@@ -193,6 +195,100 @@ def exhausted_allotment_block_reason(
         "Add a payment method and enable pay-per-use (POST /set_pay_per_use) "
         "to bill overage, or wait for the monthly reset."
     )
+
+
+def resolve_usage_period_anchor(user: Mapping[str, Any] | None) -> datetime | None:
+    """Return the user's personal usage-period anchor, if one has been written.
+
+    ``app_metadata.usage_period_anchor`` is an ISO-8601 UTC timestamp written at
+    tier upgrade (and at first checkout), marking the instant the local usage
+    window restarted so the new tier begins with a fresh allotment. Parsed
+    defensively: any missing or malformed value yields ``None`` and the period
+    falls back to the environment-configured default.
+    """
+    if not user:
+        return None
+    app_metadata = user.get("app_metadata") or {}
+    raw_anchor = app_metadata.get("usage_period_anchor")
+    if not raw_anchor or not isinstance(raw_anchor, str):
+        return None
+    try:
+        anchor = datetime.fromisoformat(raw_anchor.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=UTC)
+    return anchor.astimezone(UTC)
+
+
+_TIER_ORDER: dict[SubscriptionTier, int] = {
+    SubscriptionTier.FREE: 0,
+    SubscriptionTier.PRO: 1,
+    SubscriptionTier.PREMIUM: 2,
+}
+
+
+@dataclass(frozen=True)
+class TierChangePlan:
+    """How one tier change must be executed, per the retained/cleared usage rules.
+
+    * Upgrades take effect immediately (the user is paying for more right now):
+      subscription items are swapped at once and the local usage window restarts
+      (``reset_usage_period_anchor``) so the new tier starts with a fresh
+      allotment — "usage cleared on upgrade".
+    * Downgrades take effect at the period end via a Stripe Subscription
+      Schedule: the user already paid for the higher tier through the period, so
+      both Stripe billing and local allotment gating keep the higher tier until
+      the boundary — "unused allotment continues on downgrade".
+    """
+
+    direction: str  # "upgrade" | "downgrade"
+    swap_items_immediately: bool
+    schedule_change_at_period_end: bool
+    reset_usage_period_anchor: bool
+
+
+def plan_tier_change(
+    current_tier: SubscriptionTier, target_tier: SubscriptionTier
+) -> TierChangePlan:
+    """Return the execution plan for moving from ``current_tier`` to ``target_tier``.
+
+    Same-tier "changes" are the caller's responsibility to reject before
+    planning; this function only orders the tiers (free < pro < premium).
+    """
+    if _TIER_ORDER[target_tier] > _TIER_ORDER[current_tier]:
+        return TierChangePlan(
+            direction="upgrade",
+            swap_items_immediately=True,
+            schedule_change_at_period_end=False,
+            reset_usage_period_anchor=True,
+        )
+    return TierChangePlan(
+        direction="downgrade",
+        swap_items_immediately=False,
+        schedule_change_at_period_end=True,
+        reset_usage_period_anchor=False,
+    )
+
+
+def customer_has_payment_method(
+    customer_document: Mapping[str, Any] | None,
+    payment_methods: list[Mapping[str, Any]] | None = None,
+) -> bool:
+    """Return whether a retrieved Stripe customer has any payment method on file.
+
+    Checks the customer's ``invoice_settings.default_payment_method`` and legacy
+    ``default_source`` first, then falls back to a non-empty payment-method list
+    (from ``PaymentMethod.list``). Pure logic so the pay-per-use endpoint's
+    payment-method requirement is unit-testable without Stripe.
+    """
+    customer_document = customer_document or {}
+    invoice_settings = customer_document.get("invoice_settings") or {}
+    if invoice_settings.get("default_payment_method"):
+        return True
+    if customer_document.get("default_source"):
+        return True
+    return bool(payment_methods)
 
 
 def resolve_use_adapter_inference(

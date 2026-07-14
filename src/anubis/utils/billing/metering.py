@@ -22,13 +22,103 @@ our own accounting against Stripe invoices.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import uuid
-from typing import Any, Mapping
+from datetime import datetime, timedelta, timezone, UTC
+from typing import Any, Mapping, Sequence
 
 from src.anubis.utils.billing.tiers import UsageMeter
 
 logger = logging.getLogger(__name__)
+
+# Deterministic global anchor for fixed-length usage periods (USAGE_PERIOD_DAYS > 0)
+# when a user has no personal period anchor: every process computes the same window
+# boundaries across restarts because they all count periods from this instant.
+GLOBAL_USAGE_PERIOD_ANCHOR = datetime(2025, 1, 1, tzinfo=UTC)
+
+
+def _coerce_to_utc(moment: datetime) -> datetime:
+    """Interpret a naive datetime as UTC; convert an aware one to UTC."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
+
+
+def _monthly_boundary_for(year: int, month: int, anchor: datetime) -> datetime:
+    """Return the anchor's monthly boundary within (year, month).
+
+    The boundary keeps the anchor's day-of-month and time-of-day, clamping the
+    day to the target month's length (an anchor on January 31 yields February 28
+    or 29) — the same clamping Stripe applies to ``billing_cycle_anchor``.
+    """
+    last_day_of_month = calendar.monthrange(year, month)[1]
+    return anchor.replace(year=year, month=month, day=min(anchor.day, last_day_of_month))
+
+
+def resolve_usage_period_start(
+    now: datetime,
+    usage_period_days: int,
+    period_anchor: datetime | None = None,
+) -> datetime:
+    """Return the start of the usage period that contains ``now``.
+
+    Two period shapes, selected by the ``USAGE_PERIOD_DAYS`` environment variable:
+
+    * ``usage_period_days == 0`` (default) — calendar-month semantics. Without a
+      per-user anchor the period starts on the first of the current UTC month
+      (the historical behavior). With a per-user anchor (written on tier upgrade
+      or first checkout) the period starts at the most recent monthly boundary
+      on the anchor's day-of-month, and never earlier than the anchor itself, so
+      an upgrade begins a fresh window at the instant of the upgrade.
+    * ``usage_period_days > 0`` — fixed-length windows counted from the anchor
+      (per-user anchor when present, otherwise ``GLOBAL_USAGE_PERIOD_ANCHOR``):
+      ``anchor + floor((now - anchor) / days) * days``.
+    """
+    now = _coerce_to_utc(now)
+    if period_anchor is not None:
+        period_anchor = _coerce_to_utc(period_anchor)
+        if period_anchor > now:
+            # A future anchor should not happen; treat the anchor as the period
+            # start rather than producing a window that has not begun.
+            return period_anchor
+
+    if usage_period_days > 0:
+        anchor = period_anchor or GLOBAL_USAGE_PERIOD_ANCHOR
+        period_length = timedelta(days=usage_period_days)
+        elapsed_periods = (now - anchor) // period_length
+        return anchor + elapsed_periods * period_length
+
+    if period_anchor is None:
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    boundary_this_month = _monthly_boundary_for(now.year, now.month, period_anchor)
+    if boundary_this_month <= now:
+        period_start = boundary_this_month
+    else:
+        previous_month_year = now.year if now.month > 1 else now.year - 1
+        previous_month = now.month - 1 if now.month > 1 else 12
+        period_start = _monthly_boundary_for(
+            previous_month_year, previous_month, period_anchor
+        )
+    # The first period begins at the anchor itself, never before.
+    return max(period_start, period_anchor)
+
+
+def resolve_usage_period_end(
+    period_start: datetime,
+    usage_period_days: int,
+) -> datetime:
+    """Return the exclusive end of the usage period beginning at ``period_start``.
+
+    Companion to ``resolve_usage_period_start`` used by the subscription-status
+    endpoint to display when the current allotment resets.
+    """
+    period_start = _coerce_to_utc(period_start)
+    if usage_period_days > 0:
+        return period_start + timedelta(days=usage_period_days)
+    next_month_year = period_start.year if period_start.month < 12 else period_start.year + 1
+    next_month = period_start.month + 1 if period_start.month < 12 else 1
+    return _monthly_boundary_for(next_month_year, next_month, period_start)
 
 # Rough token-per-unit heuristics used to distill an upload into a token-equivalent
 # for the document_upload_tokens meter. Grounded in research/04_token_workload_cost_model.md:
@@ -191,29 +281,41 @@ async def ensure_api_metrics_table(pool: Any) -> None:
         logger.error("Could not ensure api_metrics table exists: %s", table_error)
 
 
-_MONTH_TO_DATE_USAGE_SQL = f"""
+_USAGE_SINCE_SQL = f"""
 SELECT COALESCE(SUM(total_tokens), 0)
 FROM {API_METRICS_TABLE_NAME}
 WHERE user_id = %s
   AND meter_event_name = %s
-  AND created_at >= date_trunc('month', now());
+  AND created_at >= %s;
+"""
+
+_USAGE_BY_METER_SINCE_SQL = f"""
+SELECT meter_event_name, COALESCE(SUM(total_tokens), 0)
+FROM {API_METRICS_TABLE_NAME}
+WHERE user_id = %s
+  AND created_at >= %s
+  AND meter_event_name IS NOT NULL
+GROUP BY meter_event_name;
 """
 
 
-async def fetch_month_to_date_usage(
-    pool: Any, user_id: str | None, meter_event_name: str
+async def fetch_usage_since(
+    pool: Any,
+    user_id: str | None,
+    meter_event_name: str,
+    period_start: datetime,
 ) -> int:
-    """Return the user's calendar-month-to-date usage for one meter, from ``api_metrics``.
+    """Return the user's usage for one meter since ``period_start``, from ``api_metrics``.
 
-    This is the enforcement-side counterpart to Stripe's meter aggregation: the
-    free tier (including anonymous users) has no Stripe subscription and therefore
-    no billing period or payable overage, so allotment gating reads the locally
-    persisted usage instead of calling Stripe on the hot path. The calendar month
-    approximates the billing period; paid tiers are never blocked (overage is
-    billable), so the approximation only ever affects free-tier users.
+    This is the enforcement-side counterpart to Stripe's meter aggregation:
+    allotment gating reads the locally persisted usage instead of calling Stripe
+    on the hot path, keyed on the same identifier that also covers anonymous
+    users (hashed-IP). ``period_start`` comes from ``resolve_usage_period_start``
+    (or the cached Stripe billing period for paid tiers), so the window follows
+    the ``USAGE_PERIOD_DAYS`` configuration and per-user upgrade anchors.
 
     Best-effort and fail-open: any database error returns zero so a metrics outage
-    degrades to "not gated" rather than blocking every free-tier message.
+    degrades to "not gated" rather than blocking every message.
     """
     if pool is None or not user_id:
         return 0
@@ -221,13 +323,14 @@ async def fetch_month_to_date_usage(
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(
-                    _MONTH_TO_DATE_USAGE_SQL, (user_id, meter_event_name)
+                    _USAGE_SINCE_SQL, (user_id, meter_event_name, period_start)
                 )
                 row = await cursor.fetchone()
                 return int(row[0]) if row and row[0] is not None else 0
     except Exception as usage_error:  # noqa: BLE001 - fail-open gating
         logger.error(
-            "Could not read month-to-date usage for user %s meter %s: %s",
+            "Could not read usage since %s for user %s meter %s: %s",
+            period_start,
             user_id,
             meter_event_name,
             usage_error,
@@ -235,45 +338,133 @@ async def fetch_month_to_date_usage(
         return 0
 
 
+async def fetch_usage_by_meter_since(
+    pool: Any,
+    user_id: str | None,
+    period_start: datetime,
+) -> dict[str, int]:
+    """Return the user's usage since ``period_start`` for every meter at once.
+
+    One grouped query backing the subscription-status endpoint, which displays
+    used-versus-allotment for all four meters; meters with no usage in the window
+    are simply absent from the mapping. Fail-open like ``fetch_usage_since``.
+    """
+    if pool is None or not user_id:
+        return {}
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(_USAGE_BY_METER_SINCE_SQL, (user_id, period_start))
+                rows = await cursor.fetchall()
+                return {
+                    str(meter_event_name): int(total)
+                    for meter_event_name, total in rows
+                    if meter_event_name is not None and total is not None
+                }
+    except Exception as usage_error:  # noqa: BLE001 - fail-open display
+        logger.error(
+            "Could not read per-meter usage since %s for user %s: %s",
+            period_start,
+            user_id,
+            usage_error,
+        )
+        return {}
+
+
 _ROLLING_WINDOW_USAGE_SQL = f"""
-SELECT COALESCE(SUM(total_tokens), 0)
+SELECT COALESCE(SUM(total_tokens), 0), MIN(created_at)
 FROM {API_METRICS_TABLE_NAME}
 WHERE user_id = %s
   AND created_at >= now() - make_interval(secs => %s);
 """
 
+_ROLLING_WINDOW_USAGE_FILTERED_SQL = f"""
+SELECT COALESCE(SUM(total_tokens), 0), MIN(created_at)
+FROM {API_METRICS_TABLE_NAME}
+WHERE user_id = %s
+  AND created_at >= now() - make_interval(secs => %s)
+  AND meter_event_name = ANY(%s);
+"""
+
 
 async def fetch_rolling_window_usage(
-    pool: Any, user_id: str | None, window_seconds: int
-) -> int:
-    """Return the user's total token usage across ALL meters in a rolling window.
+    pool: Any,
+    user_id: str | None,
+    window_seconds: int,
+    meter_event_names: Sequence[str] | None = None,
+) -> tuple[int, datetime | None]:
+    """Return ``(total tokens, oldest usage timestamp)`` inside a rolling window.
 
     Backs the per-period token rate limit: unlike the monthly allotment (which is
     a billing budget), the rate limit is an abuse guard that caps how fast tokens
     can be consumed regardless of tier or pay-per-use, so a runaway client cannot
     burn an entire month's budget (or an unbounded overage bill) in minutes.
+    ``meter_event_names`` narrows the sum to specific meters so message traffic
+    and media-upload traffic are limited independently; ``None`` sums every meter.
+    The oldest timestamp lets the caller compute a Retry-After — the limit clears
+    when that row ages out of the window.
 
-    Best-effort and fail-open like ``fetch_month_to_date_usage``: a database error
-    returns zero so a metrics outage degrades to "not rate limited" rather than
-    refusing every request.
+    Best-effort and fail-open like ``fetch_usage_since``: a database error
+    returns zero usage so a metrics outage degrades to "not rate limited" rather
+    than refusing every request.
     """
     if pool is None or not user_id or window_seconds <= 0:
-        return 0
+        return 0, None
     try:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
-                await cursor.execute(
-                    _ROLLING_WINDOW_USAGE_SQL, (user_id, int(window_seconds))
-                )
+                if meter_event_names:
+                    await cursor.execute(
+                        _ROLLING_WINDOW_USAGE_FILTERED_SQL,
+                        (user_id, int(window_seconds), list(meter_event_names)),
+                    )
+                else:
+                    await cursor.execute(
+                        _ROLLING_WINDOW_USAGE_SQL, (user_id, int(window_seconds))
+                    )
                 row = await cursor.fetchone()
-                return int(row[0]) if row and row[0] is not None else 0
+                if not row:
+                    return 0, None
+                total = int(row[0]) if row[0] is not None else 0
+                oldest_usage_at = row[1]
+                return total, oldest_usage_at
     except Exception as usage_error:  # noqa: BLE001 - fail-open rate limiting
         logger.error(
             "Could not read rolling-window usage for user %s: %s",
             user_id,
             usage_error,
         )
-        return 0
+        return 0, None
+
+
+def token_rate_limit_retry_after_seconds(
+    window_usage: int,
+    tokens_per_window: int,
+    window_seconds: int,
+    oldest_usage_at: datetime | None,
+    now: datetime | None = None,
+) -> int | None:
+    """Return ``None`` when the request is allowed, else a Retry-After in seconds.
+
+    Pure decision logic for the token rate limit (the endpoint helper turns a
+    non-``None`` result into HTTP 429). A ``tokens_per_window`` of zero or less
+    disables the limit entirely. When the window usage has already reached the
+    cap, the wait is the time until the oldest contributing row ages out of the
+    rolling window, clamped to ``[1, window_seconds]`` so the client always
+    receives a sane, bounded hint even if timestamps are missing or skewed.
+    """
+    if tokens_per_window <= 0 or window_seconds <= 0:
+        return None
+    if window_usage < tokens_per_window:
+        return None
+    if oldest_usage_at is None:
+        return window_seconds
+    now = _coerce_to_utc(now or datetime.now(UTC))
+    oldest_usage_at = _coerce_to_utc(oldest_usage_at)
+    seconds_until_oldest_expires = (
+        oldest_usage_at + timedelta(seconds=window_seconds) - now
+    ).total_seconds()
+    return max(1, min(window_seconds, int(seconds_until_oldest_expires) + 1))
 
 
 async def persist_api_metrics_row(
@@ -323,3 +514,44 @@ async def persist_api_metrics_row(
     except Exception as insert_error:  # noqa: BLE001 - non-fatal metering
         logger.error("Could not persist api_metrics row: %s", insert_error)
         return False
+
+
+async def report_adapter_training_usage(
+    stripe_client: Any,
+    pool: Any,
+    *,
+    stripe_customer_id: str | None,
+    metering_user_id: str | None,
+    trained_adapter_count: int = 1,
+    assistant_id: str | None = None,
+    idempotency_identifier: str | None = None,
+) -> bool:
+    """Report one adapter-training run against the ``adapter_training_units`` meter.
+
+    The adapter-training job endpoint does not exist yet (Phase 7 of the media
+    pipeline); this helper is the complete, ready-to-call metering path so the
+    future training job only has to invoke one function. The unit is a count of
+    trained adapters, carried in ``total_tokens`` so ``fetch_usage_since`` sums
+    every meter uniformly for allotment gating and the subscription-status
+    endpoint. Best-effort like every other metering path; returns whether the
+    Stripe meter event was accepted.
+    """
+    if trained_adapter_count <= 0:
+        return False
+    stripe_accepted = await report_meter_event(
+        stripe_client,
+        UsageMeter.ADAPTER_TRAINING_UNITS,
+        stripe_customer_id,
+        trained_adapter_count,
+        idempotency_identifier=idempotency_identifier,
+    )
+    await persist_api_metrics_row(
+        pool,
+        inference_type="adapter_training",
+        total_tokens=trained_adapter_count,
+        user_id=metering_user_id,
+        stripe_customer_id=stripe_customer_id,
+        assistant_id=assistant_id,
+        meter_event_name=UsageMeter.ADAPTER_TRAINING_UNITS.value,
+    )
+    return stripe_accepted

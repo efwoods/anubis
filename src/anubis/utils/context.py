@@ -598,28 +598,68 @@ class GlobalContext:
         },
     )
 
-    rate_limit_window_seconds: int = field(
-        default=3600,
+    message_rate_limit_window_seconds: int = field(
+        default=60,
         metadata={
             "description": (
                 "Length, in seconds, of the rolling window used by the per-user "
-                "token rate limit. Combined with RATE_LIMIT_TOKENS_PER_WINDOW: a "
-                "request is refused with HTTP 429 when the user's summed token "
-                "usage across every meter within this window already meets the "
-                "cap. Zero or empty disables rate limiting."
+                "token rate limit on the message endpoints. Combined with "
+                "MESSAGE_RATE_LIMIT_TOKENS_PER_WINDOW: a message request is "
+                "refused with HTTP 429 and a Retry-After header when the user's "
+                "summed messaging plus adapter-inference token usage inside this "
+                "window already meets the cap."
             )
         },
     )
 
-    rate_limit_tokens_per_window: int = field(
+    message_rate_limit_tokens_per_window: int = field(
         default=0,
         metadata={
             "description": (
-                "Maximum total tokens (all meters combined) one user may consume "
-                "inside each RATE_LIMIT_WINDOW_SECONDS rolling window. This is an "
-                "abuse guard independent of the monthly allotment and of "
-                "pay-per-use, so a runaway client cannot burn a month's budget "
-                "or an unbounded overage bill in minutes. Zero disables the limit."
+                "Maximum messaging plus adapter-inference tokens one user may "
+                "consume inside each MESSAGE_RATE_LIMIT_WINDOW_SECONDS rolling "
+                "window (a tokens-per-minute style limit, in the spirit of the "
+                "OpenAI rate-limit guide). This is an abuse guard independent of "
+                "the monthly allotment and of pay-per-use, so a runaway client "
+                "cannot burn a month's budget or an unbounded overage bill in "
+                "minutes. Zero disables the limit."
+            )
+        },
+    )
+
+    media_upload_rate_limit_window_seconds: int = field(
+        default=60,
+        metadata={
+            "description": (
+                "Length, in seconds, of the rolling window used by the per-user "
+                "token rate limit on the update_avatar_identity_with_media "
+                "endpoint. Combined with MEDIA_UPLOAD_RATE_LIMIT_TOKENS_PER_WINDOW."
+            )
+        },
+    )
+
+    media_upload_rate_limit_tokens_per_window: int = field(
+        default=0,
+        metadata={
+            "description": (
+                "Maximum document-upload token-equivalents one user may consume "
+                "inside each MEDIA_UPLOAD_RATE_LIMIT_WINDOW_SECONDS rolling "
+                "window on the update_avatar_identity_with_media endpoint. Zero "
+                "disables the limit."
+            )
+        },
+    )
+
+    usage_period_days: int = field(
+        default=0,
+        metadata={
+            "description": (
+                "Length, in days, of the local usage-allotment period read by "
+                "allotment gating and the subscription-status endpoint. Zero "
+                "(the default) means calendar-month periods, matching Stripe's "
+                "monthly billing cycle; a positive value means fixed-length "
+                "windows counted from the user's usage_period_anchor (or the "
+                "deterministic global anchor when the user has none)."
             )
         },
     )

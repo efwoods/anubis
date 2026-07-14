@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
 # from src.url_loading_graph.graph import url_loading_graph
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 # Add metrics imports
 from time import time_ns
@@ -60,17 +60,28 @@ from src.anubis.utils.billing import (
     TierCapability,
     UsageMeter,
     billable_tokens_from_metadata,
+    customer_has_payment_method,
     ensure_api_metrics_table,
     estimate_upload_token_units,
-    fetch_month_to_date_usage,
+    exhausted_allotment_block_reason,
+    fetch_rolling_window_usage,
+    fetch_usage_by_meter_since,
+    fetch_usage_since,
     load_stripe_billing_config,
     persist_api_metrics_row,
+    plan_tier_change,
     report_meter_event,
     resolve_metering_user_id,
+    resolve_pay_per_use_enabled,
     resolve_stripe_customer_id,
     resolve_tier,
+    resolve_usage_period_anchor,
+    resolve_usage_period_end,
+    resolve_usage_period_start,
     resolve_use_adapter_inference,
     tier_allotment_for_meter,
+    tier_from_value,
+    token_rate_limit_retry_after_seconds,
 )
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
@@ -93,6 +104,7 @@ from src.security.auth import (
     get_current_user_or_anonymous_user,
     security_route,
     update_assistant_config,
+    update_user_app_metadata_fields,
     update_user_subscription_status,
 )
 
@@ -141,38 +153,109 @@ def enforce_tier_capability(current_user: dict, capability: TierCapability) -> S
     )
 
 
+def resolve_usage_period_start_for_user(current_user: dict) -> datetime:
+    """Return the start of the usage period governing this user's allotment.
+
+    The most recent of the available period signals wins, so a mid-period tier
+    upgrade always begins a fresh local usage window:
+
+    1. The Stripe billing period start cached into
+       ``app_metadata.subscription_status.current_period_start`` by the webhook
+       (paid tiers only) — keeps local gating aligned with the invoice period
+       without a Stripe call on the hot path.
+    2. The user's ``usage_period_anchor`` (written at tier upgrade and first
+       checkout), expanded into a recurring window by
+       ``resolve_usage_period_start`` per the USAGE_PERIOD_DAYS configuration.
+    3. The environment-configured default period (calendar month when
+       USAGE_PERIOD_DAYS is zero).
+    """
+    context = GlobalContext()
+    now = datetime.now(UTC)
+    usage_period_days = int(context.usage_period_days or 0)
+    period_anchor = resolve_usage_period_anchor(current_user)
+    period_start = resolve_usage_period_start(now, usage_period_days, period_anchor)
+
+    app_metadata = (current_user or {}).get("app_metadata") or {}
+    subscription_status = app_metadata.get("subscription_status") or {}
+    cached_stripe_period_start = subscription_status.get("current_period_start")
+    if cached_stripe_period_start:
+        try:
+            stripe_period_start = datetime.fromtimestamp(
+                int(cached_stripe_period_start), tz=UTC
+            )
+            period_start = max(period_start, stripe_period_start)
+        except (TypeError, ValueError, OSError):
+            pass
+    return period_start
+
+
 async def enforce_remaining_allotment(
     app_state, current_user: dict, meter: UsageMeter
 ) -> None:
-    """Block a free-tier user whose monthly allotment for ``meter`` is exhausted.
+    """Block a user of ANY tier who exhausted the ``meter`` allotment without pay-per-use.
 
-    Paid tiers are never blocked here: their subscription carries a graduated
-    metered price, so usage past the allotment simply bills as pay-per-use overage.
-    The free tier has no subscription and therefore no payable overage, so once the
-    month-to-date usage (read from the local ``api_metrics`` table, which also
-    covers anonymous users via their hashed-IP identifier) reaches the free
-    allotment the request is refused with HTTP 402 until the calendar month rolls
-    over or the user subscribes.
+    The block decision is ``exhausted_allotment_block_reason``: usage under the
+    period allotment is always allowed; usage at or past the allotment is allowed
+    only when pay-per-use is enabled (a payment method on file lets the Stripe
+    graduated metered price bill the overage). Otherwise the request is refused
+    with HTTP 402 until the period resets, pay-per-use is enabled, or the user
+    upgrades tiers. Usage is read from the local ``api_metrics`` table (which
+    also covers anonymous users via their hashed-IP identifier) over the period
+    resolved by ``resolve_usage_period_start_for_user``.
     """
     tier = resolve_tier(current_user)
-    if tier != SubscriptionTier.FREE:
-        return
     allotment = tier_allotment_for_meter(tier, meter)
     if allotment is None:
         # The capability gate is the authority for dimensions the tier lacks.
         return
     metering_user_id = resolve_metering_user_id(current_user)
-    month_to_date_usage = await fetch_month_to_date_usage(
-        getattr(app_state, "pool", None), metering_user_id, meter.value
+    period_start = resolve_usage_period_start_for_user(current_user)
+    period_usage = await fetch_usage_since(
+        getattr(app_state, "pool", None), metering_user_id, meter.value, period_start
     )
-    if month_to_date_usage >= allotment.monthly_allotment:
+    block_reason = exhausted_allotment_block_reason(
+        tier, meter, period_usage, resolve_pay_per_use_enabled(current_user)
+    )
+    if block_reason:
+        raise HTTPException(status_code=402, detail=block_reason)
+
+
+async def enforce_token_rate_limit(
+    app_state,
+    current_user: dict,
+    meter_event_names: list[str],
+    window_seconds: int,
+    tokens_per_window: int,
+) -> None:
+    """Refuse the request with HTTP 429 when the user's token rate cap is met.
+
+    A tokens-per-window abuse guard (in the spirit of the OpenAI rate-limit
+    guide) independent of the monthly allotment and of pay-per-use: it caps how
+    fast tokens can be consumed so a runaway client cannot burn a month's budget
+    or an unbounded overage bill in minutes. The Retry-After header tells the
+    client when the oldest usage row ages out of the rolling window. A cap of
+    zero or less disables the limit entirely.
+    """
+    if tokens_per_window <= 0 or window_seconds <= 0:
+        return
+    window_usage, oldest_usage_at = await fetch_rolling_window_usage(
+        getattr(app_state, "pool", None),
+        resolve_metering_user_id(current_user),
+        window_seconds,
+        meter_event_names=meter_event_names,
+    )
+    retry_after_seconds = token_rate_limit_retry_after_seconds(
+        window_usage, tokens_per_window, window_seconds, oldest_usage_at
+    )
+    if retry_after_seconds is not None:
         raise HTTPException(
-            status_code=402,
+            status_code=429,
             detail=(
-                "Your free-tier monthly allotment of "
-                f"{allotment.monthly_allotment:,} {meter.value.replace('_', ' ')} "
-                "is exhausted. Subscribe to a paid tier to continue this month."
+                f"Token rate limit reached: {window_usage:,} tokens used in the "
+                f"last {window_seconds} seconds against a cap of "
+                f"{tokens_per_window:,}. Retry after {retry_after_seconds} seconds."
             ),
+            headers={"Retry-After": str(retry_after_seconds)},
         )
 
 
@@ -448,7 +531,7 @@ async def message_graph_sse(
         "thread_metadata": {
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "most_recent_message": datetime.now(UTC).isoformat(),
             "conversation_title": conversation_title_value,
         },
         "graph_id": "Anubis",
@@ -888,12 +971,16 @@ async def subscribe(
     tier: SubscriptionTier = Query(default=SubscriptionTier.PRO, description="Chosen subscription tier."),
     current_user: dict = Depends(get_current_user),
 ):
-    """Create a Stripe Checkout session for a paid tier (pro or premium).
+    """Create a Stripe Checkout session for a subscription tier.
 
     Replaces the single legacy payment link: a subscription now bundles the tier's
     flat base price with its metered (allotment + overage) prices, so a customer can
-    pick a tier and the metered billing is wired from the first invoice. Anonymous
-    users can never reach this endpoint — it requires a verified authenticated user.
+    pick a tier and the metered billing is wired from the first invoice. The free
+    tier is also subscribable: a $0-base subscription that always collects a payment
+    method, existing solely as the billing vehicle for pay-per-use overage past the
+    free allotment (every account is on the free tier without one; a free user who
+    never enables pay-per-use has no reason to check out). Anonymous users can never
+    reach this endpoint — it requires a verified authenticated user.
     """
     verified_email = current_user.get("email_verified", None)
     if not verified_email:
@@ -902,11 +989,6 @@ async def subscribe(
         )
 
     requested_tier = tier_from_value_or_400(tier.value if isinstance(tier, SubscriptionTier) else tier)
-    if requested_tier == SubscriptionTier.FREE:
-        raise HTTPException(
-            detail="The free tier requires no checkout; every account starts on it.",
-            status_code=400,
-        )
 
     billing_config = getattr(request.app.state, "stripe_billing_config", None)
     email = current_user.get("email")
@@ -962,6 +1044,12 @@ async def subscribe(
             "neural_nexus_tier": requested_tier.value,
         },
     }
+    if requested_tier == SubscriptionTier.FREE:
+        # The first free-tier invoice totals $0, which would let Checkout skip
+        # payment-method collection — but a payment method is the entire point
+        # of the free subscription (billing pay-per-use overage), so force
+        # collection.
+        checkout_kwargs["payment_method_collection"] = "always"
     if subscription_data:
         checkout_kwargs["subscription_data"] = subscription_data
     if customer_id:
@@ -979,18 +1067,176 @@ async def subscribe(
     return {"url": session["url"], "message": "Follow this link to subscribe."}
 
 
+def _subscription_period_bounds(subscription: dict) -> tuple[int | None, int | None]:
+    """Return ``(current_period_start, current_period_end)`` epoch seconds.
+
+    Newer Stripe API versions (flexible billing mode) place the period bounds on
+    each subscription item rather than the subscription top level, so this reads
+    items-first with a top-level fallback.
+    """
+    items = (subscription.get("items") or {}).get("data") or []
+    first_item = items[0] if items and isinstance(items[0], dict) else {}
+    period_start = first_item.get("current_period_start") or subscription.get(
+        "current_period_start"
+    )
+    period_end = first_item.get("current_period_end") or subscription.get(
+        "current_period_end"
+    )
+    return (
+        int(period_start) if period_start else None,
+        int(period_end) if period_end else None,
+    )
+
+
+def _release_pending_subscription_schedule(stripe_client, subscription: dict) -> None:
+    """Release the subscription's pending schedule (a scheduled downgrade), if any.
+
+    A subscription attached to a schedule cannot have its items or cancellation
+    state modified directly, so every mutation path (tier change, cancel,
+    reactivate) releases the schedule first. Releasing keeps the subscription
+    running on its current items — the pending change is simply abandoned.
+    """
+    schedule_id = subscription.get("schedule")
+    if not schedule_id:
+        return
+    if isinstance(schedule_id, dict):
+        schedule_id = schedule_id.get("id")
+    try:
+        stripe_client.SubscriptionSchedule.release(schedule_id)
+    except Exception as release_error:  # noqa: BLE001 - surfaced by the follow-up modify
+        logger.error(
+            "Could not release subscription schedule %s: %s",
+            schedule_id,
+            release_error,
+        )
+
+
+async def _write_usage_period_anchor(request: Request, current_user: dict) -> None:
+    """Restart the user's local usage window at this instant (upgrade semantics).
+
+    Writes ``app_metadata.usage_period_anchor`` so allotment gating and the
+    subscription-status endpoint count usage from the tier change forward —
+    "usage cleared on upgrade". Also updates the in-memory user so the current
+    request already sees the fresh window.
+    """
+    anchor_value = datetime.now(UTC).isoformat()
+    await update_user_app_metadata_fields(
+        request,
+        current_user.get("user_id"),
+        {"usage_period_anchor": anchor_value},
+    )
+    current_user.setdefault("app_metadata", {})["usage_period_anchor"] = anchor_value
+
+
+async def _apply_pay_per_use_setting(
+    request: Request, current_user: dict, enabled: bool
+) -> None:
+    """Persist the explicit pay-per-use flag, requiring a payment method to enable.
+
+    Disabling is always allowed (a user capping their own spend). Enabling
+    requires a Stripe customer with a payment method on file, because pay-per-use
+    means the graduated metered price bills overage — without a card there is
+    nothing to bill and the allotment gate would silently become an unbounded
+    free pass. Raises HTTPException with actionable guidance when the
+    requirement is not met.
+    """
+    if enabled:
+        stripe_client = request.app.state.stripe
+        customer_id = resolve_stripe_customer_id(current_user)
+        if not customer_id:
+            status = await check_subscription_status(
+                request=request, current_user=current_user
+            )
+            customer_id = status.get("customer_id")
+        if not customer_id:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Pay-per-use requires a payment method on file. Subscribe first "
+                    "(GET /subscribe?tier=free adds a card without a paid plan)."
+                ),
+            )
+        try:
+            customer_document = stripe_client.Customer.retrieve(
+                customer_id, expand=["invoice_settings.default_payment_method"]
+            ).to_dict()
+            payment_methods = []
+            if not customer_has_payment_method(customer_document):
+                payment_methods = (
+                    stripe_client.PaymentMethod.list(customer=customer_id, limit=1)
+                    .to_dict()
+                    .get("data", [])
+                )
+        except Exception as customer_error:
+            logger.error(
+                "Could not verify payment method for customer %s: %s",
+                customer_id,
+                customer_error,
+            )
+            raise HTTPException(
+                status_code=502, detail="Could not verify payment method with Stripe."
+            )
+        if not customer_has_payment_method(customer_document, payment_methods):
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "No payment method on file. Add one via GET /manage_subscription "
+                    "before enabling pay-per-use."
+                ),
+            )
+
+    updated = await update_user_app_metadata_fields(
+        request, current_user.get("user_id"), {"pay_per_use_enabled": enabled}
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=502, detail="Could not persist the pay-per-use setting."
+        )
+    current_user.setdefault("app_metadata", {})["pay_per_use_enabled"] = enabled
+
+
+@app.post("/set_pay_per_use")
+async def set_pay_per_use(
+    request: Request,
+    enabled: bool = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enable or disable billing overage past the monthly allotment (pay-per-use).
+
+    With pay-per-use enabled, usage past a meter's allotment continues and the
+    tier's graduated metered price bills the overage; disabled, requests are
+    refused with HTTP 402 at the allotment. Enabling requires a payment method on
+    file (subscribe — the free tier's $0 subscription qualifies — or add a card
+    through the billing portal). Trialing users with a card may enable pay-per-use.
+    """
+    await _apply_pay_per_use_setting(request, current_user, enabled)
+    return {"pay_per_use_enabled": enabled}
+
+
 @app.post("/change_subscription_tier")
 async def change_subscription_tier(
     request: Request,
     tier: str = Body(..., embed=True),
+    pay_per_use: bool | None = Body(default=None, embed=True),
     current_user: dict = Depends(get_current_user),
 ):
     """Switch an existing subscription to a different tier via the Subscription API.
 
     The Stripe customer portal cannot switch plans that contain metered prices, so
-    tier changes replace every subscription item's price with the target tier's
-    prices (base + metered) in a single update, prorating the difference. Downgrading
-    to free cancels the subscription at period end.
+    tier changes go through this endpoint. The direction decides the timing, per
+    the retained/cleared usage rules (``plan_tier_change``):
+
+    * **Upgrades** take effect immediately — every subscription item's price is
+      replaced with the target tier's prices (base + metered) in one prorated
+      update, and the local usage window restarts so the new tier begins with a
+      fresh allotment.
+    * **Downgrades** take effect at the period end via a Subscription Schedule —
+      the user already paid for the higher tier through the period, so billing
+      and allotment keep the higher tier until the boundary ("unused allotment
+      continues"). Downgrading to free cancels the subscription at period end.
+
+    ``pay_per_use`` optionally sets the overage flag in the same call (same
+    validation as POST /set_pay_per_use).
     """
     requested_tier = tier_from_value_or_400(tier)
     billing_config = getattr(request.app.state, "stripe_billing_config", None)
@@ -1012,59 +1258,119 @@ async def change_subscription_tier(
             detail=f"You are already on the {requested_tier.value} tier.",
             status_code=400,
         )
+    current_tier = tier_from_value(status.get("tier"))
+    tier_change_plan = plan_tier_change(current_tier, requested_tier)
 
     if requested_tier == SubscriptionTier.FREE:
+        # Downgrade to free = cancellation at period end; the
+        # customer.subscription.deleted webhook pins the tier to free at the
+        # boundary, so the paid allotment continues until then.
         try:
+            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+            _release_pending_subscription_schedule(stripe_client, subscription)
             stripe_client.Subscription.modify(
                 subscription_id, cancel_at_period_end=True
             )
         except Exception as cancel_error:
             logger.error("Could not schedule downgrade to free: %s", cancel_error)
             raise HTTPException(detail="Could not change tier.", status_code=502)
+        if pay_per_use is not None:
+            await _apply_pay_per_use_setting(request, current_user, pay_per_use)
         return {
             "message": "Subscription will end at the period boundary; you will drop to the free tier."
         }
 
     try:
         subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        _release_pending_subscription_schedule(stripe_client, subscription)
         existing_items = subscription.get("items", {}).get("data", [])
         target_price_ids = billing_config.identifiers_for_tier(
             requested_tier
         ).all_price_ids()
 
-        # Stripe forbids changing a subscription item between licensed and metered
-        # usage types, so the safe universal move is: delete every existing item and
-        # add the target tier's prices in the same atomic modify call. Tier price ids
-        # never overlap across tiers (per-tier lookup keys), so a delete+add of the
-        # same price cannot occur; the same-tier case is rejected above.
-        #
-        # clear_usage applies only to classic-billing-mode subscriptions with legacy
-        # usage-record metered items; flexible-mode subscriptions (the default for
-        # newly created ones) reject the parameter, and Billing-Meter usage lives on
-        # the meter rather than the item, so nothing needs clearing there.
-        billing_mode_type = (subscription.get("billing_mode") or {}).get("type")
-        supports_clear_usage = billing_mode_type != "flexible"
-        items_payload: list[dict] = []
-        for existing_item in existing_items:
-            deletion: dict = {"id": existing_item["id"], "deleted": True}
-            usage_type = (
-                (existing_item.get("price") or {}).get("recurring") or {}
-            ).get("usage_type")
-            if usage_type == "metered" and supports_clear_usage:
-                deletion["clear_usage"] = True
-            items_payload.append(deletion)
-        for target_price_id in target_price_ids:
-            items_payload.append({"price": target_price_id})
+        if tier_change_plan.schedule_change_at_period_end:
+            # Downgrade: keep the paid-for tier (billing AND allotment) until the
+            # period boundary, then switch. Phase one restates the current items
+            # through the period end; phase two runs the target tier for one
+            # period and then releases, leaving the subscription running on the
+            # target tier's items.
+            schedule = stripe_client.SubscriptionSchedule.create(
+                from_subscription=subscription_id
+            ).to_dict()
+            current_phase = (schedule.get("phases") or [{}])[0]
+            _, current_period_end = _subscription_period_bounds(subscription)
+            stripe_client.SubscriptionSchedule.modify(
+                schedule["id"],
+                end_behavior="release",
+                phases=[
+                    {
+                        "items": [
+                            {"price": (item.get("price") or {}).get("id")}
+                            for item in existing_items
+                        ],
+                        "start_date": current_phase.get("start_date"),
+                        "end_date": current_period_end
+                        or current_phase.get("end_date"),
+                    },
+                    {
+                        "items": [
+                            {"price": target_price_id}
+                            for target_price_id in target_price_ids
+                        ],
+                        "iterations": 1,
+                    },
+                ],
+            )
+        else:
+            # Upgrade: immediate switch. Stripe forbids changing a subscription
+            # item between licensed and metered usage types, so the safe universal
+            # move is: delete every existing item and add the target tier's prices
+            # in the same atomic modify call. Tier price ids never overlap across
+            # tiers (per-tier lookup keys), so a delete+add of the same price
+            # cannot occur; the same-tier case is rejected above.
+            #
+            # clear_usage applies only to classic-billing-mode subscriptions with
+            # legacy usage-record metered items; flexible-mode subscriptions (the
+            # default for newly created ones) reject the parameter, and
+            # Billing-Meter usage lives on the meter rather than the item, so
+            # nothing needs clearing there.
+            billing_mode_type = (subscription.get("billing_mode") or {}).get("type")
+            supports_clear_usage = billing_mode_type != "flexible"
+            items_payload: list[dict] = []
+            for existing_item in existing_items:
+                deletion: dict = {"id": existing_item["id"], "deleted": True}
+                usage_type = (
+                    (existing_item.get("price") or {}).get("recurring") or {}
+                ).get("usage_type")
+                if usage_type == "metered" and supports_clear_usage:
+                    deletion["clear_usage"] = True
+                items_payload.append(deletion)
+            for target_price_id in target_price_ids:
+                items_payload.append({"price": target_price_id})
 
-        stripe_client.Subscription.modify(
-            subscription_id,
-            items=items_payload,
-            proration_behavior="always_invoice",
-        )
+            stripe_client.Subscription.modify(
+                subscription_id,
+                items=items_payload,
+                proration_behavior="always_invoice",
+            )
     except Exception as change_error:
         logger.error("Could not change subscription tier: %s", change_error)
         raise HTTPException(detail="Could not change tier.", status_code=502)
 
+    if tier_change_plan.reset_usage_period_anchor:
+        # Upgrade clears local usage: the new tier starts with a fresh allotment.
+        await _write_usage_period_anchor(request, current_user)
+
+    if pay_per_use is not None:
+        await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+
+    if tier_change_plan.schedule_change_at_period_end:
+        return {
+            "message": (
+                f"Subscription will switch to the {requested_tier.value} tier at the "
+                "period boundary; your current allotment continues until then."
+            )
+        }
     return {"message": f"Subscription changed to the {requested_tier.value} tier."}
 
 
@@ -1072,20 +1378,134 @@ async def change_subscription_tier(
 async def manage_subscription(
     request: Request, current_user: dict = Depends(get_current_user)
 ):
+    """Return a Stripe billing-portal session URL for this customer.
+
+    A billing-portal session is created per request, so the link works in both
+    the test and live Stripe environments (the static
+    STRIPE_MANAGE_SUBSCRIPTION_URL login page remains only as a degraded-mode
+    fallback when billing objects are not provisioned). The portal covers
+    invoices, payment methods, and billing information; tier switching stays on
+    POST /change_subscription_tier because the portal cannot switch plans that
+    contain metered prices.
+    """
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    if billing_config is None:
+        return {
+            "url": request.app.state.context.stripe_manage_subscription_url,
+            "message": "Follow this link to manage your subscription.",
+        }
+
+    stripe_client = request.app.state.stripe
+    customer_id = resolve_stripe_customer_id(current_user)
+    if not customer_id:
+        status = await check_subscription_status(
+            request=request, current_user=current_user
+        )
+        customer_id = status.get("customer_id")
+    if not customer_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No billing account yet. Use GET /subscribe to create one.",
+        )
+
+    portal_kwargs: dict = {
+        "customer": customer_id,
+        "return_url": f"{str(request.base_url).rstrip('/')}/docs",
+    }
+    portal_configuration_id = getattr(billing_config, "portal_configuration_id", None)
+    if portal_configuration_id:
+        portal_kwargs["configuration"] = portal_configuration_id
+    try:
+        session = stripe_client.billing_portal.Session.create(**portal_kwargs).to_dict()
+    except Exception as portal_error:
+        logger.error("Could not create billing-portal session: %s", portal_error)
+        raise HTTPException(
+            status_code=502, detail="Could not open the billing portal. Try again."
+        )
     return {
-        "url": request.app.state.context.stripe_manage_subscription_url,
+        "url": session["url"],
         "message": "Follow this link to manage your subscription.",
     }
 
 
-@app.get("/cancel_subscription")
+@app.post("/cancel_subscription")
 async def cancel_subscription(
     request: Request, current_user: dict = Depends(get_current_user)
 ):
+    """Cancel the subscription at the period end via the Subscription API.
+
+    The user keeps the paid tier (and its allotment) through the period they
+    already paid for; the customer.subscription.deleted webhook pins the tier to
+    free at the boundary. A pending scheduled downgrade is released first. Undo
+    with POST /reactivate_subscription before the period ends.
+    """
+    stripe_client = request.app.state.stripe
+    status = await check_subscription_status(request=request, current_user=current_user)
+    subscription_id = status.get("subscription_id")
+    if not subscription_id:
+        raise HTTPException(
+            status_code=404, detail="No subscription to cancel."
+        )
+    try:
+        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        if subscription.get("status") == "canceled":
+            raise HTTPException(
+                status_code=409,
+                detail="The subscription is already canceled. Use GET /subscribe to start a new one.",
+            )
+        _release_pending_subscription_schedule(stripe_client, subscription)
+        updated_subscription = stripe_client.Subscription.modify(
+            subscription_id, cancel_at_period_end=True
+        ).to_dict()
+    except HTTPException:
+        raise
+    except Exception as cancel_error:
+        logger.error("Could not cancel subscription %s: %s", subscription_id, cancel_error)
+        raise HTTPException(status_code=502, detail="Could not cancel the subscription.")
+    _, current_period_end = _subscription_period_bounds(updated_subscription)
     return {
-        "url": request.app.state.context.stripe_manage_subscription_url,
-        "message": "Follow this link to manage and cancel your subscription.",
+        "message": "Subscription will cancel at the period end.",
+        "cancel_at_period_end": True,
+        "current_period_end": current_period_end,
     }
+
+
+@app.post("/reactivate_subscription")
+async def reactivate_subscription(
+    request: Request, current_user: dict = Depends(get_current_user)
+):
+    """Undo a pending period-end cancellation (or scheduled downgrade).
+
+    Only works while the subscription is still running; once fully canceled the
+    user must start a new subscription through GET /subscribe.
+    """
+    stripe_client = request.app.state.stripe
+    status = await check_subscription_status(request=request, current_user=current_user)
+    subscription_id = status.get("subscription_id")
+    if not subscription_id:
+        raise HTTPException(status_code=404, detail="No subscription to reactivate.")
+    try:
+        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        if subscription.get("status") == "canceled":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The subscription is fully canceled and cannot be reactivated. "
+                    "Use GET /subscribe to start a new one."
+                ),
+            )
+        _release_pending_subscription_schedule(stripe_client, subscription)
+        stripe_client.Subscription.modify(subscription_id, cancel_at_period_end=False)
+    except HTTPException:
+        raise
+    except Exception as reactivate_error:
+        logger.error(
+            "Could not reactivate subscription %s: %s", subscription_id, reactivate_error
+        )
+        raise HTTPException(
+            status_code=502, detail="Could not reactivate the subscription."
+        )
+    return {"message": "Subscription reactivated.", "cancel_at_period_end": False}
 
 
 def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Optional[str]:
@@ -1112,6 +1532,9 @@ async def _handle_stripe_event(
         subscription_id = data_object.get("subscription")
         tier = data_object.get("metadata", {}).get("neural_nexus_tier", "free")
         status_value = "active"
+        current_period_start = None
+        current_period_end = None
+        cancel_at_period_end = False
         if subscription_id:
             try:
                 subscription = stripe_client.Subscription.retrieve(
@@ -1119,6 +1542,10 @@ async def _handle_stripe_event(
                 ).to_dict()
                 status_value = subscription.get("status", "active")
                 tier = _tier_from_subscription(stripe_client, subscription)
+                current_period_start, current_period_end = _subscription_period_bounds(
+                    subscription
+                )
+                cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
             except Exception as retrieve_error:
                 logger.error("Could not retrieve subscription: %s", retrieve_error)
         await update_user_subscription_status(
@@ -1130,7 +1557,17 @@ async def _handle_stripe_event(
                 "customer_id": customer_id,
                 "email": data_object.get("customer_details", {}).get("email"),
                 "tier": tier,
+                "current_period_start": current_period_start,
+                "current_period_end": current_period_end,
+                "cancel_at_period_end": cancel_at_period_end,
             },
+        )
+        # First checkout starts a fresh local usage window (a free→paid upgrade,
+        # or the free $0 subscription's first period).
+        await update_user_app_metadata_fields(
+            request,
+            auth0_user_id,
+            {"usage_period_anchor": datetime.now(UTC).isoformat()},
         )
 
     elif event_type in (
@@ -1139,6 +1576,9 @@ async def _handle_stripe_event(
     ):
         customer_id = data_object.get("customer")
         auth0_user_id = _auth0_user_id_for_customer(stripe_client, customer_id)
+        current_period_start, current_period_end = _subscription_period_bounds(
+            data_object
+        )
         if event_type == "customer.subscription.deleted":
             tier = "free"
             status_value = "canceled"
@@ -1154,8 +1594,17 @@ async def _handle_stripe_event(
                 "customer_id": customer_id,
                 "email": None,
                 "tier": tier,
+                "current_period_start": current_period_start,
+                "current_period_end": current_period_end,
+                "cancel_at_period_end": bool(data_object.get("cancel_at_period_end")),
             },
         )
+        if event_type == "customer.subscription.deleted":
+            # A stale explicit pay-per-use flag must not grant overage after the
+            # subscription (the billing vehicle) is gone.
+            await update_user_app_metadata_fields(
+                request, auth0_user_id, {"pay_per_use_enabled": False}
+            )
 
     elif event_type == "invoice.payment_failed":
         customer_id = data_object.get("customer")
@@ -1251,10 +1700,63 @@ async def stripe_webhook(request: Request):
 async def verify_subscription_status(
     request: Request, current_user: dict = Depends(get_current_user)
 ):
+    """Return subscription status plus per-meter allotment, usage, and remaining.
+
+    The single endpoint a customer portal polls: subscription identity/status,
+    the pay-per-use flag, the current usage period bounds, and — for every meter
+    the tier grants — the period allotment, usage to date (from the local
+    ``api_metrics`` accounting), remaining budget, and the overage rate that
+    applies when pay-per-use is enabled.
+    """
     status = await check_subscription_status(request=request, current_user=current_user)
-    if status["status"] == None:
-        return {"subscription_status:Not Subscribed"}
-    return status
+    tier = tier_from_value(status.get("tier"))
+
+    context = GlobalContext()
+    usage_period_days = int(context.usage_period_days or 0)
+    period_start = resolve_usage_period_start_for_user(current_user)
+
+    app_metadata = (current_user or {}).get("app_metadata") or {}
+    cached_subscription_status = app_metadata.get("subscription_status") or {}
+    cached_period_end = cached_subscription_status.get("current_period_end")
+    if cached_period_end:
+        try:
+            period_end = datetime.fromtimestamp(int(cached_period_end), tz=UTC)
+        except (TypeError, ValueError, OSError):
+            period_end = resolve_usage_period_end(period_start, usage_period_days)
+    else:
+        period_end = resolve_usage_period_end(period_start, usage_period_days)
+
+    usage_by_meter = await fetch_usage_by_meter_since(
+        getattr(request.app.state, "pool", None),
+        resolve_metering_user_id(current_user),
+        period_start,
+    )
+
+    meters: dict = {}
+    for meter, allotment in TIER_DEFINITIONS[tier].meter_allotments.items():
+        used_to_date = int(usage_by_meter.get(meter.value, 0))
+        meters[meter.value] = {
+            "monthly_allotment": allotment.monthly_allotment,
+            "used_to_date": used_to_date,
+            "remaining": max(0, allotment.monthly_allotment - used_to_date),
+            "overage_price_per_million": allotment.overage_price_per_million,
+            "overage_price_per_unit_usd": allotment.overage_price_per_unit_usd,
+        }
+
+    return {
+        "status": status.get("status"),
+        "tier": tier.value,
+        "subscription_id": status.get("subscription_id"),
+        "customer_id": status.get("customer_id"),
+        "email": status.get("email"),
+        "pay_per_use_enabled": resolve_pay_per_use_enabled(current_user),
+        "cancel_at_period_end": bool(
+            cached_subscription_status.get("cancel_at_period_end")
+        ),
+        "usage_period_start": period_start.isoformat(),
+        "usage_period_end": period_end.isoformat(),
+        "meters": meters,
+    }
 
 
 @app.post("/create_avatar")
@@ -1804,10 +2306,28 @@ async def message_selected_avatar(
             detail="Error retrieving assistant information.", status_code=400
         )
 
-    # Free-tier users (paid tiers bill overage instead) are blocked once their
-    # monthly messaging-token allotment is exhausted.
-    await enforce_remaining_allotment(
-        request.app.state, current_user, UsageMeter.MESSAGING_TOKENS
+    # This turn bills the adapter-inference meter only when the client asked for
+    # the adapter AND the user's tier grants adapter inference; otherwise the
+    # messaging meter governs. Any tier without pay-per-use is blocked at the
+    # allotment; a token rate cap guards against runaway clients.
+    message_meter = (
+        UsageMeter.ADAPTER_INFERENCE_TOKENS
+        if resolve_use_adapter_inference(current_user, adapter)
+        else UsageMeter.MESSAGING_TOKENS
+    )
+    await enforce_remaining_allotment(request.app.state, current_user, message_meter)
+    message_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
     )
 
     user_name = your_name
@@ -1914,7 +2434,7 @@ async def message_selected_avatar(
         "thread_metadata": {
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "most_recent_message": datetime.now(UTC).isoformat(),
             "conversation_title": conversation_title,
         },
         "graph_id": "Anubis",
@@ -1977,10 +2497,28 @@ async def message_avatar(
             detail="Error retrieving assistant information.", status_code=400
         )
 
-    # Free-tier users (anonymous users resolve to free) are blocked once their
-    # monthly messaging-token allotment is exhausted; paid tiers bill overage.
-    await enforce_remaining_allotment(
-        request.app.state, current_user, UsageMeter.MESSAGING_TOKENS
+    # This turn bills the adapter-inference meter only when the client asked for
+    # the adapter AND the user's tier grants adapter inference; otherwise the
+    # messaging meter governs. Any tier without pay-per-use is blocked at the
+    # allotment; a token rate cap guards against runaway clients.
+    message_meter = (
+        UsageMeter.ADAPTER_INFERENCE_TOKENS
+        if resolve_use_adapter_inference(current_user, adapter)
+        else UsageMeter.MESSAGING_TOKENS
+    )
+    await enforce_remaining_allotment(request.app.state, current_user, message_meter)
+    message_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
     )
 
     user_name = your_name
@@ -2113,7 +2651,7 @@ async def message_avatar(
         "thread_metadata": {
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "most_recent_message": datetime.now(UTC).isoformat(),
             "conversation_title": conversation_title_data,
         },
         "graph_id": "Anubis",
@@ -2179,6 +2717,26 @@ async def resume_avatar_message(
         raise HTTPException(
             detail="Error retrieving assistant information.", status_code=400
         )
+
+    # The resumed continuation bills the messaging meter (resume has no adapter
+    # form field), so the same allotment and rate-limit gates apply as on the
+    # initial message endpoints.
+    await enforce_remaining_allotment(
+        request.app.state, current_user, UsageMeter.MESSAGING_TOKENS
+    )
+    message_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
+    )
 
     user_id = current_user["identities"][0]["user_id"]
     if request.headers.get("api-key", "") != "":
@@ -3823,6 +4381,24 @@ async def update_avatar_identity_with_media(
     try:
         # Gate: only pro/premium tiers may update avatar identity with media.
         enforce_tier_capability(current_user, TierCapability.UPLOAD)
+        # Block once the document-upload allotment is exhausted without
+        # pay-per-use, and cap the upload token rate for runaway clients.
+        await enforce_remaining_allotment(
+            app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
+        )
+        media_upload_rate_limit_context = GlobalContext()
+        await enforce_token_rate_limit(
+            app.state,
+            current_user,
+            meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
+            window_seconds=int(
+                media_upload_rate_limit_context.media_upload_rate_limit_window_seconds or 0
+            ),
+            tokens_per_window=int(
+                media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
+                or 0
+            ),
+        )
 
         user_id = current_user["identities"][0]["user_id"]
         if not assistant_id:
@@ -4306,6 +4882,7 @@ async def media_job_status(
     it returns that single item's status/result.
     """
     user_id = current_user["identities"][0]["user_id"]
+    job_id = job_id.strip()
     registry = app.state.media_jobs
     job: Optional[MediaJob] = get_job(registry, job_id)
     if job is None:
@@ -4359,6 +4936,7 @@ async def media_job_progress(
     status and result (or error).
     """
     user_id = current_user["identities"][0]["user_id"]
+    job_id = job_id.strip()
     job: Optional[MediaJob] = get_job(app.state.media_jobs, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
@@ -4492,6 +5070,7 @@ async def cancel_media_job(
     there may be nothing to delete.
     """
     user_id = current_user["identities"][0]["user_id"]
+    job_id = job_id.strip() # remove spaces and newline characters
     registry = app.state.media_jobs
     job: Optional[MediaJob] = get_job(registry, job_id)
     if job is None:

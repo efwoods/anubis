@@ -17,6 +17,9 @@ What it creates:
 * One licensed flat monthly base price per tier (the subscription fee).
 * One graduated metered price per (tier, meter) pair: tier 1 is the included
   monthly allotment at zero cost, tier 2 is pay-per-use overage.
+* One billing-portal configuration (invoices, payment methods, billing
+  information, at-period-end cancellation; no plan switching — metered prices
+  require tier changes to go through POST /change_subscription_tier).
 
 Idempotency:
 
@@ -60,6 +63,8 @@ from src.anubis.utils.billing.tiers import (  # noqa: E402
 # Bump this to force creation of a new immutable price set after editing amounts.
 PRICE_LOOKUP_KEY_VERSION = "v1"
 PRODUCT_TIER_METADATA_KEY = "neural_nexus_tier"
+PORTAL_CONFIGURATION_METADATA_KEY = "neural_nexus_portal"
+PORTAL_CONFIGURATION_METADATA_VALUE = f"portal_{PRICE_LOOKUP_KEY_VERSION}"
 
 
 def _base_price_lookup_key(tier: SubscriptionTier) -> str:
@@ -177,6 +182,53 @@ def find_or_create_metered_price(
     return created["id"]
 
 
+def find_or_create_billing_portal_configuration() -> str:
+    """Return the id of the Neural Nexus billing-portal configuration.
+
+    The portal configuration defines what the Stripe-hosted customer portal
+    exposes: invoice history, payment-method updates, and billing-information
+    updates, plus at-period-end cancellation. Plan switching stays DISABLED here
+    — the hosted portal cannot switch plans that contain metered prices, so tier
+    changes go through the API's POST /change_subscription_tier. Matched by a
+    metadata tag so re-runs reuse the existing configuration.
+    """
+    for existing in stripe.billing_portal.Configuration.list(
+        active=True, limit=100
+    ).auto_paging_iter():
+        existing_configuration = existing.to_dict()
+        tagged_value = (existing_configuration.get("metadata") or {}).get(
+            PORTAL_CONFIGURATION_METADATA_KEY
+        )
+        if tagged_value == PORTAL_CONFIGURATION_METADATA_VALUE:
+            print(
+                f"  portal configuration exists -> {existing_configuration['id']}"
+            )
+            return existing_configuration["id"]
+
+    created = stripe.billing_portal.Configuration.create(
+        business_profile={
+            "headline": "Neural Nexus — manage your subscription",
+        },
+        features={
+            "invoice_history": {"enabled": True},
+            "payment_method_update": {"enabled": True},
+            "customer_update": {
+                "enabled": True,
+                "allowed_updates": ["email", "address", "phone", "name"],
+            },
+            "subscription_cancel": {
+                "enabled": True,
+                "mode": "at_period_end",
+            },
+        },
+        metadata={
+            PORTAL_CONFIGURATION_METADATA_KEY: PORTAL_CONFIGURATION_METADATA_VALUE
+        },
+    )
+    print(f"  portal configuration CREATED -> {created['id']}")
+    return created["id"]
+
+
 def provision() -> Dict[str, Any]:
     """Create/reuse every object and return the billing-config JSON document."""
     print("Provisioning Billing Meters:")
@@ -203,9 +255,13 @@ def provision() -> Dict[str, Any]:
             "metered_prices": metered_price_ids,
         }
 
+    print("Provisioning billing-portal configuration:")
+    portal_configuration_id = find_or_create_billing_portal_configuration()
+
     return {
         "meters": {meter.value: meter_id for meter, meter_id in meter_ids.items()},
         "tiers": tiers_config,
+        "portal_configuration": portal_configuration_id,
     }
 
 

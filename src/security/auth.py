@@ -1047,6 +1047,56 @@ async def update_user_subscription_status(
         return False
 
 
+async def update_user_app_metadata_fields(
+    request: Request, auth0_user_id: str, fields: dict
+) -> bool:
+    """Patch top-level ``app_metadata`` keys for one Auth0 user and drop stale cache.
+
+    Auth0 merges ``app_metadata`` at the top level, so patching only the supplied
+    keys (for example ``pay_per_use_enabled`` or ``usage_period_anchor``) leaves
+    every other key untouched. After a successful patch, every cached API-key
+    entry for this user is evicted so the five-minute TTL cache cannot serve a
+    stale billing flag to the next request. Best-effort: logs and returns
+    ``False`` on failure.
+    """
+    if not auth0_user_id or not fields:
+        return False
+    try:
+        headers = await _mgmt_headers(request)
+        provider_encoded_user_id = quote(auth0_user_id, safe="")
+        response = await retry_async_httpx_request(
+            method="PATCH",
+            url=f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}",
+            headers=headers,
+            json={"app_metadata": fields},
+        )
+        response.raise_for_status()
+    except Exception as patch_error:
+        logger.error(
+            "Could not patch app_metadata fields %s for %s: %s",
+            list(fields),
+            auth0_user_id,
+            patch_error,
+        )
+        return False
+
+    # The cache indexes by identity user_id (the id without the provider prefix).
+    bare_user_id = auth0_user_id.split("|")[-1]
+    async with _cache_lock:
+        stale_keys = [
+            cache_key
+            for cache_key, cached_user in _api_key_cache.items()
+            if cached_user.get("user_id") == auth0_user_id
+            or (
+                (cached_user.get("identities") or [{}])[0].get("user_id")
+                == bare_user_id
+            )
+        ]
+        for cache_key in stale_keys:
+            del _api_key_cache[cache_key]
+    return True
+
+
 async def check_subscription_status(request: Request, current_user: dict) -> dict:
     stripe_client = request.app.state.stripe
     subscription_status = current_user["app_metadata"].get("subscription_status", None)

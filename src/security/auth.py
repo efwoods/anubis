@@ -200,25 +200,48 @@ async def _provision_stripe_customer_and_default_tier(
     email: Optional[str],
     name: Optional[str] = None,
 ) -> Optional[str]:
-    """Create a Stripe customer for a new signup and pin the account to free tier.
+    """Create or REUSE a Stripe customer for a signup and pin the account to free tier.
 
-    Establishes the single canonical ``app_metadata.stripe_customer_id`` (replacing
-    the historically inconsistent ``customer_dict``/``customer`` keys) and records a
-    default free-tier ``subscription_status`` so gating has a tier to read before the
-    user ever subscribes. Best-effort: a Stripe or Auth0 failure logs and returns
-    ``None`` rather than blocking signup, because the Stripe webhook and
-    ``check_subscription_status`` reconcile the record later.
+    An existing customer with the same email is reused rather than duplicated:
+    account deletion keeps the Stripe customer (with the
+    ``neural_nexus_trial_used`` metadata flag), so a delete-and-re-signup with
+    the same email reattaches to the original customer and can never harvest a
+    second free trial. Establishes the single canonical
+    ``app_metadata.stripe_customer_id`` (replacing the historically
+    inconsistent ``customer_dict``/``customer`` keys) and records a default
+    free-tier ``subscription_status`` so gating has a tier to read before the
+    user ever subscribes. Best-effort: a Stripe or Auth0 failure logs and
+    returns ``None`` rather than blocking signup, because the Stripe webhook
+    and ``check_subscription_status`` reconcile the record later.
     """
     stripe_client = request.app.state.stripe
+    customer = None
     try:
-        customer = stripe_client.Customer.create(
-            email=email,
-            name=name or None,
-            metadata={"auth0_user_id": user_id or ""},
-        )
+        if email:
+            existing_customers = (
+                stripe_client.Customer.list(email=email, limit=1)
+                .to_dict()
+                .get("data", [])
+            )
+            if existing_customers:
+                customer = existing_customers[0]
+                # Reattach: refresh the Auth0 linkage on the reused customer
+                # (the previous account's id is preserved separately by
+                # delete_user as deleted_auth0_user_id).
+                stripe_client.Customer.modify(
+                    customer["id"], metadata={"auth0_user_id": user_id or ""}
+                )
+        if customer is None:
+            customer = stripe_client.Customer.create(
+                email=email,
+                name=name or None,
+                metadata={"auth0_user_id": user_id or ""},
+            )
     except Exception as customer_error:
         logger.error(
-            "Could not create Stripe customer for %s: %s", email, customer_error
+            "Could not create/reuse Stripe customer for %s: %s",
+            email,
+            customer_error,
         )
         return None
 
@@ -254,6 +277,247 @@ async def _provision_stripe_customer_and_default_tier(
             patch_error,
         )
     return customer_id
+
+
+def _subscription_items_for_tier(billing_config, tier) -> list[dict]:
+    """Build server-side Subscription.create items: base price + metered prices.
+
+    Mirrors the Checkout line items (``_checkout_line_items_for_tier`` in
+    webapp.py): the licensed base price carries ``quantity=1``; metered prices
+    are reported via meter events and carry no quantity.
+    """
+    identifiers = billing_config.identifiers_for_tier(tier)
+    items: list[dict] = [{"price": identifiers.base_price_id, "quantity": 1}]
+    for metered_price_id in identifiers.metered_price_ids.values():
+        items.append({"price": metered_price_id})
+    return items
+
+
+def create_free_tier_subscription(
+    stripe_client,
+    billing_config,
+    customer_id: str,
+    auth0_user_id: str = "",
+    extra_metadata: Optional[dict] = None,
+) -> Optional[dict]:
+    """Create the $0 free-tier subscription server-side (no Checkout, no card).
+
+    The free-tier subscription is the billing vehicle for metering free usage
+    (every meter event lands on a real subscription for cost analysis) and for
+    pay-per-use overage once the user adds a card. The $0 base invoice
+    finalizes without a payment method. Used by: the post-verification
+    fallback when a trial cannot be granted, the trial-end webhook (trial
+    lapsed without a card), and anonymous per-hashed-IP metering customers.
+    Best-effort: returns ``None`` on failure (the account still gates as free
+    from the default ``subscription_status``).
+    """
+    from src.anubis.utils.billing.tiers import SubscriptionTier
+
+    metadata = {"neural_nexus_tier": SubscriptionTier.FREE.value}
+    if auth0_user_id:
+        metadata["auth0_user_id"] = auth0_user_id
+    metadata.update(extra_metadata or {})
+    try:
+        return stripe_client.Subscription.create(
+            customer=customer_id,
+            items=_subscription_items_for_tier(
+                billing_config, SubscriptionTier.FREE
+            ),
+            metadata=metadata,
+        ).to_dict()
+    except Exception as subscription_error:  # noqa: BLE001 - best-effort
+        logger.error(
+            "Could not create free-tier subscription for customer %s: %s",
+            customer_id,
+            subscription_error,
+        )
+        return None
+
+
+async def ensure_initial_subscription_after_verification(
+    request: Request, user: dict
+) -> None:
+    """Auto-enroll a newly VERIFIED account: pro free trial, or free tier.
+
+    Called the first time an email-verified user is seen without a
+    subscription (the API-key cache keeps this off the hot path; the
+    ``initial_subscription_provisioned`` marker keeps it off Stripe on cache
+    misses). The enrollment rules:
+
+    * A verified account that has never used a trial receives the PRO tier
+      with the 30-day free trial, created server-side without Checkout and
+      without a card. ``trial_settings.end_behavior.missing_payment_method``
+      is ``cancel`` (Stripe forbids "pause" on subscriptions with metered
+      prices); the ``customer.subscription.deleted`` webhook then auto-creates
+      the free-tier subscription when a trial lapses without a card.
+    * Trial abuse is denied by the Stripe customer record, which survives
+      account deletion: a customer with ``metadata.neural_nexus_trial_used``
+      (or any prior subscription) enrolls straight into the FREE tier.
+    * A customer with a LIVE subscription (delete-and-re-signup during the
+      trial period) simply adopts that subscription — the free trial is
+      retained until the end of the original trial period, never restarted.
+
+    Best-effort and idempotent: any Stripe failure logs and returns without
+    writing the marker, so the next cache-miss request retries. Anonymous
+    users never reach this function (no email verification for them).
+    """
+    from src.anubis.utils.billing.gating import resolve_stripe_customer_id
+    from src.anubis.utils.billing.tiers import TIER_DEFINITIONS, SubscriptionTier
+
+    app_metadata = user.get("app_metadata") or {}
+    if app_metadata.get("initial_subscription_provisioned"):
+        return
+
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    if billing_config is None:
+        # Billing objects not provisioned (degraded mode) — retry on a later
+        # request once configuration exists; do not write the marker.
+        return
+
+    email = user.get("email")
+    auth0_user_id = user.get("user_id")
+    if not email or not auth0_user_id:
+        return
+
+    stripe_client = request.app.state.stripe
+
+    cached_subscription_status = app_metadata.get("subscription_status") or {}
+    if cached_subscription_status.get("subscription_id"):
+        # A subscription already exists (checkout or webhook beat this path);
+        # just write the marker so this check never calls Stripe again.
+        await update_user_app_metadata_fields(
+            request, auth0_user_id, {"initial_subscription_provisioned": True}
+        )
+        user.setdefault("app_metadata", {})[
+            "initial_subscription_provisioned"
+        ] = True
+        return
+
+    try:
+        customer_id = resolve_stripe_customer_id(user)
+        if not customer_id:
+            customer_id = await _provision_stripe_customer_and_default_tier(
+                request=request,
+                user_id=auth0_user_id,
+                email=email,
+                name=user.get("name"),
+            )
+        if not customer_id:
+            return
+
+        customer = stripe_client.Customer.retrieve(customer_id).to_dict()
+        trial_already_used = bool(
+            (customer.get("metadata") or {}).get("neural_nexus_trial_used")
+        )
+        prior_subscriptions = (
+            stripe_client.Subscription.list(
+                customer=customer_id, status="all", limit=1
+            )
+            .to_dict()
+            .get("data", [])
+        )
+
+        live_prior_subscription = next(
+            (
+                subscription
+                for subscription in prior_subscriptions
+                if subscription.get("status") in ("active", "trialing", "past_due")
+            ),
+            None,
+        )
+
+        subscription_status_update: dict
+        app_metadata_update: dict = {
+            "stripe_customer_id": customer_id,
+            "initial_subscription_provisioned": True,
+        }
+
+        if live_prior_subscription is not None:
+            # Delete-and-re-signup with the same email while the original
+            # subscription (typically the trial) is still running: adopt the
+            # running subscription — the free trial is retained until the end
+            # of the original trial period.
+            subscription = live_prior_subscription
+            subscription_status_update = {
+                "status": subscription.get("status"),
+                "tier": _tier_from_subscription(stripe_client, subscription),
+                "subscription_id": subscription.get("id"),
+                "customer_id": customer_id,
+                "email": email,
+            }
+            if subscription.get("status") == "trialing" and subscription.get(
+                "trial_end"
+            ):
+                app_metadata_update["trial_context"] = {
+                    "tier": subscription_status_update["tier"],
+                    "trial_end": int(subscription["trial_end"]),
+                }
+        elif trial_already_used or prior_subscriptions:
+            # Trial denied (used before, or some prior subscription history):
+            # enroll straight into the free tier.
+            subscription = create_free_tier_subscription(
+                stripe_client, billing_config, customer_id, auth0_user_id
+            )
+            if subscription is None:
+                return
+            subscription_status_update = {
+                "status": subscription.get("status"),
+                "tier": SubscriptionTier.FREE.value,
+                "subscription_id": subscription.get("id"),
+                "customer_id": customer_id,
+                "email": email,
+            }
+        else:
+            # First verified account on this customer: grant the PRO tier
+            # with the 30-day free trial, no card required.
+            pro_definition = TIER_DEFINITIONS[SubscriptionTier.PRO]
+            subscription = stripe_client.Subscription.create(
+                customer=customer_id,
+                items=_subscription_items_for_tier(
+                    billing_config, SubscriptionTier.PRO
+                ),
+                trial_period_days=pro_definition.trial_period_days,
+                # Stripe forbids "pause" with metered prices; "cancel" plus
+                # the deleted-webhook's free-tier auto-enrollment achieves
+                # the trial-to-free product outcome.
+                trial_settings={
+                    "end_behavior": {"missing_payment_method": "cancel"}
+                },
+                metadata={
+                    "auth0_user_id": auth0_user_id,
+                    "neural_nexus_tier": SubscriptionTier.PRO.value,
+                },
+            ).to_dict()
+            stripe_client.Customer.modify(
+                customer_id, metadata={"neural_nexus_trial_used": "true"}
+            )
+            subscription_status_update = {
+                "status": subscription.get("status"),
+                "tier": SubscriptionTier.PRO.value,
+                "subscription_id": subscription.get("id"),
+                "customer_id": customer_id,
+                "email": email,
+            }
+            app_metadata_update["usage_period_anchor"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            if subscription.get("trial_end"):
+                app_metadata_update["trial_context"] = {
+                    "tier": SubscriptionTier.PRO.value,
+                    "trial_end": int(subscription["trial_end"]),
+                }
+    except Exception as provisioning_error:  # noqa: BLE001 - best-effort
+        logger.error(
+            "Could not auto-enroll verified user %s into an initial "
+            "subscription: %s",
+            auth0_user_id,
+            provisioning_error,
+        )
+        return
+
+    app_metadata_update["subscription_status"] = subscription_status_update
+    await update_user_app_metadata_fields(request, auth0_user_id, app_metadata_update)
+    user.setdefault("app_metadata", {}).update(app_metadata_update)
 
 
 # utility functions
@@ -478,6 +742,19 @@ async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
             status_code=401,
         )
 
+    # First time a VERIFIED account is seen without a subscription: auto-enroll
+    # into the pro free trial (or straight into the free tier when a trial was
+    # already used on this Stripe customer). Non-fatal and idempotent — a
+    # failure here must never block authentication.
+    try:
+        await ensure_initial_subscription_after_verification(request, user)
+    except Exception as enrollment_error:  # noqa: BLE001 - non-fatal
+        logger.error(
+            "Initial subscription enrollment failed for %s: %s",
+            user.get("user_id"),
+            enrollment_error,
+        )
+
     # if user['app_metadata']['logged_in'] != True:
     #     raise HTTPException(detail="User is not logged in. Please log in to continue.")
 
@@ -518,8 +795,13 @@ async def get_anonymous_user_with_anonymous_api_key(
     # cache_key = _hash_key(request.headers.get('x-forwarded-for'))
     if request.app.state.context.dev == "TRUE":
         hashed_ip = _hash_key("172.18.0.1")
+        # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
+        # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULATED
     else:
         hashed_ip = _hash_key(request.headers.get("x-forwarded-for"))
+        # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
+        # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULA
+
     # async with _cache_lock:
     #     if cache_key in _api_key_cache:
     #         return _api_key_cache[cache_key]
@@ -590,6 +872,24 @@ async def get_anonymous_user_with_anonymous_api_key(
     else:
         user["identities"] = [{}]
         user["identities"][0]["user_id"] = hashed_ip
+
+    # Anonymous users use free-tier metering only (never a trial): lazily
+    # attach the per-hashed-ip Stripe customer (with a $0 free-tier
+    # subscription) so meter events for anonymous usage become visible in
+    # Stripe cost analysis. Fail-open — a missing customer only means the
+    # meter report stays a no-op, exactly the pre-existing behavior. Tier
+    # gating is unaffected: is_anonymous_user still pins the tier to free.
+    from src.security.anonymous_billing import (
+        resolve_or_create_anonymous_stripe_customer,
+    )
+
+    anonymous_stripe_customer_id = await resolve_or_create_anonymous_stripe_customer(
+        request, hashed_ip
+    )
+    if anonymous_stripe_customer_id:
+        user.setdefault("app_metadata", {})[
+            "stripe_customer_id"
+        ] = anonymous_stripe_customer_id
 
     return user
 
@@ -671,8 +971,12 @@ async def resend_verification_email(
     request: Request, current_user: dict = Depends(get_current_user)
 ):
     # TODO: RATE LIMIT API CALL
+    # Auth0 Management-API user objects carry ``user_id`` (JWT payloads carry
+    # ``sub``); the request INSTANCE must be forwarded, not the Request class.
     logger.info("breakpoint")
-    return await send_verification_email(current_user["sub"], request=Request)
+    return await send_verification_email(
+        current_user.get("user_id") or current_user.get("sub"), request=request
+    )
 
 
 @security_route.post("/rotate_api_key")
@@ -753,49 +1057,47 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         encoded_user_id = quote(current_user["user_id"], safe="")
         headers = await _mgmt_headers(request)
 
-        customer_id = current_user["app_metadata"].get("customer", {}).get("id", "")
+        # The Stripe customer is deliberately KEPT (never deleted): the
+        # customer record carries the trial-usage history
+        # (metadata.neural_nexus_trial_used) that prevents a delete-and-
+        # re-signup from harvesting a fresh free trial. Signing up again with
+        # the same email reattaches this customer, so a free trial in
+        # progress is retained until the end of the trial period. Any live
+        # subscription is set to cancel at period end so a departed user is
+        # never billed for another period. Both writes are best-effort — a
+        # Stripe failure must not block account deletion.
+        from src.anubis.utils.billing.gating import resolve_stripe_customer_id
 
-        if customer_id and customer_id != "":
-            # delete customer information
-            stripe = request.app.state.stripe
+        customer_id = resolve_stripe_customer_id(current_user) or ""
+
+        if customer_id:
+            stripe_client = request.app.state.stripe
             try:
-                deleted = stripe.Customer.delete(customer_id)
-                if deleted.get("deleted", False) is not True:
-                    raise HTTPException(
-                        detail="Error deleting customer account.", status_code=500
-                    )
-            except stripe.error.CardError as e:
-                # A declined card error
-                print("Status: %s" % e.http_status)
-                print("Code: %s" % e.code)
-                if e.param:
-                    print("Param: %s" % e.param)
-                print("Message: %s" % e.user_message)
-                print("Request ID: %s" % e.request_id)
-            except stripe.error.RateLimitError as e:
-                # Too many requests made to the API too quickly
-                print("Request ID: %s" % e.request_id)
-            except stripe.error.InvalidRequestError as e:
-                # Invalid parameters were supplied to Stripe's API
-                print("Message: %s" % e.user_message)
-                if e.param:
-                    print("Param: %s" % e.param)
-                print("Request ID: %s" % e.request_id)
-            except stripe.error.AuthenticationError as e:
-                # Authentication with Stripe's API failed
-                print("Request ID: %s" % e.request_id)
-            except stripe.error.APIConnectionError as e:
-                # Network communication with Stripe failed
-                print("Request ID: %s" % e.request_id)
-            except stripe.error.StripeError as e:
-                # All other Stripe errors
-                print("Status: %s" % e.http_status)
-                print("Code: %s" % e.code)
-                print("Message: %s" % e.user_message)
-                print("Request ID: %s" % e.request_id)
-            except Exception as e:
-                raise HTTPException(
-                    detail="Error deleting customer account.", status_code=500
+                stripe_client.Customer.modify(
+                    customer_id,
+                    metadata={
+                        "deleted_auth0_user_id": current_user.get("user_id", ""),
+                        "account_deleted_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                live_subscriptions = stripe_client.Subscription.list(
+                    customer=customer_id, status="all", limit=10
+                ).to_dict()
+                for subscription in live_subscriptions.get("data", []):
+                    if subscription.get("status") in (
+                        "active",
+                        "trialing",
+                        "past_due",
+                    ) and not subscription.get("cancel_at_period_end"):
+                        stripe_client.Subscription.modify(
+                            subscription["id"], cancel_at_period_end=True
+                        )
+            except Exception as stripe_error:  # noqa: BLE001 - best-effort
+                logger.error(
+                    "Could not tag/cancel Stripe customer %s during user "
+                    "deletion: %s",
+                    customer_id,
+                    stripe_error,
                 )
 
         # retrieve all avatar ids created by the user:

@@ -13,22 +13,42 @@ What it creates:
 
 * Four Billing Meters (one per usage dimension), aggregating ``sum`` of the
   ``value`` field, keyed to the customer via ``stripe_customer_id``.
-* One product per tier (free / pro / premium).
-* One licensed flat monthly base price per tier (the subscription fee).
-* One graduated metered price per (tier, meter) pair: tier 1 is the included
-  monthly allotment at zero cost, tier 2 is pay-per-use overage.
+* One SELF-DESCRIBING base product per tier (free / pro / premium) whose name
+  and description enumerate the tier's included monthly allotments — Stripe
+  Checkout displays product names and descriptions on every line item, so the
+  customer sees exactly what each line is.
+* One SELF-DESCRIBING product per (tier, meter) pair — e.g. "Neural Nexus Pro
+  — Messaging Tokens (5,000,000 included/month)" with the overage rate in the
+  description — so metered line items in Checkout are no longer three
+  identical "Neural Nexus Pro Tier" rows.
+* One licensed flat monthly base price per tier (the subscription fee), under
+  the tier's base product.
+* One graduated metered price per (tier, meter) pair, under that pair's
+  product: tier 1 is the included monthly allotment at zero cost, tier 2 is
+  pay-per-use overage.
 * One billing-portal configuration (invoices, payment methods, billing
   information, at-period-end cancellation; no plan switching — metered prices
-  require tier changes to go through POST /change_subscription_tier).
+  require tier changes to go through POST /subscribe).
 
 Idempotency:
 
 * Meters are matched by ``event_name`` (Stripe forbids two active meters sharing
   one), and reused when present.
-* Products are matched by the ``neural_nexus_tier`` metadata key.
+* Products are matched by the metadata triple ``neural_nexus_tier`` +
+  ``neural_nexus_product_role`` (+ ``neural_nexus_meter`` for metered
+  products) at the current ``neural_nexus_catalog_version``; on reuse the
+  name and description are refreshed so re-runs keep the customer-facing copy
+  in sync with ``tiers.py``.
 * Prices are matched by ``lookup_key``. Because Stripe prices are immutable once
   used, bump ``PRICE_LOOKUP_KEY_VERSION`` to force a fresh set of prices after
   changing any amount or allotment in ``tiers.py`` (archive the old ones by hand).
+
+Migration from the v1 catalog (one product per tier, all prices attached to
+that one product): re-run this script (test mode first), paste the printed
+JSON into ``STRIPE_BILLING_CONFIG_JSON``, and restart the API. Existing
+subscriptions keep their v1 prices until their next tier change (the tier
+change swaps subscription items to the current price ids); archive the v1
+prices and products by hand once no live subscription references them.
 
 Usage:
 
@@ -61,10 +81,23 @@ from src.anubis.utils.billing.tiers import (  # noqa: E402
 )
 
 # Bump this to force creation of a new immutable price set after editing amounts.
-PRICE_LOOKUP_KEY_VERSION = "v1"
+PRICE_LOOKUP_KEY_VERSION = "v2"
 PRODUCT_TIER_METADATA_KEY = "neural_nexus_tier"
+PRODUCT_ROLE_METADATA_KEY = "neural_nexus_product_role"
+PRODUCT_METER_METADATA_KEY = "neural_nexus_meter"
+PRODUCT_CATALOG_VERSION_METADATA_KEY = "neural_nexus_catalog_version"
+PRODUCT_ROLE_BASE = "base"
+PRODUCT_ROLE_METERED = "metered"
 PORTAL_CONFIGURATION_METADATA_KEY = "neural_nexus_portal"
 PORTAL_CONFIGURATION_METADATA_VALUE = f"portal_{PRICE_LOOKUP_KEY_VERSION}"
+
+# Customer-facing names for each usage meter, shown on Checkout line items.
+METER_DISPLAY_NAMES: Dict[UsageMeter, str] = {
+    UsageMeter.MESSAGING_TOKENS: "Messaging Tokens",
+    UsageMeter.DOCUMENT_UPLOAD_TOKENS: "Document Upload Tokens",
+    UsageMeter.ADAPTER_INFERENCE_TOKENS: "Adapter Inference Tokens",
+    UsageMeter.ADAPTER_TRAINING_UNITS: "Adapter Training",
+}
 
 
 def _base_price_lookup_key(tier: SubscriptionTier) -> str:
@@ -73,6 +106,82 @@ def _base_price_lookup_key(tier: SubscriptionTier) -> str:
 
 def _metered_price_lookup_key(tier: SubscriptionTier, meter: UsageMeter) -> str:
     return f"nn_{tier.value}_{meter.value}_{PRICE_LOOKUP_KEY_VERSION}"
+
+
+def _allotment_unit_noun(meter: UsageMeter) -> str:
+    """Return the plural unit noun the customer reads for one meter."""
+    if meter is UsageMeter.ADAPTER_TRAINING_UNITS:
+        return "trained adapters"
+    return "tokens"
+
+
+def _allotment_overage_sentence(allotment: MeterAllotment) -> str:
+    """Return the customer-facing sentence describing the overage rate."""
+    if allotment.overage_price_per_unit_usd is not None:
+        return (
+            f"additional usage is billed at "
+            f"${allotment.overage_price_per_unit_usd:,.2f} per "
+            f"{_allotment_unit_noun(allotment.meter).rstrip('s')} "
+            "when pay-per-use is enabled."
+        )
+    if allotment.overage_price_per_million is not None:
+        return (
+            f"additional usage is billed at "
+            f"${allotment.overage_price_per_million:,.2f} per 1,000,000 "
+            f"{_allotment_unit_noun(allotment.meter)} "
+            "when pay-per-use is enabled."
+        )
+    return "no overage rate applies."
+
+
+def _allotment_summary(allotment: MeterAllotment) -> str:
+    """Return the short 'name (allotment included/month)' summary for one meter."""
+    return (
+        f"{METER_DISPLAY_NAMES[allotment.meter]} "
+        f"({allotment.monthly_allotment:,} included/month)"
+    )
+
+
+def _allotment_description(allotment: MeterAllotment) -> str:
+    """Return the full customer-facing description for one (tier, meter) product."""
+    return (
+        f"{allotment.monthly_allotment:,} "
+        f"{_allotment_unit_noun(allotment.meter)} included each month; "
+        f"{_allotment_overage_sentence(allotment)}"
+    )
+
+
+def _tier_base_description(definition: TierDefinition) -> str:
+    """Return the base product's description enumerating every included allotment."""
+    included_summaries = [
+        f"{allotment.monthly_allotment:,} "
+        + (
+            _allotment_unit_noun(meter)
+            if meter is UsageMeter.ADAPTER_TRAINING_UNITS
+            else METER_DISPLAY_NAMES[meter].lower()
+        )
+        for meter, allotment in definition.meter_allotments.items()
+    ]
+    if len(included_summaries) > 1:
+        included_text = (
+            ", ".join(included_summaries[:-1]) + f" and {included_summaries[-1]}"
+        )
+    else:
+        included_text = included_summaries[0]
+    base_fee_text = (
+        f"${definition.monthly_base_fee_usd:,.2f} per month"
+        if definition.monthly_base_fee_usd > 0
+        else "no monthly fee"
+    )
+    trial_text = (
+        f" Includes a {definition.trial_period_days}-day free trial."
+        if definition.trial_period_days > 0
+        else ""
+    )
+    return (
+        f"{definition.display_name} subscription ({base_fee_text}): "
+        f"includes {included_text} per month.{trial_text}"
+    )
 
 
 def find_or_create_meter(meter: UsageMeter) -> str:
@@ -96,24 +205,101 @@ def find_or_create_meter(meter: UsageMeter) -> str:
     return created["id"]
 
 
-def find_or_create_product(definition: TierDefinition) -> str:
-    """Return the id of the product for a tier, creating it if absent."""
+def _find_product_by_metadata(
+    tier: SubscriptionTier, role: str, meter: UsageMeter | None
+) -> str | None:
+    """Return the id of the active product matching the metadata triple, if any.
+
+    Matching is scoped to the current catalog version so v1's single
+    product-per-tier is never mistaken for a v2 base or metered product.
+    """
     for existing in stripe.Product.list(active=True, limit=100).auto_paging_iter():
         existing_product = existing.to_dict()
-        existing_tier = (existing_product.get("metadata") or {}).get(
-            PRODUCT_TIER_METADATA_KEY
-        )
-        if existing_tier == definition.tier.value:
-            print(
-                f"  product '{definition.tier.value}' exists -> {existing_product['id']}"
-            )
+        product_metadata = existing_product.get("metadata") or {}
+        if (
+            product_metadata.get(PRODUCT_TIER_METADATA_KEY) == tier.value
+            and product_metadata.get(PRODUCT_ROLE_METADATA_KEY) == role
+            and product_metadata.get(PRODUCT_CATALOG_VERSION_METADATA_KEY)
+            == PRICE_LOOKUP_KEY_VERSION
+            and product_metadata.get(PRODUCT_METER_METADATA_KEY)
+            == (meter.value if meter else None)
+        ):
             return existing_product["id"]
+    return None
+
+
+def find_or_create_base_product(definition: TierDefinition) -> str:
+    """Return the id of a tier's self-describing BASE product, creating it if absent.
+
+    The base product carries the flat subscription fee. Checkout shows the
+    product name and description on the line item, so both enumerate what the
+    tier includes. On reuse, the name and description are refreshed so re-runs
+    keep the customer-facing copy in sync with ``tiers.py``.
+    """
+    product_name = f"{definition.display_name} — Base Subscription"
+    product_description = _tier_base_description(definition)
+    existing_id = _find_product_by_metadata(
+        definition.tier, PRODUCT_ROLE_BASE, meter=None
+    )
+    if existing_id:
+        stripe.Product.modify(
+            existing_id, name=product_name, description=product_description
+        )
+        print(f"  base product '{definition.tier.value}' exists -> {existing_id}")
+        return existing_id
 
     created = stripe.Product.create(
-        name=definition.display_name,
-        metadata={PRODUCT_TIER_METADATA_KEY: definition.tier.value},
+        name=product_name,
+        description=product_description,
+        metadata={
+            PRODUCT_TIER_METADATA_KEY: definition.tier.value,
+            PRODUCT_ROLE_METADATA_KEY: PRODUCT_ROLE_BASE,
+            PRODUCT_CATALOG_VERSION_METADATA_KEY: PRICE_LOOKUP_KEY_VERSION,
+        },
     )
-    print(f"  product '{definition.tier.value}' CREATED -> {created['id']}")
+    print(f"  base product '{definition.tier.value}' CREATED -> {created['id']}")
+    return created["id"]
+
+
+def find_or_create_meter_product(
+    definition: TierDefinition, allotment: MeterAllotment
+) -> str:
+    """Return the id of one (tier, meter) self-describing product, creating it if absent.
+
+    Every metered price gets a dedicated product whose name says which meter
+    the line item bills and how much is included — the fix for Checkout
+    rendering three indistinguishable "Neural Nexus Pro Tier" rows. On reuse,
+    the name and description are refreshed to match ``tiers.py``.
+    """
+    product_name = f"{definition.display_name} — {_allotment_summary(allotment)}"
+    product_description = _allotment_description(allotment)
+    existing_id = _find_product_by_metadata(
+        definition.tier, PRODUCT_ROLE_METERED, meter=allotment.meter
+    )
+    if existing_id:
+        stripe.Product.modify(
+            existing_id, name=product_name, description=product_description
+        )
+        print(
+            f"  meter product '{definition.tier.value}/{allotment.meter.value}' "
+            f"exists -> {existing_id}"
+        )
+        return existing_id
+
+    created = stripe.Product.create(
+        name=product_name,
+        description=product_description,
+        metadata={
+            PRODUCT_TIER_METADATA_KEY: definition.tier.value,
+            PRODUCT_ROLE_METADATA_KEY: PRODUCT_ROLE_METERED,
+            PRODUCT_METER_METADATA_KEY: allotment.meter.value,
+            PRODUCT_CATALOG_VERSION_METADATA_KEY: PRICE_LOOKUP_KEY_VERSION,
+        },
+    )
+    print(
+        f"  meter product '{definition.tier.value}/{allotment.meter.value}' "
+        f"CREATED -> {created['id']}"
+    )
     return created["id"]
 
 
@@ -189,7 +375,7 @@ def find_or_create_billing_portal_configuration() -> str:
     exposes: invoice history, payment-method updates, and billing-information
     updates, plus at-period-end cancellation. Plan switching stays DISABLED here
     — the hosted portal cannot switch plans that contain metered prices, so tier
-    changes go through the API's POST /change_subscription_tier. Matched by a
+    changes go through the API's POST /subscribe. Matched by a
     metadata tag so re-runs reuse the existing configuration.
     """
     for existing in stripe.billing_portal.Configuration.list(
@@ -239,18 +425,22 @@ def provision() -> Dict[str, Any]:
     tiers_config: Dict[str, Any] = {}
     for tier, definition in TIER_DEFINITIONS.items():
         print(f"Provisioning tier '{tier.value}':")
-        product_id = find_or_create_product(definition)
-        base_price_id = find_or_create_base_price(definition, product_id)
+        base_product_id = find_or_create_base_product(definition)
+        base_price_id = find_or_create_base_price(definition, base_product_id)
 
         metered_price_ids: Dict[str, str] = {}
         for meter, allotment in definition.meter_allotments.items():
+            # Each metered price lives under a dedicated self-describing
+            # (tier, meter) product so Checkout line items name the meter and
+            # the included allotment instead of repeating the tier name.
+            meter_product_id = find_or_create_meter_product(definition, allotment)
             price_id = find_or_create_metered_price(
-                definition, product_id, meter_ids[meter], allotment
+                definition, meter_product_id, meter_ids[meter], allotment
             )
             metered_price_ids[meter.value] = price_id
 
         tiers_config[tier.value] = {
-            "product": product_id,
+            "product": base_product_id,
             "base_price": base_price_id,
             "metered_prices": metered_price_ids,
         }
@@ -294,6 +484,14 @@ def main() -> None:
 
     print("\n=== DONE. Set STRIPE_BILLING_CONFIG_JSON to the following single line: ===\n")
     print(json.dumps(config_document, separators=(",", ":")))
+    print(
+        "\nMigration notes (v1 -> v2 catalog):\n"
+        "  1. Paste the JSON above into STRIPE_BILLING_CONFIG_JSON and restart the API.\n"
+        "  2. Existing subscriptions keep their v1 prices until their next tier\n"
+        "     change; new checkouts and tier changes use the v2 prices above.\n"
+        "  3. Archive the v1 prices and the old one-product-per-tier products by\n"
+        "     hand once no live subscription references them.\n"
+    )
 
 
 if __name__ == "__main__":

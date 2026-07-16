@@ -8,6 +8,9 @@ from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 
+from src.anubis.utils.billing.system_prompt_estimate_cache import (
+    record_system_prompt_token_estimate,
+)
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 from src.anubis.utils.context import AssistantContext, GlobalContext, UserContext
@@ -673,6 +676,11 @@ async def _build_consciousness_system_message_update(
 
     system_message_str = populated_identity_template.messages[0].content
 
+    # Token usage is estimated when token usage occurs: the system prompt was
+    # just built, so measure the prompt's tokens manually NOW and cache the
+    # measurement for the message endpoints' pre-request input-token estimate.
+    record_system_prompt_token_estimate(user_id, assistant_id, system_message_str)
+
     _write_dev_system_prompt(system_message_str, runtime)
 
     # Replace-snapshots: each persisted doc channel becomes exactly the merged,
@@ -702,3 +710,57 @@ async def load_consciousness(
     without duplicating the store reads.
     """
     return await _build_consciousness_system_message_update(state, config, runtime)
+
+
+async def build_system_prompt_text_for_estimation(
+    store, assistant_config: dict, latest_message_text: str
+) -> str:
+    """Build the real system prompt purely to MEASURE the prompt's tokens.
+
+    The message endpoints' pre-request estimate must reflect the actual
+    system prompt (identity documents, recalled memories, style profile) —
+    not a guessed constant. When the system-prompt estimate cache holds no
+    fresh measurement for a (user, avatar) pair, the endpoint calls this
+    builder: the exact same prompt-building path as ``load_consciousness``
+    (only store reads — no model call), driven by a minimal synthetic state,
+    with the measurement recorded into the cache as a side effect of the
+    build. The caller treats any failure as fail-closed (HTTP 422), because
+    nothing unestimated may reach a model.
+
+    ``assistant_config`` is the endpoint's LangGraph config dict
+    (``app_metadata.assistant_config`` merged with the request's updates);
+    the builder needs ``configurable.user_id``, ``configurable.assistant_id``,
+    ``configurable.assistant_ctx`` (including ``metadata.user_id``, the
+    creator), and optionally ``configurable.user_ctx``.
+    """
+    from types import SimpleNamespace
+
+    configurable = assistant_config.get("configurable") or {}
+    user_id = configurable.get("user_id")
+    assistant_id = configurable.get("assistant_id")
+    if not user_id or not assistant_id:
+        raise ValueError(
+            "System-prompt estimation requires configurable.user_id and "
+            "configurable.assistant_id in the assistant config."
+        )
+
+    synthetic_state: dict = {
+        "messages": [HumanMessage(content=latest_message_text or "")],
+        "user_state": {"user_id": user_id},
+        "assistant_state": {"assistant_id": assistant_id},
+    }
+    # ``_build_consciousness_system_message_update`` only reads
+    # ``runtime.store`` and ``runtime.context.assistant_ctx`` /
+    # ``runtime.context.user_ctx`` (as ``AssistantContext``/``UserContext``
+    # instances or plain dicts), so a lightweight stand-in suffices.
+    runtime_stand_in = SimpleNamespace(
+        store=store,
+        context=SimpleNamespace(
+            assistant_ctx=configurable.get("assistant_ctx") or {},
+            user_ctx=configurable.get("user_ctx") or {},
+        ),
+    )
+    input_update = await _build_consciousness_system_message_update(
+        synthetic_state, assistant_config, runtime_stand_in
+    )
+    return input_update["system_message"][0].content

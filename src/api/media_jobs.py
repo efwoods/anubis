@@ -71,6 +71,11 @@ class MediaJob:
     # Set when a cancel was requested so progress subscribers and the runner can
     # see the item/batch is being torn down.
     cancelled: bool = False
+    # Pre-request token estimate for this child's item (image dimensions,
+    # audio/video duration, extracted-text words — see billing/estimation.py),
+    # stamped at submit (or at playlist expansion) so job status/progress can
+    # show what the item was billed against.
+    estimated_tokens: int | None = None
     # Append-only history of progress payloads. Subscribers replay from index 0,
     # then wait on ``_updated`` for new appends — this supports late joiners and
     # multiple concurrent subscribers.
@@ -127,6 +132,7 @@ def create_child_job(
     parent_id: str,
     filename: Optional[str],
     namespace_filename: Optional[str],
+    estimated_tokens: int | None = None,
 ) -> MediaJob:
     """Register and return one per-item child job under ``parent_id``."""
     job = MediaJob(
@@ -136,6 +142,7 @@ def create_child_job(
         parent_id=parent_id,
         filename=filename,
         namespace_filename=namespace_filename,
+        estimated_tokens=estimated_tokens,
     )
     registry[job.job_id] = job
     return job
@@ -392,6 +399,7 @@ async def run_batch_media_job(
                         parent_id=master.job_id,
                         filename=media_file.get("filename"),
                         namespace_filename=media_file.get("namespace_filename"),
+                        estimated_tokens=media_file.get("estimated_tokens"),
                     )
                     master.child_ids.append(child.job_id)
                     items.append({"child": child, "media_file": media_file})
@@ -402,6 +410,7 @@ async def run_batch_media_job(
                             "stage": "playlist_child_added",
                             "item_job_id": child.job_id,
                             "item_filename": child.filename,
+                            "estimated_tokens": child.estimated_tokens,
                         },
                     )
 
@@ -478,6 +487,7 @@ def _summarize_children(children: List[MediaJob]) -> List[Dict[str, Any]]:
             "filename": c.filename,
             "namespace_filename": c.namespace_filename,
             "status": c.status,
+            "estimated_tokens": c.estimated_tokens,
             "error": c.error,
         }
         for c in children

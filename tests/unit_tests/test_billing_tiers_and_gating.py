@@ -8,21 +8,29 @@ and the graduated-price decimal math used by the provisioning script.
 """
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from src.anubis.utils.billing.config import load_stripe_billing_config
 from src.anubis.utils.billing.gating import (
+    SubscribeAction,
+    customer_has_payment_method,
+    exhausted_allotment_block_reason,
     is_anonymous_user,
+    plan_subscribe_action,
+    plan_tier_change,
+    resolve_effective_monthly_allotment,
     resolve_metering_user_id,
+    resolve_pay_per_use_enabled,
     resolve_stripe_customer_id,
     resolve_tier,
+    resolve_trial_context,
     resolve_use_adapter_inference,
     user_has_capability,
 )
 from src.anubis.utils.billing.metering import (
     billable_tokens_from_metadata,
-    estimate_upload_token_units,
     report_meter_event,
 )
 from src.anubis.utils.billing.tiers import (
@@ -383,11 +391,346 @@ def test_billable_tokens_prefers_total_then_sums_parts():
     assert billable_tokens_from_metadata({}) == 0
 
 
-def test_estimate_upload_token_units_scales_with_inputs():
-    assert estimate_upload_token_units() == 0
-    text_only = estimate_upload_token_units(text_character_count=4_000)
-    assert text_only == int(4_000 * 0.25 * 3.0)
-    with_media = estimate_upload_token_units(
-        audio_seconds=60, text_character_count=4_000, image_count=2, url_count=1
-    )
-    assert with_media > text_only
+# Upload token estimation moved to src/anubis/utils/billing/estimation.py and
+# is covered by tests/unit_tests/test_token_estimation.py.
+
+
+# ---------------------------------------------------------------------------
+# Tier-change planning (upgrade/downgrade timing + usage-window rules)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanTierChange:
+    def test_every_upgrade_is_immediate_and_resets_usage(self) -> None:
+        for current, target in [
+            (SubscriptionTier.FREE, SubscriptionTier.PRO),
+            (SubscriptionTier.FREE, SubscriptionTier.PREMIUM),
+            (SubscriptionTier.PRO, SubscriptionTier.PREMIUM),
+        ]:
+            plan = plan_tier_change(current, target)
+            assert plan.direction == "upgrade"
+            assert plan.swap_items_immediately
+            assert not plan.schedule_change_at_period_end
+            assert plan.reset_usage_period_anchor
+
+    def test_every_downgrade_is_scheduled_and_retains_usage(self) -> None:
+        for current, target in [
+            (SubscriptionTier.PRO, SubscriptionTier.FREE),
+            (SubscriptionTier.PREMIUM, SubscriptionTier.FREE),
+            (SubscriptionTier.PREMIUM, SubscriptionTier.PRO),
+        ]:
+            plan = plan_tier_change(current, target)
+            assert plan.direction == "downgrade"
+            assert not plan.swap_items_immediately
+            assert plan.schedule_change_at_period_end
+            assert not plan.reset_usage_period_anchor
+
+    def test_trialing_upgrade_never_resets_the_usage_window(self) -> None:
+        # One shared usage counter across a tier change during the trial.
+        plan = plan_tier_change(
+            SubscriptionTier.PRO, SubscriptionTier.PREMIUM, currently_trialing=True
+        )
+        assert plan.direction == "upgrade"
+        assert plan.swap_items_immediately
+        assert not plan.reset_usage_period_anchor
+
+    def test_trialing_downgrade_stays_scheduled_without_reset(self) -> None:
+        plan = plan_tier_change(
+            SubscriptionTier.PRO, SubscriptionTier.FREE, currently_trialing=True
+        )
+        assert plan.direction == "downgrade"
+        assert plan.schedule_change_at_period_end
+        assert not plan.reset_usage_period_anchor
+
+
+# ---------------------------------------------------------------------------
+# POST /subscribe action planning (the single subscription entry point)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanSubscribeAction:
+    def test_no_subscription_starts_checkout(self) -> None:
+        for status in (None, "canceled", "incomplete", "incomplete_expired"):
+            assert (
+                plan_subscribe_action(
+                    status,
+                    SubscriptionTier.FREE,
+                    SubscriptionTier.PRO,
+                    cancel_at_period_end=False,
+                    has_pending_downgrade_schedule=False,
+                )
+                is SubscribeAction.START_CHECKOUT
+            )
+
+    def test_live_subscription_on_a_different_tier_changes_tier(self) -> None:
+        for status in ("active", "trialing", "past_due"):
+            assert (
+                plan_subscribe_action(
+                    status,
+                    SubscriptionTier.PRO,
+                    SubscriptionTier.PREMIUM,
+                    cancel_at_period_end=False,
+                    has_pending_downgrade_schedule=False,
+                )
+                is SubscribeAction.CHANGE_TIER
+            )
+
+    def test_same_tier_with_nothing_pending_is_a_no_op(self) -> None:
+        assert (
+            plan_subscribe_action(
+                "active",
+                SubscriptionTier.PRO,
+                SubscriptionTier.PRO,
+                cancel_at_period_end=False,
+                has_pending_downgrade_schedule=False,
+            )
+            is SubscribeAction.NO_CHANGE_REQUIRED
+        )
+
+    def test_pending_cancellation_is_reactivated_automatically(self) -> None:
+        assert (
+            plan_subscribe_action(
+                "active",
+                SubscriptionTier.PRO,
+                SubscriptionTier.PRO,
+                cancel_at_period_end=True,
+                has_pending_downgrade_schedule=False,
+            )
+            is SubscribeAction.REACTIVATE
+        )
+
+    def test_pending_downgrade_schedule_is_reactivated_automatically(self) -> None:
+        assert (
+            plan_subscribe_action(
+                "active",
+                SubscriptionTier.PREMIUM,
+                SubscriptionTier.PREMIUM,
+                cancel_at_period_end=False,
+                has_pending_downgrade_schedule=True,
+            )
+            is SubscribeAction.REACTIVATE
+        )
+
+    def test_pending_change_with_a_different_tier_reactivates_then_changes(
+        self,
+    ) -> None:
+        assert (
+            plan_subscribe_action(
+                "trialing",
+                SubscriptionTier.PRO,
+                SubscriptionTier.PREMIUM,
+                cancel_at_period_end=True,
+                has_pending_downgrade_schedule=False,
+            )
+            is SubscribeAction.REACTIVATE_AND_CHANGE_TIER
+        )
+
+
+# ---------------------------------------------------------------------------
+# Trial context + trial-aware allotments (tier changes during a free trial)
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC)
+_TRIAL_END_EPOCH = int((_NOW + timedelta(days=10)).timestamp())
+
+
+def _pro_trial_user() -> dict:
+    return {
+        "user_id": "auth0|someone",
+        "email": "someone@example.com",
+        "app_metadata": {
+            "trial_context": {"tier": "pro", "trial_end": _TRIAL_END_EPOCH}
+        },
+    }
+
+
+class TestResolveTrialContext:
+    def test_parses_the_written_shape(self) -> None:
+        trial_context = resolve_trial_context(_pro_trial_user())
+        assert trial_context is not None
+        assert trial_context.trial_tier is SubscriptionTier.PRO
+        assert int(trial_context.trial_end.timestamp()) == _TRIAL_END_EPOCH
+
+    def test_missing_or_corrupt_context_is_none(self) -> None:
+        assert resolve_trial_context(None) is None
+        assert resolve_trial_context({"app_metadata": {}}) is None
+        assert (
+            resolve_trial_context(
+                {"app_metadata": {"trial_context": {"tier": "pro"}}}
+            )
+            is None
+        )
+        assert (
+            resolve_trial_context(
+                {
+                    "app_metadata": {
+                        "trial_context": {"tier": "pro", "trial_end": "soon"}
+                    }
+                }
+            )
+            is None
+        )
+
+
+class TestResolveEffectiveMonthlyAllotment:
+    def test_without_a_trial_the_tier_allotment_governs(self) -> None:
+        assert resolve_effective_monthly_allotment(
+            SubscriptionTier.FREE, UsageMeter.MESSAGING_TOKENS, None
+        ) == tier_allotment_for_meter(
+            SubscriptionTier.FREE, UsageMeter.MESSAGING_TOKENS
+        )
+
+    def test_trial_to_free_keeps_the_pro_allotments_inside_the_window(self) -> None:
+        # Downgrade during the trial: the pro trial's messaging allotment and
+        # the document-upload meter (which the free tier lacks entirely) stay
+        # granted until the trial ends.
+        trial_context = resolve_trial_context(_pro_trial_user())
+        assert resolve_effective_monthly_allotment(
+            SubscriptionTier.FREE,
+            UsageMeter.MESSAGING_TOKENS,
+            trial_context,
+            now=_NOW,
+        ) == tier_allotment_for_meter(
+            SubscriptionTier.PRO, UsageMeter.MESSAGING_TOKENS
+        )
+        assert resolve_effective_monthly_allotment(
+            SubscriptionTier.FREE,
+            UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+            trial_context,
+            now=_NOW,
+        ) == tier_allotment_for_meter(
+            SubscriptionTier.PRO, UsageMeter.DOCUMENT_UPLOAD_TOKENS
+        )
+
+    def test_trial_to_premium_takes_the_larger_allotment_per_meter(self) -> None:
+        # Upgrade during the trial: premium's larger messaging allotment wins;
+        # the trial allotment is only a floor.
+        trial_context = resolve_trial_context(_pro_trial_user())
+        assert resolve_effective_monthly_allotment(
+            SubscriptionTier.PREMIUM,
+            UsageMeter.MESSAGING_TOKENS,
+            trial_context,
+            now=_NOW,
+        ) == tier_allotment_for_meter(
+            SubscriptionTier.PREMIUM, UsageMeter.MESSAGING_TOKENS
+        )
+
+    def test_after_the_trial_window_plain_tier_allotments_apply(self) -> None:
+        trial_context = resolve_trial_context(_pro_trial_user())
+        after_trial = _NOW + timedelta(days=30)
+        assert (
+            resolve_effective_monthly_allotment(
+                SubscriptionTier.FREE,
+                UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                trial_context,
+                now=after_trial,
+            )
+            is None
+        )
+        assert resolve_effective_monthly_allotment(
+            SubscriptionTier.FREE,
+            UsageMeter.MESSAGING_TOKENS,
+            trial_context,
+            now=after_trial,
+        ) == tier_allotment_for_meter(
+            SubscriptionTier.FREE, UsageMeter.MESSAGING_TOKENS
+        )
+
+    def test_block_reason_honors_the_trial_allotment_override(self) -> None:
+        # A free-tier user inside the trial window is judged against the pro
+        # allotment: usage past the free allotment but under the pro allotment
+        # is allowed.
+        trial_context = resolve_trial_context(_pro_trial_user())
+        trial_allotment = resolve_effective_monthly_allotment(
+            SubscriptionTier.FREE,
+            UsageMeter.MESSAGING_TOKENS,
+            trial_context,
+            now=_NOW,
+        )
+        free_allotment = tier_allotment_for_meter(
+            SubscriptionTier.FREE, UsageMeter.MESSAGING_TOKENS
+        )
+        usage_past_free_under_pro = free_allotment.monthly_allotment + 1
+        assert (
+            exhausted_allotment_block_reason(
+                SubscriptionTier.FREE,
+                UsageMeter.MESSAGING_TOKENS,
+                usage_past_free_under_pro,
+                False,
+                allotment_override=trial_allotment,
+            )
+            is None
+        )
+        assert (
+            exhausted_allotment_block_reason(
+                SubscriptionTier.FREE,
+                UsageMeter.MESSAGING_TOKENS,
+                trial_allotment.monthly_allotment,
+                False,
+                allotment_override=trial_allotment,
+            )
+            is not None
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pay-per-use resolution + payment-method detection
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePayPerUseEnabled:
+    def test_explicit_flag_wins_in_both_directions(self) -> None:
+        enabled_user = {
+            "user_id": "auth0|x",
+            "email": "x@example.com",
+            "app_metadata": {
+                "pay_per_use_enabled": True,
+                "stripe_customer_id": "cus_x",
+                "subscription_status": {"status": "trialing", "tier": "pro"},
+            },
+        }
+        assert resolve_pay_per_use_enabled(enabled_user)
+        enabled_user["app_metadata"]["pay_per_use_enabled"] = False
+        enabled_user["app_metadata"]["subscription_status"]["status"] = "active"
+        assert not resolve_pay_per_use_enabled(enabled_user)
+
+    def test_active_status_infers_enabled_but_trialing_does_not(self) -> None:
+        user = {
+            "user_id": "auth0|y",
+            "email": "y@example.com",
+            "app_metadata": {
+                "stripe_customer_id": "cus_y",
+                "subscription_status": {"status": "active", "tier": "pro"},
+            },
+        }
+        assert resolve_pay_per_use_enabled(user)
+        user["app_metadata"]["subscription_status"]["status"] = "trialing"
+        assert not resolve_pay_per_use_enabled(user)
+
+    def test_anonymous_users_never_get_pay_per_use(self) -> None:
+        anonymous_user = {
+            "is_anonymous": True,
+            "identities": [{"user_id": "hashed-ip"}],
+            "app_metadata": {
+                "pay_per_use_enabled": True,
+                "stripe_customer_id": "cus_anon",
+            },
+        }
+        assert not resolve_pay_per_use_enabled(anonymous_user)
+
+
+class TestCustomerHasPaymentMethod:
+    def test_default_payment_method_counts(self) -> None:
+        assert customer_has_payment_method(
+            {"invoice_settings": {"default_payment_method": "pm_1"}}
+        )
+
+    def test_legacy_default_source_counts(self) -> None:
+        assert customer_has_payment_method({"default_source": "card_1"})
+
+    def test_payment_method_list_fallback_counts(self) -> None:
+        assert customer_has_payment_method({}, [{"id": "pm_2"}])
+
+    def test_no_payment_method_anywhere_is_false(self) -> None:
+        assert not customer_has_payment_method({}, [])
+        assert not customer_has_payment_method(None)

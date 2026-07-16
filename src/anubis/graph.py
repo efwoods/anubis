@@ -773,7 +773,7 @@ async def think(
     # TODO: Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata. The
     # user has seen the reply by now, so this adds no perceived latency.
-    if config.get("configurable", {}).get("include_metrics", False):
+    if config.get("configurable", {}).get("include_quality_metrics", False):
         # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
         # owner-scoped, so pass the avatar OWNER's id — the same first namespace
         # element calibrate_ground_truth wrote under — not the conversing user.

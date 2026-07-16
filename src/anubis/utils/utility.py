@@ -964,6 +964,68 @@ async def get_audio_duration_seconds(
         return duration_seconds
 
 
+async def get_video_duration_seconds(
+    video_base64: str, filename: str | None = None
+) -> float:
+    """Return an uploaded video's duration by probing the container header.
+
+    Mirrors ``get_audio_duration_seconds``: the bytes are written to a
+    temporary file so ffmpeg (via moviepy) can read the container metadata —
+    no frames are decoded. Used by the pre-request token estimate, which
+    treats a video as its audio track (diarization over the same duration).
+    Raises on unreadable input; the caller decides the fallback.
+    """
+    raw = _decode_base64_media_payload(video_base64)
+    suffix = Path(filename or "video.mp4").suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as temp_video:
+        temp_video.write(raw)
+        temp_video.flush()
+        with VideoFileClip(temp_video.name) as clip:
+            return float(clip.duration or 0.0)
+
+
+async def get_remote_video_duration_seconds(url: str) -> float:
+    """Return a remote (YouTube or direct) video's duration from metadata only.
+
+    Probes with yt_dlp ``extract_info(download=False)`` — the same pattern as
+    ``list_available_subtitles`` — on a worker thread so the event loop is
+    never blocked. Nothing is downloaded. Raises when the extractor fails or
+    reports no duration; the caller decides the fallback.
+    """
+
+    def _probe() -> float:
+        ydl_options = {"quiet": True, "skip_download": True}
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return float(info.get("duration") or 0.0)
+
+    return await asyncio.to_thread(_probe)
+
+
+async def get_remote_playlist_video_durations(url: str) -> list[float]:
+    """Return per-video durations for a playlist URL from flat metadata only.
+
+    Enumerates the playlist with ``extract_flat="in_playlist"`` (the same
+    single-request pattern the playlist expander uses) on a worker thread.
+    Flat entries usually carry a ``duration``; entries without one yield 0.0
+    and the caller substitutes the sanctioned fallback duration per entry.
+    Raises when the playlist cannot be enumerated at all.
+    """
+
+    def _probe() -> list[float]:
+        ydl_options = {
+            "quiet": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+        }
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        entries = info.get("entries") or []
+        return [float(entry.get("duration") or 0.0) for entry in entries if entry]
+
+    return await asyncio.to_thread(_probe)
+
+
 def _transcribe_one_segment_path(
     path: str,
     upload_filename: str,

@@ -120,18 +120,6 @@ def resolve_usage_period_end(
     next_month = period_start.month + 1 if period_start.month < 12 else 1
     return _monthly_boundary_for(next_month_year, next_month, period_start)
 
-# Rough token-per-unit heuristics used to distill an upload into a token-equivalent
-# for the document_upload_tokens meter. Grounded in research/04_token_workload_cost_model.md:
-# an hour of audio transcribes to ~9k words ≈ 12k tokens, and each media item is
-# additionally run through structured-output identity-analysis passes that read the
-# transcript back in, so we multiply by a pipeline-amplification factor.
-_ESTIMATED_TOKENS_PER_AUDIO_SECOND = 3  # ≈ 12k tokens per hour of speech
-_ESTIMATED_TOKENS_PER_TEXT_CHARACTER = 0.25  # ≈ 4 characters per token
-_ESTIMATED_TOKENS_PER_IMAGE = 1_000  # vision description + downstream analysis
-_ESTIMATED_TOKENS_PER_URL = 1_000  # fetched page/video distilled through the pipeline
-_UPLOAD_PIPELINE_AMPLIFICATION = 3.0  # transcription + classification + analysis passes
-
-
 async def report_meter_event(
     stripe_client: Any,
     meter: UsageMeter,
@@ -212,30 +200,6 @@ def billable_tokens_from_metadata(
     return prompt_tokens + completion_tokens
 
 
-def estimate_upload_token_units(
-    audio_seconds: float = 0.0,
-    text_character_count: int = 0,
-    image_count: int = 0,
-    url_count: int = 0,
-) -> int:
-    """Distill an upload into an integer token-equivalent for the upload meter.
-
-    Uploads are billed against ``document_upload_tokens`` because the identity
-    pipeline (transcription, diarization, classification, and structured-output
-    analysis) consumes model tokens roughly proportional to the raw material.
-    This estimate is intentionally conservative and pipeline-amplified so an
-    upload draws down the same monthly budget it will actually cost to process,
-    preventing a heavy upload from silently overrunning the tier allotment.
-    """
-    raw_tokens = (
-        audio_seconds * _ESTIMATED_TOKENS_PER_AUDIO_SECOND
-        + text_character_count * _ESTIMATED_TOKENS_PER_TEXT_CHARACTER
-        + image_count * _ESTIMATED_TOKENS_PER_IMAGE
-        + url_count * _ESTIMATED_TOKENS_PER_URL
-    )
-    return int(raw_tokens * _UPLOAD_PIPELINE_AMPLIFICATION)
-
-
 API_METRICS_TABLE_NAME = "api_metrics"
 
 _CREATE_API_METRICS_TABLE_SQL = f"""
@@ -279,6 +243,98 @@ async def ensure_api_metrics_table(pool: Any) -> None:
                 await cursor.execute(_CREATE_API_METRICS_TABLE_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure api_metrics table exists: %s", table_error)
+
+
+ANONYMOUS_BILLING_CUSTOMERS_TABLE_NAME = "anonymous_billing_customers"
+
+# Anonymous users have no Auth0 record to cache a Stripe customer id in, so
+# the (hashed ip -> customer id) mapping lives in Postgres: every anonymous
+# visitor's usage lands on a real free-tier Stripe customer for cost analysis.
+_CREATE_ANONYMOUS_BILLING_CUSTOMERS_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {ANONYMOUS_BILLING_CUSTOMERS_TABLE_NAME} (
+    hashed_ip TEXT PRIMARY KEY,
+    stripe_customer_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+_FETCH_ANONYMOUS_BILLING_CUSTOMER_SQL = f"""
+SELECT stripe_customer_id FROM {ANONYMOUS_BILLING_CUSTOMERS_TABLE_NAME}
+WHERE hashed_ip = %s;
+"""
+
+_PERSIST_ANONYMOUS_BILLING_CUSTOMER_SQL = f"""
+INSERT INTO {ANONYMOUS_BILLING_CUSTOMERS_TABLE_NAME} (hashed_ip, stripe_customer_id)
+VALUES (%s, %s)
+ON CONFLICT (hashed_ip) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id;
+"""
+
+
+async def ensure_anonymous_billing_customers_table(pool: Any) -> None:
+    """Create the ``anonymous_billing_customers`` table if it does not yet exist.
+
+    Called once from the FastAPI lifespan startup, beside
+    ``ensure_api_metrics_table``. Best-effort: logs and returns on failure.
+    """
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(_CREATE_ANONYMOUS_BILLING_CUSTOMERS_TABLE_SQL)
+    except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
+        logger.error(
+            "Could not ensure anonymous_billing_customers table exists: %s",
+            table_error,
+        )
+
+
+async def fetch_anonymous_stripe_customer_id(
+    pool: Any, hashed_ip: str | None
+) -> str | None:
+    """Return the Stripe customer id recorded for one hashed anonymous ip.
+
+    Fail-open: any database problem returns ``None`` (the caller may create a
+    duplicate customer in the worst case, recovered by Customer Search).
+    """
+    if pool is None or not hashed_ip:
+        return None
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    _FETCH_ANONYMOUS_BILLING_CUSTOMER_SQL, (hashed_ip,)
+                )
+                row = await cursor.fetchone()
+                return row[0] if row else None
+    except Exception as fetch_error:  # noqa: BLE001 - fail-open
+        logger.error(
+            "Could not fetch anonymous billing customer for %s: %s",
+            hashed_ip,
+            fetch_error,
+        )
+        return None
+
+
+async def persist_anonymous_stripe_customer_id(
+    pool: Any, hashed_ip: str | None, stripe_customer_id: str | None
+) -> bool:
+    """Record the (hashed ip -> Stripe customer) mapping; fail-open on error."""
+    if pool is None or not hashed_ip or not stripe_customer_id:
+        return False
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    _PERSIST_ANONYMOUS_BILLING_CUSTOMER_SQL,
+                    (hashed_ip, stripe_customer_id),
+                )
+        return True
+    except Exception as persist_error:  # noqa: BLE001 - fail-open
+        logger.error(
+            "Could not persist anonymous billing customer for %s: %s",
+            hashed_ip,
+            persist_error,
+        )
+        return False
 
 
 _USAGE_SINCE_SQL = f"""

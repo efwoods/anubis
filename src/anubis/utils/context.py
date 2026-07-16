@@ -664,6 +664,60 @@ class GlobalContext:
         },
     )
 
+    estimated_analysis_passes_per_document: int = field(
+        default=2,
+        metadata={
+            "description": (
+                "Number of identity-analysis passes that re-read one uploaded "
+                "item's extracted content (transcript or text) — used by the "
+                "pre-request token estimate as extracted-content tokens times "
+                "this pass count. Two models the current pipeline "
+                "(classification plus identity-dimension analysis); set to "
+                "zero if the analysis stage is dropped so estimates reflect "
+                "the change in advance of any model call."
+            )
+        },
+    )
+
+    system_prompt_token_estimate_cache_ttl_seconds: int = field(
+        default=300,
+        metadata={
+            "description": (
+                "Maximum age, in seconds, of a cached system-prompt token "
+                "measurement used by the pre-request message estimate. Every "
+                "load_consciousness build refreshes the measurement, so the "
+                "time-to-live only bounds staleness between a large identity "
+                "upload and the next message turn."
+            )
+        },
+    )
+
+    anonymous_billing_enabled: str = field(
+        default="FALSE",
+        metadata={
+            "description": (
+                "TRUE enables per-hashed-ip Stripe metering for anonymous "
+                "users: each anonymous visitor lazily receives a Stripe "
+                "customer with a $0 free-tier subscription so anonymous "
+                "usage is visible in Stripe cost analysis. FALSE (the "
+                "default) keeps anonymous metering local-only (api_metrics), "
+                "avoiding Stripe customer fan-out in development."
+            )
+        },
+    )
+
+    message_expected_output_tokens_estimate: int = field(
+        default=512,
+        metadata={
+            "description": (
+                "Expected completion-token budget for one message reply, used "
+                "by the manual pre-request message estimate (billed usage "
+                "covers prompt AND completion tokens). Calibrate from "
+                "observed api_metrics completion_tokens."
+            )
+        },
+    )
+
     baseline_response_threshold: float = field(
         default=47.66322963655769,
         metadata={

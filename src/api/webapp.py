@@ -59,14 +59,23 @@ from src.anubis.utils.billing import (
     SubscriptionTier,
     TierCapability,
     UsageMeter,
+    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+    TokenEstimationError,
     billable_tokens_from_metadata,
+    count_words,
     customer_has_payment_method,
     ensure_api_metrics_table,
-    estimate_upload_token_units,
+    TokenEstimateBreakdown,
+    estimate_media_item_tokens,
+    estimate_message_request_token_breakdown,
+    estimate_text_tokens_from_words,
     exhausted_allotment_block_reason,
+    fetch_or_measure_deep_agent_tool_schema_token_estimate,
+    fetch_system_prompt_token_estimate,
     fetch_rolling_window_usage,
     fetch_usage_by_meter_since,
     fetch_usage_since,
+    is_admin_metering_bypass,
     load_stripe_billing_config,
     persist_api_metrics_row,
     plan_tier_change,
@@ -190,19 +199,26 @@ def resolve_usage_period_start_for_user(current_user: dict) -> datetime:
 
 
 async def enforce_remaining_allotment(
-    app_state, current_user: dict, meter: UsageMeter
+    app_state,
+    current_user: dict,
+    meter: UsageMeter,
+    estimated_request_tokens: int = 0,
 ) -> None:
-    """Block a user of ANY tier who exhausted the ``meter`` allotment without pay-per-use.
+    """Block a user of ANY tier whose ``meter`` allotment cannot cover this request.
 
-    The block decision is ``exhausted_allotment_block_reason``: usage under the
-    period allotment is always allowed; usage at or past the allotment is allowed
-    only when pay-per-use is enabled (a payment method on file lets the Stripe
-    graduated metered price bill the overage). Otherwise the request is refused
-    with HTTP 402 until the period resets, pay-per-use is enabled, or the user
-    upgrades tiers. Usage is read from the local ``api_metrics`` table (which
-    also covers anonymous users via their hashed-IP identifier) over the period
-    resolved by ``resolve_usage_period_start_for_user``.
+    The block decision is ``exhausted_allotment_block_reason``: period usage
+    PLUS the pre-call estimate of this request under the allotment is allowed;
+    at or past the allotment, only pay-per-use (a payment method on file lets
+    the Stripe graduated metered price bill the overage) allows the request.
+    Otherwise the request is refused with HTTP 402 until the period resets,
+    pay-per-use is enabled, or the user upgrades tiers. Usage is read from the
+    local ``api_metrics`` table (which also covers anonymous users via their
+    hashed-IP identifier) over the period resolved by
+    ``resolve_usage_period_start_for_user``. The admin testing account skips
+    enforcement entirely.
     """
+    if is_admin_metering_bypass(current_user, GlobalContext().admin_user_id):
+        return
     tier = resolve_tier(current_user)
     allotment = tier_allotment_for_meter(tier, meter)
     if allotment is None:
@@ -214,7 +230,11 @@ async def enforce_remaining_allotment(
         getattr(app_state, "pool", None), metering_user_id, meter.value, period_start
     )
     block_reason = exhausted_allotment_block_reason(
-        tier, meter, period_usage, resolve_pay_per_use_enabled(current_user)
+        tier,
+        meter,
+        period_usage,
+        resolve_pay_per_use_enabled(current_user),
+        estimated_request_tokens=estimated_request_tokens,
     )
     if block_reason:
         raise HTTPException(status_code=402, detail=block_reason)
@@ -226,17 +246,23 @@ async def enforce_token_rate_limit(
     meter_event_names: list[str],
     window_seconds: int,
     tokens_per_window: int,
+    estimated_request_tokens: int = 0,
 ) -> None:
     """Refuse the request with HTTP 429 when the user's token rate cap is met.
 
     A tokens-per-window abuse guard (in the spirit of the OpenAI rate-limit
     guide) independent of the monthly allotment and of pay-per-use: it caps how
     fast tokens can be consumed so a runaway client cannot burn a month's budget
-    or an unbounded overage bill in minutes. The Retry-After header tells the
+    or an unbounded overage bill in minutes. The window usage is checked WITH
+    this request's pre-call estimate added, so one huge request is refused
+    before burning the cap rather than after. The Retry-After header tells the
     client when the oldest usage row ages out of the rolling window. A cap of
-    zero or less disables the limit entirely.
+    zero or less disables the limit entirely; the admin testing account skips
+    the limit.
     """
     if tokens_per_window <= 0 or window_seconds <= 0:
+        return
+    if is_admin_metering_bypass(current_user, GlobalContext().admin_user_id):
         return
     window_usage, oldest_usage_at = await fetch_rolling_window_usage(
         getattr(app_state, "pool", None),
@@ -244,19 +270,211 @@ async def enforce_token_rate_limit(
         window_seconds,
         meter_event_names=meter_event_names,
     )
+    projected_window_usage = window_usage + max(0, estimated_request_tokens)
     retry_after_seconds = token_rate_limit_retry_after_seconds(
-        window_usage, tokens_per_window, window_seconds, oldest_usage_at
+        projected_window_usage, tokens_per_window, window_seconds, oldest_usage_at
     )
     if retry_after_seconds is not None:
         raise HTTPException(
             status_code=429,
             detail=(
                 f"Token rate limit reached: {window_usage:,} tokens used in the "
-                f"last {window_seconds} seconds against a cap of "
-                f"{tokens_per_window:,}. Retry after {retry_after_seconds} seconds."
+                f"last {window_seconds} seconds (plus an estimated "
+                f"{max(0, estimated_request_tokens):,} for this request) against "
+                f"a cap of {tokens_per_window:,}. "
+                f"Retry after {retry_after_seconds} seconds."
             ),
             headers={"Retry-After": str(retry_after_seconds)},
         )
+
+
+def _resolve_usage_period_bounds_for_user(
+    current_user: dict,
+) -> tuple[datetime, datetime]:
+    """Return the (start, end) of the usage period governing this user.
+
+    Start comes from ``resolve_usage_period_start_for_user``; the end prefers
+    the Stripe billing period end cached by the webhook, falling back to the
+    environment-configured period shape. Shared by enforcement-adjacent
+    display: the subscription-status endpoint and the per-response usage
+    snapshots.
+    """
+    context = GlobalContext()
+    usage_period_days = int(context.usage_period_days or 0)
+    period_start = resolve_usage_period_start_for_user(current_user)
+
+    app_metadata = (current_user or {}).get("app_metadata") or {}
+    cached_subscription_status = app_metadata.get("subscription_status") or {}
+    cached_period_end = cached_subscription_status.get("current_period_end")
+    if cached_period_end:
+        try:
+            return period_start, datetime.fromtimestamp(int(cached_period_end), tz=UTC)
+        except (TypeError, ValueError, OSError):
+            pass
+    return period_start, resolve_usage_period_end(period_start, usage_period_days)
+
+
+async def _build_meter_usage_snapshot(
+    app_state, current_user: dict, meter: UsageMeter
+) -> dict:
+    """Return one meter's usage-versus-allotment view for endpoint responses.
+
+    The same shape a customer portal polls from ``/verify_subscription_status``,
+    scoped to the single meter governing the current request, so every metered
+    endpoint can show the caller where they stand: allotment, usage to date in
+    the current period, remaining budget, the pay-per-use flag, and the period
+    bounds.
+    """
+    tier = resolve_tier(current_user)
+    allotment = tier_allotment_for_meter(tier, meter)
+    period_start, period_end = _resolve_usage_period_bounds_for_user(current_user)
+    used_to_date = await fetch_usage_since(
+        getattr(app_state, "pool", None),
+        resolve_metering_user_id(current_user),
+        meter.value,
+        period_start,
+    )
+    monthly_allotment = allotment.monthly_allotment if allotment else None
+    return {
+        "meter": meter.value,
+        "tier": tier.value,
+        "monthly_allotment": monthly_allotment,
+        "used_to_date": used_to_date,
+        "remaining": (
+            max(0, monthly_allotment - used_to_date)
+            if monthly_allotment is not None
+            else None
+        ),
+        "pay_per_use_enabled": resolve_pay_per_use_enabled(current_user),
+        "usage_period_start": period_start.isoformat(),
+        "usage_period_end": period_end.isoformat(),
+    }
+
+
+async def _measure_system_prompt_tokens_for_request(
+    app_state, estimation_config: dict, message: str | None
+) -> int:
+    """Return the MEASURED token estimate of this request's real system prompt.
+
+    Reads the process-wide estimate cache first (populated every time
+    ``load_consciousness`` builds the prompt); on a miss or stale entry the
+    REAL prompt is built through ``build_system_prompt_text_for_estimation``
+    (store reads only — no model call, and the build records a fresh cache
+    entry as a side effect) and measured with the same word-ratio arithmetic.
+    Raises on any failure — the caller treats estimation as fail-closed.
+    """
+    context = GlobalContext()
+    configurable = (estimation_config or {}).get("configurable") or {}
+    user_id = configurable.get("user_id")
+    assistant_id = configurable.get("assistant_id")
+    if user_id and assistant_id:
+        cached_estimate = fetch_system_prompt_token_estimate(
+            user_id,
+            assistant_id,
+            max_age_seconds=float(
+                context.system_prompt_token_estimate_cache_ttl_seconds or 0
+            ),
+        )
+        if cached_estimate is not None:
+            return cached_estimate
+
+    # Lazy import: nodes pulls the full prompt-building stack, which must not
+    # load at webapp import time (cold-start convention in CLAUDE.md).
+    from src.anubis.utils.nodes import build_system_prompt_text_for_estimation
+
+    system_prompt_text = await build_system_prompt_text_for_estimation(
+        getattr(app_state, "store", None), estimation_config, message or ""
+    )
+    return estimate_text_tokens_from_words(count_words(system_prompt_text))
+
+
+async def _estimate_message_request_tokens(
+    app_state,
+    estimation_config: dict,
+    message: str | None,
+    file_text_content: str | None,
+    multimodal_content: list | None,
+) -> TokenEstimateBreakdown:
+    """Manually estimate one message turn's tokens before the model runs.
+
+    Manual computation (no tokenizer, no counting endpoint — arithmetic over
+    known quantities is the fastest path), split into input versus output:
+
+    * INPUT — the MEASURED system prompt for this (user, avatar) pair (from
+      the estimate cache, or built fresh on a miss), the MEASURED schemas of
+      every tool the deep agent binds (enumerated from the compiled agent,
+      so newly added tools are included automatically — see
+      ``tool_schema_estimate_cache.py``; the provider bills the serialized
+      tool definitions as input on the initial model call), the word-ratio
+      estimate of the variable user text (message plus attached-file text),
+      and every attached image's vision patches. There is NO fixed or
+      guessed input overhead — every input component is measured. (The tool
+      loop may run the model more than once before the final reply; the loop
+      count is unknowable in advance, so the estimate covers the initial
+      call and recorded actual totals govern accrual for the loop.) The
+      allotment gate consumes ``input_tokens``.
+    * OUTPUT — the expected reply budget
+      (``MESSAGE_EXPECTED_OUTPUT_TOKENS_ESTIMATE``) plus each attached
+      image's expected description. Output is not gated in advance; actual
+      TOTAL usage from the model API accrues after the turn.
+
+    ``estimation_config`` is the request's LangGraph config whose
+    ``configurable`` carries ``user_id``, ``assistant_id``, and
+    ``assistant_ctx`` — the same identifiers ``load_consciousness`` builds
+    the prompt from, so the estimate reflects the prompt the model will read.
+
+    Fail-closed: an unreadable attached image, a failed system-prompt build,
+    or any other estimation failure raises HTTP 422 — nothing unestimated may
+    reach the model.
+    """
+    context = GlobalContext()
+    try:
+        system_prompt_tokens = await _measure_system_prompt_tokens_for_request(
+            app_state, estimation_config, message
+        )
+        # First call per process compiles the deep agent graph to enumerate
+        # the bound tools, so the measurement runs on a worker thread; every
+        # later call returns the cached integer.
+        tool_schema_tokens = await asyncio.to_thread(
+            fetch_or_measure_deep_agent_tool_schema_token_estimate
+        )
+
+        image_dimensions: list[tuple[int, int]] = []
+        for content_block in multimodal_content or []:
+            if (
+                not isinstance(content_block, dict)
+                or content_block.get("type") != "image_url"
+            ):
+                continue
+            image_url_value = (content_block.get("image_url") or {}).get("url") or ""
+            if "," in image_url_value:
+                image_bytes = base64.b64decode(image_url_value.split(",", 1)[1])
+            else:
+                image_bytes = base64.b64decode(image_url_value)
+            image_dimensions.append(_image_dimensions_from_bytes(image_bytes))
+
+        variable_text = " ".join(
+            part for part in (message or "", file_text_content or "") if part
+        )
+        return estimate_message_request_token_breakdown(
+            count_words(variable_text),
+            image_dimensions,
+            system_prompt_tokens=system_prompt_tokens,
+            tool_schema_tokens=tool_schema_tokens,
+            expected_output_tokens=int(
+                context.message_expected_output_tokens_estimate or 0
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as estimation_error:  # noqa: BLE001 - fail-closed estimation
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not estimate token usage for this message: "
+                f"{estimation_error} The request was not processed."
+            ),
+        ) from estimation_error
 
 
 async def _meter_message_usage(
@@ -267,14 +485,19 @@ async def _meter_message_usage(
     assistant_id: Optional[str],
     latency_ms: float,
     request_id: Optional[str] = None,
-) -> None:
-    """Report messaging (or adapter-inference) token usage and persist a metrics row.
+) -> dict | None:
+    """Report messaging (or adapter-inference) token usage; return the usage block.
 
     Best-effort and non-fatal: extracts billable tokens from the model response
     metadata, reports them to the correct Stripe meter keyed on the customer,
-    increments the Prometheus token/cost counters (previously defined but never
-    used), and writes one ``api_metrics`` row. A ``None`` customer id (anonymous
-    user) makes the Stripe report a no-op while still recording local metrics.
+    increments the Prometheus token/cost counters, and writes one
+    ``api_metrics`` row. A ``None`` customer id (anonymous user) makes the
+    Stripe report a no-op while still recording local metrics. The admin
+    testing account skips both billing writes (Prometheus observability is
+    kept). Returns the turn's usage summary — this turn's actual token counts
+    plus the caller's usage-versus-allotment snapshot for the governing meter —
+    for endpoint responses; returns ``None`` when metering fails (the model
+    already ran; post-response reporting stays fail-open).
     """
     try:
         token_usage = (response_metadata or {}).get("token_usage") or {}
@@ -286,6 +509,9 @@ async def _meter_message_usage(
 
         stripe_customer_id = resolve_stripe_customer_id(current_user)
         tier = resolve_tier(current_user)
+        admin_metering_bypass = is_admin_metering_bypass(
+            current_user, GlobalContext().admin_user_id
+        )
 
         # Adapter inference is billed against a separate meter at a different rate;
         # the think node sets is_adapter_inference when the client requested
@@ -300,15 +526,16 @@ async def _meter_message_usage(
 
         # The request id keys Stripe's meter-event deduplication so a retried
         # request cannot double-bill the same turn.
-        await report_meter_event(
-            app_state.stripe,
-            meter,
-            stripe_customer_id,
-            total_tokens,
-            idempotency_identifier=(
-                f"{request_id}:{meter.value}" if request_id else None
-            ),
-        )
+        if not admin_metering_bypass:
+            await report_meter_event(
+                app_state.stripe,
+                meter,
+                stripe_customer_id,
+                total_tokens,
+                idempotency_identifier=(
+                    f"{request_id}:{meter.value}" if request_id else None
+                ),
+            )
 
         if model_name and total_tokens > 0:
             if prompt_tokens:
@@ -320,23 +547,38 @@ async def _meter_message_usage(
             if cost_usd:
                 MODEL_COST_TOTAL.labels(model=model_name).inc(cost_usd)
 
-        await persist_api_metrics_row(
-            getattr(app_state, "pool", None),
-            inference_type=inference_type,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            cost_usd=cost_usd,
-            latency_ms=latency_ms,
-            user_id=resolve_metering_user_id(current_user),
-            stripe_customer_id=stripe_customer_id,
-            assistant_id=assistant_id,
-            thread_id=thread_id,
-            model_name=model_name,
-            meter_event_name=meter.value,
+        if not admin_metering_bypass:
+            await persist_api_metrics_row(
+                getattr(app_state, "pool", None),
+                inference_type=inference_type,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                user_id=resolve_metering_user_id(current_user),
+                stripe_customer_id=stripe_customer_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                model_name=model_name,
+                meter_event_name=meter.value,
+            )
+
+        # The insert above was awaited, so the snapshot's used_to_date already
+        # includes this turn.
+        usage_snapshot = await _build_meter_usage_snapshot(
+            app_state, current_user, meter
         )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            **usage_snapshot,
+            **({"admin_metering_bypass": True} if admin_metering_bypass else {}),
+        }
     except Exception as metering_error:  # noqa: BLE001 - metering must never break a reply
         logger.error("Failed to meter message usage: %s", metering_error)
+        return None
 
 
 def _drop_empty_file_fields(value: Any) -> Any:
@@ -493,16 +735,43 @@ async def message_graph_sse(
     resume_command: Optional[Command] = None,
     app_state=None,
     current_user: Optional[dict] = None,
+    estimated_request_tokens: TokenEstimateBreakdown | None = None,
+    estimate_meter: UsageMeter | None = None,
+    include_usage_metrics: bool = True,
 ):
     """Stream assistant tokens (SSE) then a terminal event with full metadata.
 
-    Terminal event is ``done`` on completion, or ``interrupt`` when the graph pauses
-    for human approval (carrying the approve/edit/reject preview payload). Pass
-    ``resume_command`` (``Command(resume=...)``) to continue a paused run instead of
-    sending a fresh ``human_message``.
+    When ``include_usage_metrics`` is true, the FIRST frame is a
+    ``usage_estimate`` event carrying this request's pre-call ``input_tokens``
+    estimate (what the allotment gate consumed) and the caller's
+    usage-versus-allotment snapshot. Actual meter accrual always uses the
+    provider's returned token usage after the turn, regardless of
+    ``include_usage_metrics``. The terminal event is ``done`` on completion
+    (optionally carrying the turn's actual ``usage``), or ``interrupt`` when
+    the graph pauses for human approval. Pass ``resume_command``
+    (``Command(resume=...)``) to continue a paused run instead of sending a
+    fresh ``human_message``.
     """
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
+
+    # Pre-call estimate + allotment snapshot (reporting only).
+    if (
+        include_usage_metrics
+        and estimated_request_tokens is not None
+        and app_state is not None
+        and current_user is not None
+    ):
+        usage_estimate_event = {
+            "type": "usage_estimate",
+            "input_tokens": estimated_request_tokens.input_tokens,
+            "usage": await _build_meter_usage_snapshot(
+                app_state, current_user, estimate_meter or UsageMeter.MESSAGING_TOKENS
+            ),
+            "thread_id": thread_id,
+            "request_id": request_id,
+        }
+        yield f"data: {json.dumps(usage_estimate_event, default=str)}\n\n"
 
     graph_input = (
         resume_command if resume_command is not None else {"messages": [human_message]}
@@ -569,11 +838,12 @@ async def message_graph_sse(
     )
     if response_metadata:
         done["response_metadata"] = response_metadata
-    yield f"data: {json.dumps(done, default=str)}\n\n"
 
-    # Meter the completed turn (best-effort; never affects the already-sent stream).
+    # Always accrue actual model API usage BEFORE the terminal frame. Reporting
+    # the usage block on ``done`` is optional (``include_usage_metrics``);
+    # metering failure is fail-open and just omits the usage block.
     if app_state is not None and current_user is not None:
-        await _meter_message_usage(
+        turn_usage = await _meter_message_usage(
             app_state=app_state,
             current_user=current_user,
             response_metadata=response_metadata,
@@ -582,6 +852,9 @@ async def message_graph_sse(
             latency_ms=(time_ns() - start_time_ns) / 1_000_000,
             request_id=request_id,
         )
+        if include_usage_metrics and turn_usage:
+            done["usage"] = turn_usage
+    yield f"data: {json.dumps(done, default=str)}\n\n"
 
 
 class MessagePayload(BaseModel):
@@ -1213,7 +1486,7 @@ async def set_pay_per_use(
     return {"pay_per_use_enabled": enabled}
 
 
-@app.post("/change_subscription_tier")
+
 async def change_subscription_tier(
     request: Request,
     tier: str = Body(..., embed=True),
@@ -2289,7 +2562,8 @@ async def message_selected_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
-    include_metrics: bool = Form(True),
+    include_quality_metrics: bool = Form(True),
+    include_usage_metrics: bool = Form(True),
     adapter: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2308,14 +2582,58 @@ async def message_selected_avatar(
 
     # This turn bills the adapter-inference meter only when the client asked for
     # the adapter AND the user's tier grants adapter inference; otherwise the
-    # messaging meter governs. Any tier without pay-per-use is blocked at the
-    # allotment; a token rate cap guards against runaway clients.
+    # messaging meter governs. Attached files are processed FIRST so the
+    # pre-call estimate covers message text, attached file text, and attached
+    # images; enforcement then verifies the estimate against the allotment
+    # period BEFORE any model call (and before a thread is created). Any tier
+    # without pay-per-use is blocked at the allotment; a token rate cap guards
+    # against runaway clients.
     message_meter = (
         UsageMeter.ADAPTER_INFERENCE_TOKENS
         if resolve_use_adapter_inference(current_user, adapter)
         else UsageMeter.MESSAGING_TOKENS
     )
-    await enforce_remaining_allotment(request.app.state, current_user, message_meter)
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
+
+    user_name = your_name
+    user_description = your_description
+    user_id = current_user["identities"][0]["user_id"]
+    config_update = {
+        "configurable": {
+            "user_ctx": {"name": user_name, "description": user_description},
+            "user_id": user_id,
+        }
+    }
+    assistant_id = config["configurable"].get("assistant_id")
+
+    # The pre-call estimate measures the REAL system prompt for this
+    # (user, avatar) pair, so estimation reads the merged configurable the
+    # prompt builder needs (user_id, assistant_id, assistant_ctx). The merge
+    # happens on a copy: enforcement below still runs before a thread is
+    # created and before any model call.
+    estimation_config = {
+        "configurable": {
+            **config.get("configurable", {}),
+            **config_update["configurable"],
+        }
+    }
+    estimated_request_tokens = await _estimate_message_request_tokens(
+        request.app.state,
+        estimation_config,
+        message,
+        file_text_content,
+        multimodal_content,
+    )
+    await enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        message_meter,
+        estimated_request_tokens=estimated_request_tokens.input_tokens,
+    )
     message_rate_limit_context = GlobalContext()
     await enforce_token_rate_limit(
         request.app.state,
@@ -2328,18 +2646,8 @@ async def message_selected_avatar(
         tokens_per_window=int(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
+        estimated_request_tokens=estimated_request_tokens.total_tokens,
     )
-
-    user_name = your_name
-    user_description = your_description
-    user_id = current_user["identities"][0]["user_id"]
-    config_update = {
-        "configurable": {
-            "user_ctx": {"name": user_name, "description": user_description},
-            "user_id": user_id,
-        }
-    }
-    assistant_id = config["configurable"].get("assistant_id")
 
     # Handle thread_id
     if not thread_id:
@@ -2364,7 +2672,7 @@ async def message_selected_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["include_quality_metrics"] = include_quality_metrics
     config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
         current_user, adapter
     )
@@ -2372,12 +2680,8 @@ async def message_selected_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    # Process any uploaded files
-    (
-        file_text_content,
-        multimodal_content,
-        image_filenames,
-    ) = await process_files_for_message(files, message=message)
+    # Uploaded files were already processed above (before enforcement) so the
+    # pre-call estimate could cover them; reuse those results here.
 
     # Create the human message content
     if multimodal_content:
@@ -2413,6 +2717,9 @@ async def message_selected_avatar(
                 langgraph_client_headers=langgraph_client_headers,
                 app_state=request.app.state,
                 current_user=current_user,
+                estimated_request_tokens=estimated_request_tokens,
+                estimate_meter=message_meter,
+                include_usage_metrics=include_usage_metrics,
             ),
             media_type="text/event-stream",
             headers={
@@ -2451,7 +2758,7 @@ async def message_selected_avatar(
     logger.warning(f"RESPONSE_DATA: {response_data}")
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
-    await _meter_message_usage(
+    turn_usage = await _meter_message_usage(
         app_state=request.app.state,
         current_user=current_user,
         response_metadata=response_metadata,
@@ -2460,6 +2767,10 @@ async def message_selected_avatar(
         latency_ms=(time_ns() - start_time) / 1_000_000,
         request_id=request.state.request_id,
     )
+    if include_usage_metrics:
+        response_data["input_tokens"] = estimated_request_tokens.input_tokens
+        if turn_usage:
+            response_data["usage"] = turn_usage
     return JSONResponse(response_data, status_code=200)
 
 
@@ -2478,7 +2789,8 @@ async def message_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
-    include_metrics: bool = Form(True),
+    include_quality_metrics: bool = Form(True),
+    include_usage_metrics: bool = Form(True),
     adapter: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
@@ -2499,27 +2811,22 @@ async def message_avatar(
 
     # This turn bills the adapter-inference meter only when the client asked for
     # the adapter AND the user's tier grants adapter inference; otherwise the
-    # messaging meter governs. Any tier without pay-per-use is blocked at the
-    # allotment; a token rate cap guards against runaway clients.
+    # messaging meter governs. Attached files are processed FIRST so the
+    # pre-call estimate covers message text, attached file text, and attached
+    # images; enforcement then verifies the estimate against the allotment
+    # period BEFORE any model call (and before a thread is created). Any tier
+    # without pay-per-use is blocked at the allotment; a token rate cap guards
+    # against runaway clients.
     message_meter = (
         UsageMeter.ADAPTER_INFERENCE_TOKENS
         if resolve_use_adapter_inference(current_user, adapter)
         else UsageMeter.MESSAGING_TOKENS
     )
-    await enforce_remaining_allotment(request.app.state, current_user, message_meter)
-    message_rate_limit_context = GlobalContext()
-    await enforce_token_rate_limit(
-        request.app.state,
-        current_user,
-        meter_event_names=[
-            UsageMeter.MESSAGING_TOKENS.value,
-            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
-        ],
-        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
-        tokens_per_window=int(
-            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
-        ),
-    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
 
     user_name = your_name
     user_description = your_description
@@ -2554,6 +2861,48 @@ async def message_avatar(
             }
         }
 
+    # The pre-call estimate measures the REAL system prompt for this
+    # (user, avatar) pair, so estimation reads the merged configurable the
+    # prompt builder needs (user_id, assistant_id, assistant_ctx — the path
+    # avatar's context just fetched above, or the anonymous dependency's).
+    # The merge happens on a copy: enforcement below still runs before a
+    # thread is created and before any model call.
+    estimation_config = {
+        "configurable": {
+            **config.get("configurable", {}),
+            **config_update["configurable"],
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+        }
+    }
+    estimated_request_tokens = await _estimate_message_request_tokens(
+        request.app.state,
+        estimation_config,
+        message,
+        file_text_content,
+        multimodal_content,
+    )
+    await enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        message_meter,
+        estimated_request_tokens=estimated_request_tokens.input_tokens,
+    )
+    message_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
+        estimated_request_tokens=estimated_request_tokens.total_tokens,
+    )
+
     # Handle thread_id
     if not thread_id:
         thread_id = str(uuid4())
@@ -2577,7 +2926,7 @@ async def message_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["include_quality_metrics"] = include_quality_metrics
     config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
         current_user, adapter
     )
@@ -2585,12 +2934,8 @@ async def message_avatar(
     # store = app.state.store
     graph = app.state.graph
 
-    # Process any uploaded files
-    (
-        file_text_content,
-        multimodal_content,
-        image_filenames,
-    ) = await process_files_for_message(files, message=message)
+    # Uploaded files were already processed above (before enforcement) so the
+    # pre-call estimate could cover them; reuse those results here.
 
     # Create the human message content
     if multimodal_content:
@@ -2630,6 +2975,9 @@ async def message_avatar(
                 langgraph_client_headers=langgraph_client_headers,
                 app_state=request.app.state,
                 current_user=current_user,
+                estimated_request_tokens=estimated_request_tokens,
+                estimate_meter=message_meter,
+                include_usage_metrics=include_usage_metrics,
             ),
             media_type="text/event-stream",
             headers={
@@ -2667,7 +3015,7 @@ async def message_avatar(
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
-    await _meter_message_usage(
+    turn_usage = await _meter_message_usage(
         app_state=request.app.state,
         current_user=current_user,
         response_metadata=response_metadata,
@@ -2676,6 +3024,10 @@ async def message_avatar(
         latency_ms=(time_ns() - start_time) / 1_000_000,
         request_id=request.state.request_id,
     )
+    if include_usage_metrics:
+        response_data["input_tokens"] = estimated_request_tokens.input_tokens
+        if turn_usage:
+            response_data["usage"] = turn_usage
     return JSONResponse(response_data, status_code=200)
 
 
@@ -2689,7 +3041,8 @@ async def resume_avatar_message(
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     user_timezone: Optional[str] = Form(None),
-    include_metrics: bool = Form(True),
+    include_quality_metrics: bool = Form(True),
+    include_usage_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Resume a run paused for human approval (edit/delete identity fact).
@@ -2719,12 +3072,40 @@ async def resume_avatar_message(
         )
 
     # The resumed continuation bills the messaging meter (resume has no adapter
-    # form field), so the same allotment and rate-limit gates apply as on the
-    # initial message endpoints.
-    await enforce_remaining_allotment(
-        request.app.state, current_user, UsageMeter.MESSAGING_TOKENS
-    )
+    # form field) and IS a model call, so the same allotment and rate-limit
+    # gates apply as on the initial message endpoints. A resume carries no new
+    # user text or images, so the input estimate is the measured system prompt
+    # recorded when the interrupted turn built the prompt moments ago (zero on
+    # a cold cache — the recorded actual usage still governs accrual) plus the
+    # measured bound tool schemas (billed as input on every model call); the
+    # output estimate is the expected reply budget. No fixed or guessed input
+    # overhead — every input component is measured.
     message_rate_limit_context = GlobalContext()
+    estimated_request_tokens = TokenEstimateBreakdown(
+        input_tokens=(
+            fetch_system_prompt_token_estimate(
+                current_user["identities"][0]["user_id"],
+                assistant_id,
+                max_age_seconds=float(
+                    message_rate_limit_context.system_prompt_token_estimate_cache_ttl_seconds
+                    or 0
+                ),
+            )
+            or 0
+        )
+        + await asyncio.to_thread(
+            fetch_or_measure_deep_agent_tool_schema_token_estimate
+        ),
+        output_tokens=int(
+            message_rate_limit_context.message_expected_output_tokens_estimate or 0
+        ),
+    )
+    await enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        UsageMeter.MESSAGING_TOKENS,
+        estimated_request_tokens=estimated_request_tokens.input_tokens,
+    )
     await enforce_token_rate_limit(
         request.app.state,
         current_user,
@@ -2736,6 +3117,7 @@ async def resume_avatar_message(
         tokens_per_window=int(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
+        estimated_request_tokens=estimated_request_tokens.total_tokens,
     )
 
     user_id = current_user["identities"][0]["user_id"]
@@ -2769,7 +3151,7 @@ async def resume_avatar_message(
     config_update["configurable"]["thread_id"] = thread_id
     config["configurable"].update(config_update["configurable"])
     config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["include_quality_metrics"] = include_quality_metrics
 
     graph = app.state.graph
 
@@ -2803,6 +3185,9 @@ async def resume_avatar_message(
             resume_command=Command(resume=resume_payload),
             app_state=request.app.state,
             current_user=current_user,
+            estimated_request_tokens=estimated_request_tokens,
+            estimate_meter=UsageMeter.MESSAGING_TOKENS,
+            include_usage_metrics=include_usage_metrics,
         ),
         media_type="text/event-stream",
         headers={
@@ -4027,6 +4412,12 @@ async def _expand_youtube_playlist_to_media_entries(
     # consistent across upload paths.
     playlist_ns = _namespace_safe_formatted_filename(url_clean)
     playlist_label = (playlist_title or url_clean).strip()
+    # Per-video token estimate from the flat entry's duration — the SAME
+    # duration source and formula the endpoint billed against at submit, so
+    # child-job estimates match the batch's billed total.
+    playlist_analysis_passes = int(
+        GlobalContext().estimated_analysis_passes_per_document or 0
+    )
     media_entries: list = []
     for entry in entries:
         video_id = entry.get("id")
@@ -4035,11 +4426,23 @@ async def _expand_youtube_playlist_to_media_entries(
         )
         if not watch_url:
             continue
+        video_duration_seconds = float(entry.get("duration") or 0.0)
+        video_estimated_tokens = estimate_media_item_tokens(
+            "video",
+            duration_seconds=(
+                video_duration_seconds
+                if video_duration_seconds > 0
+                else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+            ),
+            include_analysis=True,
+            analysis_passes=playlist_analysis_passes,
+        )
         video_ns = _namespace_safe_formatted_filename(watch_url)
         video_title = (entry.get("title") or "").strip()
         media_entries.append(
             {
                 "filename": f"{playlist_label}::{video_title or watch_url}",
+                "estimated_tokens": video_estimated_tokens,
                 "content_type": "text/html",
                 "content": b"",
                 "page_url": watch_url,
@@ -4324,6 +4727,317 @@ async def _build_media_entries_for_url(
     return entries
 
 
+def _decode_entry_media_bytes(entry: dict) -> bytes | None:
+    """Return an entry's media bytes from ``content`` or its base64 data URI."""
+    content = entry.get("content")
+    if content:
+        return content
+    base64_encoded_str = entry.get("base64_encoded_str")
+    if not base64_encoded_str:
+        return None
+    payload = base64_encoded_str
+    if payload.startswith("data:") and "," in payload:
+        payload = payload.split(",", 1)[1]
+    try:
+        return base64.b64decode(payload)
+    except Exception:  # noqa: BLE001 - caller treats undecodable as absent
+        return None
+
+
+def _image_dimensions_from_bytes(image_bytes: bytes) -> tuple[int, int]:
+    """Return (width, height) pixels by parsing the image header with Pillow.
+
+    ``Image.open`` reads only the header (no full raster decode) and Pillow's
+    default decompression-bomb guard stays active. Any failure is an
+    estimation error — image dimensions are always knowable from real image
+    bytes, so an unparsable image must not reach the vision model unmetered.
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image_handle:
+            width_pixels, height_pixels = image_handle.size
+        return int(width_pixels), int(height_pixels)
+    except Exception as image_error:  # noqa: BLE001 - fail-closed estimation
+        raise TokenEstimationError(
+            f"Could not read image dimensions: {image_error}"
+        ) from image_error
+
+
+def _extract_text_from_html_bytes(body: bytes) -> str:
+    """Return the visible text of an HTML page for word-count estimation."""
+    decoded = body.decode("utf-8", errors="ignore")
+    try:
+        from bs4 import BeautifulSoup
+
+        return BeautifulSoup(decoded, "html.parser").get_text(" ")
+    except ImportError:
+        # Crude tag strip when bs4 is unavailable — good enough for a word count.
+        return re.sub(r"<[^>]+>", " ", decoded)
+
+
+def _extract_pdf_text_from_bytes(pdf_bytes: bytes, filename: str) -> str:
+    """Extract a PDF's text (PyPDFLoader over a temp file) for estimation.
+
+    The same loader the message path uses, run BEFORE any documents are
+    created so the extracted text itself is what gets estimated. Raises
+    ``TokenEstimationError`` when the PDF cannot be parsed — fail-closed.
+    """
+    from langchain_community.document_loaders import PyPDFLoader
+
+    temp_pdf_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+            temp_pdf.write(pdf_bytes)
+            temp_pdf.flush()
+            temp_pdf_path = temp_pdf.name
+        pdf_documents = PyPDFLoader(temp_pdf_path).load()
+        return "\n\n".join(
+            document.page_content
+            for document in pdf_documents
+            if hasattr(document, "page_content")
+        )
+    except Exception as pdf_error:  # noqa: BLE001 - fail-closed estimation
+        raise TokenEstimationError(
+            f"Could not extract text from PDF {filename!r}: {pdf_error}"
+        ) from pdf_error
+    finally:
+        if temp_pdf_path:
+            try:
+                os.unlink(temp_pdf_path)
+            except OSError:
+                pass
+
+
+_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS = 8.0
+
+
+async def _estimate_tokens_for_media_entry(entry: dict) -> int:
+    """Estimate one media entry's total model tokens before any model call.
+
+    Dispatches on the entry shape produced by ``_build_media_entries_for_file``
+    and ``_build_media_entries_for_url`` and applies the estimation formulas in
+    ``src/anubis/utils/billing/estimation.py``. Identity analysis is included
+    only for entries the pipeline will actually analyze (reference-image and
+    reference-audio uploads skip analysis), so estimates track the pipeline's
+    real model usage.
+
+    Fail-closed: anything that cannot be estimated raises
+    ``TokenEstimationError`` (the endpoint answers 422 naming the item). The
+    ONLY sanctioned fallback is an unknown duration on a confirmed audio/video
+    item, which assumes ``ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS``.
+    """
+    context = GlobalContext()
+    analysis_passes = int(context.estimated_analysis_passes_per_document or 0)
+    include_analysis = not (
+        entry.get("reference_audio") or entry.get("reference_image")
+    )
+    content_type = (entry.get("content_type") or "").split(";")[0].strip().lower()
+    filename = entry.get("filename") or entry.get("page_url") or "item"
+
+    def _estimate_for_duration(kind: str, duration_seconds: float | None) -> int:
+        effective_duration = (
+            duration_seconds
+            if duration_seconds and duration_seconds > 0
+            else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+        )
+        return estimate_media_item_tokens(
+            kind,
+            duration_seconds=effective_duration,
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # Images: bytes are always in hand (uploads carry ``content``; image URLs
+    # were downloaded into the data URI when the entry was built).
+    if content_type.startswith("image/") or entry.get("image_url"):
+        image_bytes = _decode_entry_media_bytes(entry)
+        if image_bytes is None and entry.get("image_url"):
+            image_bytes, _header = await fetch_remote_url_bytes(entry["image_url"])
+        if not image_bytes:
+            raise TokenEstimationError(f"No image bytes available for {filename!r}.")
+        width_pixels, height_pixels = _image_dimensions_from_bytes(image_bytes)
+        return estimate_media_item_tokens(
+            "image",
+            width_pixels=width_pixels,
+            height_pixels=height_pixels,
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # Audio: measure the clip we already hold; duration-probe failure takes the
+    # sanctioned fallback (the type IS confirmed audio).
+    if content_type.startswith("audio/") or entry.get("audio_url"):
+        from src.anubis.utils.utility import get_audio_duration_seconds
+
+        duration_seconds = None
+        media_payload = entry.get("base64_encoded_str")
+        if media_payload:
+            try:
+                duration_seconds = await get_audio_duration_seconds(
+                    media_payload, entry.get("filename")
+                )
+            except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                logger.warning(
+                    "Audio duration probe failed for %s (%s); assuming %.0f seconds.",
+                    filename,
+                    duration_error,
+                    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+                )
+        return _estimate_for_duration("audio", duration_seconds)
+
+    # Video: processed as its audio track — same formula over the video duration.
+    if content_type.startswith("video/") or entry.get("video_url"):
+        from src.anubis.utils.utility import get_video_duration_seconds
+
+        duration_seconds = None
+        media_payload = entry.get("base64_encoded_str")
+        if media_payload:
+            try:
+                duration_seconds = await get_video_duration_seconds(
+                    media_payload, entry.get("filename")
+                )
+            except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                logger.warning(
+                    "Video duration probe failed for %s (%s); assuming %.0f seconds.",
+                    filename,
+                    duration_error,
+                    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+                )
+        return _estimate_for_duration("video", duration_seconds)
+
+    # URLs: probe what the URL actually yields and estimate that media type.
+    if entry.get("page_url"):
+        page_url = entry["page_url"]
+
+        # YouTube pages probe as text/html but their payload is video/audio —
+        # read the duration from metadata only (nothing downloaded).
+        if _is_youtube_url(page_url):
+            from src.anubis.utils.utility import get_remote_video_duration_seconds
+
+            duration_seconds = None
+            try:
+                duration_seconds = await asyncio.wait_for(
+                    get_remote_video_duration_seconds(page_url),
+                    timeout=_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS,
+                )
+            except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                logger.warning(
+                    "Remote duration probe failed for %s (%s); assuming %.0f seconds.",
+                    page_url,
+                    duration_error,
+                    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+                )
+            return _estimate_for_duration("video", duration_seconds)
+
+        # Rich single-URL entries downloaded the page body into the data URI;
+        # bulk lightweight entries carry nothing yet — probe the content type
+        # and estimate the real media behind the URL.
+        page_bytes = _decode_entry_media_bytes(entry)
+        if page_bytes is None:
+            probed_content_type = await probe_remote_url_content_type(page_url)
+            if probed_content_type.startswith("image/"):
+                image_bytes, _header = await fetch_remote_url_bytes(page_url)
+                width_pixels, height_pixels = _image_dimensions_from_bytes(image_bytes)
+                return estimate_media_item_tokens(
+                    "image",
+                    width_pixels=width_pixels,
+                    height_pixels=height_pixels,
+                    include_analysis=include_analysis,
+                    analysis_passes=analysis_passes,
+                )
+            if probed_content_type.startswith("audio/"):
+                from src.anubis.utils.utility import get_audio_duration_seconds
+
+                audio_bytes, _header = await fetch_remote_url_bytes(page_url)
+                duration_seconds = None
+                try:
+                    duration_seconds = await get_audio_duration_seconds(
+                        base64.b64encode(audio_bytes).decode("ascii"), page_url
+                    )
+                except Exception:  # noqa: BLE001 - sanctioned fallback
+                    pass
+                return _estimate_for_duration("audio", duration_seconds)
+            if probed_content_type.startswith("video/"):
+                from src.anubis.utils.utility import get_remote_video_duration_seconds
+
+                duration_seconds = None
+                try:
+                    duration_seconds = await asyncio.wait_for(
+                        get_remote_video_duration_seconds(page_url),
+                        timeout=_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS,
+                    )
+                except Exception:  # noqa: BLE001 - sanctioned fallback
+                    pass
+                return _estimate_for_duration("video", duration_seconds)
+            page_bytes, _header = await fetch_remote_url_bytes(page_url)
+        page_text = _extract_text_from_html_bytes(page_bytes)
+        return estimate_media_item_tokens(
+            "text",
+            word_count=count_words(page_text),
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # PDFs: extract the text FIRST and estimate the extracted words.
+    if content_type == "application/pdf":
+        pdf_bytes = _decode_entry_media_bytes(entry) or b""
+        pdf_text = _extract_pdf_text_from_bytes(pdf_bytes, filename)
+        return estimate_media_item_tokens(
+            "text",
+            word_count=count_words(pdf_text),
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # Everything else is text-shaped (plain text, markdown, CSV-statements
+    # JSON, arbitrary JSON): decode and count the actual words.
+    text_bytes = _decode_entry_media_bytes(entry) or b""
+    text_content = text_bytes.decode("utf-8", errors="ignore")
+    return estimate_media_item_tokens(
+        "text",
+        word_count=count_words(text_content),
+        include_analysis=include_analysis,
+        analysis_passes=analysis_passes,
+    )
+
+
+async def _estimate_media_entries_tokens(media_files: list) -> int:
+    """Stamp ``estimated_tokens`` on every entry (probing in parallel) and sum.
+
+    Bulk requests probe their URLs concurrently. Fail-closed: the first entry
+    that cannot be estimated aborts the request with HTTP 422 naming the item —
+    nothing unestimated may proceed to a model.
+    """
+
+    async def _estimate_one(entry: dict) -> int:
+        try:
+            estimated = await _estimate_tokens_for_media_entry(entry)
+        except (TokenEstimationError, HTTPException) as estimation_error:
+            item_name = entry.get("filename") or entry.get("page_url") or "item"
+            detail = (
+                estimation_error.detail
+                if isinstance(estimation_error, HTTPException)
+                else str(estimation_error)
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Could not estimate token usage for {item_name!r}: {detail} "
+                    "The request was not processed."
+                ),
+            ) from estimation_error
+        entry["estimated_tokens"] = estimated
+        return estimated
+
+    estimates = await asyncio.gather(
+        *(_estimate_one(entry) for entry in media_files)
+    )
+    return sum(estimates)
+
+
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: OptionalUploadFiles = None,
@@ -4380,61 +5094,14 @@ async def update_avatar_identity_with_media(
     """
     try:
         # Gate: only pro/premium tiers may update avatar identity with media.
+        # Allotment and rate-limit enforcement run AFTER the media entries are
+        # built and estimated, so the decision uses this request's real
+        # estimated token cost — see the enforcement block below.
         enforce_tier_capability(current_user, TierCapability.UPLOAD)
-        # Block once the document-upload allotment is exhausted without
-        # pay-per-use, and cap the upload token rate for runaway clients.
-        await enforce_remaining_allotment(
-            app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
-        )
-        media_upload_rate_limit_context = GlobalContext()
-        await enforce_token_rate_limit(
-            app.state,
-            current_user,
-            meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
-            window_seconds=int(
-                media_upload_rate_limit_context.media_upload_rate_limit_window_seconds or 0
-            ),
-            tokens_per_window=int(
-                media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
-                or 0
-            ),
-        )
 
         user_id = current_user["identities"][0]["user_id"]
         if not assistant_id:
             raise HTTPException(status_code=400, detail="assistant_id is required")
-
-        # Best-effort meter the upload against the document-upload budget. Uploads are
-        # distilled to a token-equivalent (transcription + analysis passes) so a heavy
-        # upload draws down the same monthly allotment it will cost to process. This is
-        # a submission-time estimate from file sizes and URL count; the media pipeline
-        # can later reconcile with the exact token counts it observes.
-        try:
-            uploaded_file_bytes = sum(
-                int(getattr(uploaded_file, "size", 0) or 0) for uploaded_file in (files or [])
-            )
-            url_count = len(url or [])
-            estimated_upload_tokens = estimate_upload_token_units(
-                text_character_count=uploaded_file_bytes,
-                url_count=url_count,
-            )
-            await report_meter_event(
-                app.state.stripe,
-                UsageMeter.DOCUMENT_UPLOAD_TOKENS,
-                resolve_stripe_customer_id(current_user),
-                estimated_upload_tokens,
-            )
-            await persist_api_metrics_row(
-                getattr(app.state, "pool", None),
-                inference_type="document_upload",
-                total_tokens=estimated_upload_tokens,
-                user_id=resolve_metering_user_id(current_user),
-                stripe_customer_id=resolve_stripe_customer_id(current_user),
-                assistant_id=assistant_id,
-                meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
-            )
-        except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
-            logger.error("Failed to meter upload usage: %s", upload_metering_error)
 
         token = current_user["API_KEY"]
         client = get_client(headers={"API-KEY": f"{token}"})
@@ -4647,6 +5314,109 @@ async def update_avatar_identity_with_media(
             for entry in media_files:
                 entry["create_reference_media_from_playlist"] = True
 
+        # ------------------------------------------------------------------
+        # Pre-request token estimation (fail-closed), then enforcement, then
+        # metering — all BEFORE any model call happens. Every entry gets a
+        # typed estimate (image dimensions, audio/video durations, extracted
+        # text word counts); playlists are enumerated now so their videos'
+        # durations are billed accurately at submit.
+        # ------------------------------------------------------------------
+        estimated_tokens_total = await _estimate_media_entries_tokens(media_files)
+
+        playlist_estimated_tokens = 0
+        if playlist_urls:
+            from src.anubis.utils.utility import get_remote_playlist_video_durations
+
+            estimation_context = GlobalContext()
+            playlist_analysis_passes = int(
+                estimation_context.estimated_analysis_passes_per_document or 0
+            )
+            for playlist_url in playlist_urls:
+                try:
+                    playlist_video_durations = await get_remote_playlist_video_durations(
+                        playlist_url
+                    )
+                except Exception as playlist_error:  # noqa: BLE001 - fail-closed
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Could not enumerate playlist {playlist_url!r} to "
+                            f"estimate token usage: {playlist_error} "
+                            "The request was not processed."
+                        ),
+                    ) from playlist_error
+                if not playlist_video_durations:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Playlist {playlist_url!r} contains no videos to "
+                            "estimate. The request was not processed."
+                        ),
+                    )
+                for video_duration_seconds in playlist_video_durations:
+                    playlist_estimated_tokens += estimate_media_item_tokens(
+                        "video",
+                        duration_seconds=(
+                            video_duration_seconds
+                            if video_duration_seconds > 0
+                            else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+                        ),
+                        include_analysis=True,
+                        analysis_passes=playlist_analysis_passes,
+                    )
+        estimated_tokens_total += playlist_estimated_tokens
+
+        # Enforce allotment and token rate with this request's estimate so an
+        # over-budget upload is refused before anything is spent (admin
+        # testing bypass happens inside the helpers).
+        await enforce_remaining_allotment(
+            app.state,
+            current_user,
+            UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+            estimated_request_tokens=estimated_tokens_total,
+        )
+        media_upload_rate_limit_context = GlobalContext()
+        await enforce_token_rate_limit(
+            app.state,
+            current_user,
+            meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
+            window_seconds=int(
+                media_upload_rate_limit_context.media_upload_rate_limit_window_seconds
+                or 0
+            ),
+            tokens_per_window=int(
+                media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
+                or 0
+            ),
+            estimated_request_tokens=estimated_tokens_total,
+        )
+
+        # Report the estimate against the document-upload meter (Stripe +
+        # local api_metrics). Billing WRITES stay fail-open — only estimation
+        # is fail-closed. The admin testing account is never metered.
+        upload_admin_metering_bypass = is_admin_metering_bypass(
+            current_user, GlobalContext().admin_user_id
+        )
+        if not upload_admin_metering_bypass and estimated_tokens_total > 0:
+            try:
+                await report_meter_event(
+                    app.state.stripe,
+                    UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                    resolve_stripe_customer_id(current_user),
+                    estimated_tokens_total,
+                )
+                await persist_api_metrics_row(
+                    getattr(app.state, "pool", None),
+                    inference_type="document_upload",
+                    total_tokens=estimated_tokens_total,
+                    user_id=resolve_metering_user_id(current_user),
+                    stripe_customer_id=resolve_stripe_customer_id(current_user),
+                    assistant_id=assistant_id,
+                    meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
+                )
+            except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
+                logger.error("Failed to meter upload usage: %s", upload_metering_error)
+
         store = app.state.store
 
         # Collect every namespace_filename already indexed for this avatar. The
@@ -4731,6 +5501,7 @@ async def update_avatar_identity_with_media(
                 parent_id=master.job_id,
                 filename=media_file.get("filename"),
                 namespace_filename=media_file.get("namespace_filename"),
+                estimated_tokens=media_file.get("estimated_tokens"),
             )
             master.child_ids.append(child.job_id)
             items.append({"child": child, "media_file": media_file})
@@ -4739,6 +5510,7 @@ async def update_avatar_identity_with_media(
                     "job_id": child.job_id,
                     "filename": child.filename,
                     "status": child.status,
+                    "estimated_tokens": media_file.get("estimated_tokens"),
                     "status_url": f"/media_job/{child.job_id}",
                     "progress_url": f"/media_job/{child.job_id}/progress",
                     "cancel_url": f"/media_job/{child.job_id}/cancel",
@@ -4794,6 +5566,18 @@ async def update_avatar_identity_with_media(
                 # those child ids surface on the master's progress stream as
                 # ``playlist_child_added`` events rather than in this response.
                 "playlists_expanding": len(playlist_urls),
+                # The full pre-request estimate (playlist videos included) that
+                # was checked against the allotment and reported to the meter,
+                # plus where the caller now stands against the allotment.
+                "estimated_tokens_total": estimated_tokens_total,
+                "usage": await _build_meter_usage_snapshot(
+                    app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
+                ),
+                **(
+                    {"admin_metering_bypass": True}
+                    if upload_admin_metering_bypass
+                    else {}
+                ),
                 "message": (
                     "Media processing started; enumerating "
                     f"{len(playlist_urls)} playlist(s) in the background"
@@ -4896,6 +5680,7 @@ async def media_job_status(
             "filename": j.filename,
             "namespace_filename": j.namespace_filename,
             "status": j.status,
+            "estimated_tokens": j.estimated_tokens,
             "error": j.error,
             "created_at": j.created_at,
             "started_at": j.started_at,
@@ -4914,6 +5699,9 @@ async def media_job_status(
         children = [registry[cid] for cid in job.child_ids if cid in registry]
         statuses = [c.status for c in children]
         snapshot["children"] = [_descriptor(c) for c in children]
+        snapshot["estimated_tokens_total"] = sum(
+            c.estimated_tokens or 0 for c in children
+        )
         snapshot["children_total"] = len(children)
         snapshot["children_completed"] = statuses.count("completed")
         snapshot["children_error"] = statuses.count("error")

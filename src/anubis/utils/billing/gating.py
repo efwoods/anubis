@@ -20,9 +20,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
+from enum import StrEnum
 from typing import Any, Mapping
 
 from src.anubis.utils.billing.tiers import (
+    MeterAllotment,
     SubscriptionTier,
     TierCapability,
     UsageMeter,
@@ -159,6 +161,8 @@ def exhausted_allotment_block_reason(
     meter: UsageMeter,
     month_to_date_usage: int,
     pay_per_use_enabled: bool,
+    estimated_request_tokens: int = 0,
+    allotment_override: MeterAllotment | None = None,
 ) -> str | None:
     """Return a human-readable refusal reason when usage must be blocked, else ``None``.
 
@@ -167,34 +171,83 @@ def exhausted_allotment_block_reason(
     * A tier without an allotment for ``meter`` is not decided here — the
       capability gate (``enforce_tier_capability``) is the authority for
       dimensions a tier lacks entirely.
-    * Usage under the monthly allotment is always allowed.
+    * Usage plus the estimated cost of THIS request under the monthly
+      allotment is allowed. ``estimated_request_tokens`` is the pre-call
+      estimate of the request's INPUT tokens (the measured system prompt,
+      user text, image patches, analysis passes), so a request whose input
+      alone would cross the allotment is refused before anything is spent
+      (with an estimate of zero this reduces to the plain usage check).
+    * Output tokens are deliberately NOT part of the gate: total input may
+      not exceed the remaining allotment, but a request whose input fits may
+      overshoot the allotment through its OUTPUT exactly once per period —
+      ``month_to_date_usage`` records actual TOTAL tokens (input plus
+      output), so the request that crossed the allotment is honored and the
+      next request is blocked here.
     * Usage at or past the allotment is allowed only when pay-per-use is
       enabled (which requires a payment method on file), because only then can
       the Stripe graduated metered price actually bill the overage. Otherwise
       the request is refused until the period resets, the user adds a payment
       method and enables pay-per-use, or the user upgrades tiers.
+    * ``allotment_override`` carries a trial-aware allotment
+      (``resolve_effective_monthly_allotment``) when the caller has one, so a
+      user inside a free-trial window keeps the trial allotment after
+      changing tiers; without an override the tier's plain allotment governs.
     """
-    allotment = tier_allotment_for_meter(tier, meter)
+    allotment = (
+        allotment_override
+        if allotment_override is not None
+        else tier_allotment_for_meter(tier, meter)
+    )
     if allotment is None:
         return None
-    if month_to_date_usage < allotment.monthly_allotment:
+    estimated_request_tokens = max(0, estimated_request_tokens)
+    if month_to_date_usage + estimated_request_tokens < allotment.monthly_allotment:
         return None
     if pay_per_use_enabled:
         return None
     meter_display_name = meter.value.replace("_", " ")
+    # When usage alone is still under the allotment, the ESTIMATE is what
+    # crosses the line — say so, or a user with visible remaining budget will
+    # not understand why a large request was refused.
+    estimate_prefix = ""
+    if month_to_date_usage < allotment.monthly_allotment and estimated_request_tokens:
+        estimate_prefix = (
+            f"This request's input is estimated at {estimated_request_tokens:,} "
+            f"{meter_display_name}, which would exceed your remaining allotment. "
+        )
     if tier == SubscriptionTier.FREE:
         return (
+            f"{estimate_prefix}"
             f"Your free-tier monthly allotment of "
             f"{allotment.monthly_allotment:,} {meter_display_name} is exhausted. "
             "Subscribe to a paid tier, or add a payment method and enable "
             "pay-per-use, to continue this month."
         )
     return (
+        f"{estimate_prefix}"
         f"Your {tier.value}-tier monthly allotment of "
         f"{allotment.monthly_allotment:,} {meter_display_name} is exhausted. "
         "Add a payment method and enable pay-per-use (POST /set_pay_per_use) "
         "to bill overage, or wait for the monthly reset."
     )
+
+
+def is_admin_metering_bypass(
+    user: Mapping[str, Any] | None, admin_user_id: str | None
+) -> bool:
+    """Return whether this requester is the admin testing account.
+
+    The admin testing account (``GlobalContext.admin_user_id``, environment
+    variable ``ADMIN_USER_ID``) skips BOTH enforcement (402/429) and metering
+    writes (Stripe meter events, ``api_metrics`` rows) so testing never
+    pollutes real usage. A missing or empty ``admin_user_id`` never bypasses,
+    and every other user — anonymous and unsubscribed included — stays
+    metered. Keyed on ``resolve_metering_user_id`` because that is the same
+    identity that enforcement and usage attribution key on.
+    """
+    if not admin_user_id:
+        return False
+    return resolve_metering_user_id(user) == str(admin_user_id)
 
 
 def resolve_usage_period_anchor(user: Mapping[str, Any] | None) -> datetime | None:
@@ -249,19 +302,29 @@ class TierChangePlan:
 
 
 def plan_tier_change(
-    current_tier: SubscriptionTier, target_tier: SubscriptionTier
+    current_tier: SubscriptionTier,
+    target_tier: SubscriptionTier,
+    currently_trialing: bool = False,
 ) -> TierChangePlan:
     """Return the execution plan for moving from ``current_tier`` to ``target_tier``.
 
     Same-tier "changes" are the caller's responsibility to reject before
     planning; this function only orders the tiers (free < pro < premium).
+
+    ``currently_trialing`` changes the usage-window rule: a tier change during
+    an active free trial NEVER resets the usage window — the trial allotment
+    and the new tier share one usage counter (usage up to the trial allotment
+    stays free within the trial window; usage past the allotment follows the
+    new tier's rules). Direction timing is unchanged: upgrades swap items
+    immediately, downgrades schedule at the boundary (the trial end, when
+    trialing).
     """
     if _TIER_ORDER[target_tier] > _TIER_ORDER[current_tier]:
         return TierChangePlan(
             direction="upgrade",
             swap_items_immediately=True,
             schedule_change_at_period_end=False,
-            reset_usage_period_anchor=True,
+            reset_usage_period_anchor=not currently_trialing,
         )
     return TierChangePlan(
         direction="downgrade",
@@ -269,6 +332,129 @@ def plan_tier_change(
         schedule_change_at_period_end=True,
         reset_usage_period_anchor=False,
     )
+
+
+class SubscribeAction(StrEnum):
+    """What POST /subscribe must do for the caller's current subscription state."""
+
+    START_CHECKOUT = "start_checkout"
+    CHANGE_TIER = "change_tier"
+    REACTIVATE = "reactivate"
+    REACTIVATE_AND_CHANGE_TIER = "reactivate_and_change_tier"
+    NO_CHANGE_REQUIRED = "no_change_required"
+
+
+_LIVE_SUBSCRIPTION_STATUSES = ("active", "trialing", "past_due")
+
+
+def plan_subscribe_action(
+    current_status: str | None,
+    current_tier: SubscriptionTier,
+    requested_tier: SubscriptionTier,
+    cancel_at_period_end: bool,
+    has_pending_downgrade_schedule: bool,
+) -> SubscribeAction:
+    """Decide what POST /subscribe does — the single subscription entry point.
+
+    Pure decision logic (unit-testable without Stripe):
+
+    * No live subscription (``current_status`` outside active/trialing/
+      past_due, including ``None`` and fully canceled) → start a Checkout
+      session for the requested tier.
+    * Live subscription with a pending period-end cancellation or a scheduled
+      downgrade → reactivate (undo the pending change); when the requested
+      tier also differs from the current tier, follow the reactivation with a
+      tier change in the same call.
+    * Live subscription on a different tier → change tier (the logic formerly
+      exposed as POST /change_subscription_tier).
+    * Live subscription already on the requested tier with nothing pending →
+      nothing to do (the endpoint answers 200 with an explanatory message,
+      not an error).
+    """
+    if current_status not in _LIVE_SUBSCRIPTION_STATUSES:
+        return SubscribeAction.START_CHECKOUT
+    has_pending_change = cancel_at_period_end or has_pending_downgrade_schedule
+    if has_pending_change:
+        if requested_tier == current_tier:
+            return SubscribeAction.REACTIVATE
+        return SubscribeAction.REACTIVATE_AND_CHANGE_TIER
+    if requested_tier == current_tier:
+        return SubscribeAction.NO_CHANGE_REQUIRED
+    return SubscribeAction.CHANGE_TIER
+
+
+@dataclass(frozen=True)
+class TrialContext:
+    """An account's free-trial grant, written when the trial subscription is created.
+
+    ``trial_tier`` is the tier whose allotments the trial granted (pro for the
+    signup trial); ``trial_end`` is when the trial window closes. The context
+    survives tier changes during the trial — the whole point is that changing
+    tiers must not forfeit (or double) the trial allotment.
+    """
+
+    trial_tier: SubscriptionTier
+    trial_end: datetime
+
+
+def resolve_trial_context(user: Mapping[str, Any] | None) -> TrialContext | None:
+    """Parse ``app_metadata.trial_context`` defensively; ``None`` when absent/corrupt.
+
+    The shape written at trial creation is
+    ``{"tier": "pro", "trial_end": <epoch seconds>}``. Anonymous users never
+    have a trial context.
+    """
+    if not user:
+        return None
+    app_metadata = user.get("app_metadata") or {}
+    raw_trial_context = app_metadata.get("trial_context")
+    if not isinstance(raw_trial_context, Mapping):
+        return None
+    raw_trial_end = raw_trial_context.get("trial_end")
+    try:
+        trial_end = datetime.fromtimestamp(int(raw_trial_end), tz=UTC)
+    except (TypeError, ValueError, OSError):
+        return None
+    return TrialContext(
+        trial_tier=tier_from_value(raw_trial_context.get("tier")),
+        trial_end=trial_end,
+    )
+
+
+def resolve_effective_monthly_allotment(
+    tier: SubscriptionTier,
+    meter: UsageMeter,
+    trial_context: TrialContext | None,
+    now: datetime | None = None,
+) -> MeterAllotment | None:
+    """Return the allotment governing ``meter`` for a user, trial-aware.
+
+    Outside a trial window this is exactly ``tier_allotment_for_meter``.
+    Inside the trial window (``now < trial_end``), the user keeps the trial
+    tier's allotment alongside the current tier's — whichever is larger per
+    meter — because changing tiers during a trial retains the trial allotment
+    on one shared usage counter:
+
+    * pro-trial → premium: premium's larger allotments win where premium
+      grants more; the trial allotment still guarantees the floor.
+    * pro-trial → free: the pro trial allotments (messaging AND document
+      uploads) stay granted until the trial ends, then plain free-tier
+      allotments apply.
+    """
+    current_allotment = tier_allotment_for_meter(tier, meter)
+    if trial_context is None:
+        return current_allotment
+    now = now or datetime.now(UTC)
+    if now >= trial_context.trial_end:
+        return current_allotment
+    trial_allotment = tier_allotment_for_meter(trial_context.trial_tier, meter)
+    if trial_allotment is None:
+        return current_allotment
+    if current_allotment is None:
+        return trial_allotment
+    if trial_allotment.monthly_allotment > current_allotment.monthly_allotment:
+        return trial_allotment
+    return current_allotment
 
 
 def customer_has_payment_method(

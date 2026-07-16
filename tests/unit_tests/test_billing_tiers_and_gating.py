@@ -27,6 +27,7 @@ from src.anubis.utils.billing.gating import (
     resolve_tier,
     resolve_trial_context,
     resolve_use_adapter_inference,
+    subscription_has_pending_downgrade_schedule,
     user_has_capability,
 )
 from src.anubis.utils.billing.metering import (
@@ -523,6 +524,39 @@ class TestPlanSubscribeAction:
                 has_pending_downgrade_schedule=False,
             )
             is SubscribeAction.REACTIVATE_AND_CHANGE_TIER
+        )
+
+
+class TestSubscriptionHasPendingDowngradeSchedule:
+    def test_none_subscription(self) -> None:
+        assert subscription_has_pending_downgrade_schedule(None) is False
+
+    def test_absent_schedule_key(self) -> None:
+        assert subscription_has_pending_downgrade_schedule({"id": "sub_1"}) is False
+
+    def test_null_schedule(self) -> None:
+        assert (
+            subscription_has_pending_downgrade_schedule({"schedule": None}) is False
+        )
+
+    def test_string_schedule_id(self) -> None:
+        assert (
+            subscription_has_pending_downgrade_schedule({"schedule": "sub_sched_1"})
+            is True
+        )
+
+    def test_expanded_schedule_dict(self) -> None:
+        assert (
+            subscription_has_pending_downgrade_schedule(
+                {"schedule": {"id": "sub_sched_1", "status": "active"}}
+            )
+            is True
+        )
+
+    def test_expanded_schedule_dict_without_id(self) -> None:
+        assert (
+            subscription_has_pending_downgrade_schedule({"schedule": {"status": "active"}})
+            is False
         )
 
 

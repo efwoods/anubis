@@ -27,6 +27,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -63,7 +64,9 @@ from src.anubis.utils.billing import (
     TokenEstimationError,
     billable_tokens_from_metadata,
     count_words,
+    SubscribeAction,
     customer_has_payment_method,
+    ensure_anonymous_billing_customers_table,
     ensure_api_metrics_table,
     TokenEstimateBreakdown,
     estimate_media_item_tokens,
@@ -78,6 +81,7 @@ from src.anubis.utils.billing import (
     is_admin_metering_bypass,
     load_stripe_billing_config,
     persist_api_metrics_row,
+    plan_subscribe_action,
     plan_tier_change,
     report_meter_event,
     resolve_metering_user_id,
@@ -88,6 +92,7 @@ from src.anubis.utils.billing import (
     resolve_usage_period_end,
     resolve_usage_period_start,
     resolve_use_adapter_inference,
+    subscription_has_pending_downgrade_schedule,
     tier_allotment_for_meter,
     tier_from_value,
     token_rate_limit_retry_after_seconds,
@@ -1111,6 +1116,7 @@ async def lifespan(app: FastAPI):
     # Ensure the api_metrics table exists and cache the parsed Stripe billing config
     # (meter + tier price ids) so metering and subscription endpoints can use them.
     await ensure_api_metrics_table(app.state.pool)
+    await ensure_anonymous_billing_customers_table(app.state.pool)
     try:
         app.state.stripe_billing_config = load_stripe_billing_config(
             app.state.context.stripe_billing_config_json
@@ -1235,25 +1241,221 @@ def _checkout_line_items_for_tier(
     return line_items
 
 
-from fastapi import Query
-from enum import StrEnum
+_LIVE_SUBSCRIPTION_STATUSES = ("active", "trialing", "past_due")
 
-@app.get("/subscribe")
+
+def _reactivate_subscription_for_user(stripe_client, subscription: dict) -> None:
+    """Undo a pending period-end cancellation or scheduled downgrade.
+
+    The caller has already retrieved a live subscription; this only releases any
+    pending schedule and clears ``cancel_at_period_end``. Stripe errors become
+    HTTP 502.
+    """
+    subscription_id = subscription.get("id")
+    try:
+        _release_pending_subscription_schedule(stripe_client, subscription)
+        stripe_client.Subscription.modify(subscription_id, cancel_at_period_end=False)
+    except HTTPException:
+        raise
+    except Exception as reactivate_error:
+        logger.error(
+            "Could not reactivate subscription %s: %s",
+            subscription_id,
+            reactivate_error,
+        )
+        raise HTTPException(
+            status_code=502, detail="Could not reactivate the subscription."
+        )
+
+
+async def _change_subscription_tier_for_user(
+    request: Request,
+    current_user: dict,
+    requested_tier: SubscriptionTier,
+    currently_trialing: bool,
+    pay_per_use: bool | None = None,
+) -> dict:
+    """Switch an existing subscription to a different tier via the Subscription API.
+
+    The Stripe customer portal cannot switch plans that contain metered prices, so
+    tier changes go through POST /subscribe. The direction decides the timing, per
+    the retained/cleared usage rules (``plan_tier_change``):
+
+    * **Upgrades** take effect immediately — every subscription item's price is
+      replaced with the target tier's prices (base + metered) in one prorated
+      update. Outside a trial the local usage window restarts so the new tier
+      begins with a fresh allotment; while trialing the usage-period anchor is
+      left alone so trial free-usage is retained.
+    * **Downgrades** take effect at the period end via a Subscription Schedule —
+      the user already paid for the higher tier through the period, so billing
+      and allotment keep the higher tier until the boundary ("unused allotment
+      continues"). Downgrading to free cancels the subscription at period end.
+
+    ``pay_per_use`` optionally sets the overage flag in the same call (same
+    validation as POST /set_pay_per_use). Same-tier requests are the caller's
+    responsibility (``plan_subscribe_action`` routes them away first).
+    """
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    if billing_config is None:
+        raise HTTPException(
+            detail="Billing is not configured; cannot change tier.", status_code=503
+        )
+
+    stripe_client = request.app.state.stripe
+    status = await check_subscription_status(request=request, current_user=current_user)
+    subscription_id = status.get("subscription_id")
+    if not subscription_id:
+        raise HTTPException(
+            detail="No active subscription to change. Use POST /subscribe first.",
+            status_code=404,
+        )
+    current_tier = tier_from_value(status.get("tier"))
+    tier_change_plan = plan_tier_change(
+        current_tier, requested_tier, currently_trialing=currently_trialing
+    )
+
+    if requested_tier == SubscriptionTier.FREE:
+        # Downgrade to free = cancellation at period end; the
+        # customer.subscription.deleted webhook pins the tier to free at the
+        # boundary, so the paid allotment continues until then.
+        try:
+            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+            _release_pending_subscription_schedule(stripe_client, subscription)
+            stripe_client.Subscription.modify(
+                subscription_id, cancel_at_period_end=True
+            )
+        except Exception as cancel_error:
+            logger.error("Could not schedule downgrade to free: %s", cancel_error)
+            raise HTTPException(detail="Could not change tier.", status_code=502)
+        if pay_per_use is not None:
+            await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+        return {
+            "message": "Subscription will end at the period boundary; you will drop to the free tier."
+        }
+
+    try:
+        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        _release_pending_subscription_schedule(stripe_client, subscription)
+        existing_items = subscription.get("items", {}).get("data", [])
+        target_price_ids = billing_config.identifiers_for_tier(
+            requested_tier
+        ).all_price_ids()
+
+        if tier_change_plan.schedule_change_at_period_end:
+            # Downgrade: keep the paid-for tier (billing AND allotment) until the
+            # period boundary, then switch. Phase one restates the current items
+            # through the period end; phase two runs the target tier for one
+            # period and then releases, leaving the subscription running on the
+            # target tier's items.
+            schedule = stripe_client.SubscriptionSchedule.create(
+                from_subscription=subscription_id
+            ).to_dict()
+            current_phase = (schedule.get("phases") or [{}])[0]
+            _, current_period_end = _subscription_period_bounds(subscription)
+            stripe_client.SubscriptionSchedule.modify(
+                schedule["id"],
+                end_behavior="release",
+                phases=[
+                    {
+                        "items": [
+                            {"price": (item.get("price") or {}).get("id")}
+                            for item in existing_items
+                        ],
+                        "start_date": current_phase.get("start_date"),
+                        "end_date": current_period_end
+                        or current_phase.get("end_date"),
+                    },
+                    {
+                        "items": [
+                            {"price": target_price_id}
+                            for target_price_id in target_price_ids
+                        ],
+                        "iterations": 1,
+                    },
+                ],
+            )
+        else:
+            # Upgrade: immediate switch. Stripe forbids changing a subscription
+            # item between licensed and metered usage types, so the safe universal
+            # move is: delete every existing item and add the target tier's prices
+            # in the same atomic modify call. Tier price ids never overlap across
+            # tiers (per-tier lookup keys), so a delete+add of the same price
+            # cannot occur; the same-tier case is rejected by the planner above.
+            #
+            # clear_usage applies only to classic-billing-mode subscriptions with
+            # legacy usage-record metered items; flexible-mode subscriptions (the
+            # default for newly created ones) reject the parameter, and
+            # Billing-Meter usage lives on the meter rather than the item, so
+            # nothing needs clearing there.
+            billing_mode_type = (subscription.get("billing_mode") or {}).get("type")
+            supports_clear_usage = billing_mode_type != "flexible"
+            items_payload: list[dict] = []
+            for existing_item in existing_items:
+                deletion: dict = {"id": existing_item["id"], "deleted": True}
+                usage_type = (
+                    (existing_item.get("price") or {}).get("recurring") or {}
+                ).get("usage_type")
+                if usage_type == "metered" and supports_clear_usage:
+                    deletion["clear_usage"] = True
+                items_payload.append(deletion)
+            for target_price_id in target_price_ids:
+                items_payload.append({"price": target_price_id})
+
+            stripe_client.Subscription.modify(
+                subscription_id,
+                items=items_payload,
+                proration_behavior="always_invoice",
+            )
+    except Exception as change_error:
+        logger.error("Could not change subscription tier: %s", change_error)
+        raise HTTPException(detail="Could not change tier.", status_code=502)
+
+    if tier_change_plan.reset_usage_period_anchor:
+        # Upgrade clears local usage: the new tier starts with a fresh allotment.
+        await _write_usage_period_anchor(request, current_user)
+
+    if pay_per_use is not None:
+        await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+
+    if tier_change_plan.schedule_change_at_period_end:
+        return {
+            "message": (
+                f"Subscription will switch to the {requested_tier.value} tier at the "
+                "period boundary; your current allotment continues until then."
+            )
+        }
+    return {"message": f"Subscription changed to the {requested_tier.value} tier."}
+
+
+@app.post("/subscribe")
 async def subscribe(
     request: Request,
-    tier: SubscriptionTier = Query(default=SubscriptionTier.PRO, description="Chosen subscription tier."),
+    tier: SubscriptionTier = Query(
+        default=SubscriptionTier.PRO, description="Chosen subscription tier."
+    ),
+    pay_per_use: Optional[bool] = Query(
+        default=None,
+        description="Optional pay-per-use flag applied when the action does not start checkout.",
+    ),
     current_user: dict = Depends(get_current_user),
 ):
-    """Create a Stripe Checkout session for a subscription tier.
+    """Single subscription entry point: checkout, tier change, or reactivate.
 
-    Replaces the single legacy payment link: a subscription now bundles the tier's
-    flat base price with its metered (allotment + overage) prices, so a customer can
-    pick a tier and the metered billing is wired from the first invoice. The free
-    tier is also subscribable: a $0-base subscription that always collects a payment
-    method, existing solely as the billing vehicle for pay-per-use overage past the
-    free allotment (every account is on the free tier without one; a free user who
-    never enables pay-per-use has no reason to check out). Anonymous users can never
-    reach this endpoint — it requires a verified authenticated user.
+    Dispatches via ``plan_subscribe_action``:
+
+    * **start_checkout** — no live subscription; create a Stripe Checkout session
+      for the requested tier (base + metered prices). The free tier always
+      collects a payment method (pay-per-use vehicle).
+    * **no_change_required** — already on the requested tier with nothing pending;
+      subscription and trial untouched.
+    * **reactivate** — undo pending period-end cancellation or scheduled downgrade.
+    * **change_tier** — switch tiers (upgrades immediate; downgrades at period end).
+      While trialing, the usage-period anchor is not rewritten so trial free-usage
+      is retained.
+    * **reactivate_and_change_tier** — reactivate then change tier in one call.
+
+    Cancellation for end users goes through GET /manage_subscription (billing
+    portal). Anonymous users can never reach this endpoint.
     """
     verified_email = current_user.get("email_verified", None)
     if not verified_email:
@@ -1261,7 +1463,9 @@ async def subscribe(
             detail="Please verify your email before subscribing.", status_code=401
         )
 
-    requested_tier = tier_from_value_or_400(tier.value if isinstance(tier, SubscriptionTier) else tier)
+    requested_tier = tier_from_value_or_400(
+        tier.value if isinstance(tier, SubscriptionTier) else tier
+    )
 
     billing_config = getattr(request.app.state, "stripe_billing_config", None)
     email = current_user.get("email")
@@ -1271,30 +1475,93 @@ async def subscribe(
             f"{app.state.context.stripe_payment_url}"
             f"?locked_prefilled_email={email}"
         )
-        return {"url": redirect_url, "message": "Follow this link to subscribe."}
+        return {
+            "action": "start_checkout",
+            "url": redirect_url,
+            "message": "Follow this link to subscribe.",
+        }
 
     stripe_client = request.app.state.stripe
-    customer_id = resolve_stripe_customer_id(current_user)
-    tier_definition = TIER_DEFINITIONS[requested_tier]
-
-    # A customer with a live subscription must switch tiers rather than start a
-    # second overlapping subscription through Checkout.
-    existing_status = await check_subscription_status(
+    status = await check_subscription_status(
         request=request, current_user=current_user
     )
-    if existing_status.get("subscription_id") and existing_status.get("status") in (
-        "active",
-        "trialing",
-        "past_due",
-    ):
-        raise HTTPException(
-            detail=(
-                "You already have a subscription. Use POST /change_subscription_tier "
-                "to switch tiers."
-            ),
-            status_code=409,
+    current_status = status.get("status")
+    current_tier = tier_from_value(status.get("tier"))
+    cancel_at_period_end = False
+    has_pending_downgrade_schedule = False
+    subscription: dict | None = None
+    subscription_id = status.get("subscription_id")
+    if subscription_id and current_status in _LIVE_SUBSCRIPTION_STATUSES:
+        try:
+            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        except Exception as retrieve_error:
+            logger.error(
+                "Could not retrieve subscription %s: %s",
+                subscription_id,
+                retrieve_error,
+            )
+            raise HTTPException(
+                detail="Could not read the current subscription. Please try again.",
+                status_code=502,
+            )
+        cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
+        has_pending_downgrade_schedule = subscription_has_pending_downgrade_schedule(
+            subscription
         )
 
+    action = plan_subscribe_action(
+        current_status,
+        current_tier,
+        requested_tier,
+        cancel_at_period_end,
+        has_pending_downgrade_schedule,
+    )
+
+    if action is SubscribeAction.NO_CHANGE_REQUIRED:
+        if pay_per_use is not None:
+            await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+        return {
+            "action": "no_change_required",
+            "message": f"Already subscribed to the {requested_tier.value} tier.",
+            "subscription_status": status,
+        }
+
+    if action is SubscribeAction.REACTIVATE:
+        assert subscription is not None
+        _reactivate_subscription_for_user(stripe_client, subscription)
+        return {
+            "action": "reactivate",
+            "message": "Subscription reactivated.",
+            "cancel_at_period_end": False,
+            "subscription_status": status,
+        }
+
+    currently_trialing = current_status == "trialing"
+    if action is SubscribeAction.CHANGE_TIER:
+        result = await _change_subscription_tier_for_user(
+            request,
+            current_user,
+            requested_tier,
+            currently_trialing=currently_trialing,
+            pay_per_use=pay_per_use,
+        )
+        return {"action": "change_tier", **result}
+
+    if action is SubscribeAction.REACTIVATE_AND_CHANGE_TIER:
+        assert subscription is not None
+        _reactivate_subscription_for_user(stripe_client, subscription)
+        result = await _change_subscription_tier_for_user(
+            request,
+            current_user,
+            requested_tier,
+            currently_trialing=currently_trialing,
+            pay_per_use=pay_per_use,
+        )
+        return {"action": "reactivate_and_change_tier", **result}
+
+    # START_CHECKOUT
+    customer_id = resolve_stripe_customer_id(current_user)
+    tier_definition = TIER_DEFINITIONS[requested_tier]
     subscription_data: dict = {}
     if tier_definition.trial_period_days > 0:
         subscription_data["trial_period_days"] = tier_definition.trial_period_days
@@ -1337,7 +1604,11 @@ async def subscribe(
         raise HTTPException(
             detail="Could not start checkout. Please try again.", status_code=502
         )
-    return {"url": session["url"], "message": "Follow this link to subscribe."}
+    return {
+        "action": "start_checkout",
+        "url": session["url"],
+        "message": "Follow this link to subscribe.",
+    }
 
 
 def _subscription_period_bounds(subscription: dict) -> tuple[int | None, int | None]:
@@ -1426,7 +1697,7 @@ async def _apply_pay_per_use_setting(
                 status_code=402,
                 detail=(
                     "Pay-per-use requires a payment method on file. Subscribe first "
-                    "(GET /subscribe?tier=free adds a card without a paid plan)."
+                    "(POST /subscribe?tier=free adds a card without a paid plan)."
                 ),
             )
         try:
@@ -1486,167 +1757,6 @@ async def set_pay_per_use(
     return {"pay_per_use_enabled": enabled}
 
 
-
-async def change_subscription_tier(
-    request: Request,
-    tier: str = Body(..., embed=True),
-    pay_per_use: bool | None = Body(default=None, embed=True),
-    current_user: dict = Depends(get_current_user),
-):
-    """Switch an existing subscription to a different tier via the Subscription API.
-
-    The Stripe customer portal cannot switch plans that contain metered prices, so
-    tier changes go through this endpoint. The direction decides the timing, per
-    the retained/cleared usage rules (``plan_tier_change``):
-
-    * **Upgrades** take effect immediately — every subscription item's price is
-      replaced with the target tier's prices (base + metered) in one prorated
-      update, and the local usage window restarts so the new tier begins with a
-      fresh allotment.
-    * **Downgrades** take effect at the period end via a Subscription Schedule —
-      the user already paid for the higher tier through the period, so billing
-      and allotment keep the higher tier until the boundary ("unused allotment
-      continues"). Downgrading to free cancels the subscription at period end.
-
-    ``pay_per_use`` optionally sets the overage flag in the same call (same
-    validation as POST /set_pay_per_use).
-    """
-    requested_tier = tier_from_value_or_400(tier)
-    billing_config = getattr(request.app.state, "stripe_billing_config", None)
-    if billing_config is None:
-        raise HTTPException(
-            detail="Billing is not configured; cannot change tier.", status_code=503
-        )
-
-    stripe_client = request.app.state.stripe
-    status = await check_subscription_status(request=request, current_user=current_user)
-    subscription_id = status.get("subscription_id")
-    if not subscription_id:
-        raise HTTPException(
-            detail="No active subscription to change. Use /subscribe first.",
-            status_code=404,
-        )
-    if status.get("tier") == requested_tier.value:
-        raise HTTPException(
-            detail=f"You are already on the {requested_tier.value} tier.",
-            status_code=400,
-        )
-    current_tier = tier_from_value(status.get("tier"))
-    tier_change_plan = plan_tier_change(current_tier, requested_tier)
-
-    if requested_tier == SubscriptionTier.FREE:
-        # Downgrade to free = cancellation at period end; the
-        # customer.subscription.deleted webhook pins the tier to free at the
-        # boundary, so the paid allotment continues until then.
-        try:
-            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
-            _release_pending_subscription_schedule(stripe_client, subscription)
-            stripe_client.Subscription.modify(
-                subscription_id, cancel_at_period_end=True
-            )
-        except Exception as cancel_error:
-            logger.error("Could not schedule downgrade to free: %s", cancel_error)
-            raise HTTPException(detail="Could not change tier.", status_code=502)
-        if pay_per_use is not None:
-            await _apply_pay_per_use_setting(request, current_user, pay_per_use)
-        return {
-            "message": "Subscription will end at the period boundary; you will drop to the free tier."
-        }
-
-    try:
-        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
-        _release_pending_subscription_schedule(stripe_client, subscription)
-        existing_items = subscription.get("items", {}).get("data", [])
-        target_price_ids = billing_config.identifiers_for_tier(
-            requested_tier
-        ).all_price_ids()
-
-        if tier_change_plan.schedule_change_at_period_end:
-            # Downgrade: keep the paid-for tier (billing AND allotment) until the
-            # period boundary, then switch. Phase one restates the current items
-            # through the period end; phase two runs the target tier for one
-            # period and then releases, leaving the subscription running on the
-            # target tier's items.
-            schedule = stripe_client.SubscriptionSchedule.create(
-                from_subscription=subscription_id
-            ).to_dict()
-            current_phase = (schedule.get("phases") or [{}])[0]
-            _, current_period_end = _subscription_period_bounds(subscription)
-            stripe_client.SubscriptionSchedule.modify(
-                schedule["id"],
-                end_behavior="release",
-                phases=[
-                    {
-                        "items": [
-                            {"price": (item.get("price") or {}).get("id")}
-                            for item in existing_items
-                        ],
-                        "start_date": current_phase.get("start_date"),
-                        "end_date": current_period_end
-                        or current_phase.get("end_date"),
-                    },
-                    {
-                        "items": [
-                            {"price": target_price_id}
-                            for target_price_id in target_price_ids
-                        ],
-                        "iterations": 1,
-                    },
-                ],
-            )
-        else:
-            # Upgrade: immediate switch. Stripe forbids changing a subscription
-            # item between licensed and metered usage types, so the safe universal
-            # move is: delete every existing item and add the target tier's prices
-            # in the same atomic modify call. Tier price ids never overlap across
-            # tiers (per-tier lookup keys), so a delete+add of the same price
-            # cannot occur; the same-tier case is rejected above.
-            #
-            # clear_usage applies only to classic-billing-mode subscriptions with
-            # legacy usage-record metered items; flexible-mode subscriptions (the
-            # default for newly created ones) reject the parameter, and
-            # Billing-Meter usage lives on the meter rather than the item, so
-            # nothing needs clearing there.
-            billing_mode_type = (subscription.get("billing_mode") or {}).get("type")
-            supports_clear_usage = billing_mode_type != "flexible"
-            items_payload: list[dict] = []
-            for existing_item in existing_items:
-                deletion: dict = {"id": existing_item["id"], "deleted": True}
-                usage_type = (
-                    (existing_item.get("price") or {}).get("recurring") or {}
-                ).get("usage_type")
-                if usage_type == "metered" and supports_clear_usage:
-                    deletion["clear_usage"] = True
-                items_payload.append(deletion)
-            for target_price_id in target_price_ids:
-                items_payload.append({"price": target_price_id})
-
-            stripe_client.Subscription.modify(
-                subscription_id,
-                items=items_payload,
-                proration_behavior="always_invoice",
-            )
-    except Exception as change_error:
-        logger.error("Could not change subscription tier: %s", change_error)
-        raise HTTPException(detail="Could not change tier.", status_code=502)
-
-    if tier_change_plan.reset_usage_period_anchor:
-        # Upgrade clears local usage: the new tier starts with a fresh allotment.
-        await _write_usage_period_anchor(request, current_user)
-
-    if pay_per_use is not None:
-        await _apply_pay_per_use_setting(request, current_user, pay_per_use)
-
-    if tier_change_plan.schedule_change_at_period_end:
-        return {
-            "message": (
-                f"Subscription will switch to the {requested_tier.value} tier at the "
-                "period boundary; your current allotment continues until then."
-            )
-        }
-    return {"message": f"Subscription changed to the {requested_tier.value} tier."}
-
-
 @app.get("/manage_subscription")
 async def manage_subscription(
     request: Request, current_user: dict = Depends(get_current_user)
@@ -1657,9 +1767,9 @@ async def manage_subscription(
     the test and live Stripe environments (the static
     STRIPE_MANAGE_SUBSCRIPTION_URL login page remains only as a degraded-mode
     fallback when billing objects are not provisioned). The portal covers
-    invoices, payment methods, and billing information; tier switching stays on
-    POST /change_subscription_tier because the portal cannot switch plans that
-    contain metered prices.
+    invoices, payment methods, cancellation, and billing information; tier
+    switching stays on POST /subscribe because the portal cannot switch plans
+    that contain metered prices.
     """
     billing_config = getattr(request.app.state, "stripe_billing_config", None)
     if billing_config is None:
@@ -1678,7 +1788,7 @@ async def manage_subscription(
     if not customer_id:
         raise HTTPException(
             status_code=404,
-            detail="No billing account yet. Use GET /subscribe to create one.",
+            detail="No billing account yet. Use POST /subscribe to create one.",
         )
 
     portal_kwargs: dict = {
@@ -1699,86 +1809,6 @@ async def manage_subscription(
         "url": session["url"],
         "message": "Follow this link to manage your subscription.",
     }
-
-
-@app.post("/cancel_subscription")
-async def cancel_subscription(
-    request: Request, current_user: dict = Depends(get_current_user)
-):
-    """Cancel the subscription at the period end via the Subscription API.
-
-    The user keeps the paid tier (and its allotment) through the period they
-    already paid for; the customer.subscription.deleted webhook pins the tier to
-    free at the boundary. A pending scheduled downgrade is released first. Undo
-    with POST /reactivate_subscription before the period ends.
-    """
-    stripe_client = request.app.state.stripe
-    status = await check_subscription_status(request=request, current_user=current_user)
-    subscription_id = status.get("subscription_id")
-    if not subscription_id:
-        raise HTTPException(
-            status_code=404, detail="No subscription to cancel."
-        )
-    try:
-        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
-        if subscription.get("status") == "canceled":
-            raise HTTPException(
-                status_code=409,
-                detail="The subscription is already canceled. Use GET /subscribe to start a new one.",
-            )
-        _release_pending_subscription_schedule(stripe_client, subscription)
-        updated_subscription = stripe_client.Subscription.modify(
-            subscription_id, cancel_at_period_end=True
-        ).to_dict()
-    except HTTPException:
-        raise
-    except Exception as cancel_error:
-        logger.error("Could not cancel subscription %s: %s", subscription_id, cancel_error)
-        raise HTTPException(status_code=502, detail="Could not cancel the subscription.")
-    _, current_period_end = _subscription_period_bounds(updated_subscription)
-    return {
-        "message": "Subscription will cancel at the period end.",
-        "cancel_at_period_end": True,
-        "current_period_end": current_period_end,
-    }
-
-
-@app.post("/reactivate_subscription")
-async def reactivate_subscription(
-    request: Request, current_user: dict = Depends(get_current_user)
-):
-    """Undo a pending period-end cancellation (or scheduled downgrade).
-
-    Only works while the subscription is still running; once fully canceled the
-    user must start a new subscription through GET /subscribe.
-    """
-    stripe_client = request.app.state.stripe
-    status = await check_subscription_status(request=request, current_user=current_user)
-    subscription_id = status.get("subscription_id")
-    if not subscription_id:
-        raise HTTPException(status_code=404, detail="No subscription to reactivate.")
-    try:
-        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
-        if subscription.get("status") == "canceled":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "The subscription is fully canceled and cannot be reactivated. "
-                    "Use GET /subscribe to start a new one."
-                ),
-            )
-        _release_pending_subscription_schedule(stripe_client, subscription)
-        stripe_client.Subscription.modify(subscription_id, cancel_at_period_end=False)
-    except HTTPException:
-        raise
-    except Exception as reactivate_error:
-        logger.error(
-            "Could not reactivate subscription %s: %s", subscription_id, reactivate_error
-        )
-        raise HTTPException(
-            status_code=502, detail="Could not reactivate the subscription."
-        )
-    return {"message": "Subscription reactivated.", "cancel_at_period_end": False}
 
 
 def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Optional[str]:

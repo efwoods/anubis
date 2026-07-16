@@ -383,6 +383,25 @@ def plan_subscribe_action(
     return SubscribeAction.CHANGE_TIER
 
 
+def subscription_has_pending_downgrade_schedule(
+    subscription: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether a Stripe subscription has a pending schedule attached.
+
+    Stripe may return ``schedule`` as a string id, an expanded dict, or omit /
+    null it when none is attached. Any truthy value means a pending change
+    (typically a scheduled downgrade) that POST /subscribe should reactivate.
+    """
+    if not subscription:
+        return False
+    schedule = subscription.get("schedule")
+    if not schedule:
+        return False
+    if isinstance(schedule, dict):
+        return bool(schedule.get("id"))
+    return True
+
+
 @dataclass(frozen=True)
 class TrialContext:
     """An account's free-trial grant, written when the trial subscription is created.

@@ -44,6 +44,10 @@ _ANONYMOUS_CUSTOMER_CACHE_MAX_ENTRIES = 4096
 _ANONYMOUS_CUSTOMER_CACHE_TTL_SECONDS = 3600.0
 _anonymous_customer_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
 
+# Once-per-process warnings for silent fail-open paths (avoid log spam).
+_warned_anonymous_billing_disabled = False
+_warned_anonymous_billing_config_missing = False
+
 
 def _cache_get(hashed_ip: str) -> str | None:
     cached_entry = _anonymous_customer_cache.get(hashed_ip)
@@ -94,14 +98,29 @@ async def resolve_or_create_anonymous_stripe_customer(
     ``None`` whenever anything is unavailable (fail-open): billing disabled,
     billing objects unprovisioned, or Stripe/database errors.
     """
+    global _warned_anonymous_billing_disabled, _warned_anonymous_billing_config_missing
+
     if not hashed_ip:
         return None
     context = GlobalContext()
     if str(context.anonymous_billing_enabled or "").upper() != "TRUE":
+        if not _warned_anonymous_billing_disabled:
+            logger.warning(
+                "Anonymous billing is disabled (ANONYMOUS_BILLING_ENABLED != TRUE); "
+                "anonymous usage will not be metered to Stripe."
+            )
+            _warned_anonymous_billing_disabled = True
         return None
     billing_config = getattr(request.app.state, "stripe_billing_config", None)
     stripe_client = getattr(request.app.state, "stripe", None)
     if billing_config is None or stripe_client is None:
+        if not _warned_anonymous_billing_config_missing:
+            logger.warning(
+                "Anonymous billing cannot run (stripe_billing_config or stripe "
+                "client missing on app.state); anonymous usage will not be metered "
+                "to Stripe."
+            )
+            _warned_anonymous_billing_config_missing = True
         return None
 
     cached_customer_id = _cache_get(hashed_ip)

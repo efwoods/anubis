@@ -29,6 +29,7 @@ SCENARIO_FILES = [
     "scenario_period_reset.py",
     "scenario_tier_changes.py",
     "scenario_trial_paths.py",
+    "scenario_delete_and_resignup.py",
 ]
 
 

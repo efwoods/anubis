@@ -59,6 +59,13 @@ beyond usage limit premium-tier (limit token usage unless pay-per-usage is enabl
     - adapter training
     - adapter inference
 
+account deletion (DELETE /delete_user) and re-signup with the same email:
+    - deletion cancels every live subscription at the period end (never billed for another period); the Stripe customer is kept with the neural_nexus_trial_used flag
+    - re-signup within the same pay period adopts the same subscription and clears the pending cancellation — no new invoice, no double charge
+    - re-signup during a running free trial keeps the original trial_end (trial reinstated, never restarted or extended)
+    - re-signup after the trial window or after the paid period lapsed enrolls the free tier; a paid tier is regained only through Checkout tier selection like a new user, with no second free trial
+    (see TEST_SITUATIONS.md "Account deletion and re-signup"; scripts/e2e_billing/scenario_delete_and_resignup.py)
+
 ----
 # to be built (and verify if already created)
 There needs to be rate limiting to prevent too many tokens being used per period that is set.

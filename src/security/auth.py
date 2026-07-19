@@ -226,10 +226,18 @@ async def _provision_stripe_customer_and_default_tier(
             if existing_customers:
                 customer = existing_customers[0]
                 # Reattach: refresh the Auth0 linkage on the reused customer
-                # (the previous account's id is preserved separately by
-                # delete_user as deleted_auth0_user_id).
+                # and clear the delete-time markers (an empty string deletes a
+                # Stripe metadata key) — the account is live again. The
+                # neural_nexus_trial_used flag is deliberately never touched:
+                # that flag is the trial-abuse system of record and must
+                # survive every delete-and-re-signup cycle.
                 stripe_client.Customer.modify(
-                    customer["id"], metadata={"auth0_user_id": user_id or ""}
+                    customer["id"],
+                    metadata={
+                        "auth0_user_id": user_id or "",
+                        "deleted_auth0_user_id": "",
+                        "account_deleted_at": "",
+                    },
                 )
         if customer is None:
             customer = stripe_client.Customer.create(
@@ -306,8 +314,12 @@ def create_free_tier_subscription(
     (every meter event lands on a real subscription for cost analysis) and for
     pay-per-use overage once the user adds a card. The $0 base invoice
     finalizes without a payment method. Used by: the post-verification
-    fallback when a trial cannot be granted, the trial-end webhook (trial
-    lapsed without a card), and anonymous per-hashed-IP metering customers.
+    enrollment when a trial cannot be granted (trial already used, or prior
+    subscription history) and anonymous per-hashed-IP metering customers.
+    After a trial lapses without a card the ``customer.subscription.deleted``
+    webhook only pins ``subscription_status`` to free/canceled in Auth0; the
+    free-tier subscription is created on the next enrollment path, not by the
+    webhook.
     Best-effort: returns ``None`` on failure (the account still gates as free
     from the default ``subscription_status``).
     """
@@ -348,20 +360,32 @@ async def ensure_initial_subscription_after_verification(
       with the 30-day free trial, created server-side without Checkout and
       without a card. ``trial_settings.end_behavior.missing_payment_method``
       is ``cancel`` (Stripe forbids "pause" on subscriptions with metered
-      prices); the ``customer.subscription.deleted`` webhook then auto-creates
-      the free-tier subscription when a trial lapses without a card.
+      prices); when a trial lapses without a card the
+      ``customer.subscription.deleted`` webhook pins the account to
+      free/canceled, and the free-tier billing vehicle is created here on the
+      next enrollment.
     * Trial abuse is denied by the Stripe customer record, which survives
       account deletion: a customer with ``metadata.neural_nexus_trial_used``
-      (or any prior subscription) enrolls straight into the FREE tier.
-    * A customer with a LIVE subscription (delete-and-re-signup during the
-      trial period) simply adopts that subscription — the free trial is
-      retained until the end of the original trial period, never restarted.
+      (or any prior subscription) enrolls straight into the FREE tier. A
+      returning user regains a paid tier only by choosing one through
+      Checkout (``POST /subscribe``), like any new user — no paid
+      subscription is ever auto-created for them.
+    * A customer with a LIVE subscription (delete-and-re-signup within the
+      same pay period) adopts that subscription: the pending period-end
+      cancellation written by ``delete_user`` is cleared so the subscription
+      keeps renewing, a free trial is retained until the end of the original
+      trial period (never restarted, never extended), and no second charge is
+      made for the already-paid period.
 
     Best-effort and idempotent: any Stripe failure logs and returns without
     writing the marker, so the next cache-miss request retries. Anonymous
     users never reach this function (no email verification for them).
     """
     from src.anubis.utils.billing.gating import resolve_stripe_customer_id
+    from src.anubis.utils.billing.subscription_lifecycle import (
+        clear_pending_cancellation,
+        subscription_period_bounds,
+    )
     from src.anubis.utils.billing.tiers import TIER_DEFINITIONS, SubscriptionTier
 
     app_metadata = user.get("app_metadata") or {}
@@ -409,9 +433,12 @@ async def ensure_initial_subscription_after_verification(
         trial_already_used = bool(
             (customer.get("metadata") or {}).get("neural_nexus_trial_used")
         )
+        # limit=10 (matching delete_user): limit=1 returns only the newest
+        # subscription, which can hide a live subscription behind a newer
+        # canceled/incomplete record.
         prior_subscriptions = (
             stripe_client.Subscription.list(
-                customer=customer_id, status="all", limit=1
+                customer=customer_id, status="all", limit=10
             )
             .to_dict()
             .get("data", [])
@@ -436,8 +463,27 @@ async def ensure_initial_subscription_after_verification(
             # Delete-and-re-signup with the same email while the original
             # subscription (typically the trial) is still running: adopt the
             # running subscription — the free trial is retained until the end
-            # of the original trial period.
+            # of the original trial period, and the user is never charged a
+            # second time for the already-paid period.
             subscription = live_prior_subscription
+            if subscription.get("cancel_at_period_end") or subscription.get(
+                "schedule"
+            ):
+                # delete_user set cancel_at_period_end (or a downgrade schedule
+                # is pending); a reinstated subscription must keep renewing.
+                # Best-effort: on failure the subscription still ends at the
+                # period boundary and the account then gates as free.
+                try:
+                    clear_pending_cancellation(stripe_client, subscription)
+                    subscription["cancel_at_period_end"] = False
+                except Exception as reactivation_error:  # noqa: BLE001
+                    logger.error(
+                        "Could not clear the pending cancellation on adopted "
+                        "subscription %s for user %s: %s",
+                        subscription.get("id"),
+                        auth0_user_id,
+                        reactivation_error,
+                    )
             subscription_status_update = {
                 "status": subscription.get("status"),
                 "tier": _tier_from_subscription(stripe_client, subscription),
@@ -452,6 +498,18 @@ async def ensure_initial_subscription_after_verification(
                     "tier": subscription_status_update["tier"],
                     "trial_end": int(subscription["trial_end"]),
                 }
+            # The previous account's usage_period_anchor died with the deleted
+            # Auth0 record; without an anchor the local usage window falls back
+            # to the calendar month, misaligned with the Stripe billing period.
+            # Rebuild the anchor from the adopted subscription's real period
+            # start. Known limitation: api_metrics usage rows key on the Auth0
+            # user id, so locally counted usage restarts for the new account
+            # even though Stripe billing continues the same period.
+            current_period_start, _ = subscription_period_bounds(subscription)
+            if current_period_start:
+                app_metadata_update["usage_period_anchor"] = datetime.fromtimestamp(
+                    current_period_start, tz=timezone.utc
+                ).isoformat()
         elif trial_already_used or prior_subscriptions:
             # Trial denied (used before, or some prior subscription history):
             # enroll straight into the free tier.
@@ -478,7 +536,7 @@ async def ensure_initial_subscription_after_verification(
                 ),
                 trial_period_days=pro_definition.trial_period_days,
                 # Stripe forbids "pause" with metered prices; "cancel" plus
-                # the deleted-webhook's free-tier auto-enrollment achieves
+                # the deleted-webhook's free/canceled status pin achieves
                 # the trial-to-free product outcome.
                 trial_settings={
                     "end_behavior": {"missing_payment_method": "cancel"}
@@ -532,12 +590,20 @@ async def signup_user(
             "email": email,
             "password": password,
             "connection": CONNECTION,
+            # The verification email is sent EXPLICITLY below via the
+            # Management API verification-email job so the send is
+            # deterministic and observable; verify_email=False suppresses
+            # Auth0's implicit creation-time behavior (which depends on
+            # tenant template/provider settings and was observed not firing).
+            "verify_email": False,
             "app_metadata": {
                 "api_key": api_key_hash,
             },
         }
 
-        if name != "":
+        # Only send a real name: SignupRequest.name defaults to None, and
+        # Auth0 rejects an explicit null name with a payload-validation 400.
+        if name:
             payload["name"] = name
 
         headers = await _mgmt_headers(request)
@@ -560,9 +626,41 @@ async def signup_user(
             name=name if name else None,
         )
 
+        # Best-effort: a failed send must not lose the one-time API key —
+        # the user can request another email via /resend_verification_email
+        # (which accepts an unverified account).
+        try:
+            verification_result = await send_verification_email(
+                created_user_id, request=request
+            )
+            verification_message = verification_result.get(
+                "message", "A verification email has been sent."
+            )
+        except HTTPException as verification_error:
+            logger.error(
+                "Could not send the verification email to %s during signup: %s",
+                email,
+                verification_error.detail,
+            )
+            verification_message = (
+                f"The verification email could not be sent: "
+                f"{verification_error.detail}"
+            )
+        except Exception as verification_error:  # noqa: BLE001 - best-effort
+            logger.error(
+                "Could not send the verification email to %s during signup: %s",
+                email,
+                verification_error,
+            )
+            verification_message = (
+                "The verification email could not be sent; request another "
+                "one via /resend_verification_email."
+            )
+
         result = {
             "api_key": api_key,
             "message": "Save this key. This key is shown only once and used for every api request.",
+            "verification": verification_message,
         }
 
         return result
@@ -626,14 +724,60 @@ async def get_user(user_id: str, request: Request) -> dict:
 
 
 async def send_verification_email(user_id: str, request: Request) -> dict:
+    """Send the Auth0 verification email and report the DELIVERED/FAILED outcome.
+
+    The Management API verification-email endpoint is asynchronous: the
+    creation call only returns a job in ``pending`` status, which says nothing
+    about delivery. This helper polls the job briefly so a tenant-side send
+    failure (for example: no custom email provider configured — Auth0's
+    built-in provider silently fails for any address that is not a tenant
+    administrator) surfaces to the caller instead of masquerading as success.
+    """
+    headers = await _mgmt_headers(request=request)
     response = await request.app.state.httpx_client.post(
         f"{BASE_AUTH_URL}/api/v2/jobs/verification-email",
         json={"user_id": user_id},
-        headers=await _mgmt_headers(request=request),
+        headers=headers,
     )
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=response.json())
-    return response.json()  # returns a job object
+    job = response.json()
+    job_id = job.get("id")
+
+    job_status = job.get("status", "pending")
+    for poll_delay_seconds in (0.5, 1.0, 2.0):
+        if job_status != "pending" or not job_id:
+            break
+        await asyncio.sleep(poll_delay_seconds)
+        poll_response = await request.app.state.httpx_client.get(
+            f"{BASE_AUTH_URL}/api/v2/jobs/{job_id}",
+            headers=headers,
+        )
+        if poll_response.status_code >= 400:
+            break
+        job = poll_response.json()
+        job_status = job.get("status", job_status)
+
+    if job_status == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Auth0 accepted the verification email but the send FAILED. "
+                "This is a tenant configuration problem — most commonly no "
+                "custom email provider is configured (Auth0's built-in "
+                "provider only delivers to tenant administrators). Configure "
+                "one under Auth0 Dashboard → Branding → Email Provider."
+            ),
+        )
+    if job_status == "completed":
+        return {"message": "Verification email sent.", "status": job_status}
+    return {
+        "message": (
+            "Verification email accepted by Auth0 and still sending; "
+            "if nothing arrives, call /resend_verification_email."
+        ),
+        "status": job_status,
+    }
 
 
 # Token Verification
@@ -708,7 +852,18 @@ class UserDataReturn(UserDataCache):
 # ── Dependency: require valid token ────────────────────────────────────────
 
 
-async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
+async def get_user_with_api_key(
+    api_key: str, request: Request, require_verified_email: bool = True
+) -> dict | None:
+    """Resolve an Auth0 account from an API key (cached for verified users).
+
+    ``require_verified_email=False`` exists solely for
+    ``/resend_verification_email``: an unverified account must be able to
+    authenticate far enough to request another verification email. Every
+    other caller keeps the default and receives 401 until the email is
+    verified. Only verified users are cached or auto-enrolled into an
+    initial subscription.
+    """
     cache_key = _hash_key(api_key)
 
     async with _cache_lock:
@@ -737,10 +892,17 @@ async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
     user = users[0]
 
     if user["email_verified"] != True:
-        raise HTTPException(
-            detail="Email is not yet verified. Please verify email to continue.",
-            status_code=401,
-        )
+        if require_verified_email:
+            raise HTTPException(
+                detail="Email is not yet verified. Please verify email to continue.",
+                status_code=401,
+            )
+        # Unverified caller path (only /resend_verification_email): return the
+        # account without caching (the cache must only ever hold verified
+        # users) and without subscription auto-enrollment (enrollment is a
+        # post-verification step).
+        user.update({"API_KEY": api_key})
+        return user
 
     # First time a VERIFIED account is seen without a subscription: auto-enroll
     # into the pro free trial (or straight into the free tier when a trial was
@@ -777,6 +939,27 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
 
     user = await get_user_with_api_key(api_key, request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return user
+
+
+async def get_current_user_allow_unverified(
+    request: Request, api_key: str | None = Depends(api_key_scheme)
+) -> dict:
+    """Authenticate by API key WITHOUT requiring a verified email.
+
+    Used only by ``/resend_verification_email`` — an account that has not
+    verified the signup email yet must still be able to request another
+    verification email; every other endpoint uses ``get_current_user``.
+    """
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
+
+    user = await get_user_with_api_key(
+        api_key, request, require_verified_email=False
+    )
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -968,12 +1151,15 @@ async def get_current_user_id(
 
 @security_route.get("/resend_verification_email")
 async def resend_verification_email(
-    request: Request, current_user: dict = Depends(get_current_user)
+    request: Request,
+    current_user: dict = Depends(get_current_user_allow_unverified),
 ):
     # TODO: RATE LIMIT API CALL
+    # Depends on get_current_user_allow_unverified: the callers of this
+    # endpoint are exactly the accounts get_current_user rejects with
+    # "Email is not yet verified".
     # Auth0 Management-API user objects carry ``user_id`` (JWT payloads carry
     # ``sub``); the request INSTANCE must be forwarded, not the Request class.
-    logger.info("breakpoint")
     return await send_verification_email(
         current_user.get("user_id") or current_user.get("sub"), request=request
     )
@@ -1060,12 +1246,17 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         # The Stripe customer is deliberately KEPT (never deleted): the
         # customer record carries the trial-usage history
         # (metadata.neural_nexus_trial_used) that prevents a delete-and-
-        # re-signup from harvesting a fresh free trial. Signing up again with
-        # the same email reattaches this customer, so a free trial in
-        # progress is retained until the end of the trial period. Any live
-        # subscription is set to cancel at period end so a departed user is
-        # never billed for another period. Both writes are best-effort — a
-        # Stripe failure must not block account deletion.
+        # re-signup from harvesting a fresh free trial. Any live subscription
+        # is set to cancel at period end so a departed user is never billed
+        # for another period. Signing up again with the same email reattaches
+        # this customer: within the same pay period the subscription is
+        # adopted and the pending cancellation is cleared
+        # (ensure_initial_subscription_after_verification), so the
+        # subscription — including a free trial in progress — is reinstated
+        # without a second charge; after the period lapses the returning user
+        # enrolls free and re-selects a paid tier through Checkout like any
+        # new user. Both writes are best-effort — a Stripe failure must not
+        # block account deletion.
         from src.anubis.utils.billing.gating import resolve_stripe_customer_id
 
         customer_id = resolve_stripe_customer_id(current_user) or ""

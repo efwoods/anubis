@@ -64,7 +64,9 @@ from src.anubis.utils.billing import (
     TokenEstimationError,
     billable_tokens_from_metadata,
     count_words,
+    LIVE_SUBSCRIPTION_STATUSES,
     SubscribeAction,
+    clear_pending_cancellation,
     customer_has_payment_method,
     ensure_anonymous_billing_customers_table,
     ensure_api_metrics_table,
@@ -92,7 +94,10 @@ from src.anubis.utils.billing import (
     resolve_usage_period_end,
     resolve_usage_period_start,
     resolve_use_adapter_inference,
+    resolve_checkout_trial_period_days,
+    release_pending_subscription_schedule,
     subscription_has_pending_downgrade_schedule,
+    subscription_period_bounds,
     tier_allotment_for_meter,
     tier_from_value,
     token_rate_limit_retry_after_seconds,
@@ -1241,20 +1246,20 @@ def _checkout_line_items_for_tier(
     return line_items
 
 
-_LIVE_SUBSCRIPTION_STATUSES = ("active", "trialing", "past_due")
+_LIVE_SUBSCRIPTION_STATUSES = LIVE_SUBSCRIPTION_STATUSES
 
 
 def _reactivate_subscription_for_user(stripe_client, subscription: dict) -> None:
     """Undo a pending period-end cancellation or scheduled downgrade.
 
     The caller has already retrieved a live subscription; this only releases any
-    pending schedule and clears ``cancel_at_period_end``. Stripe errors become
-    HTTP 502.
+    pending schedule and clears ``cancel_at_period_end``
+    (``clear_pending_cancellation`` in the billing package). Stripe errors
+    become HTTP 502.
     """
     subscription_id = subscription.get("id")
     try:
-        _release_pending_subscription_schedule(stripe_client, subscription)
-        stripe_client.Subscription.modify(subscription_id, cancel_at_period_end=False)
+        clear_pending_cancellation(stripe_client, subscription)
     except HTTPException:
         raise
     except Exception as reactivate_error:
@@ -1370,7 +1375,9 @@ async def _change_subscription_tier_for_user(
                             {"price": target_price_id}
                             for target_price_id in target_price_ids
                         ],
-                        "iterations": 1,
+                        # Stripe flexible billing rejects legacy ``iterations``;
+                        # ``duration`` is the supported one-period phase shape.
+                        "duration": {"interval": "month", "interval_count": 1},
                     },
                 ],
             )
@@ -1563,8 +1570,14 @@ async def subscribe(
     customer_id = resolve_stripe_customer_id(current_user)
     tier_definition = TIER_DEFINITIONS[requested_tier]
     subscription_data: dict = {}
-    if tier_definition.trial_period_days > 0:
-        subscription_data["trial_period_days"] = tier_definition.trial_period_days
+    # One free trial per Stripe customer, ever — a returning user re-selecting
+    # a paid tier through Checkout pays from day one instead of harvesting a
+    # second trial (resolve_checkout_trial_period_days).
+    checkout_trial_period_days = resolve_checkout_trial_period_days(
+        stripe_client, customer_id, tier_definition.trial_period_days
+    )
+    if checkout_trial_period_days > 0:
+        subscription_data["trial_period_days"] = checkout_trial_period_days
         # Stripe forbids the legacy payment link's "pause" end behavior on
         # subscriptions containing metered prices; "cancel" achieves the same
         # product outcome — the customer.subscription.deleted webhook pins the
@@ -1611,48 +1624,11 @@ async def subscribe(
     }
 
 
-def _subscription_period_bounds(subscription: dict) -> tuple[int | None, int | None]:
-    """Return ``(current_period_start, current_period_end)`` epoch seconds.
-
-    Newer Stripe API versions (flexible billing mode) place the period bounds on
-    each subscription item rather than the subscription top level, so this reads
-    items-first with a top-level fallback.
-    """
-    items = (subscription.get("items") or {}).get("data") or []
-    first_item = items[0] if items and isinstance(items[0], dict) else {}
-    period_start = first_item.get("current_period_start") or subscription.get(
-        "current_period_start"
-    )
-    period_end = first_item.get("current_period_end") or subscription.get(
-        "current_period_end"
-    )
-    return (
-        int(period_start) if period_start else None,
-        int(period_end) if period_end else None,
-    )
-
-
-def _release_pending_subscription_schedule(stripe_client, subscription: dict) -> None:
-    """Release the subscription's pending schedule (a scheduled downgrade), if any.
-
-    A subscription attached to a schedule cannot have its items or cancellation
-    state modified directly, so every mutation path (tier change, cancel,
-    reactivate) releases the schedule first. Releasing keeps the subscription
-    running on its current items — the pending change is simply abandoned.
-    """
-    schedule_id = subscription.get("schedule")
-    if not schedule_id:
-        return
-    if isinstance(schedule_id, dict):
-        schedule_id = schedule_id.get("id")
-    try:
-        stripe_client.SubscriptionSchedule.release(schedule_id)
-    except Exception as release_error:  # noqa: BLE001 - surfaced by the follow-up modify
-        logger.error(
-            "Could not release subscription schedule %s: %s",
-            schedule_id,
-            release_error,
-        )
+# Moved to src/anubis/utils/billing/subscription_lifecycle.py so the auth layer
+# (delete-and-re-signup adoption) can share the same logic; the underscore
+# aliases keep the existing call sites in this module unchanged.
+_subscription_period_bounds = subscription_period_bounds
+_release_pending_subscription_schedule = release_pending_subscription_schedule
 
 
 async def _write_usage_period_anchor(request: Request, current_user: dict) -> None:
@@ -1742,7 +1718,7 @@ async def _apply_pay_per_use_setting(
 @app.post("/set_pay_per_use")
 async def set_pay_per_use(
     request: Request,
-    enabled: bool = Body(..., embed=True),
+    enabled: bool = True,
     current_user: dict = Depends(get_current_user),
 ):
     """Enable or disable billing overage past the monthly allotment (pay-per-use).
@@ -1849,6 +1825,15 @@ async def _handle_stripe_event(
                     subscription
                 )
                 cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
+                if status_value == "trialing" and customer_id:
+                    # A Checkout-granted trial must stamp the same one-trial-
+                    # per-customer flag the auto-enrollment path stamps, so a
+                    # later delete-and-re-signup can never harvest a second
+                    # trial through Checkout.
+                    stripe_client.Customer.modify(
+                        customer_id,
+                        metadata={"neural_nexus_trial_used": "true"},
+                    )
             except Exception as retrieve_error:
                 logger.error("Could not retrieve subscription: %s", retrieve_error)
         await update_user_subscription_status(
@@ -2861,6 +2846,7 @@ async def message_avatar(
     user_name = your_name
     user_description = your_description
     user_id = current_user["identities"][0]["user_id"]
+    assistant_id = assistant_id.strip()
     if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
         try:

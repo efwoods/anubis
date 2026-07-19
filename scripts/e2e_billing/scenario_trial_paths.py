@@ -5,9 +5,10 @@
 
 * Trial WITHOUT a payment method: ``trial_settings.end_behavior.
   missing_payment_method = "cancel"`` cancels the subscription at trial end.
-  In production the ``customer.subscription.deleted`` webhook then auto-creates
-  the $0 free-tier subscription (asserted here only when the API + the
-  ``stripe listen`` forwarder are running, because the webhook is the actor).
+  In production the ``customer.subscription.deleted`` webhook pins the account
+  to free/canceled in Auth0; no subscription is auto-created — the $0
+  free-tier billing vehicle is created on the next enrollment path
+  (``ensure_initial_subscription_after_verification``), never by the webhook.
 * Trial WITH a payment method: at trial end the subscription converts to a
   paying pro subscription (status ``active``).
 """
@@ -21,7 +22,6 @@ import stripe
 from harness import (
     ScenarioReporter,
     advance_test_clock,
-    api_base_url,
     attach_test_payment_method,
     configure_stripe_test_mode,
     create_customer_on_clock,
@@ -69,33 +69,23 @@ def run() -> int:
             expired.get("status") == "canceled",
             expired.get("status") or "no status",
         )
-        if api_base_url():
-            # The deleted-webhook auto-creates the free-tier subscription;
-            # give the forwarder a moment, then look for a fresh subscription.
-            time.sleep(5.0)
-            subscriptions_after = (
-                stripe.Subscription.list(
-                    customer=customer["id"], status="active", limit=3
-                )
-                .to_dict()
-                .get("data", [])
+        # Policy: no subscription is ever auto-created after a lapsed trial —
+        # the webhook only pins the account to free/canceled, and the $0
+        # free-tier vehicle is created on the user's next enrollment. Give any
+        # running webhook forwarder a moment, then assert nothing appeared.
+        time.sleep(5.0)
+        subscriptions_after = (
+            stripe.Subscription.list(
+                customer=customer["id"], status="active", limit=3
             )
-            reporter.check(
-                "webhook auto-created the free-tier subscription after the "
-                "card-less trial lapsed",
-                any(
-                    (s.get("metadata") or {}).get("neural_nexus_tier") == "free"
-                    for s in subscriptions_after
-                ),
-                f"{len(subscriptions_after)} active subscription(s)",
-            )
-        else:
-            reporter.skip(
-                "webhook free-tier auto-enrollment",
-                "E2E_API_BASE_URL not set (needs the API + stripe listen); "
-                "note the webhook must also resolve an auth0_user_id, so this "
-                "assertion needs a customer created through real signup",
-            )
+            .to_dict()
+            .get("data", [])
+        )
+        reporter.check(
+            "no subscription is auto-created after the card-less trial lapses",
+            not subscriptions_after,
+            f"{len(subscriptions_after)} active subscription(s)",
+        )
     finally:
         delete_test_clock(cardless_clock["id"])
 

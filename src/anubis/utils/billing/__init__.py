@@ -52,6 +52,13 @@ from src.anubis.utils.billing.gating import (
     resolve_use_adapter_inference,
     user_has_capability,
 )
+from src.anubis.utils.billing.subscription_lifecycle import (
+    LIVE_SUBSCRIPTION_STATUSES,
+    clear_pending_cancellation,
+    release_pending_subscription_schedule,
+    resolve_checkout_trial_period_days,
+    subscription_period_bounds,
+)
 from src.anubis.utils.billing.system_prompt_estimate_cache import (
     fetch_system_prompt_token_estimate,
     invalidate_system_prompt_token_estimate,
@@ -125,6 +132,11 @@ __all__ = [
     "resolve_usage_period_anchor",
     "resolve_use_adapter_inference",
     "user_has_capability",
+    "LIVE_SUBSCRIPTION_STATUSES",
+    "clear_pending_cancellation",
+    "release_pending_subscription_schedule",
+    "resolve_checkout_trial_period_days",
+    "subscription_period_bounds",
     "report_meter_event",
     "report_adapter_training_usage",
     "billable_tokens_from_metadata",

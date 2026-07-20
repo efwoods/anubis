@@ -14,9 +14,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.anubis.utils.billing.gating import (
+    TrialContext,
     customer_has_payment_method,
     exhausted_allotment_block_reason,
     plan_tier_change,
+    resolve_effective_monthly_allotment,
     resolve_pay_per_use_enabled,
     resolve_usage_period_anchor,
 )
@@ -437,4 +439,92 @@ def test_free_tier_has_an_overage_rate_for_the_pay_per_use_vehicle():
     assert (
         free_messaging.overage_price_per_million is not None
         or free_messaging.overage_price_per_unit_usd is not None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trial allotment floor: a mid-trial tier change keeps the higher trial
+# allotment until trial_end (resolve_effective_monthly_allotment).
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 7, 20, tzinfo=timezone.utc)
+_TRIAL_ACTIVE = _NOW + timedelta(days=5)
+_TRIAL_LAPSED = _NOW - timedelta(days=1)
+
+
+def test_effective_allotment_without_a_trial_is_the_plain_tier_allotment():
+    effective = resolve_effective_monthly_allotment(
+        SubscriptionTier.PRO, UsageMeter.MESSAGING_TOKENS, None, now=_NOW
+    )
+    assert effective == tier_allotment_for_meter(
+        SubscriptionTier.PRO, UsageMeter.MESSAGING_TOKENS
+    )
+
+
+def test_trialing_premium_then_downgrade_to_pro_keeps_the_premium_floor():
+    # Downgraded to pro (5M messaging) mid-trial, but the premium trial (20M)
+    # is still running, so the premium allotment governs until trial_end.
+    trial_context = TrialContext(
+        trial_tier=SubscriptionTier.PREMIUM, trial_end=_TRIAL_ACTIVE
+    )
+    effective = resolve_effective_monthly_allotment(
+        SubscriptionTier.PRO, UsageMeter.MESSAGING_TOKENS, trial_context, now=_NOW
+    )
+    assert effective.monthly_allotment == 20_000_000
+
+
+def test_effective_allotment_drops_to_the_current_tier_after_trial_end():
+    trial_context = TrialContext(
+        trial_tier=SubscriptionTier.PREMIUM, trial_end=_TRIAL_LAPSED
+    )
+    effective = resolve_effective_monthly_allotment(
+        SubscriptionTier.PRO, UsageMeter.MESSAGING_TOKENS, trial_context, now=_NOW
+    )
+    assert effective.monthly_allotment == 5_000_000
+
+
+def test_trial_only_meter_stays_granted_during_the_window():
+    # Trialing pro (grants document uploads) then downgraded to free (no upload
+    # meter): the upload allotment stays granted until the trial ends.
+    trial_context = TrialContext(
+        trial_tier=SubscriptionTier.PRO, trial_end=_TRIAL_ACTIVE
+    )
+    effective = resolve_effective_monthly_allotment(
+        SubscriptionTier.FREE,
+        UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+        trial_context,
+        now=_NOW,
+    )
+    assert effective is not None
+    assert effective.monthly_allotment == 10_000_000
+
+
+def test_trial_floor_flows_through_the_block_reason_via_override():
+    # Usage sits above the plain pro allotment (5M) but under the premium trial
+    # floor (20M); with the override the request is allowed, without it blocked.
+    trial_context = TrialContext(
+        trial_tier=SubscriptionTier.PREMIUM, trial_end=_TRIAL_ACTIVE
+    )
+    override = resolve_effective_monthly_allotment(
+        SubscriptionTier.PRO, UsageMeter.MESSAGING_TOKENS, trial_context, now=_NOW
+    )
+    usage_between = 6_000_000
+    assert (
+        exhausted_allotment_block_reason(
+            SubscriptionTier.PRO,
+            UsageMeter.MESSAGING_TOKENS,
+            usage_between,
+            pay_per_use_enabled=False,
+            allotment_override=override,
+        )
+        is None
+    )
+    assert (
+        exhausted_allotment_block_reason(
+            SubscriptionTier.PRO,
+            UsageMeter.MESSAGING_TOKENS,
+            usage_between,
+            pay_per_use_enabled=False,
+        )
+        is not None
     )

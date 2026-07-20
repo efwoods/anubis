@@ -95,6 +95,8 @@ from src.anubis.utils.billing import (
     resolve_usage_period_start,
     resolve_use_adapter_inference,
     resolve_checkout_trial_period_days,
+    resolve_effective_monthly_allotment,
+    resolve_trial_context,
     release_pending_subscription_schedule,
     subscription_has_pending_downgrade_schedule,
     subscription_period_bounds,
@@ -234,6 +236,13 @@ async def enforce_remaining_allotment(
     if allotment is None:
         # The capability gate is the authority for dimensions the tier lacks.
         return
+    # A user inside a free-trial window keeps the trial tier's allotment as a
+    # floor after changing tiers (e.g. trialing premium then downgrading to
+    # pro keeps the premium allotment until trial_end), so the gate must judge
+    # against the trial-aware effective allotment, not the plain tier value.
+    effective_allotment = resolve_effective_monthly_allotment(
+        tier, meter, resolve_trial_context(current_user)
+    )
     metering_user_id = resolve_metering_user_id(current_user)
     period_start = resolve_usage_period_start_for_user(current_user)
     period_usage = await fetch_usage_since(
@@ -245,6 +254,7 @@ async def enforce_remaining_allotment(
         period_usage,
         resolve_pay_per_use_enabled(current_user),
         estimated_request_tokens=estimated_request_tokens,
+        allotment_override=effective_allotment,
     )
     if block_reason:
         raise HTTPException(status_code=402, detail=block_reason)
@@ -336,7 +346,12 @@ async def _build_meter_usage_snapshot(
     bounds.
     """
     tier = resolve_tier(current_user)
-    allotment = tier_allotment_for_meter(tier, meter)
+    # Trial-aware allotment so the streamed snapshot matches what enforcement
+    # actually gates against during a free-trial window (see
+    # resolve_effective_monthly_allotment).
+    allotment = resolve_effective_monthly_allotment(
+        tier, meter, resolve_trial_context(current_user)
+    )
     period_start, period_end = _resolve_usage_period_bounds_for_user(current_user)
     used_to_date = await fetch_usage_since(
         getattr(app_state, "pool", None),
@@ -1859,9 +1874,14 @@ async def _handle_stripe_event(
         )
 
     elif event_type in (
+        "customer.subscription.created",
         "customer.subscription.updated",
         "customer.subscription.deleted",
     ):
+        # ``created`` flows through the same non-deleted sync path as
+        # ``updated`` so a subscription created outside Checkout (for example
+        # a server-side ``Subscription.create``) syncs its tier/status into
+        # Auth0 immediately instead of waiting for a later ``updated`` bump.
         customer_id = data_object.get("customer")
         auth0_user_id = _auth0_user_id_for_customer(stripe_client, customer_id)
         current_period_start, current_period_end = _subscription_period_bounds(
@@ -2020,8 +2040,27 @@ async def verify_subscription_status(
         period_start,
     )
 
+    # Trial-aware per-meter view: within a free-trial window the trial tier's
+    # allotment is a floor over the current tier's (resolve_effective_monthly_
+    # allotment), and any meter the trial tier grants but the current tier does
+    # not stays visible until trial_end. The meter order is the current tier's
+    # definition order, then any trial-only meters, kept deterministic via an
+    # insertion-ordered dict.
+    trial_context = resolve_trial_context(current_user)
+    ordered_meters: dict = dict.fromkeys(
+        TIER_DEFINITIONS[tier].meter_allotments.keys()
+    )
+    if trial_context is not None:
+        for trial_meter in TIER_DEFINITIONS[
+            trial_context.trial_tier
+        ].meter_allotments:
+            ordered_meters.setdefault(trial_meter, None)
+
     meters: dict = {}
-    for meter, allotment in TIER_DEFINITIONS[tier].meter_allotments.items():
+    for meter in ordered_meters:
+        allotment = resolve_effective_monthly_allotment(tier, meter, trial_context)
+        if allotment is None:
+            continue
         used_to_date = int(usage_by_meter.get(meter.value, 0))
         meters[meter.value] = {
             "monthly_allotment": allotment.monthly_allotment,

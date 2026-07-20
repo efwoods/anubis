@@ -1508,6 +1508,34 @@ def _tier_from_subscription(stripe_client, subscription: dict) -> str:
     return "free"
 
 
+async def _evict_api_key_cache_for_user(auth0_user_id: str) -> None:
+    """Drop every cached API-key entry for one Auth0 user.
+
+    The five-minute ``_api_key_cache`` TTL would otherwise keep serving a stale
+    tier/billing snapshot after Auth0 has been updated (for example by a Stripe
+    webhook tier change), so any write to a user's app_metadata must evict that
+    user's cache entries. The cache is keyed by hashed API key, and each cached
+    value indexes by the provider-prefixed ``user_id`` and by the bare
+    ``identities[0].user_id`` (the id without the provider prefix), so both
+    forms are matched.
+    """
+    if not auth0_user_id:
+        return
+    bare_user_id = auth0_user_id.split("|")[-1]
+    async with _cache_lock:
+        stale_keys = [
+            cache_key
+            for cache_key, cached_user in _api_key_cache.items()
+            if cached_user.get("user_id") == auth0_user_id
+            or (
+                (cached_user.get("identities") or [{}])[0].get("user_id")
+                == bare_user_id
+            )
+        ]
+        for cache_key in stale_keys:
+            del _api_key_cache[cache_key]
+
+
 async def update_user_subscription_status(
     request: Request, auth0_user_id: str, subscription_status: dict
 ) -> bool:
@@ -1516,7 +1544,12 @@ async def update_user_subscription_status(
     Called by the Stripe webhook to keep the cached tier/status in sync in real time.
     Auth0 merges ``app_metadata`` at the top level, so patching just the
     ``subscription_status`` key replaces that record without disturbing other
-    metadata. Best-effort: logs and returns ``False`` on failure.
+    metadata. After a successful patch the user's ``_api_key_cache`` entries are
+    evicted so the next request reads the new tier immediately instead of after
+    the five-minute TTL — otherwise a webhook-driven tier change (for example
+    ``customer.subscription.updated`` or ``invoice.payment_failed``) would be
+    served stale until the cache expired or the process restarted. Best-effort:
+    logs and returns ``False`` on failure.
     """
     if not auth0_user_id:
         return False
@@ -1530,6 +1563,7 @@ async def update_user_subscription_status(
             json={"app_metadata": {"subscription_status": subscription_status}},
         )
         response.raise_for_status()
+        await _evict_api_key_cache_for_user(auth0_user_id)
         return True
     except Exception as sync_error:
         logger.error(
@@ -1573,20 +1607,7 @@ async def update_user_app_metadata_fields(
         )
         return False
 
-    # The cache indexes by identity user_id (the id without the provider prefix).
-    bare_user_id = auth0_user_id.split("|")[-1]
-    async with _cache_lock:
-        stale_keys = [
-            cache_key
-            for cache_key, cached_user in _api_key_cache.items()
-            if cached_user.get("user_id") == auth0_user_id
-            or (
-                (cached_user.get("identities") or [{}])[0].get("user_id")
-                == bare_user_id
-            )
-        ]
-        for cache_key in stale_keys:
-            del _api_key_cache[cache_key]
+    await _evict_api_key_cache_for_user(auth0_user_id)
     return True
 
 

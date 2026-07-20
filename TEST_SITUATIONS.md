@@ -92,14 +92,14 @@ Notes from the 2026-07-18 verification run:
 
 ---
 
-# Bugs / gaps found during testing (2026-07-16)
+# Bugs / gaps found during testing (2026-07-16; status updated 2026-07-20)
 
-1. **SubscriptionSchedule downgrade 502** — Stripe flexible billing rejects `phases[].iterations`. Fixed in `src/api/webapp.py` to use `"duration": {"interval": "month", "interval_count": 1}`.
-2. **API-key cache stale after webhook** — `update_user_subscription_status` writes Auth0 but does **not** invalidate `_api_key_cache`, so `/verify_subscription_status` can keep showing an old canceled subscription until TTL (300s) or process restart.
-3. **`customer.subscription.created` not handled** — creating a subscription outside Checkout does not sync Auth0 until an `updated` event or cache clear.
-4. **Rate limit vs allotment testing** — `MESSAGE_RATE_LIMIT_TOKENS_PER_WINDOW=30000` blocks a second message within 60s because system prompt alone is ~19k–22k estimated tokens.
-5. **Adapter training** — no public API route to exercise `adapter_training_units` allotment.
-6. **Trial allotment floor** — `resolve_effective_monthly_allotment` exists but is still not wired into `enforce_remaining_allotment` / `/verify_subscription_status` (plain tier allotment used).
+1. **SubscriptionSchedule downgrade 502** — ✅ FIXED. Stripe flexible billing rejects `phases[].iterations`; `src/api/webapp.py` uses `"duration": {"interval": "month", "interval_count": 1}`.
+2. **API-key cache stale after webhook** — ✅ FIXED (2026-07-20). `update_user_subscription_status` now evicts `_api_key_cache` via the shared `_evict_api_key_cache_for_user` helper, so `customer.subscription.updated` / `invoice.payment_failed` tier changes take effect on the next request instead of after the 300s TTL.
+3. **`customer.subscription.created` not handled** — ✅ FIXED (2026-07-20). `_handle_stripe_event` now dispatches `customer.subscription.created` through the same non-deleted sync path as `updated`.
+4. **Rate limit vs allotment testing** — expected behavior, not a bug: set `MESSAGE_RATE_LIMIT_TOKENS_PER_WINDOW=0` / `MEDIA_UPLOAD_RATE_LIMIT_TOKENS_PER_WINDOW=0` before over-allotment tests (see `_METERING_MANUAL_VALIDATION.md`).
+5. **Adapter training** — still OPEN by design: no public API route to exercise `adapter_training_units` allotment (Prem10).
+6. **Trial allotment floor** — ✅ FIXED (2026-07-20). `resolve_effective_monthly_allotment` is now wired into `enforce_remaining_allotment`, the SSE usage snapshot, and `/verify_subscription_status`, so a mid-trial downgrade keeps the higher trial allotment (and trial-only meters) until `trial_end`. Covered by new unit tests in `test_billing_enforcement_and_periods.py`.
 
 # Harness scripts (local only)
 - `scripts/manual_metering_allotment_focus.py`

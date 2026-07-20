@@ -227,6 +227,23 @@ async def signup_user(
         )
 
         response.raise_for_status()
+        created_user = response.json()
+
+        # Send the verification email explicitly via the jobs endpoint. Users
+        # created through the Management API POST /api/v2/users do NOT reliably
+        # receive an email from the `verify_email` create flag (verified against
+        # the live tenant: the flag left the user Unverified with no email,
+        # while POST /api/v2/jobs/verification-email returns 201 and sends). A
+        # send failure must not fail signup — the user still gets their API key
+        # and can trigger /resend_verification_email — so this is best-effort.
+        try:
+            await send_verification_email(created_user["user_id"], request=request)
+        except Exception:
+            logger.exception(
+                "Signup succeeded but sending the verification email failed for %s",
+                created_user.get("user_id"),
+            )
+
         result = {
             "api_key": api_key,
             "message": "Save this key. This key is shown only once and used for every api request.",
@@ -375,7 +392,9 @@ class UserDataReturn(UserDataCache):
 # ── Dependency: require valid token ────────────────────────────────────────
 
 
-async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
+async def get_user_with_api_key(
+    api_key: str, request: Request, require_verified: bool = True
+) -> dict | None:
     cache_key = _hash_key(api_key)
 
     async with _cache_lock:
@@ -404,10 +423,16 @@ async def get_user_with_api_key(api_key: str, request: Request) -> dict | None:
     user = users[0]
 
     if user["email_verified"] != True:
-        raise HTTPException(
-            detail="Email is not yet verified. Please verify email to continue.",
-            status_code=401,
-        )
+        if require_verified:
+            raise HTTPException(
+                detail="Email is not yet verified. Please verify email to continue.",
+                status_code=401,
+            )
+        # Unverified but the caller opted out of the gate (e.g. the resend flow).
+        # Return the user WITHOUT caching: caching an unverified user would let a
+        # later verified lookup hit the cache and skip the gate above.
+        user.update({"API_KEY": api_key})
+        return user
 
     # if user['app_metadata']['logged_in'] != True:
     #     raise HTTPException(detail="User is not logged in. Please log in to continue.")
@@ -431,6 +456,24 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
 
     user = await get_user_with_api_key(api_key, request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return user
+
+
+async def get_current_user_allow_unverified(
+    request: Request, api_key: str | None = Depends(api_key_scheme)
+) -> dict:
+    """
+    Like `get_current_user`, but does NOT reject unverified users. Used by the
+    resend-verification flow, which must be reachable by exactly the users who
+    have not yet verified their email.
+    """
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
+
+    user = await get_user_with_api_key(api_key, request, require_verified=False)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -652,11 +695,11 @@ async def get_current_user_id(
 
 @security_route.get("/resend_verification_email")
 async def resend_verification_email(
-    request: Request, current_user: dict = Depends(get_current_user)
+    request: Request,
+    current_user: dict = Depends(get_current_user_allow_unverified),
 ):
     # TODO: RATE LIMIT API CALL
-    logger.info("breakpoint")
-    return await send_verification_email(current_user["sub"], request=Request)
+    return await send_verification_email(current_user["user_id"], request=request)
 
 
 @security_route.post("/rotate_api_key")

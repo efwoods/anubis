@@ -31,6 +31,8 @@ from fastapi import (
     Request,
     Response,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
@@ -105,6 +107,7 @@ from src.anubis.utils.billing import (
     token_rate_limit_retry_after_seconds,
 )
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.graph_interrupts import collect_pending_interrupts
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.utils.store_cache import (
     invalidate_store_cache_entry,
@@ -123,6 +126,7 @@ from src.security.auth import (
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
+    get_user_with_api_key,
     security_route,
     update_assistant_config,
     update_user_app_metadata_fields,
@@ -731,19 +735,6 @@ def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     return last_ai
 
 
-def _collect_pending_interrupts(snapshot) -> list:
-    """Return any Interrupt objects pending on a graph StateSnapshot.
-
-    Newer LangGraph exposes ``snapshot.interrupts``; older surfaces them per task.
-    """
-    interrupts = list(getattr(snapshot, "interrupts", None) or [])
-    if interrupts:
-        return interrupts
-    for task in getattr(snapshot, "tasks", None) or []:
-        interrupts.extend(getattr(task, "interrupts", None) or [])
-    return interrupts
-
-
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -802,6 +793,40 @@ async def message_graph_sse(
         resume_command if resume_command is not None else {"messages": [human_message]}
     )
 
+    # #region agent log
+    if resume_command is not None:
+        try:
+            import time
+            from pathlib import Path
+
+            _log_path = (
+                Path(__file__).resolve().parents[2] / ".cursor" / "debug-ba8488.log"
+            )
+            _log_path.parent.mkdir(parents=True, exist_ok=True)
+            with _log_path.open("a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "ba8488",
+                            "location": "webapp.py:message_graph_sse:resume_start",
+                            "message": "outer graph resume requested",
+                            "data": {
+                                "thread_id": thread_id,
+                                "resume_payload": getattr(
+                                    resume_command, "resume", None
+                                ),
+                            },
+                            "hypothesisId": "D",
+                            "timestamp": int(time.time() * 1000),
+                        },
+                        default=str,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+    # #endregion
+
     async for item in graph.astream(
         input=graph_input,
         config=config,
@@ -836,7 +861,7 @@ async def message_graph_sse(
     # If the graph paused for human approval, surface the preview instead of ``done``.
     # The client resumes via ``POST /message/{assistant_id}/resume`` on this thread_id.
     snapshot = await graph.aget_state(config)
-    pending_interrupts = _collect_pending_interrupts(snapshot)
+    pending_interrupts = collect_pending_interrupts(snapshot)
     if pending_interrupts:
         interrupt_event: dict = {
             "type": "interrupt",
@@ -2086,12 +2111,55 @@ async def verify_subscription_status(
     }
 
 
+async def _demote_other_personal_avatars(
+    client: Any, user_id: str, keep_assistant_id: Optional[str]
+) -> None:
+    """Enforce "at most one personal avatar per user" by demoting the rest.
+
+    A user may flag exactly one avatar as their ``PERSONAL_AVATAR_OF_THE_CREATOR``
+    (the only avatar that can reach their desktop MCP server and future personal
+    analytics). When a new avatar is flagged, any *other* avatar of the same user
+    that still holds the flag is cleared, so the newest choice wins without an
+    error. ``keep_assistant_id`` is the avatar just flagged (never demoted).
+    """
+    try:
+        owned_avatars = await client.assistants.search(
+            metadata={"user_id": user_id}, limit=1000
+        )
+    except Exception:
+        logger.warning(
+            "Could not enumerate avatars to demote prior personal avatar for user %s",
+            user_id,
+            exc_info=True,
+        )
+        return
+
+    for avatar in owned_avatars or []:
+        avatar_id = avatar.get("assistant_id")
+        metadata = avatar.get("metadata") or {}
+        if avatar_id == keep_assistant_id:
+            continue
+        if metadata.get("is_personal_avatar_of_creator") is True:
+            try:
+                await client.assistants.update(
+                    assistant_id=avatar_id,
+                    metadata={"is_personal_avatar_of_creator": False},
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to demote prior personal avatar %s for user %s",
+                    avatar_id,
+                    user_id,
+                    exc_info=True,
+                )
+
+
 @app.post("/create_avatar")
 async def create_avatar(
     name: str,
     description: Optional[str] = None,
     is_public: bool = False,
-    # is_self_avatar: Optional[bool] = False,
+    is_personal_avatar_of_creator: bool = False,
     current_user: dict = Depends(get_current_user),
 ):
 
@@ -2110,7 +2178,11 @@ async def create_avatar(
     try:
         assistant_id = str(uuid4())
         user_id = current_user["identities"][0]["user_id"]
-        metadata = {"user_id": user_id, "is_public": False}
+        metadata = {
+            "user_id": user_id,
+            "is_public": False,
+            "is_personal_avatar_of_creator": is_personal_avatar_of_creator,
+        }
 
         if user_id == context.admin_user_id:
             metadata["is_public"] = is_public
@@ -2133,6 +2205,12 @@ async def create_avatar(
         await client.store.put_item(
             (assistant_id, "creator_id"), key="creator_id", value={"value": user_id}
         )
+
+        # At most one personal avatar per user: flagging this one demotes any other.
+        if is_personal_avatar_of_creator:
+            await _demote_other_personal_avatars(
+                client, user_id, keep_assistant_id=assistant_id
+            )
 
         return JSONResponse(content=create_avatar_response, status_code=200)
     except Exception as creation_error:
@@ -2212,20 +2290,32 @@ async def share_avatar(
 
 @app.patch("/modify_avatar")
 async def modify_avatar(
+    request: Request,
     assistant_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
     new_avatar_name: Optional[str] = None,
     new_avatar_description: Optional[str] = None,
+    is_personal_avatar_of_creator: bool = False,
 ):
     # Avatar name changes also need to be applied to the db for consistent identities
     logger.info("breakpoint")
+    update_personal_avatar_flag = (
+        "is_personal_avatar_of_creator" in request.query_params
+    )
     if not assistant_id:
         raise HTTPException(
             detail="Supply assistant_id for the assistant to modify.", status_code=400
         )
-    if not new_avatar_name and not new_avatar_description:
+    if (
+        not new_avatar_name
+        and not new_avatar_description
+        and not update_personal_avatar_flag
+    ):
         raise HTTPException(
-            detail="Either supply the new avatar name or the new avatar description.",
+            detail=(
+                "Supply at least one of: new avatar name, new avatar description, "
+                "or is_personal_avatar_of_creator."
+            ),
             status_code=400,
         )
 
@@ -2236,30 +2326,407 @@ async def modify_avatar(
 
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
-    if assistant_id:
-        if new_avatar_name and new_avatar_description:
-            result = await client.assistants.update(
-                graph_id="Anubis",
-                assistant_id=assistant_id,
-                name=new_avatar_name,
-                description=new_avatar_description,
-            )
-        elif new_avatar_description:
-            result = await client.assistants.update(
-                graph_id="Anubis",
-                assistant_id=assistant_id,
-                description=new_avatar_description,
-            )
-        else:
-            result = await client.assistants.update(
-                graph_id="Anubis", assistant_id=assistant_id, name=new_avatar_name
-            )
-        try:
-            assert type(result) == dict
 
-            return JSONResponse(content=result, status_code=200)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error updating assistant.")
+    # Build a single update from only the supplied fields. ``metadata`` is merged
+    # (not replaced) by the assistant update, so sending only the flag preserves
+    # ``user_id`` / ``is_public`` — matching the share_avatar merge pattern above.
+    update_kwargs: dict[str, Any] = {
+        "graph_id": "Anubis",
+        "assistant_id": assistant_id,
+    }
+    if new_avatar_name:
+        update_kwargs["name"] = new_avatar_name
+    if new_avatar_description:
+        update_kwargs["description"] = new_avatar_description
+    if update_personal_avatar_flag:
+        update_kwargs["metadata"] = {
+            "is_personal_avatar_of_creator": is_personal_avatar_of_creator
+        }
+
+    try:
+        result = await client.assistants.update(**update_kwargs)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error updating assistant.")
+
+    # At most one personal avatar per user: flagging this one demotes any other.
+    if update_personal_avatar_flag and is_personal_avatar_of_creator:
+        user_id = current_user["identities"][0]["user_id"]
+        await _demote_other_personal_avatars(
+            client, user_id, keep_assistant_id=assistant_id
+        )
+
+    return JSONResponse(content=result, status_code=200)
+
+
+@app.post("/disconnect_mcp")
+async def disconnect_mcp(
+    current_user: dict = Depends(get_current_user),
+):
+    """Forget the user's saved MCP data-server connection (disconnect).
+
+    Deletes the single per-user connection record. The next turn on any owned
+    avatar re-enters the discovery/consent flow, so the user can re-connect
+    (and re-bind the connection to whichever avatar they choose). There is no
+    enable/disable switch — removing the connection is the disconnect.
+    """
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_connection_namespace,
+    )
+    from src.anubis.utils.tools.data_analysis.discovery import CONNECTION_KEY
+
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    try:
+        await client.store.delete_item(
+            list(mcp_connection_namespace(user_id)), key=CONNECTION_KEY
+        )
+        return JSONResponse(
+            content={"disconnected": True, "user_id": user_id}, status_code=200
+        )
+    except Exception as disconnect_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error disconnecting MCP server: {disconnect_error}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# MCP local-daemon relay + registration (see anubis-mcp-server-ubuntu).
+#
+# The user's local MCP server has no inbound port. It reaches this API in one of
+# two directions:
+#   - relay (default): one outbound WebSocket to ``/mcp/relay`` that tunnels HTTP
+#     both ways (this API sends ``proxy`` frames; the daemon replays them against
+#     its localhost MCP server and returns ``proxy_response`` frames);
+#   - registration: ``POST /mcp/register`` / ``/mcp/heartbeat`` / ``/mcp/unregister``
+#     announce presence + reachable URL (relay presence fallback, and the only
+#     channel for the tunnel/local advanced modes).
+# The user's API-KEY authenticates the daemon→API direction; a per-device secret
+# (``Authorization: Bearer``) authenticates the API→MCP direction.
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/mcp/relay")
+async def mcp_relay(websocket: WebSocket):
+    """Accept a local MCP daemon's outbound relay socket and tunnel HTTP over it.
+
+    Authenticates the user from the ``API-KEY`` handshake header, consumes the
+    daemon's first ``register`` frame (device id + secret + announced server
+    metadata), records the live session in the in-process relay registry, then
+    forwards every subsequent ``proxy_response`` frame to the awaiting
+    ``proxy_request`` call. The registry is what the graph's ``mcp_discovery``
+    node and the ``/mcp/relay/{device_id}`` bridge read to reach this device.
+    """
+    from src.anubis.utils.tools.data_analysis import relay as relay_registry
+
+    api_key = websocket.headers.get("API-KEY")
+    if not api_key:
+        await websocket.close(code=1008)
+        return
+    try:
+        # A ``WebSocket`` carries ``.app`` just like a ``Request``, which is all
+        # ``get_user_with_api_key`` needs (httpx client + management token).
+        user = await get_user_with_api_key(api_key, websocket)  # type: ignore[arg-type]
+    except Exception:
+        logger.warning("MCP relay authentication error", exc_info=True)
+        user = None
+    if not user:
+        await websocket.close(code=1008)
+        return
+
+    user_id = user["identities"][0]["user_id"]
+    await websocket.accept()
+
+    device_id: str | None = None
+    try:
+        register_message = json.loads(await websocket.receive_text())
+        if register_message.get("type") != relay_registry.FRAME_REGISTER:
+            await websocket.close(code=1008)
+            return
+        device_id = register_message.get("device_id")
+        device_secret = register_message.get("device_secret")
+        if not device_id or not device_secret:
+            await websocket.close(code=1008)
+            return
+
+        relay_registry.register_session(
+            device_id=device_id,
+            user_id=user_id,
+            device_secret=device_secret,
+            server_name=register_message.get("server_name") or "Ubuntu-OS-Filesystem",
+            allowed_roots=tuple(register_message.get("allowed_roots") or []),
+            websocket=websocket,
+        )
+        await websocket.send_text(
+            json.dumps(
+                {"type": relay_registry.FRAME_REGISTERED, "device_id": device_id}
+            )
+        )
+
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            relay_registry.handle_incoming(device_id, message)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.warning(
+            "MCP relay socket error for device %s", device_id, exc_info=True
+        )
+    finally:
+        if device_id:
+            relay_registry.drop_session(device_id, websocket)
+
+
+@app.api_route("/mcp/relay/{device_id}", methods=["GET", "POST", "DELETE"])
+async def mcp_relay_bridge(device_id: str, request: Request):
+    """Tunnel one MCP HTTP call to a device over its live relay socket.
+
+    This is the URL stored as a relay connection's ``McpConnection.url``; the
+    avatar's ``MultiServerMCPClient`` calls it exactly like a normal
+    streamable-HTTP MCP endpoint. Access is gated by the per-device Bearer
+    secret (the publicly routable path must not be callable by anyone who merely
+    guesses a device id). The request is re-pathed to the daemon's local MCP
+    endpoint (``/mcp``) — the daemon forwards to ``local_mcp_url + path``.
+
+    A streamable-HTTP client also opens a *standalone* ``GET`` to this endpoint
+    to receive server-initiated (server→client) messages — an unbounded
+    Server-Sent-Events stream. The relay tunnels discrete request/response
+    pairs, not open-ended streams: a tunneled ``GET`` would block the daemon's
+    single WebSocket message loop reading a body that never ends, wedging the
+    whole relay for that device. The MCP specification allows a server to
+    decline the server-push stream by answering the standalone ``GET`` with
+    ``405 Method Not Allowed``; the client then operates request/response-only
+    (every filesystem tool call is a ``POST`` whose response is finite and
+    buffered), which the relay fully supports. So short-circuit ``GET`` here and
+    never forward it over the socket.
+    """
+    from src.anubis.utils.tools.data_analysis import relay as relay_registry
+
+    if request.method == "GET":
+        return JSONResponse(
+            content={"error": "Server-push stream is not offered over the relay."},
+            status_code=405,
+        )
+
+    session = relay_registry.get_session(device_id)
+    if session is None:
+        return JSONResponse(
+            content={"error": "MCP relay device is offline."}, status_code=503
+        )
+
+    if request.headers.get("Authorization") != f"Bearer {session.device_secret}":
+        return JSONResponse(content={"error": "Unauthorized."}, status_code=401)
+
+    forwarded_headers: dict[str, str] = {}
+    for header_name in (
+        "content-type",
+        "accept",
+        "mcp-session-id",
+        "mcp-protocol-version",
+    ):
+        header_value = request.headers.get(header_name)
+        if header_value is not None:
+            forwarded_headers[header_name] = header_value
+    forwarded_headers["Authorization"] = f"Bearer {session.device_secret}"
+
+    try:
+        status_code, response_headers, response_body = await relay_registry.proxy_request(
+            device_id,
+            method=request.method,
+            path=relay_registry.LOCAL_MCP_PATH,
+            headers=forwarded_headers,
+            body=await request.body(),
+            timeout_seconds=float(
+                app.state.context.data_analysis_relay_request_timeout_seconds
+            ),
+        )
+    except TimeoutError:
+        return JSONResponse(
+            content={"error": "MCP relay timed out."}, status_code=504
+        )
+    except Exception as proxy_error:
+        return JSONResponse(
+            content={"error": f"MCP relay failed: {proxy_error}"}, status_code=502
+        )
+
+    # Preserve only the MCP-meaningful response headers; the media type governs
+    # how the streamable-HTTP client parses the body (JSON vs. text/event-stream).
+    passthrough_headers = {
+        key: value
+        for key, value in response_headers.items()
+        if key.lower() in ("mcp-session-id", "mcp-protocol-version")
+    }
+    return Response(
+        content=response_body,
+        status_code=status_code,
+        headers=passthrough_headers,
+        media_type=response_headers.get("content-type"),
+    )
+
+
+@app.post("/mcp/register")
+async def mcp_register(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record a local MCP daemon's pushed presence for the authenticated user.
+
+    Stores a single per-user ``pending_consent`` registration; the next turn on
+    the user's personal avatar reads it (``mcp_discovery``) and offers the
+    connection. This does not itself connect anything — user consent produces
+    the separate, avatar-bound ``mcp_connection`` record.
+    """
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_registration_namespace,
+    )
+    from src.anubis.utils.tools.data_analysis.discovery import REGISTRATION_KEY
+
+    body = await request.json()
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+
+    connection_mode = body.get("connection_mode") or "relay"
+    device_id = body.get("device_id")
+    # In relay mode the daemon's announced mcp_url may point at a different
+    # host (e.g. production) than the API instance that accepted the register
+    # call. Always rewrite to this request's own relay bridge so consent and
+    # tool calls stay on the same process that holds the WebSocket.
+    mcp_url = body.get("mcp_url")
+    if connection_mode == "relay" and device_id:
+        mcp_url = f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
+
+    record = {
+        "status": "pending_consent",
+        "connection_mode": connection_mode,
+        "server_name": body.get("server_name") or "Ubuntu-OS-Filesystem",
+        # Every mode is driven as a streamable-HTTP client; in relay mode the
+        # ``mcp_url`` points at this API's own ``/mcp/relay/<device_id>`` bridge.
+        "transport": "streamable_http",
+        "device_id": device_id,
+        "device_secret": body.get("device_secret"),
+        "mcp_url": mcp_url,
+        "discovery_url": body.get("discovery_url"),
+        "allowed_roots": body.get("allowed_roots") or [],
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await client.store.put_item(
+            list(mcp_registration_namespace(user_id)),
+            key=REGISTRATION_KEY,
+            value=record,
+        )
+        return JSONResponse(
+            content={"registered": True, "device_id": record["device_id"]},
+            status_code=200,
+        )
+    except Exception as register_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error registering MCP server: {register_error}",
+        )
+
+
+@app.post("/mcp/heartbeat")
+async def mcp_heartbeat(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Refresh a registration's presence fields so it keeps counting as online.
+
+    Heartbeats also sync ``device_id`` / ``mcp_url`` / ``connection_mode`` /
+    ``device_secret`` from the daemon body. Without that, a new local daemon
+    (different device id) can keep an older registration's ``last_seen_at``
+    fresh while the live relay socket belongs to a different device — leaving
+    ``resolve_available_connection`` unable to see the online session.
+    """
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_registration_namespace,
+    )
+    from src.anubis.utils.tools.data_analysis.discovery import REGISTRATION_KEY
+
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    namespace = list(mcp_registration_namespace(user_id))
+    try:
+        existing = await client.store.get_item(namespace, key=REGISTRATION_KEY)
+    except Exception:
+        # A missing item surfaces as an error from the HTTP store client; a
+        # heartbeat before/without a registration is simply a no-op.
+        existing = None
+    record = (existing or {}).get("value") if isinstance(existing, dict) else None
+    if not record:
+        # No prior registration (e.g. endpoint was down during startup);
+        # a heartbeat alone is not enough to reconstruct one.
+        return JSONResponse(content={"acknowledged": False}, status_code=200)
+
+    try:
+        record["last_seen_at"] = datetime.now(timezone.utc).isoformat()
+        if body.get("device_id"):
+            record["device_id"] = body["device_id"]
+        if body.get("connection_mode"):
+            record["connection_mode"] = body["connection_mode"]
+        if body.get("device_secret"):
+            record["device_secret"] = body["device_secret"]
+        connection_mode = record.get("connection_mode") or "relay"
+        device_id = record.get("device_id")
+        if connection_mode == "relay" and device_id:
+            record["mcp_url"] = (
+                f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
+            )
+        elif body.get("mcp_url"):
+            record["mcp_url"] = body["mcp_url"]
+        await client.store.put_item(namespace, key=REGISTRATION_KEY, value=record)
+        return JSONResponse(content={"acknowledged": True}, status_code=200)
+    except Exception as heartbeat_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error recording MCP heartbeat: {heartbeat_error}",
+        )
+
+
+@app.post("/mcp/unregister")
+async def mcp_unregister(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete the user's pending registration (daemon shutdown).
+
+    Distinct from ``/disconnect_mcp``, which forgets the *consented*, avatar-bound
+    connection; unregister only removes the presence record.
+    """
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_registration_namespace,
+    )
+    from src.anubis.utils.tools.data_analysis.discovery import REGISTRATION_KEY
+
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    try:
+        await client.store.delete_item(
+            list(mcp_registration_namespace(user_id)), key=REGISTRATION_KEY
+        )
+        return JSONResponse(content={"unregistered": True}, status_code=200)
+    except Exception as unregister_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error unregistering MCP server: {unregister_error}",
+        )
 
 
 @app.delete("/delete_avatar")
@@ -3224,6 +3691,8 @@ async def resume_avatar_message(
             raise HTTPException(status_code=400, detail="items must be a JSON list.")
         resume_payload["items"] = parsed_items
 
+    # The outer graph exposes a single think-level interrupt per pause. Multi-interrupt
+    # resume maps are built inside ``think`` for the checkpointed deep agent only.
     return StreamingResponse(
         message_graph_sse(
             graph,

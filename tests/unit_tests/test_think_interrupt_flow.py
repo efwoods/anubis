@@ -58,7 +58,7 @@ def think_app(monkeypatch):
     monkeypatch.setattr(
         graph_mod,
         "build_avatar_deep_agent",
-        lambda context, *, checkpointer=None, store=None: _build_fake_agent(
+        lambda context, *, checkpointer=None, store=None, extra_tools=None, backend=None: _build_fake_agent(
             checkpointer
         ),
     )
@@ -118,3 +118,74 @@ async def test_think_interrupt_then_resume_edit(think_app):
     assert _interrupts(think_app, config)
     resumed = await think_app.ainvoke(Command(resume={"type": "edit"}), config)
     assert resumed["messages"][-1].content == "corrected:edit"
+
+
+@pytest.mark.asyncio
+async def test_think_parallel_interrupts_then_resume_cancel(think_app, monkeypatch):
+    from langgraph.types import Send
+
+    class _ParallelState(TypedDict, total=False):
+        messages: Annotated[list, add_messages]
+
+    class _WorkerIn(TypedDict):
+        slot: int
+
+    def _fan(_state):
+        return [Send("worker", {"slot": i}) for i in range(2)]
+
+    def _worker(state: _WorkerIn):
+        decision = interrupt({"kind": "fact_correction", "slot": state["slot"]})
+        dtype = decision.get("type") if isinstance(decision, dict) else "unknown"
+        return {"messages": [AIMessage(content=f"slot{state['slot']}:{dtype}")]}
+
+    def _build_parallel(checkpointer):
+        g = StateGraph(_ParallelState)
+        g.add_node("worker", _worker)
+        g.add_conditional_edges(START, _fan, ["worker"])
+        g.add_edge("worker", END)
+        return g.compile(checkpointer=checkpointer)
+
+    shared_checkpointer = MemorySaver()
+    monkeypatch.setattr(
+        graph_mod, "get_deep_agent_checkpointer", lambda: shared_checkpointer
+    )
+    monkeypatch.setattr(
+        graph_mod,
+        "build_avatar_deep_agent",
+        lambda context, *, checkpointer=None, store=None, extra_tools=None, backend=None: _build_parallel(
+            checkpointer
+        ),
+    )
+
+    config = {"configurable": {"thread_id": "parallel-cancel"}}
+    await think_app.ainvoke(_input("trigger parallel"), config)
+    assert _interrupts(think_app, config)
+    resumed = await think_app.ainvoke(Command(resume={"type": "cancel"}), config)
+    assert "cancel" in resumed["messages"][-1].content
+    assert _interrupts(think_app, config) == []
+
+
+def test_build_interrupt_resume_command_single():
+    from langgraph.types import Interrupt
+
+    from src.anubis.utils.graph_interrupts import build_interrupt_resume_command
+
+    pending = [Interrupt(value={"kind": "fact_correction"}, id="062935311e29b3483e6fb443b5ac8d33")]
+    cmd = build_interrupt_resume_command(pending, {"type": "cancel"})
+    assert cmd.resume == {"062935311e29b3483e6fb443b5ac8d33": {"type": "cancel"}}
+
+
+def test_build_interrupt_resume_command_multiple():
+    from langgraph.types import Interrupt
+
+    from src.anubis.utils.graph_interrupts import build_interrupt_resume_command
+
+    pending = [
+        Interrupt(value={"kind": "fact_correction"}, id="062935311e29b3483e6fb443b5ac8d33"),
+        Interrupt(value={"kind": "fact_correction"}, id="90b29f9ade4fbf529c0a3154d63b98d3"),
+    ]
+    decision = {"type": "cancel"}
+    cmd = build_interrupt_resume_command(pending, decision)
+    assert isinstance(cmd.resume, dict)
+    assert len(cmd.resume) == 2
+    assert all(cmd.resume[i] == decision for i in (intr.id for intr in pending))

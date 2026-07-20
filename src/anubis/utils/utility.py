@@ -156,45 +156,6 @@ from typing import Any, Literal, Union
 from langgraph.store.base import Item, SearchItem
 
 
-# region agent log
-def _agent_debug_log(
-    message: str, data: dict | None = None, hypothesis_id: str = ""
-) -> None:
-    """Append one NDJSON line to the debug session log.
-
-    Picks the in-container bind-mount path when present, falls back to the
-    host workspace path otherwise. Best-effort: any failure is silently
-    swallowed so instrumentation never affects production behavior.
-    """
-    try:
-        import json as _json
-        import os as _os
-        import time as _time
-
-        _container_path = "/deps/anubis/.cursor/debug-aaf3d3.log"
-        _host_path = (
-            "/home/user/gh/anubis-project/wt/f-psycho-analysis/.cursor/debug-aaf3d3.log"
-        )
-        _path = (
-            _container_path if _os.path.isdir("/deps/anubis/.cursor") else _host_path
-        )
-        _payload = {
-            "sessionId": "aaf3d3",
-            "timestamp": int(_time.time() * 1000),
-            "location": "src/anubis/utils/utility.py",
-            "message": message,
-            "data": data or {},
-            "hypothesisId": hypothesis_id,
-        }
-        with open(_path, "a") as _f:
-            _f.write(_json.dumps(_payload, default=str) + "\n")
-    except Exception:
-        pass
-
-
-# endregion
-
-
 def _doc_dedup_key(doc: Document) -> str:
     """Return a stable identity key for de-duplicating a Document in the buffer.
 
@@ -210,6 +171,51 @@ def _doc_dedup_key(doc: Document) -> str:
         or meta.get("id")
         or doc.page_content
     )
+
+
+_FACT_TAG_RE = re.compile(r"<FACT>(.*?)</FACT>", re.DOTALL)
+
+
+def _document_fact_dedup_key(doc: Document) -> str:
+    """Return a content key for collapsing duplicate atomic-fact documents.
+
+    Tool-written facts carry ``metadata.fact``; media-ingested facts embed the
+    claim inside ``<FACT>…</FACT>``. Falls back to the whole ``page_content``
+    for non-fact documents (quotes, reference images, etc.).
+    """
+    meta = getattr(doc, "metadata", None) or {}
+    fact = (meta.get("fact") or "").strip()
+    if fact:
+        return fact.casefold()
+    page_content = (doc.page_content or "").strip()
+    tag_match = _FACT_TAG_RE.search(page_content)
+    if tag_match and tag_match.group(1).strip():
+        return tag_match.group(1).strip().casefold()
+    return page_content.casefold()
+
+
+def _content_dedup_documents(
+    merged: dict[str, Document],
+    score_by_key: dict[str, float | None],
+) -> list[Document]:
+    """Collapse docs that share the same atomic-fact content but different ids.
+
+    When several store writes created duplicate facts (parallel tool calls,
+    re-processed messages), keep the copy with the strongest retrieval score;
+    on a tie prefer a freshly-scored store hit over a prior-state doc.
+    """
+    best_by_fact: dict[str, Document] = {}
+    best_rank: dict[str, tuple[bool, float, int]] = {}
+    for order, (doc_id_key, doc) in enumerate(merged.items()):
+        fact_key = _document_fact_dedup_key(doc)
+        score = score_by_key.get(doc_id_key)
+        has_score = score is not None
+        score_val = float(score) if has_score else -1.0
+        rank = (has_score, score_val, -order)
+        if fact_key not in best_by_fact or rank > best_rank[fact_key]:
+            best_by_fact[fact_key] = doc
+            best_rank[fact_key] = rank
+    return list(best_by_fact.values())
 
 
 def remove_docs_update(docs: Sequence[Document]) -> dict[str, Any]:
@@ -300,33 +306,7 @@ def reduce_docs(
         existing: The docs already on the channel, if any.
         new: The instruction to apply (see above).
     """
-    # region agent log
-    _existing_len = len(existing) if existing is not None else 0
-    _new_kind = type(new).__name__
-    _new_summary: dict[str, Any] = {"kind": _new_kind}
-    if isinstance(new, list):
-        _new_summary["len"] = len(new)
-        _new_summary["item_kinds"] = list({type(i).__name__ for i in new})[:5]
-    elif isinstance(new, dict):
-        _new_summary["op"] = new.get("op")
-        _new_summary["keys_len"] = len(new.get("keys") or [])
-    elif isinstance(new, str):
-        _new_summary["str_value_short"] = new[:24]
-    _agent_debug_log(
-        "reduce_docs:enter",
-        {"existing_len": _existing_len, "new": _new_summary},
-        hypothesis_id="H1+H2+H3",
-    )
-    # endregion
-
     if new == "delete":
-        # region agent log
-        _agent_debug_log(
-            "reduce_docs:branch=delete",
-            {"existing_len": _existing_len, "result_len": 0},
-            hypothesis_id="H2",
-        )
-        # endregion
         return []
 
     # Full replacement: the buffer becomes exactly the given docs (coerced + deduped),
@@ -341,31 +321,12 @@ def reduce_docs(
                 continue
             replacement_seen.add(key)
             replacement.append(doc)
-        # region agent log
-        _agent_debug_log(
-            "reduce_docs:branch=replace",
-            {"existing_len": _existing_len, "result_len": len(replacement)},
-            hypothesis_id="H2",
-        )
-        # endregion
         return replacement
 
     # Targeted removal: drop only the processed docs, keep the rest.
     if isinstance(new, dict) and new.get("op") == "remove":
         to_remove = set(new.get("keys") or [])
-        _filtered = [d for d in (existing or []) if _doc_dedup_key(d) not in to_remove]
-        # region agent log
-        _agent_debug_log(
-            "reduce_docs:branch=remove",
-            {
-                "existing_len": _existing_len,
-                "remove_keys_len": len(to_remove),
-                "result_len": len(_filtered),
-            },
-            hypothesis_id="H2",
-        )
-        # endregion
-        return _filtered
+        return [d for d in (existing or []) if _doc_dedup_key(d) not in to_remove]
 
     coerced: list[Document] = []
     if isinstance(new, str):
@@ -375,13 +336,6 @@ def reduce_docs(
     elif isinstance(new, list):
         coerced.extend(_coerce_to_documents(new))
     else:
-        # region agent log
-        _agent_debug_log(
-            "reduce_docs:branch=unknown_new_type",
-            {"existing_len": _existing_len, "new_kind": _new_kind},
-            hypothesis_id="H2",
-        )
-        # endregion
         # Unknown ``new`` type: leave the buffer unchanged.
         return existing or []
 
@@ -389,40 +343,12 @@ def reduce_docs(
     # present so re-emitted docs do not accumulate.
     result: list[Document] = list(existing or [])
     seen = {_doc_dedup_key(doc) for doc in result}
-    # region agent log
-    _skip_count = 0
-    _sample_skip_key: str | None = None
-    _sample_added_key: str | None = None
-    # endregion
     for doc in coerced:
         key = _doc_dedup_key(doc)
         if key in seen:
-            # region agent log
-            _skip_count += 1
-            if _sample_skip_key is None:
-                _sample_skip_key = key[:64]
-            # endregion
             continue
         seen.add(key)
-        # region agent log
-        if _sample_added_key is None:
-            _sample_added_key = key[:64]
-        # endregion
         result.append(doc)
-    # region agent log
-    _agent_debug_log(
-        "reduce_docs:branch=append_dedup",
-        {
-            "existing_len": _existing_len,
-            "coerced_len": len(coerced),
-            "result_len": len(result),
-            "skip_count": _skip_count,
-            "sample_skip_key": _sample_skip_key,
-            "sample_added_key": _sample_added_key,
-        },
-        hypothesis_id="H3+H4+H5",
-    )
-    # endregion
     return result
 
 
@@ -444,6 +370,9 @@ async def merge_dedup_threshold_documents(
     * **de-duplicated** by stable document identity (:func:`_doc_dedup_key`) — on an id
       collision the FRESHLY RETRIEVED copy wins, so an in-place store edit's new content
       replaces the stale state copy, and
+    * **de-duplicated** by atomic-fact content when ``apply_threshold=False`` — distinct
+      store writes that share the same ``metadata.fact`` / ``<FACT>`` text collapse to one
+      document (highest retrieval score wins), and
     * optionally **salience-thresholded** against the current ``query``: freshly
       retrieved items reuse their store search score; prior-only docs are re-scored with
       the process-wide cached sentence embedder (the store's own embedding model, so
@@ -469,27 +398,22 @@ async def merge_dedup_threshold_documents(
         score_by_key[key] = float(score) if isinstance(score, (int, float)) else None
 
     if not apply_threshold:
-        return list(merged.values())
+        return _content_dedup_documents(merged, score_by_key)
 
     # Re-score only the docs without a store score (prior-state docs and any retrieval
     # that returned no score) against the current query, on the retrieval scale.
     unscored = [(key, doc) for key, doc in merged.items() if score_by_key[key] is None]
     if unscored:
 
-        def _compute() -> list[float]:
-            from src.anubis.utils.runtime_handles import get_sentence_embedder
+        async def _compute() -> list[float]:
+            from src.anubis.utils.runtime_handles import async_score_query_against_texts
 
-            model: Any = get_sentence_embedder()
-            query_embedding = model.encode([query], convert_to_numpy=True)
-            doc_embeddings = model.encode(
-                [doc.page_content or "" for _, doc in unscored],
-                convert_to_numpy=True,
+            return await async_score_query_against_texts(
+                query, [doc.page_content or "" for _, doc in unscored]
             )
-            similarities = model.similarity(query_embedding, doc_embeddings)[0]
-            return [float(score) for score in similarities]
 
         try:
-            computed = await asyncio.to_thread(_compute)
+            computed = await _compute()
         except Exception:
             # Scoring is best-effort: if the embedder is unavailable, keep the docs
             # rather than silently dropping salient memories.

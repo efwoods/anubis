@@ -51,8 +51,12 @@ CONNECTION = os.getenv("AUTH0_CONNECTION", "Username-Password-Authentication")
 BASE_AUTH_URL = f"https://{DOMAIN}"
 
 import hashlib, secrets
+from copy import deepcopy
+from datetime import datetime, timezone
+from uuid import NAMESPACE_URL, uuid5
 
 _api_key_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
+_anonymous_supabase_user_cache: TTLCache = TTLCache(maxsize=1000, ttl=86400)
 _cache_lock = asyncio.Lock()
 
 
@@ -970,6 +974,72 @@ from supabase import create_async_client
 from langgraph_sdk import get_client
 
 
+def _synthetic_supabase_anonymous_user(hashed_ip: str) -> dict[str, Any]:
+    """Local fallback matching Supabase ``sign_in_anonymously()`` user shape."""
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    stable_id = str(uuid5(NAMESPACE_URL, f"anonymous:{hashed_ip}"))
+    return {
+        "id": stable_id,
+        "app_metadata": {},
+        "user_metadata": {},
+        "aud": "authenticated",
+        "confirmation_sent_at": None,
+        "recovery_sent_at": None,
+        "email_change_sent_at": None,
+        "new_email": None,
+        "new_phone": None,
+        "invited_at": None,
+        "action_link": None,
+        "email": "",
+        "phone": "",
+        "created_at": now,
+        "confirmed_at": None,
+        "email_confirmed_at": None,
+        "phone_confirmed_at": None,
+        "last_sign_in_at": now,
+        "role": "authenticated",
+        "updated_at": now,
+        "identities": [],
+        "is_anonymous": True,
+        "is_sso_user": False,
+        "factors": None,
+        "deleted_at": None,
+        "banned_until": None,
+    }
+
+
+async def _anonymous_supabase_base_user(
+    context: Any, hashed_ip: str
+) -> dict[str, Any]:
+    """Return cached Supabase anonymous user metadata, signing in at most once per IP/day."""
+    async with _cache_lock:
+        cached = _anonymous_supabase_user_cache.get(hashed_ip)
+        if cached is not None:
+            return deepcopy(cached)
+
+    user: dict[str, Any] | None = None
+    if context.supabase_url and context.supabase_key:
+        try:
+            supabase_client = await create_async_client(
+                supabase_key=context.supabase_key, supabase_url=context.supabase_url
+            )
+            auth_response = await supabase_client.auth.sign_in_anonymously()
+            user = json.loads(auth_response.user.model_dump_json())
+        except Exception as exc:
+            logger.warning(
+                "Supabase anonymous sign-in failed for %s; using synthetic user: %s",
+                hashed_ip[:8],
+                exc,
+            )
+
+    if user is None:
+        user = _synthetic_supabase_anonymous_user(hashed_ip)
+
+    async with _cache_lock:
+        _anonymous_supabase_user_cache[hashed_ip] = deepcopy(user)
+    return deepcopy(user)
+
+
 async def get_anonymous_user_with_anonymous_api_key(
     request: Request, assistant_id: str
 ) -> dict | None:
@@ -1006,16 +1076,10 @@ async def get_anonymous_user_with_anonymous_api_key(
     # Handle banned user (e.g., raise HTTPException)
 
     context = request.app.state.context
-    try:
-        supabase_client = await create_async_client(
-            supabase_key=context.supabase_key, supabase_url=context.supabase_url
-        )
-        auth_response = await supabase_client.auth.sign_in_anonymously()
-        user = json.loads(auth_response.user.model_dump_json())
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail="Error creating anonymous user sign-in."
-        )
+
+    user = await _anonymous_supabase_base_user(context, hashed_ip)
+    user["identities"] = [{"user_id": hashed_ip}]
+
     if assistant_id != "":
         try:
             langgraph_client_headers = {"API-KEY": context.anonymous_api_key}
@@ -1030,10 +1094,6 @@ async def get_anonymous_user_with_anonymous_api_key(
                 status_code=401,
                 detail="Please select a public avatar or use your API key from signup.",
             )
-
-        user["identities"] = [{}]
-
-        user["identities"][0]["user_id"] = hashed_ip
 
         app_metadata = {
             "api_key": _hash_key(context.anonymous_api_key),
@@ -1051,10 +1111,8 @@ async def get_anonymous_user_with_anonymous_api_key(
             },
         }
         user["app_metadata"] = app_metadata
+        user["API_KEY"] = context.anonymous_api_key
         user["API-KEY"] = context.anonymous_api_key
-    else:
-        user["identities"] = [{}]
-        user["identities"][0]["user_id"] = hashed_ip
 
     # Anonymous users use free-tier metering only (never a trial): lazily
     # attach the per-hashed-ip Stripe customer (with a $0 free-tier

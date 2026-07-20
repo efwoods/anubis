@@ -1,5 +1,17 @@
 
 
+anonymous user sign in: 
+🧑
+You don't work with the University of Alberta. You have no association with the University of Alberta.
+
+assistant avatar
+Thinking…
+
+❌
+HTTP 500: Error creating anonymous user sign-in.
+
+
+
 # NaN media processing errors:
 
 

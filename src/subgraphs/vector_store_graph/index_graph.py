@@ -76,21 +76,6 @@ async def index_docs(
     user_id = updated_user_id['user_id']
     assistant_id = updated_assistant_id['assistant_id']
 
-    # region agent log
-    try:
-        from src.anubis.utils.utility import _agent_debug_log as _adl
-        _raw = state.get('vectorstore_documents_to_be_indexed')
-        _kind = type(_raw).__name__
-        _len = len(_raw) if hasattr(_raw, "__len__") else None
-        _adl(
-            "index_docs:entry:vectorstore_documents_to_be_indexed",
-            {"kind": _kind, "len": _len},
-            hypothesis_id="H1",
-        )
-    except Exception:
-        pass
-    # endregion
-
     docs: list[Document] = list(
         cast(Sequence[Document], state.get('vectorstore_documents_to_be_indexed') or [])
     )

@@ -750,27 +750,6 @@ async def analyze_documents(
             if result:
                 analyzed_documents.extend(result)
 
-    # region agent log
-    try:
-        from src.anubis.utils.utility import _agent_debug_log as _adl
-
-        _adl(
-            "analyze_documents:return",
-            {
-                "queue_len": len(queue),
-                "analyzed_documents_len": len(analyzed_documents),
-                "sample_doc_id": (
-                    (analyzed_documents[0].metadata or {}).get("document_id")
-                    if analyzed_documents
-                    else None
-                ),
-            },
-            hypothesis_id="H1",
-        )
-    except Exception:
-        pass
-    # endregion
-
     return {
         "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete",
         "vectorstore_documents_to_be_indexed": analyzed_documents,
@@ -970,30 +949,6 @@ async def convert_media_list_to_text_document(
         for doc in all_documents
         if doc.metadata.get("adapter_acceptable", False) == True
     ]
-
-    # region agent log
-    try:
-        from src.anubis.utils.utility import _agent_debug_log as _adl
-
-        _adl(
-            "convert_media_list_to_text_document:return",
-            {
-                "vectorstore_len": len(vector_store_document_list_formatted),
-                "analysis_len": len(analysis_document_list_formatted),
-                "adapter_len": len(adapter_document_list_formatted),
-                "sample_vs_doc_id": (
-                    (vector_store_document_list_formatted[0].metadata or {}).get(
-                        "document_id"
-                    )
-                    if vector_store_document_list_formatted
-                    else None
-                ),
-            },
-            hypothesis_id="H1",
-        )
-    except Exception:
-        pass
-    # endregion
 
     return {
         "vectorstore_documents_to_be_indexed": vector_store_document_list_formatted,

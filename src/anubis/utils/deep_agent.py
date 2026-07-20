@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import logging
 import operator
-from typing import Annotated, Any, Optional, Sequence
+from typing import Annotated, Any, Sequence
 
 from deepagents import create_deep_agent
 from deepagents.graph import DeepAgentState
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from typing_extensions import Required
 
@@ -118,11 +118,12 @@ class AvatarDeepAgentState(DeepAgentState):
 
 
 def build_avatar_deep_agent(
-    context: Optional[GlobalContext] = None,
+    context: GlobalContext | None = None,
     *,
     extra_tools: Sequence[Any] | None = None,
     checkpointer: Any | None = None,
     store: Any | None = None,
+    backend: Any | None = None,
 ):
     """Construct the avatar's deep agent.
 
@@ -132,7 +133,8 @@ def build_avatar_deep_agent(
             avatar-side helper.
         extra_tools: Additional tools to expose to the deep agent on top
             of the identity tool suite + ``load_consciousness_tool``.
-            Reserved for future analysis / OS-query / report tools.
+            Used by the data-analysis capability (discover / ingest /
+            hydrate / persist / preview tools built per turn in ``think``).
         checkpointer: Optional persistent checkpointer. Required for
             human-in-the-loop tools (``edit_identity_fact`` /
             ``delete_identity_fact``) so an
@@ -143,6 +145,12 @@ def build_avatar_deep_agent(
             propagates from the parent runtime (legacy behavior); ``think``
             passes ``runtime.store`` explicitly so the agent under its own
             checkpointer can still reach identity facts.
+        backend: Optional deep-agent file/execution backend. When ``None``
+            the deepagents default (a virtual ``StateBackend``, no shell
+            execution) applies — the legacy behavior. The data-analysis
+            capability passes a ``CompositeBackend`` (local-shell workspace
+            + per-user-per-avatar ``StoreBackend`` routes) built by
+            ``src.anubis.utils.tools.data_analysis.backend.build_analysis_backend``.
 
     Returns:
         A compiled deep-agent graph.
@@ -177,10 +185,13 @@ def build_avatar_deep_agent(
     )
     dynamic_prompt = DynamicConsciousnessPrompt()
 
+    analysis_tool_count = len(extra_tools) if extra_tools else 0
     logger.info(
-        "Building avatar deep agent: model=%s identity_tools=%d",
+        "Building avatar deep agent: model=%s identity_tools=%d analysis_tools=%d total_tools=%d",
         context.model,
         len(IDENTITY_TOOLS),
+        analysis_tool_count,
+        len(tools),
     )
 
     return create_deep_agent(
@@ -191,6 +202,7 @@ def build_avatar_deep_agent(
         state_schema=AvatarDeepAgentState,
         checkpointer=checkpointer,
         store=store,
+        backend=backend,
     ).with_config(
         {
             "recursion_limit": context.deep_agent_recursion_limit,

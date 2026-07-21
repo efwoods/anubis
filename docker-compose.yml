@@ -5,6 +5,9 @@ volumes:
         driver: local
     redis-data:
         driver: local
+    # Shared whsec_ between stripe-cli and the API (local listen; not used in prod).
+    stripe-webhook-secret:
+        driver: local
 
 services:
     redis:
@@ -39,10 +42,74 @@ services:
             start_period: 10s
         env_file:
             - .env.dev
+        environment:
+            # Prefer Dashboard STRIPE_WEBHOOK_SECRET when set; otherwise the API
+            # reads the secret written by the stripe-cli service into this file.
+            STRIPE_WEBHOOK_SECRET_FILE: /run/stripe/webhook_secret
+            # Prefer STRIPE_BILLING_CONFIG_JSON when set; otherwise the API reads
+            # the JSON written by the stripe-provision service into this file — no
+            # JSON is ever pasted into .env.dev.
+            STRIPE_BILLING_CONFIG_FILE: /run/stripe/billing_config.json
         depends_on:
             redis:
                 condition: service_healthy
+            # Block API startup until provisioning has written billing_config.json,
+            # so the billing config (loaded once at lifespan) is present at boot
+            # with no manual paste and no restart. Offline caveat: if provisioning
+            # cannot reach Stripe it exits non-zero and the API will not start —
+            # set STRIPE_BILLING_CONFIG_JSON directly (or remove this condition) to
+            # run without provisioning.
+            stripe-provision:
+                condition: service_completed_successfully
         volumes:
             - .:/deps/anubis
             # Prefetched Hub weights (see ``ensure_huggingface_models_cached``); survives container restarts.
             - ~/.cache/huggingface:/root/.cache/huggingface
+            - stripe-webhook-secret:/run/stripe
+
+    # One-shot: idempotently create/reuse the Stripe meters, tier products, and
+    # prices, then write the config JSON to the shared volume for the API to read.
+    # Runs to completion on every `docker compose up` (the provisioning script is
+    # idempotent — existing objects are matched and reused, not duplicated). Leave
+    # STRIPE_BILLING_CONFIG_JSON empty in .env.dev — no manual JSON paste, ever.
+    # Needs STRIPE_SECRET_KEY (from .env.dev); refuses live keys without --allow-live.
+    stripe-provision:
+        image: evdev3/anubis-langgraph-api:latest
+        pull_policy: never
+        env_file:
+            - .env.dev
+        environment:
+            STRIPE_BILLING_CONFIG_FILE: /run/stripe/billing_config.json
+            # scripts/ imports `src.anubis...`; put the repo root on the path.
+            PYTHONPATH: /deps/anubis
+        working_dir: /deps/anubis
+        entrypoint: ["python", "scripts/provision_stripe_billing.py"]
+        # One-shot: run once and exit; never restart.
+        restart: "no"
+        volumes:
+            - .:/deps/anubis
+            - stripe-webhook-secret:/run/stripe
+
+    # Forwards Stripe *account* (not Connect) events to the API and publishes the
+    # signing secret to the shared volume. Leave STRIPE_WEBHOOK_SECRET empty in
+    # .env.dev — no manual whsec_ paste on each restart.
+    #
+    # Persistent Dashboard webhook: create under Developers → Webhooks →
+    # "Your account" (NOT "Connect"), point at your public HTTPS /stripe/webhook,
+    # then put that endpoint's signing secret in STRIPE_WEBHOOK_SECRET (prod .env).
+    stripe-cli:
+        image: stripe/stripe-cli:latest
+        env_file:
+            - .env.dev
+        environment:
+            STRIPE_WEBHOOK_SECRET_FILE: /run/stripe/webhook_secret
+            # In-compose DNS name + container listen port (same as PORT in .env.dev).
+            STRIPE_WEBHOOK_FORWARD_TO: http://langgraph-api-dev:${PORT:-8123}/stripe/webhook
+        depends_on:
+            langgraph-api-dev:
+                condition: service_healthy
+        volumes:
+            - ./scripts/stripe_listen_entrypoint.sh:/entrypoint.sh:ro
+            - stripe-webhook-secret:/run/stripe
+        entrypoint: ["/bin/sh", "/entrypoint.sh"]
+        restart: unless-stopped

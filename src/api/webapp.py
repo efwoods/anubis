@@ -12,20 +12,22 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
 # from src.url_loading_graph.graph import url_loading_graph
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 # Add metrics imports
 from time import time_ns
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, List, Literal, Optional
 from uuid import UUID, uuid4
 
 import httpx
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -55,6 +57,56 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, BeforeValidator
 
 from src.anubis.graph import message_workflow
+from src.anubis.utils.billing import (
+    TIER_DEFINITIONS,
+    SubscriptionTier,
+    TierCapability,
+    UsageMeter,
+    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+    TokenEstimationError,
+    billable_tokens_from_metadata,
+    count_words,
+    LIVE_SUBSCRIPTION_STATUSES,
+    SubscribeAction,
+    clear_pending_cancellation,
+    customer_has_payment_method,
+    ensure_anonymous_billing_customers_table,
+    ensure_api_metrics_table,
+    TokenEstimateBreakdown,
+    estimate_media_item_tokens,
+    estimate_message_request_token_breakdown,
+    estimate_text_tokens_from_words,
+    exhausted_allotment_block_reason,
+    fetch_or_measure_deep_agent_tool_schema_token_estimate,
+    fetch_system_prompt_token_estimate,
+    fetch_rolling_window_usage,
+    fetch_usage_by_meter_since,
+    fetch_usage_since,
+    is_admin_metering_bypass,
+    load_stripe_billing_config,
+    persist_api_metrics_row,
+    plan_subscribe_action,
+    plan_tier_change,
+    report_meter_event,
+    resolve_stripe_billing_config_json,
+    resolve_metering_user_id,
+    resolve_pay_per_use_enabled,
+    resolve_stripe_customer_id,
+    resolve_tier,
+    resolve_usage_period_anchor,
+    resolve_usage_period_end,
+    resolve_usage_period_start,
+    resolve_use_adapter_inference,
+    resolve_checkout_trial_period_days,
+    resolve_effective_monthly_allotment,
+    resolve_trial_context,
+    release_pending_subscription_schedule,
+    subscription_has_pending_downgrade_schedule,
+    subscription_period_bounds,
+    tier_allotment_for_meter,
+    tier_from_value,
+    token_rate_limit_retry_after_seconds,
+)
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.graph_interrupts import collect_pending_interrupts
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
@@ -71,13 +123,492 @@ from src.api.media_jobs import (
     run_batch_media_job,
 )
 from src.security.auth import (
+    _tier_from_subscription,
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
     get_user_with_api_key,
     security_route,
     update_assistant_config,
+    update_user_app_metadata_fields,
+    update_user_subscription_status,
 )
+
+
+def tier_from_value_or_400(value: str) -> SubscriptionTier:
+    """Coerce a request-supplied tier string into a SubscriptionTier or raise 400.
+
+    Unlike the defensive ``tier_from_value`` (which silently falls back to free),
+    an explicit tier chosen by the caller must be a real tier name, so an unknown
+    value is a client error rather than a silent downgrade.
+    """
+    try:
+        return SubscriptionTier(str(value).strip().lower())
+    except ValueError:
+        raise HTTPException(
+            detail=f"Unknown subscription tier '{value}'. Expected one of: "
+            + ", ".join(t.value for t in SubscriptionTier),
+            status_code=400,
+        )
+
+
+# Human-readable reason returned when a tier lacks a capability, so the client can
+# prompt the user to upgrade to the tier that unlocks it.
+_CAPABILITY_REQUIRED_TIER = {
+    TierCapability.UPLOAD: SubscriptionTier.PRO,
+    TierCapability.TRAIN_ADAPTER: SubscriptionTier.PREMIUM,
+}
+
+
+def enforce_tier_capability(current_user: dict, capability: TierCapability) -> SubscriptionTier:
+    """Raise HTTP 403 unless the user's resolved tier unlocks ``capability``.
+
+    This is the enforcement layer that gates billable work by tier: every tier can
+    message, pro adds uploads, premium adds adapter training. Anonymous users
+    resolve to free and therefore reach only the message capability. Returns the
+    resolved tier so callers can reuse it without recomputing.
+    """
+    tier = resolve_tier(current_user)
+    if capability in TIER_DEFINITIONS[tier].capabilities:
+        return tier
+    required = _CAPABILITY_REQUIRED_TIER.get(capability)
+    required_text = f" Upgrade to the {required.value} tier." if required else ""
+    raise HTTPException(
+        status_code=403,
+        detail=f"Your '{tier.value}' tier does not permit this action.{required_text}",
+    )
+
+
+def resolve_usage_period_start_for_user(current_user: dict) -> datetime:
+    """Return the start of the usage period governing this user's allotment.
+
+    The most recent of the available period signals wins, so a mid-period tier
+    upgrade always begins a fresh local usage window:
+
+    1. The Stripe billing period start cached into
+       ``app_metadata.subscription_status.current_period_start`` by the webhook
+       (paid tiers only) — keeps local gating aligned with the invoice period
+       without a Stripe call on the hot path.
+    2. The user's ``usage_period_anchor`` (written at tier upgrade and first
+       checkout), expanded into a recurring window by
+       ``resolve_usage_period_start`` per the USAGE_PERIOD_DAYS configuration.
+    3. The environment-configured default period (calendar month when
+       USAGE_PERIOD_DAYS is zero).
+    """
+    context = GlobalContext()
+    now = datetime.now(UTC)
+    usage_period_days = int(context.usage_period_days or 0)
+    period_anchor = resolve_usage_period_anchor(current_user)
+    period_start = resolve_usage_period_start(now, usage_period_days, period_anchor)
+
+    app_metadata = (current_user or {}).get("app_metadata") or {}
+    subscription_status = app_metadata.get("subscription_status") or {}
+    cached_stripe_period_start = subscription_status.get("current_period_start")
+    if cached_stripe_period_start:
+        try:
+            stripe_period_start = datetime.fromtimestamp(
+                int(cached_stripe_period_start), tz=UTC
+            )
+            period_start = max(period_start, stripe_period_start)
+        except (TypeError, ValueError, OSError):
+            pass
+    return period_start
+
+
+async def enforce_remaining_allotment(
+    app_state,
+    current_user: dict,
+    meter: UsageMeter,
+    estimated_request_tokens: int = 0,
+) -> None:
+    """Block a user of ANY tier whose ``meter`` allotment cannot cover this request.
+
+    The block decision is ``exhausted_allotment_block_reason``: period usage
+    PLUS the pre-call estimate of this request under the allotment is allowed;
+    at or past the allotment, only pay-per-use (a payment method on file lets
+    the Stripe graduated metered price bill the overage) allows the request.
+    Otherwise the request is refused with HTTP 402 until the period resets,
+    pay-per-use is enabled, or the user upgrades tiers. Usage is read from the
+    local ``api_metrics`` table (which also covers anonymous users via their
+    hashed-IP identifier) over the period resolved by
+    ``resolve_usage_period_start_for_user``. The admin testing account skips
+    enforcement entirely.
+    """
+    if is_admin_metering_bypass(current_user, GlobalContext().admin_user_id):
+        return
+    tier = resolve_tier(current_user)
+    allotment = tier_allotment_for_meter(tier, meter)
+    if allotment is None:
+        # The capability gate is the authority for dimensions the tier lacks.
+        return
+    # A user inside a free-trial window keeps the trial tier's allotment as a
+    # floor after changing tiers (e.g. trialing premium then downgrading to
+    # pro keeps the premium allotment until trial_end), so the gate must judge
+    # against the trial-aware effective allotment, not the plain tier value.
+    effective_allotment = resolve_effective_monthly_allotment(
+        tier, meter, resolve_trial_context(current_user)
+    )
+    metering_user_id = resolve_metering_user_id(current_user)
+    period_start = resolve_usage_period_start_for_user(current_user)
+    period_usage = await fetch_usage_since(
+        getattr(app_state, "pool", None), metering_user_id, meter.value, period_start
+    )
+    block_reason = exhausted_allotment_block_reason(
+        tier,
+        meter,
+        period_usage,
+        resolve_pay_per_use_enabled(current_user),
+        estimated_request_tokens=estimated_request_tokens,
+        allotment_override=effective_allotment,
+    )
+    if block_reason:
+        raise HTTPException(status_code=402, detail=block_reason)
+
+
+async def enforce_token_rate_limit(
+    app_state,
+    current_user: dict,
+    meter_event_names: list[str],
+    window_seconds: int,
+    tokens_per_window: int,
+    estimated_request_tokens: int = 0,
+) -> None:
+    """Refuse the request with HTTP 429 when the user's token rate cap is met.
+
+    A tokens-per-window abuse guard (in the spirit of the OpenAI rate-limit
+    guide) independent of the monthly allotment and of pay-per-use: it caps how
+    fast tokens can be consumed so a runaway client cannot burn a month's budget
+    or an unbounded overage bill in minutes. The window usage is checked WITH
+    this request's pre-call estimate added, so one huge request is refused
+    before burning the cap rather than after. The Retry-After header tells the
+    client when the oldest usage row ages out of the rolling window. A cap of
+    zero or less disables the limit entirely; the admin testing account skips
+    the limit.
+    """
+    if tokens_per_window <= 0 or window_seconds <= 0:
+        return
+    if is_admin_metering_bypass(current_user, GlobalContext().admin_user_id):
+        return
+    window_usage, oldest_usage_at = await fetch_rolling_window_usage(
+        getattr(app_state, "pool", None),
+        resolve_metering_user_id(current_user),
+        window_seconds,
+        meter_event_names=meter_event_names,
+    )
+    projected_window_usage = window_usage + max(0, estimated_request_tokens)
+    retry_after_seconds = token_rate_limit_retry_after_seconds(
+        projected_window_usage, tokens_per_window, window_seconds, oldest_usage_at
+    )
+    if retry_after_seconds is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Token rate limit reached: {window_usage:,} tokens used in the "
+                f"last {window_seconds} seconds (plus an estimated "
+                f"{max(0, estimated_request_tokens):,} for this request) against "
+                f"a cap of {tokens_per_window:,}. "
+                f"Retry after {retry_after_seconds} seconds."
+            ),
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+
+
+def _resolve_usage_period_bounds_for_user(
+    current_user: dict,
+) -> tuple[datetime, datetime]:
+    """Return the (start, end) of the usage period governing this user.
+
+    Start comes from ``resolve_usage_period_start_for_user``; the end prefers
+    the Stripe billing period end cached by the webhook, falling back to the
+    environment-configured period shape. Shared by enforcement-adjacent
+    display: the subscription-status endpoint and the per-response usage
+    snapshots.
+    """
+    context = GlobalContext()
+    usage_period_days = int(context.usage_period_days or 0)
+    period_start = resolve_usage_period_start_for_user(current_user)
+
+    app_metadata = (current_user or {}).get("app_metadata") or {}
+    cached_subscription_status = app_metadata.get("subscription_status") or {}
+    cached_period_end = cached_subscription_status.get("current_period_end")
+    if cached_period_end:
+        try:
+            return period_start, datetime.fromtimestamp(int(cached_period_end), tz=UTC)
+        except (TypeError, ValueError, OSError):
+            pass
+    return period_start, resolve_usage_period_end(period_start, usage_period_days)
+
+
+async def _build_meter_usage_snapshot(
+    app_state, current_user: dict, meter: UsageMeter
+) -> dict:
+    """Return one meter's usage-versus-allotment view for endpoint responses.
+
+    The same shape a customer portal polls from ``/verify_subscription_status``,
+    scoped to the single meter governing the current request, so every metered
+    endpoint can show the caller where they stand: allotment, usage to date in
+    the current period, remaining budget, the pay-per-use flag, and the period
+    bounds.
+    """
+    tier = resolve_tier(current_user)
+    # Trial-aware allotment so the streamed snapshot matches what enforcement
+    # actually gates against during a free-trial window (see
+    # resolve_effective_monthly_allotment).
+    allotment = resolve_effective_monthly_allotment(
+        tier, meter, resolve_trial_context(current_user)
+    )
+    period_start, period_end = _resolve_usage_period_bounds_for_user(current_user)
+    used_to_date = await fetch_usage_since(
+        getattr(app_state, "pool", None),
+        resolve_metering_user_id(current_user),
+        meter.value,
+        period_start,
+    )
+    monthly_allotment = allotment.monthly_allotment if allotment else None
+    return {
+        "meter": meter.value,
+        "tier": tier.value,
+        "monthly_allotment": monthly_allotment,
+        "used_to_date": used_to_date,
+        "remaining": (
+            max(0, monthly_allotment - used_to_date)
+            if monthly_allotment is not None
+            else None
+        ),
+        "pay_per_use_enabled": resolve_pay_per_use_enabled(current_user),
+        "usage_period_start": period_start.isoformat(),
+        "usage_period_end": period_end.isoformat(),
+    }
+
+
+async def _measure_system_prompt_tokens_for_request(
+    app_state, estimation_config: dict, message: str | None
+) -> int:
+    """Return the MEASURED token estimate of this request's real system prompt.
+
+    Reads the process-wide estimate cache first (populated every time
+    ``load_consciousness`` builds the prompt); on a miss or stale entry the
+    REAL prompt is built through ``build_system_prompt_text_for_estimation``
+    (store reads only — no model call, and the build records a fresh cache
+    entry as a side effect) and measured with the same word-ratio arithmetic.
+    Raises on any failure — the caller treats estimation as fail-closed.
+    """
+    context = GlobalContext()
+    configurable = (estimation_config or {}).get("configurable") or {}
+    user_id = configurable.get("user_id")
+    assistant_id = configurable.get("assistant_id")
+    if user_id and assistant_id:
+        cached_estimate = fetch_system_prompt_token_estimate(
+            user_id,
+            assistant_id,
+            max_age_seconds=float(
+                context.system_prompt_token_estimate_cache_ttl_seconds or 0
+            ),
+        )
+        if cached_estimate is not None:
+            return cached_estimate
+
+    # Lazy import: nodes pulls the full prompt-building stack, which must not
+    # load at webapp import time (cold-start convention in CLAUDE.md).
+    from src.anubis.utils.nodes import build_system_prompt_text_for_estimation
+
+    system_prompt_text = await build_system_prompt_text_for_estimation(
+        getattr(app_state, "store", None), estimation_config, message or ""
+    )
+    return estimate_text_tokens_from_words(count_words(system_prompt_text))
+
+
+async def _estimate_message_request_tokens(
+    app_state,
+    estimation_config: dict,
+    message: str | None,
+    file_text_content: str | None,
+    multimodal_content: list | None,
+) -> TokenEstimateBreakdown:
+    """Manually estimate one message turn's tokens before the model runs.
+
+    Manual computation (no tokenizer, no counting endpoint — arithmetic over
+    known quantities is the fastest path), split into input versus output:
+
+    * INPUT — the MEASURED system prompt for this (user, avatar) pair (from
+      the estimate cache, or built fresh on a miss), the MEASURED schemas of
+      every tool the deep agent binds (enumerated from the compiled agent,
+      so newly added tools are included automatically — see
+      ``tool_schema_estimate_cache.py``; the provider bills the serialized
+      tool definitions as input on the initial model call), the word-ratio
+      estimate of the variable user text (message plus attached-file text),
+      and every attached image's vision patches. There is NO fixed or
+      guessed input overhead — every input component is measured. (The tool
+      loop may run the model more than once before the final reply; the loop
+      count is unknowable in advance, so the estimate covers the initial
+      call and recorded actual totals govern accrual for the loop.) The
+      allotment gate consumes ``input_tokens``.
+    * OUTPUT — the expected reply budget
+      (``MESSAGE_EXPECTED_OUTPUT_TOKENS_ESTIMATE``) plus each attached
+      image's expected description. Output is not gated in advance; actual
+      TOTAL usage from the model API accrues after the turn.
+
+    ``estimation_config`` is the request's LangGraph config whose
+    ``configurable`` carries ``user_id``, ``assistant_id``, and
+    ``assistant_ctx`` — the same identifiers ``load_consciousness`` builds
+    the prompt from, so the estimate reflects the prompt the model will read.
+
+    Fail-closed: an unreadable attached image, a failed system-prompt build,
+    or any other estimation failure raises HTTP 422 — nothing unestimated may
+    reach the model.
+    """
+    context = GlobalContext()
+    try:
+        system_prompt_tokens = await _measure_system_prompt_tokens_for_request(
+            app_state, estimation_config, message
+        )
+        # First call per process compiles the deep agent graph to enumerate
+        # the bound tools, so the measurement runs on a worker thread; every
+        # later call returns the cached integer.
+        tool_schema_tokens = await asyncio.to_thread(
+            fetch_or_measure_deep_agent_tool_schema_token_estimate
+        )
+
+        image_dimensions: list[tuple[int, int]] = []
+        for content_block in multimodal_content or []:
+            if (
+                not isinstance(content_block, dict)
+                or content_block.get("type") != "image_url"
+            ):
+                continue
+            image_url_value = (content_block.get("image_url") or {}).get("url") or ""
+            if "," in image_url_value:
+                image_bytes = base64.b64decode(image_url_value.split(",", 1)[1])
+            else:
+                image_bytes = base64.b64decode(image_url_value)
+            image_dimensions.append(_image_dimensions_from_bytes(image_bytes))
+
+        variable_text = " ".join(
+            part for part in (message or "", file_text_content or "") if part
+        )
+        return estimate_message_request_token_breakdown(
+            count_words(variable_text),
+            image_dimensions,
+            system_prompt_tokens=system_prompt_tokens,
+            tool_schema_tokens=tool_schema_tokens,
+            expected_output_tokens=int(
+                context.message_expected_output_tokens_estimate or 0
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as estimation_error:  # noqa: BLE001 - fail-closed estimation
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not estimate token usage for this message: "
+                f"{estimation_error} The request was not processed."
+            ),
+        ) from estimation_error
+
+
+async def _meter_message_usage(
+    app_state,
+    current_user: dict,
+    response_metadata: Optional[dict],
+    thread_id: Optional[str],
+    assistant_id: Optional[str],
+    latency_ms: float,
+    request_id: Optional[str] = None,
+) -> dict | None:
+    """Report messaging (or adapter-inference) token usage; return the usage block.
+
+    Best-effort and non-fatal: extracts billable tokens from the model response
+    metadata, reports them to the correct Stripe meter keyed on the customer,
+    increments the Prometheus token/cost counters, and writes one
+    ``api_metrics`` row. A ``None`` customer id (anonymous user) makes the
+    Stripe report a no-op while still recording local metrics. The admin
+    testing account skips both billing writes (Prometheus observability is
+    kept). Returns the turn's usage summary — this turn's actual token counts
+    plus the caller's usage-versus-allotment snapshot for the governing meter —
+    for endpoint responses; returns ``None`` when metering fails (the model
+    already ran; post-response reporting stays fail-open).
+    """
+    try:
+        token_usage = (response_metadata or {}).get("token_usage") or {}
+        prompt_tokens = int(token_usage.get("prompt_tokens") or 0)
+        completion_tokens = int(token_usage.get("completion_tokens") or 0)
+        total_tokens = billable_tokens_from_metadata(response_metadata)
+        model_name = (response_metadata or {}).get("model_name")
+        cost_usd = float((response_metadata or {}).get("total_cost") or 0.0)
+
+        stripe_customer_id = resolve_stripe_customer_id(current_user)
+        tier = resolve_tier(current_user)
+        admin_metering_bypass = is_admin_metering_bypass(
+            current_user, GlobalContext().admin_user_id
+        )
+
+        # Adapter inference is billed against a separate meter at a different rate;
+        # the think node sets is_adapter_inference when the client requested
+        # adapter=True and the user is Premium (see use_adapter_inference in config).
+        is_adapter_inference = bool((response_metadata or {}).get("is_adapter_inference"))
+        if is_adapter_inference and tier == SubscriptionTier.PREMIUM:
+            meter = UsageMeter.ADAPTER_INFERENCE_TOKENS
+            inference_type = "adapter_inference"
+        else:
+            meter = UsageMeter.MESSAGING_TOKENS
+            inference_type = "message"
+
+        # The request id keys Stripe's meter-event deduplication so a retried
+        # request cannot double-bill the same turn.
+        if not admin_metering_bypass:
+            await report_meter_event(
+                app_state.stripe,
+                meter,
+                stripe_customer_id,
+                total_tokens,
+                idempotency_identifier=(
+                    f"{request_id}:{meter.value}" if request_id else None
+                ),
+            )
+
+        if model_name and total_tokens > 0:
+            if prompt_tokens:
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="prompt").inc(prompt_tokens)
+            if completion_tokens:
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="completion").inc(
+                    completion_tokens
+                )
+            if cost_usd:
+                MODEL_COST_TOTAL.labels(model=model_name).inc(cost_usd)
+
+        if not admin_metering_bypass:
+            await persist_api_metrics_row(
+                getattr(app_state, "pool", None),
+                inference_type=inference_type,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                user_id=resolve_metering_user_id(current_user),
+                stripe_customer_id=stripe_customer_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                model_name=model_name,
+                meter_event_name=meter.value,
+            )
+
+        # The insert above was awaited, so the snapshot's used_to_date already
+        # includes this turn.
+        usage_snapshot = await _build_meter_usage_snapshot(
+            app_state, current_user, meter
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            **usage_snapshot,
+            **({"admin_metering_bypass": True} if admin_metering_bypass else {}),
+        }
+    except Exception as metering_error:  # noqa: BLE001 - metering must never break a reply
+        logger.error("Failed to meter message usage: %s", metering_error)
+        return None
 
 
 def _drop_empty_file_fields(value: Any) -> Any:
@@ -219,16 +750,45 @@ async def message_graph_sse(
     request_id: str,
     langgraph_client_headers: dict,
     resume_command: Optional[Command] = None,
+    app_state=None,
+    current_user: Optional[dict] = None,
+    estimated_request_tokens: TokenEstimateBreakdown | None = None,
+    estimate_meter: UsageMeter | None = None,
+    include_usage_metrics: bool = True,
 ):
     """Stream assistant tokens (SSE) then a terminal event with full metadata.
 
-    Terminal event is ``done`` on completion, or ``interrupt`` when the graph pauses
-    for human approval (carrying the approve/edit/reject preview payload). Pass
-    ``resume_command`` (``Command(resume=...)``) to continue a paused run instead of
-    sending a fresh ``human_message``.
+    When ``include_usage_metrics`` is true, the FIRST frame is a
+    ``usage_estimate`` event carrying this request's pre-call ``input_tokens``
+    estimate (what the allotment gate consumed) and the caller's
+    usage-versus-allotment snapshot. Actual meter accrual always uses the
+    provider's returned token usage after the turn, regardless of
+    ``include_usage_metrics``. The terminal event is ``done`` on completion
+    (optionally carrying the turn's actual ``usage``), or ``interrupt`` when
+    the graph pauses for human approval. Pass ``resume_command``
+    (``Command(resume=...)``) to continue a paused run instead of sending a
+    fresh ``human_message``.
     """
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
+
+    # Pre-call estimate + allotment snapshot (reporting only).
+    if (
+        include_usage_metrics
+        and estimated_request_tokens is not None
+        and app_state is not None
+        and current_user is not None
+    ):
+        usage_estimate_event = {
+            "type": "usage_estimate",
+            "input_tokens": estimated_request_tokens.input_tokens,
+            "usage": await _build_meter_usage_snapshot(
+                app_state, current_user, estimate_meter or UsageMeter.MESSAGING_TOKENS
+            ),
+            "thread_id": thread_id,
+            "request_id": request_id,
+        }
+        yield f"data: {json.dumps(usage_estimate_event, default=str)}\n\n"
 
     graph_input = (
         resume_command if resume_command is not None else {"messages": [human_message]}
@@ -257,7 +817,7 @@ async def message_graph_sse(
         "thread_metadata": {
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "most_recent_message": datetime.now(UTC).isoformat(),
             "conversation_title": conversation_title_value,
         },
         "graph_id": "Anubis",
@@ -288,8 +848,29 @@ async def message_graph_sse(
         "request_id": request_id,
         "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
     }
-    if last_ai is not None and getattr(last_ai, "response_metadata", None):
-        done["response_metadata"] = last_ai.response_metadata
+    response_metadata = (
+        last_ai.response_metadata
+        if last_ai is not None and getattr(last_ai, "response_metadata", None)
+        else None
+    )
+    if response_metadata:
+        done["response_metadata"] = response_metadata
+
+    # Always accrue actual model API usage BEFORE the terminal frame. Reporting
+    # the usage block on ``done`` is optional (``include_usage_metrics``);
+    # metering failure is fail-open and just omits the usage block.
+    if app_state is not None and current_user is not None:
+        turn_usage = await _meter_message_usage(
+            app_state=app_state,
+            current_user=current_user,
+            response_metadata=response_metadata,
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            latency_ms=(time_ns() - start_time_ns) / 1_000_000,
+            request_id=request_id,
+        )
+        if include_usage_metrics and turn_usage:
+            done["usage"] = turn_usage
     yield f"data: {json.dumps(done, default=str)}\n\n"
 
 
@@ -543,6 +1124,21 @@ async def lifespan(app: FastAPI):
     )
     app.state.pool = pool
     await app.state.pool.open()
+
+    # Ensure the api_metrics table exists and cache the parsed Stripe billing config
+    # (meter + tier price ids) so metering and subscription endpoints can use them.
+    await ensure_api_metrics_table(app.state.pool)
+    await ensure_anonymous_billing_customers_table(app.state.pool)
+    try:
+        # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the
+        # compose stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a
+        # reprovision never requires pasting JSON into the env or a manual edit.
+        app.state.stripe_billing_config = load_stripe_billing_config(
+            resolve_stripe_billing_config_json(app.state.context)
+        )
+    except ValueError as billing_config_error:
+        logger.error("Invalid STRIPE_BILLING_CONFIG_JSON: %s", billing_config_error)
+        app.state.stripe_billing_config = None
     try:
         embed = "huggingface:" + app.state.context.embedding_model
         # IndexConfig key must be ``fields`` (plural). Using ``field`` is ignored and
@@ -645,48 +1241,844 @@ async def documentation():
 app.include_router(router=security_route)
 
 
-@app.get("/subscribe")
-async def subscribe(current_user: dict = Depends(get_current_user)):
-    """
-    Create a monthly subscription.
-    """
+def _checkout_line_items_for_tier(
+    billing_config, tier: SubscriptionTier
+) -> list[dict]:
+    """Build Stripe Checkout line items: the flat base price plus each metered price.
 
+    The licensed base price carries ``quantity=1``; metered prices are reported via
+    usage events and therefore carry no quantity.
+    """
+    identifiers = billing_config.identifiers_for_tier(tier)
+    line_items: list[dict] = [{"price": identifiers.base_price_id, "quantity": 1}]
+    for meter, price_id in identifiers.metered_price_ids.items():
+        line_items.append({"price": price_id})
+    return line_items
+
+
+_LIVE_SUBSCRIPTION_STATUSES = LIVE_SUBSCRIPTION_STATUSES
+
+
+def _reactivate_subscription_for_user(stripe_client, subscription: dict) -> None:
+    """Undo a pending period-end cancellation or scheduled downgrade.
+
+    The caller has already retrieved a live subscription; this only releases any
+    pending schedule and clears ``cancel_at_period_end``
+    (``clear_pending_cancellation`` in the billing package). Stripe errors
+    become HTTP 502.
+    """
+    subscription_id = subscription.get("id")
+    try:
+        clear_pending_cancellation(stripe_client, subscription)
+    except HTTPException:
+        raise
+    except Exception as reactivate_error:
+        logger.error(
+            "Could not reactivate subscription %s: %s",
+            subscription_id,
+            reactivate_error,
+        )
+        raise HTTPException(
+            status_code=502, detail="Could not reactivate the subscription."
+        )
+
+
+async def _change_subscription_tier_for_user(
+    request: Request,
+    current_user: dict,
+    requested_tier: SubscriptionTier,
+    currently_trialing: bool,
+    pay_per_use: bool | None = None,
+) -> dict:
+    """Switch an existing subscription to a different tier via the Subscription API.
+
+    The Stripe customer portal cannot switch plans that contain metered prices, so
+    tier changes go through POST /subscribe. The direction decides the timing, per
+    the retained/cleared usage rules (``plan_tier_change``):
+
+    * **Upgrades** take effect immediately — every subscription item's price is
+      replaced with the target tier's prices (base + metered) in one prorated
+      update. Outside a trial the local usage window restarts so the new tier
+      begins with a fresh allotment; while trialing the usage-period anchor is
+      left alone so trial free-usage is retained.
+    * **Downgrades** take effect at the period end via a Subscription Schedule —
+      the user already paid for the higher tier through the period, so billing
+      and allotment keep the higher tier until the boundary ("unused allotment
+      continues"). Downgrading to free cancels the subscription at period end.
+
+    ``pay_per_use`` optionally sets the overage flag in the same call (same
+    validation as POST /set_pay_per_use). Same-tier requests are the caller's
+    responsibility (``plan_subscribe_action`` routes them away first).
+    """
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    if billing_config is None:
+        raise HTTPException(
+            detail="Billing is not configured; cannot change tier.", status_code=503
+        )
+
+    stripe_client = request.app.state.stripe
+    status = await check_subscription_status(request=request, current_user=current_user)
+    subscription_id = status.get("subscription_id")
+    if not subscription_id:
+        raise HTTPException(
+            detail="No active subscription to change. Use POST /subscribe first.",
+            status_code=404,
+        )
+    current_tier = tier_from_value(status.get("tier"))
+    tier_change_plan = plan_tier_change(
+        current_tier, requested_tier, currently_trialing=currently_trialing
+    )
+
+    if requested_tier == SubscriptionTier.FREE:
+        # Downgrade to free = cancellation at period end; the
+        # customer.subscription.deleted webhook pins the tier to free at the
+        # boundary, so the paid allotment continues until then.
+        try:
+            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+            _release_pending_subscription_schedule(stripe_client, subscription)
+            stripe_client.Subscription.modify(
+                subscription_id, cancel_at_period_end=True
+            )
+        except Exception as cancel_error:
+            logger.error("Could not schedule downgrade to free: %s", cancel_error)
+            raise HTTPException(detail="Could not change tier.", status_code=502)
+        if pay_per_use is not None:
+            await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+        return {
+            "message": "Subscription will end at the period boundary; you will drop to the free tier."
+        }
+
+    try:
+        subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        _release_pending_subscription_schedule(stripe_client, subscription)
+        existing_items = subscription.get("items", {}).get("data", [])
+        target_price_ids = billing_config.identifiers_for_tier(
+            requested_tier
+        ).all_price_ids()
+
+        if tier_change_plan.schedule_change_at_period_end:
+            # Downgrade: keep the paid-for tier (billing AND allotment) until the
+            # period boundary, then switch. Phase one restates the current items
+            # through the period end; phase two runs the target tier for one
+            # period and then releases, leaving the subscription running on the
+            # target tier's items.
+            schedule = stripe_client.SubscriptionSchedule.create(
+                from_subscription=subscription_id
+            ).to_dict()
+            current_phase = (schedule.get("phases") or [{}])[0]
+            _, current_period_end = _subscription_period_bounds(subscription)
+            stripe_client.SubscriptionSchedule.modify(
+                schedule["id"],
+                end_behavior="release",
+                phases=[
+                    {
+                        "items": [
+                            {"price": (item.get("price") or {}).get("id")}
+                            for item in existing_items
+                        ],
+                        "start_date": current_phase.get("start_date"),
+                        "end_date": current_period_end
+                        or current_phase.get("end_date"),
+                    },
+                    {
+                        "items": [
+                            {"price": target_price_id}
+                            for target_price_id in target_price_ids
+                        ],
+                        # Stripe flexible billing rejects legacy ``iterations``;
+                        # ``duration`` is the supported one-period phase shape.
+                        "duration": {"interval": "month", "interval_count": 1},
+                    },
+                ],
+            )
+        else:
+            # Upgrade: immediate switch. Stripe forbids changing a subscription
+            # item between licensed and metered usage types, so the safe universal
+            # move is: delete every existing item and add the target tier's prices
+            # in the same atomic modify call. Tier price ids never overlap across
+            # tiers (per-tier lookup keys), so a delete+add of the same price
+            # cannot occur; the same-tier case is rejected by the planner above.
+            #
+            # clear_usage applies only to classic-billing-mode subscriptions with
+            # legacy usage-record metered items; flexible-mode subscriptions (the
+            # default for newly created ones) reject the parameter, and
+            # Billing-Meter usage lives on the meter rather than the item, so
+            # nothing needs clearing there.
+            billing_mode_type = (subscription.get("billing_mode") or {}).get("type")
+            supports_clear_usage = billing_mode_type != "flexible"
+            items_payload: list[dict] = []
+            for existing_item in existing_items:
+                deletion: dict = {"id": existing_item["id"], "deleted": True}
+                usage_type = (
+                    (existing_item.get("price") or {}).get("recurring") or {}
+                ).get("usage_type")
+                if usage_type == "metered" and supports_clear_usage:
+                    deletion["clear_usage"] = True
+                items_payload.append(deletion)
+            for target_price_id in target_price_ids:
+                items_payload.append({"price": target_price_id})
+
+            stripe_client.Subscription.modify(
+                subscription_id,
+                items=items_payload,
+                proration_behavior="always_invoice",
+            )
+    except Exception as change_error:
+        logger.error("Could not change subscription tier: %s", change_error)
+        raise HTTPException(detail="Could not change tier.", status_code=502)
+
+    if tier_change_plan.reset_usage_period_anchor:
+        # Upgrade clears local usage: the new tier starts with a fresh allotment.
+        await _write_usage_period_anchor(request, current_user)
+
+    if pay_per_use is not None:
+        await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+
+    if tier_change_plan.schedule_change_at_period_end:
+        return {
+            "message": (
+                f"Subscription will switch to the {requested_tier.value} tier at the "
+                "period boundary; your current allotment continues until then."
+            )
+        }
+    return {"message": f"Subscription changed to the {requested_tier.value} tier."}
+
+
+@app.post("/subscribe")
+async def subscribe(
+    request: Request,
+    tier: SubscriptionTier = Query(
+        default=SubscriptionTier.PRO, description="Chosen subscription tier."
+    ),
+    pay_per_use: Optional[bool] = Query(
+        default=None,
+        description="Optional pay-per-use flag applied when the action does not start checkout.",
+    ),
+    current_user: dict = Depends(get_current_user),
+):
+    """Single subscription entry point: checkout, tier change, or reactivate.
+
+    Dispatches via ``plan_subscribe_action``:
+
+    * **start_checkout** — no live subscription; create a Stripe Checkout session
+      for the requested tier (base + metered prices). The free tier always
+      collects a payment method (pay-per-use vehicle).
+    * **no_change_required** — already on the requested tier with nothing pending;
+      subscription and trial untouched.
+    * **reactivate** — undo pending period-end cancellation or scheduled downgrade.
+    * **change_tier** — switch tiers (upgrades immediate; downgrades at period end).
+      While trialing, the usage-period anchor is not rewritten so trial free-usage
+      is retained.
+    * **reactivate_and_change_tier** — reactivate then change tier in one call.
+
+    Cancellation for end users goes through GET /manage_subscription (billing
+    portal). Anonymous users can never reach this endpoint.
+    """
     verified_email = current_user.get("email_verified", None)
     if not verified_email:
         raise HTTPException(
             detail="Please verify your email before subscribing.", status_code=401
         )
-    email = current_user.get("email")
-    user_id = current_user["app_metadata"]["customer_dict"]["id"]
-    redirect_url = f"{app.state.context.stripe_payment_url}?client_reference_id={user_id}&locked_prefilled_email={email}"
 
-    return {"url": redirect_url, "message": "Follow this link to subscribe."}
+    requested_tier = tier_from_value_or_400(
+        tier.value if isinstance(tier, SubscriptionTier) else tier
+    )
+
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    email = current_user.get("email")
+    if billing_config is None:
+        # Billing objects not provisioned yet — fall back to the legacy payment link.
+        redirect_url = (
+            f"{app.state.context.stripe_payment_url}"
+            f"?locked_prefilled_email={email}"
+        )
+        return {
+            "action": "start_checkout",
+            "url": redirect_url,
+            "message": "Follow this link to subscribe.",
+        }
+
+    stripe_client = request.app.state.stripe
+    status = await check_subscription_status(
+        request=request, current_user=current_user
+    )
+    current_status = status.get("status")
+    current_tier = tier_from_value(status.get("tier"))
+    cancel_at_period_end = False
+    has_pending_downgrade_schedule = False
+    subscription: dict | None = None
+    subscription_id = status.get("subscription_id")
+    if subscription_id and current_status in _LIVE_SUBSCRIPTION_STATUSES:
+        try:
+            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+        except Exception as retrieve_error:
+            logger.error(
+                "Could not retrieve subscription %s: %s",
+                subscription_id,
+                retrieve_error,
+            )
+            raise HTTPException(
+                detail="Could not read the current subscription. Please try again.",
+                status_code=502,
+            )
+        cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
+        has_pending_downgrade_schedule = subscription_has_pending_downgrade_schedule(
+            subscription
+        )
+
+    action = plan_subscribe_action(
+        current_status,
+        current_tier,
+        requested_tier,
+        cancel_at_period_end,
+        has_pending_downgrade_schedule,
+    )
+
+    if action is SubscribeAction.NO_CHANGE_REQUIRED:
+        if pay_per_use is not None:
+            await _apply_pay_per_use_setting(request, current_user, pay_per_use)
+        return {
+            "action": "no_change_required",
+            "message": f"Already subscribed to the {requested_tier.value} tier.",
+            "subscription_status": status,
+        }
+
+    if action is SubscribeAction.REACTIVATE:
+        assert subscription is not None
+        _reactivate_subscription_for_user(stripe_client, subscription)
+        return {
+            "action": "reactivate",
+            "message": "Subscription reactivated.",
+            "cancel_at_period_end": False,
+            "subscription_status": status,
+        }
+
+    currently_trialing = current_status == "trialing"
+    if action is SubscribeAction.CHANGE_TIER:
+        result = await _change_subscription_tier_for_user(
+            request,
+            current_user,
+            requested_tier,
+            currently_trialing=currently_trialing,
+            pay_per_use=pay_per_use,
+        )
+        return {"action": "change_tier", **result}
+
+    if action is SubscribeAction.REACTIVATE_AND_CHANGE_TIER:
+        assert subscription is not None
+        _reactivate_subscription_for_user(stripe_client, subscription)
+        result = await _change_subscription_tier_for_user(
+            request,
+            current_user,
+            requested_tier,
+            currently_trialing=currently_trialing,
+            pay_per_use=pay_per_use,
+        )
+        return {"action": "reactivate_and_change_tier", **result}
+
+    # START_CHECKOUT
+    customer_id = resolve_stripe_customer_id(current_user)
+    tier_definition = TIER_DEFINITIONS[requested_tier]
+    subscription_data: dict = {}
+    # One free trial per Stripe customer, ever — a returning user re-selecting
+    # a paid tier through Checkout pays from day one instead of harvesting a
+    # second trial (resolve_checkout_trial_period_days).
+    checkout_trial_period_days = resolve_checkout_trial_period_days(
+        stripe_client, customer_id, tier_definition.trial_period_days
+    )
+    if checkout_trial_period_days > 0:
+        subscription_data["trial_period_days"] = checkout_trial_period_days
+        # Stripe forbids the legacy payment link's "pause" end behavior on
+        # subscriptions containing metered prices; "cancel" achieves the same
+        # product outcome — the customer.subscription.deleted webhook pins the
+        # user back to the free tier when a trial lapses without a payment method.
+        subscription_data["trial_settings"] = {
+            "end_behavior": {"missing_payment_method": "cancel"}
+        }
+
+    base_url = str(request.base_url).rstrip("/")
+    checkout_kwargs: dict = {
+        "mode": "subscription",
+        "line_items": _checkout_line_items_for_tier(billing_config, requested_tier),
+        "success_url": f"{base_url}/verify_subscription_status",
+        "cancel_url": f"{base_url}/docs",
+        "metadata": {
+            "auth0_user_id": current_user.get("user_id", ""),
+            "neural_nexus_tier": requested_tier.value,
+        },
+    }
+    if requested_tier == SubscriptionTier.FREE:
+        # The first free-tier invoice totals $0, which would let Checkout skip
+        # payment-method collection — but a payment method is the entire point
+        # of the free subscription (billing pay-per-use overage), so force
+        # collection.
+        checkout_kwargs["payment_method_collection"] = "always"
+    if subscription_data:
+        checkout_kwargs["subscription_data"] = subscription_data
+    if customer_id:
+        checkout_kwargs["customer"] = customer_id
+    elif email:
+        checkout_kwargs["customer_email"] = email
+
+    try:
+        session = stripe_client.checkout.Session.create(**checkout_kwargs)
+    except Exception as checkout_error:
+        logger.error("Could not create Checkout session: %s", checkout_error)
+        raise HTTPException(
+            detail="Could not start checkout. Please try again.", status_code=502
+        )
+    return {
+        "action": "start_checkout",
+        "url": session["url"],
+        "message": "Follow this link to subscribe.",
+    }
+
+
+# Moved to src/anubis/utils/billing/subscription_lifecycle.py so the auth layer
+# (delete-and-re-signup adoption) can share the same logic; the underscore
+# aliases keep the existing call sites in this module unchanged.
+_subscription_period_bounds = subscription_period_bounds
+_release_pending_subscription_schedule = release_pending_subscription_schedule
+
+
+async def _write_usage_period_anchor(request: Request, current_user: dict) -> None:
+    """Restart the user's local usage window at this instant (upgrade semantics).
+
+    Writes ``app_metadata.usage_period_anchor`` so allotment gating and the
+    subscription-status endpoint count usage from the tier change forward —
+    "usage cleared on upgrade". Also updates the in-memory user so the current
+    request already sees the fresh window.
+    """
+    anchor_value = datetime.now(UTC).isoformat()
+    await update_user_app_metadata_fields(
+        request,
+        current_user.get("user_id"),
+        {"usage_period_anchor": anchor_value},
+    )
+    current_user.setdefault("app_metadata", {})["usage_period_anchor"] = anchor_value
+
+
+async def _apply_pay_per_use_setting(
+    request: Request, current_user: dict, enabled: bool
+) -> None:
+    """Persist the explicit pay-per-use flag, requiring a payment method to enable.
+
+    Disabling is always allowed (a user capping their own spend). Enabling
+    requires a Stripe customer with a payment method on file, because pay-per-use
+    means the graduated metered price bills overage — without a card there is
+    nothing to bill and the allotment gate would silently become an unbounded
+    free pass. Raises HTTPException with actionable guidance when the
+    requirement is not met.
+    """
+    if enabled:
+        stripe_client = request.app.state.stripe
+        customer_id = resolve_stripe_customer_id(current_user)
+        if not customer_id:
+            status = await check_subscription_status(
+                request=request, current_user=current_user
+            )
+            customer_id = status.get("customer_id")
+        if not customer_id:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Pay-per-use requires a payment method on file. Subscribe first "
+                    "(POST /subscribe?tier=free adds a card without a paid plan)."
+                ),
+            )
+        try:
+            customer_document = stripe_client.Customer.retrieve(
+                customer_id, expand=["invoice_settings.default_payment_method"]
+            ).to_dict()
+            payment_methods = []
+            if not customer_has_payment_method(customer_document):
+                payment_methods = (
+                    stripe_client.PaymentMethod.list(customer=customer_id, limit=1)
+                    .to_dict()
+                    .get("data", [])
+                )
+        except Exception as customer_error:
+            logger.error(
+                "Could not verify payment method for customer %s: %s",
+                customer_id,
+                customer_error,
+            )
+            raise HTTPException(
+                status_code=502, detail="Could not verify payment method with Stripe."
+            )
+        if not customer_has_payment_method(customer_document, payment_methods):
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "No payment method on file. Add one via GET /manage_subscription "
+                    "before enabling pay-per-use."
+                ),
+            )
+
+    updated = await update_user_app_metadata_fields(
+        request, current_user.get("user_id"), {"pay_per_use_enabled": enabled}
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=502, detail="Could not persist the pay-per-use setting."
+        )
+    current_user.setdefault("app_metadata", {})["pay_per_use_enabled"] = enabled
+
+
+@app.post("/set_pay_per_use")
+async def set_pay_per_use(
+    request: Request,
+    enabled: bool = True,
+    current_user: dict = Depends(get_current_user),
+):
+    """Enable or disable billing overage past the monthly allotment (pay-per-use).
+
+    With pay-per-use enabled, usage past a meter's allotment continues and the
+    tier's graduated metered price bills the overage; disabled, requests are
+    refused with HTTP 402 at the allotment. Enabling requires a payment method on
+    file (subscribe — the free tier's $0 subscription qualifies — or add a card
+    through the billing portal). Trialing users with a card may enable pay-per-use.
+    """
+    await _apply_pay_per_use_setting(request, current_user, enabled)
+    return {"pay_per_use_enabled": enabled}
 
 
 @app.get("/manage_subscription")
-async def manage_subscription(current_user: dict = Depends(get_current_user)):
+async def manage_subscription(
+    request: Request, current_user: dict = Depends(get_current_user)
+):
+    """Return a Stripe billing-portal session URL for this customer.
+
+    A billing-portal session is created per request, so the link works in both
+    the test and live Stripe environments (the static
+    STRIPE_MANAGE_SUBSCRIPTION_URL login page remains only as a degraded-mode
+    fallback when billing objects are not provisioned). The portal covers
+    invoices, payment methods, cancellation, and billing information; tier
+    switching stays on POST /subscribe because the portal cannot switch plans
+    that contain metered prices.
+    """
+    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    if billing_config is None:
+        return {
+            "url": request.app.state.context.stripe_manage_subscription_url,
+            "message": "Follow this link to manage your subscription.",
+        }
+
+    stripe_client = request.app.state.stripe
+    customer_id = resolve_stripe_customer_id(current_user)
+    if not customer_id:
+        status = await check_subscription_status(
+            request=request, current_user=current_user
+        )
+        customer_id = status.get("customer_id")
+    if not customer_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No billing account yet. Use POST /subscribe to create one.",
+        )
+
+    portal_kwargs: dict = {
+        "customer": customer_id,
+        "return_url": f"{str(request.base_url).rstrip('/')}/docs",
+    }
+    portal_configuration_id = getattr(billing_config, "portal_configuration_id", None)
+    if portal_configuration_id:
+        portal_kwargs["configuration"] = portal_configuration_id
+    try:
+        session = stripe_client.billing_portal.Session.create(**portal_kwargs).to_dict()
+    except Exception as portal_error:
+        logger.error("Could not create billing-portal session: %s", portal_error)
+        raise HTTPException(
+            status_code=502, detail="Could not open the billing portal. Try again."
+        )
     return {
-        "url": "https://billing.stripe.com/p/login/eVq28s6XA53C5XpdqH1oI00",
+        "url": session["url"],
         "message": "Follow this link to manage your subscription.",
     }
 
 
-@app.get("/cancel_subscription")
-async def cancel_subscription(current_user: dict = Depends(get_current_user)):
-    return {
-        "url": "https://billing.stripe.com/p/login/eVq28s6XA53C5XpdqH1oI00",
-        "message": "Follow this link to manage and cancel your subscription.",
-    }
+def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Optional[str]:
+    """Look up the Auth0 user id stored on a Stripe customer's metadata."""
+    if not customer_id:
+        return None
+    try:
+        customer = stripe_client.Customer.retrieve(customer_id).to_dict()
+        return customer.get("metadata", {}).get("auth0_user_id") or None
+    except Exception as lookup_error:
+        logger.error("Could not retrieve Stripe customer %s: %s", customer_id, lookup_error)
+        return None
+
+
+async def _handle_stripe_event(
+    request: Request, stripe_client, event_type: str, data_object: dict
+) -> None:
+    """Sync tier/status into Auth0 for the subscription-lifecycle events we care about."""
+    if event_type == "checkout.session.completed":
+        customer_id = data_object.get("customer")
+        auth0_user_id = data_object.get("metadata", {}).get(
+            "auth0_user_id"
+        ) or _auth0_user_id_for_customer(stripe_client, customer_id)
+        subscription_id = data_object.get("subscription")
+        tier = data_object.get("metadata", {}).get("neural_nexus_tier", "free")
+        status_value = "active"
+        current_period_start = None
+        current_period_end = None
+        cancel_at_period_end = False
+        if subscription_id:
+            try:
+                subscription = stripe_client.Subscription.retrieve(
+                    subscription_id
+                ).to_dict()
+                status_value = subscription.get("status", "active")
+                tier = _tier_from_subscription(stripe_client, subscription)
+                current_period_start, current_period_end = _subscription_period_bounds(
+                    subscription
+                )
+                cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
+                if status_value == "trialing" and customer_id:
+                    # A Checkout-granted trial must stamp the same one-trial-
+                    # per-customer flag the auto-enrollment path stamps, so a
+                    # later delete-and-re-signup can never harvest a second
+                    # trial through Checkout.
+                    stripe_client.Customer.modify(
+                        customer_id,
+                        metadata={"neural_nexus_trial_used": "true"},
+                    )
+            except Exception as retrieve_error:
+                logger.error("Could not retrieve subscription: %s", retrieve_error)
+        await update_user_subscription_status(
+            request,
+            auth0_user_id,
+            {
+                "status": status_value,
+                "subscription_id": subscription_id,
+                "customer_id": customer_id,
+                "email": data_object.get("customer_details", {}).get("email"),
+                "tier": tier,
+                "current_period_start": current_period_start,
+                "current_period_end": current_period_end,
+                "cancel_at_period_end": cancel_at_period_end,
+            },
+        )
+        # First checkout starts a fresh local usage window (a free→paid upgrade,
+        # or the free $0 subscription's first period).
+        await update_user_app_metadata_fields(
+            request,
+            auth0_user_id,
+            {"usage_period_anchor": datetime.now(UTC).isoformat()},
+        )
+
+    elif event_type in (
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    ):
+        # ``created`` flows through the same non-deleted sync path as
+        # ``updated`` so a subscription created outside Checkout (for example
+        # a server-side ``Subscription.create``) syncs its tier/status into
+        # Auth0 immediately instead of waiting for a later ``updated`` bump.
+        customer_id = data_object.get("customer")
+        auth0_user_id = _auth0_user_id_for_customer(stripe_client, customer_id)
+        current_period_start, current_period_end = _subscription_period_bounds(
+            data_object
+        )
+        if event_type == "customer.subscription.deleted":
+            tier = "free"
+            status_value = "canceled"
+        else:
+            tier = _tier_from_subscription(stripe_client, data_object)
+            status_value = data_object.get("status", "active")
+        await update_user_subscription_status(
+            request,
+            auth0_user_id,
+            {
+                "status": status_value,
+                "subscription_id": data_object.get("id"),
+                "customer_id": customer_id,
+                "email": None,
+                "tier": tier,
+                "current_period_start": current_period_start,
+                "current_period_end": current_period_end,
+                "cancel_at_period_end": bool(data_object.get("cancel_at_period_end")),
+            },
+        )
+        if event_type == "customer.subscription.deleted":
+            # A stale explicit pay-per-use flag must not grant overage after the
+            # subscription (the billing vehicle) is gone.
+            await update_user_app_metadata_fields(
+                request, auth0_user_id, {"pay_per_use_enabled": False}
+            )
+
+    elif event_type == "invoice.payment_failed":
+        customer_id = data_object.get("customer")
+        auth0_user_id = _auth0_user_id_for_customer(stripe_client, customer_id)
+        await update_user_subscription_status(
+            request,
+            auth0_user_id,
+            {
+                "status": "past_due",
+                "subscription_id": data_object.get("subscription"),
+                "customer_id": customer_id,
+                "email": None,
+                "tier": "free",
+            },
+        )
+
+
+def _resolve_stripe_webhook_secret(context) -> Optional[str]:
+    """Return the webhook signing secret from env, or from the CLI-shared file.
+
+    Prod sets ``STRIPE_WEBHOOK_SECRET`` once from a Dashboard "Your account"
+    endpoint. Local docker-compose leaves that empty and the ``stripe-cli``
+    service writes ``STRIPE_WEBHOOK_SECRET_FILE`` on each start — read on every
+    request so the API can come up before the CLI finishes printing the secret.
+    """
+    explicit = getattr(context, "stripe_webhook_secret", None)
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    secret_file = getattr(context, "stripe_webhook_secret_file", None)
+    if not secret_file:
+        return None
+    try:
+        with open(secret_file, encoding="utf-8") as handle:
+            value = handle.read().strip()
+        return value or None
+    except OSError:
+        return None
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Verify and process Stripe subscription-lifecycle webhooks.
+
+    This is the real-time source of truth for a user's tier/status: it keeps the
+    cached ``app_metadata.subscription_status`` in sync on checkout completion,
+    subscription updates/cancellation, and payment failure. The endpoint verifies
+    the Stripe signature against ``stripe_webhook_secret`` before trusting any data.
+    """
+    stripe_client = request.app.state.stripe
+    webhook_secret = _resolve_stripe_webhook_secret(request.app.state.context)
+    if not webhook_secret:
+        logger.error(
+            "Stripe webhook secret not configured "
+            "(set STRIPE_WEBHOOK_SECRET or wait for STRIPE_WEBHOOK_SECRET_FILE); "
+            "rejecting webhook."
+        )
+        raise HTTPException(status_code=503, detail="Webhook not configured.")
+
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature")
+    try:
+        event = stripe_client.Webhook.construct_event(
+            payload, signature, webhook_secret
+        )
+    except Exception as verify_error:
+        logger.error("Stripe webhook verification failed: %s", verify_error)
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+
+    # construct_event returns a StripeObject (not a dict subclass in stripe-python
+    # 15, so ``.get`` is unavailable); convert once here so the handler works on
+    # plain dicts.
+    event_document = event.to_dict()
+    try:
+        await _handle_stripe_event(
+            request,
+            stripe_client,
+            event_document["type"],
+            event_document["data"]["object"],
+        )
+    except Exception as handling_error:
+        # Return 200 so Stripe does not retry indefinitely on a non-transient bug;
+        # the event is logged for manual reconciliation.
+        logger.error(
+            "Error handling Stripe event %s: %s",
+            event_document["type"],
+            handling_error,
+        )
+
+    return {"received": True}
 
 
 @app.get("/verify_subscription_status")
 async def verify_subscription_status(
     request: Request, current_user: dict = Depends(get_current_user)
 ):
+    """Return subscription status plus per-meter allotment, usage, and remaining.
+
+    The single endpoint a customer portal polls: subscription identity/status,
+    the pay-per-use flag, the current usage period bounds, and — for every meter
+    the tier grants — the period allotment, usage to date (from the local
+    ``api_metrics`` accounting), remaining budget, and the overage rate that
+    applies when pay-per-use is enabled.
+    """
     status = await check_subscription_status(request=request, current_user=current_user)
-    if status["status"] == None:
-        return {"subscription_status:Not Subscribed"}
-    return status
+    tier = tier_from_value(status.get("tier"))
+
+    context = GlobalContext()
+    usage_period_days = int(context.usage_period_days or 0)
+    period_start = resolve_usage_period_start_for_user(current_user)
+
+    app_metadata = (current_user or {}).get("app_metadata") or {}
+    cached_subscription_status = app_metadata.get("subscription_status") or {}
+    cached_period_end = cached_subscription_status.get("current_period_end")
+    if cached_period_end:
+        try:
+            period_end = datetime.fromtimestamp(int(cached_period_end), tz=UTC)
+        except (TypeError, ValueError, OSError):
+            period_end = resolve_usage_period_end(period_start, usage_period_days)
+    else:
+        period_end = resolve_usage_period_end(period_start, usage_period_days)
+
+    usage_by_meter = await fetch_usage_by_meter_since(
+        getattr(request.app.state, "pool", None),
+        resolve_metering_user_id(current_user),
+        period_start,
+    )
+
+    # Trial-aware per-meter view: within a free-trial window the trial tier's
+    # allotment is a floor over the current tier's (resolve_effective_monthly_
+    # allotment), and any meter the trial tier grants but the current tier does
+    # not stays visible until trial_end. The meter order is the current tier's
+    # definition order, then any trial-only meters, kept deterministic via an
+    # insertion-ordered dict.
+    trial_context = resolve_trial_context(current_user)
+    ordered_meters: dict = dict.fromkeys(
+        TIER_DEFINITIONS[tier].meter_allotments.keys()
+    )
+    if trial_context is not None:
+        for trial_meter in TIER_DEFINITIONS[
+            trial_context.trial_tier
+        ].meter_allotments:
+            ordered_meters.setdefault(trial_meter, None)
+
+    meters: dict = {}
+    for meter in ordered_meters:
+        allotment = resolve_effective_monthly_allotment(tier, meter, trial_context)
+        if allotment is None:
+            continue
+        used_to_date = int(usage_by_meter.get(meter.value, 0))
+        meters[meter.value] = {
+            "monthly_allotment": allotment.monthly_allotment,
+            "used_to_date": used_to_date,
+            "remaining": max(0, allotment.monthly_allotment - used_to_date),
+            "overage_price_per_million": allotment.overage_price_per_million,
+            "overage_price_per_unit_usd": allotment.overage_price_per_unit_usd,
+        }
+
+    return {
+        "status": status.get("status"),
+        "tier": tier.value,
+        "subscription_id": status.get("subscription_id"),
+        "customer_id": status.get("customer_id"),
+        "email": status.get("email"),
+        "pay_per_use_enabled": resolve_pay_per_use_enabled(current_user),
+        "cancel_at_period_end": bool(
+            cached_subscription_status.get("cancel_at_period_end")
+        ),
+        "usage_period_start": period_start.isoformat(),
+        "usage_period_end": period_end.isoformat(),
+        "meters": meters,
+    }
 
 
 async def _demote_other_personal_avatars(
@@ -1661,7 +3053,9 @@ async def message_selected_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
-    include_metrics: bool = Form(True),
+    include_quality_metrics: bool = Form(True),
+    include_usage_metrics: bool = Form(True),
+    adapter: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1677,6 +3071,25 @@ async def message_selected_avatar(
             detail="Error retrieving assistant information.", status_code=400
         )
 
+    # This turn bills the adapter-inference meter only when the client asked for
+    # the adapter AND the user's tier grants adapter inference; otherwise the
+    # messaging meter governs. Attached files are processed FIRST so the
+    # pre-call estimate covers message text, attached file text, and attached
+    # images; enforcement then verifies the estimate against the allotment
+    # period BEFORE any model call (and before a thread is created). Any tier
+    # without pay-per-use is blocked at the allotment; a token rate cap guards
+    # against runaway clients.
+    message_meter = (
+        UsageMeter.ADAPTER_INFERENCE_TOKENS
+        if resolve_use_adapter_inference(current_user, adapter)
+        else UsageMeter.MESSAGING_TOKENS
+    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
+
     user_name = your_name
     user_description = your_description
     user_id = current_user["identities"][0]["user_id"]
@@ -1687,6 +3100,45 @@ async def message_selected_avatar(
         }
     }
     assistant_id = config["configurable"].get("assistant_id")
+
+    # The pre-call estimate measures the REAL system prompt for this
+    # (user, avatar) pair, so estimation reads the merged configurable the
+    # prompt builder needs (user_id, assistant_id, assistant_ctx). The merge
+    # happens on a copy: enforcement below still runs before a thread is
+    # created and before any model call.
+    estimation_config = {
+        "configurable": {
+            **config.get("configurable", {}),
+            **config_update["configurable"],
+        }
+    }
+    estimated_request_tokens = await _estimate_message_request_tokens(
+        request.app.state,
+        estimation_config,
+        message,
+        file_text_content,
+        multimodal_content,
+    )
+    await enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        message_meter,
+        estimated_request_tokens=estimated_request_tokens.input_tokens,
+    )
+    message_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
+        estimated_request_tokens=estimated_request_tokens.total_tokens,
+    )
 
     # Handle thread_id
     if not thread_id:
@@ -1711,17 +3163,16 @@ async def message_selected_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["include_quality_metrics"] = include_quality_metrics
+    config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
+        current_user, adapter
+    )
 
     # store = app.state.store
     graph = app.state.graph
 
-    # Process any uploaded files
-    (
-        file_text_content,
-        multimodal_content,
-        image_filenames,
-    ) = await process_files_for_message(files, message=message)
+    # Uploaded files were already processed above (before enforcement) so the
+    # pre-call estimate could cover them; reuse those results here.
 
     # Create the human message content
     if multimodal_content:
@@ -1755,6 +3206,11 @@ async def message_selected_avatar(
                 start_time_ns=start_time,
                 request_id=request.state.request_id,
                 langgraph_client_headers=langgraph_client_headers,
+                app_state=request.app.state,
+                current_user=current_user,
+                estimated_request_tokens=estimated_request_tokens,
+                estimate_meter=message_meter,
+                include_usage_metrics=include_usage_metrics,
             ),
             media_type="text/event-stream",
             headers={
@@ -1776,7 +3232,7 @@ async def message_selected_avatar(
         "thread_metadata": {
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "most_recent_message": datetime.now(UTC).isoformat(),
             "conversation_title": conversation_title,
         },
         "graph_id": "Anubis",
@@ -1793,6 +3249,19 @@ async def message_selected_avatar(
     logger.warning(f"RESPONSE_DATA: {response_data}")
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    turn_usage = await _meter_message_usage(
+        app_state=request.app.state,
+        current_user=current_user,
+        response_metadata=response_metadata,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        latency_ms=(time_ns() - start_time) / 1_000_000,
+        request_id=request.state.request_id,
+    )
+    if include_usage_metrics:
+        response_data["input_tokens"] = estimated_request_tokens.input_tokens
+        if turn_usage:
+            response_data["usage"] = turn_usage
     return JSONResponse(response_data, status_code=200)
 
 
@@ -1811,7 +3280,9 @@ async def message_avatar(
     like: bool = Form(False),
     dislike: bool = Form(False),
     user_timezone: Optional[str] = Form(None),
-    include_metrics: bool = Form(True),
+    include_quality_metrics: bool = Form(True),
+    include_usage_metrics: bool = Form(True),
+    adapter: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
@@ -1825,13 +3296,45 @@ async def message_avatar(
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
-        raise HTTPException(
-            detail="Error retrieving assistant information.", status_code=400
-        )
+        # This endpoint identifies the avatar by the URL path parameter, not by
+        # a previously selected avatar. An authenticated (api-key) caller
+        # rebuilds the full configurable from the path ``assistant_id`` below
+        # (name/description/metadata fetched fresh), so a pre-selected
+        # ``assistant_config`` is not required — messaging an avatar by id must
+        # work without a prior ``/select_avatar`` call. Only the anonymous
+        # branch depends on the dependency-populated ``assistant_config``
+        # (always present once an avatar resolved); start from an empty
+        # configurable that the api-key branch fills in.
+        if request.headers.get("api-key", "") != "":
+            config = {"configurable": {}}
+        else:
+            raise HTTPException(
+                detail="Error retrieving assistant information.", status_code=400
+            )
+
+    # This turn bills the adapter-inference meter only when the client asked for
+    # the adapter AND the user's tier grants adapter inference; otherwise the
+    # messaging meter governs. Attached files are processed FIRST so the
+    # pre-call estimate covers message text, attached file text, and attached
+    # images; enforcement then verifies the estimate against the allotment
+    # period BEFORE any model call (and before a thread is created). Any tier
+    # without pay-per-use is blocked at the allotment; a token rate cap guards
+    # against runaway clients.
+    message_meter = (
+        UsageMeter.ADAPTER_INFERENCE_TOKENS
+        if resolve_use_adapter_inference(current_user, adapter)
+        else UsageMeter.MESSAGING_TOKENS
+    )
+    (
+        file_text_content,
+        multimodal_content,
+        image_filenames,
+    ) = await process_files_for_message(files, message=message)
 
     user_name = your_name
     user_description = your_description
     user_id = current_user["identities"][0]["user_id"]
+    assistant_id = assistant_id.strip()
     if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
         try:
@@ -1862,6 +3365,48 @@ async def message_avatar(
             }
         }
 
+    # The pre-call estimate measures the REAL system prompt for this
+    # (user, avatar) pair, so estimation reads the merged configurable the
+    # prompt builder needs (user_id, assistant_id, assistant_ctx — the path
+    # avatar's context just fetched above, or the anonymous dependency's).
+    # The merge happens on a copy: enforcement below still runs before a
+    # thread is created and before any model call.
+    estimation_config = {
+        "configurable": {
+            **config.get("configurable", {}),
+            **config_update["configurable"],
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+        }
+    }
+    estimated_request_tokens = await _estimate_message_request_tokens(
+        request.app.state,
+        estimation_config,
+        message,
+        file_text_content,
+        multimodal_content,
+    )
+    await enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        message_meter,
+        estimated_request_tokens=estimated_request_tokens.input_tokens,
+    )
+    message_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
+        estimated_request_tokens=estimated_request_tokens.total_tokens,
+    )
+
     # Handle thread_id
     if not thread_id:
         thread_id = str(uuid4())
@@ -1885,17 +3430,16 @@ async def message_avatar(
     config["configurable"].update(config_update["configurable"])
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["include_quality_metrics"] = include_quality_metrics
+    config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
+        current_user, adapter
+    )
 
     # store = app.state.store
     graph = app.state.graph
 
-    # Process any uploaded files
-    (
-        file_text_content,
-        multimodal_content,
-        image_filenames,
-    ) = await process_files_for_message(files, message=message)
+    # Uploaded files were already processed above (before enforcement) so the
+    # pre-call estimate could cover them; reuse those results here.
 
     # Create the human message content
     if multimodal_content:
@@ -1933,6 +3477,11 @@ async def message_avatar(
                 start_time_ns=start_time,
                 request_id=request.state.request_id,
                 langgraph_client_headers=langgraph_client_headers,
+                app_state=request.app.state,
+                current_user=current_user,
+                estimated_request_tokens=estimated_request_tokens,
+                estimate_meter=message_meter,
+                include_usage_metrics=include_usage_metrics,
             ),
             media_type="text/event-stream",
             headers={
@@ -1954,7 +3503,7 @@ async def message_avatar(
         "thread_metadata": {
             "user_id": user_id,
             "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(timezone.utc).isoformat(),
+            "most_recent_message": datetime.now(UTC).isoformat(),
             "conversation_title": conversation_title_data,
         },
         "graph_id": "Anubis",
@@ -1970,6 +3519,19 @@ async def message_avatar(
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    turn_usage = await _meter_message_usage(
+        app_state=request.app.state,
+        current_user=current_user,
+        response_metadata=response_metadata,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        latency_ms=(time_ns() - start_time) / 1_000_000,
+        request_id=request.state.request_id,
+    )
+    if include_usage_metrics:
+        response_data["input_tokens"] = estimated_request_tokens.input_tokens
+        if turn_usage:
+            response_data["usage"] = turn_usage
     return JSONResponse(response_data, status_code=200)
 
 
@@ -1983,7 +3545,8 @@ async def resume_avatar_message(
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     user_timezone: Optional[str] = Form(None),
-    include_metrics: bool = Form(True),
+    include_quality_metrics: bool = Form(True),
+    include_usage_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Resume a run paused for human approval (edit/delete identity fact).
@@ -2011,6 +3574,55 @@ async def resume_avatar_message(
         raise HTTPException(
             detail="Error retrieving assistant information.", status_code=400
         )
+
+    # The resumed continuation bills the messaging meter (resume has no adapter
+    # form field) and IS a model call, so the same allotment and rate-limit
+    # gates apply as on the initial message endpoints. A resume carries no new
+    # user text or images, so the input estimate is the measured system prompt
+    # recorded when the interrupted turn built the prompt moments ago (zero on
+    # a cold cache — the recorded actual usage still governs accrual) plus the
+    # measured bound tool schemas (billed as input on every model call); the
+    # output estimate is the expected reply budget. No fixed or guessed input
+    # overhead — every input component is measured.
+    message_rate_limit_context = GlobalContext()
+    estimated_request_tokens = TokenEstimateBreakdown(
+        input_tokens=(
+            fetch_system_prompt_token_estimate(
+                current_user["identities"][0]["user_id"],
+                assistant_id,
+                max_age_seconds=float(
+                    message_rate_limit_context.system_prompt_token_estimate_cache_ttl_seconds
+                    or 0
+                ),
+            )
+            or 0
+        )
+        + await asyncio.to_thread(
+            fetch_or_measure_deep_agent_tool_schema_token_estimate
+        ),
+        output_tokens=int(
+            message_rate_limit_context.message_expected_output_tokens_estimate or 0
+        ),
+    )
+    await enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        UsageMeter.MESSAGING_TOKENS,
+        estimated_request_tokens=estimated_request_tokens.input_tokens,
+    )
+    await enforce_token_rate_limit(
+        request.app.state,
+        current_user,
+        meter_event_names=[
+            UsageMeter.MESSAGING_TOKENS.value,
+            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
+        ],
+        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        tokens_per_window=int(
+            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
+        ),
+        estimated_request_tokens=estimated_request_tokens.total_tokens,
+    )
 
     user_id = current_user["identities"][0]["user_id"]
     if request.headers.get("api-key", "") != "":
@@ -2043,7 +3655,7 @@ async def resume_avatar_message(
     config_update["configurable"]["thread_id"] = thread_id
     config["configurable"].update(config_update["configurable"])
     config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_metrics"] = include_metrics
+    config["configurable"]["include_quality_metrics"] = include_quality_metrics
 
     graph = app.state.graph
 
@@ -2077,6 +3689,11 @@ async def resume_avatar_message(
             request_id=request.state.request_id,
             langgraph_client_headers=langgraph_client_headers,
             resume_command=Command(resume=resume_payload),
+            app_state=request.app.state,
+            current_user=current_user,
+            estimated_request_tokens=estimated_request_tokens,
+            estimate_meter=UsageMeter.MESSAGING_TOKENS,
+            include_usage_metrics=include_usage_metrics,
         ),
         media_type="text/event-stream",
         headers={
@@ -3301,6 +4918,12 @@ async def _expand_youtube_playlist_to_media_entries(
     # consistent across upload paths.
     playlist_ns = _namespace_safe_formatted_filename(url_clean)
     playlist_label = (playlist_title or url_clean).strip()
+    # Per-video token estimate from the flat entry's duration — the SAME
+    # duration source and formula the endpoint billed against at submit, so
+    # child-job estimates match the batch's billed total.
+    playlist_analysis_passes = int(
+        GlobalContext().estimated_analysis_passes_per_document or 0
+    )
     media_entries: list = []
     for entry in entries:
         video_id = entry.get("id")
@@ -3309,11 +4932,23 @@ async def _expand_youtube_playlist_to_media_entries(
         )
         if not watch_url:
             continue
+        video_duration_seconds = float(entry.get("duration") or 0.0)
+        video_estimated_tokens = estimate_media_item_tokens(
+            "video",
+            duration_seconds=(
+                video_duration_seconds
+                if video_duration_seconds > 0
+                else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+            ),
+            include_analysis=True,
+            analysis_passes=playlist_analysis_passes,
+        )
         video_ns = _namespace_safe_formatted_filename(watch_url)
         video_title = (entry.get("title") or "").strip()
         media_entries.append(
             {
                 "filename": f"{playlist_label}::{video_title or watch_url}",
+                "estimated_tokens": video_estimated_tokens,
                 "content_type": "text/html",
                 "content": b"",
                 "page_url": watch_url,
@@ -3598,6 +5233,317 @@ async def _build_media_entries_for_url(
     return entries
 
 
+def _decode_entry_media_bytes(entry: dict) -> bytes | None:
+    """Return an entry's media bytes from ``content`` or its base64 data URI."""
+    content = entry.get("content")
+    if content:
+        return content
+    base64_encoded_str = entry.get("base64_encoded_str")
+    if not base64_encoded_str:
+        return None
+    payload = base64_encoded_str
+    if payload.startswith("data:") and "," in payload:
+        payload = payload.split(",", 1)[1]
+    try:
+        return base64.b64decode(payload)
+    except Exception:  # noqa: BLE001 - caller treats undecodable as absent
+        return None
+
+
+def _image_dimensions_from_bytes(image_bytes: bytes) -> tuple[int, int]:
+    """Return (width, height) pixels by parsing the image header with Pillow.
+
+    ``Image.open`` reads only the header (no full raster decode) and Pillow's
+    default decompression-bomb guard stays active. Any failure is an
+    estimation error — image dimensions are always knowable from real image
+    bytes, so an unparsable image must not reach the vision model unmetered.
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image_handle:
+            width_pixels, height_pixels = image_handle.size
+        return int(width_pixels), int(height_pixels)
+    except Exception as image_error:  # noqa: BLE001 - fail-closed estimation
+        raise TokenEstimationError(
+            f"Could not read image dimensions: {image_error}"
+        ) from image_error
+
+
+def _extract_text_from_html_bytes(body: bytes) -> str:
+    """Return the visible text of an HTML page for word-count estimation."""
+    decoded = body.decode("utf-8", errors="ignore")
+    try:
+        from bs4 import BeautifulSoup
+
+        return BeautifulSoup(decoded, "html.parser").get_text(" ")
+    except ImportError:
+        # Crude tag strip when bs4 is unavailable — good enough for a word count.
+        return re.sub(r"<[^>]+>", " ", decoded)
+
+
+def _extract_pdf_text_from_bytes(pdf_bytes: bytes, filename: str) -> str:
+    """Extract a PDF's text (PyPDFLoader over a temp file) for estimation.
+
+    The same loader the message path uses, run BEFORE any documents are
+    created so the extracted text itself is what gets estimated. Raises
+    ``TokenEstimationError`` when the PDF cannot be parsed — fail-closed.
+    """
+    from langchain_community.document_loaders import PyPDFLoader
+
+    temp_pdf_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+            temp_pdf.write(pdf_bytes)
+            temp_pdf.flush()
+            temp_pdf_path = temp_pdf.name
+        pdf_documents = PyPDFLoader(temp_pdf_path).load()
+        return "\n\n".join(
+            document.page_content
+            for document in pdf_documents
+            if hasattr(document, "page_content")
+        )
+    except Exception as pdf_error:  # noqa: BLE001 - fail-closed estimation
+        raise TokenEstimationError(
+            f"Could not extract text from PDF {filename!r}: {pdf_error}"
+        ) from pdf_error
+    finally:
+        if temp_pdf_path:
+            try:
+                os.unlink(temp_pdf_path)
+            except OSError:
+                pass
+
+
+_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS = 8.0
+
+
+async def _estimate_tokens_for_media_entry(entry: dict) -> int:
+    """Estimate one media entry's total model tokens before any model call.
+
+    Dispatches on the entry shape produced by ``_build_media_entries_for_file``
+    and ``_build_media_entries_for_url`` and applies the estimation formulas in
+    ``src/anubis/utils/billing/estimation.py``. Identity analysis is included
+    only for entries the pipeline will actually analyze (reference-image and
+    reference-audio uploads skip analysis), so estimates track the pipeline's
+    real model usage.
+
+    Fail-closed: anything that cannot be estimated raises
+    ``TokenEstimationError`` (the endpoint answers 422 naming the item). The
+    ONLY sanctioned fallback is an unknown duration on a confirmed audio/video
+    item, which assumes ``ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS``.
+    """
+    context = GlobalContext()
+    analysis_passes = int(context.estimated_analysis_passes_per_document or 0)
+    include_analysis = not (
+        entry.get("reference_audio") or entry.get("reference_image")
+    )
+    content_type = (entry.get("content_type") or "").split(";")[0].strip().lower()
+    filename = entry.get("filename") or entry.get("page_url") or "item"
+
+    def _estimate_for_duration(kind: str, duration_seconds: float | None) -> int:
+        effective_duration = (
+            duration_seconds
+            if duration_seconds and duration_seconds > 0
+            else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+        )
+        return estimate_media_item_tokens(
+            kind,
+            duration_seconds=effective_duration,
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # Images: bytes are always in hand (uploads carry ``content``; image URLs
+    # were downloaded into the data URI when the entry was built).
+    if content_type.startswith("image/") or entry.get("image_url"):
+        image_bytes = _decode_entry_media_bytes(entry)
+        if image_bytes is None and entry.get("image_url"):
+            image_bytes, _header = await fetch_remote_url_bytes(entry["image_url"])
+        if not image_bytes:
+            raise TokenEstimationError(f"No image bytes available for {filename!r}.")
+        width_pixels, height_pixels = _image_dimensions_from_bytes(image_bytes)
+        return estimate_media_item_tokens(
+            "image",
+            width_pixels=width_pixels,
+            height_pixels=height_pixels,
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # Audio: measure the clip we already hold; duration-probe failure takes the
+    # sanctioned fallback (the type IS confirmed audio).
+    if content_type.startswith("audio/") or entry.get("audio_url"):
+        from src.anubis.utils.utility import get_audio_duration_seconds
+
+        duration_seconds = None
+        media_payload = entry.get("base64_encoded_str")
+        if media_payload:
+            try:
+                duration_seconds = await get_audio_duration_seconds(
+                    media_payload, entry.get("filename")
+                )
+            except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                logger.warning(
+                    "Audio duration probe failed for %s (%s); assuming %.0f seconds.",
+                    filename,
+                    duration_error,
+                    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+                )
+        return _estimate_for_duration("audio", duration_seconds)
+
+    # Video: processed as its audio track — same formula over the video duration.
+    if content_type.startswith("video/") or entry.get("video_url"):
+        from src.anubis.utils.utility import get_video_duration_seconds
+
+        duration_seconds = None
+        media_payload = entry.get("base64_encoded_str")
+        if media_payload:
+            try:
+                duration_seconds = await get_video_duration_seconds(
+                    media_payload, entry.get("filename")
+                )
+            except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                logger.warning(
+                    "Video duration probe failed for %s (%s); assuming %.0f seconds.",
+                    filename,
+                    duration_error,
+                    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+                )
+        return _estimate_for_duration("video", duration_seconds)
+
+    # URLs: probe what the URL actually yields and estimate that media type.
+    if entry.get("page_url"):
+        page_url = entry["page_url"]
+
+        # YouTube pages probe as text/html but their payload is video/audio —
+        # read the duration from metadata only (nothing downloaded).
+        if _is_youtube_url(page_url):
+            from src.anubis.utils.utility import get_remote_video_duration_seconds
+
+            duration_seconds = None
+            try:
+                duration_seconds = await asyncio.wait_for(
+                    get_remote_video_duration_seconds(page_url),
+                    timeout=_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS,
+                )
+            except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                logger.warning(
+                    "Remote duration probe failed for %s (%s); assuming %.0f seconds.",
+                    page_url,
+                    duration_error,
+                    ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
+                )
+            return _estimate_for_duration("video", duration_seconds)
+
+        # Rich single-URL entries downloaded the page body into the data URI;
+        # bulk lightweight entries carry nothing yet — probe the content type
+        # and estimate the real media behind the URL.
+        page_bytes = _decode_entry_media_bytes(entry)
+        if page_bytes is None:
+            probed_content_type = await probe_remote_url_content_type(page_url)
+            if probed_content_type.startswith("image/"):
+                image_bytes, _header = await fetch_remote_url_bytes(page_url)
+                width_pixels, height_pixels = _image_dimensions_from_bytes(image_bytes)
+                return estimate_media_item_tokens(
+                    "image",
+                    width_pixels=width_pixels,
+                    height_pixels=height_pixels,
+                    include_analysis=include_analysis,
+                    analysis_passes=analysis_passes,
+                )
+            if probed_content_type.startswith("audio/"):
+                from src.anubis.utils.utility import get_audio_duration_seconds
+
+                audio_bytes, _header = await fetch_remote_url_bytes(page_url)
+                duration_seconds = None
+                try:
+                    duration_seconds = await get_audio_duration_seconds(
+                        base64.b64encode(audio_bytes).decode("ascii"), page_url
+                    )
+                except Exception:  # noqa: BLE001 - sanctioned fallback
+                    pass
+                return _estimate_for_duration("audio", duration_seconds)
+            if probed_content_type.startswith("video/"):
+                from src.anubis.utils.utility import get_remote_video_duration_seconds
+
+                duration_seconds = None
+                try:
+                    duration_seconds = await asyncio.wait_for(
+                        get_remote_video_duration_seconds(page_url),
+                        timeout=_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS,
+                    )
+                except Exception:  # noqa: BLE001 - sanctioned fallback
+                    pass
+                return _estimate_for_duration("video", duration_seconds)
+            page_bytes, _header = await fetch_remote_url_bytes(page_url)
+        page_text = _extract_text_from_html_bytes(page_bytes)
+        return estimate_media_item_tokens(
+            "text",
+            word_count=count_words(page_text),
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # PDFs: extract the text FIRST and estimate the extracted words.
+    if content_type == "application/pdf":
+        pdf_bytes = _decode_entry_media_bytes(entry) or b""
+        pdf_text = _extract_pdf_text_from_bytes(pdf_bytes, filename)
+        return estimate_media_item_tokens(
+            "text",
+            word_count=count_words(pdf_text),
+            include_analysis=include_analysis,
+            analysis_passes=analysis_passes,
+        )
+
+    # Everything else is text-shaped (plain text, markdown, CSV-statements
+    # JSON, arbitrary JSON): decode and count the actual words.
+    text_bytes = _decode_entry_media_bytes(entry) or b""
+    text_content = text_bytes.decode("utf-8", errors="ignore")
+    return estimate_media_item_tokens(
+        "text",
+        word_count=count_words(text_content),
+        include_analysis=include_analysis,
+        analysis_passes=analysis_passes,
+    )
+
+
+async def _estimate_media_entries_tokens(media_files: list) -> int:
+    """Stamp ``estimated_tokens`` on every entry (probing in parallel) and sum.
+
+    Bulk requests probe their URLs concurrently. Fail-closed: the first entry
+    that cannot be estimated aborts the request with HTTP 422 naming the item —
+    nothing unestimated may proceed to a model.
+    """
+
+    async def _estimate_one(entry: dict) -> int:
+        try:
+            estimated = await _estimate_tokens_for_media_entry(entry)
+        except (TokenEstimationError, HTTPException) as estimation_error:
+            item_name = entry.get("filename") or entry.get("page_url") or "item"
+            detail = (
+                estimation_error.detail
+                if isinstance(estimation_error, HTTPException)
+                else str(estimation_error)
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Could not estimate token usage for {item_name!r}: {detail} "
+                    "The request was not processed."
+                ),
+            ) from estimation_error
+        entry["estimated_tokens"] = estimated
+        return estimated
+
+    estimates = await asyncio.gather(
+        *(_estimate_one(entry) for entry in media_files)
+    )
+    return sum(estimates)
+
+
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: OptionalUploadFiles = None,
@@ -3653,6 +5599,12 @@ async def update_avatar_identity_with_media(
     in the request, including expanded playlist children.
     """
     try:
+        # Gate: only pro/premium tiers may update avatar identity with media.
+        # Allotment and rate-limit enforcement run AFTER the media entries are
+        # built and estimated, so the decision uses this request's real
+        # estimated token cost — see the enforcement block below.
+        enforce_tier_capability(current_user, TierCapability.UPLOAD)
+
         user_id = current_user["identities"][0]["user_id"]
         if not assistant_id:
             raise HTTPException(status_code=400, detail="assistant_id is required")
@@ -3868,6 +5820,109 @@ async def update_avatar_identity_with_media(
             for entry in media_files:
                 entry["create_reference_media_from_playlist"] = True
 
+        # ------------------------------------------------------------------
+        # Pre-request token estimation (fail-closed), then enforcement, then
+        # metering — all BEFORE any model call happens. Every entry gets a
+        # typed estimate (image dimensions, audio/video durations, extracted
+        # text word counts); playlists are enumerated now so their videos'
+        # durations are billed accurately at submit.
+        # ------------------------------------------------------------------
+        estimated_tokens_total = await _estimate_media_entries_tokens(media_files)
+
+        playlist_estimated_tokens = 0
+        if playlist_urls:
+            from src.anubis.utils.utility import get_remote_playlist_video_durations
+
+            estimation_context = GlobalContext()
+            playlist_analysis_passes = int(
+                estimation_context.estimated_analysis_passes_per_document or 0
+            )
+            for playlist_url in playlist_urls:
+                try:
+                    playlist_video_durations = await get_remote_playlist_video_durations(
+                        playlist_url
+                    )
+                except Exception as playlist_error:  # noqa: BLE001 - fail-closed
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Could not enumerate playlist {playlist_url!r} to "
+                            f"estimate token usage: {playlist_error} "
+                            "The request was not processed."
+                        ),
+                    ) from playlist_error
+                if not playlist_video_durations:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Playlist {playlist_url!r} contains no videos to "
+                            "estimate. The request was not processed."
+                        ),
+                    )
+                for video_duration_seconds in playlist_video_durations:
+                    playlist_estimated_tokens += estimate_media_item_tokens(
+                        "video",
+                        duration_seconds=(
+                            video_duration_seconds
+                            if video_duration_seconds > 0
+                            else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+                        ),
+                        include_analysis=True,
+                        analysis_passes=playlist_analysis_passes,
+                    )
+        estimated_tokens_total += playlist_estimated_tokens
+
+        # Enforce allotment and token rate with this request's estimate so an
+        # over-budget upload is refused before anything is spent (admin
+        # testing bypass happens inside the helpers).
+        await enforce_remaining_allotment(
+            app.state,
+            current_user,
+            UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+            estimated_request_tokens=estimated_tokens_total,
+        )
+        media_upload_rate_limit_context = GlobalContext()
+        await enforce_token_rate_limit(
+            app.state,
+            current_user,
+            meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
+            window_seconds=int(
+                media_upload_rate_limit_context.media_upload_rate_limit_window_seconds
+                or 0
+            ),
+            tokens_per_window=int(
+                media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
+                or 0
+            ),
+            estimated_request_tokens=estimated_tokens_total,
+        )
+
+        # Report the estimate against the document-upload meter (Stripe +
+        # local api_metrics). Billing WRITES stay fail-open — only estimation
+        # is fail-closed. The admin testing account is never metered.
+        upload_admin_metering_bypass = is_admin_metering_bypass(
+            current_user, GlobalContext().admin_user_id
+        )
+        if not upload_admin_metering_bypass and estimated_tokens_total > 0:
+            try:
+                await report_meter_event(
+                    app.state.stripe,
+                    UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                    resolve_stripe_customer_id(current_user),
+                    estimated_tokens_total,
+                )
+                await persist_api_metrics_row(
+                    getattr(app.state, "pool", None),
+                    inference_type="document_upload",
+                    total_tokens=estimated_tokens_total,
+                    user_id=resolve_metering_user_id(current_user),
+                    stripe_customer_id=resolve_stripe_customer_id(current_user),
+                    assistant_id=assistant_id,
+                    meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
+                )
+            except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
+                logger.error("Failed to meter upload usage: %s", upload_metering_error)
+
         store = app.state.store
 
         # Collect every namespace_filename already indexed for this avatar. The
@@ -3952,6 +6007,7 @@ async def update_avatar_identity_with_media(
                 parent_id=master.job_id,
                 filename=media_file.get("filename"),
                 namespace_filename=media_file.get("namespace_filename"),
+                estimated_tokens=media_file.get("estimated_tokens"),
             )
             master.child_ids.append(child.job_id)
             items.append({"child": child, "media_file": media_file})
@@ -3960,6 +6016,7 @@ async def update_avatar_identity_with_media(
                     "job_id": child.job_id,
                     "filename": child.filename,
                     "status": child.status,
+                    "estimated_tokens": media_file.get("estimated_tokens"),
                     "status_url": f"/media_job/{child.job_id}",
                     "progress_url": f"/media_job/{child.job_id}/progress",
                     "cancel_url": f"/media_job/{child.job_id}/cancel",
@@ -4015,6 +6072,18 @@ async def update_avatar_identity_with_media(
                 # those child ids surface on the master's progress stream as
                 # ``playlist_child_added`` events rather than in this response.
                 "playlists_expanding": len(playlist_urls),
+                # The full pre-request estimate (playlist videos included) that
+                # was checked against the allotment and reported to the meter,
+                # plus where the caller now stands against the allotment.
+                "estimated_tokens_total": estimated_tokens_total,
+                "usage": await _build_meter_usage_snapshot(
+                    app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
+                ),
+                **(
+                    {"admin_metering_bypass": True}
+                    if upload_admin_metering_bypass
+                    else {}
+                ),
                 "message": (
                     "Media processing started; enumerating "
                     f"{len(playlist_urls)} playlist(s) in the background"
@@ -4103,6 +6172,7 @@ async def media_job_status(
     it returns that single item's status/result.
     """
     user_id = current_user["identities"][0]["user_id"]
+    job_id = job_id.strip()
     registry = app.state.media_jobs
     job: Optional[MediaJob] = get_job(registry, job_id)
     if job is None:
@@ -4116,6 +6186,7 @@ async def media_job_status(
             "filename": j.filename,
             "namespace_filename": j.namespace_filename,
             "status": j.status,
+            "estimated_tokens": j.estimated_tokens,
             "error": j.error,
             "created_at": j.created_at,
             "started_at": j.started_at,
@@ -4134,6 +6205,9 @@ async def media_job_status(
         children = [registry[cid] for cid in job.child_ids if cid in registry]
         statuses = [c.status for c in children]
         snapshot["children"] = [_descriptor(c) for c in children]
+        snapshot["estimated_tokens_total"] = sum(
+            c.estimated_tokens or 0 for c in children
+        )
         snapshot["children_total"] = len(children)
         snapshot["children_completed"] = statuses.count("completed")
         snapshot["children_error"] = statuses.count("error")
@@ -4156,6 +6230,7 @@ async def media_job_progress(
     status and result (or error).
     """
     user_id = current_user["identities"][0]["user_id"]
+    job_id = job_id.strip()
     job: Optional[MediaJob] = get_job(app.state.media_jobs, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job_id")
@@ -4289,6 +6364,7 @@ async def cancel_media_job(
     there may be nothing to delete.
     """
     user_id = current_user["identities"][0]["user_id"]
+    job_id = job_id.strip() # remove spaces and newline characters
     registry = app.state.media_jobs
     job: Optional[MediaJob] = get_job(registry, job_id)
     if job is None:

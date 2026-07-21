@@ -1,4 +1,3 @@
-<<<<<<< Updated upstream
 # Final updates before launch
 - [ ] preprocessing
 - [ ] adapter training and inference infastructure
@@ -8,14 +7,6 @@
 - [ ] social media connection: will not effect any upload or messaging endpoint (prevent uploading if not of the user)
 - [ ] integrations (wrappers around the current inference endpoint)
 
-=======
-# Final updates 
-- [ ] preprocessing
-- [ ] adapter training and inference infastructure
-- [ ] metering
-- [ ] social media connection
-- [ ] integrations
->>>>>>> Stashed changes
 - [ ] onboarding                                                                                                               
 
 

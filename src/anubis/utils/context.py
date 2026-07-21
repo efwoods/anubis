@@ -664,6 +664,191 @@ class GlobalContext:
         default=None, metadata={"description": "Payment URL for subscriptions."}
     )
 
+    stripe_publishable_key: str = field(
+        default=None,
+        metadata={
+            "description": "Stripe publishable (client-side) key used to render checkout."
+        },
+    )
+
+    stripe_manage_subscription_url: str = field(
+        default=None,
+        metadata={
+            "description": "Stripe customer-portal login URL for managing/cancelling a subscription."
+        },
+    )
+
+    stripe_webhook_secret: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Signing secret used to verify inbound Stripe webhook events "
+                "(Dashboard 'Your account' endpoint, or a fixed whsec_). "
+                "When empty, the API falls back to stripe_webhook_secret_file "
+                "(written by the docker-compose stripe-cli service)."
+            )
+        },
+    )
+
+    stripe_webhook_secret_file: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Path to a file containing a whsec_ signing secret. Used when "
+                "STRIPE_WEBHOOK_SECRET is unset — typically "
+                "/run/stripe/webhook_secret from the compose stripe-cli service. "
+                "Env STRIPE_WEBHOOK_SECRET_FILE."
+            )
+        },
+    )
+
+    stripe_billing_config_json: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "JSON emitted by scripts/provision_stripe_billing.py mapping the four "
+                "meter event names to meter ids and each tier to its flat base price id "
+                "and per-meter graduated price ids. Parsed via "
+                "src.anubis.utils.billing.config.load_stripe_billing_config. When "
+                "empty, the API falls back to stripe_billing_config_file (written by "
+                "the docker-compose stripe-provision service)."
+            )
+        },
+    )
+
+    stripe_billing_config_file: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Path to a file containing the billing-config JSON. Used when "
+                "STRIPE_BILLING_CONFIG_JSON is unset — typically "
+                "/run/stripe/billing_config.json, written by the compose "
+                "stripe-provision service so no JSON is pasted into the env. "
+                "Env STRIPE_BILLING_CONFIG_FILE."
+            )
+        },
+    )
+
+    message_rate_limit_window_seconds: int = field(
+        default=60,
+        metadata={
+            "description": (
+                "Length, in seconds, of the rolling window used by the per-user "
+                "token rate limit on the message endpoints. Combined with "
+                "MESSAGE_RATE_LIMIT_TOKENS_PER_WINDOW: a message request is "
+                "refused with HTTP 429 and a Retry-After header when the user's "
+                "summed messaging plus adapter-inference token usage inside this "
+                "window already meets the cap."
+            )
+        },
+    )
+
+    message_rate_limit_tokens_per_window: int = field(
+        default=0,
+        metadata={
+            "description": (
+                "Maximum messaging plus adapter-inference tokens one user may "
+                "consume inside each MESSAGE_RATE_LIMIT_WINDOW_SECONDS rolling "
+                "window (a tokens-per-minute style limit, in the spirit of the "
+                "OpenAI rate-limit guide). This is an abuse guard independent of "
+                "the monthly allotment and of pay-per-use, so a runaway client "
+                "cannot burn a month's budget or an unbounded overage bill in "
+                "minutes. Zero disables the limit."
+            )
+        },
+    )
+
+    media_upload_rate_limit_window_seconds: int = field(
+        default=60,
+        metadata={
+            "description": (
+                "Length, in seconds, of the rolling window used by the per-user "
+                "token rate limit on the update_avatar_identity_with_media "
+                "endpoint. Combined with MEDIA_UPLOAD_RATE_LIMIT_TOKENS_PER_WINDOW."
+            )
+        },
+    )
+
+    media_upload_rate_limit_tokens_per_window: int = field(
+        default=0,
+        metadata={
+            "description": (
+                "Maximum document-upload token-equivalents one user may consume "
+                "inside each MEDIA_UPLOAD_RATE_LIMIT_WINDOW_SECONDS rolling "
+                "window on the update_avatar_identity_with_media endpoint. Zero "
+                "disables the limit."
+            )
+        },
+    )
+
+    usage_period_days: int = field(
+        default=0,
+        metadata={
+            "description": (
+                "Length, in days, of the local usage-allotment period read by "
+                "allotment gating and the subscription-status endpoint. Zero "
+                "(the default) means calendar-month periods, matching Stripe's "
+                "monthly billing cycle; a positive value means fixed-length "
+                "windows counted from the user's usage_period_anchor (or the "
+                "deterministic global anchor when the user has none)."
+            )
+        },
+    )
+
+    estimated_analysis_passes_per_document: int = field(
+        default=2,
+        metadata={
+            "description": (
+                "Number of identity-analysis passes that re-read one uploaded "
+                "item's extracted content (transcript or text) — used by the "
+                "pre-request token estimate as extracted-content tokens times "
+                "this pass count. Two models the current pipeline "
+                "(classification plus identity-dimension analysis); set to "
+                "zero if the analysis stage is dropped so estimates reflect "
+                "the change in advance of any model call."
+            )
+        },
+    )
+
+    system_prompt_token_estimate_cache_ttl_seconds: int = field(
+        default=300,
+        metadata={
+            "description": (
+                "Maximum age, in seconds, of a cached system-prompt token "
+                "measurement used by the pre-request message estimate. Every "
+                "load_consciousness build refreshes the measurement, so the "
+                "time-to-live only bounds staleness between a large identity "
+                "upload and the next message turn."
+            )
+        },
+    )
+
+    anonymous_billing_enabled: str = field(
+        default="FALSE",
+        metadata={
+            "description": (
+                "TRUE enables per-hashed-ip Stripe metering for anonymous "
+                "users: each anonymous visitor lazily receives a Stripe "
+                "customer with a $0 free-tier subscription so anonymous "
+                "usage is visible in Stripe cost analysis. FALSE (the "
+                "default) keeps anonymous metering local-only (api_metrics), "
+                "avoiding Stripe customer fan-out in development."
+            )
+        },
+    )
+
+    message_expected_output_tokens_estimate: int = field(
+        default=512,
+        metadata={
+            "description": (
+                "Expected completion-token budget for one message reply, used "
+                "by the manual pre-request message estimate (billed usage "
+                "covers prompt AND completion tokens). Calibrate from "
+                "observed api_metrics completion_tokens."
+            )
+        },
+    )
+
     baseline_response_threshold: float = field(
         default=47.66322963655769,
         metadata={

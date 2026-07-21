@@ -22,7 +22,7 @@ services:
         restart: unless-stopped
 
     langgraph-api-dev:
-        image: evdev3/anubis-langgraph-api:0.0.1
+        image: evdev3/anubis-langgraph-api:latest
         pull_policy: never
         dns:
             - 168.83.129.16

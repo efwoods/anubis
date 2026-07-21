@@ -300,6 +300,40 @@ async def login_user(email: str, password: str, request: Request) -> dict:
         )
 
 
+async def set_login_status(user_id: str, logged_in: bool, request: Request) -> None:
+    """
+    Set the server-controlled `logged_in` flag in the Auth0 user's app_metadata.
+
+    app_metadata is read-only to the user (user_metadata is user-writable), so
+    it is the correct place for a session flag the user must not be able to
+    spoof. Auth0 merges app_metadata by key on PATCH, so the sibling `api_key`
+    is preserved. Any cached copy of the user is dropped so the next auth lookup
+    (and /verify_login_status) reflects the new status instead of a stale one.
+
+    `user_id` is the full Auth0 subject, e.g. "auth0|6a5e59310832afadd626e583".
+    """
+    encoded_user_id = quote(user_id, safe="")
+    headers = await _mgmt_headers(request)
+    response = await request.app.state.httpx_client.patch(
+        f"{BASE_AUTH_URL}/api/v2/users/{encoded_user_id}",
+        json={"app_metadata": {"logged_in": logged_in}},
+        headers=headers,
+    )
+    response.raise_for_status()
+
+    # identities[0]["user_id"] is the bare id (no "auth0|" prefix), which is what
+    # the cached user objects are keyed on — mirror rotate_api_key's invalidation.
+    bare_user_id = user_id.split("|")[-1]
+    async with _cache_lock:
+        stale = [
+            key
+            for key, cached_user in _api_key_cache.items()
+            if cached_user["identities"][0]["user_id"] == bare_user_id
+        ]
+        for key in stale:
+            del _api_key_cache[key]
+
+
 async def get_user(user_id: str, request: Request) -> dict:
     response = await request.app.state.httpx_client.get(
         f"{BASE_AUTH_URL}/api/v2/users/{user_id}",
@@ -891,74 +925,63 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         raise HTTPException(status_code=500, detail=f"Error deleting user: {e}")
 
 
-# @security_route.post("/login")
-# async def login(body: LoginRequest, request: Request):
-#     try:
-#         # returns: access_token, refresh_token, id_token, expires_in
-#         response = await login_user(body.email, body.password, request=request)
-#         response.raise_for_status()
-#         logger.warning(f"response.status_code: {response.status_code}")
-#         if response.status_code == 200:
-#             data = response.json()
-#             logger.warning(f"DATA: {data}")
-#             user_info = jwt.get_unverified_claims(data.get('id_token'))
-#             logger.warning(f"DATA: {user_info}")
-#             logger.warning("XXXXXXXXXXXXXXXXXXXXX UPDATE USER LOGIN")
-#             payload = {
-#                 "app_metadata": {
-#                     "logged_in": True
-#                 }
-#             }
+@security_route.post("/login")
+async def login(body: LoginRequest, request: Request):
+    """
+    Authenticate a user with email + password against Auth0 (Resource Owner
+    Password Grant) and return the token set: access_token, id_token,
+    refresh_token, expires_in. The custom dashboard stores these client-side;
+    the refresh_token is what /logout later revokes.
 
-#             logger.warning('update login status breakpoint')
-#             # Note: user_id must be URL encoded (e.g., auth0|123 -> auth0%7C123)
-#             encoded_id = quote(user_info['sub'], safe="")
-#             headers = await _mgmt_headers(request)
-#             await request.app.state.httpx_client.patch(
-#                 f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
-#                 json=payload,
-#                 headers=headers,
-#             )
-#             return data
-#         else:
-#             raise HTTPException(status_code=response.status_code, detail=response.json())
-#     except Exception as e:
-#         raise HTTPException(status_code=response.status_code, detail=response.json())
+    Requires the Auth0 tenant/application to have the Resource Owner Password
+    Grant enabled and a Default Directory set to the database connection.
+    """
+    response = await login_user(body.email, body.password, request=request)
+    # httpx does not raise on 4xx, so an invalid credential comes back as a
+    # non-200 response we must surface explicitly (e.g. Auth0's 403
+    # "invalid_grant" / "unauthorized").
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.json())
+    data = response.json()
+    # The id_token carries the Auth0 user id in `sub`; mark the user logged in.
+    claims = jwt.get_unverified_claims(data["id_token"])
+    await set_login_status(claims["sub"], logged_in=True, request=request)
+    return data
 
-# @security_route.get("/get_user_profile")
-# async def get_user_profile(request: Request, current_user: dict = Depends(get_current_user)):
-# You don't need to pass user_id in the URL or body;
-# it is extracted from the token you're wearing!
-# user_id = current_user["user_id"]
-# return {"user_id": user_id}
 
-# @security_route.post("/logout")
-# async def logout(body: LogoutRequest, request:Request, current_user: dict = Depends(get_current_user)):
+@security_route.post("/logout")
+async def logout(
+    body: LogoutRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user_allow_unverified),
+):
+    """
+    Revoke the refresh token at Auth0 so the session can no longer be renewed,
+    and clear the user's `logged_in` app_metadata flag. The API-KEY is required
+    (not the possibly-expired access token) so the user can always be identified
+    to update the flag.
+    """
+    response = await logout_user(body.refresh_token, request=request)
+    # Auth0 POST /oauth/revoke returns 200 with an empty body on success.
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.json())
+    await set_login_status(current_user["user_id"], logged_in=False, request=request)
+    return {"message": "Logged out successfully"}
 
-#     response = await logout_user(body.refresh_token, request=request)
-#     try:
 
-#         response.raise_for_status()
-#         if response.status_code == 200:
-#             logger.warning("XXXXXXXXXXXXXXXXXXXXX UPDATE USER LOGIN")
-#             payload = {
-#                 "user_metadata": {
-#                     "logged_in": False
-#                 }
-#             }
-
-#             logger.warning('update login status breakpoint')
-#             # Note: user_id must be URL encoded (e.g., auth0|123 -> auth0%7C123)
-#             encoded_id = quote(current_user['user_id'], safe="")
-#             headers = await _mgmt_headers(request)
-#             await request.app.state.httpx_client.patch(
-#                 f"{BASE_AUTH_URL}/api/v2/users/{encoded_id}",
-#                 json=payload,
-#                 headers=headers,
-#             )
-#         return {"message": "Logged out successfully"}
-#     except Exception as e:
-#         raise HTTPException(detail = response.json(), status_code=response.status_code)
+@security_route.get("/verify_login_status")
+async def verify_login_status(
+    request: Request,
+    current_user: dict = Depends(get_current_user_allow_unverified),
+):
+    """
+    Report whether the user currently has an active login session, i.e. the
+    `logged_in` app_metadata flag set by /login and cleared by /logout. Because
+    /login and /logout invalidate the auth cache, this reads a fresh value from
+    Auth0 rather than a stale cached copy.
+    """
+    logged_in = current_user.get("app_metadata", {}).get("logged_in", False)
+    return {"logged_in": bool(logged_in)}
 
 
 import pandas as pd

@@ -10,3 +10,7 @@ ANY CONVERSATION WITH ANY AVATAR ALLOWS THE MESSAGES SENT TO BE USED TO TRAIN TH
 THIS IS A PARAMETER THAT IS CARRIED IN THE AVATAR METADATA AND IS SET AS A PARAMETER IN /CREATE_AVATAR AND MODIFIY AVATAR; 
 
 NON-CREATOR USERS CANNOT ACCESS INFORMATION (MCP OR OTHER INFORMATION) THAT IS ACCESSABLE TO THE CREATOR USER ONLY;
+
+##
+connect gmail account to schedule meetings, check availability: https://docs.langchain.com/oss/python/integrations/tools/google_calendar
+(For a multi-agent or background workflow, use LangGraph to build the booking assistant. This allows the agent to check your availability, draft a reply to the user (via Gmail) negotiating a time, and finalize the calendar event once a mutual time is agreed upon.)

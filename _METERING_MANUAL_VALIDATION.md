@@ -30,7 +30,7 @@ Allotments (catalog, `src/anubis/utils/billing/tiers.py`):
 Set both caps to 0 and recreate the API container, otherwise a second message
 within 60s trips the 429 rate limit (~19k prior + ~22k estimate vs the 30k cap):
 
-```
+```sk-kRwuKdkGnq8--piuT2PfJRWcRJji3h9cr2eU6Ir9NuE
 MESSAGE_RATE_LIMIT_TOKENS_PER_WINDOW=0
 MEDIA_UPLOAD_RATE_LIMIT_TOKENS_PER_WINDOW=0
 ```

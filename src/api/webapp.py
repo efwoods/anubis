@@ -3326,9 +3326,21 @@ async def message_avatar(
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
-        raise HTTPException(
-            detail="Error retrieving assistant information.", status_code=400
-        )
+        # This endpoint identifies the avatar by the URL path parameter, not by
+        # a previously selected avatar. An authenticated (api-key) caller
+        # rebuilds the full configurable from the path ``assistant_id`` below
+        # (name/description/metadata fetched fresh), so a pre-selected
+        # ``assistant_config`` is not required — messaging an avatar by id must
+        # work without a prior ``/select_avatar`` call. Only the anonymous
+        # branch depends on the dependency-populated ``assistant_config``
+        # (always present once an avatar resolved); start from an empty
+        # configurable that the api-key branch fills in.
+        if request.headers.get("api-key", "") != "":
+            config = {"configurable": {}}
+        else:
+            raise HTTPException(
+                detail="Error retrieving assistant information.", status_code=400
+            )
 
     # This turn bills the adapter-inference meter only when the client asked for
     # the adapter AND the user's tier grants adapter inference; otherwise the

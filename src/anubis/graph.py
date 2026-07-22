@@ -5,6 +5,7 @@ src/anubis/graph.py
 Super-Graph with a central Langchain Agent and subgraph tool use.
 """
 
+import asyncio
 import logging
 import math
 
@@ -193,7 +194,8 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             value={"value": json.dumps(baseline_key_phrases)},
         )
 
-    features_dict = extract_style_features(
+    features_dict = await asyncio.to_thread(
+        extract_style_features,
         text=avatar_response.content,
         key_phrases=baseline_key_phrases,
     )
@@ -278,8 +280,8 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             )
 
         # Compare the difference between the synthetic text and the unaltered chatgpt responses
-        M_d_square_synth_from_baseline_chatgpt = compute_mahalanobis_distance(
-            features_arr, baseline_features_arr
+        M_d_square_synth_from_baseline_chatgpt = await asyncio.to_thread(
+            compute_mahalanobis_distance, features_arr, baseline_features_arr
         )
 
         # Explain the result
@@ -327,7 +329,8 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
 
         # Swap ONLY key_phrase_rate to the avatar-referenced value; every other
         # feature is text-only and carries over from the baseline-scored dict.
-        ground_truth_features_dict = extract_style_features(
+        ground_truth_features_dict = await asyncio.to_thread(
+            extract_style_features,
             avatar_response.content,
             key_phrases=avatar_key_phrases,
             update_key_phrases_only=True,
@@ -420,22 +423,37 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 return
 
             # Compute the difference between the synthetic text and the direct quotes.
-            M_d_square_synth_from_ground_truth_corpus = compute_mahalanobis_distance(ground_truth_candidate_arr, ground_truth_text_features_arr)
+            M_d_square_synth_from_ground_truth_corpus = await asyncio.to_thread(
+                compute_mahalanobis_distance,
+                ground_truth_candidate_arr,
+                ground_truth_text_features_arr,
+            )
 
             # Predict and explain the classification
-            ground_truth_prediction = bool(ground_truth_text_features_model.predict(ground_truth_candidate_arr.reshape(1,-1))==1)
+            ground_truth_prediction = bool(
+                await asyncio.to_thread(
+                    ground_truth_text_features_model.predict,
+                    ground_truth_candidate_arr.reshape(1, -1),
+                )
+                == 1
+            )
 
             # KernelExplainer weights model.predict over EVERY background row per
             # explanation, so passing the full corpus (which can be thousands of
             # quote rows after calibration) makes this step effectively hang.
             # Summarize to a bounded background sample using kmeans clustering — standard SHAP practice.
-            shap_background = (
-                shap.kmeans(ground_truth_text_features_arr, 100)
-                if ground_truth_text_features_arr.shape[0] > 100
-                else ground_truth_text_features_arr
-            )
+            if ground_truth_text_features_arr.shape[0] > 100:
+                shap_background = await asyncio.to_thread(
+                    shap.kmeans, ground_truth_text_features_arr, 100
+                )
+            else:
+                shap_background = ground_truth_text_features_arr
             explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, shap_background)
-            ground_truth_shap_values = explainer.shap_values(ground_truth_candidate_arr.reshape(1,-1))
+            # KernelExplainer.shap_values re-runs model.predict across the background
+            # sample — the dominant CPU cost of this block — so keep it off the loop.
+            ground_truth_shap_values = await asyncio.to_thread(
+                explainer.shap_values, ground_truth_candidate_arr.reshape(1, -1)
+            )
             # shap_values for a single sample comes back shaped (1, n_features);
             # flatten to (n_features,) so it aligns with the FEATURE_NAMES index
             # (the DataFrame expects (n_features, 1), not (1, n_features)).
@@ -748,23 +766,6 @@ async def think(
         state["user_state"]["user_id"],
         state["assistant_state"]["assistant_id"],
     )
-    # #region agent log
-    try:
-        import json as _json, time as _time
-        from src.anubis.utils.tools.data_analysis.discovery import read_user_registration as _read_reg
-        from src.anubis.utils.tools.data_analysis import relay as _relay
-        _reg = await _read_reg(runtime.store, state["user_state"]["user_id"]) if runtime.store else None
-        _dev = (_reg or {}).get("device_id") if isinstance(_reg, dict) else None
-        with open("/deps/anubis/.cursor/debug-7a1f58.log", "a") as _f:
-            _f.write(_json.dumps({"sessionId":"7a1f58","runId":"post-fix","hypothesisId":"A,C,D","location":"graph.py:think","message":"bound_vs_registration","data":{"bound_url":getattr(connection,"url",None),"bound_has_secret":bool(getattr(connection,"device_secret",None)),"is_personal":is_personal_avatar,"reg_mode":(_reg or {}).get("connection_mode") if isinstance(_reg,dict) else None,"reg_mcp_url":(_reg or {}).get("mcp_url") if isinstance(_reg,dict) else None,"reg_device_id":_dev,"relay_online":_relay.is_online(_dev) if _dev else None,"live_session_device":getattr(_relay.session_for_user(state["user_state"]["user_id"]),"device_id",None),"reg_last_seen":(_reg or {}).get("last_seen_at") if isinstance(_reg,dict) else None},"timestamp":int(_time.time()*1000)}) + "\n")
-    except Exception as _e:
-        try:
-            import json as _json, time as _time
-            with open("/deps/anubis/.cursor/debug-7a1f58.log", "a") as _f:
-                _f.write(_json.dumps({"sessionId":"7a1f58","hypothesisId":"A","location":"graph.py:think","message":"debug_log_failed","data":{"error":str(_e)},"timestamp":int(_time.time()*1000)}) + "\n")
-        except Exception:
-            pass
-    # #endregion
     if connection is not None and is_personal_avatar:
         analysis_bundle = build_analysis_backend(
             deep_agent_run_context,
@@ -824,6 +825,29 @@ async def think(
             # Drop the turn lease on the conversation's browser so idle /
             # least-recently-used eviction may consider the browser again.
             await release_conversation_browser(outer_thread)
+
+
+# Cadence of the keepalive frames emitted while post-reply analysis (Go Emotions
+# + SHAP style comparison) runs. That analysis produces no user-visible tokens
+# yet gates the terminal ``done`` SSE frame, so without these the client's
+# idle-read can time out ("Error in input stream") before ``done`` arrives. Kept
+# well under common client read timeouts; promote to GlobalContext if it ever
+# needs per-deployment tuning.
+_POST_REPLY_ANALYSIS_HEARTBEAT_SECONDS = 5.0
+
+
+async def _emit_analysis_keepalives(writer, interval_seconds: float) -> None:
+    """Emit a ``keepalive`` custom stream event every ``interval_seconds``.
+
+    Run as a background task wrapping the post-reply analysis so the SSE
+    generator keeps writing bytes to the client during the token-less analysis
+    window. The caller cancels this task once analysis completes. ``writer`` is
+    the LangGraph stream writer (a no-op when the run is not being streamed, so
+    this is harmless off the streaming path).
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        writer({"type": "keepalive"})
 
 
 async def _run_avatar_deep_agent_turn(
@@ -910,33 +934,50 @@ async def _run_avatar_deep_agent_turn(
     final_message = new_messages[-1]
     intermediate = new_messages[:-1]
 
-    if isinstance(final_message, AIMessage) and not final_message.tool_calls:
-        _attach_go_emotions_metadata(final_message)
-        _attach_token_usage_metadata(final_message, new_messages)
-        if config.get("configurable", {}).get("use_adapter_inference"):
-            final_message.response_metadata = dict(
-                final_message.response_metadata or {}
+    # The reply is already fully streamed to the client by this point; what
+    # follows (Go Emotions sentiment + SHAP style comparison) only enriches the
+    # terminal ``done`` frame's metadata. It emits no tokens and can run for tens
+    # of seconds, so a background task streams keepalive frames throughout to keep
+    # the client's connection from idling out before ``done``.
+    heartbeat_task = asyncio.create_task(
+        _emit_analysis_keepalives(writer, _POST_REPLY_ANALYSIS_HEARTBEAT_SECONDS)
+    )
+    try:
+        if isinstance(final_message, AIMessage) and not final_message.tool_calls:
+            # Go Emotions is a RoBERTa forward pass — offload to a worker thread so it
+            # does not block the event loop between the streamed reply and the terminal
+            # ``done`` SSE frame (which is gated behind this whole block).
+            await asyncio.to_thread(_attach_go_emotions_metadata, final_message)
+            _attach_token_usage_metadata(final_message, new_messages)
+            if config.get("configurable", {}).get("use_adapter_inference"):
+                final_message.response_metadata = dict(
+                    final_message.response_metadata or {}
+                )
+                final_message.response_metadata["is_adapter_inference"] = True
+        # Authenticity metrics: score the (already-streamed) reply against the
+        # target author + ChatGPT baseline and attach to response_metadata.
+        if config.get("configurable", {}).get("include_quality_metrics", False):
+            # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
+            # owner-scoped, so pass the avatar OWNER's id — the same first namespace
+            # element calibrate_ground_truth wrote under — not the conversing user.
+            retrieved_user_id = (
+                config.get("configurable", {})
+                .get("assistant_ctx", {})
+                .get("metadata", {})
+                .get("user_id")
+            ) or state["user_state"]["user_id"]
+            await _attach_analyzed_features(
+                final_message,
+                runtime=runtime,
+                assistant_id=state["assistant_state"]["assistant_id"],
+                user_id=retrieved_user_id,
             )
-            final_message.response_metadata["is_adapter_inference"] = True
-    # TODO: Authenticity metrics: score the (already-streamed) reply against the
-    # target author + ChatGPT baseline and attach to response_metadata. The
-    # user has seen the reply by now, so this adds no perceived latency.
-    if config.get("configurable", {}).get("include_quality_metrics", False):
-        # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
-        # owner-scoped, so pass the avatar OWNER's id — the same first namespace
-        # element calibrate_ground_truth wrote under — not the conversing user.
-        retrieved_user_id = (
-            config.get("configurable", {})
-            .get("assistant_ctx", {})
-            .get("metadata", {})
-            .get("user_id")
-        ) or state["user_state"]["user_id"]
-        await _attach_analyzed_features(
-            final_message,
-            runtime=runtime,
-            assistant_id=state["assistant_state"]["assistant_id"],
-            user_id=retrieved_user_id,
-        )
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
     update: dict[str, Any] = {

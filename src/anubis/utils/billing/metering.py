@@ -345,10 +345,33 @@ WHERE user_id = %s
   AND created_at >= %s;
 """
 
+# Customer-keyed variant. The Stripe customer id is the DURABLE billing
+# identity: a delete-and-re-signup mints a fresh Auth0 subject (the ``user_id``
+# above) but deliberately reattaches the same Stripe customer (delete_user keeps
+# it to block free-trial re-harvesting). Aggregating paid users by customer id
+# therefore carries usage across the churn, closing the allotment-reset hole,
+# while anonymous/free users with no customer still fall back to ``user_id``.
+_USAGE_SINCE_BY_CUSTOMER_SQL = f"""
+SELECT COALESCE(SUM(total_tokens), 0)
+FROM {API_METRICS_TABLE_NAME}
+WHERE stripe_customer_id = %s
+  AND meter_event_name = %s
+  AND created_at >= %s;
+"""
+
 _USAGE_BY_METER_SINCE_SQL = f"""
 SELECT meter_event_name, COALESCE(SUM(total_tokens), 0)
 FROM {API_METRICS_TABLE_NAME}
 WHERE user_id = %s
+  AND created_at >= %s
+  AND meter_event_name IS NOT NULL
+GROUP BY meter_event_name;
+"""
+
+_USAGE_BY_METER_SINCE_BY_CUSTOMER_SQL = f"""
+SELECT meter_event_name, COALESCE(SUM(total_tokens), 0)
+FROM {API_METRICS_TABLE_NAME}
+WHERE stripe_customer_id = %s
   AND created_at >= %s
   AND meter_event_name IS NOT NULL
 GROUP BY meter_event_name;
@@ -360,27 +383,37 @@ async def fetch_usage_since(
     user_id: str | None,
     meter_event_name: str,
     period_start: datetime,
+    stripe_customer_id: str | None = None,
 ) -> int:
     """Return the user's usage for one meter since ``period_start``, from ``api_metrics``.
 
     This is the enforcement-side counterpart to Stripe's meter aggregation:
     allotment gating reads the locally persisted usage instead of calling Stripe
-    on the hot path, keyed on the same identifier that also covers anonymous
-    users (hashed-IP). ``period_start`` comes from ``resolve_usage_period_start``
-    (or the cached Stripe billing period for paid tiers), so the window follows
-    the ``USAGE_PERIOD_DAYS`` configuration and per-user upgrade anchors.
+    on the hot path. When ``stripe_customer_id`` is supplied the sum is keyed on
+    that durable billing identity (which survives a delete-and-re-signup, unlike
+    the Auth0 ``user_id``); otherwise it keys on ``user_id``, the identifier that
+    also covers anonymous users (hashed-IP). ``period_start`` comes from
+    ``resolve_usage_period_start`` (or the cached Stripe billing period for paid
+    tiers), so the window follows the ``USAGE_PERIOD_DAYS`` configuration and
+    per-user upgrade anchors.
 
     Best-effort and fail-open: any database error returns zero so a metrics outage
     degrades to "not gated" rather than blocking every message.
     """
-    if pool is None or not user_id:
+    if pool is None:
+        return 0
+    if stripe_customer_id:
+        sql = _USAGE_SINCE_BY_CUSTOMER_SQL
+        params: tuple[Any, ...] = (stripe_customer_id, meter_event_name, period_start)
+    elif user_id:
+        sql = _USAGE_SINCE_SQL
+        params = (user_id, meter_event_name, period_start)
+    else:
         return 0
     try:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
-                await cursor.execute(
-                    _USAGE_SINCE_SQL, (user_id, meter_event_name, period_start)
-                )
+                await cursor.execute(sql, params)
                 row = await cursor.fetchone()
                 return int(row[0]) if row and row[0] is not None else 0
     except Exception as usage_error:  # noqa: BLE001 - fail-open gating
@@ -398,19 +431,30 @@ async def fetch_usage_by_meter_since(
     pool: Any,
     user_id: str | None,
     period_start: datetime,
+    stripe_customer_id: str | None = None,
 ) -> dict[str, int]:
     """Return the user's usage since ``period_start`` for every meter at once.
 
     One grouped query backing the subscription-status endpoint, which displays
     used-versus-allotment for all four meters; meters with no usage in the window
-    are simply absent from the mapping. Fail-open like ``fetch_usage_since``.
+    are simply absent from the mapping. Keys on ``stripe_customer_id`` when
+    supplied (durable across re-signup) and otherwise on ``user_id``, matching
+    ``fetch_usage_since``. Fail-open like ``fetch_usage_since``.
     """
-    if pool is None or not user_id:
+    if pool is None:
+        return {}
+    if stripe_customer_id:
+        sql = _USAGE_BY_METER_SINCE_BY_CUSTOMER_SQL
+        params: tuple[Any, ...] = (stripe_customer_id, period_start)
+    elif user_id:
+        sql = _USAGE_BY_METER_SINCE_SQL
+        params = (user_id, period_start)
+    else:
         return {}
     try:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
-                await cursor.execute(_USAGE_BY_METER_SINCE_SQL, (user_id, period_start))
+                await cursor.execute(sql, params)
                 rows = await cursor.fetchall()
                 return {
                     str(meter_event_name): int(total)

@@ -13,8 +13,8 @@ how-to. Automated equivalents live in `tests/unit_tests/test_billing_*.py`,
 | Base URL | `http://localhost:8900` |
 | Header | `API-KEY: <your key>` |
 | Avatar | `c206e1a4-5cdf-4f3b-8ceb-9f23b605ddb1` |
-| Auth0 user | `auth0|6a57ea15adb2bbe67d7aba72` |
-| Stripe customer | `cus_UtHoruH8DcZUA3` |
+| Auth0 user | `auth0|6a5fb6cd601f497f56f5aa37` |
+| Stripe customer | `cus_UvHevUUQ1nJnE1` |
 | Upload fixture | `data/shivon_zilis/test_tokens_1_tokens.md` (~6 estimated tokens) |
 | Typical message cost | ~19,315 total tokens (prompt ≈19,311 / completion ≈4) |
 
@@ -30,7 +30,7 @@ Allotments (catalog, `src/anubis/utils/billing/tiers.py`):
 Set both caps to 0 and recreate the API container, otherwise a second message
 within 60s trips the 429 rate limit (~19k prior + ~22k estimate vs the 30k cap):
 
-```sk-kRwuKdkGnq8--piuT2PfJRWcRJji3h9cr2eU6Ir9NuE
+```sk-rhZGqpwMTIARI_Lzm0GsPYNhdkL0GEiAj8FbvCMlP18
 MESSAGE_RATE_LIMIT_TOKENS_PER_WINDOW=0
 MEDIA_UPLOAD_RATE_LIMIT_TOKENS_PER_WINDOW=0
 ```
@@ -39,45 +39,10 @@ Restore to 30k / 90k afterward.
 
 ### Force over-allotment (replace injected meter + tokens)
 
-```sql
-DELETE FROM api_metrics
-WHERE user_id = 'auth0|6a57ea15adb2bbe67d7aba72'
-  AND inference_type = 'test_inject';
-
-INSERT INTO api_metrics (
-  id, created_at, user_id, stripe_customer_id, inference_type,
-  prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, meter_event_name
-) VALUES (
-  gen_random_uuid(), now(),
-  'auth0|6a57ea15adb2bbe67d7aba72', 'cus_UtHoruH8DcZUA3', 'test_inject',
-  0, 0, <ALLOTMENT>, 0, 0, '<meter_name>'
-);
-```
 
 Meter names: `messaging_tokens`, `document_upload_tokens`, `adapter_inference_tokens`.
 
 ### Useful curls
-
-```bash
-API=http://localhost:8900
-KEY='…'
-AVATAR=c206e1a4-5cdf-4f3b-8ceb-9f23b605ddb1
-H=(-H "API-KEY: $KEY")
-
-curl -sS "${H[@]}" "$API/verify_subscription_status" | jq
-curl -sS -X POST "${H[@]}" "$API/set_pay_per_use?enabled=false"
-curl -sS -X POST "${H[@]}" "$API/set_pay_per_use?enabled=true"
-curl -sS -X POST "${H[@]}" "$API/subscribe?tier=pro"     # or premium|free
-
-curl -sS -N "${H[@]}" -F 'message=Reply with exactly: ok' -F stream=true \
-  -F include_quality_metrics=false -F include_usage_metrics=true \
-  "$API/message/$AVATAR"
-# adapter inference: add -F adapter=true
-
-curl -sS "${H[@]}" -F assistant_id=$AVATAR \
-  -F "files=@data/shivon_zilis/test_tokens_1_tokens.md;type=text/markdown" \
-  "$API/update_avatar_identity_with_media"
-```
 
 Stale tier after a webhook should no longer happen (the API-key cache is now
 evicted on every subscription-status write). If a tier ever still looks stale,

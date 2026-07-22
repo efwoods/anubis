@@ -1,7 +1,15 @@
 from urllib.parse import quote
 from langgraph_sdk import Auth
 from supabase import create_async_client
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Request,
+    Security,
+)
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -506,9 +514,13 @@ async def ensure_initial_subscription_after_verification(
             # Auth0 record; without an anchor the local usage window falls back
             # to the calendar month, misaligned with the Stripe billing period.
             # Rebuild the anchor from the adopted subscription's real period
-            # start. Known limitation: api_metrics usage rows key on the Auth0
-            # user id, so locally counted usage restarts for the new account
-            # even though Stripe billing continues the same period.
+            # start so the local window stays aligned with the ongoing Stripe
+            # period. Usage counted within that window survives the re-signup:
+            # fetch_usage_since / fetch_usage_by_meter_since aggregate on the
+            # durable stripe_customer_id (kept by delete_user) when present,
+            # not on the freshly minted Auth0 user id, so spent tokens and any
+            # free-trial usage carry over instead of restarting for the new
+            # account.
             current_period_start, _ = subscription_period_bounds(subscription)
             if current_period_start:
                 app_metadata_update["usage_period_anchor"] = datetime.fromtimestamp(
@@ -583,44 +595,33 @@ async def ensure_initial_subscription_after_verification(
 
 
 # utility functions
-async def signup_user(
-    email: str, password: str, request: Request, name: Optional[str] = None
-) -> dict:
+async def _run_post_signup_side_effects(
+    request: Request,
+    created_user_id: Optional[str],
+    email: str,
+    name: Optional[str],
+) -> None:
+    """Best-effort work that must NOT block delivery of the one-time API key.
+
+    Both steps are recoverable after the fact, so they run AFTER the signup
+    response has been returned (scheduled as a FastAPI background task):
+
+    * Stripe customer + default free-tier provisioning is reconciled anyway by
+      the Stripe webhook and by ``ensure_initial_subscription_after_verification``
+      on the first authenticated request, so a delay here changes nothing a
+      caller can observe.
+    * The verification email can always be re-requested via
+      ``/resend_verification_email``.
+
+    Keeping them on the request's critical path was the root cause of signup
+    (and delete) returning a client-side "network error": the sequential Auth0
+    Management API calls, the blocking Stripe SDK calls, and up to ~3.5 s of
+    verification-email job polling could push the response past the client/proxy
+    timeout, so the one-time API key was generated server-side but never
+    delivered. Moving the work here lets ``signup_user`` return the key the
+    instant the Auth0 user exists.
+    """
     try:
-        api_key = generate_api_key()
-        api_key_hash = _hash_key(api_key)
-
-        payload = {
-            "email": email,
-            "password": password,
-            "connection": CONNECTION,
-            # The verification email is sent EXPLICITLY below via the
-            # Management API verification-email job so the send is
-            # deterministic and observable; verify_email=False suppresses
-            # Auth0's implicit creation-time behavior (which depends on
-            # tenant template/provider settings and was observed not firing).
-            "verify_email": False,
-            "app_metadata": {
-                "api_key": api_key_hash,
-            },
-        }
-
-        # Only send a real name: SignupRequest.name defaults to None, and
-        # Auth0 rejects an explicit null name with a payload-validation 400.
-        if name:
-            payload["name"] = name
-
-        headers = await _mgmt_headers(request)
-        response = await request.app.state.httpx_client.post(
-            f"{BASE_AUTH_URL}/api/v2/users",
-            json=payload,
-            headers=headers,
-        )
-
-        response.raise_for_status()
-        created_user = response.json()
-        created_user_id = created_user.get("user_id") or created_user.get("_id")
-
         # Provision a Stripe customer and default free tier for the new account so
         # metering and tier gating have a canonical stripe_customer_id to work with.
         await _provision_stripe_customer_and_default_tier(
@@ -629,61 +630,147 @@ async def signup_user(
             email=email,
             name=name if name else None,
         )
+    except Exception as provisioning_error:  # noqa: BLE001 - best-effort
+        logger.error(
+            "Post-signup Stripe provisioning failed for %s: %s",
+            email,
+            provisioning_error,
+        )
 
-        # Send the verification email explicitly via the jobs endpoint. Users
-        # created through the Management API POST /api/v2/users do NOT reliably
-        # receive an email from the `verify_email` create flag (verified against
-        # the live tenant: the flag left the user Unverified with no email,
-        # while POST /api/v2/jobs/verification-email returns 201 and sends). A
-        # send failure must not lose the one-time API key — the user can request
-        # another email via /resend_verification_email (which accepts an
-        # unverified account) — so this is best-effort.
+    # Send the verification email explicitly via the jobs endpoint. Users
+    # created through the Management API POST /api/v2/users do NOT reliably
+    # receive an email from the `verify_email` create flag (verified against
+    # the live tenant: the flag left the user Unverified with no email, while
+    # POST /api/v2/jobs/verification-email returns 201 and sends).
+    try:
+        await send_verification_email(created_user_id, request=request)
+    except Exception as verification_error:  # noqa: BLE001 - best-effort
+        logger.error(
+            "Could not send the verification email to %s during signup: %s",
+            email,
+            verification_error,
+        )
+
+
+async def signup_user(
+    email: str,
+    password: str,
+    request: Request,
+    name: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> dict:
+    api_key = generate_api_key()
+    api_key_hash = _hash_key(api_key)
+
+    payload = {
+        "email": email,
+        "password": password,
+        "connection": CONNECTION,
+        # The verification email is sent EXPLICITLY (see
+        # _run_post_signup_side_effects) via the Management API
+        # verification-email job so the send is deterministic and observable;
+        # verify_email=False suppresses Auth0's implicit creation-time behavior
+        # (which depends on tenant template/provider settings and was observed
+        # not firing). The api_key hash is written into app_metadata at creation
+        # time, so the account is fully usable the moment this call succeeds —
+        # which is why the one-time key can be returned immediately below.
+        "verify_email": False,
+        "app_metadata": {
+            "api_key": api_key_hash,
+        },
+    }
+
+    # Only send a real name: SignupRequest.name defaults to None, and Auth0
+    # rejects an explicit null name with a payload-validation 400.
+    if name:
+        payload["name"] = name
+
+    # Create the Auth0 user. This is the ONLY step on the critical path: it
+    # persists the api_key hash, so once it succeeds the returned key is valid.
+    try:
+        headers = await _mgmt_headers(request)
+        response = await request.app.state.httpx_client.post(
+            f"{BASE_AUTH_URL}/api/v2/users",
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as create_error:
+        # Auth0 returned a 4xx/5xx. Surface an actionable message instead of the
+        # previous handler, which assumed ``e.response`` always existed and
+        # crashed with AttributeError on timeouts.
+        status_code = create_error.response.status_code
         try:
-            verification_result = await send_verification_email(
-                created_user_id, request=request
-            )
-            verification_message = verification_result.get(
-                "message", "A verification email has been sent."
-            )
-        except HTTPException as verification_error:
-            logger.error(
-                "Could not send the verification email to %s during signup: %s",
-                email,
-                verification_error.detail,
-            )
-            verification_message = (
-                f"The verification email could not be sent: "
-                f"{verification_error.detail}"
-            )
-        except Exception as verification_error:  # noqa: BLE001 - best-effort
-            logger.error(
-                "Could not send the verification email to %s during signup: %s",
-                email,
-                verification_error,
-            )
-            verification_message = (
-                "The verification email could not be sent; request another "
-                "one via /resend_verification_email."
-            )
-
-        result = {
-            "api_key": api_key,
-            "message": "Save this key. This key is shown only once and used for every api request.",
-            "verification": verification_message,
-        }
-
-        return result
-    except Exception as e:
-        if e.response.status_code == 400:
+            error_body = create_error.response.json()
+        except Exception:  # noqa: BLE001 - non-JSON error body
+            error_body = create_error.response.text
+        if status_code == 409:
             raise HTTPException(
-                detail=f"Invalid Password. Password Requires a lower case and upper case character as well as at least 8 characters and a special character: {response.json().get('mesage', response.json())}",
-                status_code=response.status_code,
+                status_code=409,
+                detail=(
+                    "An account with this email already exists. If this is your "
+                    "account, sign in or mint a new key via /rotate_api_key "
+                    "(email + password) — the one-time key from any earlier "
+                    "signup attempt cannot be shown again."
+                ),
             )
-        else:
+        if status_code == 400:
             raise HTTPException(
-                detail=f"Error signing up user: {response.json()}",
-                status_code=response.status_code,
+                status_code=400,
+                detail=(
+                    "Invalid signup request. The password requires a lower case "
+                    "and upper case character, at least 8 characters, and a "
+                    f"special character: {error_body}"
+                ),
             )
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"Error signing up user: {error_body}",
+        )
+    except Exception as unexpected_error:  # noqa: BLE001
+        # Timeout / connection error reaching Auth0: no response object exists.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error signing up user: {unexpected_error}",
+        )
+
+    created_user = response.json()
+    created_user_id = created_user.get("user_id") or created_user.get("_id")
+
+    # Defer Stripe provisioning + verification email so a slow upstream can
+    # never cost the caller the one-time API key. When invoked outside a request
+    # (background_tasks is None) the work runs inline so behavior is preserved.
+    if background_tasks is not None:
+        background_tasks.add_task(
+            _run_post_signup_side_effects,
+            request=request,
+            created_user_id=created_user_id,
+            email=email,
+            name=name if name else None,
+        )
+        verification_message = (
+            "A verification email is being sent. If it does not arrive shortly, "
+            "call /resend_verification_email."
+        )
+    else:
+        await _run_post_signup_side_effects(
+            request=request,
+            created_user_id=created_user_id,
+            email=email,
+            name=name if name else None,
+        )
+        verification_message = (
+            "A verification email has been sent. If it does not arrive shortly, "
+            "call /resend_verification_email."
+        )
+
+    return {
+        "api_key": api_key,
+        "message": "Save this key. This key is shown only once and used for every api request.",
+        "verification": verification_message,
+    }
 
 
 async def logout_user(refresh_token: str, request: Request) -> None:
@@ -1239,8 +1326,16 @@ async def get_current_user_or_anonymous_user_id(
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 @security_route.post("/signup")
-async def signup(body: SignupRequest, request: Request):
-    user = await signup_user(body.email, body.password, name=body.name, request=request)
+async def signup(
+    body: SignupRequest, request: Request, background_tasks: BackgroundTasks
+):
+    user = await signup_user(
+        body.email,
+        body.password,
+        name=body.name,
+        request=request,
+        background_tasks=background_tasks,
+    )
     return user
 
 

@@ -251,7 +251,11 @@ async def enforce_remaining_allotment(
     metering_user_id = resolve_metering_user_id(current_user)
     period_start = resolve_usage_period_start_for_user(current_user)
     period_usage = await fetch_usage_since(
-        getattr(app_state, "pool", None), metering_user_id, meter.value, period_start
+        getattr(app_state, "pool", None),
+        metering_user_id,
+        meter.value,
+        period_start,
+        stripe_customer_id=resolve_stripe_customer_id(current_user),
     )
     block_reason = exhausted_allotment_block_reason(
         tier,
@@ -363,6 +367,7 @@ async def _build_meter_usage_snapshot(
         resolve_metering_user_id(current_user),
         meter.value,
         period_start,
+        stripe_customer_id=resolve_stripe_customer_id(current_user),
     )
     monthly_allotment = allotment.monthly_allotment if allotment else None
     return {
@@ -808,6 +813,13 @@ async def message_graph_sse(
             if payload.get("type") == "assistant_token":
                 accumulated_chunks.append(payload.get("text") or "")
                 yield f"data: {json.dumps(payload)}\n\n"
+            elif payload.get("type") == "keepalive":
+                # SSE comment frame emitted during post-reply analysis (Go Emotions
+                # + SHAP), which yields no tokens yet gates the terminal ``done``
+                # frame. Comment lines are ignored by SSE parsers but the bytes
+                # reset the client's idle-read timer, preventing a premature
+                # "Error in input stream" while the metadata is computed.
+                yield ": keepalive\n\n"
         elif mode == "updates" and isinstance(payload, dict):
             ai = _latest_ai_from_stream_update(payload)
             if ai is not None:
@@ -2033,6 +2045,7 @@ async def verify_subscription_status(
         getattr(request.app.state, "pool", None),
         resolve_metering_user_id(current_user),
         period_start,
+        stripe_customer_id=resolve_stripe_customer_id(current_user),
     )
 
     # Trial-aware per-meter view: within a free-trial window the trial tier's

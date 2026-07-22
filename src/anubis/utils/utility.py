@@ -2214,9 +2214,16 @@ async def compute_shap_values_against_baseline(
     from src.anubis.utils.dataset.style_features import FEATURE_NAMES
 
     _explainer, _model = await load_baseline_features_explainer_model(store)
-    prediction = bool(_model.predict(feature_values.reshape(1, -1)) == 1)
+    # IsolationForest.predict and KernelExplainer.shap_values are synchronous,
+    # CPU-bound scikit-learn/SHAP calls; offload them so this coroutine does not
+    # stall the event loop (this runs post-stream, gating the terminal SSE frame).
+    prediction = bool(
+        await asyncio.to_thread(_model.predict, feature_values.reshape(1, -1)) == 1
+    )
 
-    shap_values = _explainer.shap_values(feature_values.reshape(1, -1))
+    shap_values = await asyncio.to_thread(
+        _explainer.shap_values, feature_values.reshape(1, -1)
+    )
 
     df = pd.DataFrame(
         shap_values.flatten(),

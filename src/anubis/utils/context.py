@@ -870,6 +870,13 @@ class GlobalContext:
             if getattr(self, f.name) == f.default:
                 env_val = os.environ.get(f.name.upper(), f.default)
 
+                # An env var that is declared but left empty (e.g. `MODEL_TOKEN_LIMIT=`
+                # in .env) reads back as "" rather than being absent. Treat an
+                # empty/whitespace-only string as "unset" and keep the field default,
+                # so int("")/float("") coercion below cannot crash startup.
+                if isinstance(env_val, str) and env_val.strip() == "":
+                    env_val = f.default
+
                 if env_val is not None:
                     if scalar_type is float:
                         env_val = float(env_val)

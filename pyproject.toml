@@ -94,6 +94,15 @@ dependencies = [
     # calls BeautifulSoup(html_content, "lxml")).
     "lxml>=5.0.0",
     "llvmlite>=0.43.0",
+    # TTLCache in src/security/auth.py, imported at module scope by the API app.
+    # Declared directly because the only package that ever supplied it was
+    # streamlit (a local-UI dependency), and streamlit 1.60.0 dropped it — which
+    # turned an undeclared transitive import into a hard boot failure of the
+    # auth module. A production dependency must not ride on a UI package's
+    # transitive graph. Floor is the oldest release exposing the TTLCache API
+    # this code uses; the resolved version is currently 7.x.
+    "cachetools>=5.3.0",
+    "elevenlabs>=2.58.0",
 ]
 
 [project.optional-dependencies]

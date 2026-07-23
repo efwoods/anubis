@@ -110,6 +110,7 @@ from src.anubis.utils.billing import (
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.graph_interrupts import collect_pending_interrupts
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
+from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
 from src.anubis.utils.store_cache import (
     invalidate_store_cache_entry,
     invalidate_store_cache_for_assistant,
@@ -1116,6 +1117,10 @@ async def lifespan(app: FastAPI):
     # Initialize context / context
     app.state.context = GlobalContext()
     ensure_huggingface_models_cached(app.state.context)
+    # Same rationale as the Hub prefetch above: the stylometric feature
+    # extractor's corpora are ~20 MB, and paying for them on the first scored
+    # reply stalls that request behind the download.
+    ensure_nltk_corpora_cached()
     # Explicit timeouts instead of httpx's silent 5 s default: a short connect
     # timeout fails fast on an unreachable host, while a generous read timeout
     # tolerates a slow-but-alive upstream.
@@ -2168,6 +2173,9 @@ async def create_avatar(
         }
 
         if user_id == context.admin_user_id:
+            # or is_personal_avatar_of_creator == True
+            # verify there is only a single personal avatar of the creator; 
+            # verfiy the personal avatar of the creator against social media accounts 
             metadata["is_public"] = is_public
 
         token = current_user["API_KEY"]

@@ -286,19 +286,16 @@ def _ensure_nltk_resources() -> None:
     Kept inside a function (not at import) so importing this module never pays a
     download/cold-start cost — consistent with the repo's lazy-import convention.
     Downloads are no-ops once the data is cached.
-    """
-    import nltk
 
-    for resource, locator in (
-        ("punkt", "tokenizers/punkt"),
-        ("punkt_tab", "tokenizers/punkt_tab"),
-        ("averaged_perceptron_tagger_eng", "taggers/averaged_perceptron_tagger_eng"),
-        ("stopwords", "corpora/stopwords"),
-    ):
-        try:
-            nltk.data.find(locator)
-        except LookupError:
-            nltk.download(resource, quiet=True)
+    The resource list and the download policy (bounded socket timeout, retry
+    after a failed attempt) live in :mod:`src.anubis.utils.nltk_prefetch`, which
+    the API and graph processes also call at startup so this runtime path
+    normally finds everything already present. Reaching an actual download here
+    means the startup prefetch was skipped or failed.
+    """
+    from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
+
+    ensure_nltk_corpora_cached()
 
 
 def clean_text(text: str) -> str:

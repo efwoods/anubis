@@ -19,7 +19,13 @@ fi
 
 SECRET_FILE="${STRIPE_WEBHOOK_SECRET_FILE:-/run/stripe/webhook_secret}"
 FORWARD_TO="${STRIPE_WEBHOOK_FORWARD_TO:-http://langgraph-api-dev:8123/stripe/webhook}"
-EVENTS="${STRIPE_WEBHOOK_EVENTS:-checkout.session.completed,customer.subscription.updated,customer.subscription.deleted,invoice.payment_failed}"
+# customer.subscription.created must be forwarded: the API creates subscriptions
+# server-side without Checkout (the pro signup trial, the free-tier billing
+# vehicle, tier changes made with the Stripe SDK), and those emit ONLY .created.
+# Omitting it leaves app_metadata.subscription_status pointing at whatever
+# subscription came before, so the API keeps re-reading a stale (often canceled)
+# subscription until some later .updated happens to fire.
+EVENTS="${STRIPE_WEBHOOK_EVENTS:-checkout.session.completed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.payment_failed}"
 
 mkdir -p "$(dirname "$SECRET_FILE")"
 

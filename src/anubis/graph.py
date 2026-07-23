@@ -67,6 +67,7 @@ from src.anubis.utils.huggingface_prefetch import (
     ensure_huggingface_models_cached,
 )
 from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
+from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
 from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
 from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
@@ -835,6 +836,17 @@ async def think(
 # needs per-deployment tuning.
 _POST_REPLY_ANALYSIS_HEARTBEAT_SECONDS = 5.0
 
+# Ceiling on the whole post-reply analysis window. Everything inside that window
+# is metadata enrichment, so a dependency that stalls there must cost the client
+# metadata, never the reply: without a ceiling the keepalive loop above streams
+# forever and the terminal ``done`` frame never arrives, which is exactly what a
+# ~20 MB NLTK corpus download over a slow link once did to a first request.
+# Sized well above the observed steady-state cost (tens of seconds, dominated by
+# the SHAP KernelExplainer pass over a large ground-truth corpus) so a healthy
+# turn never trips it; promote to GlobalContext if it ever needs per-deployment
+# tuning.
+_POST_REPLY_ANALYSIS_TIMEOUT_SECONDS = 180.0
+
 
 async def _emit_analysis_keepalives(writer, interval_seconds: float) -> None:
     """Emit a ``keepalive`` custom stream event every ``interval_seconds``.
@@ -848,6 +860,55 @@ async def _emit_analysis_keepalives(writer, interval_seconds: float) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         writer({"type": "keepalive"})
+
+
+async def _attach_post_reply_analysis(
+    final_message: Any,
+    *,
+    new_messages: list,
+    state: GlobalState,
+    config: RunnableConfig,
+    runtime: Runtime[GlobalContext],
+) -> None:
+    """Attach every token-less enrichment the terminal ``done`` frame reports.
+
+    Go Emotions sentiment, token-usage accounting, and — when the caller asked
+    for ``include_quality_metrics`` — the authenticity comparison against the
+    target author and the ChatGPT baseline. All of it mutates
+    ``final_message.response_metadata`` in place.
+
+    Split out of the turn body so the caller can place the entire window under a
+    single ``asyncio.wait_for`` ceiling. The whole window gates ``done``, so from
+    the client's side an unbounded step in here is indistinguishable from a hung
+    request; a partial attach is strictly better than no reply.
+    """
+    if isinstance(final_message, AIMessage) and not final_message.tool_calls:
+        # Go Emotions is a RoBERTa forward pass — offload to a worker thread so it
+        # does not block the event loop between the streamed reply and the terminal
+        # ``done`` SSE frame (which is gated behind this whole block).
+        await asyncio.to_thread(_attach_go_emotions_metadata, final_message)
+        _attach_token_usage_metadata(final_message, new_messages)
+        if config.get("configurable", {}).get("use_adapter_inference"):
+            final_message.response_metadata = dict(final_message.response_metadata or {})
+            final_message.response_metadata["is_adapter_inference"] = True
+    # Authenticity metrics: score the (already-streamed) reply against the
+    # target author + ChatGPT baseline and attach to response_metadata.
+    if config.get("configurable", {}).get("include_quality_metrics", False):
+        # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
+        # owner-scoped, so pass the avatar OWNER's id — the same first namespace
+        # element calibrate_ground_truth wrote under — not the conversing user.
+        retrieved_user_id = (
+            config.get("configurable", {})
+            .get("assistant_ctx", {})
+            .get("metadata", {})
+            .get("user_id")
+        ) or state["user_state"]["user_id"]
+        await _attach_analyzed_features(
+            final_message,
+            runtime=runtime,
+            assistant_id=state["assistant_state"]["assistant_id"],
+            user_id=retrieved_user_id,
+        )
 
 
 async def _run_avatar_deep_agent_turn(
@@ -943,35 +1004,28 @@ async def _run_avatar_deep_agent_turn(
         _emit_analysis_keepalives(writer, _POST_REPLY_ANALYSIS_HEARTBEAT_SECONDS)
     )
     try:
-        if isinstance(final_message, AIMessage) and not final_message.tool_calls:
-            # Go Emotions is a RoBERTa forward pass — offload to a worker thread so it
-            # does not block the event loop between the streamed reply and the terminal
-            # ``done`` SSE frame (which is gated behind this whole block).
-            await asyncio.to_thread(_attach_go_emotions_metadata, final_message)
-            _attach_token_usage_metadata(final_message, new_messages)
-            if config.get("configurable", {}).get("use_adapter_inference"):
-                final_message.response_metadata = dict(
-                    final_message.response_metadata or {}
-                )
-                final_message.response_metadata["is_adapter_inference"] = True
-        # Authenticity metrics: score the (already-streamed) reply against the
-        # target author + ChatGPT baseline and attach to response_metadata.
-        if config.get("configurable", {}).get("include_quality_metrics", False):
-            # The per-avatar artifacts (ground-truth cloud, key_phrase_profile) are
-            # owner-scoped, so pass the avatar OWNER's id — the same first namespace
-            # element calibrate_ground_truth wrote under — not the conversing user.
-            retrieved_user_id = (
-                config.get("configurable", {})
-                .get("assistant_ctx", {})
-                .get("metadata", {})
-                .get("user_id")
-            ) or state["user_state"]["user_id"]
-            await _attach_analyzed_features(
+        await asyncio.wait_for(
+            _attach_post_reply_analysis(
                 final_message,
+                new_messages=new_messages,
+                state=state,
+                config=config,
                 runtime=runtime,
-                assistant_id=state["assistant_state"]["assistant_id"],
-                user_id=retrieved_user_id,
-            )
+            ),
+            timeout=_POST_REPLY_ANALYSIS_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        # Degrade rather than hang: whatever was attached before the deadline
+        # stays on the message and the rest is simply absent from ``done``.
+        # The cancellation reaches the awaiting coroutine, NOT any
+        # ``asyncio.to_thread`` worker already running inside it — a wedged
+        # thread runs to its own completion in the background, but the client is
+        # released now instead of waiting on it.
+        logger.warning(
+            "Post-reply analysis exceeded %.0fs; emitting the reply with whatever "
+            "metadata was attached before the deadline.",
+            _POST_REPLY_ANALYSIS_TIMEOUT_SECONDS,
+        )
     finally:
         heartbeat_task.cancel()
         try:
@@ -1163,5 +1217,6 @@ graph = message_workflow.compile()
 graph.name = "Anubis"
 
 ensure_huggingface_models_cached(GlobalContext())
+ensure_nltk_corpora_cached()
 
 __all__ = ["graph"]

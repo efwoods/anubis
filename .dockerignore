@@ -1,3 +1,8 @@
+.venv
+test_q_a_dataset.pkl
+adapters/
+
+
 .DS_Store
 .amazonq/
 features/

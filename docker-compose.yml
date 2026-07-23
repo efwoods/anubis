@@ -25,7 +25,7 @@ services:
         restart: unless-stopped
 
     langgraph-api-dev:
-        image: evdev3/anubis-langgraph-api:latest
+        image: evdev3/anubis-langgraph-api:0.0.1
         pull_policy: never
         dns:
             - 168.83.129.16
@@ -65,6 +65,13 @@ services:
             - .:/deps/anubis
             # Prefetched Hub weights (see ``ensure_huggingface_models_cached``); survives container restarts.
             - ~/.cache/huggingface:/root/.cache/huggingface
+            # Prefetched NLTK corpora (see ``ensure_nltk_corpora_cached``). The base
+            # image already bakes these into /usr/share/nltk_data, so this only has
+            # to catch anything downloaded at runtime — a resource added to
+            # NLTK_RESOURCES ahead of an image rebuild — and keep a container
+            # recreate from re-downloading ~20 MB. /root/nltk_data is on nltk's
+            # default search path, so no NLTK_DATA environment variable is needed.
+            - ~/.cache/nltk_data:/root/nltk_data
             - stripe-webhook-secret:/run/stripe
 
     # One-shot: idempotently create/reuse the Stripe meters, tier products, and

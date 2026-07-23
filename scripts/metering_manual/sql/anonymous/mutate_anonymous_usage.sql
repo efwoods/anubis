@@ -1,0 +1,14 @@
+INSERT INTO api_metrics (
+  id, created_at, user_id, stripe_customer_id, inference_type,
+  prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, meter_event_name
+)
+VALUES (
+  gen_random_uuid(), now(),
+  '245c0ffc0f6a0215471542b9add1fa5331647f4af18c431f039c66dbee92732e',
+  'cus_UtT1Pxg26KRKUX',
+  'test_inject',
+  0, 0,
+  200000000,
+  0, 0,
+  'messaging_tokens'
+);

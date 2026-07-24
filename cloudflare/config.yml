@@ -2,6 +2,11 @@ tunnel: 980ecf10-3835-4226-a164-dc22d13b2dc9
 credentials-file: /home/user/.cloudflared/980ecf10-3835-4226-a164-dc22d13b2dc9.json
 
 ingress:
+  # Neural Nexus API (Anubis LangGraph API, prod container).
   - hostname: api.neuralnexus.site
     service: http://localhost:8124
+  # Customer portal backend-for-frontend (anubis-customer-portal server
+  # container, published on the host as :8200 -> container :8080).
+  - hostname: checkout-api.neuralnexus.site
+    service: http://localhost:8200
   - service: http_status:404

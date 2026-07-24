@@ -83,7 +83,10 @@ dependencies = [
     "peft>=0.19.1",
     "datasets>=5.0.0",
     "trl>=1.6.0",
-    "bitsandbytes>=0.49.2",
+    # 0.50.0 only ships a macosx_14_0_arm64 wheel (no Linux/manylinux build),
+    # which breaks `uv sync` on Linux hosts. Cap below it until a Linux wheel
+    # is published for a newer release.
+    "bitsandbytes>=0.49.2,<0.50.0",
     "langgraph-sdk>=0.4.2",
     "torch>=2.12.1",
     "boto3",

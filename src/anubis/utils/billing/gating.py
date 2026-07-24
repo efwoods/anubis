@@ -440,40 +440,183 @@ def resolve_trial_context(user: Mapping[str, Any] | None) -> TrialContext | None
     )
 
 
+@dataclass(frozen=True)
+class CanceledTierContext:
+    """The paid tier a customer held when their subscription ended mid-period.
+
+    Written by the ``customer.subscription.deleted`` webhook (the event a refund
+    or any immediate cancellation produces) so the period the customer already
+    paid for is not silently forfeited when they resubscribe before it ends:
+
+    * ``canceled_tier`` — the tier the ended subscription represented.
+    * ``period_end`` — when the paid-for period would have closed; every rule
+      below is inert once ``now`` passes this instant, so the context expires on
+      its own and the allotment resets as usual at the period boundary.
+    * ``previous_usage_period_anchor`` — the usage window the customer was
+      counting against before the cancellation, restored on a resubscribe to the
+      same or a lower tier so accrued usage is retained rather than re-granted.
+    """
+
+    canceled_tier: SubscriptionTier
+    period_end: datetime
+    previous_usage_period_anchor: datetime | None
+
+
+def resolve_canceled_tier_context(
+    user: Mapping[str, Any] | None,
+) -> CanceledTierContext | None:
+    """Parse ``app_metadata.canceled_tier_context`` defensively; ``None`` when absent.
+
+    The shape written at cancellation is ``{"tier": "premium", "period_end":
+    <epoch seconds>, "previous_usage_period_anchor": "<ISO-8601 UTC>"}``. Any
+    missing or malformed record yields ``None``, which degrades to the plain
+    tier allotment — never to a larger one — so a corrupt value cannot grant
+    budget the customer did not pay for.
+    """
+    if not user:
+        return None
+    app_metadata = user.get("app_metadata") or {}
+    raw_context = app_metadata.get("canceled_tier_context")
+    if not isinstance(raw_context, Mapping):
+        return None
+    try:
+        period_end = datetime.fromtimestamp(int(raw_context.get("period_end")), tz=UTC)
+    except (TypeError, ValueError, OSError):
+        return None
+    previous_anchor: datetime | None = None
+    raw_previous_anchor = raw_context.get("previous_usage_period_anchor")
+    if isinstance(raw_previous_anchor, str) and raw_previous_anchor:
+        try:
+            parsed_anchor = datetime.fromisoformat(
+                raw_previous_anchor.replace("Z", "+00:00")
+            )
+        except ValueError:
+            parsed_anchor = None
+        if parsed_anchor is not None:
+            if parsed_anchor.tzinfo is None:
+                parsed_anchor = parsed_anchor.replace(tzinfo=UTC)
+            previous_anchor = parsed_anchor.astimezone(UTC)
+    return CanceledTierContext(
+        canceled_tier=tier_from_value(raw_context.get("tier")),
+        period_end=period_end,
+        previous_usage_period_anchor=previous_anchor,
+    )
+
+
+def canceled_tier_allotment_floor_applies(
+    tier: SubscriptionTier,
+    canceled_tier_context: CanceledTierContext | None,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a canceled paid tier still guarantees this user's allotment floor.
+
+    The floor is what makes "resubscribing within the same pay period retains
+    the allotment you already paid for" true, and it deliberately applies in
+    exactly one situation — the customer is back on a paid tier no higher than
+    the one they paid for, inside the period they paid for:
+
+    * ``tier`` is ``free`` → the floor never applies. A refunded customer who
+      has not resubscribed drops to the plain free-tier allotment immediately,
+      which is the whole point of refunding.
+    * ``tier`` ranks ABOVE ``canceled_tier`` (paid pro, resubscribed premium) →
+      the floor never applies. That is an upgrade, and upgrades start a fresh
+      window with the new tier's own allotment.
+    * ``now`` at or past ``period_end`` → the floor never applies. The paid-for
+      period is over and the allotment resets as usual.
+    """
+    if canceled_tier_context is None:
+        return False
+    if tier == SubscriptionTier.FREE:
+        return False
+    now = now or datetime.now(UTC)
+    if now >= canceled_tier_context.period_end:
+        return False
+    return _TIER_ORDER[tier] <= _TIER_ORDER[canceled_tier_context.canceled_tier]
+
+
 def resolve_effective_monthly_allotment(
     tier: SubscriptionTier,
     meter: UsageMeter,
     trial_context: TrialContext | None,
     now: datetime | None = None,
+    canceled_tier_context: CanceledTierContext | None = None,
 ) -> MeterAllotment | None:
-    """Return the allotment governing ``meter`` for a user, trial-aware.
+    """Return the allotment governing ``meter`` for a user, trial- and refund-aware.
 
-    Outside a trial window this is exactly ``tier_allotment_for_meter``.
-    Inside the trial window (``now < trial_end``), the user keeps the trial
-    tier's allotment alongside the current tier's — whichever is larger per
-    meter — because changing tiers during a trial retains the trial allotment
-    on one shared usage counter:
+    Outside a trial window and with no retained paid period this is exactly
+    ``tier_allotment_for_meter``. Two contexts can raise it, and each acts only
+    as a FLOOR — the larger of the candidate allotments wins per meter, so a
+    context can never shrink a budget:
 
-    * pro-trial → premium: premium's larger allotments win where premium
-      grants more; the trial allotment still guarantees the floor.
-    * pro-trial → free: the pro trial allotments (messaging AND document
-      uploads) stay granted until the trial ends, then plain free-tier
-      allotments apply.
+    * ``trial_context`` — inside the trial window (``now < trial_end``) the user
+      keeps the trial tier's allotment alongside the current tier's, because
+      changing tiers during a trial retains the trial allotment on one shared
+      usage counter. pro-trial → premium keeps premium's larger allotments where
+      premium grants more; pro-trial → free keeps the pro trial allotments until
+      the trial ends.
+    * ``canceled_tier_context`` — a customer who paid for a period, had the
+      subscription ended mid-period (a refund), and resubscribed to the same or
+      a lower tier inside that period keeps the allotment they paid for until
+      the period closes. See ``canceled_tier_allotment_floor_applies`` for the
+      exact conditions; a customer still on the free tier after a refund is
+      deliberately NOT covered and gets the plain free allotment at once.
     """
-    current_allotment = tier_allotment_for_meter(tier, meter)
-    if trial_context is None:
-        return current_allotment
     now = now or datetime.now(UTC)
-    if now >= trial_context.trial_end:
-        return current_allotment
-    trial_allotment = tier_allotment_for_meter(trial_context.trial_tier, meter)
-    if trial_allotment is None:
-        return current_allotment
-    if current_allotment is None:
-        return trial_allotment
-    if trial_allotment.monthly_allotment > current_allotment.monthly_allotment:
-        return trial_allotment
-    return current_allotment
+    effective_allotment = tier_allotment_for_meter(tier, meter)
+
+    def apply_floor(candidate_tier: SubscriptionTier) -> None:
+        nonlocal effective_allotment
+        candidate_allotment = tier_allotment_for_meter(candidate_tier, meter)
+        if candidate_allotment is None:
+            return
+        if (
+            effective_allotment is None
+            or candidate_allotment.monthly_allotment
+            > effective_allotment.monthly_allotment
+        ):
+            effective_allotment = candidate_allotment
+
+    if trial_context is not None and now < trial_context.trial_end:
+        apply_floor(trial_context.trial_tier)
+    if canceled_tier_allotment_floor_applies(tier, canceled_tier_context, now):
+        assert canceled_tier_context is not None
+        apply_floor(canceled_tier_context.canceled_tier)
+    return effective_allotment
+
+
+def plan_resubscribe_usage_window(
+    resubscribed_tier: SubscriptionTier,
+    canceled_tier_context: CanceledTierContext | None,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Return the usage-period anchor a resubscribe must write, or ``None`` for "now".
+
+    Completing checkout normally restarts the local usage window at that
+    instant. Resubscribing inside a period the customer already paid for is the
+    exception, and the direction decides which way it goes:
+
+    * Same or LOWER tier than the canceled one (paid premium → resubscribed pro,
+      or premium → premium) — the customer is not buying more than they already
+      bought, so the window they were counting against is RESTORED and accrued
+      usage carries over. Paired with the allotment floor in
+      ``resolve_effective_monthly_allotment``, that customer keeps the canceled
+      tier's limits for the remainder of the period.
+    * HIGHER tier than the canceled one (paid pro → resubscribed premium) — that
+      is an upgrade, so limits and usage both reset to zero: the anchor moves to
+      ``now`` like any other upgrade.
+    * No retained period (context absent or expired) — ``now``, the ordinary
+      first-checkout behavior.
+
+    Returning ``None`` means "anchor at the current instant"; a datetime means
+    "restore this anchor".
+    """
+    now = now or datetime.now(UTC)
+    if not canceled_tier_allotment_floor_applies(
+        resubscribed_tier, canceled_tier_context, now
+    ):
+        return None
+    assert canceled_tier_context is not None
+    return canceled_tier_context.previous_usage_period_anchor
 
 
 def customer_has_payment_method(

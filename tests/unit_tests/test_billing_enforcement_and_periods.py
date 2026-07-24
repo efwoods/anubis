@@ -14,10 +14,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.anubis.utils.billing.gating import (
+    CanceledTierContext,
     TrialContext,
+    canceled_tier_allotment_floor_applies,
     customer_has_payment_method,
     exhausted_allotment_block_reason,
+    plan_resubscribe_usage_window,
     plan_tier_change,
+    resolve_canceled_tier_context,
     resolve_effective_monthly_allotment,
     resolve_pay_per_use_enabled,
     resolve_usage_period_anchor,
@@ -528,3 +532,117 @@ def test_trial_floor_flows_through_the_block_reason_via_override():
         )
         is not None
     )
+
+
+# ---------------------------------------------------------------------------
+# Refund / resubscribe retention: a mid-period paid cancellation keeps its
+# allotment floor only for a same-or-lower resubscribe inside the paid period
+# (canceled_tier_allotment_floor_applies, resolve_effective_monthly_allotment,
+# plan_resubscribe_usage_window).
+# ---------------------------------------------------------------------------
+
+_PERIOD_OPEN = _NOW + timedelta(days=10)
+_PERIOD_CLOSED = _NOW - timedelta(days=1)
+
+
+def _canceled_context(tier, period_end, anchor="2026-07-01T00:00:00+00:00"):
+    return CanceledTierContext(
+        canceled_tier=tier, period_end=period_end, previous_usage_period_anchor=(
+            datetime.fromisoformat(anchor) if anchor else None
+        )
+    )
+
+
+def test_refunded_customer_on_free_tier_gets_no_floor():
+    # A refund with no resubscribe leaves the account on free: the floor never
+    # applies, so the plain free allotment governs immediately.
+    context = _canceled_context(SubscriptionTier.PREMIUM, _PERIOD_OPEN)
+    assert not canceled_tier_allotment_floor_applies(
+        SubscriptionTier.FREE, context, now=_NOW
+    )
+
+
+def test_resubscribe_same_tier_within_period_keeps_the_floor():
+    context = _canceled_context(SubscriptionTier.PRO, _PERIOD_OPEN)
+    assert canceled_tier_allotment_floor_applies(
+        SubscriptionTier.PRO, context, now=_NOW
+    )
+
+
+def test_resubscribe_lower_tier_within_period_keeps_the_higher_floor():
+    # Paid premium, refunded, resubscribed pro inside the period: premium's
+    # larger messaging allotment (20M) governs, not pro's (5M).
+    context = _canceled_context(SubscriptionTier.PREMIUM, _PERIOD_OPEN)
+    effective = resolve_effective_monthly_allotment(
+        SubscriptionTier.PRO,
+        UsageMeter.MESSAGING_TOKENS,
+        None,
+        now=_NOW,
+        canceled_tier_context=context,
+    )
+    assert effective == tier_allotment_for_meter(
+        SubscriptionTier.PREMIUM, UsageMeter.MESSAGING_TOKENS
+    )
+
+
+def test_resubscribe_higher_tier_is_an_upgrade_no_floor():
+    # Paid pro, refunded, resubscribed premium: that is an upgrade, so premium's
+    # own allotment applies and no retained floor is layered on.
+    context = _canceled_context(SubscriptionTier.PRO, _PERIOD_OPEN)
+    assert not canceled_tier_allotment_floor_applies(
+        SubscriptionTier.PREMIUM, context, now=_NOW
+    )
+    effective = resolve_effective_monthly_allotment(
+        SubscriptionTier.PREMIUM,
+        UsageMeter.MESSAGING_TOKENS,
+        None,
+        now=_NOW,
+        canceled_tier_context=context,
+    )
+    assert effective == tier_allotment_for_meter(
+        SubscriptionTier.PREMIUM, UsageMeter.MESSAGING_TOKENS
+    )
+
+
+def test_expired_retained_period_drops_the_floor():
+    context = _canceled_context(SubscriptionTier.PREMIUM, _PERIOD_CLOSED)
+    assert not canceled_tier_allotment_floor_applies(
+        SubscriptionTier.PRO, context, now=_NOW
+    )
+
+
+def test_resubscribe_window_restores_previous_anchor_for_same_or_lower_tier():
+    context = _canceled_context(SubscriptionTier.PREMIUM, _PERIOD_OPEN)
+    restored = plan_resubscribe_usage_window(
+        SubscriptionTier.PRO, context, now=_NOW
+    )
+    assert restored == context.previous_usage_period_anchor
+
+
+def test_resubscribe_window_is_now_for_an_upgrade():
+    context = _canceled_context(SubscriptionTier.PRO, _PERIOD_OPEN)
+    assert plan_resubscribe_usage_window(
+        SubscriptionTier.PREMIUM, context, now=_NOW
+    ) is None
+
+
+def test_resolve_canceled_tier_context_parses_and_rejects_malformed():
+    epoch = int(_PERIOD_OPEN.timestamp())
+    user = {
+        "app_metadata": {
+            "canceled_tier_context": {
+                "tier": "premium",
+                "period_end": epoch,
+                "previous_usage_period_anchor": "2026-07-01T00:00:00+00:00",
+            }
+        }
+    }
+    context = resolve_canceled_tier_context(user)
+    assert context is not None
+    assert context.canceled_tier == SubscriptionTier.PREMIUM
+    assert context.period_end == _PERIOD_OPEN
+    # A missing period_end is unusable and must yield None, never a floor.
+    assert resolve_canceled_tier_context(
+        {"app_metadata": {"canceled_tier_context": {"tier": "premium"}}}
+    ) is None
+    assert resolve_canceled_tier_context({"app_metadata": {}}) is None

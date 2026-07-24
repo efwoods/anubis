@@ -83,11 +83,14 @@ from src.anubis.utils.billing import (
     fetch_usage_by_meter_since,
     fetch_usage_since,
     is_admin_metering_bypass,
+    canceled_tier_allotment_floor_applies,
     load_stripe_billing_config,
     persist_api_metrics_row,
+    plan_resubscribe_usage_window,
     plan_subscribe_action,
     plan_tier_change,
     report_meter_event,
+    resolve_canceled_tier_context,
     resolve_stripe_billing_config_json,
     resolve_metering_user_id,
     resolve_pay_per_use_enabled,
@@ -128,6 +131,7 @@ from src.security.auth import (
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
+    get_user,
     get_user_with_api_key,
     security_route,
     update_assistant_config,
@@ -195,12 +199,26 @@ def resolve_usage_period_start_for_user(current_user: dict) -> datetime:
        ``resolve_usage_period_start`` per the USAGE_PERIOD_DAYS configuration.
     3. The environment-configured default period (calendar month when
        USAGE_PERIOD_DAYS is zero).
+
+    One deliberate exception overrides rule 1: while a canceled paid period is
+    still being retained (``canceled_tier_allotment_floor_applies`` — the user
+    was refunded mid-period and resubscribed to the same or a lower tier inside
+    that period), the restored anchor is INTENTIONALLY older than the brand-new
+    subscription's Stripe period start. Taking the maximum there would discard
+    the retained window and hand the user a second full allotment for a period
+    they were refunded for, so the anchor alone governs until the retained
+    period closes.
     """
     context = GlobalContext()
     now = datetime.now(UTC)
     usage_period_days = int(context.usage_period_days or 0)
     period_anchor = resolve_usage_period_anchor(current_user)
     period_start = resolve_usage_period_start(now, usage_period_days, period_anchor)
+
+    if canceled_tier_allotment_floor_applies(
+        resolve_tier(current_user), resolve_canceled_tier_context(current_user), now
+    ):
+        return period_start
 
     app_metadata = (current_user or {}).get("app_metadata") or {}
     subscription_status = app_metadata.get("subscription_status") or {}
@@ -244,10 +262,15 @@ async def enforce_remaining_allotment(
         return
     # A user inside a free-trial window keeps the trial tier's allotment as a
     # floor after changing tiers (e.g. trialing premium then downgrading to
-    # pro keeps the premium allotment until trial_end), so the gate must judge
-    # against the trial-aware effective allotment, not the plain tier value.
+    # pro keeps the premium allotment until trial_end), and a user who was
+    # refunded mid-period and resubscribed to the same or a lower tier keeps
+    # the allotment they already paid for until that period closes. The gate
+    # must judge against that effective allotment, not the plain tier value.
     effective_allotment = resolve_effective_monthly_allotment(
-        tier, meter, resolve_trial_context(current_user)
+        tier,
+        meter,
+        resolve_trial_context(current_user),
+        canceled_tier_context=resolve_canceled_tier_context(current_user),
     )
     metering_user_id = resolve_metering_user_id(current_user)
     period_start = resolve_usage_period_start_for_user(current_user)
@@ -356,11 +379,14 @@ async def _build_meter_usage_snapshot(
     bounds.
     """
     tier = resolve_tier(current_user)
-    # Trial-aware allotment so the streamed snapshot matches what enforcement
-    # actually gates against during a free-trial window (see
-    # resolve_effective_monthly_allotment).
+    # Trial- and refund-aware allotment so the streamed snapshot matches what
+    # enforcement actually gates against during a free-trial window or a
+    # retained paid period (see resolve_effective_monthly_allotment).
     allotment = resolve_effective_monthly_allotment(
-        tier, meter, resolve_trial_context(current_user)
+        tier,
+        meter,
+        resolve_trial_context(current_user),
+        canceled_tier_context=resolve_canceled_tier_context(current_user),
     )
     period_start, period_end = _resolve_usage_period_bounds_for_user(current_user)
     used_to_date = await fetch_usage_since(
@@ -1630,6 +1656,18 @@ async def subscribe(
         # of the free subscription (billing pay-per-use overage), so force
         # collection.
         checkout_kwargs["payment_method_collection"] = "always"
+    if customer_id:
+        # Without this, a returning customer sees an EMPTY card form even with a
+        # card already on file: subscription-mode Checkout saves cards with
+        # allow_redisplay="limited", and Checkout only prefills cards marked
+        # "always". Widening the filter shows the cards this customer already
+        # has, and payment_method_save lets them consent to reuse for next time
+        # — which is also what stops a duplicate PaymentMethod being created for
+        # a card the customer already gave us.
+        checkout_kwargs["saved_payment_method_options"] = {
+            "payment_method_save": "enabled",
+            "allow_redisplay_filters": ["always", "limited", "unspecified"],
+        }
     if subscription_data:
         checkout_kwargs["subscription_data"] = subscription_data
     if customer_id:
@@ -1826,6 +1864,102 @@ def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Op
         return None
 
 
+async def _read_user_app_metadata(request: Request, auth0_user_id: str | None) -> dict:
+    """Return one Auth0 user's ``app_metadata``, or an empty mapping.
+
+    Webhook handlers receive only a Stripe object, so any rule that depends on
+    what the account already holds (the usage window it was counting against,
+    a retained paid period) has to read it back from Auth0. Best-effort: a
+    lookup failure yields ``{}`` and the caller falls back to its default,
+    because a webhook must never fail on a read.
+    """
+    if not auth0_user_id:
+        return {}
+    try:
+        auth0_user = await get_user(auth0_user_id, request)
+    except Exception as lookup_error:  # noqa: BLE001 - best-effort webhook read
+        logger.error(
+            "Could not read app_metadata for %s while handling a Stripe event: %s",
+            auth0_user_id,
+            lookup_error,
+        )
+        return {}
+    return auth0_user.get("app_metadata") or {}
+
+
+async def _build_canceled_tier_context_fields(
+    request: Request,
+    auth0_user_id: str | None,
+    canceled_tier: SubscriptionTier,
+    period_end_epoch: int | None,
+) -> dict:
+    """Return the app_metadata patch recording a mid-period paid cancellation.
+
+    Produces two keys together, because they are two halves of one rule:
+
+    * ``usage_period_anchor`` moves to this instant, which is what makes
+      "a refunded subscription immediately switches to the free-tier allotment"
+      literally true — usage to date stops counting against the new window.
+    * ``canceled_tier_context`` remembers the tier, the period end, and the
+      window that was just abandoned, so a resubscribe before ``period_end``
+      can restore it (see ``plan_resubscribe_usage_window``) instead of handing
+      out a second allotment for a period the customer was refunded for.
+
+    A canceled FREE subscription records no context — there is no paid period
+    to retain, and the allotment floor never applies to the free tier anyway.
+    """
+    fresh_anchor = datetime.now(UTC).isoformat()
+    if canceled_tier == SubscriptionTier.FREE or not period_end_epoch:
+        return {"usage_period_anchor": fresh_anchor}
+    app_metadata = await _read_user_app_metadata(request, auth0_user_id)
+    return {
+        "usage_period_anchor": fresh_anchor,
+        "canceled_tier_context": {
+            "tier": canceled_tier.value,
+            "period_end": int(period_end_epoch),
+            "previous_usage_period_anchor": app_metadata.get("usage_period_anchor"),
+        },
+    }
+
+
+async def _write_resubscribe_usage_period_anchor(
+    request: Request, auth0_user_id: str | None, subscribed_tier: SubscriptionTier
+) -> None:
+    """Set the usage window a completed checkout starts, honoring a retained period.
+
+    Ordinary checkouts restart the window at this instant. A checkout that
+    resubscribes to the same or a lower tier inside a period the customer was
+    refunded for instead RESTORES the window they were counting against, so the
+    usage they already accrued carries over and (via the allotment floor in
+    ``resolve_effective_monthly_allotment``) the canceled tier's limits govern
+    the rest of that period.
+
+    The ``canceled_tier_context`` is cleared whenever it is not being honored —
+    an upgrade past the canceled tier, or a window that has since expired — so a
+    stale record can never resurrect a paid allotment later.
+    """
+    app_metadata = await _read_user_app_metadata(request, auth0_user_id)
+    canceled_tier_context = resolve_canceled_tier_context(
+        {"app_metadata": app_metadata}
+    )
+    restored_anchor = plan_resubscribe_usage_window(
+        subscribed_tier, canceled_tier_context
+    )
+    if restored_anchor is not None:
+        await update_user_app_metadata_fields(
+            request, auth0_user_id, {"usage_period_anchor": restored_anchor.isoformat()}
+        )
+        return
+    await update_user_app_metadata_fields(
+        request,
+        auth0_user_id,
+        {
+            "usage_period_anchor": datetime.now(UTC).isoformat(),
+            "canceled_tier_context": None,
+        },
+    )
+
+
 async def _handle_stripe_event(
     request: Request, stripe_client, event_type: str, data_object: dict
 ) -> None:
@@ -1877,13 +2011,39 @@ async def _handle_stripe_event(
                 "cancel_at_period_end": cancel_at_period_end,
             },
         )
-        # First checkout starts a fresh local usage window (a free→paid upgrade,
-        # or the free $0 subscription's first period).
-        await update_user_app_metadata_fields(
-            request,
-            auth0_user_id,
-            {"usage_period_anchor": datetime.now(UTC).isoformat()},
+        # Checkout normally starts a fresh local usage window (a free→paid
+        # upgrade, or the free $0 subscription's first period). Resubscribing
+        # inside a period the customer was refunded for is the exception:
+        # ``plan_resubscribe_usage_window`` restores the pre-cancellation window
+        # for a same-or-lower tier so accrued usage carries over, and returns
+        # None (anchor at this instant, usage cleared) for an upgrade or an
+        # expired retention window.
+        await _write_resubscribe_usage_period_anchor(
+            request, auth0_user_id, tier_from_value(tier)
         )
+
+    elif event_type == "customer.updated":
+        # The customer portal cannot evict this API's api-key cache directly, so
+        # it mirrors the pay-per-use switch into Stripe customer metadata and
+        # lets this webhook carry it the rest of the way. Writing the flag into
+        # Auth0 here evicts the cache (update_user_app_metadata_fields), which
+        # is what makes a portal-side toggle take effect on the very next
+        # request instead of after the five-minute TTL. Stripe metadata values
+        # are always strings, so the boolean is parsed rather than trusted.
+        raw_flag = (data_object.get("metadata") or {}).get("pay_per_use_enabled")
+        if raw_flag is not None:
+            customer_id = data_object.get("id")
+            auth0_user_id = (data_object.get("metadata") or {}).get(
+                "auth0_user_id"
+            ) or _auth0_user_id_for_customer(stripe_client, customer_id)
+            await update_user_app_metadata_fields(
+                request,
+                auth0_user_id,
+                {
+                    "pay_per_use_enabled": str(raw_flag).strip().lower()
+                    in ("true", "1", "yes", "enabled")
+                },
+            )
 
     elif event_type in (
         "customer.subscription.created",
@@ -1900,6 +2060,13 @@ async def _handle_stripe_event(
             data_object
         )
         if event_type == "customer.subscription.deleted":
+            # Read the tier the ended subscription represented BEFORE pinning
+            # the account to free — a refund-driven immediate cancellation has
+            # to remember what was paid for in order to honor it on a
+            # resubscribe inside the same period.
+            canceled_tier = tier_from_value(
+                _tier_from_subscription(stripe_client, data_object)
+            )
             tier = "free"
             status_value = "canceled"
         else:
@@ -1921,9 +2088,22 @@ async def _handle_stripe_event(
         )
         if event_type == "customer.subscription.deleted":
             # A stale explicit pay-per-use flag must not grant overage after the
-            # subscription (the billing vehicle) is gone.
+            # subscription (the billing vehicle) is gone. The same patch drops
+            # the account to the free-tier allotment AT ONCE by restarting the
+            # usage window, and records what was paid for so a resubscribe
+            # inside the paid-for period can retain it — see
+            # _build_canceled_tier_context_fields.
             await update_user_app_metadata_fields(
-                request, auth0_user_id, {"pay_per_use_enabled": False}
+                request,
+                auth0_user_id,
+                {
+                    "pay_per_use_enabled": False,
+                    **(
+                        await _build_canceled_tier_context_fields(
+                            request, auth0_user_id, canceled_tier, current_period_end
+                        )
+                    ),
+                },
             )
 
     elif event_type == "invoice.payment_failed":
@@ -2060,6 +2240,7 @@ async def verify_subscription_status(
     # definition order, then any trial-only meters, kept deterministic via an
     # insertion-ordered dict.
     trial_context = resolve_trial_context(current_user)
+    canceled_tier_context = resolve_canceled_tier_context(current_user)
     ordered_meters: dict = dict.fromkeys(
         TIER_DEFINITIONS[tier].meter_allotments.keys()
     )
@@ -2068,10 +2249,24 @@ async def verify_subscription_status(
             trial_context.trial_tier
         ].meter_allotments:
             ordered_meters.setdefault(trial_meter, None)
+    # A retained paid period can likewise grant meters the current tier lacks
+    # (refunded premium, resubscribed pro keeps premium's adapter meters until
+    # the paid-for period closes), so those stay visible too.
+    if canceled_tier_allotment_floor_applies(tier, canceled_tier_context):
+        assert canceled_tier_context is not None
+        for retained_meter in TIER_DEFINITIONS[
+            canceled_tier_context.canceled_tier
+        ].meter_allotments:
+            ordered_meters.setdefault(retained_meter, None)
 
     meters: dict = {}
     for meter in ordered_meters:
-        allotment = resolve_effective_monthly_allotment(tier, meter, trial_context)
+        allotment = resolve_effective_monthly_allotment(
+            tier,
+            meter,
+            trial_context,
+            canceled_tier_context=canceled_tier_context,
+        )
         if allotment is None:
             continue
         used_to_date = int(usage_by_meter.get(meter.value, 0))

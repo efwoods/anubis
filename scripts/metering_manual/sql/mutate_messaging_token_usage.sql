@@ -16,8 +16,8 @@ INSERT INTO api_metrics (
 )
 VALUES (
   gen_random_uuid(), now(),
-  'auth0|6a61928d122ee3c9a8f2734c',   -- $NN_USER_ID
-  'cus_Uw63jpTP11EDCv',               -- $NN_CUSTOMER
+  'auth0|6a624194d35cf2fb8de3e51a',   -- $NN_USER_ID
+  'cus_UwI5WZe7H8TOnx',               -- $NN_CUSTOMER
   'test_inject',
   0, 0,
   5000000000,                            -- pro allotment; raise to 20000000 for premium

@@ -115,12 +115,13 @@ from src.anubis.utils.billing import (
 )
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.graph_interrupts import collect_pending_interrupts
+from src.anubis.utils.avatar_deletion import (
+    purge_avatar_data,
+    search_all_avatars_for_user,
+)
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
-from src.anubis.utils.store_cache import (
-    invalidate_store_cache_entry,
-    invalidate_store_cache_for_assistant,
-)
+from src.anubis.utils.store_cache import invalidate_store_cache_entry
 from src.api.media_jobs import (
     MediaJob,
     create_child_job,
@@ -3023,45 +3024,54 @@ async def mcp_unregister(
 async def delete_avatar(
     assistant_id: str, request: Request, current_user: dict = Depends(get_current_user)
 ):
-    # TODO: Delete avatar in database
-    logger.info("breakpoint")
+    context = app.state.context
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
     client = get_client(headers={"API-KEY": f"{token}"})
 
-    metadata = {"user_id": user_id}
-    metadata.update({"assistant_id": assistant_id})
-    # Delete all entries in the store and store vectors for the created avatars
-    pool = request.app.state.pool
-    SQL_STORE_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
-    SQL_STORE_VECTOR_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
+    # Ownership gate. Without this check any authenticated caller could delete
+    # any avatar by passing an arbitrary assistant_id, including a public avatar
+    # or one belonging to another user. Mirrors the creator check that
+    # /update_avatar_identity_with_media already performs.
     try:
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                params = (
-                    assistant_id,
-                    f"{assistant_id}.%",
-                    f"%.{assistant_id}.%",
-                    f"%.{assistant_id}",
-                )
-                await cur.execute(SQL_STORE_DELETE_QUERY, params)
-                await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
-    except Exception as e:
+        assistant = await client.assistants.get(assistant_id)
+    except Exception as lookup_error:
         raise HTTPException(
-            detail="Error deleting items from store and store vectors during delete avatar.",
-            status_code=500,
+            status_code=404, detail=f"Could not load assistant: {lookup_error}"
+        ) from lookup_error
+    creator_id = (assistant.get("metadata") or {}).get("user_id")
+    if not creator_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Assistant metadata is missing the creator's user_id; "
+                "cannot verify deletion permissions."
+            ),
+        )
+    if user_id != creator_id and user_id != context.admin_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the creator of this avatar may delete the avatar. "
+                "The signed-in user is not the assistant's creator."
+            ),
         )
 
-    # Every store row mentioning the assistant was just removed by raw SQL,
-    # bypassing the store client — drop every cached entry for the assistant
-    # from the load_consciousness read-through cache.
-    invalidate_store_cache_for_assistant(assistant_id)
-
     try:
-        await client.assistants.delete(assistant_id=assistant_id, delete_threads=True)
-    except Exception as e:
-        raise HTTPException(detail="Error Deleting Assistant", status_code=500)
-    return JSONResponse("Deleted Avatar Successfully", status_code=200)
+        deleted_counts = await purge_avatar_data(
+            pool=request.app.state.pool,
+            langgraph_sdk_client=client,
+            assistant_id=assistant_id,
+        )
+    except Exception as purge_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error deleting avatar {assistant_id}: {purge_error}",
+        ) from purge_error
+    return JSONResponse(
+        {"message": "Deleted Avatar Successfully", "deleted": deleted_counts},
+        status_code=200,
+    )
 
 
 @app.get("/list_public_avatars")
@@ -3087,8 +3097,10 @@ async def list_user_avatars(
         )
         token = current_user["API_KEY"]
         client = get_client(headers={"API-KEY": f"{token}"})
-        response = await client.assistants.search(
-            metadata={"user_id": current_user["identities"][0]["user_id"]}
+        # Paged: assistants.search defaults to limit=10, which silently hid
+        # every avatar past the tenth from the owner's own listing.
+        response = await search_all_avatars_for_user(
+            client, current_user["identities"][0]["user_id"]
         )
         if len(response) > 0:
             avatar_list = response

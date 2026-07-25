@@ -1,3 +1,4 @@
+*.md
 .venv
 test_q_a_dataset.pkl
 adapters/

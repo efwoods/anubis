@@ -1176,11 +1176,10 @@ async def get_anonymous_user_with_anonymous_api_key(
 ) -> dict | None:
 
     logger.info(f"test breakpoint")
-    logger.warning(f"request.headers: {request.headers}")
     # cache_key = _hash_key(request.headers.get('x-forwarded-for'))
     if request.app.state.context.dev == "TRUE":
-        # hashed_ip = _hash_key("172.18.0.1")
-        hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
+        hashed_ip = _hash_key("172.18.0.1")
+        # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
         # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULATED
     else:
         hashed_ip = _hash_key(request.headers.get("x-forwarded-for"))
@@ -1519,46 +1518,76 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         # retrieve all avatar ids created by the user:
         from langgraph_sdk import get_client
 
+        from src.anubis.utils.avatar_deletion import (
+            delete_api_metrics_for_user,
+            delete_store_rows_for_user,
+            purge_avatar_data,
+            search_all_avatars_for_user,
+        )
+
         token = current_user["API_KEY"]
         headers = {"API-KEY": f"{token}"}
         langgraph_sdk_client = get_client(headers=headers)
 
-        metadata = {"user_id": current_user["identities"][0]["user_id"]}
+        pool = request.app.state.pool
+        user_id = current_user["identities"][0].get("user_id")
 
-        avatars = await langgraph_sdk_client.assistants.search(
-            graph_id="Anubis", metadata=metadata
+        # The user's own store rows and usage metrics are removed BEFORE the
+        # avatars. Deleting avatars first means a later failure strands rows
+        # whose avatar is already gone and therefore no longer discoverable
+        # through any listing endpoint — which is how orphaned avatar data
+        # accumulated in the first place.
+        try:
+            await delete_store_rows_for_user(pool, user_id)
+            await delete_api_metrics_for_user(pool, user_id)
+        except Exception as user_row_error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Error deleting store rows and usage metrics during "
+                    f"delete user: {user_row_error}"
+                ),
+            ) from user_row_error
+
+        # Paged, and deliberately not filtered by graph_id: assistants.search
+        # defaults to limit=10, so an account with more than ten avatars used to
+        # keep the remainder forever once the Auth0 user was deleted and the
+        # owning user_id could never be presented again.
+        avatars = await search_all_avatars_for_user(
+            langgraph_sdk_client, user_id, headers=headers
         )
 
+        # Every avatar is attempted even when one fails, so a single bad avatar
+        # cannot strand the rest. The Auth0 user is only deleted when all of the
+        # avatars are gone; leaving the account alive keeps the survivors
+        # reachable for a retry.
+        failed_assistant_ids: list[str] = []
         for avatar in avatars:
             assistant_id = avatar.get("assistant_id", "")
             try:
-                delete_result = await langgraph_sdk_client.assistants.delete(
-                    assistant_id=assistant_id, delete_threads=True, headers=headers
+                await purge_avatar_data(
+                    pool=pool,
+                    langgraph_sdk_client=langgraph_sdk_client,
+                    assistant_id=assistant_id,
+                    headers=headers,
                 )
-            except Exception as e:
-                raise HTTPException(
-                    detail="Error deleting avatar for user.", status_code=500
+            except Exception as avatar_error:  # noqa: BLE001 - continue the sweep
+                failed_assistant_ids.append(assistant_id)
+                logger.error(
+                    "Failed to purge avatar %s during deletion of user %s: %s",
+                    assistant_id,
+                    user_id,
+                    avatar_error,
                 )
 
-        # Delete all entries in the store and store vectors for the created avatars
-        pool = request.app.state.pool
-        user_id = current_user["identities"][0].get("user_id")
-        SQL_STORE_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
-        SQL_STORE_VECTOR_DELETE_QUERY = """DELETE FROM store WHERE prefix = %s OR prefix LIKE %s or prefix LIKE %s or prefix LIKE %s;"""
-        params = (
-            user_id,
-            f"{user_id}.%",
-            f"%.{user_id}.%",
-            f"%.{user_id}",
-        )
-        try:
-            async with pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(SQL_STORE_DELETE_QUERY, params)
-                    await cur.execute(SQL_STORE_VECTOR_DELETE_QUERY, params)
-        except Exception as e:
+        if failed_assistant_ids:
             raise HTTPException(
-                detail="Error deleting items from store and store vectors during delete user."
+                status_code=500,
+                detail=(
+                    "Could not delete every avatar for this user; the account "
+                    "was kept so the remaining avatars stay reachable. Failed "
+                    f"avatars: {', '.join(failed_assistant_ids)}"
+                ),
             )
 
         # # Delete the login information of the user
@@ -1574,10 +1603,22 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
         #  headers=headers
         response.raise_for_status()
         if response.status_code == 204:
-            del _api_key_cache[api_key_hash]
+            # pop, not del: the entry may already have aged out of the TTL cache,
+            # and a KeyError here would report a completed deletion as a failure.
+            _api_key_cache.pop(api_key_hash, None)
             return {"message": "User deleted"}
         else:
-            raise HTTPException(status_code=500, detail=f"Error deleting user: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Error deleting user: Auth0 returned status "
+                    f"{response.status_code}"
+                ),
+            )
+    except HTTPException:
+        # Already carries a specific status code and message — re-raise rather
+        # than flattening every failure into an indistinguishable 500.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting user: {e}")
 
@@ -1830,22 +1871,9 @@ async def check_subscription_status(request: Request, current_user: dict) -> dic
     subscription_status = current_user["app_metadata"].get("subscription_status", None)
     email = current_user.get("email")
 
-    # Anonymous / email-less users are always the free tier and can never hold a
-    # paid subscription, so short-circuit before looking anything up by email.
-    # They DO have a billing identity when anonymous metering is enabled — the
-    # per-hashed-ip customer and its $0 free-tier subscription, already resolved
-    # into app_metadata by get_anonymous_user_with_anonymous_api_key — and
-    # reporting it is what lets the subscription-status endpoint show an
-    # anonymous visitor the usage Stripe is accumulating for them. The tier stays
-    # free: it is read from this record, which is written as free.
+    # Anonymous / email-less users are always the free tier and never have a Stripe
+    # subscription to look up, so short-circuit before touching Stripe.
     if not email:
-        if subscription_status and subscription_status.get("customer_id"):
-            return SubscriptionStatus(
-                status=subscription_status.get("status"),
-                subscription_id=subscription_status.get("subscription_id"),
-                customer_id=subscription_status.get("customer_id"),
-                tier=subscription_status.get("tier", "free"),
-            ).to_dict()
         return SubscriptionStatus().to_dict()
 
     if not subscription_status or not subscription_status.get("subscription_id"):

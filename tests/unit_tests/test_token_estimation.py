@@ -40,7 +40,11 @@ from src.anubis.utils.billing.system_prompt_estimate_cache import (
 )
 from src.anubis.utils.billing.gating import (
     exhausted_allotment_block_reason,
+    MeteringBypass,
     is_admin_metering_bypass,
+    is_dev_metered_enforcement_bypass,
+    parse_metering_bypass_identifiers,
+    resolve_metering_bypass,
 )
 from src.anubis.utils.billing.tiers import (
     SubscriptionTier,
@@ -659,3 +663,175 @@ def test_missing_admin_id_never_bypasses():
     assert not is_admin_metering_bypass({"user_id": _ADMIN_USER_ID}, None)
     assert not is_admin_metering_bypass({"user_id": _ADMIN_USER_ID}, "")
     assert not is_admin_metering_bypass(None, _ADMIN_USER_ID)
+
+
+# ---------------------------------------------------------------------------
+# Configured bypass identifiers (anonymous hashed-IP testing accounts)
+# ---------------------------------------------------------------------------
+
+# sha256("172.18.0.1") — the docker bridge gateway the dev container sees.
+_HASHED_IP_DEV_GATEWAY = (
+    "245c0ffc0f6a0215471542b9add1fa5331647f4af18c431f039c66dbee92732e"
+)
+_HASHED_IP_VPN_SIMULATED = (
+    "2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1"
+)
+_BYPASS_IDENTIFIERS = f"{_HASHED_IP_DEV_GATEWAY},{_HASHED_IP_VPN_SIMULATED}"
+
+
+def _anonymous_user(hashed_ip: str) -> dict:
+    """Shape an anonymous user the way the auth layer stamps one.
+
+    ``get_anonymous_user_with_anonymous_api_key`` puts the hashed IP in
+    ``identities[0].user_id`` and leaves no top-level ``user_id``, which is the
+    only place ``resolve_metering_user_id`` can find an anonymous identity.
+    """
+    return {"identities": [{"user_id": hashed_ip}]}
+
+
+def test_listed_anonymous_hashed_ip_bypasses_metering():
+    assert is_admin_metering_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY), None, _BYPASS_IDENTIFIERS
+    )
+    assert is_admin_metering_bypass(
+        _anonymous_user(_HASHED_IP_VPN_SIMULATED), _ADMIN_USER_ID, _BYPASS_IDENTIFIERS
+    )
+
+
+def test_unlisted_anonymous_hashed_ip_stays_metered():
+    unlisted = "72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15"
+    assert not is_admin_metering_bypass(
+        _anonymous_user(unlisted), _ADMIN_USER_ID, _BYPASS_IDENTIFIERS
+    )
+
+
+def test_admin_user_id_still_bypasses_alongside_the_identifier_list():
+    assert is_admin_metering_bypass(
+        {"user_id": _ADMIN_USER_ID}, _ADMIN_USER_ID, _BYPASS_IDENTIFIERS
+    )
+
+
+def test_empty_identifier_list_leaves_everyone_metered():
+    # The production posture: no ADMIN_USER_ID and no configured identifiers
+    # must not degrade into "the empty string matches", which would exempt a
+    # user whose metering id could not be resolved.
+    for empty_configuration in (None, "", "  ", ",,", "\n"):
+        assert not is_admin_metering_bypass(
+            _anonymous_user(_HASHED_IP_DEV_GATEWAY), None, empty_configuration
+        )
+        assert not is_admin_metering_bypass({}, None, empty_configuration)
+
+
+def test_identifier_parsing_tolerates_whitespace_case_and_comments():
+    assert is_admin_metering_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY),
+        None,
+        f"  {_HASHED_IP_DEV_GATEWAY.upper()} , # a comment\n",
+    )
+    assert parse_metering_bypass_identifiers(
+        f"{_HASHED_IP_DEV_GATEWAY}\n{_HASHED_IP_VPN_SIMULATED},"
+    ) == frozenset({_HASHED_IP_DEV_GATEWAY, _HASHED_IP_VPN_SIMULATED})
+    assert parse_metering_bypass_identifiers(None) == frozenset()
+
+
+def test_identifier_list_accepts_an_already_split_iterable():
+    assert is_admin_metering_bypass(
+        _anonymous_user(_HASHED_IP_VPN_SIMULATED),
+        None,
+        [_HASHED_IP_DEV_GATEWAY, _HASHED_IP_VPN_SIMULATED],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Development enforcement-only bypass (still metered)
+# ---------------------------------------------------------------------------
+
+
+class _BypassContext:
+    """The four GlobalContext fields resolve_metering_bypass reads."""
+
+    def __init__(
+        self,
+        dev="TRUE",
+        admin_user_id=None,
+        admin_metering_bypass_identifiers=None,
+        dev_metered_enforcement_bypass_identifiers=None,
+    ):
+        self.dev = dev
+        self.admin_user_id = admin_user_id
+        self.admin_metering_bypass_identifiers = admin_metering_bypass_identifiers
+        self.dev_metered_enforcement_bypass_identifiers = (
+            dev_metered_enforcement_bypass_identifiers
+        )
+
+
+def test_dev_metered_bypass_skips_enforcement_but_keeps_metering():
+    # The whole point of the mode: the anonymous tester keeps messaging past the
+    # free-tier allotment, and every turn still reaches Stripe and api_metrics
+    # so the portal, /verify_subscription_status and the SSE frames agree.
+    bypass = resolve_metering_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY),
+        _BypassContext(
+            dev_metered_enforcement_bypass_identifiers=_BYPASS_IDENTIFIERS
+        ),
+    )
+    assert bypass.skips_enforcement
+    assert not bypass.skips_metering_writes
+    assert bypass.usage_response_fields() == {"admin_enforcement_bypass": True}
+
+
+def test_dev_metered_bypass_is_inert_outside_development():
+    # A hashed IP left in a copied environment file must not become an
+    # unenforced production requester.
+    for production_dev_flag in ("FALSE", "", None, "false-ish"):
+        bypass = resolve_metering_bypass(
+            _anonymous_user(_HASHED_IP_DEV_GATEWAY),
+            _BypassContext(
+                dev=production_dev_flag,
+                dev_metered_enforcement_bypass_identifiers=_BYPASS_IDENTIFIERS,
+            ),
+        )
+        assert bypass == MeteringBypass()
+        assert bypass.usage_response_fields() == {}
+
+
+def test_dev_metered_bypass_honors_the_dev_flag_case_and_whitespace():
+    assert is_dev_metered_enforcement_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY), _BYPASS_IDENTIFIERS, " true "
+    )
+    assert not is_dev_metered_enforcement_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY), None, "TRUE"
+    )
+    assert not is_dev_metered_enforcement_bypass(
+        _anonymous_user("an-unlisted-hashed-ip"), _BYPASS_IDENTIFIERS, "TRUE"
+    )
+    assert not is_dev_metered_enforcement_bypass(None, _BYPASS_IDENTIFIERS, "TRUE")
+
+
+def test_full_admin_bypass_wins_over_the_dev_metered_list():
+    # Listed on both: the broader treatment applies rather than one that depends
+    # on which list is consulted first.
+    bypass = resolve_metering_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY),
+        _BypassContext(
+            admin_metering_bypass_identifiers=_BYPASS_IDENTIFIERS,
+            dev_metered_enforcement_bypass_identifiers=_BYPASS_IDENTIFIERS,
+        ),
+    )
+    assert bypass.skips_enforcement
+    assert bypass.skips_metering_writes
+    assert bypass.usage_response_fields() == {"admin_metering_bypass": True}
+
+
+def test_ordinary_requester_is_enforced_and_metered():
+    bypass = resolve_metering_bypass(
+        _anonymous_user("an-unlisted-hashed-ip"),
+        _BypassContext(
+            admin_user_id=_ADMIN_USER_ID,
+            dev_metered_enforcement_bypass_identifiers=_BYPASS_IDENTIFIERS,
+        ),
+    )
+    assert bypass == MeteringBypass(
+        skips_enforcement=False, skips_metering_writes=False
+    )
+    assert bypass.usage_response_fields() == {}

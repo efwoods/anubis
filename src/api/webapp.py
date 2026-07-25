@@ -82,7 +82,7 @@ from src.anubis.utils.billing import (
     fetch_rolling_window_usage,
     fetch_usage_by_meter_since,
     fetch_usage_since,
-    is_admin_metering_bypass,
+    is_anonymous_user,
     canceled_tier_allotment_floor_applies,
     load_stripe_billing_config,
     persist_api_metrics_row,
@@ -90,7 +90,10 @@ from src.anubis.utils.billing import (
     plan_subscribe_action,
     plan_tier_change,
     report_meter_event,
+    fetch_stripe_period_usage,
+    reconcile_period_usage,
     resolve_canceled_tier_context,
+    resolve_metering_bypass,
     resolve_stripe_billing_config_json,
     resolve_metering_user_id,
     resolve_pay_per_use_enabled,
@@ -131,6 +134,7 @@ from src.security.auth import (
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
+    get_current_user_or_anonymous_user_id,
     get_user,
     get_user_with_api_key,
     security_route,
@@ -234,6 +238,45 @@ def resolve_usage_period_start_for_user(current_user: dict) -> datetime:
     return period_start
 
 
+async def resolve_period_usage_to_date(
+    app_state,
+    current_user: dict,
+    meter: UsageMeter,
+    period_start: datetime,
+) -> int:
+    """Return this caller's authoritative usage for ``meter`` since ``period_start``.
+
+    STRIPE IS THE SOURCE OF TRUTH. Usage is recorded in two places — Stripe's
+    Billing Meter aggregation (what the customer portal displays) and the local
+    ``api_metrics`` table (what gating historically read alone) — and because
+    both writes are fail-open, the two ledgers drift permanently whenever one
+    lands without the other. That drift is what let the portal show an anonymous
+    visitor an exhausted allotment while this API still reported budget
+    remaining and kept answering. ``reconcile_period_usage`` resolves the two
+    into one number: Stripe governs, the local sum stands as a floor for usage
+    Stripe has not finished aggregating, and the local sum governs alone when
+    Stripe cannot be read.
+
+    Every allotment decision and every usage display goes through here, so the
+    402 boundary and the number the customer sees are always the same number.
+    """
+    local_usage = await fetch_usage_since(
+        getattr(app_state, "pool", None),
+        resolve_metering_user_id(current_user),
+        meter.value,
+        period_start,
+        stripe_customer_id=resolve_stripe_customer_id(current_user),
+    )
+    stripe_usage = await fetch_stripe_period_usage(
+        getattr(app_state, "stripe", None),
+        getattr(app_state, "stripe_billing_config", None),
+        meter,
+        resolve_stripe_customer_id(current_user),
+        period_start,
+    )
+    return reconcile_period_usage(local_usage, stripe_usage)
+
+
 async def enforce_remaining_allotment(
     app_state,
     current_user: dict,
@@ -247,13 +290,18 @@ async def enforce_remaining_allotment(
     at or past the allotment, only pay-per-use (a payment method on file lets
     the Stripe graduated metered price bill the overage) allows the request.
     Otherwise the request is refused with HTTP 402 until the period resets,
-    pay-per-use is enabled, or the user upgrades tiers. Usage is read from the
-    local ``api_metrics`` table (which also covers anonymous users via their
-    hashed-IP identifier) over the period resolved by
-    ``resolve_usage_period_start_for_user``. The admin testing account skips
-    enforcement entirely.
+    pay-per-use is enabled, or the user upgrades tiers. Usage comes from
+    ``resolve_period_usage_to_date`` — Stripe's meter aggregation (the source of
+    truth the customer portal displays) reconciled with the local
+    ``api_metrics`` table, which also covers anonymous users via their hashed-IP
+    identifier — over the period resolved by
+    ``resolve_usage_period_start_for_user``. The admin testing account, any
+    identifier listed in ``ADMIN_METERING_BYPASS_IDENTIFIERS``, and (in
+    development only) any identifier listed in
+    ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS`` skip enforcement entirely;
+    only the first two also stop being metered.
     """
-    if is_admin_metering_bypass(current_user, GlobalContext().admin_user_id):
+    if resolve_metering_bypass(current_user).skips_enforcement:
         return
     tier = resolve_tier(current_user)
     allotment = tier_allotment_for_meter(tier, meter)
@@ -272,14 +320,9 @@ async def enforce_remaining_allotment(
         resolve_trial_context(current_user),
         canceled_tier_context=resolve_canceled_tier_context(current_user),
     )
-    metering_user_id = resolve_metering_user_id(current_user)
     period_start = resolve_usage_period_start_for_user(current_user)
-    period_usage = await fetch_usage_since(
-        getattr(app_state, "pool", None),
-        metering_user_id,
-        meter.value,
-        period_start,
-        stripe_customer_id=resolve_stripe_customer_id(current_user),
+    period_usage = await resolve_period_usage_to_date(
+        app_state, current_user, meter, period_start
     )
     block_reason = exhausted_allotment_block_reason(
         tier,
@@ -310,12 +353,13 @@ async def enforce_token_rate_limit(
     this request's pre-call estimate added, so one huge request is refused
     before burning the cap rather than after. The Retry-After header tells the
     client when the oldest usage row ages out of the rolling window. A cap of
-    zero or less disables the limit entirely; the admin testing account skips
-    the limit.
+    zero or less disables the limit entirely; every requester that
+    ``resolve_metering_bypass`` marks as skipping enforcement also skips the
+    limit.
     """
     if tokens_per_window <= 0 or window_seconds <= 0:
         return
-    if is_admin_metering_bypass(current_user, GlobalContext().admin_user_id):
+    if resolve_metering_bypass(current_user).skips_enforcement:
         return
     window_usage, oldest_usage_at = await fetch_rolling_window_usage(
         getattr(app_state, "pool", None),
@@ -376,7 +420,9 @@ async def _build_meter_usage_snapshot(
     scoped to the single meter governing the current request, so every metered
     endpoint can show the caller where they stand: allotment, usage to date in
     the current period, remaining budget, the pay-per-use flag, and the period
-    bounds.
+    bounds. ``used_to_date`` is the reconciled, Stripe-authoritative figure
+    (``resolve_period_usage_to_date``), so what a client is told matches both
+    the customer portal and the number the 402 gate judges against.
     """
     tier = resolve_tier(current_user)
     # Trial- and refund-aware allotment so the streamed snapshot matches what
@@ -389,12 +435,8 @@ async def _build_meter_usage_snapshot(
         canceled_tier_context=resolve_canceled_tier_context(current_user),
     )
     period_start, period_end = _resolve_usage_period_bounds_for_user(current_user)
-    used_to_date = await fetch_usage_since(
-        getattr(app_state, "pool", None),
-        resolve_metering_user_id(current_user),
-        meter.value,
-        period_start,
-        stripe_customer_id=resolve_stripe_customer_id(current_user),
+    used_to_date = await resolve_period_usage_to_date(
+        app_state, current_user, meter, period_start
     )
     monthly_allotment = allotment.monthly_allotment if allotment else None
     return {
@@ -556,7 +598,8 @@ async def _meter_message_usage(
     ``api_metrics`` row. A ``None`` customer id (anonymous user) makes the
     Stripe report a no-op while still recording local metrics. The admin
     testing account skips both billing writes (Prometheus observability is
-    kept). Returns the turn's usage summary — this turn's actual token counts
+    kept); a dev enforcement-only bypass keeps both writes, so its usage stays
+    visible everywhere usage is read. Returns the turn's usage summary — this turn's actual token counts
     plus the caller's usage-versus-allotment snapshot for the governing meter —
     for endpoint responses; returns ``None`` when metering fails (the model
     already ran; post-response reporting stays fail-open).
@@ -571,9 +614,7 @@ async def _meter_message_usage(
 
         stripe_customer_id = resolve_stripe_customer_id(current_user)
         tier = resolve_tier(current_user)
-        admin_metering_bypass = is_admin_metering_bypass(
-            current_user, GlobalContext().admin_user_id
-        )
+        metering_bypass = resolve_metering_bypass(current_user)
 
         # Adapter inference is billed against a separate meter at a different rate;
         # the think node sets is_adapter_inference when the client requested
@@ -588,8 +629,9 @@ async def _meter_message_usage(
 
         # The request id keys Stripe's meter-event deduplication so a retried
         # request cannot double-bill the same turn.
-        if not admin_metering_bypass:
-            await report_meter_event(
+        stripe_meter_event_accepted = False
+        if not metering_bypass.skips_metering_writes:
+            stripe_meter_event_accepted = await report_meter_event(
                 app_state.stripe,
                 meter,
                 stripe_customer_id,
@@ -609,8 +651,8 @@ async def _meter_message_usage(
             if cost_usd:
                 MODEL_COST_TOTAL.labels(model=model_name).inc(cost_usd)
 
-        if not admin_metering_bypass:
-            await persist_api_metrics_row(
+        if not metering_bypass.skips_metering_writes:
+            local_row_written = await persist_api_metrics_row(
                 getattr(app_state, "pool", None),
                 inference_type=inference_type,
                 prompt_tokens=prompt_tokens,
@@ -625,6 +667,22 @@ async def _meter_message_usage(
                 model_name=model_name,
                 meter_event_name=meter.value,
             )
+            # Stripe accepted the usage but the local ledger did not record it:
+            # the two ledgers have just diverged for this customer, permanently
+            # and by exactly these tokens. Usage reads treat Stripe as the source
+            # of truth so the divergence cannot mislead the customer, but it must
+            # still be greppable when reconciling api_metrics against invoices.
+            if stripe_meter_event_accepted and not local_row_written:
+                logger.warning(
+                    "Usage ledger divergence: Stripe accepted %s tokens on the %s "
+                    "meter for customer %s (request %s) but the api_metrics row "
+                    "was not written; the local ledger now under-counts this "
+                    "customer by that amount.",
+                    total_tokens,
+                    meter.value,
+                    stripe_customer_id,
+                    request_id,
+                )
 
         # The insert above was awaited, so the snapshot's used_to_date already
         # includes this turn.
@@ -636,7 +694,7 @@ async def _meter_message_usage(
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             **usage_snapshot,
-            **({"admin_metering_bypass": True} if admin_metering_bypass else {}),
+            **metering_bypass.usage_response_fields(),
         }
     except Exception as metering_error:  # noqa: BLE001 - metering must never break a reply
         logger.error("Failed to meter message usage: %s", metering_error)
@@ -2198,15 +2256,27 @@ async def stripe_webhook(request: Request):
 
 @app.get("/verify_subscription_status")
 async def verify_subscription_status(
-    request: Request, current_user: dict = Depends(get_current_user)
+    request: Request,
+    current_user: dict = Depends(get_current_user_or_anonymous_user_id),
 ):
     """Return subscription status plus per-meter allotment, usage, and remaining.
 
     The single endpoint a customer portal polls: subscription identity/status,
     the pay-per-use flag, the current usage period bounds, and — for every meter
-    the tier grants — the period allotment, usage to date (from the local
-    ``api_metrics`` accounting), remaining budget, and the overage rate that
-    applies when pay-per-use is enabled.
+    the tier grants — the period allotment, usage to date, remaining budget, and
+    the overage rate that applies when pay-per-use is enabled. ``used_to_date``
+    is the reconciled, Stripe-authoritative figure
+    (``resolve_period_usage_to_date``), the same number allotment enforcement
+    judges against.
+
+    ANONYMOUS CALLERS ARE ACCEPTED (no API key): an anonymous visitor is
+    identified by the hash of their network address, always resolves to the free
+    tier, and reports the usage accumulating on their per-hashed-ip Stripe
+    free-tier customer — the same customer, window, and aggregation the customer
+    portal reads, so an anonymous visitor can be shown exactly how much of the
+    free allotment they have spent. The response flags them with ``anonymous``
+    so a client can render their view read-only (they cannot subscribe, hold a
+    trial, or enable pay-per-use until they create an account).
     """
     status = await check_subscription_status(request=request, current_user=current_user)
     tier = tier_from_value(status.get("tier"))
@@ -2259,7 +2329,7 @@ async def verify_subscription_status(
         ].meter_allotments:
             ordered_meters.setdefault(retained_meter, None)
 
-    meters: dict = {}
+    granted_allotments: dict = {}
     for meter in ordered_meters:
         allotment = resolve_effective_monthly_allotment(
             tier,
@@ -2267,13 +2337,46 @@ async def verify_subscription_status(
             trial_context,
             canceled_tier_context=canceled_tier_context,
         )
-        if allotment is None:
-            continue
-        used_to_date = int(usage_by_meter.get(meter.value, 0))
+        if allotment is not None:
+            granted_allotments[meter] = allotment
+
+    # Stripe's aggregation per granted meter, read CONCURRENTLY: a premium tier
+    # grants four meters and a portal polls this endpoint, so four sequential
+    # Stripe round trips would be four times the wait for one screen. Cached
+    # readings return without any call at all.
+    stripe_usage_by_meter = dict(
+        zip(
+            granted_allotments,
+            await asyncio.gather(
+                *(
+                    fetch_stripe_period_usage(
+                        getattr(request.app.state, "stripe", None),
+                        getattr(request.app.state, "stripe_billing_config", None),
+                        meter,
+                        resolve_stripe_customer_id(current_user),
+                        period_start,
+                    )
+                    for meter in granted_allotments
+                )
+            ),
+        )
+    )
+
+    meters: dict = {}
+    for meter, allotment in granted_allotments.items():
+        # Stripe reconciled against the local per-meter sum read above, so the
+        # portal, this response, and the 402 gate all report one figure.
+        # ``over_allotment`` is stated explicitly because a customer billing
+        # pay-per-use overage needs to see how far past the allotment they have
+        # run, not a bar pinned at zero remaining.
+        used_to_date = reconcile_period_usage(
+            int(usage_by_meter.get(meter.value, 0)), stripe_usage_by_meter.get(meter)
+        )
         meters[meter.value] = {
             "monthly_allotment": allotment.monthly_allotment,
             "used_to_date": used_to_date,
             "remaining": max(0, allotment.monthly_allotment - used_to_date),
+            "over_allotment": max(0, used_to_date - allotment.monthly_allotment),
             "overage_price_per_million": allotment.overage_price_per_million,
             "overage_price_per_unit_usd": allotment.overage_price_per_unit_usd,
         }
@@ -2284,6 +2387,7 @@ async def verify_subscription_status(
         "subscription_id": status.get("subscription_id"),
         "customer_id": status.get("customer_id"),
         "email": status.get("email"),
+        "anonymous": is_anonymous_user(current_user),
         "pay_per_use_enabled": resolve_pay_per_use_enabled(current_user),
         "cancel_at_period_end": bool(
             cached_subscription_status.get("cancel_at_period_end")
@@ -6115,11 +6219,10 @@ async def update_avatar_identity_with_media(
 
         # Report the estimate against the document-upload meter (Stripe +
         # local api_metrics). Billing WRITES stay fail-open — only estimation
-        # is fail-closed. The admin testing account is never metered.
-        upload_admin_metering_bypass = is_admin_metering_bypass(
-            current_user, GlobalContext().admin_user_id
-        )
-        if not upload_admin_metering_bypass and estimated_tokens_total > 0:
+        # is fail-closed. The admin testing account is never metered; a dev
+        # enforcement-only bypass still is.
+        upload_metering_bypass = resolve_metering_bypass(current_user)
+        if not upload_metering_bypass.skips_metering_writes and estimated_tokens_total > 0:
             try:
                 await report_meter_event(
                     app.state.stripe,
@@ -6295,11 +6398,7 @@ async def update_avatar_identity_with_media(
                 "usage": await _build_meter_usage_snapshot(
                     app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
                 ),
-                **(
-                    {"admin_metering_bypass": True}
-                    if upload_admin_metering_bypass
-                    else {}
-                ),
+                **upload_metering_bypass.usage_response_fields(),
                 "message": (
                     "Media processing started; enumerating "
                     f"{len(playlist_urls)} playlist(s) in the background"

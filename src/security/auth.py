@@ -1179,8 +1179,8 @@ async def get_anonymous_user_with_anonymous_api_key(
     logger.warning(f"request.headers: {request.headers}")
     # cache_key = _hash_key(request.headers.get('x-forwarded-for'))
     if request.app.state.context.dev == "TRUE":
-        hashed_ip = _hash_key("172.18.0.1")
-        # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
+        # hashed_ip = _hash_key("172.18.0.1")
+        hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
         # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULATED
     else:
         hashed_ip = _hash_key(request.headers.get("x-forwarded-for"))
@@ -1253,16 +1253,44 @@ async def get_anonymous_user_with_anonymous_api_key(
     # meter report stays a no-op, exactly the pre-existing behavior. Tier
     # gating is unaffected: is_anonymous_user still pins the tier to free.
     from src.security.anonymous_billing import (
-        resolve_or_create_anonymous_stripe_customer,
+        resolve_or_create_anonymous_billing_record,
     )
 
-    anonymous_stripe_customer_id = await resolve_or_create_anonymous_stripe_customer(
+    anonymous_billing_record = await resolve_or_create_anonymous_billing_record(
         request, hashed_ip
     )
-    if anonymous_stripe_customer_id:
-        user.setdefault("app_metadata", {})[
+    if anonymous_billing_record is not None:
+        anonymous_app_metadata = user.setdefault("app_metadata", {})
+        anonymous_app_metadata[
             "stripe_customer_id"
-        ] = anonymous_stripe_customer_id
+        ] = anonymous_billing_record.stripe_customer_id
+        # The free-tier subscription's billing cycle — NOT the calendar month —
+        # is the window Stripe aggregates this visitor's meter events over, and
+        # the customer portal reads that same aggregation. Caching the cycle in
+        # the same two fields the Stripe webhook writes for authenticated users
+        # (``current_period_start`` / ``current_period_end``) makes
+        # ``resolve_usage_period_start_for_user`` resolve the identical window
+        # for anonymous visitors, so usage-to-date and the 402 boundary agree
+        # with what the portal displays. This does not confer any paid
+        # capability: ``is_anonymous_user`` short-circuits on the
+        # ``is_anonymous`` flag Supabase sets, which pins the tier to free and
+        # pay-per-use to false regardless of the cached status.
+        anonymous_subscription_status: dict[str, Any] = {
+            "status": anonymous_billing_record.subscription_status,
+            "subscription_id": anonymous_billing_record.subscription_id,
+            "customer_id": anonymous_billing_record.stripe_customer_id,
+            "email": None,
+            "tier": "free",
+        }
+        if anonymous_billing_record.current_period_start:
+            anonymous_subscription_status[
+                "current_period_start"
+            ] = anonymous_billing_record.current_period_start
+        if anonymous_billing_record.current_period_end:
+            anonymous_subscription_status[
+                "current_period_end"
+            ] = anonymous_billing_record.current_period_end
+        anonymous_app_metadata["subscription_status"] = anonymous_subscription_status
 
     return user
 
@@ -1802,9 +1830,22 @@ async def check_subscription_status(request: Request, current_user: dict) -> dic
     subscription_status = current_user["app_metadata"].get("subscription_status", None)
     email = current_user.get("email")
 
-    # Anonymous / email-less users are always the free tier and never have a Stripe
-    # subscription to look up, so short-circuit before touching Stripe.
+    # Anonymous / email-less users are always the free tier and can never hold a
+    # paid subscription, so short-circuit before looking anything up by email.
+    # They DO have a billing identity when anonymous metering is enabled — the
+    # per-hashed-ip customer and its $0 free-tier subscription, already resolved
+    # into app_metadata by get_anonymous_user_with_anonymous_api_key — and
+    # reporting it is what lets the subscription-status endpoint show an
+    # anonymous visitor the usage Stripe is accumulating for them. The tier stays
+    # free: it is read from this record, which is written as free.
     if not email:
+        if subscription_status and subscription_status.get("customer_id"):
+            return SubscriptionStatus(
+                status=subscription_status.get("status"),
+                subscription_id=subscription_status.get("subscription_id"),
+                customer_id=subscription_status.get("customer_id"),
+                tier=subscription_status.get("tier", "free"),
+            ).to_dict()
         return SubscriptionStatus().to_dict()
 
     if not subscription_status or not subscription_status.get("subscription_id"):

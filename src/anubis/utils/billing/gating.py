@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from src.anubis.utils.billing.tiers import (
     MeterAllotment,
@@ -32,6 +32,7 @@ from src.anubis.utils.billing.tiers import (
     tier_from_value,
     tier_has_capability,
 )
+from src.anubis.utils.context import GlobalContext
 
 
 def is_anonymous_user(user: Mapping[str, Any] | None) -> bool:
@@ -232,22 +233,174 @@ def exhausted_allotment_block_reason(
     )
 
 
+def parse_metering_bypass_identifiers(
+    configured_identifiers: str | Iterable[str] | None,
+) -> frozenset[str]:
+    """Normalize a configured bypass list into a comparable identifier set.
+
+    Accepts the raw environment-variable form (one string, entries separated by
+    commas and/or newlines, blanks and ``#`` comment lines ignored) or an
+    already-split iterable. Entries are casefolded because the anonymous
+    identifiers are hex SHA-256 digests that are easy to paste in uppercase,
+    and a digest that silently fails to match would look like the bypass is
+    broken rather than mistyped.
+    """
+    if not configured_identifiers:
+        return frozenset()
+    if isinstance(configured_identifiers, str):
+        candidate_entries: Iterable[str] = configured_identifiers.replace(
+            "\n", ","
+        ).split(",")
+    else:
+        candidate_entries = configured_identifiers
+    return frozenset(
+        entry.strip().casefold()
+        for entry in candidate_entries
+        if entry and entry.strip() and not entry.strip().startswith("#")
+    )
+
+
 def is_admin_metering_bypass(
-    user: Mapping[str, Any] | None, admin_user_id: str | None
+    user: Mapping[str, Any] | None,
+    admin_user_id: str | None,
+    additional_bypass_identifiers: str | Iterable[str] | None = None,
 ) -> bool:
-    """Return whether this requester is the admin testing account.
+    """Return whether this requester bypasses metering as a testing account.
 
     The admin testing account (``GlobalContext.admin_user_id``, environment
     variable ``ADMIN_USER_ID``) skips BOTH enforcement (402/429) and metering
     writes (Stripe meter events, ``api_metrics`` rows) so testing never
-    pollutes real usage. A missing or empty ``admin_user_id`` never bypasses,
-    and every other user — anonymous and unsubscribed included — stays
-    metered. Keyed on ``resolve_metering_user_id`` because that is the same
-    identity that enforcement and usage attribution key on.
+    pollutes real usage. Every other user — anonymous and unsubscribed
+    included — stays metered. Keyed on ``resolve_metering_user_id`` because
+    that is the same identity that enforcement and usage attribution key on.
+
+    ``additional_bypass_identifiers``
+    (``GlobalContext.admin_metering_bypass_identifiers``, environment variable
+    ``ADMIN_METERING_BYPASS_IDENTIFIERS``) extends the same bypass to a list of
+    identifiers rather than a single one. Its purpose is anonymous testing:
+    ``admin_user_id`` holds one Auth0 user id, but an anonymous requester has
+    no account — the only durable handle is the hashed IP that
+    ``resolve_metering_user_id`` reads out of ``identities[0].user_id``, and a
+    tester exercising the anonymous path from several source addresses (direct,
+    VPN on, VPN off) presents a different hash each time. Listing those hashes
+    here lets the anonymous flows be driven past the free-tier allotment
+    without minting real usage.
+
+    Both inputs empty means nobody bypasses, which is the intended production
+    posture: leave ``ADMIN_METERING_BYPASS_IDENTIFIERS`` unset there, because
+    any identifier on this list is an unmetered, unenforced requester.
     """
-    if not admin_user_id:
+    bypass_identifiers = parse_metering_bypass_identifiers(
+        additional_bypass_identifiers
+    )
+    if admin_user_id:
+        bypass_identifiers = bypass_identifiers | {str(admin_user_id).casefold()}
+    if not bypass_identifiers:
         return False
-    return resolve_metering_user_id(user) == str(admin_user_id)
+    metering_user_id = resolve_metering_user_id(user)
+    if metering_user_id is None:
+        return False
+    return metering_user_id.casefold() in bypass_identifiers
+
+
+def is_dev_metered_enforcement_bypass(
+    user: Mapping[str, Any] | None,
+    configured_identifiers: str | Iterable[str] | None,
+    dev_mode: str | None,
+) -> bool:
+    """Return whether this requester skips enforcement but stays fully metered.
+
+    Backs ``GlobalContext.dev_metered_enforcement_bypass_identifiers``
+    (environment variable ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS``), whose
+    entries are the same kind of identifier
+    ``ADMIN_METERING_BYPASS_IDENTIFIERS`` takes — for an anonymous tester, the
+    hashed IP that ``resolve_metering_user_id`` reads out of
+    ``identities[0].user_id``.
+
+    The list is honored ONLY when ``GlobalContext.dev`` is ``TRUE``. Gating on
+    the development flag rather than trusting the list alone means a hashed IP
+    left behind in a shared or copied environment file cannot turn into an
+    unenforced production requester; in production the entries are inert.
+    """
+    if str(dev_mode or "").strip().upper() != "TRUE":
+        return False
+    bypass_identifiers = parse_metering_bypass_identifiers(configured_identifiers)
+    if not bypass_identifiers:
+        return False
+    metering_user_id = resolve_metering_user_id(user)
+    if metering_user_id is None:
+        return False
+    return metering_user_id.casefold() in bypass_identifiers
+
+
+@dataclass(frozen=True)
+class MeteringBypass:
+    """Which of the two halves of metering a requester skips.
+
+    Metering is two independent mechanisms, and testing needs them separable:
+
+    * ENFORCEMENT — the HTTP 402 exhausted-allotment refusal and the HTTP 429
+      token rate limit, both of which stop a request before the model runs.
+    * METERING WRITES — the Stripe meter event and the ``api_metrics`` row that
+      record what the request consumed.
+
+    The admin testing account and ``ADMIN_METERING_BYPASS_IDENTIFIERS`` skip
+    BOTH, so that traffic never enters either ledger.
+    ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS`` skips ENFORCEMENT ONLY: an
+    anonymous tester driven past the 200,000-token free-tier allotment keeps
+    messaging, while every turn is still reported to Stripe and to
+    ``api_metrics``, so the customer portal, ``/verify_subscription_status`` and
+    the SSE usage frames all keep advancing off the same numbers. Skipping the
+    writes instead is what freezes reported usage while messaging continues,
+    which is indistinguishable from the API and the portal having fallen out of
+    sync.
+    """
+
+    skips_enforcement: bool = False
+    skips_metering_writes: bool = False
+
+    def usage_response_fields(self) -> dict[str, bool]:
+        """Return the bypass flags to surface on usage payloads.
+
+        Empty for an ordinary metered requester, so the flags appear only when
+        something really was bypassed. The two modes get distinct keys because a
+        client reading ``admin_metering_bypass`` must keep meaning "these tokens
+        were never recorded anywhere".
+        """
+        response_fields: dict[str, bool] = {}
+        if self.skips_metering_writes:
+            response_fields["admin_metering_bypass"] = True
+        elif self.skips_enforcement:
+            response_fields["admin_enforcement_bypass"] = True
+        return response_fields
+
+
+def resolve_metering_bypass(
+    user: Mapping[str, Any] | None, context: Any | None = None
+) -> MeteringBypass:
+    """Resolve how much of metering this requester skips.
+
+    One place reads the three configured inputs (``ADMIN_USER_ID``,
+    ``ADMIN_METERING_BYPASS_IDENTIFIERS``,
+    ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS``) so every enforcement site and
+    every metering-write site decides from the same answer. The full admin
+    bypass is checked first: an identifier listed on both lists gets the broader
+    treatment rather than a mode that depends on evaluation order.
+    """
+    context = context or GlobalContext()
+    if is_admin_metering_bypass(
+        user,
+        context.admin_user_id,
+        context.admin_metering_bypass_identifiers,
+    ):
+        return MeteringBypass(skips_enforcement=True, skips_metering_writes=True)
+    if is_dev_metered_enforcement_bypass(
+        user,
+        context.dev_metered_enforcement_bypass_identifiers,
+        context.dev,
+    ):
+        return MeteringBypass(skips_enforcement=True, skips_metering_writes=False)
+    return MeteringBypass()
 
 
 def resolve_usage_period_anchor(user: Mapping[str, Any] | None) -> datetime | None:

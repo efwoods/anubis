@@ -586,8 +586,21 @@ async def persist_api_metrics_row(
 
     Best-effort persistence for observability and invoice reconciliation; returns
     whether the row was written and never raises into the request path.
+
+    A ``False`` return is the drift signal: the Stripe meter event for the same
+    operation has already been accepted, so a lost row leaves the local ledger
+    permanently behind Stripe's aggregation (observed as 241,955 messaging tokens
+    of Stripe-only usage on one anonymous customer). Callers should log the
+    mismatch, and usage reads treat Stripe as authoritative precisely because
+    this write is the one that can vanish.
     """
     if pool is None:
+        logger.warning(
+            "No database pool available to record an api_metrics row for a %s "
+            "operation; local usage accounting will lag the Stripe meter for "
+            "this request.",
+            inference_type,
+        )
         return False
     try:
         async with pool.connection() as connection:

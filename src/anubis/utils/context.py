@@ -636,6 +636,40 @@ class GlobalContext:
         },
     )
 
+    admin_metering_bypass_identifiers: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Comma-separated metering identifiers that skip usage enforcement "
+                "and metering writes exactly like admin_user_id, for testing flows "
+                "that admin_user_id cannot cover. Anonymous requesters have no "
+                "account, so an entry is the hashed IP that appears in "
+                "identities[0].user_id (sha256 of the x-forwarded-for value); "
+                "authenticated user ids are accepted too. Leave EMPTY in "
+                "production: every listed identifier is unmetered and unenforced."
+            )
+        },
+    )
+
+    dev_metered_enforcement_bypass_identifiers: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Comma-separated metering identifiers that skip usage ENFORCEMENT "
+                "(the 402 exhausted-allotment refusal and the 429 token rate limit) "
+                "while still being metered to Stripe and to api_metrics, unlike "
+                "admin_metering_bypass_identifiers which also suppresses those "
+                "writes. Intended for driving the anonymous free-tier flows past "
+                "the allotment during development while the customer portal, "
+                "/verify_subscription_status and the SSE usage frames keep "
+                "advancing in step. An entry is the hashed IP that appears in "
+                "identities[0].user_id (sha256 of the x-forwarded-for value); "
+                "authenticated user ids are accepted too. Honored ONLY when "
+                "DEV=TRUE, so a leftover entry is inert in production."
+            )
+        },
+    )
+
     anonymous_user_id: str = field(
         default=None,
         metadata={
@@ -833,6 +867,35 @@ class GlobalContext:
                 "usage is visible in Stripe cost analysis. FALSE (the "
                 "default) keeps anonymous metering local-only (api_metrics), "
                 "avoiding Stripe customer fan-out in development."
+            )
+        },
+    )
+
+    stripe_usage_source_of_truth_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": (
+                "TRUE (the default) reads period usage for allotment gating and "
+                "every usage display from Stripe's Billing Meter aggregation — "
+                "the same number the customer portal shows — using the local "
+                "api_metrics sum only as a floor for usage Stripe has not "
+                "finished aggregating, and as the fallback when Stripe cannot "
+                "be read. FALSE returns to local-only accounting, which drifts "
+                "from the portal whenever an api_metrics insert fails while the "
+                "Stripe meter event succeeds."
+            )
+        },
+    )
+
+    stripe_usage_cache_ttl_seconds: int = field(
+        default=60,
+        metadata={
+            "description": (
+                "Maximum age, in seconds, of a cached Stripe usage reading per "
+                "(customer, meter, usage period). Allotment enforcement runs on "
+                "the message hot path, so this bounds how often a message turn "
+                "pays for a Stripe usage call; zero disables the cache and "
+                "reads Stripe on every metered request."
             )
         },
     )

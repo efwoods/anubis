@@ -1176,6 +1176,7 @@ async def get_anonymous_user_with_anonymous_api_key(
 ) -> dict | None:
 
     logger.info(f"test breakpoint")
+    logger.warning(f"request.headers: {request.headers}")
     # cache_key = _hash_key(request.headers.get('x-forwarded-for'))
     if request.app.state.context.dev == "TRUE":
         hashed_ip = _hash_key("172.18.0.1")

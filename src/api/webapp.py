@@ -4183,29 +4183,59 @@ def _webp_is_animated(data: bytes) -> bool:
 
 
 def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
-    """Return normalized image MIME; raises HTTPException if not an allowed still image."""
-    mime = normalize_declared_image_mime(declared_mime)
-    sniff = _sniff_media_category_from_bytes(body[:512])
-    if mime in ("", "application/octet-stream"):
-        if sniff not in ALLOWED_IMAGE_MIMES:
+    """Return normalized image MIME; raises HTTPException if not an allowed still image.
+
+    The declared Content-Type is a hint, never evidence. Clients derive the
+    multipart part's Content-Type from the filename extension (curl and browsers
+    both do), so a JPEG that someone saved as ``screenshot.PNG`` arrives declared
+    ``image/png``. The magic bytes are the only authority on what the file
+    actually is, so a recognized sniff always wins over the declaration: the
+    declaration is used only when the magic bytes are unrecognized.
+    """
+    declared_image_mime = normalize_declared_image_mime(declared_mime)
+    sniffed_image_mime = normalize_declared_image_mime(
+        _sniff_media_category_from_bytes(body[:512]) or ""
+    )
+
+    if sniffed_image_mime:
+        # Magic bytes recognized — they decide, whatever the caller declared.
+        if sniffed_image_mime not in ALLOWED_IMAGE_MIMES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"File contents are {sniffed_image_mime!r}, which is not an "
+                    "allowed still image; allowed: image/jpeg, image/png, "
+                    "image/gif (non-animated), image/webp."
+                ),
+            )
+        if declared_image_mime not in ("", "application/octet-stream") and (
+            declared_image_mime != sniffed_image_mime
+        ):
+            logger.info(
+                "Upload declared Content-Type %r but the file contents are %r; "
+                "using the sniffed type.",
+                declared_image_mime,
+                sniffed_image_mime,
+            )
+        mime = sniffed_image_mime
+    else:
+        # Magic bytes unrecognized (an image format this sniffer does not cover):
+        # the declaration is all there is to go on.
+        if declared_image_mime in ("", "application/octet-stream"):
             raise HTTPException(
                 status_code=400,
                 detail="Could not determine an allowed image type from the file or URL.",
             )
-        mime = sniff
-    if mime not in ALLOWED_IMAGE_MIMES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Image type not allowed (got {mime!r}); "
-                "allowed: image/jpeg, image/png, image/gif (non-animated), image/webp."
-            ),
-        )
-    if sniff and normalize_declared_image_mime(sniff) != mime:
-        raise HTTPException(
-            status_code=400,
-            detail="Declared Content-Type does not match image file contents.",
-        )
+        if declared_image_mime not in ALLOWED_IMAGE_MIMES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Image type not allowed (got {declared_image_mime!r}); "
+                    "allowed: image/jpeg, image/png, image/gif (non-animated), image/webp."
+                ),
+            )
+        mime = declared_image_mime
+
     if mime == "image/gif" and _gif_is_animated(body):
         raise HTTPException(
             status_code=400, detail="Animated GIF is not allowed; use a still frame."
@@ -4959,6 +4989,27 @@ def _lightweight_url_media_entry(
     }
 
 
+def _rejected_media_item(source_name: str, error: BaseException) -> dict:
+    """Describe one upload item that could not be turned into a media entry.
+
+    Entry building validates each item (media type, CSV/JSON shape, remote
+    fetch) and raises on the ones it cannot process. In a multi-item request
+    every other item is still perfectly processable, so the failure is recorded
+    as data and returned to the caller instead of aborting the whole batch.
+    """
+    if isinstance(error, HTTPException):
+        return {
+            "filename": source_name,
+            "reason": str(error.detail),
+            "status_code": error.status_code,
+        }
+    return {
+        "filename": source_name,
+        "reason": f"{type(error).__name__}: {error}",
+        "status_code": 400,
+    }
+
+
 async def _build_media_entries_for_file(
     raw_name: str,
     content: bytes,
@@ -5131,33 +5182,48 @@ async def _build_media_entries_for_file(
                     else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type.startswith("video/"):
+        elif mime_type.startswith("video/") or (
+            mime_type == "application/octet-stream"
+            and sniff
+            and sniff.startswith("video/")
+        ):
+            effective = (
+                mime_type if mime_type.startswith("video/") else (sniff or mime_type)
+            )
             entries.append(
                 {
                     "filename": raw_name,
-                    "content_type": mime_type,
+                    "content_type": effective,
                     "content": content,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
                     "reference_audio": False,
                     "reference_image": False,
-                    "base64_encoded_str": make_data_uri(mime_type, content),
+                    "base64_encoded_str": make_data_uri(effective, content),
                     "namespace_filename": raw_name
                     if not "." in raw_name
                     else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type == "application/pdf":
+        elif mime_type == "application/pdf" or (
+            # A PDF uploaded without a usable declaration (extension-less file,
+            # or a client that sends application/octet-stream) would otherwise
+            # fall through to the plain-text branch below and be ingested as
+            # binary text. The %PDF magic is decisive, so honor it.
+            mime_type == "application/octet-stream"
+            and sniff == "application/pdf"
+        ):
+            effective = "application/pdf"
             entries.append(
                 {
                     "filename": raw_name,
-                    "content_type": mime_type,
+                    "content_type": effective,
                     "content": content,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
                     "reference_audio": False,
                     "reference_image": False,
-                    "base64_encoded_str": make_data_uri(mime_type, content),
+                    "base64_encoded_str": make_data_uri(effective, content),
                     "namespace_filename": raw_name
                     if not "." in raw_name
                     else _namespace_safe_formatted_filename(raw_name),
@@ -6025,6 +6091,12 @@ async def update_avatar_identity_with_media(
             )
 
         media_files: list = []
+        # Items that failed validation while their siblings succeeded. A batch is
+        # a set of independent jobs, so one unusable file (a mislabeled media
+        # type, an unreachable URL, a malformed CSV) is reported here and skipped
+        # rather than failing the whole request. Reference mode is exempt: it
+        # carries exactly one item, so its failure is the request's failure.
+        rejected_items: list[dict] = []
         # Playlist URLs detected on the request path but enumerated later, in the
         # background master task, so the 202 isn't blocked on yt_dlp. Each yields
         # one child job per video once expanded.
@@ -6074,34 +6146,47 @@ async def update_avatar_identity_with_media(
             file_entries: list = []
             manifest_urls: list[str] = []
             for uf in non_empty_files:
-                content = await uf.read()
                 raw_name = uf.filename
-                mime_type = (
-                    (uf.content_type or "application/octet-stream")
-                    .split(";")[0]
-                    .strip()
-                    .lower()
-                )
-                # A .txt/.md (non-CSV) whose lines are bare URLs is a manifest:
-                # expand it into URLs instead of ingesting it as a text document.
-                if not _is_csv_upload(raw_name, mime_type) and (
-                    _looks_like_manifest_candidate(raw_name, mime_type)
-                ):
-                    extracted = _extract_manifest_urls(content)
-                    if extracted:
-                        manifest_urls.extend(extracted)
-                        continue
-                file_entries.extend(
-                    await _build_media_entries_for_file(
-                        raw_name,
-                        content,
-                        mime_type,
-                        reference_image=False,
-                        reference_audio=False,
-                        user_id=user_id,
-                        assistant_id=assistant_id,
+                # Each file is its own job: a failure here rejects that one item
+                # and the loop moves on, so a single mislabeled or unreadable
+                # upload cannot discard its siblings.
+                try:
+                    content = await uf.read()
+                    mime_type = (
+                        (uf.content_type or "application/octet-stream")
+                        .split(";")[0]
+                        .strip()
+                        .lower()
                     )
-                )
+                    # A .txt/.md (non-CSV) whose lines are bare URLs is a manifest:
+                    # expand it into URLs instead of ingesting it as a text document.
+                    if not _is_csv_upload(raw_name, mime_type) and (
+                        _looks_like_manifest_candidate(raw_name, mime_type)
+                    ):
+                        extracted = _extract_manifest_urls(content)
+                        if extracted:
+                            manifest_urls.extend(extracted)
+                            continue
+                    file_entries.extend(
+                        await _build_media_entries_for_file(
+                            raw_name,
+                            content,
+                            mime_type,
+                            reference_image=False,
+                            reference_audio=False,
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                        )
+                    )
+                except Exception as file_entry_error:  # noqa: BLE001 - per-item skip
+                    rejected_items.append(
+                        _rejected_media_item(raw_name, file_entry_error)
+                    )
+                    logger.warning(
+                        "Skipping upload %r: %s",
+                        raw_name,
+                        rejected_items[-1]["reason"],
+                    )
 
             # Merge explicit + manifest URLs, de-duplicated, order preserved.
             all_urls: list[str] = []
@@ -6122,16 +6207,24 @@ async def update_avatar_identity_with_media(
                 if _is_youtube_playlist_url_str(u):
                     playlist_urls.append(u)
                     continue
-                url_entries.extend(
-                    await _build_media_entries_for_url(
-                        u,
-                        reference_image=False,
-                        reference_audio=False,
-                        user_id=user_id,
-                        assistant_id=assistant_id,
-                        rich=rich_urls,
+                # Same per-item isolation as the file loop: an unreachable or
+                # unsupported URL is skipped, not fatal to the batch.
+                try:
+                    url_entries.extend(
+                        await _build_media_entries_for_url(
+                            u,
+                            reference_image=False,
+                            reference_audio=False,
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                            rich=rich_urls,
+                        )
                     )
-                )
+                except Exception as url_entry_error:  # noqa: BLE001 - per-item skip
+                    rejected_items.append(_rejected_media_item(u, url_entry_error))
+                    logger.warning(
+                        "Skipping url %r: %s", u, rejected_items[-1]["reason"]
+                    )
 
             media_files = [*file_entries, *url_entries]
 
@@ -6139,9 +6232,29 @@ async def update_avatar_identity_with_media(
         # enumerated in the background), so only reject when nothing at all — no
         # files and no playlists — was found.
         if not media_files and not playlist_urls:
+            # Nothing survived. When items were rejected individually, return why
+            # — a bare "no processable media" hides the actual per-item reasons.
+            if rejected_items:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": (
+                            "No processable media found in the request; every "
+                            "item was rejected."
+                        ),
+                        "rejected": rejected_items,
+                    },
+                )
             raise HTTPException(
                 status_code=400,
                 detail="No processable media found in the request.",
+            )
+        if rejected_items:
+            logger.info(
+                "Continuing with %d item(s); %d rejected: %s",
+                len(media_files),
+                len(rejected_items),
+                [item["filename"] for item in rejected_items],
             )
 
         # Stamp the batch-wide "no single target" flag onto every entry (top
@@ -6399,6 +6512,12 @@ async def update_avatar_identity_with_media(
                 "items_accepted": len(media_files),
                 "filenames": [m.get("filename") for m in media_files],
                 "items": item_descriptors,
+                # Items that could not be turned into a job (mislabeled media
+                # type, unreachable URL, malformed CSV). The rest of the batch
+                # still runs; these are reported so the caller can fix and
+                # re-upload just the ones that were skipped.
+                "items_rejected": len(rejected_items),
+                "rejected": rejected_items,
                 # Playlists resolve to their per-video child jobs in the background;
                 # those child ids surface on the master's progress stream as
                 # ``playlist_child_added`` events rather than in this response.
@@ -6412,10 +6531,18 @@ async def update_avatar_identity_with_media(
                 ),
                 **upload_metering_bypass.usage_response_fields(),
                 "message": (
-                    "Media processing started; enumerating "
-                    f"{len(playlist_urls)} playlist(s) in the background"
-                    if playlist_urls
-                    else "Media processing started"
+                    "Media processing started"
+                    + (
+                        f"; enumerating {len(playlist_urls)} playlist(s) in the "
+                        "background"
+                        if playlist_urls
+                        else ""
+                    )
+                    + (
+                        f"; skipped {len(rejected_items)} unprocessable item(s)"
+                        if rejected_items
+                        else ""
+                    )
                 ),
             },
         )

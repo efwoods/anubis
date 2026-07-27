@@ -3903,9 +3903,23 @@ async def resume_avatar_message(
 
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
-        raise HTTPException(
-            detail="Error retrieving assistant information.", status_code=400
-        )
+        # Same rule as ``POST /message/{assistant_id}``: this endpoint identifies
+        # the avatar by the URL path parameter, not by a previously selected
+        # avatar. An authenticated (api-key) caller rebuilds the full configurable
+        # from the path ``assistant_id`` below (name/description/metadata fetched
+        # fresh), so a pre-selected ``assistant_config`` is not required — a client
+        # that messages an avatar by id without a prior ``/select_avatar`` call
+        # must be able to resume the run that message paused, otherwise the
+        # approve/edit/reject panel renders but can never be acted on. Only the
+        # anonymous branch depends on the dependency-populated
+        # ``assistant_config`` (always present once an avatar resolved); start
+        # from an empty configurable that the api-key branch fills in.
+        if request.headers.get("api-key", "") != "":
+            config = {"configurable": {}}
+        else:
+            raise HTTPException(
+                detail="Error retrieving assistant information.", status_code=400
+            )
 
     # The resumed continuation bills the messaging meter (resume has no adapter
     # form field) and IS a model call, so the same allotment and rate-limit
@@ -3957,6 +3971,10 @@ async def resume_avatar_message(
     )
 
     user_id = current_user["identities"][0]["user_id"]
+    # Trim the path parameter the same way ``POST /message/{assistant_id}`` does, so a
+    # stray trailing space in the id surfaces as a miss on our side rather than a 500
+    # from the assistant lookup.
+    assistant_id = assistant_id.strip()
     if request.headers.get("api-key", "") != "":
         langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
         try:

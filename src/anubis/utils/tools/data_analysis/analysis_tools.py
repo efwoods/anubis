@@ -27,8 +27,10 @@ import asyncio
 import base64
 import hashlib
 import logging
+import mimetypes
+import re
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
 
 from langchain.tools import ToolRuntime, tool
@@ -92,6 +94,170 @@ def _write_workspace_file(bundle: AnalysisBackendBundle, name: str, data: bytes)
     disk_path.parent.mkdir(parents=True, exist_ok=True)
     disk_path.write_bytes(data)
     return relative_path
+
+
+
+# Underscored calendar date and clock time appended to every created artifact
+# name, e.g. ``report_2026_07_27_14_30_05.md``. Underscores throughout (rather
+# than dashes or colons) keep the name safe as a file name on every platform
+# and as a store key.
+_ARTIFACT_TIMESTAMP_FORMAT = "%Y_%m_%d_%H_%M_%S"
+_ARTIFACT_TIMESTAMP_PATTERN = re.compile(r"_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}$")
+
+
+def timestamped_artifact_name(file_name: str, moment: datetime) -> str:
+    """Artifact file name carrying the date and time the artifact was saved.
+
+    ``report.md`` becomes ``report_2026_07_27_14_30_05.md`` and ``plot.png``
+    becomes ``plot_2026_07_27_14_30_05.png``. Store keys are basenames, so
+    without the date and time every analysis turn would overwrite the previous
+    turn's report and plot; with the date and time each report and plot is a
+    distinct, self-describing record the conversation partner can go back to.
+
+    Applying the date and time is idempotent: a name the model already
+    timestamped (the capability prompt asks the model to do exactly that) is
+    returned unchanged rather than stamped twice.
+    """
+    stem = PurePosixPath(file_name).stem
+    suffix = PurePosixPath(file_name).suffix
+    if _ARTIFACT_TIMESTAMP_PATTERN.search(stem):
+        return file_name
+    return f"{stem}_{moment.strftime(_ARTIFACT_TIMESTAMP_FORMAT)}{suffix}"
+
+
+def _artifact_mime_type(file_name: str) -> str:
+    """MIME type for one created artifact, derived from the file name.
+
+    The store value carries no MIME field (see ``persist_workspace_file``), so
+    the extension is the only signal available to a client deciding whether to
+    render an artifact as an image, as markdown, or as a download link.
+    ``mimetypes`` does not know ``.md`` on every platform, so markdown is
+    mapped explicitly rather than falling back to ``text/plain``.
+    """
+    suffix = PurePosixPath(file_name).suffix.lower()
+    if suffix in (".md", ".markdown"):
+        return "text/markdown"
+    guessed_mime_type, _encoding = mimetypes.guess_type(file_name)
+    return guessed_mime_type or "application/octet-stream"
+
+
+async def persist_workspace_file(
+    bundle: AnalysisBackendBundle,
+    store: Any,
+    candidate_path: Path,
+) -> dict[str, Any]:
+    """Save one workspace file into the durable created-artifact namespace.
+
+    Shared by the ``persist_created_artifact`` tool (model-driven) and
+    ``collect_turn_artifacts`` (the end-of-turn sweep), so both write exactly
+    the same store record and both append to ``bundle.persisted_artifacts``.
+
+    Binary files are base64-encoded because the store holds JSON values; text
+    files stay readable so the deep agent can ``read_file`` an earlier
+    conversation's report back out of ``/data_created/``.
+
+    The saved name carries the date and time (see
+    :func:`timestamped_artifact_name`), so each turn's report and plot is kept
+    rather than overwriting the previous turn's.
+    """
+    data = candidate_path.read_bytes()
+    try:
+        content = data.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        content = base64.standard_b64encode(data).decode("ascii")
+        encoding = "base64"
+
+    saved_at = datetime.now(UTC)
+    artifact_name = timestamped_artifact_name(candidate_path.name, saved_at)
+    store_key = f"/{artifact_name}"
+    now_iso = saved_at.isoformat()
+    await store.aput(
+        created_namespace(bundle.user_id, bundle.assistant_id),
+        key=store_key,
+        value={
+            "content": content,
+            "encoding": encoding,
+            "created_at": now_iso,
+            "modified_at": now_iso,
+            "size_bytes": len(data),
+        },
+    )
+
+    record = {
+        "name": artifact_name,
+        "workspace_name": candidate_path.name,
+        "mime_type": _artifact_mime_type(artifact_name),
+        "size_bytes": len(data),
+        "created_at": now_iso,
+        "persisted_path": f"{CREATED_ROUTE.rstrip('/')}{store_key}",
+        "encoding": encoding,
+        "content": content,
+    }
+    # Deduplicated on the WORKSPACE name, not the saved name: a turn that
+    # regenerates plot.png and persists the file twice produces two different
+    # timestamped names, and the conversation partner should see the finished
+    # plot once rather than two near-identical charts.
+    bundle.persisted_artifacts = [
+        existing
+        for existing in bundle.persisted_artifacts
+        if existing["workspace_name"] != record["workspace_name"]
+    ]
+    bundle.persisted_artifacts.append(record)
+    return record
+
+
+async def collect_turn_artifacts(
+    context: GlobalContext, bundle: AnalysisBackendBundle
+) -> list[dict[str, Any]]:
+    """Persist and return every artifact this turn produced, for display.
+
+    Called once at the end of the turn, before the workspace is wiped. Two
+    sources are merged:
+
+    1. artifacts the model explicitly saved with ``persist_created_artifact``;
+    2. a sweep of the workspace root for files the model wrote but never
+       persisted — the prompt tells the model to write ``report.md`` /
+       ``plot.png`` and then persist them, and a skipped persist call would
+       otherwise silently discard the very thing the user asked for.
+
+    The sweep is deliberately non-recursive: the ``work/`` subdirectory holds
+    ingested *input* data, which is already persisted in its own namespace and
+    is not an artifact of this turn.
+
+    Returned records carry inline ``content`` so the client can render the
+    report and plot without a second fetch. Content above
+    ``data_analysis_inline_artifact_max_bytes`` is dropped from the record
+    (the durable store copy is unaffected) so one oversized file cannot bloat
+    the checkpointed message it rides on.
+    """
+    workspace_root = bundle.workspace_path
+    if bundle.store is not None and workspace_root.is_dir():
+        # Compared on the workspace name because the saved name carries a
+        # timestamp the workspace file does not — matching on the saved name
+        # would re-persist every file the model already saved.
+        already_persisted = {
+            record["workspace_name"] for record in bundle.persisted_artifacts
+        }
+        for candidate_path in sorted(workspace_root.iterdir()):
+            if not candidate_path.is_file() or candidate_path.name in already_persisted:
+                continue
+            try:
+                await persist_workspace_file(bundle, bundle.store, candidate_path)
+            except Exception:
+                logger.exception(
+                    "Could not persist swept analysis artifact %s", candidate_path
+                )
+
+    inline_byte_cap = int(context.data_analysis_inline_artifact_max_bytes or 0)
+    display_records: list[dict[str, Any]] = []
+    for record in bundle.persisted_artifacts:
+        display_record = dict(record)
+        if inline_byte_cap and record["size_bytes"] > inline_byte_cap:
+            display_record["content"] = None
+            display_record["omitted_reason"] = "too_large"
+        display_records.append(display_record)
+    return display_records
 
 
 def build_data_analysis_tools(
@@ -349,15 +515,23 @@ def build_data_analysis_tools(
     ) -> dict[str, Any]:
         """Save a produced report or plot from the workspace into durable storage.
 
-        Use this tool after writing an analysis artifact (for example
-        "report.md" or "plot.png") with the execute or write_file tools, so
-        the artifact survives after the workspace is cleaned at the end of
-        the turn. The artifact becomes readable in future conversations
-        under "/data_created/".
+        Use this tool after writing an analysis artifact with the execute or
+        write_file tools, so the artifact survives after the workspace is
+        cleaned at the end of the turn. The artifact becomes readable in
+        future conversations under "/data_created/".
+
+        The saved artifact name always carries the current date and time,
+        separated by underscores, so that every report and plot is unique and
+        no report or plot ever replaces an earlier one — for example
+        "report_2026_07_27_14_30_05.md" and "plot_2026_07_27_14_30_05.png".
+        The date and time are appended automatically when the name given does
+        not already carry a date and time, so passing plain "report.md" is
+        also correct.
 
         Args:
             workspace_file_path: Path of the produced file relative to the
-                workspace root, for example "report.md" or "work/plot.png".
+                workspace root, for example
+                "report_2026_07_27_14_30_05.md" or "work/plot.png".
         """
         candidate_path = (
             bundle.workspace_path / workspace_file_path.lstrip("/")
@@ -367,28 +541,8 @@ def build_data_analysis_tools(
         if not candidate_path.is_file():
             return {"error": f"No such workspace file: {workspace_file_path}"}
 
-        data = candidate_path.read_bytes()
-        try:
-            content = data.decode("utf-8")
-            encoding = "utf-8"
-        except UnicodeDecodeError:
-            content = base64.standard_b64encode(data).decode("ascii")
-            encoding = "base64"
-
-        store_key = f"/{candidate_path.name}"
-        now_iso = datetime.now(UTC).isoformat()
-        await runtime.store.aput(
-            created_namespace(user_id, assistant_id),
-            key=store_key,
-            value={
-                "content": content,
-                "encoding": encoding,
-                "created_at": now_iso,
-                "modified_at": now_iso,
-                "size_bytes": len(data),
-            },
-        )
-        return {"persisted_path": f"{CREATED_ROUTE.rstrip('/')}{store_key}"}
+        record = await persist_workspace_file(bundle, runtime.store, candidate_path)
+        return {"persisted_path": record["persisted_path"]}
 
     @tool
     async def list_persisted_data(

@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -117,6 +117,24 @@ class AnalysisBackendBundle:
     user_id: str
     assistant_id: str
 
+    store: Any = None
+    """The cross-thread ``BaseStore``.
+
+    Held on the bundle so the end-of-turn artifact sweep
+    (``analysis_tools.collect_turn_artifacts``) can persist files the model
+    produced but never passed to ``persist_created_artifact`` — the sweep runs
+    outside any tool, so it has no ``ToolRuntime`` to read the store from.
+    """
+
+    persisted_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    """Artifacts saved to the created-artifact namespace during THIS turn.
+
+    Recorded as they are persisted so the turn can report exactly what it
+    produced. The store namespace itself cannot answer that question: keys are
+    basenames, so a turn that rewrites ``report.md`` is indistinguishable from
+    one that left an earlier turn's ``report.md`` untouched.
+    """
+
 
 def build_analysis_backend(
     context: GlobalContext,
@@ -181,6 +199,7 @@ def build_analysis_backend(
         execution_backend_name=execution_backend_name,
         user_id=user_id,
         assistant_id=assistant_id,
+        store=store,
     )
 
 

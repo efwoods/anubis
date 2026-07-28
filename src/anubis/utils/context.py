@@ -526,6 +526,13 @@ class GlobalContext:
         },
     )
 
+    data_analysis_inline_artifact_max_bytes: int = field(
+        default=2097152,
+        metadata={
+            "description": "Maximum size in bytes of one created artifact (report or plot) whose content is inlined on the assistant reply for display in the client. Larger artifacts stay in durable storage but are reported as metadata only, so an oversized file cannot bloat the checkpointed message. Default 2 MiB. Env DATA_ANALYSIS_INLINE_ARTIFACT_MAX_BYTES."
+        },
+    )
+
     """ </Data Analysis (MCP filesystem -> deep agent) tuning> """
 
     dev: str = field(

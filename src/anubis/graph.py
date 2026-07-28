@@ -82,6 +82,7 @@ from src.anubis.utils.tools.data_analysis import (
     build_connect_tool,
     build_data_analysis_tools,
     cleanup_analysis_workspace,
+    collect_turn_artifacts,
     is_declined,
     mark_declined,
     read_user_connection,
@@ -818,6 +819,7 @@ async def think(
             deep_agent_config,
             outer_thread,
             checkpointer,
+            analysis_bundle=analysis_bundle,
         )
     finally:
         if analysis_bundle is not None:
@@ -919,11 +921,17 @@ async def _run_avatar_deep_agent_turn(
     deep_agent_config: RunnableConfig,
     outer_thread: str | None,
     checkpointer: Any,
+    analysis_bundle: Any = None,
 ):
     """Body of one ``think`` turn: run/resume the deep agent, slice output.
 
     Split out of ``think`` so the data-analysis workspace cleanup can wrap
     the whole run in a ``try``/``finally`` without re-indenting the flow.
+
+    ``analysis_bundle`` is the turn's data-analysis bundle when the avatar has
+    a bound MCP connection. It is read here — not in ``think`` — because the
+    created artifacts must be attached to the final message before the caller's
+    ``finally`` wipes the workspace they were produced in.
     """
     deep_agent_input = {
         "messages": list(state["messages"]),
@@ -1033,6 +1041,25 @@ async def _run_avatar_deep_agent_turn(
         except asyncio.CancelledError:
             pass
 
+    # Reports and plots this turn produced ride out on ``response_metadata``:
+    # the terminal ``done`` SSE frame already forwards that field verbatim, it
+    # is checkpointed on the message (so a client reloading the thread still
+    # gets the artifacts), and — unlike ``additional_kwargs`` — it is never
+    # converted back into a provider request, so the inlined base64 is not
+    # re-sent to the model on later turns.
+    if analysis_bundle is not None:
+        try:
+            created_artifacts = await collect_turn_artifacts(
+                runtime.context, analysis_bundle
+            )
+            if created_artifacts:
+                final_message.response_metadata = dict(
+                    final_message.response_metadata or {}
+                )
+                final_message.response_metadata["created_artifacts"] = created_artifacts
+        except Exception:
+            # Never lose an already-streamed reply over a display concern.
+            logger.exception("Could not collect this turn's analysis artifacts.")
 
     update: dict[str, Any] = {
         "messages": [final_message],

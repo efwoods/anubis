@@ -9,6 +9,9 @@ the capability.
 """
 
 import asyncio
+import base64
+import re
+from datetime import UTC, datetime
 
 import pytest
 from langgraph.store.memory import InMemoryStore
@@ -22,6 +25,7 @@ from src.anubis.utils.tools.data_analysis import (
     build_data_analysis_tools,
     cleanup_analysis_workspace,
     clear_user_connection,
+    collect_turn_artifacts,
     enforce_ingested_quota,
     is_declined,
     mark_declined,
@@ -31,6 +35,7 @@ from src.anubis.utils.tools.data_analysis import (
 from src.anubis.utils.tools.data_analysis.analysis_tools import (
     _decode_store_content,
     _store_key_for_source,
+    timestamped_artifact_name,
 )
 from src.anubis.utils.tools.data_analysis.backend import (
     created_namespace,
@@ -252,24 +257,6 @@ def test_persist_created_artifact_rejects_traversal(context):
     asyncio.run(run())
 
 
-def test_persist_created_artifact_roundtrip(context):
-    async def run():
-        store = InMemoryStore()
-        bundle = build_analysis_backend(context, "u1", "a1", store=store)
-        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
-        runtime = _FakeToolRuntime(store)
-        (bundle.workspace_path / "report.md").write_text("# Report")
-        result = await tools["persist_created_artifact"].coroutine(
-            workspace_file_path="report.md", runtime=runtime
-        )
-        assert result == {"persisted_path": "/data_created/report.md"}
-        item = await store.aget(created_namespace("u1", "a1"), "/report.md")
-        assert item is not None and item.value["content"] == "# Report"
-        cleanup_analysis_workspace(bundle)
-
-    asyncio.run(run())
-
-
 def test_check_and_disconnect_tools(context):
     async def run():
         store = InMemoryStore()
@@ -363,6 +350,146 @@ def test_ingest_passes_connection_to_mcp_calls(context, monkeypatch):
         assert result["ingested"] == ["/data/health1.json"]
         item = await store.aget(ingested_namespace("u1", "a1"), "/health1.json")
         assert item is not None and item.value["content"] == "hello"
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_timestamped_artifact_name_appends_underscored_date_and_time():
+    moment = datetime(2026, 7, 27, 14, 30, 5, tzinfo=UTC)
+    assert (
+        timestamped_artifact_name("report.md", moment) == "report_2026_07_27_14_30_05.md"
+    )
+    assert (
+        timestamped_artifact_name("plot.png", moment) == "plot_2026_07_27_14_30_05.png"
+    )
+    # Idempotent: a name the model already timestamped is not stamped twice.
+    assert (
+        timestamped_artifact_name("report_2026_07_27_14_30_05.md", moment)
+        == "report_2026_07_27_14_30_05.md"
+    )
+    # A name that merely contains digits is still stamped.
+    assert (
+        timestamped_artifact_name("health_2026.md", moment)
+        == "health_2026_2026_07_27_14_30_05.md"
+    )
+
+
+def test_persist_created_artifact_saves_under_a_timestamped_name(context):
+    """The turn remembers what it saved, under a name carrying the date and time."""
+
+    async def run():
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        (bundle.workspace_path / "report.md").write_text("# Report")
+        result = await tools["persist_created_artifact"].coroutine(
+            workspace_file_path="report.md", runtime=_FakeToolRuntime(store)
+        )
+
+        saved_name = bundle.persisted_artifacts[0]["name"]
+        assert re.fullmatch(r"report_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.md", saved_name)
+        assert result == {"persisted_path": f"/data_created/{saved_name}"}
+        assert bundle.persisted_artifacts[0]["workspace_name"] == "report.md"
+        assert bundle.persisted_artifacts[0]["mime_type"] == "text/markdown"
+        assert bundle.persisted_artifacts[0]["content"] == "# Report"
+        # The store is keyed by the timestamped name, so nothing is overwritten.
+        item = await store.aget(created_namespace("u1", "a1"), f"/{saved_name}")
+        assert item is not None and item.value["content"] == "# Report"
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_reports_from_different_turns_do_not_overwrite_each_other(context):
+    """Two turns each writing report.md must leave two distinct stored reports."""
+
+    async def run():
+        store = InMemoryStore()
+        for turn_body in ("# First turn", "# Second turn"):
+            bundle = build_analysis_backend(context, "u1", "a1", store=store)
+            tools = {
+                t.name: t
+                for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)
+            }
+            (bundle.workspace_path / "report.md").write_text(turn_body)
+            await tools["persist_created_artifact"].coroutine(
+                workspace_file_path="report.md", runtime=_FakeToolRuntime(store)
+            )
+            cleanup_analysis_workspace(bundle)
+            await asyncio.sleep(1.01)  # distinct whole-second timestamps
+
+        stored = await store.asearch(created_namespace("u1", "a1"), limit=10)
+        assert len(stored) == 2
+        assert {item.value["content"] for item in stored} == {"# First turn", "# Second turn"}
+
+    asyncio.run(run())
+
+
+def test_collect_turn_artifacts_sweeps_unpersisted_workspace_files(context):
+    """A plot the model wrote but forgot to persist is still saved and displayed."""
+
+    async def run():
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        # Binary artifact never passed to persist_created_artifact.
+        png_bytes = b"\x89PNG\r\n\x1a\n binary plot bytes"
+        (bundle.workspace_path / "plot.png").write_bytes(png_bytes)
+        # Ingested input data lives under work/ and is NOT an artifact of this turn.
+        (bundle.workspace_path / "work" / "health1.json").write_text("{}")
+
+        artifacts = await collect_turn_artifacts(context, bundle)
+
+        assert [record["workspace_name"] for record in artifacts] == ["plot.png"]
+        plot = artifacts[0]
+        assert re.fullmatch(r"plot_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.png", plot["name"])
+        assert plot["mime_type"] == "image/png"
+        assert plot["encoding"] == "base64"
+        assert base64.standard_b64decode(plot["content"]) == png_bytes
+        assert plot["persisted_path"] == f"/data_created/{plot['name']}"
+        # The sweep persists as well as reports: the artifact survives the turn.
+        item = await store.aget(created_namespace("u1", "a1"), f"/{plot['name']}")
+        assert item is not None and item.value["encoding"] == "base64"
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_collect_turn_artifacts_does_not_duplicate_persisted_files(context):
+    async def run():
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        (bundle.workspace_path / "report.md").write_text("# Report")
+        await tools["persist_created_artifact"].coroutine(
+            workspace_file_path="report.md", runtime=_FakeToolRuntime(store)
+        )
+        artifacts = await collect_turn_artifacts(context, bundle)
+        # The sweep must recognize the already-saved file by its WORKSPACE name;
+        # the saved name differs because it carries the date and time.
+        assert [record["workspace_name"] for record in artifacts] == ["report.md"]
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_collect_turn_artifacts_omits_content_above_the_inline_cap(context):
+    """Oversized artifacts stay in durable storage but never bloat the reply."""
+
+    async def run():
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        (bundle.workspace_path / "plot.png").write_bytes(b"\x89PNG" + b"x" * 4096)
+        context.data_analysis_inline_artifact_max_bytes = 100
+
+        artifacts = await collect_turn_artifacts(context, bundle)
+
+        assert artifacts[0]["content"] is None
+        assert artifacts[0]["omitted_reason"] == "too_large"
+        assert artifacts[0]["size_bytes"] > 100
+        # Durable storage still holds the full artifact.
+        item = await store.aget(created_namespace("u1", "a1"), f"/{artifacts[0]['name']}")
+        assert item is not None and item.value["content"]
         cleanup_analysis_workspace(bundle)
 
     asyncio.run(run())

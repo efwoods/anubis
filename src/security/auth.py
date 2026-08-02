@@ -1183,6 +1183,8 @@ async def get_anonymous_user_with_anonymous_api_key(
         # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULATED
     else:
         hashed_ip = _hash_key(request.headers.get("x-forwarded-for"))
+        logger.warning(f"hashed_ip: {hashed_ip}")
+        logger.warning(f"request.headers.get('x-forwarded-for'): {request.headers.get('x-forwarded-for')}")
         # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
         # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULA
 
@@ -1966,27 +1968,3 @@ async def authenticate(request: Request, authorization: str) -> dict:
         "metadata": {"user_id": user["identities"][0]["user_id"]},
     }
 
-
-# Token Authentication
-# @auth.authenticate
-# async def authenticate(authorization: str | None, request: Request) -> Auth.types.MinimalUserDict:
-#     """LangGraph calls this on every request to verify the token."""
-#     if not authorization:
-#         raise Auth.exceptions.HTTPException(status_code=401, detail="No authorization header")
-
-#     scheme, _, token = authorization.partition(" ")
-#     if scheme.lower() != "bearer":
-#         raise Auth.exceptions.HTTPException(status_code=401, detail="Invalid auth scheme")
-
-#     try:
-#         payload = await verify_token(token, request=request)
-#     except Exception as e:
-#         raise Auth.exceptions.HTTPException(status_code=401, detail=str(e))
-
-#     # Must return a dict with at least "identity"
-#     return {
-#         "identity": payload["sub"],          # Auth0 user ID e.g. "auth0|abc123"
-#         "email":    payload.get("email"),
-#         "permissions": payload.get("permissions", []),
-#         "metadata": {"user_id": payload["sub"]}
-#     }

@@ -138,7 +138,7 @@ TIER_DEFINITIONS: Dict[SubscriptionTier, TierDefinition] = {
         meter_allotments={
             UsageMeter.MESSAGING_TOKENS: MeterAllotment(
                 meter=UsageMeter.MESSAGING_TOKENS,
-                monthly_allotment=200_000,  # ≈ a light month of conversation
+                monthly_allotment=2_000_000,  # ≈ a light month of conversation
                 overage_price_per_million=2.00,
             ),
         },

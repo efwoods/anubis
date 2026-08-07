@@ -16,7 +16,10 @@ two different totals, so the anonymous subscription's period travels with the
 customer id. The customer is resolved lazily on first use:
 
 1. Process-local TTL cache (hashed ip -> customer id) — hot path, no I/O.
-2. ``anonymous_billing_customers`` Postgres row — survives restarts.
+2. ``anonymous_billing_customers`` Postgres row — survives restarts. The row is
+   only trusted while the customer it names is still live in Stripe (see
+   ``_customer_is_live``); a customer deleted out from under it falls through to
+   the steps below, which mint a replacement and overwrite the row.
 3. Stripe Customer Search on ``metadata.anonymous_hashed_ip`` — recovers the
    mapping when a previous create succeeded but the row write failed.
 4. ``Customer.create`` + free-tier ``Subscription.create`` — first sighting.
@@ -157,6 +160,49 @@ async def _fetch_current_subscription(
         return None
 
 
+async def _customer_is_live(stripe_client, stripe_customer_id: str) -> bool:
+    """Return whether a previously recorded Stripe customer still exists.
+
+    The ``anonymous_billing_customers`` row outlives the Stripe account it
+    points into: wiping test data, or deleting the customer by hand, leaves the
+    row naming a customer Stripe no longer has. Trusting that row unconditionally
+    is silently fatal — every meter event for the visitor is rejected with
+    ``No such customer`` (so nothing reaches Stripe), every usage read falls back
+    to the local ``api_metrics`` table, and the customer portal, which finds the
+    visitor by searching Stripe for ``metadata.anonymous_hashed_ip``, sees no
+    customer and reports no usage at all. Checking liveness lets the caller fall
+    through and mint a replacement instead.
+
+    Stripe answers a deleted customer with ``{"deleted": true}`` rather than an
+    error, so both that flag and a resource-missing error count as not live.
+    Any OTHER failure (network, auth, rate limit) returns ``True``: a transient
+    outage must not orphan a good customer and fan out duplicates.
+
+    Costs one Stripe call per hashed ip per cache time-to-live, not per request —
+    the process-local cache already fronts this whole path.
+    """
+
+    def _retrieve() -> bool:
+        customer = stripe_client.Customer.retrieve(stripe_customer_id)
+        customer_payload = (
+            customer.to_dict() if hasattr(customer, "to_dict") else dict(customer)
+        )
+        return not customer_payload.get("deleted", False)
+
+    try:
+        return await asyncio.to_thread(_retrieve)
+    except Exception as retrieve_error:  # noqa: BLE001 - classified below
+        if getattr(retrieve_error, "code", None) == "resource_missing":
+            return False
+        logger.warning(
+            "Could not confirm anonymous Stripe customer %s is live; keeping it "
+            "rather than minting a duplicate: %s",
+            stripe_customer_id,
+            retrieve_error,
+        )
+        return True
+
+
 def _search_customer_by_hashed_ip(stripe_client, hashed_ip: str) -> str | None:
     """Recover a previously created customer via Stripe Customer Search.
 
@@ -221,6 +267,19 @@ async def resolve_or_create_anonymous_billing_record(
 
     pool = getattr(request.app.state, "pool", None)
     persisted_customer_id = await fetch_anonymous_stripe_customer_id(pool, hashed_ip)
+    if persisted_customer_id and not await _customer_is_live(
+        stripe_client, persisted_customer_id
+    ):
+        # The recorded customer is gone from Stripe (test data wiped, or deleted
+        # by hand). Falling through re-creates one and the upsert below replaces
+        # the row; keeping it would leave this visitor permanently unmetered.
+        logger.warning(
+            "Recorded anonymous Stripe customer %s for %s no longer exists; "
+            "creating a replacement so anonymous usage keeps reaching Stripe.",
+            persisted_customer_id,
+            hashed_ip,
+        )
+        persisted_customer_id = None
     if persisted_customer_id:
         billing_record = _billing_record_from_subscription(
             persisted_customer_id,

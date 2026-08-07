@@ -90,6 +90,7 @@ from src.anubis.utils.billing import (
     plan_subscribe_action,
     plan_tier_change,
     report_meter_event,
+    schedule_usage_notification,
     fetch_stripe_period_usage,
     reconcile_period_usage,
     resolve_canceled_tier_context,
@@ -689,6 +690,17 @@ async def _meter_message_usage(
         # includes this turn.
         usage_snapshot = await _build_meter_usage_snapshot(
             app_state, current_user, meter
+        )
+        # Push that same reconciled figure to the customer portal so its meters
+        # move now instead of waiting for Stripe's aggregation. Fire-and-forget
+        # and fail-open: it never delays or breaks the reply, and a lost event is
+        # corrected by the portal's own Stripe read.
+        schedule_usage_notification(
+            stripe_customer_id=stripe_customer_id,
+            meter_event_name=meter.value,
+            cumulative_period_usage=usage_snapshot.get("used_to_date"),
+            usage_period_start=usage_snapshot.get("usage_period_start"),
+            usage_period_end=usage_snapshot.get("usage_period_end"),
         )
         return {
             "prompt_tokens": prompt_tokens,

@@ -77,6 +77,24 @@ def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
+# The development client ip. Pinned so a local API, a local customer portal, and
+# the anonymous Stripe customer they share all resolve to one identity.
+DEVELOPMENT_MODE_CLIENT_IP = "172.18.0.1"
+
+
+def resolve_request_hashed_ip(request: Request) -> str:
+    """Return the hashed client ip that identifies an anonymous visitor.
+
+    The single place this hash is derived. Anonymous metering and anonymous
+    customer lookup must agree on it exactly: a second copy that drifted would
+    silently split one visitor into two billing identities, or merge two
+    visitors into one.
+    """
+    if getattr(request.app.state.context, "dev", None) == "TRUE":
+        return _hash_key(DEVELOPMENT_MODE_CLIENT_IP)
+    return _hash_key(request.headers.get("x-forwarded-for"))
+
+
 async def update_assistant_config(
     hashed_api_key: str,
     provider_encoded_user_id: str,
@@ -252,6 +270,10 @@ async def _provision_stripe_customer_and_default_tier(
                     },
                 )
         if customer is None:
+            # A new account always gets its OWN Stripe customer. An anonymous
+            # visitor's customer is never reused here: anonymous and account
+            # usage are separate allotments, reported separately, so the two
+            # identities must stay separate billing records.
             customer = stripe_client.Customer.create(
                 email=email,
                 name=name or None,
@@ -455,6 +477,18 @@ async def ensure_initial_subscription_after_verification(
             .to_dict()
             .get("data", [])
         )
+        # A $0 subscription that exists only to meter an anonymous visitor is
+        # not subscription history and must never deny an account its free
+        # trial. An account's own customer should never carry one — anonymous
+        # visitors keep their own separate customer — so this filter is a guard
+        # against the two identities ever being merged onto one customer, which
+        # would otherwise silently downgrade a new signup to the free tier. The
+        # real trial-abuse guard remains metadata.neural_nexus_trial_used.
+        prior_subscriptions = [
+            subscription
+            for subscription in prior_subscriptions
+            if not (subscription.get("metadata") or {}).get("anonymous_hashed_ip")
+        ]
 
         live_prior_subscription = next(
             (
@@ -987,12 +1021,12 @@ async def get_user_with_api_key(
 ) -> dict | None:
     """Resolve an Auth0 account from an API key (cached for verified users).
 
-    ``require_verified_email=False`` exists solely for
-    ``/resend_verification_email``: an unverified account must be able to
-    authenticate far enough to request another verification email. Every
-    other caller keeps the default and receives 401 until the email is
-    verified. Only verified users are cached or auto-enrolled into an
-    initial subscription.
+    ``require_verified_email=False`` exists for the endpoints an unverified
+    account must still reach: ``/resend_verification_email`` (request another
+    verification email), ``/logout``, and ``/delete_user`` (abandon the
+    account entirely). Every other caller keeps the default and receives 401
+    until the email is verified. Only verified users are cached or
+    auto-enrolled into an initial subscription.
     """
     cache_key = _hash_key(api_key)
 
@@ -1079,15 +1113,15 @@ async def get_current_user_allow_unverified(
     request: Request, api_key: str | None = Depends(api_key_scheme)
 ) -> dict:
     """
-    Like `get_current_user`, but does NOT reject unverified users. Used by the
-    resend-verification flow, which must be reachable by exactly the users who
-    have not yet verified their email.
-    
+    Like `get_current_user`, but does NOT reject unverified users.
+
     Authenticate by API key WITHOUT requiring a verified email.
 
-    Used only by ``/resend_verification_email`` — an account that has not
-    verified the signup email yet must still be able to request another
-    verification email; every other endpoint uses ``get_current_user``.
+    Used by the endpoints that an account which has not verified the signup
+    email must still be able to reach: ``/resend_verification_email``
+    (request another verification email), ``/logout``, and ``/delete_user``
+    (remove the unverified account and everything the account created).
+    Every other endpoint uses ``get_current_user``.
     """
     if not api_key:
         raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
@@ -1175,18 +1209,11 @@ async def get_anonymous_user_with_anonymous_api_key(
     request: Request, assistant_id: str
 ) -> dict | None:
 
-    logger.info(f"test breakpoint")
-    # cache_key = _hash_key(request.headers.get('x-forwarded-for'))
-    if request.app.state.context.dev == "TRUE":
-        hashed_ip = _hash_key("172.18.0.1")
-        # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
-        # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULATED
-    else:
-        hashed_ip = _hash_key(request.headers.get("x-forwarded-for"))
-        logger.warning(f"hashed_ip: {hashed_ip}")
-        logger.warning(f"request.headers.get('x-forwarded-for'): {request.headers.get('x-forwarded-for')}")
-        # hashed_ip = '2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1' # VPN_SIMULATED
-        # hashed_ip = '72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15' # NO_VPN_SIMULA
+    # Derived by resolve_request_hashed_ip so every anonymous code path agrees
+    # on who this visitor is.
+    #   VPN_SIMULATED    2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1
+    #   NO_VPN_SIMULATED 72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15
+    hashed_ip = resolve_request_hashed_ip(request)
 
     # async with _cache_lock:
     #     if cache_key in _api_key_cache:
@@ -1462,8 +1489,17 @@ async def forgot_password(
 
 
 @security_route.delete("/delete_user")
-async def delete_user(request: Request, current_user: dict = Depends(get_current_user)):
-    # Optional: ensure users can only delete themselves unless admin
+async def delete_user(
+    request: Request,
+    current_user: dict = Depends(get_current_user_allow_unverified),
+):
+    # Deliberately authenticated WITHOUT requiring a verified email: a user who
+    # signed up but never verified the signup email still owns an Auth0
+    # account, an API key, and any avatar/store rows created before
+    # verification, and must be able to remove that account. Requiring
+    # verification first would strand exactly the accounts most likely to be
+    # abandoned. The API key still proves ownership, so a caller can only ever
+    # delete themselves.
     try:
         api_key_hash = current_user["app_metadata"]["api_key"]
         encoded_user_id = quote(current_user["user_id"], safe="")
@@ -1525,6 +1561,7 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
             delete_store_rows_for_user,
             purge_avatar_data,
             search_all_avatars_for_user,
+            select_assistant_ids_for_user,
         )
 
         token = current_user["API_KEY"]
@@ -1551,13 +1588,43 @@ async def delete_user(request: Request, current_user: dict = Depends(get_current
                 ),
             ) from user_row_error
 
-        # Paged, and deliberately not filtered by graph_id: assistants.search
-        # defaults to limit=10, so an account with more than ten avatars used to
-        # keep the remainder forever once the Auth0 user was deleted and the
-        # owning user_id could never be presented again.
-        avatars = await search_all_avatars_for_user(
-            langgraph_sdk_client, user_id, headers=headers
-        )
+        # The avatar sweep runs through the LangGraph SDK, and every SDK call
+        # re-enters this application's own ``@auth.authenticate`` handler with
+        # the caller's API key. That handler requires a verified email, so an
+        # unverified account sweeping avatars raises AuthenticationError
+        # ("Email is not yet verified") from inside the endpoint and the whole
+        # deletion fails with a 500.
+        #
+        # An unverified account cannot own an avatar in the first place: every
+        # avatar-creating endpoint depends on get_current_user, which rejects an
+        # unverified email, and the only endpoints reachable without
+        # verification are /resend_verification_email, /logout,
+        # /verify_login_status and this one. So the sweep is skipped rather than
+        # attempted — but the assumption is checked against Postgres instead of
+        # trusted, because silently skipping a sweep that did have work to do is
+        # exactly how orphaned avatar data accumulated before.
+        if not current_user.get("email_verified"):
+            orphan_assistant_ids = await select_assistant_ids_for_user(pool, user_id)
+            if orphan_assistant_ids:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "This account has not verified its email yet but owns "
+                        "avatars, which should not be possible. The account was "
+                        "kept so the avatars stay reachable. Verify the email "
+                        "and delete the account again. Avatars: "
+                        f"{', '.join(orphan_assistant_ids)}"
+                    ),
+                )
+            avatars: list[dict] = []
+        else:
+            # Paged, and deliberately not filtered by graph_id: assistants.search
+            # defaults to limit=10, so an account with more than ten avatars used to
+            # keep the remainder forever once the Auth0 user was deleted and the
+            # owning user_id could never be presented again.
+            avatars = await search_all_avatars_for_user(
+                langgraph_sdk_client, user_id, headers=headers
+            )
 
         # Every avatar is attempted even when one fails, so a single bad avatar
         # cannot strand the rest. The Auth0 user is only deleted when all of the
@@ -1635,6 +1702,22 @@ async def login(body: LoginRequest, request: Request):
 
     Requires the Auth0 tenant/application to have the Resource Owner Password
     Grant enabled and a Default Directory set to the database connection.
+
+    A successful sign-in is also the point at which a verified account is
+    auto-enrolled into its initial subscription (see
+    ``ensure_initial_subscription_after_verification``). Sign-in is the ONLY
+    enrollment trigger the customer portal reaches: the portal authenticates
+    with email + password and never holds an API key, so the API-key path in
+    ``get_user_with_api_key`` never runs for a portal-only user, and its signup
+    endpoint deliberately does not sign the user in — every portal user must log
+    in after verifying their email. Without this call such an account would keep
+    a free-tier Stripe customer with no subscription at all and would never
+    receive the pro free trial.
+
+    Known gap: an account that signs in BEFORE verifying, verifies afterward,
+    and never signs in again stays unenrolled until its next sign-in, because
+    the portal session outlives verification and the portal has no other way to
+    reach this API as that user.
     """
     response = await login_user(body.email, body.password, request=request)
     # httpx does not raise on 4xx, so an invalid credential comes back as a
@@ -1646,6 +1729,28 @@ async def login(body: LoginRequest, request: Request):
     # The id_token carries the Auth0 user id in `sub`; mark the user logged in.
     claims = jwt.get_unverified_claims(data["id_token"])
     await set_login_status(claims["sub"], logged_in=True, request=request)
+
+    # Auto-enroll a verified account into its initial subscription. The token
+    # set carries neither email_verified nor app_metadata, so the full Auth0
+    # record is fetched here. Awaited rather than backgrounded: the enrollment
+    # short-circuits on the app_metadata.initial_subscription_provisioned marker
+    # before making any Stripe call, so the multi-call cost is paid exactly once
+    # per account, and awaiting it means the Stripe customer exists before the
+    # customer portal looks it up by email immediately after this response
+    # (that lookup returns 403 when no customer exists). Non-fatal: a failure
+    # here must never cost the caller their sign-in, and the next sign-in
+    # retries because the marker is only written on success.
+    try:
+        auth0_user = await get_user(claims["sub"], request=request)
+        if auth0_user.get("email_verified") is True:
+            await ensure_initial_subscription_after_verification(request, auth0_user)
+    except Exception as enrollment_error:  # noqa: BLE001 - non-fatal
+        logger.error(
+            "Initial subscription enrollment failed at login for %s: %s",
+            claims.get("sub"),
+            enrollment_error,
+        )
+
     return data
 
 

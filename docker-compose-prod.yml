@@ -5,6 +5,17 @@ volumes:
         driver: local
     redis-data:
         driver: local
+    # Billing config handoff: stripe-provision writes billing_config.json here and
+    # langgraph-api-prod reads it via STRIPE_BILLING_CONFIG_FILE, so the JSON is
+    # never pasted into .env by hand. Mirrors the same handoff in
+    # docker-compose.yml. NOTE: this volume deliberately does NOT carry a
+    # webhook secret — the dev stack's stripe-cli publishes an ephemeral whsec_
+    # for local `stripe listen` forwarding, which has no production equivalent.
+    # Production receives webhooks from Stripe's servers at a public URL, and a
+    # registered endpoint's signing secret is returned only when the endpoint is
+    # created, so STRIPE_WEBHOOK_SECRET stays an explicit value in .env.
+    stripe-billing-config:
+        driver: local
 
 services:
     redis:
@@ -36,11 +47,24 @@ services:
             start_period: 10s
         env_file:
             - .env
+        environment:
+            # Read the billing config from the file stripe-provision wrote rather
+            # than a pasted STRIPE_BILLING_CONFIG_JSON. resolve_stripe_billing_config_json
+            # gives the env var precedence over this file, so leave that variable
+            # EMPTY in .env or it will silently shadow a freshly provisioned config.
+            STRIPE_BILLING_CONFIG_FILE: /run/stripe/billing_config.json
         depends_on:
             redis:
                 condition: service_healthy
+            stripe-provision:
+                # Fail loudly rather than start with no billing config and silently
+                # treat paying customers as free tier. Trade-off: a Stripe outage at
+                # boot blocks startup even though the previous config is still in the
+                # volume. Billing correctness is worth more than that availability.
+                condition: service_completed_successfully
         volumes:
             - .:/deps/anubis
+            - stripe-billing-config:/run/stripe
             # Prefetched Hub weights (see ``ensure_huggingface_models_cached``); survives container restarts.
             - ~/.cache/huggingface:/root/.cache/huggingface
             # Prefetched NLTK corpora (see ``ensure_nltk_corpora_cached``). The base
@@ -50,6 +74,38 @@ services:
             # recreate from re-downloading ~20 MB. /root/nltk_data is on nltk's
             # default search path, so no NLTK_DATA environment variable is needed.
             - ~/.cache/nltk_data:/root/nltk_data
+    # One-shot: creates/reuses the Stripe meters, products, prices, and billing-portal
+    # configuration for every tier, then writes the resulting id map to the shared
+    # volume and exits. Idempotent — meters are matched by event_name, products by
+    # the neural_nexus_tier/product_role/meter metadata triple, prices by lookup_key,
+    # so a re-run reports "exists" for everything and emits identical JSON.
+    #
+    # --allow-live is REQUIRED here and is the whole difference from the dev variant:
+    # the script refuses an sk_live_ key without it. Consequence worth knowing — every
+    # `docker compose -f docker-compose-prod.yml up` performs writes against the LIVE
+    # Stripe account. That is safe by idempotency, not by omission.
+    #
+    # Bump PRICE_LOOKUP_KEY_VERSION in the script after changing any amount or
+    # allotment in tiers.py; Stripe prices are immutable once used, so a fresh set
+    # has to be minted and the old ones archived by hand.
+    stripe-provision:
+        image: evdev3/anubis-langgraph-api:latest
+        pull_policy: never
+        env_file:
+            - .env
+        environment:
+            STRIPE_BILLING_CONFIG_FILE: /run/stripe/billing_config.json
+            # scripts/ imports `src.anubis...`; put the repo root on the path.
+            PYTHONPATH: /deps/anubis
+        working_dir: /deps/anubis
+        entrypoint:
+            ["python", "scripts/provision_stripe_billing.py", "--allow-live"]
+        # One-shot: run once and exit; never restart.
+        restart: "no"
+        volumes:
+            - .:/deps/anubis
+            - stripe-billing-config:/run/stripe
+
     grafana:
         image: grafana/grafana:latest
         ports:

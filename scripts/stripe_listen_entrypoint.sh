@@ -19,13 +19,21 @@ fi
 
 SECRET_FILE="${STRIPE_WEBHOOK_SECRET_FILE:-/run/stripe/webhook_secret}"
 FORWARD_TO="${STRIPE_WEBHOOK_FORWARD_TO:-http://langgraph-api-dev:8123/stripe/webhook}"
+# This list must stay equal to the branches in webapp.py::_handle_stripe_event,
+# which is the source of truth. It is duplicated in two places that cannot import
+# it — here, and in scripts/provision_stripe_webhook.py (which registers the
+# production endpoint). Change one, change all three.
+#
 # customer.subscription.created must be forwarded: the API creates subscriptions
 # server-side without Checkout (the pro signup trial, the free-tier billing
 # vehicle, tier changes made with the Stripe SDK), and those emit ONLY .created.
 # Omitting it leaves app_metadata.subscription_status pointing at whatever
 # subscription came before, so the API keeps re-reading a stale (often canceled)
 # subscription until some later .updated happens to fire.
-EVENTS="${STRIPE_WEBHOOK_EVENTS:-checkout.session.completed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.payment_failed}"
+#
+# customer.updated must be forwarded too: webapp.py handles it to keep the
+# cached billing email in step when a customer's details change in Stripe.
+EVENTS="${STRIPE_WEBHOOK_EVENTS:-checkout.session.completed,customer.updated,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.payment_failed}"
 
 mkdir -p "$(dirname "$SECRET_FILE")"
 

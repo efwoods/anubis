@@ -907,6 +907,35 @@ class GlobalContext:
         },
     )
 
+    portal_usage_event_url: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Customer portal endpoint that receives a usage event after each "
+                "metered turn, so the portal can show usage immediately instead "
+                "of waiting for Stripe's meter aggregation (for example "
+                "http://host.docker.internal:8200/internal/usage-event). Delivery "
+                "is fire-and-forget and fail-open; leaving this empty disables "
+                "the push entirely and the portal falls back to reading Stripe "
+                "on its own schedule. Env PORTAL_USAGE_EVENT_URL."
+            )
+        },
+    )
+
+    portal_usage_event_secret: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Shared secret signing usage events sent to "
+                "portal_usage_event_url, as an HMAC-SHA256 over "
+                "'<timestamp>.<body>' — the same construction Stripe uses for "
+                "webhook signatures. Must match the portal's "
+                "USAGE_EVENT_SHARED_SECRET exactly or every event is rejected. "
+                "Empty disables the push. Env PORTAL_USAGE_EVENT_SECRET."
+            )
+        },
+    )
+
     message_expected_output_tokens_estimate: int = field(
         default=512,
         metadata={

@@ -89,6 +89,19 @@ SQL_DELETE_CHECKPOINT_TABLES_FOR_THREADS = (
     "DELETE FROM run WHERE thread_id = ANY(%s);",
 )
 
+# Ownership read that does NOT go through the LangGraph SDK. Needed because the
+# SDK authenticates every call with the caller's API key, and the
+# ``@auth.authenticate`` handler rejects an account whose email is unverified —
+# so an unverified account deleting itself cannot enumerate avatars the way a
+# verified account does. ``create_avatar`` writes the owner into
+# ``assistant.metadata.user_id`` (the raw Auth0 identity id, no "auth0|"
+# prefix), which is the same value the SDK search filters on.
+SQL_SELECT_ASSISTANT_IDS_FOR_USER = """
+SELECT assistant_id
+  FROM assistant
+ WHERE metadata->>'user_id' = %s;
+"""
+
 SQL_DELETE_API_METRICS_FOR_ASSISTANT = (
     "DELETE FROM api_metrics WHERE assistant_id = %s;"
 )
@@ -125,6 +138,21 @@ async def search_all_avatars_for_user(
             break
         offset += AVATAR_SEARCH_PAGE_SIZE
     return all_avatars
+
+
+async def select_assistant_ids_for_user(pool: Any, user_id: str) -> list[str]:
+    """Return the avatar identifiers owned by the user, read straight from Postgres.
+
+    The SDK-based ``search_all_avatars_for_user`` is the normal enumeration and
+    stays the one used for verified accounts, because the SDK is also what
+    deletes an avatar. This function exists for the one caller that cannot use
+    the SDK at all — account deletion for an unverified email — where the only
+    question is whether any avatar exists, not how to remove one.
+    """
+    async with pool.connection() as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(SQL_SELECT_ASSISTANT_IDS_FOR_USER, (user_id,))
+            return [str(row[0]) for row in await cursor.fetchall()]
 
 
 async def delete_store_rows_for_assistant(pool: Any, assistant_id: str) -> int:

@@ -101,6 +101,9 @@ from src.anubis.utils.billing.metering import (
     resolve_usage_period_start,
     token_rate_limit_retry_after_seconds,
 )
+from src.anubis.utils.billing.usage_notification import (
+    schedule_usage_notification,
+)
 from src.anubis.utils.billing.tiers import (
     METER_EVENT_NAMES,
     TIER_DEFINITIONS,
@@ -166,6 +169,7 @@ __all__ = [
     "reconcile_period_usage",
     "stripe_usage_source_of_truth_enabled",
     "report_meter_event",
+    "schedule_usage_notification",
     "report_adapter_training_usage",
     "billable_tokens_from_metadata",
     "TokenEstimateBreakdown",

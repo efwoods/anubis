@@ -6,6 +6,16 @@ re-signup (clearing the pending period-end cancellation written by
 ``delete_user``, retaining the original trial end, rebuilding the local
 usage-period anchor from the real billing period), the free-tier enrollment for
 customers whose trial was already used, and the first-ever PRO trial grant.
+
+Also exercises the ``/login`` route as an enrollment trigger. Sign-in is the
+only trigger the customer portal reaches — it authenticates with email +
+password and never holds an API key — so these tests are what keep a portal
+signup from silently ending up with a Stripe customer and no subscription.
+
+The last group asserts that an account's billing identity stays separate from an
+anonymous visitor's: anonymous usage and account usage are separate allotments
+reported separately, which holds only while the two never share one Stripe
+customer.
 """
 
 from types import SimpleNamespace
@@ -13,7 +23,11 @@ from types import SimpleNamespace
 import pytest
 
 from src.security import auth as auth_module
-from src.security.auth import ensure_initial_subscription_after_verification
+from src.security.auth import (
+    _provision_stripe_customer_and_default_tier,
+    ensure_initial_subscription_after_verification,
+    login,
+)
 
 
 class _DictResult:
@@ -56,15 +70,28 @@ class _RecordingSubscriptionScheduleAPI:
 
 
 class _RecordingCustomerAPI:
-    def __init__(self, customer_payload):
+    def __init__(self, customer_payload, listed_customers=None):
         self._customer_payload = customer_payload
+        self._listed_customers = listed_customers or []
+        self.retrieve_calls = []
         self.modify_calls = []
+        self.list_calls = []
+        self.create_calls = []
 
     def retrieve(self, customer_id):
+        self.retrieve_calls.append(customer_id)
         return _DictResult(dict(self._customer_payload))
 
     def modify(self, customer_id, **kwargs):
         self.modify_calls.append((customer_id, kwargs))
+
+    def list(self, **kwargs):
+        self.list_calls.append(kwargs)
+        return _DictResult({"data": list(self._listed_customers)})
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return {"id": "cus_new_account"}
 
 
 class _FakeStripeClient:
@@ -73,13 +100,15 @@ class _FakeStripeClient:
         listed_subscriptions=None,
         customer_metadata=None,
         fail_on_modify: bool = False,
+        listed_customers=None,
     ):
         self.Subscription = _RecordingSubscriptionAPI(
             listed_subscriptions or [], fail_on_modify=fail_on_modify
         )
         self.SubscriptionSchedule = _RecordingSubscriptionScheduleAPI()
         self.Customer = _RecordingCustomerAPI(
-            {"id": "cus_1", "metadata": customer_metadata or {}}
+            {"id": "cus_1", "metadata": customer_metadata or {}},
+            listed_customers=listed_customers,
         )
 
 
@@ -287,3 +316,246 @@ async def test_already_provisioned_account_is_left_alone(
     )
     assert recorded_app_metadata_writes == []
     assert stripe_client.Subscription.list_calls == []
+
+
+# ── Sign-in as an enrollment trigger ────────────────────────────────────────
+#
+# The customer portal authenticates with email + password and never holds an
+# API key, so ``get_user_with_api_key`` — the other enrollment trigger — never
+# runs for a portal-only account. Sign-in is the only trigger it reaches.
+
+
+class _FakeLoginResponse:
+    def __init__(self, payload, status_code: int = 200):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+@pytest.fixture
+def login_environment(monkeypatch):
+    """Wire ``/login``'s Auth0 collaborators to fakes and expose the Auth0 record.
+
+    Only the identity-provider calls are faked. The enrollment itself runs for
+    real against the fake Stripe client, so these tests cover the whole path
+    from sign-in through to the Stripe subscription.
+    """
+    auth0_record = {
+        "user_id": "auth0|new-account",
+        "email": "person@example.com",
+        "email_verified": True,
+        "app_metadata": {"stripe_customer_id": "cus_1"},
+    }
+    environment = SimpleNamespace(
+        auth0_record=auth0_record,
+        login_status_calls=[],
+        get_user_calls=[],
+        get_user_error=None,
+    )
+
+    async def _fake_login_user(email, password, request):
+        return _FakeLoginResponse({"id_token": "fake.id.token"})
+
+    async def _fake_set_login_status(user_id, logged_in, request):
+        environment.login_status_calls.append((user_id, logged_in))
+
+    async def _fake_get_user(user_id, request):
+        environment.get_user_calls.append(user_id)
+        if environment.get_user_error is not None:
+            raise environment.get_user_error
+        return environment.auth0_record
+
+    monkeypatch.setattr(auth_module, "login_user", _fake_login_user)
+    monkeypatch.setattr(auth_module, "set_login_status", _fake_set_login_status)
+    monkeypatch.setattr(auth_module, "get_user", _fake_get_user)
+    monkeypatch.setattr(
+        auth_module.jwt,
+        "get_unverified_claims",
+        lambda id_token: {"sub": "auth0|new-account"},
+    )
+    return environment
+
+
+async def _sign_in(stripe_client):
+    return await login(
+        auth_module.LoginRequest(email="person@example.com", password="Secret!1"),
+        _fake_request(stripe_client),
+    )
+
+
+@pytest.mark.asyncio
+async def test_signing_in_enrolls_a_verified_account_into_the_pro_trial(
+    login_environment, recorded_app_metadata_writes
+):
+    stripe_client = _FakeStripeClient(listed_subscriptions=[])
+    stripe_client.Subscription.create_result = {
+        "id": "sub_trial",
+        "status": "trialing",
+        "trial_end": 1_753_000_000,
+    }
+
+    data = await _sign_in(stripe_client)
+
+    assert data == {"id_token": "fake.id.token"}
+    (create_call,) = stripe_client.Subscription.create_calls
+    assert create_call["trial_period_days"] == 30
+    assert create_call["items"][0]["price"] == "price_base_pro"
+    assert create_call["trial_settings"] == {
+        "end_behavior": {"missing_payment_method": "cancel"}
+    }
+    ((_, fields),) = recorded_app_metadata_writes
+    assert fields["subscription_status"]["tier"] == "pro"
+    assert fields["initial_subscription_provisioned"] is True
+    assert fields["trial_context"] == {"tier": "pro", "trial_end": 1_753_000_000}
+    assert fields["usage_period_anchor"]
+
+
+@pytest.mark.asyncio
+async def test_signing_in_unverified_creates_no_subscription_but_still_signs_in(
+    login_environment, recorded_app_metadata_writes
+):
+    login_environment.auth0_record["email_verified"] = False
+    stripe_client = _FakeStripeClient(listed_subscriptions=[])
+
+    data = await _sign_in(stripe_client)
+
+    # The sign-in itself is unaffected — only enrollment waits for verification.
+    assert data == {"id_token": "fake.id.token"}
+    assert login_environment.login_status_calls == [("auth0|new-account", True)]
+    assert stripe_client.Subscription.create_calls == []
+    assert stripe_client.Subscription.list_calls == []
+    assert recorded_app_metadata_writes == []
+
+
+@pytest.mark.asyncio
+async def test_signing_in_again_after_enrollment_makes_no_stripe_call(
+    login_environment, recorded_app_metadata_writes
+):
+    login_environment.auth0_record["app_metadata"][
+        "initial_subscription_provisioned"
+    ] = True
+    stripe_client = _FakeStripeClient(listed_subscriptions=[_pro_subscription()])
+
+    await _sign_in(stripe_client)
+
+    # The marker short-circuits before any Stripe call, so the multi-call
+    # enrollment cost is paid exactly once per account rather than every login.
+    assert stripe_client.Customer.retrieve_calls == []
+    assert stripe_client.Subscription.list_calls == []
+    assert stripe_client.Subscription.create_calls == []
+    assert recorded_app_metadata_writes == []
+
+
+@pytest.mark.asyncio
+async def test_a_stripe_failure_during_enrollment_never_fails_the_sign_in(
+    login_environment, recorded_app_metadata_writes
+):
+    stripe_client = _FakeStripeClient(listed_subscriptions=[])
+
+    def _raise(**kwargs):
+        raise RuntimeError("stripe unavailable")
+
+    stripe_client.Subscription.list = _raise
+
+    data = await _sign_in(stripe_client)
+
+    assert data == {"id_token": "fake.id.token"}
+    # No marker was written, so the next sign-in retries the enrollment.
+    assert recorded_app_metadata_writes == []
+
+
+@pytest.mark.asyncio
+async def test_an_auth0_lookup_failure_never_fails_the_sign_in(
+    login_environment, recorded_app_metadata_writes
+):
+    login_environment.get_user_error = RuntimeError("auth0 unreachable")
+    stripe_client = _FakeStripeClient(listed_subscriptions=[])
+
+    data = await _sign_in(stripe_client)
+
+    assert data == {"id_token": "fake.id.token"}
+    assert stripe_client.Subscription.create_calls == []
+
+
+# ── Anonymous and account billing identities stay separate ──────────────────
+#
+# Anonymous usage and account usage are separate allotments reported
+# separately. That holds only while an anonymous visitor's Stripe customer and
+# an account's Stripe customer never become the same record.
+
+
+@pytest.mark.asyncio
+async def test_an_anonymous_subscription_never_denies_an_account_its_trial(
+    recorded_app_metadata_writes,
+):
+    # A $0 subscription that exists only to meter an anonymous visitor is not
+    # subscription history. If it were counted, the account would be enrolled
+    # straight into the free tier and silently lose its pro trial.
+    stripe_client = _FakeStripeClient(
+        listed_subscriptions=[
+            {
+                "id": "sub_anonymous",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "metadata": {
+                    "anonymous_hashed_ip": "245c0ffc0f6a0215471542b9add1fa53"
+                    "31647f4af18c431f039c66dbee92732e",
+                    "neural_nexus_tier": "free",
+                },
+            }
+        ]
+    )
+    stripe_client.Subscription.create_result = {
+        "id": "sub_trial",
+        "status": "trialing",
+        "trial_end": 1_753_000_000,
+    }
+
+    await ensure_initial_subscription_after_verification(
+        _fake_request(stripe_client), _verified_user()
+    )
+
+    (create_call,) = stripe_client.Subscription.create_calls
+    assert create_call["trial_period_days"] == 30
+    ((_, fields),) = recorded_app_metadata_writes
+    assert fields["subscription_status"]["tier"] == "pro"
+
+
+@pytest.mark.asyncio
+async def test_a_signup_never_reuses_a_customer_that_has_no_matching_email(
+    monkeypatch,
+):
+    # An anonymous visitor's customer carries a hashed IP and no email, so a
+    # signup from that same address must mint its own customer rather than
+    # attach to the anonymous one and merge the two usage ledgers.
+    stripe_client = _FakeStripeClient(listed_customers=[])
+    patched_app_metadata = {}
+
+    async def _fake_mgmt_headers(request):
+        return {}
+
+    async def _fake_patch(method, url, headers, json):
+        patched_app_metadata.update(json["app_metadata"])
+        return SimpleNamespace(raise_for_status=lambda: None)
+
+    monkeypatch.setattr(auth_module, "_mgmt_headers", _fake_mgmt_headers)
+    monkeypatch.setattr(auth_module, "retry_async_httpx_request", _fake_patch)
+
+    customer_id = await _provision_stripe_customer_and_default_tier(
+        request=_fake_request(stripe_client),
+        user_id="auth0|new-account",
+        email="person@example.com",
+    )
+
+    # The lookup is by email only — a hashed-IP customer can never match it.
+    assert stripe_client.Customer.list_calls == [
+        {"email": "person@example.com", "limit": 1}
+    ]
+    assert stripe_client.Customer.modify_calls == []
+    assert customer_id == "cus_new_account"
+    (create_call,) = stripe_client.Customer.create_calls
+    assert create_call["metadata"] == {"auth0_user_id": "auth0|new-account"}
+    assert "anonymous_hashed_ip" not in create_call["metadata"]
+    assert patched_app_metadata["stripe_customer_id"] == "cus_new_account"

@@ -30,8 +30,27 @@ to change pricing; nothing else in the codebase hardcodes these values.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from typing import Dict, FrozenSet
+
+# Stripe accepts at most twelve decimal places in ``unit_amount_decimal``. Every
+# rate is quantized to that precision before being sent, so a rate that cannot be
+# represented exactly is rounded once, deliberately, here — rather than arriving
+# at Stripe as a float artifact that is rejected or silently re-rounded.
+STRIPE_DECIMAL_PLACES = 12
+_STRIPE_DECIMAL_QUANTUM = Decimal(1).scaleb(-STRIPE_DECIMAL_PLACES)
+
+
+def _format_stripe_decimal(amount: Decimal) -> str:
+    """Render ``amount`` as a plain decimal string Stripe accepts.
+
+    Quantizing to twelve places and then normalizing strips the trailing zeros the
+    quantum introduces, and ``format(..., "f")`` renders without exponent notation —
+    ``Decimal.normalize`` turns 0.0002 into ``2E-4``, which Stripe rejects.
+    """
+    quantized = amount.quantize(_STRIPE_DECIMAL_QUANTUM)
+    return format(quantized.normalize(), "f")
 
 
 class SubscriptionTier(StrEnum):
@@ -94,11 +113,23 @@ class MeterAllotment:
         pricing requires. A rate of ``overage_price_per_million`` dollars per one
         million units equals ``overage_price_per_million / 1_000_000`` dollars per
         unit, i.e. ``overage_price_per_million / 10_000`` cents per unit.
+
+        The arithmetic runs in ``Decimal``, not binary floating point, because the
+        result is compared against what Stripe echoes back to decide whether a
+        provisioned price still matches this catalog. ``str(1.10 / 10_000.0)``
+        yields ``"0.00011000000000000002"`` — twenty decimal places where Stripe
+        permits twelve — which would be rejected on the way out and, if it were
+        not, would never compare equal on the way back, so every provisioning run
+        would believe the price had drifted and mint a replacement.
         """
         if self.overage_price_per_unit_usd is not None:
-            return str(self.overage_price_per_unit_usd * 100.0)
+            return _format_stripe_decimal(
+                Decimal(str(self.overage_price_per_unit_usd)) * Decimal(100)
+            )
         if self.overage_price_per_million is not None:
-            return str(self.overage_price_per_million / 10_000.0)
+            return _format_stripe_decimal(
+                Decimal(str(self.overage_price_per_million)) / Decimal(10_000)
+            )
         raise ValueError(
             f"Meter allotment for {self.meter.value} has no overage rate configured."
         )
@@ -119,8 +150,17 @@ class TierDefinition:
     trial_period_days: int = 0
 
     def stripe_base_unit_amount_cents(self) -> int:
-        """Return the flat monthly base fee as an integer number of US cents."""
-        return int(round(self.monthly_base_fee_usd * 100))
+        """Return the flat monthly base fee as an integer number of US cents.
+
+        Converted through ``Decimal`` for the same reason as the overage rates:
+        ``19.99 * 100`` is 1998.9999999999998 in binary floating point, and the
+        cent value is compared against what Stripe reports to detect a price edit.
+        """
+        return int(
+            (Decimal(str(self.monthly_base_fee_usd)) * Decimal(100)).quantize(
+                Decimal(1)
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

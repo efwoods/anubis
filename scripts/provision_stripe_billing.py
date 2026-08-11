@@ -1,13 +1,19 @@
 #!/usr/bin/env python
 # scripts/provision_stripe_billing.py
 
-"""Idempotently create the Stripe meters, products, and prices for all three tiers.
+"""Create — and MUTATE — the Stripe meters, products, and prices for all three tiers.
 
 This script turns the tier catalog in ``src/anubis/utils/billing/tiers.py`` into
-concrete Stripe objects and prints the JSON to paste into
-``STRIPE_BILLING_CONFIG_JSON``. It is the single, reviewable, repeatable way to
-build the billing objects — run it against a TEST-mode key first, verify, then
-re-run against the live key.
+concrete Stripe objects. Editing a number there (a base fee, a monthly allotment,
+an overage rate) and re-running this script is how pricing changes: the run
+notices the live price no longer matches, replaces it, and moves existing
+subscribers onto the replacement, so the customer portal, this API, and the
+Stripe invoice all quote the same figure.
+
+Which Stripe account it touches is decided by the environment file, not by an
+ambient shell variable: ``.env.dev`` (test, ``sk_test_``) by default, ``.env``
+(live, ``sk_live_``) with ``--live``. A key that does not match the file it came
+from is a hard error.
 
 What it creates:
 
@@ -30,7 +36,7 @@ What it creates:
   information, at-period-end cancellation; no plan switching — metered prices
   require tier changes to go through POST /subscribe).
 
-Idempotency:
+How a price is mutated:
 
 * Meters are matched by ``event_name`` (Stripe forbids two active meters sharing
   one), and reused when present.
@@ -39,24 +45,29 @@ Idempotency:
   products) at the current ``neural_nexus_catalog_version``; on reuse the
   name and description are refreshed so re-runs keep the customer-facing copy
   in sync with ``tiers.py``.
-* Prices are matched by ``lookup_key``. Because Stripe prices are immutable once
-  used, bump ``PRICE_LOOKUP_KEY_VERSION`` to force a fresh set of prices after
-  changing any amount or allotment in ``tiers.py`` (archive the old ones by hand).
+* Prices are matched by ``lookup_key`` and then COMPARED against ``tiers.py``.
+  A Stripe price is immutable in amount and graduated tiers, so a changed number
+  means a new price: the replacement is created with ``transfer_lookup_key=True``
+  (which atomically moves the lookup key off the old price) and the old price is
+  then archived. The lookup key — not the price id — is the stable name for "the
+  current pro base price", which is what makes a re-run find and compare the
+  right object.
+* Live subscriptions still holding a replaced price are migrated onto the
+  replacement, because the API gates allotments on ``tiers.py`` while Stripe
+  bills whatever price the subscription item holds; leaving those apart charges
+  a customer something different from what the portal shows them.
 
-Migration from the v1 catalog (one product per tier, all prices attached to
-that one product): re-run this script (test mode first), paste the printed
-JSON into ``STRIPE_BILLING_CONFIG_JSON``, and restart the API. Existing
-subscriptions keep their v1 prices until their next tier change (the tier
-change swaps subscription items to the current price ids); archive the v1
-prices and products by hand once no live subscription references them.
+``PRICE_LOOKUP_KEY_VERSION`` is the catalog GENERATION. It is not how a price is
+changed — bumping it renames every lookup key and re-tags every product. Edit
+``tiers.py`` instead.
 
 Usage:
 
-    # test mode (default guard: refuses a live key unless --allow-live is passed)
-    STRIPE_SECRET_KEY=sk_test_... python scripts/provision_stripe_billing.py
+    # test environment: reads .env.dev, requires an sk_test_ key
+    python scripts/provision_stripe_billing.py
 
-    # live mode (explicit opt-in)
-    STRIPE_SECRET_KEY=sk_live_... python scripts/provision_stripe_billing.py --allow-live
+    # live environment: reads .env, requires an sk_live_ key
+    python scripts/provision_stripe_billing.py --live
 """
 
 from __future__ import annotations
@@ -65,9 +76,11 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Dict
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Mapping
 
 import stripe
+from dotenv import dotenv_values
 
 # Allow running as a plain script from the repo root without installing the package.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -80,7 +93,8 @@ from src.anubis.utils.billing.tiers import (  # noqa: E402
     UsageMeter,
 )
 
-# Bump this to force creation of a new immutable price set after editing amounts.
+# The catalog generation, embedded in every price lookup key. See the module
+# docstring for why bumping this is NOT how a price is changed.
 PRICE_LOOKUP_KEY_VERSION = "v2"
 PRODUCT_TIER_METADATA_KEY = "neural_nexus_tier"
 PRODUCT_ROLE_METADATA_KEY = "neural_nexus_product_role"
@@ -91,6 +105,16 @@ PRODUCT_ROLE_METERED = "metered"
 PORTAL_CONFIGURATION_METADATA_KEY = "neural_nexus_portal"
 PORTAL_CONFIGURATION_METADATA_VALUE = f"portal_{PRICE_LOOKUP_KEY_VERSION}"
 
+SUBSCRIPTION_TIER_METADATA_KEY = "neural_nexus_tier"
+
+# Statuses in which a subscription is still billing and therefore still needs to
+# hold current prices. Mirrors LIVE_SUBSCRIPTION_STATUSES in the billing package.
+LIVE_SUBSCRIPTION_STATUSES = ("active", "trialing", "past_due", "unpaid")
+
+# Which environment file supplies the Stripe key for each mode.
+TEST_ENVIRONMENT_FILE = ".env.dev"
+LIVE_ENVIRONMENT_FILE = ".env"
+
 # Customer-facing names for each usage meter, shown on Checkout line items.
 METER_DISPLAY_NAMES: Dict[UsageMeter, str] = {
     UsageMeter.MESSAGING_TOKENS: "Messaging Tokens",
@@ -98,6 +122,57 @@ METER_DISPLAY_NAMES: Dict[UsageMeter, str] = {
     UsageMeter.ADAPTER_INFERENCE_TOKENS: "Adapter Inference Tokens",
     UsageMeter.ADAPTER_TRAINING_UNITS: "Adapter Training",
 }
+
+
+def resolve_stripe_secret_key(use_live: bool) -> tuple[str, str]:
+    """Return the Stripe secret key for the selected environment, and its source.
+
+    The environment FILE decides which Stripe account is touched — ``.env.dev``
+    for test, ``.env`` for live — because that is the separation the rest of the
+    project already uses. The file is parsed with ``dotenv_values`` rather than
+    loaded into the process: ``load_dotenv(override=True)`` would also overwrite
+    variables docker-compose supplies through ``environment:``, including the
+    empty ``STRIPE_BILLING_CONFIG_FILE=`` line these files carry.
+
+    Falling back to the process environment covers a container that was handed a
+    key without a mounted env file. Either way the key must match the environment
+    it claims to be: an ``sk_live_`` key exported in a shell is exactly how a run
+    intended for test would otherwise rewrite live prices.
+    """
+    environment_file = LIVE_ENVIRONMENT_FILE if use_live else TEST_ENVIRONMENT_FILE
+    expected_prefix = "sk_live_" if use_live else "sk_test_"
+    environment_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", environment_file)
+    )
+
+    file_values: Mapping[str, str | None] = (
+        dotenv_values(environment_path) if os.path.isfile(environment_path) else {}
+    )
+    secret_key = (file_values.get("STRIPE_SECRET_KEY") or "").strip()
+    source = environment_file
+    if not secret_key:
+        secret_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+        source = "the process environment"
+
+    if not secret_key:
+        raise SystemExit(
+            f"No STRIPE_SECRET_KEY found in {environment_file} or the process "
+            "environment."
+        )
+    if not secret_key.startswith(expected_prefix):
+        actual_prefix = secret_key.split("_")[0:2]
+        raise SystemExit(
+            f"Refusing to run: the key from {source} starts with "
+            f"'{'_'.join(actual_prefix)}_' but the "
+            f"{'live' if use_live else 'test'} environment requires "
+            f"'{expected_prefix}'. Check {environment_file}"
+            + (
+                ", or unset STRIPE_SECRET_KEY in your shell."
+                if source == "the process environment"
+                else "."
+            )
+        )
+    return secret_key, source
 
 
 def _base_price_lookup_key(tier: SubscriptionTier) -> str:
@@ -234,7 +309,8 @@ def find_or_create_base_product(definition: TierDefinition) -> str:
     The base product carries the flat subscription fee. Checkout shows the
     product name and description on the line item, so both enumerate what the
     tier includes. On reuse, the name and description are refreshed so re-runs
-    keep the customer-facing copy in sync with ``tiers.py``.
+    keep the customer-facing copy in sync with ``tiers.py`` — which is what makes
+    an edited price show up in the copy as well as the amount.
     """
     product_name = f"{definition.display_name} — Base Subscription"
     product_description = _tier_base_description(definition)
@@ -268,8 +344,8 @@ def find_or_create_meter_product(
 
     Every metered price gets a dedicated product whose name says which meter
     the line item bills and how much is included — the fix for Checkout
-    rendering three indistinguishable "Neural Nexus Pro Tier" rows. On reuse,
-    the name and description are refreshed to match ``tiers.py``.
+    rendering three indistinguishable "Neural Nexus Pro Tier" rows. On reuse, the
+    name and description are refreshed to match ``tiers.py``.
     """
     product_name = f"{definition.display_name} — {_allotment_summary(allotment)}"
     product_description = _allotment_description(allotment)
@@ -303,33 +379,189 @@ def find_or_create_meter_product(
     return created["id"]
 
 
-def _find_price_by_lookup_key(lookup_key: str) -> str | None:
-    prices = stripe.Price.list(lookup_keys=[lookup_key], active=True, limit=1).to_dict()
-    if prices.get("data"):
-        return prices["data"][0]["id"]
-    return None
+def _find_active_price_by_lookup_key(
+    lookup_key: str, expand_tiers: bool = False
+) -> dict | None:
+    """Return the active price holding ``lookup_key``, or None.
+
+    ``expand_tiers`` is required for metered prices: without the graduated tiers
+    there is no way to tell whether the live price still carries the allotment
+    and overage rate ``tiers.py`` calls for, and an uncomparable price would be
+    reused forever.
+    """
+    prices = stripe.Price.list(
+        lookup_keys=[lookup_key],
+        active=True,
+        limit=1,
+        **({"expand": ["data.tiers"]} if expand_tiers else {}),
+    ).to_dict()
+    data = prices.get("data") or []
+    return data[0] if data else None
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    """Coerce a Stripe money field to ``Decimal``, or None when unusable.
+
+    Stripe returns ``unit_amount_decimal`` as a ``Decimal`` through the SDK but as
+    a string over raw HTTP, and test fixtures naturally use ints and floats. All
+    of those have to compare equal to the same rate, and going through ``str``
+    first keeps a float from contributing its own representation error.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _cents_text(cents: int | None) -> str:
+    return "unset" if cents is None else f"${cents / 100:,.2f}"
+
+
+def base_price_differences(
+    existing_price: Mapping[str, Any], definition: TierDefinition, product_id: str
+) -> List[str]:
+    """Return why a live flat price no longer matches ``tiers.py`` (empty when it does)."""
+    differences: List[str] = []
+    desired_amount = definition.stripe_base_unit_amount_cents()
+    if existing_price.get("unit_amount") != desired_amount:
+        differences.append(
+            f"base fee {_cents_text(existing_price.get('unit_amount'))} -> "
+            f"{_cents_text(desired_amount)}"
+        )
+    if existing_price.get("currency") != "usd":
+        differences.append(f"currency {existing_price.get('currency')!r} -> 'usd'")
+    if existing_price.get("product") != product_id:
+        differences.append(
+            f"product {existing_price.get('product')!r} -> {product_id!r}"
+        )
+    recurring = existing_price.get("recurring") or {}
+    if recurring.get("interval") != "month":
+        differences.append(f"interval {recurring.get('interval')!r} -> 'month'")
+    return differences
+
+
+def metered_price_differences(
+    existing_price: Mapping[str, Any],
+    allotment: MeterAllotment,
+    product_id: str,
+    meter_id: str,
+) -> List[str]:
+    """Return why a live metered price no longer matches ``tiers.py``.
+
+    Money is compared as ``Decimal`` so that ``"0.00015"``, ``Decimal("0.000150")``
+    and ``0.00015`` are one value — otherwise a re-run would "detect" a change
+    that is only a difference of representation and mint a new price every time.
+    """
+    differences: List[str] = []
+    if existing_price.get("product") != product_id:
+        differences.append(
+            f"product {existing_price.get('product')!r} -> {product_id!r}"
+        )
+    recurring = existing_price.get("recurring") or {}
+    if recurring.get("meter") != meter_id:
+        differences.append(f"meter {recurring.get('meter')!r} -> {meter_id!r}")
+    if recurring.get("interval") != "month":
+        differences.append(f"interval {recurring.get('interval')!r} -> 'month'")
+    if existing_price.get("billing_scheme") != "tiered":
+        differences.append(
+            f"billing_scheme {existing_price.get('billing_scheme')!r} -> 'tiered'"
+        )
+    if existing_price.get("tiers_mode") != "graduated":
+        differences.append(
+            f"tiers_mode {existing_price.get('tiers_mode')!r} -> 'graduated'"
+        )
+
+    graduated_tiers = existing_price.get("tiers")
+    if graduated_tiers is None:
+        differences.append("graduated tiers were not expanded on the existing price")
+        return differences
+    if len(graduated_tiers) != 2:
+        differences.append(f"{len(graduated_tiers)} graduated tiers -> 2")
+        return differences
+
+    included_tier, overage_tier = graduated_tiers
+    if included_tier.get("up_to") != allotment.monthly_allotment:
+        differences.append(
+            f"allotment {included_tier.get('up_to')} -> "
+            f"{allotment.monthly_allotment:,}"
+        )
+    desired_rate = Decimal(allotment.stripe_unit_amount_decimal())
+    existing_rate = _as_decimal(
+        overage_tier.get("unit_amount_decimal")
+        if overage_tier.get("unit_amount_decimal") is not None
+        else overage_tier.get("unit_amount")
+    )
+    if existing_rate is None or existing_rate != desired_rate:
+        differences.append(
+            f"overage rate {overage_tier.get('unit_amount_decimal')} -> "
+            f"{allotment.stripe_unit_amount_decimal()} cents/unit"
+        )
+    return differences
+
+
+def _replace_price(
+    existing_price_id: str,
+    lookup_key: str,
+    differences: List[str],
+    create_parameters: Dict[str, Any],
+) -> str:
+    """Create the replacement for a drifted price and archive the old one.
+
+    The order is not interchangeable. ``transfer_lookup_key=True`` moves the
+    lookup key off the existing price as part of the create; archiving first
+    would strand the key on an inactive price and the next run would not find it.
+    Archiving does not disturb customers — Stripe keeps billing and renewing
+    subscriptions that reference an archived price — and ``migrate_live_subscriptions``
+    moves them off it afterwards.
+    """
+    print(f"    price '{lookup_key}' CHANGED: {'; '.join(differences)}")
+    replacement = stripe.Price.create(
+        transfer_lookup_key=True, **create_parameters
+    )
+    stripe.Price.modify(existing_price_id, active=False)
+    print(
+        f"    price '{lookup_key}' REPLACED {existing_price_id} -> "
+        f"{replacement['id']} (old price archived)"
+    )
+    return replacement["id"]
 
 
 def find_or_create_base_price(
-    definition: TierDefinition, product_id: str
+    definition: TierDefinition,
+    product_id: str,
+    superseded_price_tiers: Dict[str, str],
 ) -> str:
-    """Return the licensed flat monthly base price id for a tier."""
+    """Return the licensed flat monthly base price id for a tier, replacing it on change."""
     lookup_key = _base_price_lookup_key(definition.tier)
-    existing = _find_price_by_lookup_key(lookup_key)
-    if existing:
-        print(f"    base price '{lookup_key}' exists -> {existing}")
-        return existing
+    create_parameters: Dict[str, Any] = {
+        "product": product_id,
+        "currency": "usd",
+        "unit_amount": definition.stripe_base_unit_amount_cents(),
+        "recurring": {"interval": "month"},
+        "lookup_key": lookup_key,
+        "nickname": f"{definition.display_name} — base",
+    }
 
-    created = stripe.Price.create(
-        product=product_id,
-        currency="usd",
-        unit_amount=definition.stripe_base_unit_amount_cents(),
-        recurring={"interval": "month"},
-        lookup_key=lookup_key,
-        nickname=f"{definition.display_name} — base",
+    existing = _find_active_price_by_lookup_key(lookup_key)
+    if existing is None:
+        created = stripe.Price.create(**create_parameters)
+        print(f"    base price '{lookup_key}' CREATED -> {created['id']}")
+        return created["id"]
+
+    differences = base_price_differences(existing, definition, product_id)
+    if not differences:
+        print(f"    base price '{lookup_key}' exists -> {existing['id']}")
+        return existing["id"]
+
+    replacement_id = _replace_price(
+        existing["id"], lookup_key, differences, create_parameters
     )
-    print(f"    base price '{lookup_key}' CREATED -> {created['id']}")
-    return created["id"]
+    superseded_price_tiers[existing["id"]] = definition.tier.value
+    return replacement_id
 
 
 def find_or_create_metered_price(
@@ -337,35 +569,46 @@ def find_or_create_metered_price(
     product_id: str,
     meter_id: str,
     allotment: MeterAllotment,
+    superseded_price_tiers: Dict[str, str],
 ) -> str:
-    """Return the graduated metered price id for one (tier, meter) pair."""
+    """Return the graduated metered price id for one (tier, meter), replacing it on change."""
     lookup_key = _metered_price_lookup_key(definition.tier, allotment.meter)
-    existing = _find_price_by_lookup_key(lookup_key)
-    if existing:
-        print(f"    metered price '{lookup_key}' exists -> {existing}")
-        return existing
-
-    created = stripe.Price.create(
-        product=product_id,
-        currency="usd",
-        recurring={
+    create_parameters: Dict[str, Any] = {
+        "product": product_id,
+        "currency": "usd",
+        "recurring": {
             "interval": "month",
             "usage_type": "metered",
             "meter": meter_id,
         },
-        billing_scheme="tiered",
-        tiers_mode="graduated",
-        tiers=[
+        "billing_scheme": "tiered",
+        "tiers_mode": "graduated",
+        "tiers": [
             # Tier 1: the included monthly allotment, at zero cost.
             {"up_to": allotment.monthly_allotment, "unit_amount_decimal": "0"},
             # Tier 2: pay-per-use overage past the allotment.
             {"up_to": "inf", "unit_amount_decimal": allotment.stripe_unit_amount_decimal()},
         ],
-        lookup_key=lookup_key,
-        nickname=f"{definition.display_name} — {allotment.meter.value}",
+        "lookup_key": lookup_key,
+        "nickname": f"{definition.display_name} — {allotment.meter.value}",
+    }
+
+    existing = _find_active_price_by_lookup_key(lookup_key, expand_tiers=True)
+    if existing is None:
+        created = stripe.Price.create(**create_parameters)
+        print(f"    metered price '{lookup_key}' CREATED -> {created['id']}")
+        return created["id"]
+
+    differences = metered_price_differences(existing, allotment, product_id, meter_id)
+    if not differences:
+        print(f"    metered price '{lookup_key}' exists -> {existing['id']}")
+        return existing["id"]
+
+    replacement_id = _replace_price(
+        existing["id"], lookup_key, differences, create_parameters
     )
-    print(f"    metered price '{lookup_key}' CREATED -> {created['id']}")
-    return created["id"]
+    superseded_price_tiers[existing["id"]] = definition.tier.value
+    return replacement_id
 
 
 def find_or_create_billing_portal_configuration() -> str:
@@ -415,18 +658,101 @@ def find_or_create_billing_portal_configuration() -> str:
     return created["id"]
 
 
+def migrate_live_subscriptions(
+    superseded_price_tiers: Dict[str, str],
+    price_ids_by_tier: Dict[str, List[str]],
+) -> int:
+    """Move live subscriptions off the prices this run replaced. Returns the count.
+
+    Without this a price change only reaches new customers: existing subscribers
+    keep billing the archived price while the API grants them the allotment from
+    the edited ``tiers.py`` and the portal displays the edited figure — the
+    customer is quoted one thing and charged another.
+
+    Proration is deliberately ``none``. The customer did not ask for this change,
+    so an operator's price edit must not produce a mid-period charge or credit.
+    Usage already metered this period is unaffected: meter events key to the
+    CUSTOMER (``stripe_customer_id``), not to the subscription item, so the
+    replacement item continues to bill against the same accumulated total.
+
+    Subscriptions managed by a subscription schedule are reported and skipped —
+    Stripe refuses item changes on them, and releasing the schedule to force one
+    through would silently discard a pending downgrade the customer requested.
+    """
+    if not superseded_price_tiers:
+        return 0
+
+    migrated_count = 0
+    for subscription_object in stripe.Subscription.list(
+        status="all", limit=100
+    ).auto_paging_iter():
+        subscription = subscription_object.to_dict()
+        if subscription.get("status") not in LIVE_SUBSCRIPTION_STATUSES:
+            continue
+
+        existing_items = (subscription.get("items", {}) or {}).get("data", [])
+        held_superseded_tiers = [
+            superseded_price_tiers[price_id]
+            for price_id in (
+                (item.get("price") or {}).get("id") for item in existing_items
+            )
+            if price_id in superseded_price_tiers
+        ]
+        if not held_superseded_tiers:
+            continue
+
+        subscription_id = str(subscription["id"])
+        tier = held_superseded_tiers[0]
+        if subscription.get("schedule"):
+            print(
+                f"  subscription {subscription_id} ({tier}) holds a replaced price "
+                "but is managed by a subscription schedule; NOT migrated. Let the "
+                "pending change land, then re-run."
+            )
+            continue
+
+        # Same item-replacement shape the API and the customer portal use for a
+        # tier change: delete every current item, then add the tier's current
+        # price set with quantity only on the licensed base price.
+        target_price_ids = price_ids_by_tier[tier]
+        replacement_items: List[Dict[str, Any]] = [
+            {"id": item["id"], "deleted": True} for item in existing_items
+        ]
+        replacement_items.append({"price": target_price_ids[0], "quantity": 1})
+        replacement_items.extend(
+            {"price": price_id} for price_id in target_price_ids[1:]
+        )
+
+        stripe.Subscription.modify(
+            subscription_id,
+            items=replacement_items,
+            proration_behavior="none",
+            metadata={SUBSCRIPTION_TIER_METADATA_KEY: tier},
+        )
+        migrated_count += 1
+        print(f"  subscription {subscription_id} MIGRATED to current {tier} prices")
+
+    return migrated_count
+
+
 def provision() -> Dict[str, Any]:
-    """Create/reuse every object and return the billing-config JSON document."""
+    """Create/reuse/replace every object and return the billing-config JSON document."""
     print("Provisioning Billing Meters:")
     meter_ids: Dict[UsageMeter, str] = {
         meter: find_or_create_meter(meter) for meter in UsageMeter
     }
 
+    # Old price id -> the tier it priced, for every price replaced in this run.
+    superseded_price_tiers: Dict[str, str] = {}
     tiers_config: Dict[str, Any] = {}
+    price_ids_by_tier: Dict[str, List[str]] = {}
+
     for tier, definition in TIER_DEFINITIONS.items():
         print(f"Provisioning tier '{tier.value}':")
         base_product_id = find_or_create_base_product(definition)
-        base_price_id = find_or_create_base_price(definition, base_product_id)
+        base_price_id = find_or_create_base_price(
+            definition, base_product_id, superseded_price_tiers
+        )
 
         metered_price_ids: Dict[str, str] = {}
         for meter, allotment in definition.meter_allotments.items():
@@ -435,7 +761,11 @@ def provision() -> Dict[str, Any]:
             # the included allotment instead of repeating the tier name.
             meter_product_id = find_or_create_meter_product(definition, allotment)
             price_id = find_or_create_metered_price(
-                definition, meter_product_id, meter_ids[meter], allotment
+                definition,
+                meter_product_id,
+                meter_ids[meter],
+                allotment,
+                superseded_price_tiers,
             )
             metered_price_ids[meter.value] = price_id
 
@@ -444,6 +774,21 @@ def provision() -> Dict[str, Any]:
             "base_price": base_price_id,
             "metered_prices": metered_price_ids,
         }
+        price_ids_by_tier[tier.value] = [base_price_id] + [
+            metered_price_ids[meter.value]
+            for meter in UsageMeter
+            if meter.value in metered_price_ids
+        ]
+
+    if superseded_price_tiers:
+        print("Migrating live subscriptions onto the replaced prices:")
+        migrated_count = migrate_live_subscriptions(
+            superseded_price_tiers, price_ids_by_tier
+        )
+        print(
+            f"  {len(superseded_price_tiers)} price(s) replaced, "
+            f"{migrated_count} subscription(s) migrated"
+        )
 
     print("Provisioning billing-portal configuration:")
     portal_configuration_id = find_or_create_billing_portal_configuration()
@@ -456,29 +801,23 @@ def provision() -> Dict[str, Any]:
 
 
 def main() -> None:
-    """Parse arguments, guard test/live mode, provision objects, and print config."""
+    """Parse arguments, select the environment, provision objects, and print config."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--allow-live",
+        "--live",
         action="store_true",
-        help="Permit running against a live (sk_live_) key. Off by default.",
+        help=(
+            f"Provision the LIVE environment: read the Stripe key from "
+            f"{LIVE_ENVIRONMENT_FILE} (sk_live_). Without this the key comes from "
+            f"{TEST_ENVIRONMENT_FILE} (sk_test_)."
+        ),
     )
-    args = parser.parse_args()
+    arguments = parser.parse_args()
 
-    secret_key = os.environ.get("STRIPE_SECRET_KEY")
-    if not secret_key:
-        raise SystemExit("STRIPE_SECRET_KEY is not set.")
-
-    is_live_key = secret_key.startswith("sk_live_")
-    if is_live_key and not args.allow_live:
-        raise SystemExit(
-            "Refusing to provision against a LIVE key without --allow-live. "
-            "Provision and verify in test mode first (use an sk_test_ key)."
-        )
-
+    secret_key, key_source = resolve_stripe_secret_key(arguments.live)
     stripe.api_key = secret_key
-    mode = "LIVE" if is_live_key else "TEST"
-    print(f"=== Provisioning Stripe billing objects in {mode} mode ===")
+    mode = "LIVE" if arguments.live else "TEST"
+    print(f"=== Provisioning Stripe billing objects in {mode} mode ({key_source}) ===")
 
     config_document = provision()
 
@@ -510,14 +849,6 @@ def main() -> None:
 
     print("\n=== DONE. Set STRIPE_BILLING_CONFIG_JSON to the following single line: ===\n")
     print(config_json)
-    print(
-        "\nMigration notes (v1 -> v2 catalog):\n"
-        "  1. Paste the JSON above into STRIPE_BILLING_CONFIG_JSON and restart the API.\n"
-        "  2. Existing subscriptions keep their v1 prices until their next tier\n"
-        "     change; new checkouts and tier changes use the v2 prices above.\n"
-        "  3. Archive the v1 prices and the old one-product-per-tier products by\n"
-        "     hand once no live subscription references them.\n"
-    )
 
 
 if __name__ == "__main__":

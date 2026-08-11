@@ -84,7 +84,8 @@ from src.anubis.utils.billing import (
     fetch_usage_since,
     is_anonymous_user,
     canceled_tier_allotment_floor_applies,
-    load_stripe_billing_config,
+    current_stripe_billing_config,
+    initialize_stripe_billing_config,
     persist_api_metrics_row,
     plan_resubscribe_usage_window,
     plan_subscribe_action,
@@ -95,7 +96,6 @@ from src.anubis.utils.billing import (
     reconcile_period_usage,
     resolve_canceled_tier_context,
     resolve_metering_bypass,
-    resolve_stripe_billing_config_json,
     resolve_metering_user_id,
     resolve_pay_per_use_enabled,
     resolve_stripe_customer_id,
@@ -271,7 +271,7 @@ async def resolve_period_usage_to_date(
     )
     stripe_usage = await fetch_stripe_period_usage(
         getattr(app_state, "stripe", None),
-        getattr(app_state, "stripe_billing_config", None),
+        current_stripe_billing_config(app_state),
         meter,
         resolve_stripe_customer_id(current_user),
         period_start,
@@ -1243,16 +1243,12 @@ async def lifespan(app: FastAPI):
     # (meter + tier price ids) so metering and subscription endpoints can use them.
     await ensure_api_metrics_table(app.state.pool)
     await ensure_anonymous_billing_customers_table(app.state.pool)
-    try:
-        # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the
-        # compose stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a
-        # reprovision never requires pasting JSON into the env or a manual edit.
-        app.state.stripe_billing_config = load_stripe_billing_config(
-            resolve_stripe_billing_config_json(app.state.context)
-        )
-    except ValueError as billing_config_error:
-        logger.error("Invalid STRIPE_BILLING_CONFIG_JSON: %s", billing_config_error)
-        app.state.stripe_billing_config = None
+    # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
+    # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
+    # requires pasting JSON into the env or a manual edit. This is only the INITIAL
+    # load: current_stripe_billing_config re-reads the file when a reprovision
+    # changes it, so edited prices take effect without restarting the API.
+    initialize_stripe_billing_config(app.state)
     try:
         embed = "huggingface:" + app.state.context.embedding_model
         # IndexConfig key must be ``fields`` (plural). Using ``field`` is ignored and
@@ -1424,7 +1420,7 @@ async def _change_subscription_tier_for_user(
     validation as POST /set_pay_per_use). Same-tier requests are the caller's
     responsibility (``plan_subscribe_action`` routes them away first).
     """
-    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    billing_config = current_stripe_billing_config(request.app.state)
     if billing_config is None:
         raise HTTPException(
             detail="Billing is not configured; cannot change tier.", status_code=503
@@ -1598,7 +1594,7 @@ async def subscribe(
         tier.value if isinstance(tier, SubscriptionTier) else tier
     )
 
-    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    billing_config = current_stripe_billing_config(request.app.state)
     email = current_user.get("email")
     if billing_config is None:
         # Billing objects not provisioned yet — fall back to the legacy payment link.
@@ -1883,7 +1879,7 @@ async def manage_subscription(
     switching stays on POST /subscribe because the portal cannot switch plans
     that contain metered prices.
     """
-    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    billing_config = current_stripe_billing_config(request.app.state)
     if billing_config is None:
         return {
             "url": request.app.state.context.stripe_manage_subscription_url,
@@ -2364,7 +2360,7 @@ async def verify_subscription_status(
                 *(
                     fetch_stripe_period_usage(
                         getattr(request.app.state, "stripe", None),
-                        getattr(request.app.state, "stripe_billing_config", None),
+                        current_stripe_billing_config(request.app.state),
                         meter,
                         resolve_stripe_customer_id(current_user),
                         period_start,

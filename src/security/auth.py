@@ -415,6 +415,7 @@ async def ensure_initial_subscription_after_verification(
     writing the marker, so the next cache-miss request retries. Anonymous
     users never reach this function (no email verification for them).
     """
+    from src.anubis.utils.billing.config import current_stripe_billing_config
     from src.anubis.utils.billing.gating import resolve_stripe_customer_id
     from src.anubis.utils.billing.subscription_lifecycle import (
         clear_pending_cancellation,
@@ -426,7 +427,7 @@ async def ensure_initial_subscription_after_verification(
     if app_metadata.get("initial_subscription_provisioned"):
         return
 
-    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    billing_config = current_stripe_billing_config(request.app.state)
     if billing_config is None:
         # Billing objects not provisioned (degraded mode) — retry on a later
         # request once configuration exists; do not write the marker.

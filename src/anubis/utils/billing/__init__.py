@@ -11,6 +11,9 @@ enforce per-tier capability and allotment gating.
 from src.anubis.utils.billing.config import (
     StripeBillingConfig,
     TierStripeIdentifiers,
+    billing_config_source_conflict,
+    current_stripe_billing_config,
+    initialize_stripe_billing_config,
     load_stripe_billing_config,
     resolve_stripe_billing_config_json,
 )
@@ -130,6 +133,9 @@ __all__ = [
     "tier_allotment_for_meter",
     "StripeBillingConfig",
     "TierStripeIdentifiers",
+    "billing_config_source_conflict",
+    "current_stripe_billing_config",
+    "initialize_stripe_billing_config",
     "load_stripe_billing_config",
     "resolve_stripe_billing_config_json",
     "is_anonymous_user",

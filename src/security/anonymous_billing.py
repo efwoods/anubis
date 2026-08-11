@@ -39,6 +39,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from src.anubis.utils.billing.config import current_stripe_billing_config
 from src.anubis.utils.billing.metering import (
     fetch_anonymous_stripe_customer_id,
     persist_anonymous_stripe_customer_id,
@@ -249,7 +250,7 @@ async def resolve_or_create_anonymous_billing_record(
             )
             _warned_anonymous_billing_disabled = True
         return None
-    billing_config = getattr(request.app.state, "stripe_billing_config", None)
+    billing_config = current_stripe_billing_config(request.app.state)
     stripe_client = getattr(request.app.state, "stripe", None)
     if billing_config is None or stripe_client is None:
         if not _warned_anonymous_billing_config_missing:

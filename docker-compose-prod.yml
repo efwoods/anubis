@@ -80,14 +80,18 @@ services:
     # the neural_nexus_tier/product_role/meter metadata triple, prices by lookup_key,
     # so a re-run reports "exists" for everything and emits identical JSON.
     #
-    # --allow-live is REQUIRED here and is the whole difference from the dev variant:
-    # the script refuses an sk_live_ key without it. Consequence worth knowing — every
+    # --live is the whole difference from the dev variant: it points the script at
+    # .env (sk_live_) instead of .env.dev (sk_test_), and the script refuses a key
+    # that does not match the file it came from. Consequence worth knowing — every
     # `docker compose -f docker-compose-prod.yml up` performs writes against the LIVE
     # Stripe account. That is safe by idempotency, not by omission.
     #
-    # Bump PRICE_LOOKUP_KEY_VERSION in the script after changing any amount or
-    # allotment in tiers.py; Stripe prices are immutable once used, so a fresh set
-    # has to be minted and the old ones archived by hand.
+    # Changing a price: edit the amount or allotment in tiers.py and re-run. Stripe
+    # prices are immutable, so the script compares the live price against tiers.py
+    # and, on a change, creates the replacement carrying the same lookup key and
+    # archives the old one, then migrates live subscriptions onto it with no
+    # proration. Do NOT bump PRICE_LOOKUP_KEY_VERSION to change a price — that
+    # renames every lookup key and re-tags every product.
     stripe-provision:
         image: evdev3/anubis-langgraph-api:latest
         pull_policy: never
@@ -99,7 +103,7 @@ services:
             PYTHONPATH: /deps/anubis
         working_dir: /deps/anubis
         entrypoint:
-            ["python", "scripts/provision_stripe_billing.py", "--allow-live"]
+            ["python", "scripts/provision_stripe_billing.py", "--live"]
         # One-shot: run once and exit; never restart.
         restart: "no"
         volumes:

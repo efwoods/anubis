@@ -2407,47 +2407,121 @@ async def verify_subscription_status(
     }
 
 
-async def _demote_other_personal_avatars(
-    client: Any, user_id: str, keep_assistant_id: Optional[str]
-) -> None:
-    """Enforce "at most one personal avatar per user" by demoting the rest.
+# The "at most one personal avatar per user" enforcement lives in
+# src/anubis/utils/personal_avatar.py so that /create_avatar, /modify_avatar, and
+# post-verification auto-provisioning all enforce the invariant identically.
+from src.anubis.utils.personal_avatar import (  # noqa: E402
+    demote_other_personal_avatars as _demote_other_personal_avatars,
+)
 
-    A user may flag exactly one avatar as their ``PERSONAL_AVATAR_OF_THE_CREATOR``
-    (the only avatar that can reach their desktop MCP server and future personal
-    analytics). When a new avatar is flagged, any *other* avatar of the same user
-    that still holds the flag is cleared, so the newest choice wins without an
-    error. ``keep_assistant_id`` is the avatar just flagged (never demoted).
+
+@app.get("/personal_avatar")
+async def get_personal_avatar(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the caller's one personal avatar plus the capabilities exclusive to it.
+
+    Every signed-up user always has exactly one personal avatar, so a missing
+    avatar is a provisioning gap this route closes silently rather than an error
+    reported back to the owner: resolution provisions one when none is found.
+
+    Each capability reports a live status where the capability has landed and
+    ``not_configured`` where the connection has not been made yet, so the owner
+    can see the full set of what the personal avatar is for.
     """
-    try:
-        owned_avatars = await client.assistants.search(
-            metadata={"user_id": user_id}, limit=1000
-        )
-    except Exception:
-        logger.warning(
-            "Could not enumerate avatars to demote prior personal avatar for user %s",
-            user_id,
-            exc_info=True,
-        )
-        return
+    from src.anubis.utils.personal_avatar import (
+        PERSONAL_AVATAR_CAPABILITIES,
+        resolve_personal_avatar,
+    )
 
-    for avatar in owned_avatars or []:
-        avatar_id = avatar.get("assistant_id")
-        metadata = avatar.get("metadata") or {}
-        if avatar_id == keep_assistant_id:
-            continue
-        if metadata.get("is_personal_avatar_of_creator") is True:
-            try:
-                await client.assistants.update(
-                    assistant_id=avatar_id,
-                    metadata={"is_personal_avatar_of_creator": False},
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to demote prior personal avatar %s for user %s",
-                    avatar_id,
-                    user_id,
-                    exc_info=True,
-                )
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+
+    try:
+        personal_avatar = await resolve_personal_avatar(
+            client, request, current_user, token
+        )
+    except Exception as resolution_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error resolving the personal avatar: {resolution_error}",
+        )
+
+    if personal_avatar is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The personal avatar could not be provisioned. Retry shortly; "
+                "provisioning is retried on every request until it succeeds."
+            ),
+        )
+
+    capability_statuses = await _resolve_personal_avatar_capability_statuses(
+        client, user_id, personal_avatar
+    )
+
+    return JSONResponse(
+        content={
+            "personal_avatar": personal_avatar,
+            "capabilities": [
+                {
+                    "name": capability.name,
+                    "summary": capability.summary,
+                    "status": capability_statuses.get(
+                        capability.status_key, "not_configured"
+                    ),
+                }
+                for capability in PERSONAL_AVATAR_CAPABILITIES
+            ],
+        },
+        status_code=200,
+    )
+
+
+async def _resolve_personal_avatar_capability_statuses(
+    client: Any, user_id: str, personal_avatar: dict
+) -> dict[str, Any]:
+    """Collect the live status of each personal-avatar capability.
+
+    Capabilities that have not been built yet are simply absent from the returned
+    mapping, and the caller renders those as ``not_configured``. Every lookup is
+    best-effort: a capability whose backing store is unreachable must not fail the
+    whole listing.
+    """
+    from src.anubis.utils.tools.data_analysis.backend import mcp_connection_namespace
+    from src.anubis.utils.tools.data_analysis.discovery import CONNECTION_KEY
+
+    statuses: dict[str, Any] = {}
+
+    try:
+        connection_item = await client.store.get_item(
+            list(mcp_connection_namespace(user_id)), key=CONNECTION_KEY
+        )
+        connection = (connection_item or {}).get("value") or {}
+        if connection.get("status") == "connected":
+            statuses["connected_data_servers"] = [
+                {
+                    "server_name": connection.get("server_name"),
+                    "bound_to_this_avatar": (
+                        connection.get("assistant_id")
+                        == personal_avatar.get("assistant_id")
+                    ),
+                    "connected_at": connection.get("connected_at"),
+                }
+            ]
+    except Exception:
+        # A missing item surfaces as an error from the HTTP store client, which
+        # simply means no data server is connected.
+        logger.debug(
+            "No Model Context Protocol connection found for user %s", user_id
+        )
+
+    # The personal avatar's adapter is trained from the owner's messages across
+    # every avatar; no connection step gates that, so it is always active.
+    statuses["adapter_training"] = "active"
+    return statuses
 
 
 @app.post("/create_avatar")

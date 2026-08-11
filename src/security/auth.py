@@ -1089,6 +1089,36 @@ async def get_user_with_api_key(
         _api_key_cache[cache_key] = user
 
     user.update({"API_KEY": api_key})
+
+    # Guarantee the verified account owns exactly one personal avatar.
+    #
+    # This runs AFTER the cache write above, and that ordering is required, not
+    # incidental. Provisioning creates a LangGraph assistant through the software
+    # development kit, which is an HTTP call back into this very API; the
+    # LangGraph server authenticates that call through the ``authenticate``
+    # handler below, which calls THIS function again with the same key. Were
+    # provisioning invoked before the cache write, the nested call would miss the
+    # cache and re-enter provisioning without bound. With the entry already
+    # cached, the nested authentication returns from cache and performs no side
+    # effects. (``ensure_initial_subscription_after_verification`` above needs no
+    # such care: that function only reaches Stripe and Auth0, never back into
+    # this API.) ``ensure_personal_avatar_for_user`` additionally holds a
+    # re-entrancy guard for the case where the cache entry is evicted mid-flight.
+    #
+    # Non-fatal and idempotent, like the subscription enrollment: the marker is
+    # written only on success, so a failure simply retries on the next cache miss
+    # and never costs the caller their authentication.
+    try:
+        from src.anubis.utils.personal_avatar import ensure_personal_avatar_for_user
+
+        await ensure_personal_avatar_for_user(request, user, api_key)
+    except Exception as provisioning_error:  # noqa: BLE001 - non-fatal
+        logger.error(
+            "Personal avatar provisioning failed for %s: %s",
+            user.get("user_id"),
+            provisioning_error,
+        )
+
     return user
 
 
@@ -1719,6 +1749,13 @@ async def login(body: LoginRequest, request: Request):
     and never signs in again stays unenrolled until its next sign-in, because
     the portal session outlives verification and the portal has no other way to
     reach this API as that user.
+
+    Personal avatar provisioning is deliberately NOT performed here. Creating an
+    avatar requires the LangGraph software development kit authenticated as the
+    user, which needs the account's API key; this route only ever holds the email
+    and password, and Auth0 stores only the key's hash. Provisioning therefore
+    happens on the API-key path in ``get_user_with_api_key``, which every account
+    reaches on its first API request after verification.
     """
     response = await login_user(body.email, body.password, request=request)
     # httpx does not raise on 4xx, so an invalid credential comes back as a

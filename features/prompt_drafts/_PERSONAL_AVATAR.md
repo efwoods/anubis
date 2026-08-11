@@ -17,6 +17,25 @@ connect gmail account to schedule meetings, check availability: https://docs.lan
 
 # Personal Avatar Query the following business metrics to answer questions about businesses (add database connections, business affiliated websites, etc)
 
+
+IMAP read email and schedule: -- Reply above this line --
+
+Hi Evan,
+
+You have a new message from Takahisa_ Toda!
+
+Takahisa_ says,
+
+    I am sorry, Evan. There will be an event at 11:00 AM today. If you schedule another time, i will be very appreciate. Takahisa.
+
+11:42 AM on August 11, 2026
+
+
+View conversation
+You can also reply directly to this email to send Takahisa_ a message.
+For your convenience, this email contains links that automatically log you into your account. So please don't share this email with anyone!
+
+
 Should be able to add urls and databases to query for analytics such as state of affairs and future projections
 
 ## Vectorstore
@@ -43,3 +62,22 @@ https://secure.bankofamerica.com/myaccounts/signin/signIn.go?returnSiteIndicator
 # Personal Avatar Query the following business metrics to answer questions about personal health (add database connections, personal affiliated websites, etc)
 
 Bank of America
+
+
+
+https://developers.google.com/workspace/drive/api/reference/rest/v3/files
+
+
+
+
+----
+
+This will 
+display reports
+
+----
+Planned:
+connect social media accounts for the user
+create the personal avatar after verifying email on signup
+imap
+scheduling

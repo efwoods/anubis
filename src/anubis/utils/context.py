@@ -691,6 +691,28 @@ class GlobalContext:
         },
     )
 
+    unrestricted_anonymous_messaging_avatar_identifiers: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Comma-separated avatar (assistant) identifiers that anonymous "
+                "visitors may message without usage ENFORCEMENT — neither the 402 "
+                "exhausted-allotment refusal nor the 429 token rate limit applies "
+                "to an anonymous request aimed at one of these avatars. Every such "
+                "turn is STILL metered to Stripe and to api_metrics, so the cost of "
+                "the demonstration stays visible; only the refusals are lifted. The "
+                "exemption is keyed on the avatar rather than on the requester "
+                "because a public demonstration avatar is messaged by visitors whose "
+                "hashed IP is not known in advance, and the exemption is limited to "
+                "anonymous requesters so an authenticated account can never obtain "
+                "unlimited free messaging by aiming at a listed avatar. Unlike "
+                "dev_metered_enforcement_bypass_identifiers this list is honored in "
+                "production, which is the point: leave EMPTY unless a listed avatar "
+                "is genuinely intended to answer unlimited anonymous traffic."
+            )
+        },
+    )
+
     anonymous_user_id: str = field(
         default=None,
         metadata={

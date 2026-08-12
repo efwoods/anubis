@@ -48,7 +48,20 @@ def _write_dev_system_prompt(system_message_str: str, runtime) -> None:
 
     if context.dev.upper() != "TRUE":
         return
-    _DEV_SYSTEM_PROMPT_PATH.write_text(system_message_str, encoding="utf-8")
+    try:
+        _DEV_SYSTEM_PROMPT_PATH.write_text(system_message_str, encoding="utf-8")
+    except OSError as write_error:
+        # This dump exists to be read by a developer; it is not part of
+        # answering the user. Letting it raise took down the whole turn — the
+        # run died mid-stream and the client saw a reply that simply stopped.
+        # A container writing through a bind mount hits this routinely: the
+        # file is owned by another user on the host, and the write is refused.
+        logger.warning(
+            "Could not write the dev system prompt to %s: %s",
+            _DEV_SYSTEM_PROMPT_PATH,
+            write_error,
+        )
+        return
     logger.info("dev system prompt written to: %s", _DEV_SYSTEM_PROMPT_PATH)
 
 

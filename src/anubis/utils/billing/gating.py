@@ -333,6 +333,47 @@ def is_dev_metered_enforcement_bypass(
     return metering_user_id.casefold() in bypass_identifiers
 
 
+def is_unrestricted_anonymous_messaging_avatar(
+    user: Mapping[str, Any] | None,
+    assistant_id: str | None,
+    configured_identifiers: str | Iterable[str] | None,
+) -> bool:
+    """Return whether this anonymous request may message ``assistant_id`` unenforced.
+
+    Backs ``GlobalContext.unrestricted_anonymous_messaging_avatar_identifiers``
+    (environment variable ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS``),
+    a list of avatar (assistant) identifiers set aside for public demonstration.
+    An anonymous visitor messaging one of those avatars skips ENFORCEMENT ONLY —
+    the HTTP 402 exhausted-allotment refusal and the HTTP 429 token rate limit —
+    while every turn is still metered to Stripe and to ``api_metrics``, so the
+    demonstration's cost stays visible in exactly the places real usage appears.
+
+    Two deliberate scoping decisions:
+
+    * The exemption is keyed on the AVATAR, not on the requester, because a
+      demonstration avatar answers visitors whose hashed IP cannot be enumerated
+      in advance — which is what
+      ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS`` requires.
+    * The exemption applies ONLY to anonymous requesters
+      (``is_anonymous_user``). An authenticated account that aimed at a listed
+      avatar would otherwise convert a demonstration avatar into unlimited free
+      messaging for a real, subscribable customer.
+
+    Unlike the development bypass this list is honored in production, since a
+    public demonstration only exists there; an empty list means nobody is exempt.
+    """
+    if not assistant_id:
+        return False
+    if not is_anonymous_user(user):
+        return False
+    unrestricted_avatar_identifiers = parse_metering_bypass_identifiers(
+        configured_identifiers
+    )
+    if not unrestricted_avatar_identifiers:
+        return False
+    return str(assistant_id).strip().casefold() in unrestricted_avatar_identifiers
+
+
 @dataclass(frozen=True)
 class MeteringBypass:
     """Which of the two halves of metering a requester skips.
@@ -354,38 +395,58 @@ class MeteringBypass:
     writes instead is what freezes reported usage while messaging continues,
     which is indistinguishable from the API and the portal having fallen out of
     sync.
+
+    ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS`` also skips
+    ENFORCEMENT ONLY, on the same terms, but is granted per demonstration avatar
+    to anonymous visitors rather than per tester identifier, and is honored in
+    production. ``unrestricted_anonymous_messaging_avatar`` records which of the
+    two enforcement-only paths granted the exemption, so a client can tell a
+    demonstration avatar's unlimited traffic apart from a developer's bypass.
     """
 
     skips_enforcement: bool = False
     skips_metering_writes: bool = False
+    unrestricted_anonymous_messaging_avatar: bool = False
 
     def usage_response_fields(self) -> dict[str, bool]:
         """Return the bypass flags to surface on usage payloads.
 
         Empty for an ordinary metered requester, so the flags appear only when
-        something really was bypassed. The two modes get distinct keys because a
+        something really was bypassed. The three modes get distinct keys because a
         client reading ``admin_metering_bypass`` must keep meaning "these tokens
-        were never recorded anywhere".
+        were never recorded anywhere", and because unlimited anonymous traffic to
+        a demonstration avatar is a standing production arrangement rather than a
+        tester's temporary exemption.
         """
         response_fields: dict[str, bool] = {}
         if self.skips_metering_writes:
             response_fields["admin_metering_bypass"] = True
+        elif self.unrestricted_anonymous_messaging_avatar:
+            response_fields["unrestricted_anonymous_messaging_avatar"] = True
         elif self.skips_enforcement:
             response_fields["admin_enforcement_bypass"] = True
         return response_fields
 
 
 def resolve_metering_bypass(
-    user: Mapping[str, Any] | None, context: Any | None = None
+    user: Mapping[str, Any] | None,
+    context: Any | None = None,
+    assistant_id: str | None = None,
 ) -> MeteringBypass:
     """Resolve how much of metering this requester skips.
 
-    One place reads the three configured inputs (``ADMIN_USER_ID``,
+    One place reads the four configured inputs (``ADMIN_USER_ID``,
     ``ADMIN_METERING_BYPASS_IDENTIFIERS``,
-    ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS``) so every enforcement site and
-    every metering-write site decides from the same answer. The full admin
-    bypass is checked first: an identifier listed on both lists gets the broader
-    treatment rather than a mode that depends on evaluation order.
+    ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS``,
+    ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS``) so every enforcement
+    site and every metering-write site decides from the same answer. The full
+    admin bypass is checked first: an identifier listed on both lists gets the
+    broader treatment rather than a mode that depends on evaluation order.
+
+    ``assistant_id`` is the avatar this request is aimed at, which only the
+    message paths know; omitting it simply leaves the per-avatar demonstration
+    exemption out of the answer, so a caller that has no avatar in hand (an
+    upload, a usage display) behaves exactly as before.
     """
     context = context or GlobalContext()
     if is_admin_metering_bypass(
@@ -400,6 +461,16 @@ def resolve_metering_bypass(
         context.dev,
     ):
         return MeteringBypass(skips_enforcement=True, skips_metering_writes=False)
+    if is_unrestricted_anonymous_messaging_avatar(
+        user,
+        assistant_id,
+        getattr(context, "unrestricted_anonymous_messaging_avatar_identifiers", None),
+    ):
+        return MeteringBypass(
+            skips_enforcement=True,
+            skips_metering_writes=False,
+            unrestricted_anonymous_messaging_avatar=True,
+        )
     return MeteringBypass()
 
 

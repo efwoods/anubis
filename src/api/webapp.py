@@ -285,6 +285,7 @@ async def enforce_remaining_allotment(
     current_user: dict,
     meter: UsageMeter,
     estimated_request_tokens: int = 0,
+    assistant_id: str | None = None,
 ) -> None:
     """Block a user of ANY tier whose ``meter`` allotment cannot cover this request.
 
@@ -302,9 +303,14 @@ async def enforce_remaining_allotment(
     identifier listed in ``ADMIN_METERING_BYPASS_IDENTIFIERS``, and (in
     development only) any identifier listed in
     ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS`` skip enforcement entirely;
-    only the first two also stop being metered.
+    only the first two also stop being metered. ``assistant_id`` is the avatar
+    the request is aimed at: an anonymous visitor messaging an avatar listed in
+    ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS`` also skips this
+    refusal while remaining fully metered.
     """
-    if resolve_metering_bypass(current_user).skips_enforcement:
+    if resolve_metering_bypass(
+        current_user, assistant_id=assistant_id
+    ).skips_enforcement:
         return
     tier = resolve_tier(current_user)
     allotment = tier_allotment_for_meter(tier, meter)
@@ -346,6 +352,7 @@ async def enforce_token_rate_limit(
     window_seconds: int,
     tokens_per_window: int,
     estimated_request_tokens: int = 0,
+    assistant_id: str | None = None,
 ) -> None:
     """Refuse the request with HTTP 429 when the user's token rate cap is met.
 
@@ -358,11 +365,17 @@ async def enforce_token_rate_limit(
     client when the oldest usage row ages out of the rolling window. A cap of
     zero or less disables the limit entirely; every requester that
     ``resolve_metering_bypass`` marks as skipping enforcement also skips the
-    limit.
+    limit — including an anonymous visitor messaging an avatar listed in
+    ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS``, which is why
+    ``assistant_id`` is passed through: an unlimited demonstration avatar that
+    still answered only until the rolling token cap was met would not be
+    unlimited.
     """
     if tokens_per_window <= 0 or window_seconds <= 0:
         return
-    if resolve_metering_bypass(current_user).skips_enforcement:
+    if resolve_metering_bypass(
+        current_user, assistant_id=assistant_id
+    ).skips_enforcement:
         return
     window_usage, oldest_usage_at = await fetch_rolling_window_usage(
         getattr(app_state, "pool", None),
@@ -617,7 +630,12 @@ async def _meter_message_usage(
 
         stripe_customer_id = resolve_stripe_customer_id(current_user)
         tier = resolve_tier(current_user)
-        metering_bypass = resolve_metering_bypass(current_user)
+        # The avatar is passed so an unrestricted demonstration turn is LABELLED
+        # as one on the usage payload. The bypass it resolves to skips no
+        # metering write, so both ledgers below run exactly as for any other turn.
+        metering_bypass = resolve_metering_bypass(
+            current_user, assistant_id=assistant_id
+        )
 
         # Adapter inference is billed against a separate meter at a different rate;
         # the think node sets is_adapter_inference when the client requested
@@ -2648,12 +2666,28 @@ async def share_avatar(
             status_code=404, detail=f"Could not load assistant: {lookup_error}"
         ) from lookup_error
 
-    creator_id = (assistant.get("metadata") or {}).get("user_id")
+    assistant_metadata = assistant.get("metadata") or {}
+    creator_id = assistant_metadata.get("user_id")
     is_admin = user_id == context.admin_user_id
     if not is_admin and (not creator_id or creator_id != user_id):
         raise HTTPException(
             status_code=403,
             detail="Only the creator of this avatar may share it.",
+        )
+
+    # Sharing is limited to the avatar that depicts its creator. That is the
+    # entire basis on which a user is entitled to publish an avatar: it is their
+    # own likeness. An avatar they invented, or assembled from someone else's
+    # material, carries no such entitlement and stays private.
+    if not is_admin and not assistant_metadata.get(
+        "is_personal_avatar_of_creator"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only your personal avatar — the one that depicts you — may be "
+                "shared publicly."
+            ),
         )
 
     try:
@@ -3805,11 +3839,18 @@ async def message_selected_avatar(
         file_text_content,
         multimodal_content,
     )
+    # ``assistant_id`` reaches enforcement so an avatar listed in
+    # UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS answers anonymous
+    # visitors without a 402/429 while staying metered. This endpoint requires
+    # an authenticated api key, so the exemption never actually fires here; it
+    # is passed for consistency with the by-id message endpoints, and because
+    # the exemption itself refuses to apply to a non-anonymous requester.
     await enforce_remaining_allotment(
         request.app.state,
         current_user,
         message_meter,
         estimated_request_tokens=estimated_request_tokens.input_tokens,
+        assistant_id=assistant_id,
     )
     message_rate_limit_context = GlobalContext()
     await enforce_token_rate_limit(
@@ -3824,6 +3865,7 @@ async def message_selected_avatar(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
         estimated_request_tokens=estimated_request_tokens.total_tokens,
+        assistant_id=assistant_id,
     )
 
     # Handle thread_id
@@ -4072,11 +4114,17 @@ async def message_avatar(
         file_text_content,
         multimodal_content,
     )
+    # This is the endpoint anonymous visitors message a public avatar through,
+    # so passing the path avatar into enforcement is what lets an avatar listed
+    # in UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS keep answering an
+    # anonymous visitor past the free-tier allotment and past the token rate
+    # cap. Both turns are still metered; only the refusals are lifted.
     await enforce_remaining_allotment(
         request.app.state,
         current_user,
         message_meter,
         estimated_request_tokens=estimated_request_tokens.input_tokens,
+        assistant_id=assistant_id,
     )
     message_rate_limit_context = GlobalContext()
     await enforce_token_rate_limit(
@@ -4091,6 +4139,7 @@ async def message_avatar(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
         estimated_request_tokens=estimated_request_tokens.total_tokens,
+        assistant_id=assistant_id,
     )
 
     # Handle thread_id
@@ -4304,11 +4353,17 @@ async def resume_avatar_message(
             message_rate_limit_context.message_expected_output_tokens_estimate or 0
         ),
     )
+    # The resumed continuation is aimed at the same avatar as the message that
+    # paused, so the demonstration-avatar exemption applies here too: an
+    # anonymous visitor whose turn interrupted for approval must be able to
+    # complete that turn, not be refused halfway through. ``assistant_id`` is
+    # trimmed the same way the lookup below trims the path parameter.
     await enforce_remaining_allotment(
         request.app.state,
         current_user,
         UsageMeter.MESSAGING_TOKENS,
         estimated_request_tokens=estimated_request_tokens.input_tokens,
+        assistant_id=assistant_id.strip(),
     )
     await enforce_token_rate_limit(
         request.app.state,
@@ -4322,6 +4377,7 @@ async def resume_avatar_message(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
         estimated_request_tokens=estimated_request_tokens.total_tokens,
+        assistant_id=assistant_id.strip(),
     )
 
     user_id = current_user["identities"][0]["user_id"]

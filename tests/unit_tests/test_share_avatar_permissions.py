@@ -36,6 +36,11 @@ class _AssistantsAPI:
         return {"assistant_id": assistant_id, "metadata": metadata}
 
 
+def _personal(user_id=CREATOR_ID, **extra):
+    """Metadata for the avatar that depicts its creator."""
+    return {"user_id": user_id, "is_personal_avatar_of_creator": True, **extra}
+
+
 def _install(monkeypatch, metadata):
     assistants_api = _AssistantsAPI(metadata)
     monkeypatch.setattr(
@@ -54,7 +59,7 @@ def _install(monkeypatch, metadata):
 
 @pytest.mark.asyncio
 async def test_the_creator_may_share_their_own_avatar(monkeypatch):
-    assistants_api = _install(monkeypatch, {"user_id": CREATOR_ID})
+    assistants_api = _install(monkeypatch, _personal())
 
     response = await webapp_module.share_avatar(
         assistant_id=ASSISTANT_ID,
@@ -68,7 +73,7 @@ async def test_the_creator_may_share_their_own_avatar(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_creator_may_withdraw_a_shared_avatar(monkeypatch):
-    assistants_api = _install(monkeypatch, {"user_id": CREATOR_ID, "is_public": True})
+    assistants_api = _install(monkeypatch, _personal(is_public=True))
 
     await webapp_module.share_avatar(
         assistant_id=ASSISTANT_ID,
@@ -81,7 +86,7 @@ async def test_the_creator_may_withdraw_a_shared_avatar(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_stranger_may_not_share_someone_elses_avatar(monkeypatch):
-    assistants_api = _install(monkeypatch, {"user_id": CREATOR_ID})
+    assistants_api = _install(monkeypatch, _personal())
 
     with pytest.raises(webapp_module.HTTPException) as rejection:
         await webapp_module.share_avatar(
@@ -112,7 +117,7 @@ async def test_an_avatar_with_no_recorded_creator_is_not_shareable(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_admin_may_still_share_any_avatar(monkeypatch):
-    assistants_api = _install(monkeypatch, {"user_id": CREATOR_ID})
+    assistants_api = _install(monkeypatch, _personal())
 
     response = await webapp_module.share_avatar(
         assistant_id=ASSISTANT_ID,
@@ -122,3 +127,23 @@ async def test_the_admin_may_still_share_any_avatar(monkeypatch):
 
     assert response.status_code == 200
     assert assistants_api.updates == [(ASSISTANT_ID, {"is_public": True})]
+
+
+@pytest.mark.asyncio
+async def test_an_avatar_that_is_not_your_likeness_may_not_be_shared(monkeypatch):
+    """A character you invented is not yours to publish — only your own face is."""
+    assistants_api = _install(
+        monkeypatch,
+        {"user_id": CREATOR_ID, "is_personal_avatar_of_creator": False},
+    )
+
+    with pytest.raises(webapp_module.HTTPException) as rejection:
+        await webapp_module.share_avatar(
+            assistant_id=ASSISTANT_ID,
+            is_public=True,
+            current_user=_current_user(CREATOR_ID),
+        )
+
+    assert rejection.value.status_code == 403
+    assert "personal avatar" in rejection.value.detail
+    assert assistants_api.updates == []

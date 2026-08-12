@@ -308,7 +308,7 @@ disconnecting removes both.
 other's registration and live connection intact.
 ----
 
-EMAIL INBOX
+# EMAIL INBOX (COMPLETELY SEPARATE FEATURE)
 # Stage 2 — Mailbox connection, email-triage graph, Agent Inbox
 
 ## Immediate deliverable (owner's direction, 2026-08-12)

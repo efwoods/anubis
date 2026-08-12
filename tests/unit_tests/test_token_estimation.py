@@ -43,6 +43,7 @@ from src.anubis.utils.billing.gating import (
     MeteringBypass,
     is_admin_metering_bypass,
     is_dev_metered_enforcement_bypass,
+    is_unrestricted_anonymous_messaging_avatar,
     parse_metering_bypass_identifiers,
     resolve_metering_bypass,
 )
@@ -748,7 +749,7 @@ def test_identifier_list_accepts_an_already_split_iterable():
 
 
 class _BypassContext:
-    """The four GlobalContext fields resolve_metering_bypass reads."""
+    """The five GlobalContext fields resolve_metering_bypass reads."""
 
     def __init__(
         self,
@@ -756,12 +757,16 @@ class _BypassContext:
         admin_user_id=None,
         admin_metering_bypass_identifiers=None,
         dev_metered_enforcement_bypass_identifiers=None,
+        unrestricted_anonymous_messaging_avatar_identifiers=None,
     ):
         self.dev = dev
         self.admin_user_id = admin_user_id
         self.admin_metering_bypass_identifiers = admin_metering_bypass_identifiers
         self.dev_metered_enforcement_bypass_identifiers = (
             dev_metered_enforcement_bypass_identifiers
+        )
+        self.unrestricted_anonymous_messaging_avatar_identifiers = (
+            unrestricted_anonymous_messaging_avatar_identifiers
         )
 
 
@@ -835,3 +840,117 @@ def test_ordinary_requester_is_enforced_and_metered():
         skips_enforcement=False, skips_metering_writes=False
     )
     assert bypass.usage_response_fields() == {}
+
+
+# ---------------------------------------------------------------------------
+# Unrestricted anonymous messaging of a demonstration avatar (still metered)
+# ---------------------------------------------------------------------------
+
+_DEMONSTRATION_AVATAR_ID = "47cfdaa2-1196-4519-9127-31cb13ff9d3a"
+_OTHER_AVATAR_ID = "0f2b6a51-8f4d-4c2e-9d10-6b7a5c3e21ff"
+
+
+def _demonstration_avatar_context(**overrides) -> _BypassContext:
+    """A context whose only exemption is the demonstration avatar list.
+
+    ``dev="FALSE"`` on purpose: this exemption must hold in PRODUCTION, unlike
+    ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS``, so every test below proves
+    the production behavior rather than a development-only one.
+    """
+    return _BypassContext(
+        dev="FALSE",
+        unrestricted_anonymous_messaging_avatar_identifiers=_DEMONSTRATION_AVATAR_ID,
+        **overrides,
+    )
+
+
+def test_anonymous_visitor_messaging_the_demonstration_avatar_is_unenforced():
+    # The point of the mode: an anonymous visitor keeps messaging this avatar
+    # past the free-tier allotment and past the token rate cap, while both
+    # ledgers still record every turn so the demonstration's cost stays visible.
+    bypass = resolve_metering_bypass(
+        _anonymous_user("some-visitors-hashed-ip"),
+        _demonstration_avatar_context(),
+        assistant_id=_DEMONSTRATION_AVATAR_ID,
+    )
+    assert bypass.skips_enforcement
+    assert not bypass.skips_metering_writes
+    assert bypass.usage_response_fields() == {
+        "unrestricted_anonymous_messaging_avatar": True
+    }
+
+
+def test_other_avatars_stay_enforced_for_the_same_visitor():
+    bypass = resolve_metering_bypass(
+        _anonymous_user("some-visitors-hashed-ip"),
+        _demonstration_avatar_context(),
+        assistant_id=_OTHER_AVATAR_ID,
+    )
+    assert bypass == MeteringBypass()
+    assert bypass.usage_response_fields() == {}
+
+
+def test_message_paths_without_an_avatar_stay_enforced():
+    # Uploads and usage displays call resolve_metering_bypass with no avatar in
+    # hand; leaving the argument out must not exempt anybody.
+    bypass = resolve_metering_bypass(
+        _anonymous_user("some-visitors-hashed-ip"), _demonstration_avatar_context()
+    )
+    assert bypass == MeteringBypass()
+
+
+def test_authenticated_account_never_rides_the_demonstration_avatar():
+    # Otherwise a real, subscribable customer could obtain unlimited free
+    # messaging simply by aiming at the demonstration avatar.
+    authenticated_user = {
+        "user_id": "auth0|a-real-account",
+        "email": "someone@example.com",
+        "app_metadata": {"subscription_status": {"tier": "free", "status": "active"}},
+    }
+    assert not is_unrestricted_anonymous_messaging_avatar(
+        authenticated_user, _DEMONSTRATION_AVATAR_ID, _DEMONSTRATION_AVATAR_ID
+    )
+    bypass = resolve_metering_bypass(
+        authenticated_user,
+        _demonstration_avatar_context(),
+        assistant_id=_DEMONSTRATION_AVATAR_ID,
+    )
+    assert bypass == MeteringBypass()
+
+
+def test_demonstration_avatar_matching_tolerates_whitespace_and_case():
+    assert is_unrestricted_anonymous_messaging_avatar(
+        _anonymous_user("some-visitors-hashed-ip"),
+        f"  {_DEMONSTRATION_AVATAR_ID.upper()} ",
+        f"{_OTHER_AVATAR_ID}, {_DEMONSTRATION_AVATAR_ID}",
+    )
+
+
+def test_empty_avatar_list_leaves_every_avatar_enforced():
+    for empty_configuration in (None, "", "  ", ",,", "\n"):
+        assert not is_unrestricted_anonymous_messaging_avatar(
+            _anonymous_user("some-visitors-hashed-ip"),
+            _DEMONSTRATION_AVATAR_ID,
+            empty_configuration,
+        )
+    # An absent avatar must not match an empty entry either.
+    assert not is_unrestricted_anonymous_messaging_avatar(
+        _anonymous_user("some-visitors-hashed-ip"), "", _DEMONSTRATION_AVATAR_ID
+    )
+    assert not is_unrestricted_anonymous_messaging_avatar(
+        _anonymous_user("some-visitors-hashed-ip"), None, _DEMONSTRATION_AVATAR_ID
+    )
+
+
+def test_full_admin_bypass_still_wins_over_the_demonstration_avatar():
+    # A listed tester messaging the demonstration avatar keeps the broader
+    # treatment, so testing traffic never enters either ledger.
+    bypass = resolve_metering_bypass(
+        _anonymous_user(_HASHED_IP_DEV_GATEWAY),
+        _demonstration_avatar_context(
+            admin_metering_bypass_identifiers=_BYPASS_IDENTIFIERS
+        ),
+        assistant_id=_DEMONSTRATION_AVATAR_ID,
+    )
+    assert bypass.skips_metering_writes
+    assert bypass.usage_response_fields() == {"admin_metering_bypass": True}

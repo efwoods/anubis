@@ -674,19 +674,21 @@ async def _build_consciousness_system_message_update(
     # Data-analysis capability guidance, mirroring the ``think`` node's tool
     # gates exactly so the prompt never advertises tools the deep agent was
     # not given:
-    # - connection bound to THIS avatar → full analysis guidance (the status
-    #   block deliberately carries NO server address or directory paths —
-    #   connection details must never surface in the conversation);
-    # - no connection but the conversing user OWNS this avatar → the small
+    # - one or more machines bound to THIS avatar → full analysis guidance plus
+    #   the roster of connected machine names (the status block deliberately
+    #   carries NO server address or directory paths — connection details must
+    #   never surface in the conversation, though machine NAMES may, because the
+    #   user chose those names);
+    # - no connected machine but the conversing user OWNS this avatar → the small
     #   connect-on-request section (the connect_data_server tool is attached);
     # - otherwise (visitor on a shared avatar, or bound elsewhere) → nothing.
     from src.anubis.utils.prompts.system_prompts import (
         DATA_ANALYSIS_CAPABILITY_PROMPT,
         DATA_SERVER_CONNECT_PROMPT,
     )
-    from src.anubis.utils.tools.data_analysis import bound_connection_for
+    from src.anubis.utils.tools.data_analysis import bound_connections_for
 
-    bound_mcp_connection = await bound_connection_for(
+    bound_mcp_connections = await bound_connections_for(
         runtime.store, user_id, assistant_id
     )
     assistant_metadata = (
@@ -701,13 +703,22 @@ async def _build_consciousness_system_message_update(
         and avatar_owner_id == user_id
         and assistant_metadata.get("is_personal_avatar_of_creator") is True
     )
-    if bound_mcp_connection is not None and is_personal_avatar:
+    if bound_mcp_connections and is_personal_avatar:
         system_message_str = system_message_str + DATA_ANALYSIS_CAPABILITY_PROMPT
+        # Naming the connected machines in the prompt lets the avatar answer
+        # "which of my machines can you see?" without spending a tool call, and
+        # keeps the model from inventing a machine name that is not connected.
+        connected_machine_names = ", ".join(
+            connection.device_label for connection in bound_mcp_connections
+        )
         system_message_str += (
             "\n<MCP_CONNECTION_STATUS>\n"
-            "The Neural Nexus MCP data server is connected for this avatar — "
-            "confirm this plainly when asked. Never reveal the server's "
-            "address, transport, or host directory paths in a reply.\n"
+            "The Neural Nexus MCP data server is connected for this avatar on "
+            f"the following machines: {connected_machine_names}. "
+            "Confirm this plainly when asked, naming the machines. Never reveal "
+            "any machine's address, port, transport, or host directory paths in "
+            "a reply — the machine names above are the only connection detail "
+            "that may appear in a reply.\n"
             "</MCP_CONNECTION_STATUS>\n"
         )
     elif is_personal_avatar:

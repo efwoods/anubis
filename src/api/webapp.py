@@ -133,6 +133,7 @@ from src.api.media_jobs import (
 )
 from src.security.auth import (
     _tier_from_subscription,
+    bearer_credentials_from_request,
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
@@ -1303,8 +1304,14 @@ async def metrics_middleware(request: Request, call_next):
     try:
         if _is_auth_catch_all_target(method=request.method, path=request.url.path):
             try:
+                # Called directly rather than through dependency injection, so
+                # BOTH credentials have to be handed over explicitly: an omitted
+                # argument would leave the parameter holding FastAPI's Depends
+                # sentinel instead of None.
                 await get_current_user(
-                    request=request, api_key=request.headers.get("API-KEY")
+                    request=request,
+                    api_key=request.headers.get("API-KEY"),
+                    bearer_credentials=bearer_credentials_from_request(request),
                 )
             except HTTPException as exc:
                 return JSONResponse(
@@ -2480,6 +2487,30 @@ async def get_personal_avatar(
     )
 
 
+async def _search_device_records(
+    client: Any, namespace: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    """List every device-keyed record in one store namespace, best effort.
+
+    The Model Context Protocol namespaces hold one record per connected machine,
+    keyed by ``device_id``. This wraps the SDK ``StoreClient`` search so the
+    daemon-facing endpoints (which authenticate as the user and therefore use the
+    HTTP store client rather than the in-process ``BaseStore``) can read the whole
+    device set in one call.
+
+    Returns an empty list when the namespace is empty or unreachable — every
+    caller treats "no devices" and "cannot tell" the same way, and a store hiccup
+    must never fail an endpoint whose real job is something else.
+    """
+    try:
+        response = await client.store.search_items(list(namespace), limit=100)
+    except Exception:
+        logger.debug("Could not search store namespace %s", namespace, exc_info=True)
+        return []
+    items = (response or {}).get("items") or []
+    return [item.get("value") or {} for item in items if isinstance(item, dict)]
+
+
 async def _resolve_personal_avatar_capability_statuses(
     client: Any, user_id: str, personal_avatar: dict
 ) -> dict[str, Any]:
@@ -2491,32 +2522,27 @@ async def _resolve_personal_avatar_capability_statuses(
     whole listing.
     """
     from src.anubis.utils.tools.data_analysis.backend import mcp_connection_namespace
-    from src.anubis.utils.tools.data_analysis.discovery import CONNECTION_KEY
 
     statuses: dict[str, Any] = {}
 
-    try:
-        connection_item = await client.store.get_item(
-            list(mcp_connection_namespace(user_id)), key=CONNECTION_KEY
-        )
-        connection = (connection_item or {}).get("value") or {}
-        if connection.get("status") == "connected":
-            statuses["connected_data_servers"] = [
-                {
-                    "server_name": connection.get("server_name"),
-                    "bound_to_this_avatar": (
-                        connection.get("assistant_id")
-                        == personal_avatar.get("assistant_id")
-                    ),
-                    "connected_at": connection.get("connected_at"),
-                }
-            ]
-    except Exception:
-        # A missing item surfaces as an error from the HTTP store client, which
-        # simply means no data server is connected.
-        logger.debug(
-            "No Model Context Protocol connection found for user %s", user_id
-        )
+    connections = await _search_device_records(
+        client, mcp_connection_namespace(user_id)
+    )
+    connected_data_servers = [
+        {
+            "server_name": connection.get("server_name"),
+            "device_label": connection.get("device_label"),
+            "platform": connection.get("platform"),
+            "bound_to_this_avatar": (
+                connection.get("assistant_id") == personal_avatar.get("assistant_id")
+            ),
+            "connected_at": connection.get("connected_at"),
+        }
+        for connection in connections
+        if connection.get("status") == "connected"
+    ]
+    if connected_data_servers:
+        statuses["connected_data_servers"] = connected_data_servers
 
     # The personal avatar's adapter is trained from the owner's messages across
     # every avatar; no connection step gates that, so it is always active.
@@ -2599,30 +2625,48 @@ async def share_avatar(
     is_public: bool = True,
     current_user: dict = Depends(get_current_user),
 ):
+    """List an avatar publicly, or withdraw it again.
+
+    A user may share an avatar they created, and nothing else. That is the same
+    rule /delete_avatar and /update_avatar_identity_with_media enforce, resolved
+    from the same ``metadata.user_id``, and it satisfies the product rule that a
+    person shares only their own likeness: the avatar someone made of themselves
+    is theirs to publish. The admin account may still share any avatar.
+
+    Sharing is reversible — ``is_public=false`` withdraws the avatar from
+    /list_public_avatars — so this grants no permanent exposure.
+    """
     context = app.state.context
     user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
 
-    if user_id == context.admin_user_id:
-        """verify users are creating avatars of their own likeness in the future"""
-        metadata = {"is_public": is_public}
+    try:
+        assistant = await client.assistants.get(assistant_id)
+    except Exception as lookup_error:
+        raise HTTPException(
+            status_code=404, detail=f"Could not load assistant: {lookup_error}"
+        ) from lookup_error
 
-    # Only admins may share avatars;
-    # Users will authenticate and share avatars in the near future.
-    if user_id == context.admin_user_id:
-        try:
-            token = current_user["API_KEY"]
-            client = get_client(headers={"API-KEY": f"{token}"})
-            result = await client.assistants.update(
-                assistant_id=assistant_id, metadata=metadata
-            )
-            return JSONResponse(result, status_code=200)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Error during update of sharing avatar: {e}"
-            )
-    raise HTTPException(
-        status_code=401, detail="Users may only share avatars of themselves."
-    )
+    creator_id = (assistant.get("metadata") or {}).get("user_id")
+    is_admin = user_id == context.admin_user_id
+    if not is_admin and (not creator_id or creator_id != user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the creator of this avatar may share it.",
+        )
+
+    try:
+        # LangGraph merges metadata by key, so this leaves user_id and the
+        # personal-avatar flag alone and changes only the sharing state.
+        result = await client.assistants.update(
+            assistant_id=assistant_id, metadata={"is_public": is_public}
+        )
+        return JSONResponse(result, status_code=200)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error during update of sharing avatar: {e}"
+        )
 
 
 # @app.post("/user_is_creator")
@@ -2733,35 +2777,147 @@ async def modify_avatar(
 
 @app.post("/disconnect_mcp")
 async def disconnect_mcp(
+    device_id: str | None = None,
     current_user: dict = Depends(get_current_user),
 ):
-    """Forget the user's saved MCP data-server connection (disconnect).
+    """Forget saved MCP data-server connections (disconnect).
 
-    Deletes the single per-user connection record. The next turn on any owned
-    avatar re-enters the discovery/consent flow, so the user can re-connect
-    (and re-bind the connection to whichever avatar they choose). There is no
-    enable/disable switch — removing the connection is the disconnect.
+    Deletes one machine's connection record when ``device_id`` is given, or every
+    machine's when it is omitted. There is no enable/disable switch — removing the
+    connection is the disconnect.
+
+    Note that the avatar re-adopts a reachable machine automatically on the next
+    turn. Suppressing that re-adoption is a per-avatar decision made in
+    conversation ("disconnect my phone"), which writes the suppression marker;
+    this endpoint is the account-level equivalent of unplugging, not a permanent
+    opt-out.
     """
     from src.anubis.utils.tools.data_analysis.backend import (
         mcp_connection_namespace,
     )
-    from src.anubis.utils.tools.data_analysis.discovery import CONNECTION_KEY
 
     user_id = current_user["identities"][0]["user_id"]
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
+    namespace = list(mcp_connection_namespace(user_id))
     try:
-        await client.store.delete_item(
-            list(mcp_connection_namespace(user_id)), key=CONNECTION_KEY
-        )
+        if device_id:
+            await client.store.delete_item(namespace, key=device_id)
+            removed = [device_id]
+        else:
+            records = await _search_device_records(
+                client, mcp_connection_namespace(user_id)
+            )
+            removed = []
+            for record in records:
+                record_device_id = record.get("device_id")
+                if not record_device_id:
+                    continue
+                await client.store.delete_item(namespace, key=record_device_id)
+                removed.append(record_device_id)
         return JSONResponse(
-            content={"disconnected": True, "user_id": user_id}, status_code=200
+            content={
+                "disconnected": True,
+                "user_id": user_id,
+                "disconnected_device_ids": removed,
+            },
+            status_code=200,
         )
     except Exception as disconnect_error:
         raise HTTPException(
             status_code=500,
             detail=f"Error disconnecting MCP server: {disconnect_error}",
         )
+
+
+@app.get("/list_mcp_connections")
+async def list_mcp_connections(
+    current_user: dict = Depends(get_current_user),
+):
+    """List every machine the user has registered, with live presence.
+
+    Registrations and connections are separate records: a machine that is running
+    the daemon appears as a registration, and gains a connection once the avatar
+    adopts the machine. Both are merged here so one call answers "what do I have
+    connected, and is each machine up right now?".
+
+    Presence comes from the in-process relay registry rather than from the stored
+    heartbeat, because the live socket is the authoritative signal for relay-mode
+    machines. Host directory paths are deliberately omitted.
+    """
+    from src.anubis.utils.tools.data_analysis import relay as relay_registry
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_connection_namespace,
+        mcp_registration_namespace,
+    )
+
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+
+    registrations = await _search_device_records(
+        client, mcp_registration_namespace(user_id)
+    )
+    connections = await _search_device_records(
+        client, mcp_connection_namespace(user_id)
+    )
+    connection_by_device = {
+        record.get("device_id"): record
+        for record in connections
+        if record.get("device_id")
+    }
+
+    devices: list[dict[str, Any]] = []
+    seen_device_ids: set[str] = set()
+    for registration in registrations:
+        registration_device_id = registration.get("device_id")
+        if not registration_device_id:
+            continue
+        seen_device_ids.add(registration_device_id)
+        connection = connection_by_device.get(registration_device_id) or {}
+        devices.append(
+            {
+                "device_id": registration_device_id,
+                "device_label": registration.get("device_label")
+                or connection.get("device_label"),
+                "platform": registration.get("platform") or connection.get("platform"),
+                "server_name": registration.get("server_name"),
+                "connection_mode": registration.get("connection_mode"),
+                "online": relay_registry.is_online(registration_device_id),
+                "last_seen_at": registration.get("last_seen_at"),
+                "connected": connection.get("status") == "connected",
+                "bound_assistant_id": connection.get("assistant_id"),
+                "connected_at": connection.get("connected_at"),
+            }
+        )
+
+    # A connection whose registration record is gone (the daemon unregistered on
+    # shutdown but the avatar keeps the adopted connection) still belongs in the
+    # listing, otherwise a user sees a machine vanish while the avatar still
+    # holds tools for the machine.
+    for device_identifier, connection in connection_by_device.items():
+        if device_identifier in seen_device_ids:
+            continue
+        devices.append(
+            {
+                "device_id": device_identifier,
+                "device_label": connection.get("device_label"),
+                "platform": connection.get("platform"),
+                "server_name": connection.get("server_name"),
+                "connection_mode": None,
+                "online": relay_registry.is_online(device_identifier),
+                "last_seen_at": None,
+                "connected": connection.get("status") == "connected",
+                "bound_assistant_id": connection.get("assistant_id"),
+                "connected_at": connection.get("connected_at"),
+            }
+        )
+
+    devices.sort(key=lambda device: str(device.get("device_label") or ""))
+    return JSONResponse(
+        content={"user_id": user_id, "device_count": len(devices), "devices": devices},
+        status_code=200,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2788,10 +2944,11 @@ async def mcp_relay(websocket: WebSocket):
     daemon's first ``register`` frame (device id + secret + announced server
     metadata), records the live session in the in-process relay registry, then
     forwards every subsequent ``proxy_response`` frame to the awaiting
-    ``proxy_request`` call. The registry is what the graph's ``mcp_discovery``
+    ``proxy_request`` call. The registry is what the graph's ``mcp_auto_adopt``
     node and the ``/mcp/relay/{device_id}`` bridge read to reach this device.
     """
     from src.anubis.utils.tools.data_analysis import relay as relay_registry
+    from src.anubis.utils.tools.data_analysis.devices import derive_device_identity
 
     api_key = websocket.headers.get("API-KEY")
     if not api_key:
@@ -2823,6 +2980,11 @@ async def mcp_relay(websocket: WebSocket):
             await websocket.close(code=1008)
             return
 
+        # Older daemons announce no device label; derive one from the announced
+        # server name so every machine is nameable in conversation whether or not
+        # the daemon on that machine has been updated.
+        device_label, platform = derive_device_identity(register_message)
+
         relay_registry.register_session(
             device_id=device_id,
             user_id=user_id,
@@ -2830,6 +2992,8 @@ async def mcp_relay(websocket: WebSocket):
             server_name=register_message.get("server_name") or "Ubuntu-OS-Filesystem",
             allowed_roots=tuple(register_message.get("allowed_roots") or []),
             websocket=websocket,
+            device_label=device_label,
+            platform=platform,
         )
         await websocket.send_text(
             json.dumps(
@@ -2947,17 +3111,21 @@ async def mcp_register(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Record a local MCP daemon's pushed presence for the authenticated user.
+    """Record one local MCP daemon's pushed presence for the authenticated user.
 
-    Stores a single per-user ``pending_consent`` registration; the next turn on
-    the user's personal avatar reads it (``mcp_discovery``) and offers the
-    connection. This does not itself connect anything — user consent produces
-    the separate, avatar-bound ``mcp_connection`` record.
+    Stores a registration record keyed by ``device_id``, so a user who runs the
+    daemon on several machines accumulates one record per machine rather than
+    each machine overwriting the last. The next turn on the user's personal
+    avatar reads every record (``mcp_auto_adopt``) and binds the machines that
+    are reachable and not explicitly suppressed.
     """
     from src.anubis.utils.tools.data_analysis.backend import (
         mcp_registration_namespace,
     )
-    from src.anubis.utils.tools.data_analysis.discovery import REGISTRATION_KEY
+    from src.anubis.utils.tools.data_analysis.devices import (
+        deduplicate_label,
+        derive_device_identity,
+    )
 
     body = await request.json()
     user_id = current_user["identities"][0]["user_id"]
@@ -2966,13 +3134,44 @@ async def mcp_register(
 
     connection_mode = body.get("connection_mode") or "relay"
     device_id = body.get("device_id")
+    if not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A device_id is required to register a Model Context Protocol "
+                "server; the registration record is keyed by the device."
+            ),
+        )
     # In relay mode the daemon's announced mcp_url may point at a different
     # host (e.g. production) than the API instance that accepted the register
-    # call. Always rewrite to this request's own relay bridge so consent and
+    # call. Always rewrite to this request's own relay bridge so adoption and
     # tool calls stay on the same process that holds the WebSocket.
     mcp_url = body.get("mcp_url")
-    if connection_mode == "relay" and device_id:
+    if connection_mode == "relay":
         mcp_url = f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
+
+    existing_records = await _search_device_records(
+        client, mcp_registration_namespace(user_id)
+    )
+    # The cap counts only OTHER devices, so a machine that is already registered
+    # can always re-register (every daemon restart does) even at the limit.
+    other_device_count = sum(
+        1 for record in existing_records if record.get("device_id") != device_id
+    )
+    max_devices = int(app.state.context.data_analysis_max_devices_per_user)
+    if other_device_count >= max_devices:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This account already has {other_device_count} registered "
+                f"Model Context Protocol devices, which is the configured "
+                f"maximum of {max_devices}. Disconnect a device before "
+                f"registering another."
+            ),
+        )
+
+    derived_label, platform = derive_device_identity(body)
+    device_label = deduplicate_label(derived_label, existing_records, device_id)
 
     record = {
         "status": "pending_consent",
@@ -2982,6 +3181,8 @@ async def mcp_register(
         # ``mcp_url`` points at this API's own ``/mcp/relay/<device_id>`` bridge.
         "transport": "streamable_http",
         "device_id": device_id,
+        "device_label": device_label,
+        "platform": platform,
         "device_secret": body.get("device_secret"),
         "mcp_url": mcp_url,
         "discovery_url": body.get("discovery_url"),
@@ -2991,11 +3192,16 @@ async def mcp_register(
     try:
         await client.store.put_item(
             list(mcp_registration_namespace(user_id)),
-            key=REGISTRATION_KEY,
+            key=device_id,
             value=record,
         )
         return JSONResponse(
-            content={"registered": True, "device_id": record["device_id"]},
+            content={
+                "registered": True,
+                "device_id": device_id,
+                "device_label": device_label,
+                "platform": platform,
+            },
             status_code=200,
         )
     except Exception as register_error:
@@ -3010,18 +3216,24 @@ async def mcp_heartbeat(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Refresh a registration's presence fields so it keeps counting as online.
+    """Refresh one device's registration so the device keeps counting as online.
 
-    Heartbeats also sync ``device_id`` / ``mcp_url`` / ``connection_mode`` /
-    ``device_secret`` from the daemon body. Without that, a new local daemon
-    (different device id) can keep an older registration's ``last_seen_at``
-    fresh while the live relay socket belongs to a different device — leaving
-    ``resolve_available_connection`` unable to see the online session.
+    The record is looked up by the body's ``device_id``, so each machine
+    heartbeats its own record. Before records were device-keyed, a second machine
+    kept the first machine's ``last_seen_at`` fresh, which made an offline
+    machine look reachable and hid the machine that really was online.
+
+    Heartbeats also sync ``connection_mode`` / ``device_secret`` / ``mcp_url``
+    and re-derive the device label, so a daemon that gains an explicit label in a
+    later release adopts the label without needing to re-register.
     """
     from src.anubis.utils.tools.data_analysis.backend import (
         mcp_registration_namespace,
     )
-    from src.anubis.utils.tools.data_analysis.discovery import REGISTRATION_KEY
+    from src.anubis.utils.tools.data_analysis.devices import (
+        deduplicate_label,
+        derive_device_identity,
+    )
 
     user_id = current_user["identities"][0]["user_id"]
     token = current_user["API_KEY"]
@@ -3034,9 +3246,16 @@ async def mcp_heartbeat(
     if not isinstance(body, dict):
         body = {}
 
+    device_id = body.get("device_id")
+    if not device_id:
+        # A heartbeat that does not say which machine it came from cannot be
+        # applied to any record without guessing, and guessing is exactly what
+        # let one machine refresh another machine's presence.
+        return JSONResponse(content={"acknowledged": False}, status_code=200)
+
     namespace = list(mcp_registration_namespace(user_id))
     try:
-        existing = await client.store.get_item(namespace, key=REGISTRATION_KEY)
+        existing = await client.store.get_item(namespace, key=device_id)
     except Exception:
         # A missing item surfaces as an error from the HTTP store client; a
         # heartbeat before/without a registration is simply a no-op.
@@ -3049,21 +3268,47 @@ async def mcp_heartbeat(
 
     try:
         record["last_seen_at"] = datetime.now(timezone.utc).isoformat()
-        if body.get("device_id"):
-            record["device_id"] = body["device_id"]
+        record["device_id"] = device_id
         if body.get("connection_mode"):
             record["connection_mode"] = body["connection_mode"]
         if body.get("device_secret"):
             record["device_secret"] = body["device_secret"]
+        if body.get("server_name"):
+            record["server_name"] = body["server_name"]
+
+        # Re-derive identity from the heartbeat body, falling back to whatever
+        # the record already holds, so an updated daemon can start supplying an
+        # explicit label mid-session.
+        derived_label, platform = derive_device_identity(
+            {
+                "device_label": body.get("device_label"),
+                "platform": body.get("platform") or record.get("platform"),
+                "server_name": body.get("server_name") or record.get("server_name"),
+            }
+        )
+        if body.get("device_label"):
+            other_records = [
+                other
+                for other in await _search_device_records(
+                    client, mcp_registration_namespace(user_id)
+                )
+                if other.get("device_id") != device_id
+            ]
+            record["device_label"] = deduplicate_label(
+                derived_label, other_records, device_id
+            )
+        else:
+            record["device_label"] = record.get("device_label") or derived_label
+        record["platform"] = platform
+
         connection_mode = record.get("connection_mode") or "relay"
-        device_id = record.get("device_id")
-        if connection_mode == "relay" and device_id:
+        if connection_mode == "relay":
             record["mcp_url"] = (
                 f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
             )
         elif body.get("mcp_url"):
             record["mcp_url"] = body["mcp_url"]
-        await client.store.put_item(namespace, key=REGISTRATION_KEY, value=record)
+        await client.store.put_item(namespace, key=device_id, value=record)
         return JSONResponse(content={"acknowledged": True}, status_code=200)
     except Exception as heartbeat_error:
         raise HTTPException(
@@ -3077,24 +3322,51 @@ async def mcp_unregister(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Delete the user's pending registration (daemon shutdown).
+    """Delete ONE device's registration record (that daemon is shutting down).
 
-    Distinct from ``/disconnect_mcp``, which forgets the *consented*, avatar-bound
+    Distinct from ``/disconnect_mcp``, which forgets the *adopted*, avatar-bound
     connection; unregister only removes the presence record.
+
+    The ``device_id`` is REQUIRED, and only that device's record is deleted. This
+    is the fix for a recorded production incident: while every machine shared one
+    registration record under a constant key, stopping a development daemon
+    deleted production's registration, because both daemons wrote and deleted the
+    same key in a shared store. Deleting every record when no device is named
+    would reproduce exactly that failure, so a body without a ``device_id`` is
+    rejected rather than treated as "all".
     """
     from src.anubis.utils.tools.data_analysis.backend import (
         mcp_registration_namespace,
     )
-    from src.anubis.utils.tools.data_analysis.discovery import REGISTRATION_KEY
 
     user_id = current_user["identities"][0]["user_id"]
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
     try:
-        await client.store.delete_item(
-            list(mcp_registration_namespace(user_id)), key=REGISTRATION_KEY
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    device_id = body.get("device_id")
+    if not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A device_id is required to unregister a Model Context Protocol "
+                "server, so that one machine's shutdown never removes another "
+                "machine's registration."
+            ),
         )
-        return JSONResponse(content={"unregistered": True}, status_code=200)
+
+    try:
+        await client.store.delete_item(
+            list(mcp_registration_namespace(user_id)), key=device_id
+        )
+        return JSONResponse(
+            content={"unregistered": True, "device_id": device_id}, status_code=200
+        )
     except Exception as unregister_error:
         raise HTTPException(
             status_code=500,
@@ -3476,7 +3748,7 @@ async def message_selected_avatar(
     # data-collection / preference-learning pipeline is intentionally deferred
     # while the upload + evaluation pipeline ships first; the parameters exist
     # now so the frontend can wire its UI without a breaking API change later.
-    langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
     # allow for select avatar in query and anonymous user for a dedicated endpoint
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -3719,7 +3991,7 @@ async def message_avatar(
         # branch depends on the dependency-populated ``assistant_config``
         # (always present once an avatar resolved); start from an empty
         # configurable that the api-key branch fills in.
-        if request.headers.get("api-key", "") != "":
+        if not is_anonymous_user(current_user):
             config = {"configurable": {}}
         else:
             raise HTTPException(
@@ -3749,8 +4021,8 @@ async def message_avatar(
     user_description = your_description
     user_id = current_user["identities"][0]["user_id"]
     assistant_id = assistant_id.strip()
-    if request.headers.get("api-key", "") != "":
-        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
+    if not is_anonymous_user(current_user):
+        langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
         try:
             langgraph_client = get_client(headers=langgraph_client_headers)
             assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
@@ -3996,7 +4268,7 @@ async def resume_avatar_message(
         # anonymous branch depends on the dependency-populated
         # ``assistant_config`` (always present once an avatar resolved); start
         # from an empty configurable that the api-key branch fills in.
-        if request.headers.get("api-key", "") != "":
+        if not is_anonymous_user(current_user):
             config = {"configurable": {}}
         else:
             raise HTTPException(
@@ -4057,8 +4329,8 @@ async def resume_avatar_message(
     # stray trailing space in the id surfaces as a miss on our side rather than a 500
     # from the assistant lookup.
     assistant_id = assistant_id.strip()
-    if request.headers.get("api-key", "") != "":
-        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
+    if not is_anonymous_user(current_user):
+        langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
         try:
             langgraph_client = get_client(headers=langgraph_client_headers)
             assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
@@ -4144,12 +4416,7 @@ async def get_all_conversations(
 ):
     """Return all threads for this user + assistant, newest-first."""
     user_id = current_user["identities"][0]["user_id"]
-    if request.headers.get("api-key", "") != "":
-        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
-    else:
-        langgraph_client_headers = {
-            "API-KEY": request.app.state.context.anonymous_api_key
-        }
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         threads = await langgraph_client.threads.search(
@@ -4171,15 +4438,40 @@ async def get_thread_messages(
     assistant_id: str,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
-    """Return the message history for a single thread."""
-    if request.headers.get("api-key", "") != "":
-        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
-    else:
-        langgraph_client_headers = {
-            "API-KEY": request.app.state.context.anonymous_api_key
-        }
+    """Return the message history for a single thread.
+
+    ``assistant_id`` is not decoration: the thread is verified to belong to that
+    avatar AND to this caller before any message is returned. Without the check
+    this endpoint would hand over any thread whose id the caller could name,
+    which is how a client bug once served one avatar's transcript under another
+    avatar's chat window — silently, because the mismatched id was accepted.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
+        thread = await langgraph_client.threads.get(thread_id=thread_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"No such conversation: {exc}")
+
+    # Threads are stamped by /message with the avatar and user they belong to
+    # (the same shape /conversations searches on). A thread predating that
+    # stamping carries neither, and is left alone rather than made unreadable.
+    thread_metadata = (thread.get("metadata") or {}).get("thread_metadata") or {}
+    owning_assistant_id = thread_metadata.get("assistant_id")
+    owning_user_id = thread_metadata.get("user_id")
+    if owning_assistant_id is not None and owning_assistant_id != assistant_id:
+        raise HTTPException(
+            status_code=404,
+            detail="That conversation does not belong to this avatar.",
+        )
+    if owning_user_id is not None and owning_user_id != user_id:
+        raise HTTPException(
+            status_code=404,
+            detail="That conversation does not belong to this user.",
+        )
+
+    try:
         state = await langgraph_client.threads.get_state(thread_id=thread_id)
         messages = state.get("values", {}).get("messages", []) if state else []
         return JSONResponse({"messages": messages})
@@ -4937,10 +5229,7 @@ async def get_avatar_reference_image(
     same portrait that the chat-time consciousness loader reads.
     """
     store = app.state.store
-    if request.headers.get("api-key", "") != "":
-        langgraph_client_headers = {"API-KEY": request.headers.get("api-key")}
-    else:
-        langgraph_client_headers = {"API-KEY": app.state.context.anonymous_api_key}
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)

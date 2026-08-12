@@ -8,9 +8,12 @@ matplotlib) inside an ephemeral workspace, and persist created artifacts
 
 Modules:
 
-- ``discovery``: subscribes to a server's Server-Sent-Events announcement,
-  and persists the per-user (single-avatar-bound) connection + per-avatar
-  decline marker in the cross-thread store.
+- ``devices``: resolves each connected machine's human-readable label and
+  platform, and works out which machine an absolute host path belongs to.
+- ``discovery``: resolves every reachable machine (live relay socket, pushed
+  registration, or Server-Sent-Events announcement) and persists one
+  avatar-bound connection record per device, plus per-device auto-adopt
+  suppression, in the cross-thread store.
 - ``mcp_client``: cached access to a saved connection's Model Context
   Protocol filesystem tools with graceful degradation when unreachable.
 - ``backend``: assembles the ``CompositeBackend`` (local-shell execution
@@ -32,18 +35,24 @@ from src.anubis.utils.tools.data_analysis.backend import (
     cleanup_analysis_workspace,
     enforce_ingested_quota,
 )
+from src.anubis.utils.tools.data_analysis.devices import (
+    deduplicate_label,
+    derive_device_identity,
+    resolve_device_for_path,
+)
 from src.anubis.utils.tools.data_analysis.discovery import (
     McpConnection,
-    bound_connection_for,
+    bound_connections_for,
     clear_declined,
     clear_user_connection,
     discover_announced_server,
     is_declined,
     mark_declined,
-    read_user_connection,
-    read_user_registration,
-    resolve_available_connection,
+    read_user_connections,
+    read_user_registrations,
+    resolve_available_connections,
     save_user_connection,
+    suppressed_device_ids,
 )
 from src.anubis.utils.tools.data_analysis.mcp_client import (
     call_mcp_filesystem_tool,
@@ -52,7 +61,7 @@ from src.anubis.utils.tools.data_analysis.mcp_client import (
 __all__ = [
     "AnalysisBackendBundle",
     "McpConnection",
-    "bound_connection_for",
+    "bound_connections_for",
     "build_analysis_backend",
     "build_connect_tool",
     "build_data_analysis_tools",
@@ -61,13 +70,17 @@ __all__ = [
     "clear_declined",
     "clear_user_connection",
     "collect_turn_artifacts",
+    "deduplicate_label",
+    "derive_device_identity",
     "discover_announced_server",
     "enforce_ingested_quota",
     "is_declined",
     "mark_declined",
     "persist_workspace_file",
-    "read_user_connection",
-    "read_user_registration",
-    "resolve_available_connection",
+    "read_user_connections",
+    "read_user_registrations",
+    "resolve_available_connections",
+    "resolve_device_for_path",
     "save_user_connection",
+    "suppressed_device_ids",
 ]

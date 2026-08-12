@@ -77,17 +77,16 @@ from src.anubis.utils.tools.browser import (
     release_conversation_browser,
 )
 from src.anubis.utils.tools.data_analysis import (
-    bound_connection_for,
+    bound_connections_for,
     build_analysis_backend,
     build_connect_tool,
     build_data_analysis_tools,
     cleanup_analysis_workspace,
     collect_turn_artifacts,
-    is_declined,
-    mark_declined,
-    read_user_connection,
-    resolve_available_connection,
+    read_user_connections,
+    resolve_available_connections,
     save_user_connection,
+    suppressed_device_ids,
 )
 from src.anubis.utils.utility import format_docs
 
@@ -752,43 +751,46 @@ async def think(
         deep_agent_run_context.deep_agent_recursion_limit
     )
 
-    # Data-analysis capability gate: the SOLE condition is a saved MCP
-    # connection that (a) the user established through the discovery/consent
-    # flow (the ``mcp_discovery`` node) and (b) is bound to THIS avatar. No
-    # environment switch, no per-avatar enable flag — the connection is the
-    # gate. Unbound avatars (e.g. a test avatar) get nothing; an unreachable
-    # server degrades to a normal turn (empty tool list) inside the tools.
+    # Data-analysis capability gate: the SOLE condition is one or more saved MCP
+    # connections that (a) the ``mcp_auto_adopt`` node bound for this user and
+    # (b) are bound to THIS avatar. No environment switch, no per-avatar enable
+    # flag — the connections are the gate. Unbound avatars (e.g. a test avatar)
+    # get nothing; an unreachable machine degrades to an offline entry inside the
+    # tools rather than costing the turn.
     analysis_bundle = None
     analysis_extra_tools: list[Any] | None = None
-    # Exclusive to the user's own personal avatar: a bound connection on a
+    # Exclusive to the user's own personal avatar: bound connections on a
     # demoted (no-longer-personal) avatar must NOT re-enable live MCP access.
     is_personal_avatar = _user_personal_avatar(config, state)
-    connection = await bound_connection_for(
+    connections = await bound_connections_for(
         runtime.store,
         state["user_state"]["user_id"],
         state["assistant_state"]["assistant_id"],
     )
-    if connection is not None and is_personal_avatar:
-        analysis_bundle = build_analysis_backend(
-            deep_agent_run_context,
-            state["user_state"]["user_id"],
-            state["assistant_state"]["assistant_id"],
-            store=runtime.store,
-        )
-        analysis_extra_tools = build_data_analysis_tools(
-            deep_agent_run_context, analysis_bundle, connection
-        )
-    elif runtime.store is not None and is_personal_avatar:
-        # Unconnected owned avatar: carry only the explicit-connect tool so a
-        # natural-language "connect to the Neural Nexus MCP server" always
-        # works, even after a decline or disconnect suppressed the automatic
-        # discovery offer.
+    if is_personal_avatar and runtime.store is not None:
+        # The explicit-connect tool is attached whether or not machines are
+        # already connected: with several machines a user can have one connected
+        # and another suppressed by an earlier explicit disconnect, and
+        # "reconnect my laptop" has to work in that state.
         analysis_extra_tools = [
             build_connect_tool(
                 deep_agent_run_context,
                 state["user_state"]["user_id"],
                 state["assistant_state"]["assistant_id"],
             )
+        ]
+    if connections and is_personal_avatar:
+        analysis_bundle = build_analysis_backend(
+            deep_agent_run_context,
+            state["user_state"]["user_id"],
+            state["assistant_state"]["assistant_id"],
+            store=runtime.store,
+        )
+        analysis_extra_tools = [
+            *(analysis_extra_tools or []),
+            *build_data_analysis_tools(
+                deep_agent_run_context, analysis_bundle, connections
+            ),
         ]
 
     # Browser capability gate: a process-wide environment switch
@@ -1118,30 +1120,32 @@ def _user_personal_avatar(config: RunnableConfig, state: GlobalState) -> bool:
     )
 
 
-async def mcp_discovery(
+async def mcp_auto_adopt(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
-    """Offer to connect a discovered MCP data server, and persist the choice.
+    """Bind every reachable Neural Nexus machine to the user's personal avatar.
 
-    Runs before ``load_consciousness`` so a just-approved connection is visible
-    to both the capability prompt and the ``think`` gate in the same turn. It
-    offers a connection only when ALL of the following hold, and otherwise
+    Runs before ``load_consciousness`` so a machine that just came online is
+    visible to both the capability prompt and the ``think`` gate in the same
+    turn.
+
+    Adoption is automatic and raises no interrupt. A daemon registers by calling
+    this API with the user's OWN API key, so a registration is already proof that
+    the machine belongs to the account — asking the user to approve each of four
+    machines would add a consent step that the credential has already satisfied.
+
+    A machine is adopted when ALL of the following hold, and the node otherwise
     returns an empty delta (a normal turn):
 
     - this is the user's own PERSONAL avatar (owner match AND the
       ``is_personal_avatar_of_creator`` flag) — never a visitor on someone
       else's avatar, and never the user's other, non-personal avatars;
-    - the user has NO connection yet (a user has at most one MCP connection —
-      once established, bound to one avatar, no further offers are made);
-    - this avatar has not previously DECLINED (a decline on one avatar never
-      suppresses the offer on the user's other avatars);
-    - a server actually ANNOUNCES itself over the discovery SSE channel.
-
-    When those hold, it raises a durable ``interrupt`` — surfaced to the client
-    as the SSE ``interrupt`` event and resolved via ``POST
-    /message/{assistant_id}/resume`` — deferring the connect decision to the
-    user. ``{"type": "apply"}`` saves the connection bound to this avatar;
-    anything else records a per-avatar decline.
+    - the machine is reachable right now (a live relay socket, or a
+      tunnel/local registration with a fresh heartbeat);
+    - the machine is not already bound to this avatar;
+    - the user has not explicitly disconnected this machine from this avatar.
+      That suppression marker is what keeps an explicit disconnect from being
+      silently undone on the very next conversation turn.
     """
     store = runtime.store
     if store is None:
@@ -1153,39 +1157,36 @@ async def mcp_discovery(
     if not _user_personal_avatar(config, state):
         return {}
 
-    if await read_user_connection(store, user_id) is not None:
-        return {}
-    if await is_declined(store, user_id, assistant_id):
-        return {}
-
     context = runtime.context or GlobalContext()
-    connection = await resolve_available_connection(store, user_id, context)
-    if connection is None:
+    available = await resolve_available_connections(store, user_id, context)
+    if not available:
         return {}
 
-    decision = interrupt(
-        {
-            "kind": "mcp_connect_consent",
-            "prompt": (
-                "An MCP data server is available and not yet connected — "
-                "connect it to this avatar for data analysis?"
-            ),
-            "server": {
-                "server_name": connection.server_name,
-                "url": connection.url,
-                "transport": connection.transport,
-                "allowed_roots": list(connection.allowed_roots),
-            },
-        }
-    )
+    already_bound = {
+        record.get("device_id")
+        for record in await read_user_connections(store, user_id)
+        if record.get("assistant_id") == assistant_id
+        and record.get("status") == "connected"
+    }
+    suppressed = await suppressed_device_ids(store, user_id, assistant_id)
 
-    approved = isinstance(decision, dict) and decision.get("type") == "apply"
-    if approved:
+    for connection in available:
+        if not connection.device_id:
+            continue
+        if connection.device_id in already_bound:
+            continue
+        if connection.device_id in suppressed:
+            continue
         await save_user_connection(
             store, user_id, connection=connection, assistant_id=assistant_id
         )
-    else:
-        await mark_declined(store, user_id, assistant_id, connection)
+        logger.info(
+            "Adopted Model Context Protocol device %r (%s) for user %s on avatar %s",
+            connection.device_label,
+            connection.device_id,
+            user_id,
+            assistant_id,
+        )
     return {}
 
 
@@ -1201,14 +1202,14 @@ anubis_workflow = StateGraph(
 
 """ ANUBIS WORKFLOW NODES """
 
-anubis_workflow.add_node("mcp_discovery", mcp_discovery)
+anubis_workflow.add_node("mcp_auto_adopt", mcp_auto_adopt)
 anubis_workflow.add_node("load_consciousness", load_consciousness)
 anubis_workflow.add_node("think", think)
 
 """ ANUBIS WORKFLOW EDGES """
 
-anubis_workflow.add_edge(START, "mcp_discovery")
-anubis_workflow.add_edge("mcp_discovery", "load_consciousness")
+anubis_workflow.add_edge(START, "mcp_auto_adopt")
+anubis_workflow.add_edge("mcp_auto_adopt", "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "think")
 anubis_workflow.add_edge("think", END)
 

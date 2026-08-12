@@ -4,8 +4,13 @@ The full Model-Context-Protocol round trip (discover → ingest → execute →
 persist) is exercised against the live filesystem server by the manual
 harness; these tests cover the pure policies: namespace isolation, the
 store byte/age quota, workspace lifecycle, key collision hashing, and the
-per-user single connection / per-avatar binding + decline model that gates
+per-device connection / per-avatar binding + suppression model that gates
 the capability.
+
+A user connects several machines at once, so the connection records are keyed
+by ``device_id`` and the host-filesystem tools fan out across every connected
+machine. The fan-out shape — grouped results, an offline machine reported
+rather than raised, and path-to-machine resolution — is covered here too.
 """
 
 import asyncio
@@ -19,7 +24,7 @@ from langgraph.store.memory import InMemoryStore
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.tools.data_analysis import (
     McpConnection,
-    bound_connection_for,
+    bound_connections_for,
     build_analysis_backend,
     build_connect_tool,
     build_data_analysis_tools,
@@ -29,7 +34,8 @@ from src.anubis.utils.tools.data_analysis import (
     enforce_ingested_quota,
     is_declined,
     mark_declined,
-    read_user_connection,
+    read_user_connections,
+    resolve_device_for_path,
     save_user_connection,
 )
 from src.anubis.utils.tools.data_analysis.analysis_tools import (
@@ -49,6 +55,20 @@ _TEST_CONNECTION = McpConnection(
     transport="streamable_http",
     server_name="Ubuntu-OS-Filesystem",
     allowed_roots=("/data",),
+    device_id="d-ubuntu",
+    device_label="Ubuntu",
+    platform="ubuntu",
+)
+
+# A second machine, so the multi-device behaviour has something to fan out to.
+_SECOND_CONNECTION = McpConnection(
+    url="http://localhost:8000/mcp/relay/d-macos",
+    transport="streamable_http",
+    server_name="macOS-Filesystem",
+    allowed_roots=("/Users/evan/data",),
+    device_id="d-macos",
+    device_label="macOS",
+    platform="macos",
 )
 
 
@@ -86,12 +106,16 @@ def test_store_key_plain_name_and_collision_hash():
     collided = _store_key_for_source("/other/health1.json", "/data/health1.json")
     assert collided != "/health1.json"
     assert collided.startswith("/health1-") and collided.endswith(".json")
-    assert collided == _store_key_for_source("/other/health1.json", "/data/health1.json")
+    assert collided == _store_key_for_source(
+        "/other/health1.json", "/data/health1.json"
+    )
 
 
 def test_decode_store_content_text_and_base64():
     assert _decode_store_content({"content": "hello", "encoding": "utf-8"}) == b"hello"
-    assert _decode_store_content({"content": "aGVsbG8=", "encoding": "base64"}) == b"hello"
+    assert (
+        _decode_store_content({"content": "aGVsbG8=", "encoding": "base64"}) == b"hello"
+    )
 
 
 def test_workspace_lifecycle(context):
@@ -110,7 +134,9 @@ def test_unsupported_execution_backend_raises(context):
 
 def test_tool_set_names(context):
     bundle = build_analysis_backend(context, "u1", "a1", store=InMemoryStore())
-    tool_names = {t.name for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+    tool_names = {
+        t.name for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
+    }
     assert tool_names == {
         "discover_data_files",
         "preview_data_file",
@@ -159,8 +185,12 @@ def test_quota_age_backstop(context):
 def test_quota_ignores_other_namespaces(context):
     async def run():
         store = InMemoryStore()
-        await store.aput(ingested_namespace("u1", "a1"), "/a.json", {"content": "x" * 100})
-        await store.aput(ingested_namespace("u2", "a1"), "/b.json", {"content": "x" * 100})
+        await store.aput(
+            ingested_namespace("u1", "a1"), "/a.json", {"content": "x" * 100}
+        )
+        await store.aput(
+            ingested_namespace("u2", "a1"), "/b.json", {"content": "x" * 100}
+        )
         await store.aput(created_namespace("u1", "a1"), "/r.md", {"content": "x" * 100})
         context.data_analysis_store_max_bytes = 0
         evicted = await enforce_ingested_quota(store, "u1", "a1", context)
@@ -172,9 +202,9 @@ def test_quota_ignores_other_namespaces(context):
     asyncio.run(run())
 
 
-def test_mcp_connection_namespace_is_single_per_user():
-    # Two-element namespace keyed by user only — exactly one connection record
-    # can exist per user, regardless of how many avatars the user owns.
+def test_mcp_connection_namespace_is_scoped_to_the_user():
+    # Two-element namespace scoped to the user; records INSIDE the namespace are
+    # keyed by device_id, so one user holds one record per connected machine.
     assert mcp_connection_namespace("u1") == ("u1", "mcp_connection")
     assert mcp_connection_namespace("u1") != mcp_connection_namespace("u2")
     assert len(mcp_connection_namespace("u1")) == 2
@@ -183,70 +213,138 @@ def test_mcp_connection_namespace_is_single_per_user():
 def test_connection_save_read_clear_roundtrip():
     async def run():
         store = InMemoryStore()
-        assert await read_user_connection(store, "u1") is None
+        assert await read_user_connections(store, "u1") == []
 
         await save_user_connection(
             store, "u1", connection=_TEST_CONNECTION, assistant_id="a1"
         )
-        record = await read_user_connection(store, "u1")
-        assert record is not None
-        assert record["status"] == "connected"
-        assert record["assistant_id"] == "a1"
-        assert record["url"] == _TEST_CONNECTION.url
+        records = await read_user_connections(store, "u1")
+        assert len(records) == 1
+        assert records[0]["status"] == "connected"
+        assert records[0]["assistant_id"] == "a1"
+        assert records[0]["url"] == _TEST_CONNECTION.url
+        assert records[0]["device_id"] == "d-ubuntu"
+        assert records[0]["device_label"] == "Ubuntu"
 
-        assert await clear_user_connection(store, "u1") is True
-        assert await read_user_connection(store, "u1") is None
+        assert await clear_user_connection(store, "u1") == ["d-ubuntu"]
+        assert await read_user_connections(store, "u1") == []
         # Clearing again reports nothing existed.
-        assert await clear_user_connection(store, "u1") is False
+        assert await clear_user_connection(store, "u1") == []
 
     asyncio.run(run())
 
 
-def test_bound_connection_matches_only_the_bound_avatar():
+def test_saving_a_second_machine_does_not_replace_the_first():
+    """The singleton bug: a second machine used to overwrite the first record."""
+
+    async def run():
+        store = InMemoryStore()
+        await save_user_connection(
+            store, "u1", connection=_TEST_CONNECTION, assistant_id="a1"
+        )
+        await save_user_connection(
+            store, "u1", connection=_SECOND_CONNECTION, assistant_id="a1"
+        )
+
+        records = await read_user_connections(store, "u1")
+        assert {record["device_id"] for record in records} == {"d-ubuntu", "d-macos"}
+
+        # Disconnecting one machine leaves the other connected.
+        assert await clear_user_connection(store, "u1", "d-macos") == ["d-macos"]
+        remaining = await read_user_connections(store, "u1")
+        assert [record["device_id"] for record in remaining] == ["d-ubuntu"]
+
+    asyncio.run(run())
+
+
+def test_a_connection_without_a_device_identifier_cannot_be_saved():
+    """The record key IS the device identifier, so an unidentified device fails loudly."""
+
+    async def run():
+        store = InMemoryStore()
+        anonymous = McpConnection(
+            url="http://localhost:8000/mcp",
+            transport="streamable_http",
+            server_name="Ubuntu-OS-Filesystem",
+        )
+        with pytest.raises(ValueError):
+            await save_user_connection(
+                store, "u1", connection=anonymous, assistant_id="a1"
+            )
+
+    asyncio.run(run())
+
+
+def test_bound_connections_match_only_the_bound_avatar():
     async def run():
         store = InMemoryStore()
         # No connection yet → capability off for any avatar.
-        assert await bound_connection_for(store, "u1", "a1") is None
+        assert await bound_connections_for(store, "u1", "a1") == []
 
-        # Connect, binding the single connection to avatar a1 (the personal avatar).
+        # Bind both machines to avatar a1 (the personal avatar).
         await save_user_connection(
             store, "u1", connection=_TEST_CONNECTION, assistant_id="a1"
         )
-        bound = await bound_connection_for(store, "u1", "a1")
-        assert bound is not None and bound.url == _TEST_CONNECTION.url
+        await save_user_connection(
+            store, "u1", connection=_SECOND_CONNECTION, assistant_id="a1"
+        )
+        bound = await bound_connections_for(store, "u1", "a1")
+        assert {connection.device_id for connection in bound} == {
+            "d-ubuntu",
+            "d-macos",
+        }
 
-        # The user's OTHER avatar (e.g. a test avatar) shares the single
-        # connection record but is NOT the bound avatar → no capability.
-        assert await bound_connection_for(store, "u1", "a2") is None
+        # The user's OTHER avatar (e.g. a test avatar) shares the namespace but
+        # is NOT the bound avatar → no capability.
+        assert await bound_connections_for(store, "u1", "a2") == []
 
-        # A different user never sees this connection.
-        assert await bound_connection_for(store, "u2", "a1") is None
+        # A different user never sees these connections.
+        assert await bound_connections_for(store, "u2", "a1") == []
 
     asyncio.run(run())
 
 
-def test_decline_marker_is_per_avatar():
+def test_suppression_marker_is_per_avatar_and_per_device():
     async def run():
         store = InMemoryStore()
-        assert await is_declined(store, "u1", "a1") is False
-        assert await is_declined(store, "u1", "a2") is False
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is False
+        assert await is_declined(store, "u1", "a2", "d-ubuntu") is False
 
         await mark_declined(store, "u1", "a2", _TEST_CONNECTION)
-        # Declining on the test avatar suppresses only that avatar; the
-        # personal avatar can still be offered the connection.
-        assert await is_declined(store, "u1", "a2") is True
-        assert await is_declined(store, "u1", "a1") is False
+        # Suppressing on the test avatar affects only that avatar; the personal
+        # avatar still adopts the machine automatically.
+        assert await is_declined(store, "u1", "a2", "d-ubuntu") is True
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is False
+        # And only that machine: the user's other machines are unaffected.
+        assert await is_declined(store, "u1", "a2", "d-macos") is False
         # And it never leaks to another user.
-        assert await is_declined(store, "u2", "a2") is False
+        assert await is_declined(store, "u2", "a2", "d-ubuntu") is False
 
     asyncio.run(run())
+
+
+def test_resolve_device_for_path_picks_the_owning_machine():
+    connections = [_TEST_CONNECTION, _SECOND_CONNECTION]
+    assert resolve_device_for_path("/data/health.json", connections) is _TEST_CONNECTION
+    assert (
+        resolve_device_for_path("/Users/evan/data/health.json", connections)
+        is _SECOND_CONNECTION
+    )
+    # A path under no allow-listed root is ambiguous rather than guessed at.
+    assert resolve_device_for_path("/elsewhere/health.json", connections) is None
+    # A root prefix must be a DIRECTORY boundary, not a bare string prefix, so
+    # "/database" never resolves to the machine exposing "/data".
+    assert resolve_device_for_path("/database/health.json", connections) is None
 
 
 def test_persist_created_artifact_rejects_traversal(context):
     async def run():
         store = InMemoryStore()
         bundle = build_analysis_backend(context, "u1", "a1", store=store)
-        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
+        }
         runtime = _FakeToolRuntime(store)
         result = await tools["persist_created_artifact"].coroutine(
             workspace_file_path="../../etc/passwd", runtime=runtime
@@ -265,21 +363,79 @@ def test_check_and_disconnect_tools(context):
             store, "u1", connection=_TEST_CONNECTION, assistant_id="a1"
         )
         bundle = build_analysis_backend(context, "u1", "a1", store=store)
-        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
+        }
         runtime = _FakeToolRuntime(store)
 
-        # Natural-language "are you connected?" confirms the connection but —
-        # privacy requirement — carries NO address or directory details.
+        # Natural-language "are you connected?" confirms the connection and
+        # names the machines but — privacy requirement — carries NO address or
+        # directory details.
         status = await tools["check_data_server_connection"].coroutine(runtime=runtime)
-        assert status == {"connected": True, "server": "Neural Nexus MCP data server"}
+        assert status["connected"] is True
+        assert status["device_count"] == 1
+        assert status["devices"][0]["device_label"] == "Ubuntu"
         assert "url" not in status and "allowed_roots" not in status
+        assert all("url" not in device for device in status["devices"])
 
         # Natural-language "disconnect" clears the saved connection (gate
-        # closes) and suppresses the automatic re-offer for this avatar.
+        # closes) and suppresses automatic re-adoption of that machine.
         result = await tools["disconnect_data_server"].coroutine(runtime=runtime)
         assert result["disconnected"] is True
-        assert await bound_connection_for(store, "u1", "a1") is None
-        assert await is_declined(store, "u1", "a1") is True
+        assert result["disconnected_devices"] == ["Ubuntu"]
+        assert await bound_connections_for(store, "u1", "a1") == []
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is True
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_disconnect_one_named_machine_leaves_the_other_connected(context):
+    async def run():
+        store = InMemoryStore()
+        for connection in (_TEST_CONNECTION, _SECOND_CONNECTION):
+            await save_user_connection(
+                store, "u1", connection=connection, assistant_id="a1"
+            )
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(
+                context, bundle, [_TEST_CONNECTION, _SECOND_CONNECTION]
+            )
+        }
+        runtime = _FakeToolRuntime(store)
+
+        result = await tools["disconnect_data_server"].coroutine(
+            device_label="macOS", runtime=runtime
+        )
+        assert result["disconnected_devices"] == ["macOS"]
+
+        remaining = await bound_connections_for(store, "u1", "a1")
+        assert [connection.device_id for connection in remaining] == ["d-ubuntu"]
+        # Only the named machine is suppressed.
+        assert await is_declined(store, "u1", "a1", "d-macos") is True
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is False
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_unknown_device_label_reports_the_valid_names(context):
+    async def run():
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(
+                context, bundle, [_TEST_CONNECTION, _SECOND_CONNECTION]
+            )
+        }
+        result = await tools["discover_data_files"].coroutine(device_label="Toaster")
+        assert "error" in result
+        # Naming the valid machines lets the model correct itself in one step.
+        assert "Ubuntu" in result["error"] and "macOS" in result["error"]
         cleanup_analysis_workspace(bundle)
 
     asyncio.run(run())
@@ -289,27 +445,60 @@ def test_connect_tool_saves_connection_and_clears_decline(context, monkeypatch):
     async def run():
         store = InMemoryStore()
         runtime = _FakeToolRuntime(store)
-        # A previously declined avatar: automatic offers are suppressed…
+        # A previously disconnected machine: automatic adoption is suppressed…
         await mark_declined(store, "u1", "a1", _TEST_CONNECTION)
-        assert await is_declined(store, "u1", "a1") is True
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is True
 
         # …but an explicit natural-language connect always works.
         import src.anubis.utils.tools.data_analysis.analysis_tools as at
 
-        async def _fake_resolve(store, user_id, context, *, ignore_failure_backoff=False):
+        async def _fake_resolve(
+            store, user_id, context, *, ignore_failure_backoff=False
+        ):
             assert ignore_failure_backoff is True
-            return _TEST_CONNECTION
+            return [_TEST_CONNECTION]
 
-        monkeypatch.setattr(at, "resolve_available_connection", _fake_resolve)
+        monkeypatch.setattr(at, "resolve_available_connections", _fake_resolve)
         connect = build_connect_tool(context, "u1", "a1")
         result = await connect.coroutine(runtime=runtime)
         assert result["connected"] is True
+        assert result["connected_devices"] == ["Ubuntu"]
         # Privacy: no address or directory details in the tool result.
         assert "url" not in result and "allowed_roots" not in result
 
-        bound = await bound_connection_for(store, "u1", "a1")
-        assert bound is not None and bound.url == _TEST_CONNECTION.url
-        assert await is_declined(store, "u1", "a1") is False
+        bound = await bound_connections_for(store, "u1", "a1")
+        assert len(bound) == 1 and bound[0].url == _TEST_CONNECTION.url
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is False
+
+    asyncio.run(run())
+
+
+def test_connect_tool_can_target_one_named_machine(context, monkeypatch):
+    """ "Reconnect my Mac" must not also re-adopt a machine the user disconnected."""
+
+    async def run():
+        store = InMemoryStore()
+        runtime = _FakeToolRuntime(store)
+        await mark_declined(store, "u1", "a1", _TEST_CONNECTION)
+        await mark_declined(store, "u1", "a1", _SECOND_CONNECTION)
+
+        import src.anubis.utils.tools.data_analysis.analysis_tools as at
+
+        async def _fake_resolve(
+            store, user_id, context, *, ignore_failure_backoff=False
+        ):
+            return [_TEST_CONNECTION, _SECOND_CONNECTION]
+
+        monkeypatch.setattr(at, "resolve_available_connections", _fake_resolve)
+        connect = build_connect_tool(context, "u1", "a1")
+        result = await connect.coroutine(device_label="macOS", runtime=runtime)
+
+        assert result["connected_devices"] == ["macOS"]
+        bound = await bound_connections_for(store, "u1", "a1")
+        assert [connection.device_id for connection in bound] == ["d-macos"]
+        # The machine that was not named stays suppressed.
+        assert await is_declined(store, "u1", "a1", "d-ubuntu") is True
+        assert await is_declined(store, "u1", "a1", "d-macos") is False
 
     asyncio.run(run())
 
@@ -324,7 +513,10 @@ def test_ingest_passes_connection_to_mcp_calls(context, monkeypatch):
     async def run():
         store = InMemoryStore()
         bundle = build_analysis_backend(context, "u1", "a1", store=store)
-        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
+        }
         runtime = _FakeToolRuntime(store)
 
         import base64 as b64
@@ -358,7 +550,8 @@ def test_ingest_passes_connection_to_mcp_calls(context, monkeypatch):
 def test_timestamped_artifact_name_appends_underscored_date_and_time():
     moment = datetime(2026, 7, 27, 14, 30, 5, tzinfo=UTC)
     assert (
-        timestamped_artifact_name("report.md", moment) == "report_2026_07_27_14_30_05.md"
+        timestamped_artifact_name("report.md", moment)
+        == "report_2026_07_27_14_30_05.md"
     )
     assert (
         timestamped_artifact_name("plot.png", moment) == "plot_2026_07_27_14_30_05.png"
@@ -381,14 +574,19 @@ def test_persist_created_artifact_saves_under_a_timestamped_name(context):
     async def run():
         store = InMemoryStore()
         bundle = build_analysis_backend(context, "u1", "a1", store=store)
-        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
+        }
         (bundle.workspace_path / "report.md").write_text("# Report")
         result = await tools["persist_created_artifact"].coroutine(
             workspace_file_path="report.md", runtime=_FakeToolRuntime(store)
         )
 
         saved_name = bundle.persisted_artifacts[0]["name"]
-        assert re.fullmatch(r"report_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.md", saved_name)
+        assert re.fullmatch(
+            r"report_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.md", saved_name
+        )
         assert result == {"persisted_path": f"/data_created/{saved_name}"}
         assert bundle.persisted_artifacts[0]["workspace_name"] == "report.md"
         assert bundle.persisted_artifacts[0]["mime_type"] == "text/markdown"
@@ -410,7 +608,7 @@ def test_reports_from_different_turns_do_not_overwrite_each_other(context):
             bundle = build_analysis_backend(context, "u1", "a1", store=store)
             tools = {
                 t.name: t
-                for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)
+                for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
             }
             (bundle.workspace_path / "report.md").write_text(turn_body)
             await tools["persist_created_artifact"].coroutine(
@@ -421,7 +619,10 @@ def test_reports_from_different_turns_do_not_overwrite_each_other(context):
 
         stored = await store.asearch(created_namespace("u1", "a1"), limit=10)
         assert len(stored) == 2
-        assert {item.value["content"] for item in stored} == {"# First turn", "# Second turn"}
+        assert {item.value["content"] for item in stored} == {
+            "# First turn",
+            "# Second turn",
+        }
 
     asyncio.run(run())
 
@@ -442,7 +643,9 @@ def test_collect_turn_artifacts_sweeps_unpersisted_workspace_files(context):
 
         assert [record["workspace_name"] for record in artifacts] == ["plot.png"]
         plot = artifacts[0]
-        assert re.fullmatch(r"plot_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.png", plot["name"])
+        assert re.fullmatch(
+            r"plot_\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.png", plot["name"]
+        )
         assert plot["mime_type"] == "image/png"
         assert plot["encoding"] == "base64"
         assert base64.standard_b64decode(plot["content"]) == png_bytes
@@ -459,7 +662,10 @@ def test_collect_turn_artifacts_does_not_duplicate_persisted_files(context):
     async def run():
         store = InMemoryStore()
         bundle = build_analysis_backend(context, "u1", "a1", store=store)
-        tools = {t.name: t for t in build_data_analysis_tools(context, bundle, _TEST_CONNECTION)}
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(context, bundle, [_TEST_CONNECTION])
+        }
         (bundle.workspace_path / "report.md").write_text("# Report")
         await tools["persist_created_artifact"].coroutine(
             workspace_file_path="report.md", runtime=_FakeToolRuntime(store)
@@ -488,7 +694,9 @@ def test_collect_turn_artifacts_omits_content_above_the_inline_cap(context):
         assert artifacts[0]["omitted_reason"] == "too_large"
         assert artifacts[0]["size_bytes"] > 100
         # Durable storage still holds the full artifact.
-        item = await store.aget(created_namespace("u1", "a1"), f"/{artifacts[0]['name']}")
+        item = await store.aget(
+            created_namespace("u1", "a1"), f"/{artifacts[0]['name']}"
+        )
         assert item is not None and item.value["content"]
         cleanup_analysis_workspace(bundle)
 
@@ -501,13 +709,128 @@ def test_connect_tool_reports_unreachable_server(context, monkeypatch):
         runtime = _FakeToolRuntime(store)
         import src.anubis.utils.tools.data_analysis.analysis_tools as at
 
-        async def _fake_resolve(store, user_id, context, *, ignore_failure_backoff=False):
-            return None
+        async def _fake_resolve(
+            store, user_id, context, *, ignore_failure_backoff=False
+        ):
+            return []
 
-        monkeypatch.setattr(at, "resolve_available_connection", _fake_resolve)
+        monkeypatch.setattr(at, "resolve_available_connections", _fake_resolve)
         connect = build_connect_tool(context, "u1", "a1")
         result = await connect.coroutine(runtime=runtime)
         assert result["connected"] is False
-        assert await bound_connection_for(store, "u1", "a1") is None
+        assert await bound_connections_for(store, "u1", "a1") == []
+
+    asyncio.run(run())
+
+
+def test_discover_fans_out_and_groups_results_by_machine(context, monkeypatch):
+    async def run():
+        import src.anubis.utils.tools.data_analysis.analysis_tools as at
+
+        async def _fake_call(connection, tool_name, tool_args):
+            assert tool_name == "list_all_files"
+            if connection.device_id == "d-ubuntu":
+                assert tool_args["directory"] == "/data"
+                return ["/data/steps.json", "/data/sleep.json"]
+            assert tool_args["directory"] == "/Users/evan/data"
+            return ["/Users/evan/data/weight.csv"]
+
+        monkeypatch.setattr(at, "call_mcp_filesystem_tool", _fake_call)
+
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(
+                context, bundle, [_TEST_CONNECTION, _SECOND_CONNECTION]
+            )
+        }
+
+        result = await tools["discover_data_files"].coroutine()
+        # Each machine lists its OWN connected directory, and results are
+        # attributable to a machine by name.
+        assert set(result["devices"]) == {"Ubuntu", "macOS"}
+        assert result["devices"]["Ubuntu"]["total_files"] == 2
+        assert result["devices"]["macOS"]["total_files"] == 1
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_offline_machine_is_reported_not_raised(context, monkeypatch):
+    """One sleeping laptop must never cost the user an answer from the others."""
+
+    async def run():
+        import src.anubis.utils.tools.data_analysis.analysis_tools as at
+
+        async def _fake_call(connection, tool_name, tool_args):
+            if connection.device_id == "d-macos":
+                raise RuntimeError("relay device is offline")
+            return ["/data/steps.json"]
+
+        monkeypatch.setattr(at, "call_mcp_filesystem_tool", _fake_call)
+
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(
+                context, bundle, [_TEST_CONNECTION, _SECOND_CONNECTION]
+            )
+        }
+
+        result = await tools["discover_data_files"].coroutine()
+        assert result["devices"]["Ubuntu"]["total_files"] == 1
+        # The offline machine is PRESENT in the result, so the model can say the
+        # machine was unreachable instead of reporting partial data as complete.
+        assert result["devices"]["macOS"]["status"] == "offline"
+        cleanup_analysis_workspace(bundle)
+
+    asyncio.run(run())
+
+
+def test_ingest_resolves_each_path_to_its_own_machine(context, monkeypatch):
+    """One ingest call may pull files from two different machines."""
+
+    async def run():
+        import base64 as b64
+
+        import src.anubis.utils.tools.data_analysis.analysis_tools as at
+
+        calls: list[tuple[str, str]] = []
+
+        async def _fake_call(connection, tool_name, tool_args):
+            calls.append((connection.device_id, tool_args["file_path"]))
+            if tool_name == "get_file_info":
+                return {"modified_at": "2026-08-01T00:00:00+00:00", "size_bytes": 3}
+            return b64.standard_b64encode(b"{}\n").decode("ascii")
+
+        monkeypatch.setattr(at, "call_mcp_filesystem_tool", _fake_call)
+
+        store = InMemoryStore()
+        bundle = build_analysis_backend(context, "u1", "a1", store=store)
+        tools = {
+            t.name: t
+            for t in build_data_analysis_tools(
+                context, bundle, [_TEST_CONNECTION, _SECOND_CONNECTION]
+            )
+        }
+        runtime = _FakeToolRuntime(store)
+
+        result = await tools["ingest_data_files"].coroutine(
+            file_paths=["/data/steps.json", "/Users/evan/data/weight.json"],
+            runtime=runtime,
+        )
+        assert result["errors"] == []
+        # Each path went to the machine whose allow-listed root contains it.
+        assert ("d-ubuntu", "/data/steps.json") in calls
+        assert ("d-macos", "/Users/evan/data/weight.json") in calls
+        assert ("d-macos", "/data/steps.json") not in calls
+
+        # The buffered copy records which machine the data came from.
+        items = await store.asearch(ingested_namespace("u1", "a1"), limit=10)
+        labels = {(item.value or {}).get("device_label") for item in items}
+        assert labels == {"Ubuntu", "macOS"}
+        cleanup_analysis_workspace(bundle)
 
     asyncio.run(run())

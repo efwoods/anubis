@@ -19,6 +19,23 @@ and return compact summaries instead.
 
 The tools are built per turn by ``build_data_analysis_tools`` because they
 close over the turn's ``AnalysisBackendBundle`` (workspace path + ids).
+
+**Several machines at once.** A user connects the Neural Nexus daemon on an
+Ubuntu desktop, a Mac, a phone, and a Windows machine simultaneously, so the
+tools close over a LIST of connections rather than one. Two addressing shapes
+are used, chosen per tool by what the model already knows:
+
+- Tools that answer "what do I have?" (``discover_data_files``) **fan out**:
+  every connected machine is queried concurrently and results come back grouped
+  by device label. A machine that is asleep contributes an ``offline`` entry
+  instead of failing the call, so one sleeping laptop never costs the user an
+  answer — but the entry is present so the model can say a machine was not
+  reached rather than presenting partial data as complete.
+- Tools that name one absolute host path (``preview_data_file``,
+  ``ingest_data_files``) resolve the owning machine from that path against each
+  device's allow-listed roots. Broadcasting a path to every device would cost a
+  round trip per machine and produce confusing failures from the machines that
+  do not hold the file.
 """
 
 from __future__ import annotations
@@ -46,12 +63,16 @@ from src.anubis.utils.tools.data_analysis.backend import (
     enforce_ingested_quota,
     ingested_namespace,
 )
+from src.anubis.utils.tools.data_analysis.devices import (
+    connection_label_map,
+    resolve_device_for_path,
+)
 from src.anubis.utils.tools.data_analysis.discovery import (
     McpConnection,
     clear_declined,
     clear_user_connection,
     mark_declined,
-    resolve_available_connection,
+    resolve_available_connections,
     save_user_connection,
 )
 from src.anubis.utils.tools.data_analysis.mcp_client import call_mcp_filesystem_tool
@@ -94,7 +115,6 @@ def _write_workspace_file(bundle: AnalysisBackendBundle, name: str, data: bytes)
     disk_path.parent.mkdir(parents=True, exist_ok=True)
     disk_path.write_bytes(data)
     return relative_path
-
 
 
 # Underscored calendar date and clock time appended to every created artifact
@@ -260,104 +280,239 @@ async def collect_turn_artifacts(
     return display_records
 
 
+# Fallback per-device deadline for one fan-out leg, used when the context does
+# not carry ``data_analysis_device_fanout_timeout_seconds``. A device that has
+# not answered within this window is reported as offline rather than awaited
+# further: fan-out legs run concurrently, so this is the ceiling the whole
+# fan-out call adds to the turn regardless of how many machines are connected.
+_DEFAULT_DEVICE_FANOUT_TIMEOUT_SECONDS = 20.0
+
+
+def _device_fanout_timeout_seconds(context: GlobalContext) -> float:
+    """Per-device deadline for one leg of a fan-out call."""
+    configured = getattr(context, "data_analysis_device_fanout_timeout_seconds", None)
+    if configured is None:
+        return _DEFAULT_DEVICE_FANOUT_TIMEOUT_SECONDS
+    try:
+        return float(configured)
+    except (TypeError, ValueError):
+        return _DEFAULT_DEVICE_FANOUT_TIMEOUT_SECONDS
+
+
+async def _call_one_device(
+    connection: McpConnection,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    timeout_seconds: float,
+) -> Any:
+    """Invoke one Model Context Protocol tool on one device, never raising.
+
+    Returns the tool's normalized result, or a status mapping describing why the
+    machine did not answer. Failures are converted rather than raised because a
+    fan-out call must survive a machine that is asleep, and because a raised
+    exception inside ``asyncio.gather`` would lose which device produced it.
+    """
+    try:
+        return await asyncio.wait_for(
+            call_mcp_filesystem_tool(connection, tool_name, tool_args),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        logger.info(
+            "Device %r did not answer %s within %.1fs; reported offline.",
+            connection.device_label,
+            tool_name,
+            timeout_seconds,
+        )
+        return {
+            "status": "offline",
+            "detail": "The machine did not answer before the deadline.",
+        }
+    except Exception as error:
+        logger.warning(
+            "Device %r failed %s", connection.device_label, tool_name, exc_info=True
+        )
+        return {"status": "offline", "detail": str(error)}
+
+
+def _select_devices(
+    connections: list[McpConnection], device_label: str | None
+) -> tuple[list[McpConnection], dict[str, Any] | None]:
+    """Resolve a model-supplied device label to the devices to query.
+
+    Returns ``(devices, error)``. A missing label selects every device (the
+    fan-out default). An unrecognized label returns an error naming the valid
+    labels, so the model can correct itself in one step instead of guessing.
+    """
+    if device_label is None or not str(device_label).strip():
+        return connections, None
+    label_map = connection_label_map(connections)
+    selected = label_map.get(str(device_label).strip().lower())
+    if selected is None:
+        return [], {
+            "error": (
+                f"No connected machine is named {device_label!r}. "
+                f"Connected machines: {[c.device_label for c in connections]}."
+            )
+        }
+    return [selected], None
+
+
 def build_data_analysis_tools(
     context: GlobalContext,
     bundle: AnalysisBackendBundle,
-    connection: McpConnection,
+    connections: list[McpConnection],
 ) -> list[Any]:
-    """Build the per-turn data-analysis tool set.
+    """Build the per-turn data-analysis tool set across every connected machine.
 
     Every tool closes over the turn's ``AnalysisBackendBundle`` — the
     authenticated ``(user_id, assistant_id)`` pair scopes all store access,
     so one user's data is never reachable from another user's session and
     each avatar's buffer is distinct per user. The host filesystem tools are
-    reached through ``connection`` — the per-user MCP connection saved for the
-    bound avatar — so a turn only ever talks to that avatar's own server.
+    reached through ``connections`` — the per-device MCP connections saved for
+    the bound avatar — so a turn only ever talks to that avatar's own machines.
     """
     user_id = bundle.user_id
     assistant_id = bundle.assistant_id
+    fanout_timeout_seconds = _device_fanout_timeout_seconds(context)
+
+    def _ambiguous_path_error(file_path: str) -> dict[str, Any]:
+        return {
+            "error": (
+                f"Could not tell which machine holds {file_path!r}. "
+                f"Name the machine explicitly with the device_label argument. "
+                f"Connected machines: {[c.device_label for c in connections]}."
+            )
+        }
+
+    def _device_for_path(
+        file_path: str, device_label: str | None
+    ) -> tuple[McpConnection | None, dict[str, Any] | None]:
+        """Pick the one machine a named host path belongs to."""
+        selected, error = _select_devices(connections, device_label)
+        if error is not None:
+            return None, error
+        if len(selected) == 1:
+            return selected[0], None
+        resolved = resolve_device_for_path(file_path, selected)
+        if resolved is None:
+            return None, _ambiguous_path_error(file_path)
+        return resolved, None
 
     @tool
     async def discover_data_files(
         directory: str | None = None,
         recursive: bool = True,
+        device_label: str | None = None,
     ) -> dict[str, Any]:
-        """List data files available on the connected host filesystem.
+        """List data files available on the connected machines.
 
-        Use this tool first to find which files exist before ingesting.
-        Omit the directory argument to list the connected data directory —
-        the directory the Neural Nexus MCP data server exposes. The host only
-        exposes allow-listed directories; asking for a directory outside the
-        allow-list returns an error.
+        Use this tool first to find which files exist before ingesting. Results
+        come back grouped by machine name, so state which machine a file is on
+        when reporting findings. A machine that is asleep or unreachable appears
+        with a status of "offline" instead of failing the whole call — say so
+        plainly rather than presenting the remaining results as complete.
+
+        Omit the directory argument to list each machine's connected data
+        directory. Each machine only exposes allow-listed directories; asking
+        for a directory outside the allow-list returns an error for that machine.
 
         Args:
             directory: Optional absolute host directory to list; omit to use
-                the connected data directory.
+                each machine's connected data directory.
             recursive: When true, include files in subdirectories.
+            device_label: Optional name of a single machine to list, for example
+                "Ubuntu" or "My MacBook". Omit to list every connected machine.
         """
-        if directory is None:
-            if not connection.allowed_roots:
-                return {"error": "The connected data server exposes no directories."}
-            directory = connection.allowed_roots[0]
-        try:
-            file_paths = await call_mcp_filesystem_tool(
+        selected, error = _select_devices(connections, device_label)
+        if error is not None:
+            return error
+
+        async def list_one(connection: McpConnection) -> tuple[str, Any]:
+            target_directory = directory
+            if target_directory is None:
+                if not connection.allowed_roots:
+                    return connection.device_label, {
+                        "error": "This machine exposes no directories."
+                    }
+                target_directory = connection.allowed_roots[0]
+            result = await _call_one_device(
                 connection,
                 "list_all_files",
-                {"directory": directory, "recursive": recursive},
+                {"directory": target_directory, "recursive": recursive},
+                fanout_timeout_seconds,
             )
-        except Exception as error:
-            # Return the failure to the model rather than raising, so an
-            # unreachable Neural Nexus MCP server degrades to a graceful reply
-            # ("the data server seems unreachable") instead of crashing the turn.
-            return {"error": f"Could not reach the data server: {error}"}
-        if not isinstance(file_paths, list):
-            return {"error": f"Unexpected listing result: {file_paths!r}"}
-        return {
-            "total_files": len(file_paths),
-            "file_paths": file_paths[:_DISCOVER_RESULT_LIMIT],
-            "truncated": len(file_paths) > _DISCOVER_RESULT_LIMIT,
-        }
+            if isinstance(result, dict) and result.get("status") == "offline":
+                return connection.device_label, result
+            if not isinstance(result, list):
+                return connection.device_label, {
+                    "error": f"Unexpected listing result: {result!r}"
+                }
+            return connection.device_label, {
+                "total_files": len(result),
+                "file_paths": result[:_DISCOVER_RESULT_LIMIT],
+                "truncated": len(result) > _DISCOVER_RESULT_LIMIT,
+            }
+
+        # Legs run concurrently so the call costs one device's latency rather
+        # than the sum across every connected machine.
+        outcomes = await asyncio.gather(
+            *(list_one(connection) for connection in selected)
+        )
+        return {"devices": dict(outcomes)}
 
     @tool
-    async def preview_data_file(file_path: str, n_rows: int = 5) -> Any:
-        """Preview the first rows of one CSV or JSON file on the host.
+    async def preview_data_file(
+        file_path: str, n_rows: int = 5, device_label: str | None = None
+    ) -> Any:
+        """Preview the first rows of one CSV or JSON file on one machine.
 
         Use this tool to inspect a file's structure (columns, nesting)
-        before deciding to ingest the file.
+        before deciding to ingest the file. The machine holding the file is
+        worked out from the path; name the machine explicitly only when the
+        result says the path was ambiguous.
 
         Args:
             file_path: Absolute host path of the file to preview.
             n_rows: Number of rows to preview.
+            device_label: Optional name of the machine holding the file.
         """
-        try:
-            return await call_mcp_filesystem_tool(
-                connection,
-                "preview_data",
-                {"file_path": file_path, "n_rows": n_rows},
-            )
-        except Exception as error:
-            return {"error": f"Could not reach the data server: {error}"}
+        connection, error = _device_for_path(file_path, device_label)
+        if error is not None:
+            return error
+        return await _call_one_device(
+            connection,
+            "preview_data",
+            {"file_path": file_path, "n_rows": n_rows},
+            fanout_timeout_seconds,
+        )
 
     @tool
     async def ingest_data_files(
         file_paths: list[str],
+        device_label: str | None = None,
         runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
     ) -> dict[str, Any]:
         """Copy host data files into the analysis workspace and the persistent buffer.
 
-        For each host file: the file's bytes are fetched from the host,
-        written into the workspace directory "work/" (so shell commands can
-        read the file with a relative path like "work/health1.json"), and —
-        for text files — saved into the persistent per-avatar buffer under
-        "/data_ingested/" so future conversations can reuse the data without
-        re-fetching. Files that have not changed on the host since the last
-        ingest are served from the buffer instead of being re-fetched;
-        files whose host modification time changed are re-fetched and the
-        buffered copy is overwritten. Binary files (for example images) are
+        For each host file: the file's bytes are fetched from the machine that
+        holds the file, written into the workspace directory "work/" (so shell
+        commands can read the file with a relative path like
+        "work/health1.json"), and — for text files — saved into the persistent
+        per-avatar buffer under "/data_ingested/" so future conversations can
+        reuse the data without re-fetching. Files that have not changed on the
+        host since the last ingest are served from the buffer instead of being
+        re-fetched; files whose host modification time changed are re-fetched and
+        the buffered copy is overwritten. Binary files (for example images) are
         placed in the workspace only and are not persisted.
+
+        Paths from different machines may be mixed in one call: the machine
+        holding each file is worked out from that file's path.
 
         Args:
             file_paths: Absolute host paths of the files to ingest.
+            device_label: Optional name of the machine holding every listed
+                file. Omit unless a previous result said a path was ambiguous.
         """
         max_bytes = int(context.data_analysis_store_max_bytes)
         ingested: list[str] = []
@@ -375,6 +530,10 @@ def build_data_analysis_tools(
             basename_counts[name] = basename_counts.get(name, 0) + 1
 
         async def ingest_one(source_path: str) -> None:
+            connection, resolution_error = _device_for_path(source_path, device_label)
+            if resolution_error is not None:
+                errors.append(f"{source_path}: {resolution_error['error']}")
+                return
             try:
                 file_info = await call_mcp_filesystem_tool(
                     connection, "get_file_info", {"file_path": source_path}
@@ -396,21 +555,15 @@ def build_data_analysis_tools(
                     existing_item = await runtime.store.aget(namespace, store_key)
                 else:
                     provisional_key = _store_key_for_source(source_path, None)
-                    existing_item = await runtime.store.aget(
-                        namespace, provisional_key
-                    )
+                    existing_item = await runtime.store.aget(namespace, provisional_key)
                     existing_source_path = (
                         (existing_item.value or {}).get("source_path")
                         if existing_item is not None
                         else None
                     )
-                    store_key = _store_key_for_source(
-                        source_path, existing_source_path
-                    )
+                    store_key = _store_key_for_source(source_path, existing_source_path)
                     if store_key != provisional_key:
-                        existing_item = await runtime.store.aget(
-                            namespace, store_key
-                        )
+                        existing_item = await runtime.store.aget(namespace, store_key)
 
                 if (
                     existing_item is not None
@@ -458,6 +611,11 @@ def build_data_analysis_tools(
                         "source_path": source_path,
                         "source_modified_at": source_modified_at,
                         "size_bytes": size_bytes,
+                        # Which machine the data came from, so a later
+                        # conversation reading the buffer can still attribute
+                        # the data to a machine without re-contacting the host.
+                        "device_id": connection.device_id,
+                        "device_label": connection.device_label,
                     },
                 )
                 ingested.append(source_path)
@@ -566,6 +724,10 @@ def build_data_analysis_tools(
                     "source_path": (item.value or {}).get("source_path"),
                     "source_modified_at": (item.value or {}).get("source_modified_at"),
                     "size_bytes": (item.value or {}).get("size_bytes"),
+                    # Absent for data ingested before machines were tracked
+                    # individually; the model reports the machine only when the
+                    # machine is known.
+                    "device_label": (item.value or {}).get("device_label"),
                 }
                 for item in ingested_items
             ],
@@ -583,42 +745,74 @@ def build_data_analysis_tools(
     async def check_data_server_connection(
         runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
     ) -> dict[str, Any]:
-        """Report the current Neural Nexus MCP data-server connection.
+        """Report which machines are connected through Neural Nexus.
 
         Use this tool to answer natural-language questions like "are you
-        connected to the MCP server / Neural Nexus server / my data server?".
-        This tool set is present only while a connection is established, so a
-        successful call means "connected". The result deliberately carries no
-        server address or directory details — never reveal those in the chat.
+        connected to the MCP server / Neural Nexus server / my data server?" and
+        "which of my machines can you see?". Report the machines by name and say
+        which are currently reachable. The result deliberately carries no server
+        address, port, or directory details — never reveal those in the chat.
         """
+        from src.anubis.utils.tools.data_analysis import relay
+
         return {
             "connected": True,
             "server": "Neural Nexus MCP data server",
+            "device_count": len(connections),
+            "devices": [
+                {
+                    "device_label": connection.device_label,
+                    "platform": connection.platform,
+                    "online": relay.is_online(connection.device_id),
+                }
+                for connection in connections
+            ],
         }
 
     @tool
     async def disconnect_data_server(
+        device_label: str | None = None,
         runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
     ) -> dict[str, Any]:
-        """Disconnect this avatar from the Neural Nexus MCP data server.
+        """Disconnect one machine, or every machine, from this avatar.
 
         Use this tool when the user asks in natural language to disconnect,
-        unlink, or forget the data server (for example "disconnect from the
-        Neural Nexus server"). It deletes the saved connection so future turns
-        no longer have data-analysis tools. Automatic connection offers stay
-        suppressed after an explicit disconnect; the user can reconnect at any
-        time by asking to connect (the connect_data_server tool).
+        unlink, or forget a machine or the data server (for example "disconnect
+        from the Neural Nexus server" or "disconnect my phone"). Name the machine
+        when the user named one; omit the name to disconnect every machine.
+
+        A disconnected machine stays disconnected — it is not picked up again
+        automatically — until the user asks to connect it (the connect_data_server
+        tool).
+
+        Args:
+            device_label: Optional name of a single machine to disconnect. Omit
+                to disconnect every connected machine.
         """
-        cleared = await clear_user_connection(runtime.store, user_id)
-        # Suppress the automatic re-offer: the user just said "disconnect" —
-        # immediately asking "connect?" again on the next message would nag.
-        # An explicit "connect" request clears this marker again.
-        await mark_declined(runtime.store, user_id, assistant_id, connection)
+        selected, error = _select_devices(connections, device_label)
+        if error is not None:
+            return error
+
+        removed_labels: list[str] = []
+        for connection in selected:
+            removed = await clear_user_connection(
+                runtime.store, user_id, connection.device_id
+            )
+            if removed:
+                removed_labels.append(connection.device_label)
+            # Suppress automatic re-adoption: the user just said "disconnect",
+            # and without this marker the next conversation turn would silently
+            # bind the machine again. An explicit "connect" clears the marker.
+            await mark_declined(runtime.store, user_id, assistant_id, connection)
+
         return {
-            "disconnected": cleared,
+            "disconnected": bool(removed_labels),
+            "disconnected_devices": removed_labels,
             "message": (
-                "Disconnected from the Neural Nexus MCP data server."
-                if cleared
+                "Disconnected from the Neural Nexus MCP data server on "
+                + ", ".join(removed_labels)
+                + "."
+                if removed_labels
                 else "No active connection was found to disconnect."
             ),
         }
@@ -635,39 +829,47 @@ def build_data_analysis_tools(
     ]
 
 
-def build_connect_tool(
-    context: GlobalContext, user_id: str, assistant_id: str
-) -> Any:
-    """Build the single tool an UNCONNECTED owned avatar carries: explicit connect.
+def build_connect_tool(context: GlobalContext, user_id: str, assistant_id: str) -> Any:
+    """Build the explicit-connect tool the personal avatar always carries.
 
-    The automatic discovery offer (the ``mcp_discovery`` consent interrupt) is
-    suppressed after a decline or an explicit disconnect — but a user saying
-    "connect to the Neural Nexus MCP server" must always work. This tool
-    discovers the announced server (bypassing the discovery failure backoff,
-    because the user may have just started the server), saves the single
-    per-user connection bound to this avatar, and clears the decline marker so
-    automatic offers resume.
+    Devices are adopted automatically (``mcp_auto_adopt``), but adoption is
+    suppressed for a machine the user explicitly disconnected — so a user saying
+    "connect my laptop again" must always work. This tool resolves every
+    reachable machine (bypassing the discovery failure backoff, because the user
+    may have just started a daemon), binds them to this avatar, and clears the
+    suppression markers so automatic adoption resumes.
+
+    The tool is attached even when machines are already connected, because with
+    several machines a user can have one connected and another suppressed.
     """
 
     @tool
     async def connect_data_server(
+        device_label: str | None = None,
         runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
     ) -> dict[str, Any]:
-        """Connect this avatar to the Neural Nexus MCP data server.
+        """Connect this avatar to the user's Neural Nexus machines.
 
         Use this tool when the user asks in natural language to connect,
-        reconnect, or link the Neural Nexus MCP data server (for example
-        "please connect to the Neural Nexus MCP Server"). Never reveal server
-        addresses or directory paths in the reply — confirm the connection by
-        name only.
+        reconnect, or link a machine or the Neural Nexus MCP data server (for
+        example "please connect to the Neural Nexus MCP Server" or "reconnect my
+        desktop"). Never reveal server addresses, ports, or directory paths in
+        the reply — confirm each connection by machine name only.
+
+        Args:
+            device_label: Optional name of a single machine to connect. Omit to
+                connect every machine that is currently reachable.
         """
-        connection = await resolve_available_connection(
+        available = await resolve_available_connections(
             runtime.store,
             user_id,
             context,
             ignore_failure_backoff=True,
         )
-        if connection is None:
+        selected, error = _select_devices(available, device_label)
+        if error is not None:
+            return error
+        if not selected:
             return {
                 "connected": False,
                 "message": (
@@ -675,15 +877,27 @@ def build_connect_tool(
                     "Confirm the server is running, then ask to connect again."
                 ),
             }
-        await save_user_connection(
-            runtime.store, user_id, connection=connection, assistant_id=assistant_id
-        )
-        await clear_declined(runtime.store, user_id, assistant_id)
+
+        connected_labels: list[str] = []
+        for connection in selected:
+            await save_user_connection(
+                runtime.store,
+                user_id,
+                connection=connection,
+                assistant_id=assistant_id,
+            )
+            await clear_declined(
+                runtime.store, user_id, assistant_id, connection.device_id
+            )
+            connected_labels.append(connection.device_label)
+
         return {
             "connected": True,
+            "connected_devices": connected_labels,
             "message": (
-                "Connected to the Neural Nexus MCP data server. "
-                "Data analysis is available from the next message onward."
+                "Connected to the Neural Nexus MCP data server on "
+                + ", ".join(connected_labels)
+                + ". Data analysis is available from the next message onward."
             ),
         }
 

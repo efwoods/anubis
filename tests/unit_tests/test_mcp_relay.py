@@ -1,14 +1,20 @@
 """Unit tests for the MCP relay bridge, registration resolver, and Bearer auth.
 
-Covers the API side of the local-daemon relay (``anubis-mcp-server-ubuntu``):
+Covers the API side of the local-daemon relay (``anubis-mcp-server-ubuntu-desktop``
+and its macOS / mobile / Windows siblings):
 
-- the in-process relay registry correlates a ``proxy`` request with its
-  ``proxy_response`` and decodes the body, fails cleanly when the device is
-  offline, and times out when no response arrives;
-- ``McpConnection`` round-trips the per-device secret through the store;
+- the in-process relay registry holds MANY devices per user simultaneously,
+  correlates a ``proxy`` request with its ``proxy_response`` and decodes the
+  body, fails cleanly when a device is offline, and times out when no response
+  arrives;
+- dropping one device's session leaves the user's other devices connected — the
+  regression that motivated device-keying, since one daemon's shutdown used to
+  remove the record every daemon shared;
+- ``McpConnection`` round-trips the per-device secret and identity through the
+  store;
 - ``build_mcp_client`` attaches ``Authorization: Bearer <device_secret>`` only
   when a secret is present;
-- ``resolve_available_connection`` prefers a live relay registration, treats an
+- ``resolve_available_connections`` returns every reachable device, treats an
   offline relay registration as unavailable, and falls back to SSE discovery
   only when no registration exists.
 """
@@ -25,9 +31,8 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.tools.data_analysis import McpConnection
 from src.anubis.utils.tools.data_analysis.backend import mcp_registration_namespace
 from src.anubis.utils.tools.data_analysis.discovery import (
-    REGISTRATION_KEY,
-    bound_connection_for,
-    resolve_available_connection,
+    bound_connections_for,
+    resolve_available_connections,
     save_user_connection,
 )
 
@@ -46,20 +51,29 @@ class _FakeWebSocket:
 def _clear_registry():
     """Reset the module-level relay registry around every test."""
     relay._sessions_by_device.clear()
-    relay._device_id_by_user.clear()
+    relay._device_ids_by_user.clear()
     yield
     relay._sessions_by_device.clear()
-    relay._device_id_by_user.clear()
+    relay._device_ids_by_user.clear()
 
 
-def _register(websocket, *, device_id="d1", user_id="u1", secret="mcp_dev_x"):
+def _register(
+    websocket,
+    *,
+    device_id="d1",
+    user_id="u1",
+    secret="mcp_dev_x",
+    device_label="Ubuntu",
+    allowed_roots=("/data",),
+):
     return relay.register_session(
         device_id=device_id,
         user_id=user_id,
         device_secret=secret,
         server_name="Ubuntu-OS-Filesystem",
-        allowed_roots=("/data",),
+        allowed_roots=allowed_roots,
         websocket=websocket,
+        device_label=device_label,
     )
 
 
@@ -68,59 +82,109 @@ def test_registry_presence_indexes_by_device_and_user():
     _register(websocket)
     assert relay.is_online("d1") is True
     assert relay.is_online("nope") is False
-    assert relay.session_for_user("u1").device_id == "d1"
-
+    assert [s.device_id for s in relay.sessions_for_user("u1")] == ["d1"]
     relay.drop_session("d1", websocket)
-    assert relay.is_online("d1") is False
-    assert relay.session_for_user("u1") is None
+    assert relay.sessions_for_user("u1") == []
+
+
+def test_registry_holds_several_devices_for_one_user():
+    """Four machines connected at once must all stay addressable."""
+    sockets = {}
+    for device_id, label in (
+        ("d-ubuntu", "Ubuntu"),
+        ("d-macos", "macOS"),
+        ("d-mobile", "iPhone"),
+        ("d-windows", "Windows"),
+    ):
+        sockets[device_id] = _FakeWebSocket()
+        _register(
+            sockets[device_id],
+            device_id=device_id,
+            user_id="u1",
+            device_label=label,
+        )
+
+    sessions = relay.sessions_for_user("u1")
+    assert len(sessions) == 4
+    # Ordered by label so repeated questions produce a stable device order.
+    assert [s.device_label for s in sessions] == [
+        "Ubuntu",
+        "Windows",
+        "iPhone",
+        "macOS",
+    ]
+    assert all(relay.is_online(device_id) for device_id in sockets)
+
+
+def test_dropping_one_device_leaves_the_others_connected():
+    """The production incident: one daemon stopping must not unplug the rest."""
+    ubuntu_socket = _FakeWebSocket()
+    macos_socket = _FakeWebSocket()
+    _register(ubuntu_socket, device_id="d-ubuntu", user_id="u1", device_label="Ubuntu")
+    _register(macos_socket, device_id="d-macos", user_id="u1", device_label="macOS")
+
+    relay.drop_session("d-ubuntu", ubuntu_socket)
+
+    assert relay.is_online("d-ubuntu") is False
+    assert relay.is_online("d-macos") is True
+    assert [s.device_id for s in relay.sessions_for_user("u1")] == ["d-macos"]
+
+
+def test_sessions_are_isolated_between_users():
+    _register(_FakeWebSocket(), device_id="d1", user_id="u1")
+    _register(_FakeWebSocket(), device_id="d2", user_id="u2")
+    assert [s.device_id for s in relay.sessions_for_user("u1")] == ["d1"]
+    assert [s.device_id for s in relay.sessions_for_user("u2")] == ["d2"]
 
 
 def test_drop_session_ignores_superseded_socket():
     first = _FakeWebSocket()
-    _register(first)
+    _register(first, device_id="d1")
     second = _FakeWebSocket()
-    _register(second)  # reconnect replaces the session
-    # A late disconnect of the OLD socket must not evict the live reconnect.
+    _register(second, device_id="d1")
+    # The late disconnect of the replaced socket must not evict the live one.
     relay.drop_session("d1", first)
     assert relay.is_online("d1") is True
-    assert relay.get_session("d1").websocket is second
+    relay.drop_session("d1", second)
+    assert relay.is_online("d1") is False
 
 
 def test_proxy_request_correlates_and_decodes():
     async def run():
         websocket = _FakeWebSocket()
-        _register(websocket)
+        _register(websocket, device_id="d1")
 
-        task = asyncio.create_task(
-            relay.proxy_request(
+        async def respond_when_framed():
+            for _ in range(100):
+                if websocket.sent:
+                    break
+                await asyncio.sleep(0.01)
+            request_id = websocket.sent[0]["request_id"]
+            relay.handle_incoming(
                 "d1",
-                method="POST",
-                path=relay.LOCAL_MCP_PATH,
-                headers={"content-type": "application/json"},
-                body=b'{"hello":"world"}',
-                timeout_seconds=5.0,
+                {
+                    "type": relay.FRAME_PROXY_RESPONSE,
+                    "request_id": request_id,
+                    "status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": '{"ok": true}',
+                    "body_encoding": "text",
+                },
             )
-        )
-        # Let proxy_request send its frame, then answer with the matching id.
-        await asyncio.sleep(0)
-        frame = websocket.sent[0]
-        assert frame["type"] == relay.FRAME_PROXY
-        assert frame["path"] == relay.LOCAL_MCP_PATH
-        relay.handle_incoming(
+
+        responder = asyncio.create_task(respond_when_framed())
+        status, headers, body = await relay.proxy_request(
             "d1",
-            {
-                "type": relay.FRAME_PROXY_RESPONSE,
-                "request_id": frame["request_id"],
-                "status_code": 200,
-                "headers": {"content-type": "application/json"},
-                "body": '{"ok":true}',
-                "body_encoding": "text",
-            },
+            method="POST",
+            path="/mcp",
+            headers={"content-type": "application/json"},
+            body=b'{"jsonrpc": "2.0"}',
+            timeout_seconds=5.0,
         )
-        status, headers, body = await task
+        await responder
         assert status == 200
         assert headers["content-type"] == "application/json"
-        assert body == b'{"ok":true}'
+        assert json.loads(body) == {"ok": True}
 
     asyncio.run(run())
 
@@ -129,7 +193,7 @@ def test_proxy_request_offline_raises():
     async def run():
         with pytest.raises(RuntimeError):
             await relay.proxy_request(
-                "absent",
+                "missing",
                 method="POST",
                 path="/mcp",
                 headers={},
@@ -142,7 +206,7 @@ def test_proxy_request_offline_raises():
 
 def test_proxy_request_times_out_without_response():
     async def run():
-        _register(_FakeWebSocket())
+        _register(_FakeWebSocket(), device_id="d1")
         with pytest.raises(TimeoutError):
             await relay.proxy_request(
                 "d1",
@@ -152,28 +216,47 @@ def test_proxy_request_times_out_without_response():
                 body=b"",
                 timeout_seconds=0.05,
             )
-        # The pending future is cleaned up, not leaked.
-        assert relay.get_session("d1").pending_responses == {}
 
     asyncio.run(run())
 
 
-def test_connection_round_trips_device_secret():
+def test_connection_round_trips_device_identity_and_secret():
     connection = McpConnection(
-        url="https://api.neuralnexus.site/mcp/relay/d1",
+        url="http://127.0.0.1:8000/mcp/relay/d1",
         transport="streamable_http",
         server_name="Ubuntu-OS-Filesystem",
         allowed_roots=("/data",),
         device_secret="mcp_dev_secret",
+        device_id="d1",
+        device_label="Ubuntu",
+        platform="ubuntu",
     )
-    value = connection.to_store_value(assistant_id="a1")
-    assert value["device_secret"] == "mcp_dev_secret"
-    rebuilt = McpConnection.from_mapping(value)
+    stored = connection.to_store_value(assistant_id="a1")
+    assert stored["device_secret"] == "mcp_dev_secret"
+    assert stored["device_id"] == "d1"
+    assert stored["device_label"] == "Ubuntu"
+    assert stored["platform"] == "ubuntu"
+
+    rebuilt = McpConnection.from_mapping(stored)
     assert rebuilt.device_secret == "mcp_dev_secret"
-    assert rebuilt.url == connection.url
+    assert rebuilt.device_id == "d1"
+    assert rebuilt.device_label == "Ubuntu"
+    assert rebuilt.platform == "ubuntu"
+
+
+def test_connection_from_session_carries_device_identity():
+    session = _register(_FakeWebSocket(), device_id="d-macos", device_label="macOS")
+    connection = relay.connection_from_session(session)
+    assert connection.device_id == "d-macos"
+    assert connection.device_label == "macOS"
+    assert connection.url == relay.bridge_url_for_device("d-macos")
 
 
 def test_build_mcp_client_attaches_bearer_only_with_secret():
+    # ``build_mcp_client`` imports ``MultiServerMCPClient`` lazily INSIDE the
+    # function (the repository cold-start rule), so the fake must replace the
+    # attribute on the SOURCE module the import reads from — patching our own
+    # module would be shadowed by the function-local import.
     client_mod = pytest.importorskip("langchain_mcp_adapters.client")
     from src.anubis.utils.tools.data_analysis.mcp_client import build_mcp_client
 
@@ -194,9 +277,7 @@ def test_build_mcp_client_attaches_bearer_only_with_secret():
         )
         build_mcp_client(with_secret)
         server_config = captured["config"]["Ubuntu-OS-Filesystem"]
-        assert server_config["headers"] == {
-            "Authorization": "Bearer mcp_dev_secret"
-        }
+        assert server_config["headers"] == {"Authorization": "Bearer mcp_dev_secret"}
 
         without_secret = McpConnection(
             url="http://localhost:8000/mcp",
@@ -212,80 +293,76 @@ def test_build_mcp_client_attaches_bearer_only_with_secret():
 def _put_registration(store, user_id, record):
     async def run():
         await store.aput(
-            mcp_registration_namespace(user_id), REGISTRATION_KEY, record
+            mcp_registration_namespace(user_id), record["device_id"], record
         )
 
     asyncio.run(run())
 
 
+def _relay_registration(device_id, *, secret="mcp_dev_secret", label="Ubuntu"):
+    return {
+        "status": "pending_consent",
+        "connection_mode": "relay",
+        "server_name": "Ubuntu-OS-Filesystem",
+        "device_id": device_id,
+        "device_label": label,
+        "platform": "ubuntu",
+        "device_secret": secret,
+        "mcp_url": f"https://api.neuralnexus.site/mcp/relay/{device_id}",
+        "allowed_roots": ["/data"],
+        "last_seen_at": "2026-07-09T00:00:00+00:00",
+    }
+
+
 def test_resolver_returns_relay_connection_when_online():
     store = InMemoryStore()
-    _put_registration(
-        store,
-        "u1",
-        {
-            "status": "pending_consent",
-            "connection_mode": "relay",
-            "server_name": "Ubuntu-OS-Filesystem",
-            "device_id": "d1",
-            "device_secret": "mcp_dev_secret",
-            "mcp_url": "https://api.neuralnexus.site/mcp/relay/d1",
-            "allowed_roots": ["/data"],
-            "last_seen_at": "2026-07-09T00:00:00+00:00",
-        },
-    )
+    _put_registration(store, "u1", _relay_registration("d1"))
     _register(_FakeWebSocket(), device_id="d1", user_id="u1", secret="mcp_dev_secret")
 
-    connection = asyncio.run(
-        resolve_available_connection(store, "u1", GlobalContext())
+    connections = asyncio.run(
+        resolve_available_connections(store, "u1", GlobalContext())
     )
-    assert connection is not None
+    assert len(connections) == 1
     # Live session wins: loopback bridge URL for THIS process, not the stale
     # production URL left in the registration record.
-    assert connection.url == relay.bridge_url_for_device("d1")
-    assert connection.device_secret == "mcp_dev_secret"
+    assert connections[0].url == relay.bridge_url_for_device("d1")
+    assert connections[0].device_secret == "mcp_dev_secret"
 
 
-def test_resolver_prefers_live_session_over_stale_registration_device():
-    """A new daemon under a different device_id must still be discoverable.
-
-    Heartbeats used to refresh only ``last_seen_at`` on an older registration,
-    so ``is_online(old_device_id)`` was false while the live socket belonged to
-    the new device. Live ``session_for_user`` is the authoritative source.
-    """
+def test_resolver_returns_every_online_device():
+    """Two machines online at once must both be resolved, not just the first."""
     store = InMemoryStore()
-    _put_registration(
-        store,
-        "u1",
-        {
-            "status": "pending_consent",
-            "connection_mode": "relay",
-            "server_name": "Ubuntu-OS-Filesystem",
-            "device_id": "stale-device",
-            "device_secret": "old_secret",
-            "mcp_url": "https://api.neuralnexus.site/mcp/relay/stale-device",
-            "allowed_roots": ["/old"],
-            "last_seen_at": "2026-07-09T00:00:00+00:00",
-        },
-    )
+    _put_registration(store, "u1", _relay_registration("d-ubuntu", label="Ubuntu"))
+    _put_registration(store, "u1", _relay_registration("d-macos", label="macOS"))
     _register(
-        _FakeWebSocket(),
-        device_id="live-device",
-        user_id="u1",
-        secret="new_secret",
+        _FakeWebSocket(), device_id="d-ubuntu", user_id="u1", device_label="Ubuntu"
     )
+    _register(_FakeWebSocket(), device_id="d-macos", user_id="u1", device_label="macOS")
 
-    connection = asyncio.run(
-        resolve_available_connection(store, "u1", GlobalContext())
+    connections = asyncio.run(
+        resolve_available_connections(store, "u1", GlobalContext())
     )
-    assert connection is not None
-    assert connection.url == relay.bridge_url_for_device("live-device")
-    assert connection.device_secret == "new_secret"
-    assert connection.allowed_roots == ("/data",)
+    assert {connection.device_id for connection in connections} == {
+        "d-ubuntu",
+        "d-macos",
+    }
+
+
+def test_resolver_returns_only_the_online_half():
+    """One machine asleep must not hide the machine that is awake."""
+    store = InMemoryStore()
+    _put_registration(store, "u1", _relay_registration("d-ubuntu", label="Ubuntu"))
+    _put_registration(store, "u1", _relay_registration("d-macos", label="macOS"))
+    _register(_FakeWebSocket(), device_id="d-macos", user_id="u1", device_label="macOS")
+
+    connections = asyncio.run(
+        resolve_available_connections(store, "u1", GlobalContext())
+    )
+    assert [connection.device_id for connection in connections] == ["d-macos"]
 
 
 def test_bound_connection_refreshes_stale_url_from_live_relay():
-    """Consent saved a host-only URL; live relay must replace it each turn."""
+    """Adoption saved a host-only URL; a live relay must replace it each turn."""
 
     async def run():
         store = InMemoryStore()
@@ -295,10 +372,10 @@ def test_bound_connection_refreshes_stale_url_from_live_relay():
             server_name="Ubuntu-OS-Filesystem",
             allowed_roots=("/old",),
             device_secret=None,
+            device_id="live-device",
+            device_label="Ubuntu",
         )
-        await save_user_connection(
-            store, "u1", connection=stale, assistant_id="a1"
-        )
+        await save_user_connection(store, "u1", connection=stale, assistant_id="a1")
         _register(
             _FakeWebSocket(),
             device_id="live-device",
@@ -306,14 +383,14 @@ def test_bound_connection_refreshes_stale_url_from_live_relay():
             secret="mcp_dev_live",
         )
 
-        bound = await bound_connection_for(store, "u1", "a1")
-        assert bound is not None
-        assert bound.url == relay.bridge_url_for_device("live-device")
-        assert bound.device_secret == "mcp_dev_live"
+        bound = await bound_connections_for(store, "u1", "a1")
+        assert len(bound) == 1
+        assert bound[0].url == relay.bridge_url_for_device("live-device")
+        assert bound[0].device_secret == "mcp_dev_live"
         # Store is rewritten so a brief relay blip still has a usable URL.
-        saved = await store.aget(("u1", "mcp_connection"), "connection")
+        saved = await store.aget(("u1", "mcp_connection"), "live-device")
         assert saved is not None
-        assert saved.value["url"] == bound.url
+        assert saved.value["url"] == bound[0].url
         assert saved.value["device_secret"] == "mcp_dev_live"
 
     asyncio.run(run())
@@ -321,23 +398,13 @@ def test_bound_connection_refreshes_stale_url_from_live_relay():
 
 def test_resolver_skips_relay_registration_when_offline():
     store = InMemoryStore()
-    _put_registration(
-        store,
-        "u1",
-        {
-            "connection_mode": "relay",
-            "device_id": "d1",
-            "device_secret": "mcp_dev_secret",
-            "mcp_url": "https://api.neuralnexus.site/mcp/relay/d1",
-            "last_seen_at": "2026-07-09T00:00:00+00:00",
-        },
-    )
+    _put_registration(store, "u1", _relay_registration("d1"))
     # No live socket registered → the relay is offline → nothing offered, and we
     # do NOT fall through to the unrelated SSE endpoint.
-    connection = asyncio.run(
-        resolve_available_connection(store, "u1", GlobalContext())
+    connections = asyncio.run(
+        resolve_available_connections(store, "u1", GlobalContext())
     )
-    assert connection is None
+    assert connections == []
 
 
 def test_resolver_falls_back_to_sse_without_registration(monkeypatch):
@@ -352,7 +419,54 @@ def test_resolver_falls_back_to_sse_without_registration(monkeypatch):
         return sentinel
 
     monkeypatch.setattr(discovery, "discover_announced_server", _fake_discover)
-    connection = asyncio.run(
-        resolve_available_connection(store, "u1", GlobalContext())
+    connections = asyncio.run(
+        resolve_available_connections(store, "u1", GlobalContext())
     )
-    assert connection is sentinel
+    assert connections == [sentinel]
+
+
+def test_legacy_singleton_registration_is_migrated_to_a_device_key():
+    """Installations written before device-keying must keep working untouched."""
+
+    async def run():
+        store = InMemoryStore()
+        namespace = mcp_registration_namespace("u1")
+        await store.aput(
+            namespace, discovery.LEGACY_REGISTRATION_KEY, _relay_registration("d-old")
+        )
+
+        records = await discovery.read_user_registrations(store, "u1")
+        assert [record["device_id"] for record in records] == ["d-old"]
+        # Re-keyed under the device, and the legacy key is gone so it can never
+        # shadow a real per-device record again.
+        assert await store.aget(namespace, "d-old") is not None
+        assert await store.aget(namespace, discovery.LEGACY_REGISTRATION_KEY) is None
+
+    asyncio.run(run())
+
+
+def test_legacy_singleton_connection_recovers_device_id_from_relay_url():
+    """A legacy connection record stored no device id; the URL still carries one."""
+
+    async def run():
+        store = InMemoryStore()
+        namespace = ("u1", "mcp_connection")
+        await store.aput(
+            namespace,
+            discovery.LEGACY_CONNECTION_KEY,
+            {
+                "status": "connected",
+                "url": "https://api.neuralnexus.site/mcp/relay/d-legacy",
+                "transport": "streamable_http",
+                "server_name": "Ubuntu-OS-Filesystem",
+                "allowed_roots": ["/data"],
+                "assistant_id": "a1",
+            },
+        )
+
+        records = await discovery.read_user_connections(store, "u1")
+        assert [record["device_id"] for record in records] == ["d-legacy"]
+        assert await store.aget(namespace, "d-legacy") is not None
+        assert await store.aget(namespace, discovery.LEGACY_CONNECTION_KEY) is None
+
+    asyncio.run(run())

@@ -1,20 +1,31 @@
-"""MCP server discovery and per-user connection persistence.
+"""Model Context Protocol device discovery and per-device connection persistence.
 
 The avatar does not read a hard-coded Model Context Protocol server URL. It
-*discovers* a server: the installed filesystem server announces itself over
-Server-Sent Events (``GET /discovery``), and this module subscribes to that
-channel, reads the announced connection details, and — once the user consents
-in chat — saves the connection so the personal avatar reuses it for every
-future query.
+*discovers* servers: each Neural Nexus daemon announces itself — by opening an
+outbound relay socket, by pushing a registration, or (co-located development
+only) over a Server-Sent-Events channel — and this module persists the resulting
+connections so the personal avatar reuses them on every future turn.
 
-Two persistence facts, both in the cross-thread LangGraph store:
+Three persistence facts, all in the cross-thread LangGraph store:
 
-- **The connection** is a *singleton per user*, bound to a *single avatar*
-  (namespace ``(user_id, "mcp_connection")``). Only the bound avatar receives
-  the data-analysis capability; the user's other avatars do not.
-- **A decline** is recorded *per avatar* (namespace
-  ``(user_id, assistant_id, "mcp_connection_declined")``) so declining on one
-  avatar never suppresses the offer on the user's other avatars.
+- **Connections** live in namespace ``(user_id, "mcp_connection")``, keyed by
+  ``device_id`` — one record per machine. Each record names the single avatar
+  the device is bound to; only that avatar receives the data-analysis
+  capability.
+- **Registrations** live in namespace ``(user_id, "mcp_registration")``, also
+  keyed by ``device_id``.
+- **Auto-adopt suppression** lives in namespace
+  ``(user_id, assistant_id, "mcp_connection_declined")``, keyed by ``device_id``,
+  so disconnecting the phone from one avatar affects neither the desktop nor the
+  user's other avatars.
+
+Every namespace previously held a single record under a constant key. That
+singleton is why a second machine silently replaced the first, and why a
+development daemon deleted the production registration in a shared store. The
+constant keys survive only as :data:`LEGACY_CONNECTION_KEY` and
+:data:`LEGACY_REGISTRATION_KEY`, which :func:`read_user_connections` and
+:func:`read_user_registrations` migrate to device keys on first read so existing
+installations need no manual step.
 
 The heavy ``httpx``/``httpx_sse`` imports are deferred into the discovery
 function per the repository cold-start rule.
@@ -35,17 +46,29 @@ from src.anubis.utils.tools.data_analysis.backend import (
     mcp_connection_namespace,
     mcp_registration_namespace,
 )
+from src.anubis.utils.tools.data_analysis.devices import (
+    UNKNOWN_DEVICE_LABEL,
+    UNKNOWN_PLATFORM,
+)
 
 logger = logging.getLogger(__name__)
 
-# Fixed key names inside the per-user / per-avatar namespaces (each namespace
-# holds exactly one record, so the key is a constant). ``CONNECTION_KEY`` is
-# public so the API's disconnect endpoint (which uses the langgraph_sdk
-# ``StoreClient`` HTTP API rather than the in-process ``BaseStore``) deletes
-# the same key this module writes.
-CONNECTION_KEY = "connection"
-_DECLINED_KEY = "declined"
-REGISTRATION_KEY = "registration"
+# The constant keys these namespaces used while each held exactly one record.
+# Retained ONLY so a record written before device-keying is migrated on read;
+# nothing writes these keys any more.
+LEGACY_CONNECTION_KEY = "connection"
+LEGACY_REGISTRATION_KEY = "registration"
+
+# Backwards-compatible aliases. ``webapp.py`` and the daemon-facing endpoints
+# imported these names while the records were singletons; keeping the aliases
+# avoids a flag-day rename across modules that no longer use a constant key.
+CONNECTION_KEY = LEGACY_CONNECTION_KEY
+REGISTRATION_KEY = LEGACY_REGISTRATION_KEY
+
+# Upper bound on records read from one namespace in a single search. A user with
+# more devices than this has hit ``data_analysis_max_devices_per_user`` many
+# times over; the bound only protects the store call from an unbounded scan.
+_DEVICE_SEARCH_LIMIT = 100
 
 # Timestamp of the most recent failed/empty discovery attempt, keyed by
 # discovery URL, so an absent server is not re-dialed on every conversation
@@ -56,10 +79,13 @@ _DISCOVERY_FAILURE_RETRY_SECONDS = 30.0
 
 @dataclass(frozen=True)
 class McpConnection:
-    """A resolved connection to a Model Context Protocol filesystem server.
+    """A resolved connection to one device's Model Context Protocol server.
 
-    Carries exactly what building the tool client needs. Constructed either
-    from a discovery announcement or from a saved store record.
+    Carries exactly what building the tool client needs, plus the device
+    identity the conversation needs in order to attribute a result to a machine
+    ("your Ubuntu desktop") rather than to an opaque device token. Constructed
+    either from a live relay session, a stored record, or a discovery
+    announcement.
     """
 
     url: str
@@ -71,9 +97,15 @@ class McpConnection:
     # relay/tunnel installs (the daemon generates it locally and registers it);
     # ``None`` for the co-located SSE-discovery dev path, which is unauthenticated.
     device_secret: str | None = None
+    # Device identity. ``device_id`` is the store key for this connection, so a
+    # connection without one cannot be saved; the SSE development path supplies
+    # a synthetic identifier (see :func:`discover_announced_server`).
+    device_id: str = ""
+    device_label: str = UNKNOWN_DEVICE_LABEL
+    platform: str = UNKNOWN_PLATFORM
 
     def to_store_value(self, *, assistant_id: str) -> dict[str, Any]:
-        """Serialize as the per-user connection record bound to one avatar."""
+        """Serialize as this device's connection record, bound to one avatar."""
         return {
             "status": "connected",
             "url": self.url,
@@ -81,6 +113,9 @@ class McpConnection:
             "server_name": self.server_name,
             "allowed_roots": list(self.allowed_roots),
             "device_secret": self.device_secret,
+            "device_id": self.device_id,
+            "device_label": self.device_label,
+            "platform": self.platform,
             "assistant_id": assistant_id,
             "connected_at": datetime.now(UTC).isoformat(),
         }
@@ -94,7 +129,27 @@ class McpConnection:
             server_name=value.get("server_name", "Ubuntu-OS-Filesystem"),
             allowed_roots=tuple(value.get("allowed_roots", []) or []),
             device_secret=value.get("device_secret"),
+            device_id=value.get("device_id") or "",
+            device_label=value.get("device_label") or UNKNOWN_DEVICE_LABEL,
+            platform=value.get("platform") or UNKNOWN_PLATFORM,
         )
+
+
+def device_id_from_relay_url(url: str) -> str:
+    """Recover a device identifier from a ``/mcp/relay/<device_id>`` bridge URL.
+
+    Used only when migrating a legacy singleton connection record, which was
+    written before ``device_id`` was stored alongside the connection. The relay
+    bridge URL always ends in the device identifier, so the identifier is
+    recoverable without contacting the daemon.
+
+    Returns an empty string for a non-relay URL (the co-located development
+    path), whose record the caller keys synthetically instead.
+    """
+    marker = "/mcp/relay/"
+    if marker not in url:
+        return ""
+    return url.rsplit(marker, 1)[-1].strip("/")
 
 
 async def discover_announced_server(
@@ -112,6 +167,11 @@ async def discover_announced_server(
     pass ``ignore_failure_backoff=True`` for an explicit user "connect"
     request, which should always dial (the user may have just started the
     server).
+
+    This is the co-located development path, which predates device identity: the
+    announcement carries no ``device_id``, so one is synthesized from the
+    announced URL. That keeps the record device-keyed like every other record
+    while remaining stable across turns for the same announced server.
     """
     last_failure = _discovery_last_failure_monotonic.get(discovery_url)
     if (
@@ -154,6 +214,7 @@ async def discover_announced_server(
         return None
 
     _discovery_last_failure_monotonic.pop(discovery_url, None)
+    connection = _ensure_device_identity(connection)
     logger.info(
         "Discovered Model Context Protocol server %r at %s (tools url %s)",
         connection.server_name,
@@ -163,17 +224,124 @@ async def discover_announced_server(
     return connection
 
 
-async def read_user_registration(store: Any, user_id: str) -> dict[str, Any] | None:
-    """Return the user's pending MCP daemon registration record, or ``None``.
+def _ensure_device_identity(connection: McpConnection) -> McpConnection:
+    """Fill in a device identifier and label for an announcement that lacks both.
 
-    Written by the daemon's ``POST /mcp/register`` call (see ``webapp.py``);
-    read by :func:`resolve_available_connection` to decide whether a server is
+    Announcements from the co-located Server-Sent-Events development path carry
+    no device identity. A store record must still be device-keyed, so derive a
+    stable identifier from the announced URL — stable meaning the same announced
+    server always maps to the same key, rather than accumulating one record per
+    conversation turn.
+    """
+    import hashlib
+
+    from src.anubis.utils.tools.data_analysis.devices import derive_device_identity
+
+    device_id = connection.device_id or device_id_from_relay_url(connection.url)
+    if not device_id:
+        device_id = (
+            "announced-" + hashlib.sha1(connection.url.encode("utf-8")).hexdigest()[:12]
+        )
+
+    device_label, platform = derive_device_identity(
+        {
+            "device_label": (
+                connection.device_label
+                if connection.device_label != UNKNOWN_DEVICE_LABEL
+                else ""
+            ),
+            "platform": (
+                connection.platform if connection.platform != UNKNOWN_PLATFORM else ""
+            ),
+            "server_name": connection.server_name,
+        }
+    )
+    return McpConnection(
+        url=connection.url,
+        transport=connection.transport,
+        server_name=connection.server_name,
+        allowed_roots=connection.allowed_roots,
+        device_secret=connection.device_secret,
+        device_id=device_id,
+        device_label=device_label,
+        platform=platform,
+    )
+
+
+async def _search_namespace(store: Any, namespace: tuple[str, ...]) -> list[Any]:
+    """List every item in a namespace, tolerating a store that has none."""
+    if store is None:
+        return []
+    try:
+        return list(await store.asearch(namespace, limit=_DEVICE_SEARCH_LIMIT))
+    except Exception:
+        logger.warning("Could not search store namespace %s", namespace, exc_info=True)
+        return []
+
+
+async def _read_device_keyed_records(
+    store: Any,
+    namespace: tuple[str, ...],
+    legacy_key: str,
+) -> list[dict[str, Any]]:
+    """Return every record in a device-keyed namespace, migrating legacy items.
+
+    A record written before device-keying sits under ``legacy_key``. Migration
+    re-writes that record under its own ``device_id`` and deletes the legacy
+    key, so the singleton disappears the first time any code path reads the
+    namespace and no operator step is needed. A legacy record whose value has no
+    ``device_id`` recovers one from its relay bridge URL.
+    """
+    records: list[dict[str, Any]] = []
+    for item in await _search_namespace(store, namespace):
+        value = item.value or {}
+        if item.key != legacy_key:
+            records.append(value)
+            continue
+
+        device_id = value.get("device_id") or device_id_from_relay_url(
+            str(value.get("url") or value.get("mcp_url") or "")
+        )
+        if not device_id:
+            # Nothing identifies this device, so re-keying is impossible. Drop
+            # the record rather than leave a singleton that would keep shadowing
+            # real per-device records; the daemon re-registers within one
+            # heartbeat interval.
+            logger.info(
+                "Discarding unidentifiable legacy record in namespace %s", namespace
+            )
+            await store.adelete(namespace, legacy_key)
+            continue
+
+        value["device_id"] = device_id
+        await store.aput(namespace, key=device_id, value=value)
+        await store.adelete(namespace, legacy_key)
+        logger.info(
+            "Migrated legacy singleton record in namespace %s to device key %s",
+            namespace,
+            device_id,
+        )
+        records.append(value)
+    return records
+
+
+async def read_user_registrations(store: Any, user_id: str) -> list[dict[str, Any]]:
+    """Return every daemon registration record for a user, one per device.
+
+    Written by each daemon's ``POST /mcp/register`` call (see ``webapp.py``);
+    read by :func:`resolve_available_connections` to decide which devices are
     reachable this turn without dialing the co-located SSE endpoint.
     """
-    if store is None:
-        return None
-    item = await store.aget(mcp_registration_namespace(user_id), REGISTRATION_KEY)
-    return None if item is None else (item.value or None)
+    return await _read_device_keyed_records(
+        store, mcp_registration_namespace(user_id), LEGACY_REGISTRATION_KEY
+    )
+
+
+async def read_user_connections(store: Any, user_id: str) -> list[dict[str, Any]]:
+    """Return every saved connection record for a user, one per device."""
+    return await _read_device_keyed_records(
+        store, mcp_connection_namespace(user_id), LEGACY_CONNECTION_KEY
+    )
 
 
 def _connection_from_registration(record: dict[str, Any]) -> McpConnection:
@@ -190,6 +358,9 @@ def _connection_from_registration(record: dict[str, Any]) -> McpConnection:
         server_name=record.get("server_name", "Ubuntu-OS-Filesystem"),
         allowed_roots=tuple(record.get("allowed_roots", []) or []),
         device_secret=record.get("device_secret"),
+        device_id=record.get("device_id") or "",
+        device_label=record.get("device_label") or UNKNOWN_DEVICE_LABEL,
+        platform=record.get("platform") or UNKNOWN_PLATFORM,
     )
 
 
@@ -211,68 +382,69 @@ def _registration_is_fresh(record: dict[str, Any], stale_seconds: float) -> bool
     return (datetime.now(UTC) - last_seen_at).total_seconds() <= stale_seconds
 
 
-async def resolve_available_connection(
+async def resolve_available_connections(
     store: Any,
     user_id: str,
     context: Any,
     *,
     ignore_failure_backoff: bool = False,
-) -> McpConnection | None:
-    """Find a currently-reachable MCP server for a user, or ``None``.
+) -> list[McpConnection]:
+    """Find every currently-reachable device for a user.
 
-    Resolution order, replacing the old single global SSE dial so that remote
-    (relay/tunnel) installs work, while co-located dev still functions:
+    Resolution order, applied across all of the user's devices rather than
+    stopping at the first hit:
 
-    1. **Live relay socket** for this user (authoritative). The in-process
-       registry wins over a stale store registration — e.g. when a new local
-       daemon reconnects under a different ``device_id`` while heartbeats only
-       refreshed ``last_seen_at`` on an older record.
-    2. **Pending registration** (the daemon pushed its presence to this API).
-       For ``relay`` mode presence still requires a live socket for the stored
-       ``device_id``; for ``tunnel``/``local`` modes presence is inferred from
-       a fresh heartbeat. Either way the stored ``mcp_url`` becomes the
-       connection when no live session was found above.
-    3. **SSE fallback** — only when no registration exists — dials the
-       co-located discovery endpoint (``discover_announced_server``) for the
+    1. **Live relay sockets** (authoritative). The in-process registry wins over
+       a stale store registration — for example when a daemon reconnects under a
+       new ``device_id`` while heartbeats only refreshed ``last_seen_at`` on an
+       older record.
+    2. **Registrations for devices with no live socket.** In ``relay`` mode a
+       device without a live socket is simply offline this turn, because the
+       socket is the only path to that machine. In ``tunnel``/``local`` mode
+       presence is inferred from a fresh heartbeat and the stored ``mcp_url``
+       becomes the connection.
+    3. **SSE fallback** — only when the user has no registrations and no live
+       sockets at all — dials the co-located discovery endpoint for the
        same-machine development flow.
+
+    Returns an empty list when nothing is reachable.
     """
     from src.anubis.utils.tools.data_analysis import relay
 
-    live_session = relay.session_for_user(user_id)
-    if live_session is not None:
-        return relay.connection_from_session(live_session)
+    connections: list[McpConnection] = []
+    seen_device_ids: set[str] = set()
 
-    record = await read_user_registration(store, user_id)
-    if record is not None:
+    for session in relay.sessions_for_user(user_id):
+        connections.append(relay.connection_from_session(session))
+        seen_device_ids.add(session.device_id)
+
+    records = await read_user_registrations(store, user_id)
+    for record in records:
+        device_id = record.get("device_id") or ""
+        if device_id and device_id in seen_device_ids:
+            continue
         connection_mode = record.get("connection_mode", "relay")
-        device_id = record.get("device_id")
         if connection_mode == "relay":
-            if relay.is_online(device_id):
-                return _connection_from_registration(record)
-            # Registered but the outbound socket is down: the server is not
-            # reachable this turn. Do not fall through to the unrelated SSE
-            # endpoint — report nothing available.
-            return None
+            # Registered but the outbound socket is down: this machine is not
+            # reachable this turn. Every other device is still considered.
+            continue
         stale_seconds = float(
             getattr(context, "data_analysis_registration_stale_seconds", 120.0)
         )
         if _registration_is_fresh(record, stale_seconds):
-            return _connection_from_registration(record)
-        return None
+            connections.append(_connection_from_registration(record))
+            if device_id:
+                seen_device_ids.add(device_id)
 
-    return await discover_announced_server(
+    if connections or records:
+        return connections
+
+    announced = await discover_announced_server(
         context.data_analysis_mcp_discovery_url,
         float(context.data_analysis_discovery_timeout_seconds),
         ignore_failure_backoff=ignore_failure_backoff,
     )
-
-
-async def read_user_connection(store: Any, user_id: str) -> dict[str, Any] | None:
-    """Return the user's single saved connection record, or ``None``."""
-    if store is None:
-        return None
-    item = await store.aget(mcp_connection_namespace(user_id), CONNECTION_KEY)
-    return None if item is None else (item.value or None)
+    return [announced] if announced is not None else []
 
 
 async def save_user_connection(
@@ -282,99 +454,166 @@ async def save_user_connection(
     connection: McpConnection,
     assistant_id: str,
 ) -> None:
-    """Save the user's single connection, bound to exactly one avatar.
+    """Save one device's connection, bound to exactly one avatar.
 
-    Overwrites any prior record: a user has at most one connection, and
-    connecting a different avatar re-binds that single record.
+    Keyed by the connection's ``device_id``, so saving a second machine adds a
+    record rather than replacing the first. Re-saving the same device overwrites
+    only that device's record, which is how the stale-URL self-heal in
+    :func:`bound_connections_for` refreshes a relay bridge address.
     """
+    if not connection.device_id:
+        raise ValueError(
+            "Cannot save a Model Context Protocol connection without a device "
+            "identifier; the record key is the device identifier."
+        )
     await store.aput(
         mcp_connection_namespace(user_id),
-        key=CONNECTION_KEY,
+        key=connection.device_id,
         value=connection.to_store_value(assistant_id=assistant_id),
     )
 
 
-async def clear_user_connection(store: Any, user_id: str) -> bool:
-    """Delete the user's saved connection (disconnect). Report whether one existed."""
+async def clear_user_connection(
+    store: Any, user_id: str, device_id: str | None = None
+) -> list[str]:
+    """Delete saved connections (disconnect). Report which devices were removed.
+
+    Args:
+        store: The cross-thread store.
+        user_id: Owner of the connections.
+        device_id: Remove only this device's connection. When omitted, every
+            connection the user has is removed — the "disconnect everything"
+            request.
+
+    Returns:
+        The device identifiers whose connections were deleted, so the caller can
+        name the affected machines back to the user.
+    """
     if store is None:
-        return False
-    existing = await store.aget(mcp_connection_namespace(user_id), CONNECTION_KEY)
-    if existing is None:
-        return False
-    await store.adelete(mcp_connection_namespace(user_id), CONNECTION_KEY)
-    return True
+        return []
+    namespace = mcp_connection_namespace(user_id)
+    records = await read_user_connections(store, user_id)
+    removed: list[str] = []
+    for record in records:
+        record_device_id = record.get("device_id") or ""
+        if device_id is not None and record_device_id != device_id:
+            continue
+        if not record_device_id:
+            continue
+        await store.adelete(namespace, record_device_id)
+        removed.append(record_device_id)
+    return removed
 
 
 async def mark_declined(
     store: Any, user_id: str, assistant_id: str, connection: McpConnection
 ) -> None:
-    """Record that this avatar declined the offer, so it stops being asked."""
+    """Suppress automatic adoption of one device on one avatar.
+
+    Written when the user explicitly disconnects a machine. Without this marker
+    ``mcp_auto_adopt`` would re-bind the device on the next conversation turn,
+    making an explicit disconnect look broken.
+    """
+    if store is None or not connection.device_id:
+        return
     await store.aput(
         mcp_connection_declined_namespace(user_id, assistant_id),
-        key=_DECLINED_KEY,
+        key=connection.device_id,
         value={
             "declined_at": datetime.now(UTC).isoformat(),
-            "server_url": connection.url,
+            "device_id": connection.device_id,
+            "device_label": connection.device_label,
         },
     )
 
 
-async def is_declined(store: Any, user_id: str, assistant_id: str) -> bool:
-    """Report whether this avatar previously declined the connection offer."""
+async def suppressed_device_ids(
+    store: Any, user_id: str, assistant_id: str
+) -> set[str]:
+    """Device identifiers this avatar must not adopt automatically."""
+    items = await _search_namespace(
+        store, mcp_connection_declined_namespace(user_id, assistant_id)
+    )
+    return {item.key for item in items}
+
+
+async def is_declined(
+    store: Any, user_id: str, assistant_id: str, device_id: str
+) -> bool:
+    """Report whether one device is suppressed on this avatar."""
     if store is None:
         return False
     item = await store.aget(
-        mcp_connection_declined_namespace(user_id, assistant_id), _DECLINED_KEY
+        mcp_connection_declined_namespace(user_id, assistant_id), device_id
     )
     return item is not None
 
 
-async def clear_declined(store: Any, user_id: str, assistant_id: str) -> None:
-    """Remove the decline marker so automatic offers resume for this avatar.
+async def clear_declined(
+    store: Any, user_id: str, assistant_id: str, device_id: str | None = None
+) -> None:
+    """Remove suppression so automatic adoption resumes for this avatar.
 
-    Called when the user explicitly connects: a past decline only means
-    "stop offering automatically" — an explicit connect always wins.
+    Called when the user explicitly connects: a past disconnect only means "stop
+    adopting this device automatically" — an explicit connect always wins.
+    Clears one device when ``device_id`` is given, otherwise every suppressed
+    device on this avatar.
     """
     if store is None:
         return
-    await store.adelete(
-        mcp_connection_declined_namespace(user_id, assistant_id), _DECLINED_KEY
-    )
+    namespace = mcp_connection_declined_namespace(user_id, assistant_id)
+    if device_id is not None:
+        await store.adelete(namespace, device_id)
+        return
+    for item in await _search_namespace(store, namespace):
+        await store.adelete(namespace, item.key)
 
 
-async def bound_connection_for(
+async def bound_connections_for(
     store: Any, user_id: str, assistant_id: str
-) -> McpConnection | None:
-    """Return the connection iff it is established AND bound to this avatar.
+) -> list[McpConnection]:
+    """Return every established connection bound to this avatar.
 
     This is the sole gate for the data-analysis capability: no environment
-    switch, no per-avatar enable flag — only a saved, consented connection
-    whose bound avatar matches the avatar currently answering.
+    switch, no per-avatar enable flag — only saved, adopted connections whose
+    bound avatar matches the avatar currently answering.
 
-    When a live relay socket exists for the user, the returned connection is
-    rebuilt from that session (loopback bridge URL + current device secret)
-    so a stale saved URL — e.g. ``host.docker.internal:8000`` from an older
-    local-mode consent — cannot keep data analysis permanently broken.
+    When a live relay socket exists for a device, that device's connection is
+    rebuilt from the session (loopback bridge URL + current device secret) so a
+    stale saved URL — for example ``host.docker.internal:8000`` left by an older
+    local-mode adoption — cannot keep data analysis permanently broken. The
+    refreshed record is written back only when something actually changed, so a
+    healthy turn performs no extra store writes.
     """
-    record = await read_user_connection(store, user_id)
-    if record is None or record.get("status") != "connected":
-        return None
-    if record.get("assistant_id") != assistant_id:
-        return None
+    records = await read_user_connections(store, user_id)
+    if not records:
+        return []
 
     from src.anubis.utils.tools.data_analysis import relay
 
-    live_session = relay.session_for_user(user_id)
-    if live_session is not None:
+    connections: list[McpConnection] = []
+    for record in records:
+        if record.get("status") != "connected":
+            continue
+        if record.get("assistant_id") != assistant_id:
+            continue
+
+        device_id = record.get("device_id") or ""
+        live_session = relay.get_session(device_id) if device_id else None
+        if live_session is None:
+            connections.append(McpConnection.from_mapping(record))
+            continue
+
         connection = relay.connection_from_session(live_session)
         if (
             record.get("url") != connection.url
             or record.get("device_secret") != connection.device_secret
             or list(record.get("allowed_roots") or []) != list(connection.allowed_roots)
+            or record.get("device_label") != connection.device_label
         ):
             await save_user_connection(
                 store, user_id, connection=connection, assistant_id=assistant_id
             )
-        return connection
+        connections.append(connection)
 
-    return McpConnection.from_mapping(record)
+    return connections

@@ -12,11 +12,17 @@ single socket:
 
 This module is the API side of that tunnel. It holds a process-local registry
 mapping each connected ``device_id`` to the live :class:`RelaySession` (the
-WebSocket, the owning ``user_id``, the device secret, and the announced server
-metadata), plus a ``user_id -> device_id`` index so a conversation turn can
-find the caller's own device. :func:`proxy_request` frames one HTTP call, awaits
-the correlated ``proxy_response`` through an ``asyncio.Future``, and returns the
-reconstructed ``(status, headers, body)``.
+WebSocket, the owning ``user_id``, the device secret, the device identity, and
+the announced server metadata), plus a ``user_id -> {device_id}`` index so a
+conversation turn can find **every** machine the caller currently has online.
+:func:`proxy_request` frames one HTTP call, awaits the correlated
+``proxy_response`` through an ``asyncio.Future``, and returns the reconstructed
+``(status, headers, body)``.
+
+A user runs the daemon on several machines at once (Ubuntu desktop, macOS,
+mobile, Windows), so the per-user index is a SET of device identifiers. It was
+previously a single identifier, which meant a second machine connecting silently
+displaced the first from every lookup even though both sockets stayed open.
 
 Single-process assumption: ``langgraph.json`` mounts this FastAPI application
 (``webapp.py:app``) and the graph (``graph.py:graph``) in one server process, so
@@ -43,6 +49,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.anubis.utils.tools.data_analysis.devices import (
+    UNKNOWN_DEVICE_LABEL,
+    UNKNOWN_PLATFORM,
+)
+
 logger = logging.getLogger(__name__)
 
 # Relay WebSocket frame type names — fixed contract with the local daemon.
@@ -62,7 +73,7 @@ LOCAL_MCP_PATH = "/mcp"
 
 @dataclass
 class RelaySession:
-    """One live outbound relay socket from a user's local MCP daemon."""
+    """One live outbound relay socket from one of a user's local MCP daemons."""
 
     device_id: str
     user_id: str
@@ -70,6 +81,8 @@ class RelaySession:
     server_name: str
     allowed_roots: tuple[str, ...]
     websocket: Any
+    device_label: str = UNKNOWN_DEVICE_LABEL
+    platform: str = UNKNOWN_PLATFORM
     last_seen_monotonic: float = field(default_factory=time.monotonic)
     # Correlation table: ``request_id -> Future`` awaiting a ``proxy_response``.
     pending_responses: dict[str, asyncio.Future] = field(default_factory=dict)
@@ -77,7 +90,9 @@ class RelaySession:
 
 # Module-level registry (see module docstring for the single-process rationale).
 _sessions_by_device: dict[str, RelaySession] = {}
-_device_id_by_user: dict[str, str] = {}
+# One user owns many devices simultaneously, so this index holds a set rather
+# than a single identifier.
+_device_ids_by_user: dict[str, set[str]] = {}
 
 
 def register_session(
@@ -88,12 +103,16 @@ def register_session(
     server_name: str,
     allowed_roots: tuple[str, ...],
     websocket: Any,
+    device_label: str = UNKNOWN_DEVICE_LABEL,
+    platform: str = UNKNOWN_PLATFORM,
 ) -> RelaySession:
-    """Record a freshly connected daemon socket, replacing any prior one.
+    """Record a freshly connected daemon socket.
 
-    A user runs at most one active MCP device per socket; a reconnect (new
-    socket, same ``device_id``) supersedes the old session, whose pending
-    requests are failed so their callers degrade rather than hang.
+    Sessions are keyed by ``device_id``, so registering a *different* machine
+    adds a session and leaves the user's other machines connected. A reconnect
+    (new socket, same ``device_id``) still supersedes that one device's old
+    session, whose pending requests are failed so their callers degrade rather
+    than hang.
     """
     existing = _sessions_by_device.get(device_id)
     if existing is not None and existing.websocket is not websocket:
@@ -106,21 +125,26 @@ def register_session(
         server_name=server_name,
         allowed_roots=allowed_roots,
         websocket=websocket,
+        device_label=device_label,
+        platform=platform,
     )
     _sessions_by_device[device_id] = session
-    _device_id_by_user[user_id] = device_id
+    _device_ids_by_user.setdefault(user_id, set()).add(device_id)
     logger.info(
-        "Relay session registered: device=%s user=%s server=%r roots=%d",
+        "Relay session registered: device=%s label=%r user=%s server=%r roots=%d "
+        "(user now has %d live device(s))",
         device_id,
+        device_label,
         user_id,
         server_name,
         len(allowed_roots),
+        len(_device_ids_by_user[user_id]),
     )
     return session
 
 
 def drop_session(device_id: str, websocket: Any) -> None:
-    """Remove a session on disconnect — but only if the socket still matches.
+    """Remove one device's session on disconnect, leaving the user's others live.
 
     The socket guard prevents a late disconnect of a superseded socket from
     evicting the live reconnect that already replaced the session.
@@ -130,8 +154,11 @@ def drop_session(device_id: str, websocket: Any) -> None:
         return
     _fail_pending(session, RuntimeError("relay session closed"))
     del _sessions_by_device[device_id]
-    if _device_id_by_user.get(session.user_id) == device_id:
-        del _device_id_by_user[session.user_id]
+    owned_device_ids = _device_ids_by_user.get(session.user_id)
+    if owned_device_ids is not None:
+        owned_device_ids.discard(device_id)
+        if not owned_device_ids:
+            del _device_ids_by_user[session.user_id]
     logger.info("Relay session dropped: device=%s user=%s", device_id, session.user_id)
 
 
@@ -147,10 +174,20 @@ def get_session(device_id: str) -> RelaySession | None:
     return _sessions_by_device.get(device_id)
 
 
-def session_for_user(user_id: str) -> RelaySession | None:
-    """Return the live session for a user's registered device, or ``None``."""
-    device_id = _device_id_by_user.get(user_id)
-    return None if device_id is None else _sessions_by_device.get(device_id)
+def sessions_for_user(user_id: str) -> list[RelaySession]:
+    """Return every live session for a user, one per currently connected machine.
+
+    Ordered by device label so the devices a conversation reports stay in a
+    stable order between turns; an unstable order would make the same question
+    asked twice appear to return different answers.
+    """
+    device_ids = _device_ids_by_user.get(user_id) or set()
+    sessions = [
+        session
+        for session in (_sessions_by_device.get(device_id) for device_id in device_ids)
+        if session is not None
+    ]
+    return sorted(sessions, key=lambda session: session.device_label)
 
 
 def is_online(device_id: str | None) -> bool:
@@ -183,6 +220,9 @@ def connection_from_session(session: RelaySession):
         server_name=session.server_name,
         allowed_roots=session.allowed_roots,
         device_secret=session.device_secret,
+        device_id=session.device_id,
+        device_label=session.device_label,
+        platform=session.platform,
     )
 
 

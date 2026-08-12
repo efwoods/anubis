@@ -445,7 +445,7 @@ class GlobalContext:
     data_analysis_enabled: str = field(
         default="FALSE",
         metadata={
-            "description": "Set to TRUE to enable the data preprocessing pipeline. Env DATA_ANALYSIS_ENABLED. NOTE: this gates data PREPROCESSING only — it does NOT gate the avatar's MCP data-analysis capability, which is gated solely by a discovered+consented per-user MCP connection (see data_analysis_mcp_discovery_url)."
+            "description": "Set to TRUE to enable the data preprocessing pipeline. Env DATA_ANALYSIS_ENABLED. NOTE: this gates data PREPROCESSING only — it does NOT gate the avatar's MCP data-analysis capability, which is gated solely by the per-device MCP connections adopted for the personal avatar (see data_analysis_mcp_discovery_url)."
         },
     )
 
@@ -530,6 +530,20 @@ class GlobalContext:
         default=2097152,
         metadata={
             "description": "Maximum size in bytes of one created artifact (report or plot) whose content is inlined on the assistant reply for display in the client. Larger artifacts stay in durable storage but are reported as metadata only, so an oversized file cannot bloat the checkpointed message. Default 2 MiB. Env DATA_ANALYSIS_INLINE_ARTIFACT_MAX_BYTES."
+        },
+    )
+
+    data_analysis_device_fanout_timeout_seconds: float = field(
+        default=20.0,
+        metadata={
+            "description": "Maximum seconds one connected machine is given to answer its leg of a fan-out data-analysis call (for example discover_data_files across every connected machine) before that machine is reported as offline. Fan-out legs run concurrently, so this is the ceiling the whole call adds to the turn no matter how many machines are connected. Kept well below data_analysis_relay_request_timeout_seconds so a sleeping laptop cannot stall a conversation turn. Env DATA_ANALYSIS_DEVICE_FANOUT_TIMEOUT_SECONDS."
+        },
+    )
+
+    data_analysis_max_devices_per_user: int = field(
+        default=10,
+        metadata={
+            "description": "Maximum number of local MCP daemon devices one user may register simultaneously (Ubuntu desktop, macOS, mobile, Windows, and so on). POST /mcp/register rejects a new device beyond this count. Guards the fan-out cost of a data-analysis call and the store against an unbounded set of stale device records. Env DATA_ANALYSIS_MAX_DEVICES_PER_USER."
         },
     )
 

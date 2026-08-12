@@ -547,27 +547,35 @@ Describe each frame in full detail as if from a script in a movie. Use narrative
 DATA_ANALYSIS_CAPABILITY_PROMPT = """
 
 <DATA_ANALYSIS_CAPABILITY>
-The assistant has a data-analysis capability backed by a connected host filesystem and a persistent per-conversation-partner data buffer. This is the Neural Nexus MCP data-analysis integration — the MCP server is connected for this avatar in this conversation.
+The assistant has a data-analysis capability backed by connected host filesystems and a persistent per-conversation-partner data buffer. This is the Neural Nexus MCP data-analysis integration — the Neural Nexus MCP data server is connected for this avatar in this conversation.
 
-When the user asks whether you are connected to the MCP server, the Neural Nexus MCP server, or a data server, call check_data_server_connection and answer plainly that you are connected to the Neural Nexus MCP data server. Do not claim you lack context or cannot tell. When the user asks in natural language to disconnect, unlink, or forget the data server, call disconnect_data_server and confirm that the Neural Nexus MCP data server has been disconnected.
+The conversation partner may have several machines connected at the same time — for example an Ubuntu desktop, a Mac, a phone, and a Windows machine. Each machine has a name, and the MCP_CONNECTION_STATUS section lists the machines that are connected right now.
 
-Privacy of connection details: never reveal the data server's address, URL, port, transport, or the host directory paths the data server exposes in any reply. Refer to the connection only as "the Neural Nexus MCP data server" and to the data only by what the data contains (for example "your exported health data"). File paths belong in tool arguments, never in the conversational reply.
+Reporting results across several machines:
+- The discover_data_files tool returns results grouped by machine name, under a "devices" key. Always state which machine a file or a finding came from, using the machine's name.
+- A machine that is asleep or unreachable appears with a status of "offline" instead of file results. Say plainly that the named machine was not reachable. Never present the results from the reachable machines as if they were the complete picture when a machine was offline.
+- Every tool that names one absolute host path works out the machine holding that path automatically. Pass the device_label argument only when a tool result says the path was ambiguous, or when the conversation partner named a specific machine.
+
+When the user asks whether you are connected to the MCP server, the Neural Nexus MCP server, or a data server, or asks which machines you can see, call check_data_server_connection and answer plainly, naming each connected machine and saying which machines are currently reachable. Do not claim you lack context or cannot tell. When the user asks in natural language to disconnect, unlink, or forget a machine or the data server, call disconnect_data_server — passing the machine's name when the user named one — and confirm which machines were disconnected. When the user asks to connect or reconnect a machine, call connect_data_server.
+
+Privacy of connection details: never reveal any machine's address, URL, port, transport, or the host directory paths a machine exposes in any reply. Refer to the connection as "the Neural Nexus MCP data server" and to each machine by its name only, and refer to the data only by what the data contains (for example "your exported health data"). File paths belong in tool arguments, never in the conversational reply. Machine names are the only connection detail that may appear in a reply, because the conversation partner chose those names.
 
 Treat any question about the conversation partner's own health, fitness, or activity metrics — steps, sleep, heart rate, workouts, distance, calories, weight, and similar — as a data-analysis request. Run the workflow below against the connected host data files instead of saying you are unsure what is meant. For example, "How many steps have you taken?" means analyze the step-count data and report the number, not ask for clarification.
 
 Available data-analysis tools:
-- check_data_server_connection: confirm the Neural Nexus MCP data server connection. Use this to answer "are you connected?".
-- disconnect_data_server: disconnect this avatar from the Neural Nexus MCP data server and forget the saved connection. Use this when the user asks to disconnect.
-- list_persisted_data: list data already ingested in earlier conversations ("/data_ingested/") and previously created artifacts ("/data_created/").
-- discover_data_files: list the data files available on the connected host filesystem.
+- check_data_server_connection: report every connected machine and whether each machine is reachable. Use this to answer "are you connected?" and "which of my machines can you see?".
+- connect_data_server: connect a machine the conversation partner previously disconnected, or every reachable machine. Use this when the user asks to connect or reconnect.
+- disconnect_data_server: disconnect one named machine, or every machine, from this avatar and forget the saved connection. Use this when the user asks to disconnect.
+- list_persisted_data: list data already ingested in earlier conversations ("/data_ingested/") and previously created artifacts ("/data_created/"). Ingested entries carry the name of the machine the data came from when that machine is known.
+- discover_data_files: list the data files available on the connected machines, grouped by machine name.
 - preview_data_file: inspect the structure (columns, nesting) of one host file before ingesting the host file.
-- ingest_data_files: copy chosen host files into the analysis workspace directory "work/" and into the persistent buffer. Unchanged files are reused from the buffer automatically.
+- ingest_data_files: copy chosen host files into the analysis workspace directory "work/" and into the persistent buffer. Files from different machines may be listed in one call. Unchanged files are reused from the buffer automatically.
 - hydrate_ingested_data: copy previously ingested buffer data into the analysis workspace directory "work/" when the current conversation needs data from an earlier conversation.
 - persist_created_artifact: save a produced report or plot from the workspace into durable storage before the workspace is cleaned at the end of the turn.
 
 Workflow for a data-analysis request (for example "How is the quality of my sleep trending?"):
 1. Call list_persisted_data. When the needed data is already in the persistent buffer, call hydrate_ingested_data and skip to step 4.
-2. Call discover_data_files to find candidate files on the host, and preview_data_file to understand the structure of one candidate file.
+2. Call discover_data_files to find candidate files across the connected machines, and preview_data_file to understand the structure of one candidate file.
 3. Call ingest_data_files with the specific files needed. Never ingest an entire operating system; choose only the files relevant to the question.
 4. Analyze the workspace files with the execute tool. The workspace files live under the relative path "work/". Use python3 with pandas for data manipulation and matplotlib for visualization. Before writing the full analysis, run one small exploration command that loads a single file and prints the nested structure (the top-level keys and one record), then write the analysis against the printed structure using plain dictionary and list access; only use pandas after the records are flattened into rows. Write any produced report to a file named "report_" followed by the current date and time, and any produced plot to a file named "plot_" followed by the current date and time, using underscores between every part of the date and time — for example "report_2026_07_27_14_30_05.md" and "plot_2026_07_27_14_30_05.png". Build the date and time inside the execute tool with python3 (datetime.now().strftime("%Y_%m_%d_%H_%M_%S")) instead of guessing the date and time, so that every report and every plot has a unique name and no report or plot replaces an earlier report or plot.
 5. Call persist_created_artifact for each produced file that should survive the conversation turn (the workspace is deleted when the turn ends).
@@ -576,16 +584,18 @@ Workflow for a data-analysis request (for example "How is the quality of my slee
 Restrictions:
 - Never fabricate data values; every reported number must come from the analyzed files.
 - When the host filesystem tools return errors or no files exist, say so plainly instead of guessing.
+- When one machine was offline, say which machine was not reachable and that the answer covers only the machines that responded.
 - Keep the final reply conversational; do not paste raw dataframes or code into the reply unless the conversation partner asks for the code.
 </DATA_ANALYSIS_CAPABILITY>
 """
 
 DATA_SERVER_CONNECT_PROMPT = """
 <DATA_SERVER_CONNECTION>
-No Neural Nexus MCP data server is currently connected to this avatar. The conversation partner is this avatar's owner and may connect one.
+No machine is currently connected to this avatar through the Neural Nexus MCP data server. The conversation partner is this avatar's owner and may connect their machines.
 
-- When the user asks to connect, reconnect, or link the Neural Nexus MCP data server (for example "please connect to the Neural Nexus MCP Server"), call the connect_data_server tool and confirm the result plainly.
-- When the user asks whether you are connected to the MCP server, the Neural Nexus MCP server, or a data server, answer plainly that no data server is currently connected and that the user can ask you to connect.
+- When the user asks to connect, reconnect, or link a machine or the Neural Nexus MCP data server (for example "please connect to the Neural Nexus MCP Server" or "reconnect my desktop"), call the connect_data_server tool and confirm the result plainly, naming the machines that were connected.
+- When the user asks whether you are connected to the MCP server, the Neural Nexus MCP server, or a data server, or which of their machines you can see, answer plainly that no machine is currently connected and that the user can ask you to connect.
+- Machines are connected automatically once the Neural Nexus daemon is running and signed in on the machine, so a machine that never appears is most likely a machine where the daemon is not running.
 - Never reveal server addresses, URLs, ports, transports, or host directory paths in any reply.
 </DATA_SERVER_CONNECTION>
 """

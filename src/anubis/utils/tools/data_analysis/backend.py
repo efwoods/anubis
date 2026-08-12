@@ -66,25 +66,30 @@ def created_namespace(user_id: str, assistant_id: str) -> tuple[str, str, str]:
 
 
 def mcp_connection_namespace(user_id: str) -> tuple[str, str]:
-    """Store namespace for the single MCP connection a user may establish.
+    """Store namespace holding one connection record per connected device.
 
-    Keyed by user only (a two-element tuple, unlike the per-avatar data
-    namespaces above) so that exactly one connection record can exist per
-    user — the "single MCP connection per user" rule. The record's value
-    records which single avatar the connection is bound to.
+    Scoped to the user (a two-element tuple, unlike the per-avatar data
+    namespaces above) and keyed INSIDE that namespace by ``device_id``, so a
+    user who runs the daemon on an Ubuntu desktop, a Mac, and a phone has three
+    coexisting records. Each record names the single avatar the device is bound
+    to.
+
+    This namespace previously held exactly one record under a constant key,
+    which is what let a second machine silently overwrite the first — and what
+    let a development daemon clobber the production record, since both wrote the
+    same key in a shared store.
     """
     return (user_id, MCP_CONNECTION_NAMESPACE_KIND)
 
 
 def mcp_registration_namespace(user_id: str) -> tuple[str, str]:
-    """Store namespace for a user's pending MCP daemon registration.
+    """Store namespace holding one daemon registration per device.
 
-    Keyed by user only (a two-element tuple, like
-    :func:`mcp_connection_namespace`) so exactly one pending registration can
-    exist per user. The local MCP daemon writes this record by calling
-    ``POST /mcp/register``; ``mcp_discovery`` reads it to decide whether to
-    offer a connection, before the user has consented (that consent then
-    produces the separate, avatar-bound ``mcp_connection`` record).
+    Scoped to the user and keyed by ``device_id``, like
+    :func:`mcp_connection_namespace`. Each local Neural Nexus Model Context
+    Protocol daemon writes its own record by calling ``POST /mcp/register``;
+    ``mcp_auto_adopt`` reads every record to bind newly seen devices to the
+    user's personal avatar.
     """
     return (user_id, MCP_REGISTRATION_NAMESPACE_KIND)
 
@@ -92,11 +97,17 @@ def mcp_registration_namespace(user_id: str) -> tuple[str, str]:
 def mcp_connection_declined_namespace(
     user_id: str, assistant_id: str
 ) -> tuple[str, str, str]:
-    """Store namespace for a per-avatar 'do not offer again' decline marker.
+    """Store namespace for per-avatar, per-device auto-adopt suppression.
 
-    Per user *and* avatar so declining the offer on one avatar never
-    suppresses the offer on the user's other avatars (e.g. declining on a
-    test avatar must not prevent connecting the personal avatar later).
+    Scoped to user *and* avatar so suppressing one device on one avatar never
+    affects the user's other avatars, and keyed inside that namespace by
+    ``device_id`` so suppressing the phone never suppresses the desktop.
+
+    A marker means "the user explicitly disconnected this device from this
+    avatar; do not adopt the device again automatically". Without the marker,
+    ``mcp_auto_adopt`` would re-bind a device on the very next conversation
+    turn and an explicit disconnect would appear not to work. An explicit
+    request to connect clears the marker.
     """
     return (user_id, assistant_id, MCP_CONNECTION_DECLINED_NAMESPACE_KIND)
 
@@ -155,7 +166,9 @@ def build_analysis_backend(
     # Heavy-ish import kept out of module scope per the cold-start rule.
     from deepagents.backends import CompositeBackend, LocalShellBackend, StoreBackend
 
-    execution_backend_name = (context.data_analysis_execution_backend or "local_shell").lower()
+    execution_backend_name = (
+        context.data_analysis_execution_backend or "local_shell"
+    ).lower()
     if execution_backend_name != "local_shell":
         raise NotImplementedError(
             "Execution backend "
@@ -184,11 +197,15 @@ def build_analysis_backend(
         routes={
             INGESTED_ROUTE: StoreBackend(
                 store=store,
-                namespace=lambda _runtime, ns=ingested_namespace(user_id, assistant_id): ns,
+                namespace=lambda _runtime, ns=ingested_namespace(user_id, assistant_id): (
+                    ns
+                ),
             ),
             CREATED_ROUTE: StoreBackend(
                 store=store,
-                namespace=lambda _runtime, ns=created_namespace(user_id, assistant_id): ns,
+                namespace=lambda _runtime, ns=created_namespace(user_id, assistant_id): (
+                    ns
+                ),
             ),
         },
     )
@@ -242,7 +259,9 @@ async def enforce_ingested_quota(
     max_bytes = int(context.data_analysis_store_max_bytes)
 
     def item_updated_at(item: Any) -> datetime:
-        updated_at = getattr(item, "updated_at", None) or getattr(item, "created_at", None)
+        updated_at = getattr(item, "updated_at", None) or getattr(
+            item, "created_at", None
+        )
         if isinstance(updated_at, str):
             updated_at = datetime.fromisoformat(updated_at)
         if updated_at is None:

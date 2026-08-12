@@ -42,11 +42,18 @@ auth = Auth()
 
 security_route = APIRouter()
 
-security = HTTPBearer()
+# Every authenticated dependency accepts EITHER credential: the long-lived
+# ``API-KEY`` header (what integrations and scripts hold) or the ``refresh_token``
+# issued by POST /login sent as ``Authorization: Bearer`` (what a browser session
+# holds, since /signup shows its API key exactly once and a browser has nowhere
+# safe to keep it). Both schemes are declared auto_error=False so that a request
+# carrying only one of them is not rejected by the scheme that is missing; the
+# dependencies below decide what a total absence of credentials means, which
+# differs between them (401 for the authenticated ones, an anonymous identity for
+# the public ones).
+optional_api_key_scheme = APIKeyHeader(name="API-KEY", auto_error=False)
 
-api_key_scheme = APIKeyHeader(name="API-KEY")
-
-anonymous_api_key_scheme = APIKeyHeader(name="API-KEY", auto_error=False)
+optional_bearer_scheme = HTTPBearer(auto_error=False)
 
 ALGORITHMS = ["RS256"]
 
@@ -65,6 +72,11 @@ from uuid import NAMESPACE_URL, uuid5
 
 _api_key_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
 _anonymous_supabase_user_cache: TTLCache = TTLCache(maxsize=1000, ttl=86400)
+# Refresh-token sessions, keyed on the hash of the refresh token. Resolving one
+# costs a token exchange against Auth0 plus a Management API read, so the result
+# is cached exactly like ``_api_key_cache`` — same size, same TTL — and for the
+# same reason: without it every single request would pay two upstream round trips.
+_refresh_token_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
 _cache_lock = asyncio.Lock()
 
 
@@ -878,6 +890,18 @@ async def set_login_status(user_id: str, logged_in: bool, request: Request) -> N
         for key in stale:
             del _api_key_cache[key]
 
+        # Refresh-token sessions must go the same way, and on /logout they MUST:
+        # the refresh token is revoked at Auth0 moments later, and a surviving
+        # cache entry would keep authenticating that dead token until the entry
+        # expired on its own.
+        stale_sessions = [
+            key
+            for key, cached_session in _refresh_token_cache.items()
+            if cached_session["user"]["identities"][0]["user_id"] == bare_user_id
+        ]
+        for key in stale_sessions:
+            del _refresh_token_cache[key]
+
 
 async def get_user(user_id: str, request: Request) -> dict:
     response = await request.app.state.httpx_client.get(
@@ -1001,7 +1025,10 @@ class LoginRequest(BaseModel):
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: str
+    # Optional: a session that authenticates WITH its refresh token already sent
+    # it in the Authorization header, and /logout falls back to that. Requiring it
+    # here would reject exactly the callers that have nothing to put in the body.
+    refresh_token: str | None = None
 
 
 class UserDataCache(BaseModel):
@@ -1122,46 +1149,276 @@ async def get_user_with_api_key(
     return user
 
 
+async def _seed_ephemeral_api_key_for_session(user: dict, ephemeral_api_key: str) -> str:
+    """Make ``ephemeral_api_key`` resolve to ``user`` for the rest of this process.
+
+    A refresh-token session has no API key, but fourteen call sites in
+    ``src/api/webapp.py`` hand ``current_user["API_KEY"]`` to the LangGraph
+    software development kit as an ``API-KEY`` header, and the ``authenticate``
+    handler at the bottom of this module resolves that header back to an identity.
+    Auth0 stores only the *hash* of the real key, so the real key cannot be
+    recovered to satisfy them.
+
+    Seeding ``_api_key_cache`` with the already-resolved user closes that gap
+    without touching a single call site: ``get_user_with_api_key`` checks the cache
+    before it queries Auth0, so the ephemeral key resolves to this user and is
+    never looked up upstream (it does not exist upstream — no account carries its
+    hash). The key is a normal ``generate_api_key()`` value, so it is
+    indistinguishable in transit and useless once the entry expires.
+
+    This depends on the LangGraph server and this FastAPI application sharing one
+    process, which ``langgraph.json`` guarantees by mounting this app as
+    ``http.app``. Were the API ever run with multiple uvicorn workers or replicas,
+    a key minted in one worker would not resolve in another and graph-backed
+    endpoints would 401 for refresh-token sessions; the mapping would then have to
+    move to shared storage.
+
+    Only ever call this for a VERIFIED account. The cache is what
+    ``get_user_with_api_key`` consults before it applies the verified-email gate,
+    so seeding an unverified user here would let that user's key pass a check the
+    API-key path fails — see the unverified branch of the caller.
+    """
+    async with _cache_lock:
+        _api_key_cache[_hash_key(ephemeral_api_key)] = user
+    user["API_KEY"] = ephemeral_api_key
+    return ephemeral_api_key
+
+
+async def get_user_with_refresh_token(
+    refresh_token: str, request: Request, require_verified_email: bool = True
+) -> dict | None:
+    """Resolve an Auth0 account from the refresh token POST /login returned.
+
+    An Auth0 refresh token is opaque — it carries no claims and cannot be verified
+    locally — so the only way to learn who it belongs to is to spend it at the
+    token endpoint and read ``sub`` from the resulting ``id_token``. That is two
+    upstream round trips (exchange, then Management API read), which is why the
+    resolved session is cached under the token's hash for the cache TTL.
+
+    ``require_verified_email`` mirrors ``get_user_with_api_key`` exactly, including
+    the message, so a caller sees the same rejection whichever credential it sent.
+
+    Returns None when the token is not a credential this tenant issued (revoked by
+    /logout, expired, or simply wrong), which the dependencies turn into a 401.
+    """
+    cache_key = _hash_key(refresh_token)
+
+    async with _cache_lock:
+        cached_session = _refresh_token_cache.get(cache_key)
+
+    if cached_session is not None:
+        # The two caches expire independently, so the API-KEY entry may already be
+        # gone while this session is still valid. Re-seeding is idempotent and
+        # keeps ONE ephemeral key per session rather than minting a fresh key per
+        # request, which would churn ``_api_key_cache`` and evict real accounts.
+        await _seed_ephemeral_api_key_for_session(
+            cached_session["user"], cached_session["ephemeral_api_key"]
+        )
+        return cached_session["user"]
+
+    try:
+        token_response = await request.app.state.httpx_client.post(
+            f"{BASE_AUTH_URL}/oauth/token",
+            json={
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "refresh_token": refresh_token,
+            },
+        )
+    except (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.TimeoutException,
+        httpx.TransportError,
+    ) as exc:
+        # Same treatment as the API-key path: an unreachable identity provider is
+        # a 503 the client can retry, not a request error.
+        logger.warning("Token exchange with %s failed (transport): %s", BASE_AUTH_URL, exc)
+        raise HTTPException(
+            status_code=503, detail="Authentication service temporarily unreachable."
+        ) from exc
+
+    if token_response.status_code != 200:
+        # Auth0 answers a revoked or unknown refresh token with 401/403
+        # invalid_grant. That is an authentication failure, not a server fault.
+        return None
+
+    id_token = token_response.json().get("id_token")
+    if not id_token:
+        # Only possible if the session was issued without the openid scope, which
+        # /login always requests. Treat as unauthenticated rather than crashing.
+        logger.warning("Refresh token exchange returned no id_token.")
+        return None
+
+    # Unverified claims are read here for the same reason /login reads them: the
+    # token was just handed to us directly by Auth0 over TLS, so its signature adds
+    # nothing that the transport has not already established.
+    claims = jwt.get_unverified_claims(id_token)
+    user = await get_user(claims["sub"], request=request)
+    if not user:
+        return None
+
+    if user.get("email_verified") is not True:
+        if require_verified_email:
+            raise HTTPException(
+                detail="Email is not yet verified. Please verify email to continue.",
+                status_code=401,
+            )
+        # Unverified callers are never cached and never auto-enrolled, matching
+        # get_user_with_api_key. The session still carries an API_KEY value
+        # because /delete_user reads one, but it is deliberately NOT seeded into
+        # the cache: it must fail to resolve, exactly as the real key of an
+        # unverified account does when the nested LangGraph call re-applies the
+        # verified-email gate. Failing closed keeps both credentials equally
+        # permissive rather than making this one a way around the gate.
+        user["API_KEY"] = generate_api_key()
+        return user
+
+    try:
+        await ensure_initial_subscription_after_verification(request, user)
+    except Exception as enrollment_error:  # noqa: BLE001 - non-fatal
+        logger.error(
+            "Initial subscription enrollment failed for %s: %s",
+            user.get("user_id"),
+            enrollment_error,
+        )
+
+    ephemeral_api_key = generate_api_key()
+    async with _cache_lock:
+        _refresh_token_cache[cache_key] = {
+            "user": user,
+            "ephemeral_api_key": ephemeral_api_key,
+        }
+    await _seed_ephemeral_api_key_for_session(user, ephemeral_api_key)
+
+    # Provisioning runs AFTER both cache writes for the re-entrancy reason spelled
+    # out in get_user_with_api_key: it calls back into this API through the
+    # LangGraph software development kit, and that nested call authenticates with
+    # the ephemeral key seeded above, which must already be resolvable.
+    try:
+        from src.anubis.utils.personal_avatar import ensure_personal_avatar_for_user
+
+        await ensure_personal_avatar_for_user(request, user, ephemeral_api_key)
+    except Exception as provisioning_error:  # noqa: BLE001 - non-fatal
+        logger.error(
+            "Personal avatar provisioning failed for %s: %s",
+            user.get("user_id"),
+            provisioning_error,
+        )
+
+    return user
+
+
+async def _resolve_authenticated_user(
+    request: Request,
+    api_key: str | None,
+    bearer_credentials: HTTPAuthorizationCredentials | None,
+    require_verified_email: bool = True,
+) -> dict | None:
+    """Resolve whichever credential the caller sent, API key taking precedence.
+
+    The precedence matters only when a client sends both, which no client does; the
+    API key is tried first because it is the cheaper lookup.
+    """
+    if api_key:
+        return await get_user_with_api_key(
+            api_key, request, require_verified_email=require_verified_email
+        )
+    if bearer_credentials is not None:
+        return await get_user_with_refresh_token(
+            bearer_credentials.credentials,
+            request,
+            require_verified_email=require_verified_email,
+        )
+    return None
+
+
+def bearer_credentials_from_request(
+    request: Request,
+) -> HTTPAuthorizationCredentials | None:
+    """Parse the bearer credential out of a raw request.
+
+    For the callers that invoke ``get_current_user`` as a plain function rather
+    than through dependency injection — the metrics middleware does this to
+    pre-authenticate catch-all routes. Such a caller MUST pass this, because an
+    omitted argument leaves the parameter holding FastAPI's ``Depends`` sentinel
+    rather than None, and the sentinel is not a credential.
+    """
+    authorization_header = request.headers.get("Authorization") or ""
+    scheme, _, credentials = authorization_header.partition(" ")
+    if scheme.lower() != "bearer" or not credentials:
+        return None
+    return HTTPAuthorizationCredentials(scheme=scheme, credentials=credentials)
+
+
+def _invalid_credential_error(
+    bearer_credentials: HTTPAuthorizationCredentials | None,
+) -> HTTPException:
+    """Describe the rejection in terms of the credential the caller actually sent."""
+    if bearer_credentials is not None:
+        return HTTPException(
+            status_code=401,
+            detail="Session is no longer valid. Please log in again.",
+        )
+    return HTTPException(status_code=401, detail="Invalid API key")
+
+
 async def get_current_user(
-    request: Request, api_key: str | None = Depends(api_key_scheme)
+    request: Request,
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
 ) -> dict:
     """
     This dependency validates the JWT and returns the payload.
     The 'sub' field in the payload is the Auth0 user_id.
     """
     logger.info("breakpoint")
-    if not api_key:
-        raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
+    if not api_key and bearer_credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Please send API-KEY in request, or Authorization: Bearer <refresh_token>.",
+        )
 
-    user = await get_user_with_api_key(api_key, request)
+    user = await _resolve_authenticated_user(request, api_key, bearer_credentials)
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise _invalid_credential_error(bearer_credentials)
 
     return user
 
 
 async def get_current_user_allow_unverified(
-    request: Request, api_key: str | None = Depends(api_key_scheme)
+    request: Request,
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
 ) -> dict:
     """
     Like `get_current_user`, but does NOT reject unverified users.
 
-    Authenticate by API key WITHOUT requiring a verified email.
+    Authenticate by API key or refresh token WITHOUT requiring a verified email.
 
     Used by the endpoints that an account which has not verified the signup
     email must still be able to reach: ``/resend_verification_email``
-    (request another verification email), ``/logout``, and ``/delete_user``
+    (request another verification email), ``/verify_login_status`` (how the sign-up
+    screen watches for the verification to land), ``/logout``, and ``/delete_user``
     (remove the unverified account and everything the account created).
     Every other endpoint uses ``get_current_user``.
     """
-    if not api_key:
-        raise HTTPException(status_code=401, detail="Please send API-KEY in request.")
+    if not api_key and bearer_credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Please send API-KEY in request, or Authorization: Bearer <refresh_token>.",
+        )
 
-    user = await get_user_with_api_key(
-        api_key, request, require_verified_email=False
+    user = await _resolve_authenticated_user(
+        request, api_key, bearer_credentials, require_verified_email=False
     )
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise _invalid_credential_error(bearer_credentials)
 
     return user
 
@@ -1357,57 +1614,64 @@ async def get_anonymous_user_with_anonymous_api_key(
 async def get_current_user_or_anonymous_user(
     request: Request,
     assistant_id: str = "",
-    api_key: str | None = Depends(anonymous_api_key_scheme),
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
 ) -> dict:
     """
     This dependency validates the JWT and returns the payload.
     The 'sub' field in the payload is the Auth0 user_id.
     """
     logger.info("breakpoint")
-    if not api_key:
+    if not api_key and bearer_credentials is None:
         # create anonymous user
         user = await get_anonymous_user_with_anonymous_api_key(
             request=request, assistant_id=assistant_id
         )
     else:
-        user = await get_user_with_api_key(api_key, request)
+        user = await _resolve_authenticated_user(request, api_key, bearer_credentials)
 
     if not user:
         # create anonymous user
-        if not api_key:
+        if not api_key and bearer_credentials is None:
             raise HTTPException(
                 status_code=500, detail="Error creating anonymous user."
             )
         else:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+            raise _invalid_credential_error(bearer_credentials)
 
     return user
 
 
 async def get_current_user_or_anonymous_user_id(
-    request: Request, api_key: str | None = Depends(anonymous_api_key_scheme)
+    request: Request,
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
 ) -> dict:
     """
     This dependency validates the JWT and returns the payload.
     The 'sub' field in the payload is the Auth0 user_id.
     """
     logger.info("breakpoint")
-    if not api_key:
+    if not api_key and bearer_credentials is None:
         # create anonymous user
         user = await get_anonymous_user_with_anonymous_api_key(
             request=request, assistant_id=""
         )
     else:
-        user = await get_user_with_api_key(api_key, request)
+        user = await _resolve_authenticated_user(request, api_key, bearer_credentials)
 
     if not user:
         # create anonymous user
-        if not api_key:
+        if not api_key and bearer_credentials is None:
             raise HTTPException(
                 status_code=500, detail="Error creating anonymous user."
             )
         else:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+            raise _invalid_credential_error(bearer_credentials)
 
     return user
 
@@ -1794,21 +2058,49 @@ async def login(body: LoginRequest, request: Request):
 
 @security_route.post("/logout")
 async def logout(
-    body: LogoutRequest,
     request: Request,
+    body: LogoutRequest | None = None,
     current_user: dict = Depends(get_current_user_allow_unverified),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
 ):
     """
     Revoke the refresh token at Auth0 so the session can no longer be renewed,
-    and clear the user's `logged_in` app_metadata flag. The API-KEY is required
-    (not the possibly-expired access token) so the user can always be identified
-    to update the flag.
+    and clear the user's `logged_in` app_metadata flag.
+
+    The refresh token is read from the request body first and from the bearer
+    credential second. A browser session authenticates WITH its refresh token, so
+    it carries the token in the Authorization header and has no reason to repeat
+    it in the body; an API-KEY client holds the token separately and sends it in
+    the body. Both are optional because the caller is already identified by the
+    credential that authenticated this request: when neither carries a token the
+    `logged_in` flag is still cleared, which ends the session for this API, but
+    nothing is revoked at Auth0 and the response says so rather than pretending.
     """
-    response = await logout_user(body.refresh_token, request=request)
-    # Auth0 POST /oauth/revoke returns 200 with an empty body on success.
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.json())
+    refresh_token = (body.refresh_token if body else None) or (
+        bearer_credentials.credentials if bearer_credentials else None
+    )
+
+    if refresh_token:
+        response = await logout_user(refresh_token, request=request)
+        # Auth0 POST /oauth/revoke returns 200 with an empty body on success.
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code, detail=response.json()
+            )
+
+    # Drops the cached session as well as the flag, so a revoked token stops
+    # authenticating immediately rather than at the end of its cache TTL.
     await set_login_status(current_user["user_id"], logged_in=False, request=request)
+
+    if not refresh_token:
+        return {
+            "message": (
+                "Logged out of this API. No refresh token was supplied, so the "
+                "token itself was not revoked at the identity provider."
+            )
+        }
     return {"message": "Logged out successfully"}
 
 
@@ -1822,9 +2114,19 @@ async def verify_login_status(
     `logged_in` app_metadata flag set by /login and cleared by /logout. Because
     /login and /logout invalidate the auth cache, this reads a fresh value from
     Auth0 rather than a stale cached copy.
+
+    `email_verified` is reported alongside it because this is the one endpoint an
+    account can reach BEFORE verifying its email, which makes it the only way a
+    client can watch for the verification to land. It is never stale for an
+    unverified caller: neither credential path caches an unverified account, so
+    every call re-reads the account from Auth0 and the flag flips the moment the
+    user follows the link in the email.
     """
     logged_in = current_user.get("app_metadata", {}).get("logged_in", False)
-    return {"logged_in": bool(logged_in)}
+    return {
+        "logged_in": bool(logged_in),
+        "email_verified": current_user.get("email_verified") is True,
+    }
 
 
 import stripe

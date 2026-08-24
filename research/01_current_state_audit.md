@@ -129,17 +129,15 @@ PATCH  /modify_avatar
 DELETE /delete_avatar
 GET    /list_public_avatars
 GET    /list_user_avatars
-POST   /select_avatar
 
-POST   /message
 POST   /message/{assistant_id}
 GET    /conversations
 GET    /conversations/{thread_id}/messages
 
 GET    /avatar_reference_image
 POST   /update_avatar_identity_with_media
-GET    /list_avatar_documents
-DELETE /delete_avatar_document
+GET    /list_avatar_documents?assistant_id=...
+DELETE /delete_avatar_document?assistant_id=...&source_document_name=...
 ```
 
 Any "single-avatar VM" must still serve `/message/{assistant_id}` and the

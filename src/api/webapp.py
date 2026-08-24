@@ -141,7 +141,6 @@ from src.security.auth import (
     get_user,
     get_user_with_api_key,
     security_route,
-    update_assistant_config,
     update_user_app_metadata_fields,
     update_user_subscription_status,
 )
@@ -759,7 +758,6 @@ OptionalUploadFiles = Annotated[
 ]
 
 import logging
-from urllib.parse import quote
 
 import stripe
 from dotenv import load_dotenv
@@ -1164,6 +1162,57 @@ def _is_auth_catch_all_target(method: str, path: str) -> bool:
         if method == expected_method and pattern.match(normalized_path):
             return True
     return False
+
+
+async def resolve_assistant_for_creator(
+    assistant_id: str,
+    current_user: dict,
+    action_description: str = "perform this action",
+) -> tuple[dict, str]:
+    """Load an avatar and confirm the signed-in caller is the creator of that avatar.
+
+    Returns ``(assistant, creator_user_id)``.
+
+    The creator is read from the avatar's ``metadata.user_id``, which ``create_avatar``
+    stamps with the bare Auth0 identifier (``identities[0]["user_id"]``) — the same value
+    every other ownership check in this module compares against, and the same value the
+    avatar's store namespaces are keyed under. Callers therefore use the returned
+    ``creator_user_id`` to scope store reads and writes rather than re-deriving it.
+
+    ``action_description`` completes the sentence "Only the creator of this avatar may
+    ___" in the 403 detail, so each caller reports the action the caller was refused.
+
+    Raises 400 when the avatar cannot be loaded or carries no creator, and 403 when the
+    signed-in caller is not that creator.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    try:
+        assistant = await client.assistants.get(assistant_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not load assistant: {exc}"
+        ) from exc
+    assistant_metadata = assistant.get("metadata") or {}
+    creator_id = assistant_metadata.get("user_id")
+    if not creator_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Assistant metadata is missing the creator's user_id; "
+                "cannot verify permissions for this avatar."
+            ),
+        )
+    if user_id != creator_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Only the creator of this avatar may {action_description}. "
+                "The signed-in user is not the assistant's creator."
+            ),
+        )
+    return assistant, creator_id
 
 
 async def get_public_avatars(
@@ -3502,150 +3551,6 @@ async def list_user_avatars(
         raise HTTPException(detail=error, status_code=500)
 
 
-@app.post("/select_avatar")
-async def select_avatar(
-    request: Request,
-    response: Response,
-    current_user: dict = Depends(get_current_user),
-    assistant_id: Optional[str] = None,
-    assistant_name: Optional[str] = None,
-):
-    logger.info("breakpoint")
-    if not current_user and not assistant_id:
-        return HTTPException(
-            status_code=400,
-            detail="Unauthenticated users must log in to use the select avatars via name feature. Please log in or use an assistant_id for selection.",
-        )
-
-    assistant_config = {"configurable": {"assistant_id": assistant_id}}
-
-    public_avatar_result = await get_public_avatars(assistant_id=assistant_id)
-
-    # if not current_user['identities'][0]['user_id'] is request.app.state.context['anonymous_user_id']: # anonymous user case
-    if not current_user:
-        if len(public_avatar_result) > 0:
-            assistant_config["configurable"].update(
-                {
-                    "assistant_ctx": {
-                        "name": public_avatar_result[0].get("name", None),
-                        "description": public_avatar_result[0].get("description", None),
-                    }
-                }
-            )
-
-        public_avatar_result = await update_assistant_config(
-            assistant_config=assistant_config, request=request
-        )
-        return assistant_config
-    else:
-        token = current_user["API_KEY"]
-        client = get_client(headers={"API-KEY": token})
-        user_id = current_user["identities"][0]["user_id"]
-        if assistant_id:
-            try:
-                if len(public_avatar_result) == 0:  # the avatar was not public
-                    result = await client.assistants.get(
-                        assistant_id=assistant_id
-                    )  # attempt to get user-specific avatar with api key
-                    if not result:
-                        raise HTTPException(
-                            detail="Assistant not found: {assistant_id}",
-                            status_code=500,
-                        )
-                        # assistant = {"name": None, "description": None}
-                    else:
-                        assistant = result
-                    logger.info(f"result:{result}")
-                    assistant_config = {
-                        "configurable": {
-                            "assistant_id": assistant_id,
-                            "assistant_ctx": {
-                                "name": assistant.get("name", ""),
-                                "description": assistant.get("description", ""),
-                                "metadata": assistant.get("metadata", {}),
-                            },
-                        }
-                    }
-                else:
-                    assistant_config["configurable"].update(
-                        {
-                            "assistant_ctx": {
-                                "name": public_avatar_result[0].get("name", None),
-                                "description": public_avatar_result[0].get(
-                                    "description", None
-                                ),
-                                "metadata": public_avatar_result[0].get("metadata", {}),
-                            }
-                        }
-                    )
-                provider_encoded_user_id = quote(current_user["user_id"], safe="")
-
-                hashed_api_key = current_user["app_metadata"]["api_key"]
-                _ = await update_assistant_config(
-                    hashed_api_key=hashed_api_key,
-                    provider_encoded_user_id=provider_encoded_user_id,
-                    assistant_config=assistant_config,
-                    request=request,
-                )
-                return assistant_config
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error using assistant_id for logged in user {e}",
-                )
-        elif assistant_name:
-            try:
-                result = await client.assistants.search(name=assistant_name)
-                try:
-                    if len(result) == 0:
-                        raise HTTPException(
-                            detail="Assistant not found.", status_code=400
-                        )
-                    assistant = result[0]
-                    is_public = assistant.get("metadata", {}).get("is_public", False)
-                    if not is_public and (
-                        current_user["identities"][0]["user_id"]
-                        != assistant.get("metadata", {}).get("user_id", None)
-                    ):
-                        raise HTTPException(
-                            detail="Non-public avatar id.", status_code=401
-                        )
-                    else:
-                        assistant_config = {
-                            "configurable": {
-                                "assistant_ctx": {
-                                    "name": assistant.get("name", None),
-                                    "description": assistant.get("description", None),
-                                    "metadata": assistant.get("metadata", {}),
-                                },
-                                "assistant_id": assistant.get("assistant_id", None),
-                            }
-                        }
-                    hashed_api_key = current_user["app_metadata"]["api_key"]
-                    provider_encoded_user_id = quote(current_user["user_id"], safe="")
-                    result = await update_assistant_config(
-                        hashed_api_key=hashed_api_key,
-                        provider_encoded_user_id=provider_encoded_user_id,
-                        assistant_config=assistant_config,
-                        request=request,
-                    )
-
-                    return JSONResponse(content=assistant_config, status_code=200)
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Error during avatar selection via assistant_name: {e}",
-                    )
-            except Exception as e:
-                error_str = "{error}".format(error=e)
-                return HTTPException(detail=error_str, status_code=500)
-        else:
-            return HTTPException(
-                detail="Error: either assistant_id or assistant_name is required.",
-                status_code=400,
-            )
-
-
 async def process_files_for_message(
     files: OptionalUploadFiles = None,
     message: str = "",
@@ -3759,240 +3664,6 @@ async def process_files_for_message(
     return combined_text, None, []
 
 
-@app.post("/message")
-async def message_selected_avatar(
-    request: Request,
-    message: str = Form(""),
-    your_name: Optional[str] = Form(None),
-    your_description: Optional[str] = Form(None),
-    conversation_title: Optional[str] = Form(None),
-    files: OptionalUploadFiles = None,
-    thread_id: Optional[str] = Form(None),
-    stream: bool = Form(True),
-    feedback: bool = Form(False),
-    like: bool = Form(False),
-    dislike: bool = Form(False),
-    user_timezone: Optional[str] = Form(None),
-    include_quality_metrics: bool = Form(True),
-    include_usage_metrics: bool = Form(True),
-    adapter: bool = Form(False),
-    current_user: dict = Depends(get_current_user),
-):
-    # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
-    # data-collection / preference-learning pipeline is intentionally deferred
-    # while the upload + evaluation pipeline ships first; the parameters exist
-    # now so the frontend can wire its UI without a breaking API change later.
-    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
-    # allow for select avatar in query and anonymous user for a dedicated endpoint
-    start_time = time_ns()
-    config = current_user.get("app_metadata", {}).get("assistant_config", {})
-    if not config:
-        raise HTTPException(
-            detail="Error retrieving assistant information.", status_code=400
-        )
-
-    # This turn bills the adapter-inference meter only when the client asked for
-    # the adapter AND the user's tier grants adapter inference; otherwise the
-    # messaging meter governs. Attached files are processed FIRST so the
-    # pre-call estimate covers message text, attached file text, and attached
-    # images; enforcement then verifies the estimate against the allotment
-    # period BEFORE any model call (and before a thread is created). Any tier
-    # without pay-per-use is blocked at the allotment; a token rate cap guards
-    # against runaway clients.
-    message_meter = (
-        UsageMeter.ADAPTER_INFERENCE_TOKENS
-        if resolve_use_adapter_inference(current_user, adapter)
-        else UsageMeter.MESSAGING_TOKENS
-    )
-    (
-        file_text_content,
-        multimodal_content,
-        image_filenames,
-    ) = await process_files_for_message(files, message=message)
-
-    user_name = your_name
-    user_description = your_description
-    user_id = current_user["identities"][0]["user_id"]
-    config_update = {
-        "configurable": {
-            "user_ctx": {"name": user_name, "description": user_description},
-            "user_id": user_id,
-        }
-    }
-    assistant_id = config["configurable"].get("assistant_id")
-
-    # The pre-call estimate measures the REAL system prompt for this
-    # (user, avatar) pair, so estimation reads the merged configurable the
-    # prompt builder needs (user_id, assistant_id, assistant_ctx). The merge
-    # happens on a copy: enforcement below still runs before a thread is
-    # created and before any model call.
-    estimation_config = {
-        "configurable": {
-            **config.get("configurable", {}),
-            **config_update["configurable"],
-        }
-    }
-    estimated_request_tokens = await _estimate_message_request_tokens(
-        request.app.state,
-        estimation_config,
-        message,
-        file_text_content,
-        multimodal_content,
-    )
-    # ``assistant_id`` reaches enforcement so an avatar listed in
-    # UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS answers anonymous
-    # visitors without a 402/429 while staying metered. This endpoint requires
-    # an authenticated api key, so the exemption never actually fires here; it
-    # is passed for consistency with the by-id message endpoints, and because
-    # the exemption itself refuses to apply to a non-anonymous requester.
-    await enforce_remaining_allotment(
-        request.app.state,
-        current_user,
-        message_meter,
-        estimated_request_tokens=estimated_request_tokens.input_tokens,
-        assistant_id=assistant_id,
-    )
-    message_rate_limit_context = GlobalContext()
-    await enforce_token_rate_limit(
-        request.app.state,
-        current_user,
-        meter_event_names=[
-            UsageMeter.MESSAGING_TOKENS.value,
-            UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
-        ],
-        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
-        tokens_per_window=int(
-            message_rate_limit_context.message_rate_limit_tokens_per_window or 0
-        ),
-        estimated_request_tokens=estimated_request_tokens.total_tokens,
-        assistant_id=assistant_id,
-    )
-
-    # Handle thread_id
-    if not thread_id:
-        thread_id = str(uuid4())
-        thread_metadata = {
-            "thread_metadata": {"user_id": user_id, "assistant_id": assistant_id},
-            "graph_id": "Anubis",
-        }
-        # create thread_id
-        try:
-            langgraph_client = get_client(headers=langgraph_client_headers)
-            thread_create_response = await langgraph_client.threads.create(
-                thread_id=thread_id, metadata=thread_metadata
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail="Error creating new conversation thread."
-            )
-
-    # update with user information
-    config_update["configurable"]["thread_id"] = thread_id
-    config["configurable"].update(config_update["configurable"])
-    # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
-    config["configurable"]["user_timezone"] = user_timezone
-    config["configurable"]["include_quality_metrics"] = include_quality_metrics
-    config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
-        current_user, adapter
-    )
-
-    # store = app.state.store
-    graph = app.state.graph
-
-    # Uploaded files were already processed above (before enforcement) so the
-    # pre-call estimate could cover them; reuse those results here.
-
-    # Create the human message content
-    if multimodal_content:
-        human_message = HumanMessage(
-            id=str(uuid4()),
-            content=multimodal_content,
-            additional_kwargs={"image_filenames": image_filenames},
-        )
-    else:
-        # Use text-only content
-        if file_text_content:
-            if (message or "").strip():
-                human_message_content = message.strip() + "\n\n" + file_text_content
-            else:
-                human_message_content = file_text_content
-        else:
-            human_message_content = message
-        human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
-
-    if stream:
-        return StreamingResponse(
-            message_graph_sse(
-                graph,
-                human_message,
-                config,
-                app.state.context,
-                thread_id=thread_id,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                conversation_title_value=conversation_title,
-                start_time_ns=start_time,
-                request_id=request.state.request_id,
-                langgraph_client_headers=langgraph_client_headers,
-                app_state=request.app.state,
-                current_user=current_user,
-                estimated_request_tokens=estimated_request_tokens,
-                estimate_meter=message_meter,
-                include_usage_metrics=include_usage_metrics,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    result = await graph.ainvoke(
-        input={"messages": [human_message]},
-        config=config,
-        context=app.state.context,
-    )
-
-    # Update most_recent_message
-    langgraph_client = get_client(headers=langgraph_client_headers)
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title,
-        },
-        "graph_id": "Anubis",
-    }
-    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
-
-    response_data = {}
-    response_data["content"] = result["messages"][-1].content
-    response_metadata = result["messages"][-1].response_metadata
-    if response_metadata:
-        response_data["response_metadata"] = response_metadata
-
-    response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
-    logger.warning(f"RESPONSE_DATA: {response_data}")
-    response_data["thread_id"] = thread_id
-    response_data["request_id"] = request.state.request_id
-    turn_usage = await _meter_message_usage(
-        app_state=request.app.state,
-        current_user=current_user,
-        response_metadata=response_metadata,
-        thread_id=thread_id,
-        assistant_id=assistant_id,
-        latency_ms=(time_ns() - start_time) / 1_000_000,
-        request_id=request.state.request_id,
-    )
-    if include_usage_metrics:
-        response_data["input_tokens"] = estimated_request_tokens.input_tokens
-        if turn_usage:
-            response_data["usage"] = turn_usage
-    return JSONResponse(response_data, status_code=200)
-
-
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,
@@ -4024,15 +3695,16 @@ async def message_avatar(
     start_time = time_ns()
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
-        # This endpoint identifies the avatar by the URL path parameter, not by
-        # a previously selected avatar. An authenticated (api-key) caller
-        # rebuilds the full configurable from the path ``assistant_id`` below
-        # (name/description/metadata fetched fresh), so a pre-selected
-        # ``assistant_config`` is not required — messaging an avatar by id must
-        # work without a prior ``/select_avatar`` call. Only the anonymous
-        # branch depends on the dependency-populated ``assistant_config``
-        # (always present once an avatar resolved); start from an empty
-        # configurable that the api-key branch fills in.
+        # This endpoint identifies the avatar by the URL path parameter. An
+        # authenticated (api-key) caller rebuilds the full configurable from the
+        # path ``assistant_id`` below (name/description/metadata fetched fresh),
+        # so an ``assistant_config`` on the account is not required. Only the
+        # anonymous branch depends on the dependency-populated
+        # ``assistant_config``, which ``get_anonymous_user_with_anonymous_api_key``
+        # builds in memory from the same path ``assistant_id`` after confirming
+        # the avatar is public (that is where the public-avatar gate lives, so
+        # the anonymous branch must not fall back to an empty configurable);
+        # start from an empty configurable that the api-key branch fills in.
         if not is_anonymous_user(current_user):
             config = {"configurable": {}}
         else:
@@ -4307,16 +3979,16 @@ async def resume_avatar_message(
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
         # Same rule as ``POST /message/{assistant_id}``: this endpoint identifies
-        # the avatar by the URL path parameter, not by a previously selected
-        # avatar. An authenticated (api-key) caller rebuilds the full configurable
-        # from the path ``assistant_id`` below (name/description/metadata fetched
-        # fresh), so a pre-selected ``assistant_config`` is not required — a client
-        # that messages an avatar by id without a prior ``/select_avatar`` call
+        # the avatar by the URL path parameter. An authenticated (api-key) caller
+        # rebuilds the full configurable from the path ``assistant_id`` below
+        # (name/description/metadata fetched fresh), so an ``assistant_config`` on
+        # the account is not required — a client that messaged an avatar by id
         # must be able to resume the run that message paused, otherwise the
         # approve/edit/reject panel renders but can never be acted on. Only the
         # anonymous branch depends on the dependency-populated
-        # ``assistant_config`` (always present once an avatar resolved); start
-        # from an empty configurable that the api-key branch fills in.
+        # ``assistant_config``, which carries the public-avatar gate applied when
+        # the anonymous visitor was resolved; start from an empty configurable
+        # that the api-key branch fills in.
         if not is_anonymous_user(current_user):
             config = {"configurable": {}}
         else:
@@ -6452,32 +6124,13 @@ async def update_avatar_identity_with_media(
         if not assistant_id:
             raise HTTPException(status_code=400, detail="assistant_id is required")
 
-        token = current_user["API_KEY"]
-        client = get_client(headers={"API-KEY": f"{token}"})
-        try:
-            assistant = await client.assistants.get(assistant_id)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400, detail=f"Could not load assistant: {exc}"
-            ) from exc
+        # Only the creator of an avatar may add media to that avatar's identity.
+        # Shared with /list_avatar_documents and /delete_avatar_document, which read
+        # and remove the very rows this endpoint writes.
+        assistant, _creator_id = await resolve_assistant_for_creator(
+            assistant_id, current_user, action_description="upload media for that avatar"
+        )
         assistant_meta = assistant.get("metadata") or {}
-        creator_id = assistant_meta.get("user_id")
-        if not creator_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Assistant metadata is missing the creator's user_id; "
-                    "cannot verify upload permissions."
-                ),
-            )
-        if user_id != creator_id:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Only the creator of this avatar may upload media for it. "
-                    "The signed-in user is not the assistant's creator."
-                ),
-            )
 
         config = {
             "configurable": {
@@ -7302,18 +6955,22 @@ async def cancel_media_job(
 
 
 @app.get("/list_avatar_documents")
-async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
-    user_id = current_user["identities"][0]["user_id"]
-    assistant_id = (
-        current_user["app_metadata"]
-        .get("assistant_config", {})
-        .get("configurable", {})
-        .get("assistant_id", None)
+async def list_avatar_documents(
+    assistant_id: str, current_user: dict = Depends(get_current_user)
+):
+    # The caller names the avatar explicitly. Only the creator of that avatar may
+    # see the source documents that built the avatar's identity, so this endpoint
+    # applies the same creator check /update_avatar_identity_with_media applies
+    # when writing those documents. resolve_assistant_for_creator returns the
+    # creator's user id, which is the user id the avatar's store rows were written
+    # under and therefore what scopes the read below. After the creator check the
+    # creator's user id and the caller's user id necessarily hold the same value;
+    # reading the creator's makes the store scoping self-documenting.
+    _assistant, user_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="list the documents of that avatar",
     )
-    if assistant_id is None:
-        raise HTTPException(
-            detail="Please select an avatar before continuing.", status_code=400
-        )
 
     # Read the avatar's store namespace in-process via app.state.store rather than
     # the LangGraph SDK HTTP client. The HTTP round-trip ConnectTimeouts while a
@@ -7344,7 +7001,9 @@ async def list_avatar_documents(current_user: dict = Depends(get_current_user)):
 
 @app.delete("/delete_avatar_document")
 async def delete_avatar_documents(
-    source_document_name: str, current_user: dict = Depends(get_current_user)
+    assistant_id: str,
+    source_document_name: str,
+    current_user: dict = Depends(get_current_user),
 ):
 
     # Strip wrappers from copied SQL tuple/list output, e.g. ('Mom.m4a',) or "Mom.m4a",
@@ -7353,17 +7012,14 @@ async def delete_avatar_documents(
     # Keep the user-facing name for the response; source_document_name itself may
     # be rewritten below into an opaque hashed/composite store key.
     display_name = source_document_name
-    user_id = current_user["identities"][0]["user_id"]
-    assistant_id = (
-        current_user["app_metadata"]
-        .get("assistant_config", {})
-        .get("configurable", {})
-        .get("assistant_id", None)
+    # Same rule as /list_avatar_documents: the caller names the avatar, and only
+    # the creator of that avatar may delete the documents that built the avatar's
+    # identity. The creator's user id scopes every store prefix built below.
+    _assistant, user_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="delete the documents of that avatar",
     )
-    if assistant_id is None:
-        raise HTTPException(
-            detail="Please select an avatar before continuing.", status_code=400
-        )
 
     # Users delete by pasting a string straight out of /list_avatar_documents.
     # For a plain file that string IS the stored key (filename), but a playlist

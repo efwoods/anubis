@@ -25,7 +25,6 @@ certificate
 neuralnexus-467517-firebase-adminsdk-fbsvc-e796deb01f.json
 .taxes.txt
 **q_and_a_testing
-.env.test
 uv.lock
 **/.bak/**
 **.ipynb
@@ -34,7 +33,6 @@ uv.lock
 **init.ipynb**
 **/models/**
 test.ipynb
-.env.dev
 data/**
 data/elon-musk-dataset
 # Tracked source modules that live under data/ (the rest of data/ is runtime output)
@@ -170,6 +168,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/

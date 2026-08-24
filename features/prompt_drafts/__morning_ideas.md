@@ -181,8 +181,6 @@ allow the process media graph to be used as a tool triggered in conversation
 # get reference audio file and reference image file url endpoints
 # CRUD memories/identity_memories endpoints
 
-# I need avatar_id as a parameter for list_avatar_documents; delete_avatar_documents; use selected avatar if avatar_id is not present: verify that the requester is the creator in the endpoint
-
 # Moving forward
 
 # measure quality
@@ -194,7 +192,6 @@ allow the process media graph to be used as a tool triggered in conversation
 # save transcriptions for parsing from calls or video meetings
 
 # MCP servers for connecting accounts and pulling information
-
 
 ------
 # 

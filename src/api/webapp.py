@@ -1187,11 +1187,29 @@ async def get_public_avatars(
             return [assistant_query.to_assistant() for assistant_query in data]
 
 
-def _assistant_without_metadata_if_public(assistant: dict[str, Any]) -> dict[str, Any]:
+def _assistant_without_metadata_if_public(
+    assistant: dict[str, Any], viewer_user_id: str | None = None
+) -> dict[str, Any]:
+    """Hide a public avatar's metadata from everyone except its creator.
+
+    The metadata carries ``user_id``, so stripping it is what keeps one user's
+    identifier out of another user's listing. It must NOT be stripped from the
+    creator's own copy: ``metadata.user_id`` is the only thing a client can
+    compare against the signed-in user to decide whether that user may
+    administer the avatar. Stripping it from the owner too made every avatar the
+    owner had shared read as someone else's, so the Avatar Settings tab vanished
+    the moment an avatar was made public — including from the personal avatar,
+    the one avatar the product expects a user to share.
+
+    ``viewer_user_id`` is the caller. Passing None keeps the unconditional
+    behaviour, which is what an unauthenticated public listing wants.
+    """
     meta = assistant.get("metadata")
     if isinstance(meta, dict):
         pub = meta.get("is_public")
         if pub is True or (isinstance(pub, str) and pub.lower() == "true"):
+            if viewer_user_id is not None and meta.get("user_id") == viewer_user_id:
+                return assistant
             return {k: v for k, v in assistant.items() if k != "metadata"}
     return assistant
 
@@ -2487,16 +2505,19 @@ async def get_personal_avatar(
     )
 
 
-async def _search_device_records(
+async def _search_namespace_records(
     client: Any, namespace: tuple[str, ...]
 ) -> list[dict[str, Any]]:
-    """List every device-keyed record in one store namespace, best effort.
+    """List every record in one per-user store namespace, best effort.
 
-    The Model Context Protocol namespaces hold one record per connected machine,
-    keyed by ``device_id``. This wraps the SDK ``StoreClient`` search so the
-    daemon-facing endpoints (which authenticate as the user and therefore use the
-    HTTP store client rather than the in-process ``BaseStore``) can read the whole
-    device set in one call.
+    Used by two namespace families that share the same shape — one record per
+    thing, keyed by that thing's identifier. The Model Context Protocol
+    namespaces hold one record per connected machine keyed by ``device_id``; the
+    connected-account namespace holds one record per connected external account
+    keyed by ``"{provider}:{address}"``. This wraps the SDK ``StoreClient``
+    search so endpoints (which authenticate as the user and therefore use the
+    HTTP store client rather than the in-process ``BaseStore``) can read a whole
+    record set in one call.
 
     Returns an empty list when the namespace is empty or unreachable — every
     caller treats "no devices" and "cannot tell" the same way, and a store hiccup
@@ -2525,7 +2546,7 @@ async def _resolve_personal_avatar_capability_statuses(
 
     statuses: dict[str, Any] = {}
 
-    connections = await _search_device_records(
+    connections = await _search_namespace_records(
         client, mcp_connection_namespace(user_id)
     )
     connected_data_servers = [
@@ -2544,10 +2565,331 @@ async def _resolve_personal_avatar_capability_statuses(
     if connected_data_servers:
         statuses["connected_data_servers"] = connected_data_servers
 
+    # Connected external accounts fill two capabilities from one namespace,
+    # split by the provider's kind. The split is deliberate and is a security
+    # boundary rather than presentation: `social_accounts` is the capability an
+    # identity-verification gate reads, and a mailbox must never be able to
+    # discharge "the account behind this likeness is verified". See
+    # `connected_accounts/providers.py`.
+    from src.anubis.utils.connected_accounts import (
+        STATUS_CONNECTED,
+        connected_account_namespace,
+        public_account_view,
+    )
+
+    accounts = await _search_namespace_records(
+        client, connected_account_namespace(user_id)
+    )
+    connected_mailboxes = [
+        public_account_view(account)
+        for account in accounts
+        if account.get("kind") == "mailbox"
+    ]
+    if connected_mailboxes:
+        statuses["connected_mailboxes"] = connected_mailboxes
+
+    connected_social_accounts = [
+        public_account_view(account)
+        for account in accounts
+        if account.get("kind") == "social" and account.get("status") == STATUS_CONNECTED
+    ]
+    if connected_social_accounts:
+        statuses["connected_social_accounts"] = connected_social_accounts
+
     # The personal avatar's adapter is trained from the owner's messages across
     # every avatar; no connection step gates that, so it is always active.
     statuses["adapter_training"] = "active"
     return statuses
+
+
+async def _resolve_personal_avatar_for_connection(
+    client: Any, request: Any, current_user: dict, token: str
+) -> dict:
+    """Return the caller's personal avatar or fail the request.
+
+    Every connected-account route is exclusive to the personal avatar: these
+    credentials reach the owner's private mail, and no shared or secondary
+    avatar may be bound to them. Resolution is self-healing, so a user who has
+    somehow lost their personal avatar gets one provisioned here rather than an
+    error telling them to create one first.
+    """
+    from src.anubis.utils.personal_avatar import resolve_personal_avatar
+
+    try:
+        personal_avatar = await resolve_personal_avatar(
+            client, request, current_user, token
+        )
+    except Exception as resolution_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error resolving the personal avatar: {resolution_error}",
+        )
+    if personal_avatar is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The personal avatar could not be provisioned. Retry shortly; "
+                "provisioning is retried on every request until it succeeds."
+            ),
+        )
+    return personal_avatar
+
+
+@app.post("/connect_mailbox")
+async def connect_mailbox(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect one of the owner's email accounts to their personal avatar.
+
+    Body: ``provider`` (default "gmail"), ``email_address``, ``app_password``.
+
+    The credential is proved against the real mail server BEFORE anything is
+    written, so a bad credential is rejected while the owner still has the
+    connect form in front of them rather than failing on the first mail call
+    days later. Only then is it encrypted and stored; the plaintext is never
+    persisted and never logged.
+
+    On Gmail the password must be a 16-character app password, not the account
+    password: Google stopped accepting account passwords over IMAP on
+    2025-03-14, and creating an app password requires 2-Step Verification. A
+    rejected credential says exactly that and links to the page that issues one,
+    because "authentication failed" alone sends people to re-type the same wrong
+    secret.
+    """
+    # save_connected_account is deliberately NOT used here: it writes through the
+    # in-process BaseStore, while an endpoint authenticates as the user and must
+    # go through the SDK StoreClient, as every other endpoint in this module does.
+    from src.anubis.utils.connected_accounts import (
+        account_key,
+        build_account_record,
+        connected_account_namespace,
+        deduplicate_label,
+        derive_display_label,
+        get_provider,
+        public_account_view,
+    )
+    from src.anubis.utils.secret_store import (
+        SecretEncryptionNotConfiguredError,
+        encrypt_secret,
+    )
+    from src.anubis.utils.tools.email.imap_client import (
+        MailboxAuthenticationError,
+        MailboxCredentials,
+        MailboxUnreachableError,
+        verify_credentials,
+    )
+
+    body = await request.json()
+    provider_name = str(body.get("provider") or "gmail").strip().lower()
+    email_address = str(body.get("email_address") or "").strip()
+    app_password = str(body.get("app_password") or "")
+
+    provider = get_provider(provider_name)
+    if provider is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider {provider_name!r}.",
+        )
+    if not provider.is_mailbox:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{provider.display_name} is not a mailbox and cannot be "
+                "connected with an email address and password."
+            ),
+        )
+    if not email_address or not app_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Both email_address and app_password are required.",
+        )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+
+    namespace = connected_account_namespace(user_id)
+    existing_records = await _search_namespace_records(client, namespace)
+    key = account_key(provider.name, email_address)
+    # Reconnecting an account the owner already has must refresh that record
+    # rather than count against the cap, otherwise rotating an app password
+    # eventually locks the owner out of their own mailbox.
+    if not any(record.get("account_key") == key for record in existing_records):
+        maximum = int(app.state.context.max_connected_accounts_per_user)
+        if len(existing_records) >= maximum:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A maximum of {maximum} accounts may be connected. "
+                    "Disconnect one before connecting another."
+                ),
+            )
+
+    credentials = MailboxCredentials(
+        account_address=email_address,
+        password=app_password,
+        imap_host=provider.imap_host,
+        imap_port=provider.imap_port,
+        smtp_host=provider.smtp_host,
+        smtp_port=provider.smtp_port,
+        drafts_mailbox=provider.drafts_mailbox,
+        timeout_seconds=float(app.state.context.mailbox_request_timeout_seconds),
+    )
+    try:
+        await asyncio.to_thread(verify_credentials, credentials)
+    except MailboxAuthenticationError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{provider.display_name} rejected that address and password. "
+                "Use a 16-character app password, not your account password — "
+                "Google stopped accepting account passwords for mail access on "
+                "14 March 2025. Creating one requires 2-Step Verification: "
+                f"{provider.credential_help_url}"
+            ),
+        )
+    except MailboxUnreachableError as unreachable_error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Could not reach {provider.display_name} to check the "
+                f"credential: {unreachable_error}"
+            ),
+        )
+
+    try:
+        encrypted_secret = encrypt_secret(app_password, app.state.context)
+    except SecretEncryptionNotConfiguredError as configuration_error:
+        raise HTTPException(status_code=503, detail=str(configuration_error))
+
+    label = deduplicate_label(
+        derive_display_label(email_address), existing_records, key
+    )
+    record = build_account_record(
+        provider=provider,
+        account_address=email_address,
+        display_label=label,
+        encrypted_secret=encrypted_secret,
+        assistant_id=personal_avatar.get("assistant_id"),
+    )
+    await client.store.put_item(list(namespace), key=key, value=record)
+
+    return JSONResponse(
+        content={"connected": True, "account": public_account_view(record)},
+        status_code=200,
+    )
+
+
+@app.get("/connectable_providers")
+async def connectable_providers(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Describe the accounts that can be connected, and the form each one needs.
+
+    The same card description the avatar raises mid-conversation, served for the
+    settings screen. Both surfaces read this one description so a provider's
+    labels, fields, and help text cannot drift into two versions — which matters
+    most for the app-password explanation, the only place an owner is told that
+    a Google account password will never authenticate.
+
+    Carries no user data: it is the static registry, projected for a client.
+    """
+    from src.anubis.utils.connected_accounts.connection_tools import (
+        build_connect_card,
+    )
+    from src.anubis.utils.connected_accounts.providers import mailbox_providers
+
+    return JSONResponse(
+        content={
+            "providers": [
+                build_connect_card(provider) for provider in mailbox_providers()
+            ]
+        },
+        status_code=200,
+    )
+
+
+@app.get("/list_connected_accounts")
+async def list_connected_accounts(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the external accounts connected to the caller's personal avatar.
+
+    Returns the projection in ``public_account_view`` only. Neither the password
+    (never stored) nor its ciphertext is included: the ciphertext is useless to a
+    caller and returning it would only help an attacker who later obtained the
+    encryption key.
+    """
+    from src.anubis.utils.connected_accounts import (
+        connected_account_namespace,
+        public_account_view,
+    )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    await _resolve_personal_avatar_for_connection(client, request, current_user, token)
+
+    records = await _search_namespace_records(
+        client, connected_account_namespace(user_id)
+    )
+    return JSONResponse(
+        content={"accounts": [public_account_view(record) for record in records]},
+        status_code=200,
+    )
+
+
+@app.delete("/disconnect_account")
+async def disconnect_account(
+    request: Request,
+    account_key: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Disconnect one external account, deleting its stored credential.
+
+    The account key is REQUIRED and exactly one record is deleted. There is
+    deliberately no "disconnect everything" mode: ``/disconnect_mcp`` shipped
+    with an omitted identifier meaning "remove every device", and that shape is
+    what let one caller destroy every record it could see. Repeating it here
+    would put every mailbox a user owns behind a single missing argument.
+    """
+    from src.anubis.utils.connected_accounts import connected_account_namespace
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    await _resolve_personal_avatar_for_connection(client, request, current_user, token)
+
+    if not str(account_key or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="An account_key is required; name the account to disconnect.",
+        )
+
+    namespace = list(connected_account_namespace(user_id))
+    # Existence is checked before deleting rather than inferred from the delete
+    # call: the store client does not report a missing key as an error, so a
+    # delete alone would answer "disconnected" for an account that was never
+    # connected — and an owner who mistyped a key would believe a live mailbox
+    # had been removed.
+    existing = await client.store.get_item(namespace, key=account_key)
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No connected account {account_key!r} to disconnect.",
+        )
+    await client.store.delete_item(namespace, key=account_key)
+
+    return JSONResponse(
+        content={"disconnected": True, "account_key": account_key},
+        status_code=200,
+    )
 
 
 @app.post("/create_avatar")
@@ -2805,7 +3147,7 @@ async def disconnect_mcp(
             await client.store.delete_item(namespace, key=device_id)
             removed = [device_id]
         else:
-            records = await _search_device_records(
+            records = await _search_namespace_records(
                 client, mcp_connection_namespace(user_id)
             )
             removed = []
@@ -2855,10 +3197,10 @@ async def list_mcp_connections(
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
 
-    registrations = await _search_device_records(
+    registrations = await _search_namespace_records(
         client, mcp_registration_namespace(user_id)
     )
-    connections = await _search_device_records(
+    connections = await _search_namespace_records(
         client, mcp_connection_namespace(user_id)
     )
     connection_by_device = {
@@ -3150,7 +3492,7 @@ async def mcp_register(
     if connection_mode == "relay":
         mcp_url = f"{str(request.base_url).rstrip('/')}/mcp/relay/{device_id}"
 
-    existing_records = await _search_device_records(
+    existing_records = await _search_namespace_records(
         client, mcp_registration_namespace(user_id)
     )
     # The cap counts only OTHER devices, so a machine that is already registered
@@ -3289,7 +3631,7 @@ async def mcp_heartbeat(
         if body.get("device_label"):
             other_records = [
                 other
-                for other in await _search_device_records(
+                for other in await _search_namespace_records(
                     client, mcp_registration_namespace(user_id)
                 )
                 if other.get("device_id") != device_id
@@ -3459,8 +3801,13 @@ async def list_user_avatars(
         if len(response) > 0:
             avatar_list = response
             public_avatars_result.extend(avatar_list)  # public and private avatars
+        # The caller sees their OWN avatars in full, public or not; only other
+        # people's public avatars are stripped.
         sanitized = [
-            _assistant_without_metadata_if_public(a) for a in public_avatars_result
+            _assistant_without_metadata_if_public(
+                a, viewer_user_id=current_user["identities"][0]["user_id"]
+            )
+            for a in public_avatars_result
         ]
         return JSONResponse(sanitized, status_code=200)
     except Exception as e:

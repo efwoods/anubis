@@ -804,7 +804,45 @@ async def think(
         deep_agent_run_context, conversation_key=outer_thread
     )
 
-    extra_tools = [*(analysis_extra_tools or []), *browser_toolkit_tools]
+    # Mailbox capability gate: the connected accounts bound to THIS avatar, and
+    # only when this avatar is the owner's personal avatar. Same two-part gate as
+    # the data-analysis tools, and for a stronger reason — these tools carry the
+    # owner's own mail credentials, so a shared avatar or a demoted one must
+    # reach nothing. No environment switch: a connected account is the gate.
+    mailbox_tools: list[Any] = []
+    connection_tools: list[Any] = []
+    if is_personal_avatar and runtime.store is not None:
+        from src.anubis.utils.connected_accounts import bound_accounts_for
+        from src.anubis.utils.connected_accounts.connection_tools import (
+            build_connection_tools,
+        )
+        from src.anubis.utils.tools.email.mailbox_tools import build_mailbox_tools
+
+        owner_user_id = state["user_state"]["user_id"]
+        answering_assistant_id = state["assistant_state"]["assistant_id"]
+        connected_accounts = await bound_accounts_for(
+            runtime.store,
+            owner_user_id,
+            answering_assistant_id,
+        )
+        mailbox_tools = build_mailbox_tools(runtime.context, connected_accounts)
+        # Offered whether or not anything is connected. The owner with no mailbox
+        # is precisely the owner who needs to connect one, so gating the connect
+        # tool on having a connection would leave no way in.
+        connection_tools = build_connection_tools(
+            runtime.context,
+            store=runtime.store,
+            user_id=owner_user_id,
+            assistant_id=answering_assistant_id,
+            connected_accounts=connected_accounts,
+        )
+
+    extra_tools = [
+        *(analysis_extra_tools or []),
+        *browser_toolkit_tools,
+        *mailbox_tools,
+        *connection_tools,
+    ]
     deep_agent = build_avatar_deep_agent(
         runtime.context,
         checkpointer=checkpointer,

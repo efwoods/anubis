@@ -178,6 +178,14 @@ def enforce_tier_capability(current_user: dict, capability: TierCapability) -> S
     message, pro adds uploads, premium adds adapter training. Anonymous users
     resolve to free and therefore reach only the message capability. Returns the
     resolved tier so callers can reuse it without recomputing.
+
+    Every tier keeps its own feature set here, with NO exemptions. An account
+    listed in ``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS`` is uncapped WITHIN the
+    tier the account holds — the allotment and the rate limit stop applying — but
+    the tier still decides which capabilities exist at all, so a listed account on
+    the free tier is refused uploads exactly like any other free-tier account and
+    reaches uploads by changing tier. Keeping this gate tier-only is what makes a
+    demonstration account a faithful demonstration of the tier being shown.
     """
     tier = resolve_tier(current_user)
     if capability in TIER_DEFINITIONS[tier].capabilities:
@@ -302,7 +310,12 @@ async def enforce_remaining_allotment(
     identifier listed in ``ADMIN_METERING_BYPASS_IDENTIFIERS``, and (in
     development only) any identifier listed in
     ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS`` skip enforcement entirely;
-    only the first two also stop being metered. ``assistant_id`` is the avatar
+    only the first two also stop being metered. An account listed in
+    ``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS`` likewise skips this refusal, in
+    production as well as development, and may run past the allotment of whatever
+    tier the account currently holds while every token stays metered; that
+    account's tier still governs which capabilities exist at all.
+    ``assistant_id`` is the avatar
     the request is aimed at: an anonymous visitor messaging an avatar listed in
     ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS`` also skips this
     refusal while remaining fully metered.
@@ -364,7 +377,8 @@ async def enforce_token_rate_limit(
     client when the oldest usage row ages out of the rolling window. A cap of
     zero or less disables the limit entirely; every requester that
     ``resolve_metering_bypass`` marks as skipping enforcement also skips the
-    limit — including an anonymous visitor messaging an avatar listed in
+    limit — an account listed in ``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS``,
+    and an anonymous visitor messaging an avatar listed in
     ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS``, which is why
     ``assistant_id`` is passed through: an unlimited demonstration avatar that
     still answered only until the rolling token cap was met would not be
@@ -2464,6 +2478,12 @@ async def verify_subscription_status(
             "overage_price_per_unit_usd": allotment.overage_price_per_unit_usd,
         }
 
+    # A requester that skips enforcement is never refused at the allotment, so a
+    # client rendering this payload has to be told: the same bypass flags the SSE
+    # usage frames and the upload response already carry are spread here too, and
+    # a portal reading unrestricted_metered_account knows not to draw an exhausted
+    # allotment as a wall. One vocabulary across all three usage payloads.
+    metering_bypass = resolve_metering_bypass(current_user)
     return {
         "status": status.get("status"),
         "tier": tier.value,
@@ -2478,6 +2498,7 @@ async def verify_subscription_status(
         "usage_period_start": period_start.isoformat(),
         "usage_period_end": period_end.isoformat(),
         "meters": meters,
+        **metering_bypass.usage_response_fields(),
     }
 
 

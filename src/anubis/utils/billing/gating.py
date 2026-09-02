@@ -374,6 +374,85 @@ def is_unrestricted_anonymous_messaging_avatar(
     return str(assistant_id).strip().casefold() in unrestricted_avatar_identifiers
 
 
+def is_unrestricted_metered_account(
+    user: Mapping[str, Any] | None,
+    configured_identifiers: str | Iterable[str] | None,
+) -> bool:
+    """Return whether this account is exempt from every usage restriction.
+
+    Backs ``GlobalContext.unrestricted_metered_account_identifiers``
+    (environment variable ``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS``), the
+    accounts set aside for demonstrating and testing the product. A listed
+    account is UNCAPPED WITHIN THE TIER the account holds: the HTTP 402
+    exhausted-allotment refusal and the HTTP 429 token rate limit stop applying,
+    so usage may run past the allotment indefinitely. The tier itself is NOT
+    changed and no capability is granted — the HTTP 403 tier-capability gate
+    still applies in full, so a listed account on the free tier is refused
+    uploads exactly like any other free-tier account and reaches uploads by
+    changing tier, which a listed account is free to do at any time. Every token
+    is still metered to Stripe and to ``api_metrics``, so the cost of the
+    demonstration stays visible in the customer portal, in
+    ``/verify_subscription_status`` and in the streamed usage frames.
+
+    Three spellings are accepted for one account, each for a reason:
+
+    * The EMAIL ADDRESS is the preferred entry and the only durable one. Auth0
+      mints a new user id whenever an account is deleted and signs up again, so a
+      list keyed only on a user id stops matching the moment either account is
+      recreated — and stops matching silently, which is the failure this function
+      is written to avoid. The email address is honored only when
+      ``email_verified`` is true, so an unverified account claiming a listed
+      address cannot inherit the exemption.
+    * The PREFIXED user id (``auth0|<subject>``) is what
+      ``resolve_metering_user_id`` returns for an authenticated account, and is
+      therefore the spelling every other metering identifier list uses.
+    * The BARE subject is the spelling ``GlobalContext.admin_user_id`` and every
+      avatar-ownership check use, because those read
+      ``identities[0]["user_id"]``.
+
+    Accepting both user-id spellings is not defensive clutter: the two forms are
+    already live side by side, and mixing them is what has kept
+    ``is_admin_metering_bypass`` from ever matching the configured
+    ``admin_user_id``.
+
+    Anonymous requesters are excluded outright. An anonymous requester carries no
+    email address and a per-request identity; the exemptions written for
+    anonymous traffic are ``admin_metering_bypass_identifiers``,
+    ``dev_metered_enforcement_bypass_identifiers`` and
+    ``unrestricted_anonymous_messaging_avatar_identifiers``.
+
+    Unlike the development bypass this list is honored in production, which is
+    the whole purpose: a demonstration account has to work against the deployed
+    API, which runs with ``DEV`` set to ``FALSE``. An empty list means nobody is
+    exempt, which is the intended default.
+    """
+    if is_anonymous_user(user):
+        return False
+    unrestricted_account_identifiers = parse_metering_bypass_identifiers(
+        configured_identifiers
+    )
+    if not unrestricted_account_identifiers:
+        return False
+
+    candidate_identifiers: list[Any] = []
+    # An email address is trusted as an identifier only once Auth0 has verified
+    # the address, because an unverified address is chosen freely at signup.
+    if (user or {}).get("email_verified") is True:
+        candidate_identifiers.append((user or {}).get("email"))
+    candidate_identifiers.append(resolve_metering_user_id(user))
+    identities = (user or {}).get("identities") or []
+    if identities and isinstance(identities[0], Mapping):
+        candidate_identifiers.append(identities[0].get("user_id"))
+
+    # A blank candidate must never match a blank list entry; the parse above
+    # already drops blank entries, and this guard covers the other direction.
+    return any(
+        str(candidate).strip().casefold() in unrestricted_account_identifiers
+        for candidate in candidate_identifiers
+        if candidate and str(candidate).strip()
+    )
+
+
 @dataclass(frozen=True)
 class MeteringBypass:
     """Which of the two halves of metering a requester skips.
@@ -400,27 +479,44 @@ class MeteringBypass:
     ENFORCEMENT ONLY, on the same terms, but is granted per demonstration avatar
     to anonymous visitors rather than per tester identifier, and is honored in
     production. ``unrestricted_anonymous_messaging_avatar`` records which of the
-    two enforcement-only paths granted the exemption, so a client can tell a
+    enforcement-only paths granted the exemption, so a client can tell a
     demonstration avatar's unlimited traffic apart from a developer's bypass.
+
+    ``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS`` is the third enforcement-only
+    mode: granted per ACCOUNT rather than per tester identifier or per avatar,
+    and honored in production. A listed account is UNCAPPED WITHIN ITS TIER — the
+    allotment and the rate limit stop applying — while the tier itself is
+    untouched, so the tier still decides which capabilities exist and the account
+    changes tier to reach a different feature set like any other customer. The
+    cost still lands in both ledgers.
     """
 
     skips_enforcement: bool = False
     skips_metering_writes: bool = False
     unrestricted_anonymous_messaging_avatar: bool = False
+    unrestricted_metered_account: bool = False
 
     def usage_response_fields(self) -> dict[str, bool]:
         """Return the bypass flags to surface on usage payloads.
 
         Empty for an ordinary metered requester, so the flags appear only when
-        something really was bypassed. The three modes get distinct keys because a
+        something really was bypassed. The modes get distinct keys because a
         client reading ``admin_metering_bypass`` must keep meaning "these tokens
-        were never recorded anywhere", and because unlimited anonymous traffic to
-        a demonstration avatar is a standing production arrangement rather than a
-        tester's temporary exemption.
+        were never recorded anywhere", and because an unrestricted demonstration
+        account and unlimited anonymous traffic to a demonstration avatar are
+        standing production arrangements rather than a tester's temporary
+        exemption. A client showing a usage bar reads
+        ``unrestricted_metered_account`` to know that a spent allotment is not a
+        wall for this account and must not be rendered as one.
+
+        The branches are ordered most specific first, so an exemption is never
+        reported under the vaguer ``admin_enforcement_bypass`` key.
         """
         response_fields: dict[str, bool] = {}
         if self.skips_metering_writes:
             response_fields["admin_metering_bypass"] = True
+        elif self.unrestricted_metered_account:
+            response_fields["unrestricted_metered_account"] = True
         elif self.unrestricted_anonymous_messaging_avatar:
             response_fields["unrestricted_anonymous_messaging_avatar"] = True
         elif self.skips_enforcement:
@@ -435,13 +531,24 @@ def resolve_metering_bypass(
 ) -> MeteringBypass:
     """Resolve how much of metering this requester skips.
 
-    One place reads the four configured inputs (``ADMIN_USER_ID``,
+    One place reads the five configured inputs
+    (``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS``, ``ADMIN_USER_ID``,
     ``ADMIN_METERING_BYPASS_IDENTIFIERS``,
     ``DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS``,
     ``UNRESTRICTED_ANONYMOUS_MESSAGING_AVATAR_IDENTIFIERS``) so every enforcement
-    site and every metering-write site decides from the same answer. The full
-    admin bypass is checked first: an identifier listed on both lists gets the
-    broader treatment rather than a mode that depends on evaluation order.
+    site and every metering-write site decides from the same answer.
+
+    Order of resolution, where an identifier appears on more than one list: the
+    mode that PRESERVES BOTH LEDGERS wins, so the unrestricted-account list is
+    checked first. An account is placed on that list precisely so the cost of
+    demonstrating the product keeps landing in Stripe and in ``api_metrics``, and
+    letting the full admin bypass capture the same account would silently stop
+    both writes — the one outcome that list exists to prevent. Among the
+    remaining modes the broader bypass still wins, so the full admin bypass is
+    checked before the two enforcement-only lists rather than depending on
+    evaluation order. In practice no identifier collides today: the
+    unrestricted-account list matches authenticated accounts only, while the
+    admin and development lists hold anonymous hashed network addresses.
 
     ``assistant_id`` is the avatar this request is aimed at, which only the
     message paths know; omitting it simply leaves the per-avatar demonstration
@@ -449,6 +556,18 @@ def resolve_metering_bypass(
     upload, a usage display) behaves exactly as before.
     """
     context = context or GlobalContext()
+    # Read defensively, exactly as the avatar list is read below: the unit tests
+    # pass a hand-built context double, and a double written before this field
+    # existed must not raise.
+    if is_unrestricted_metered_account(
+        user,
+        getattr(context, "unrestricted_metered_account_identifiers", None),
+    ):
+        return MeteringBypass(
+            skips_enforcement=True,
+            skips_metering_writes=False,
+            unrestricted_metered_account=True,
+        )
     if is_admin_metering_bypass(
         user,
         context.admin_user_id,

@@ -44,6 +44,7 @@ from src.anubis.utils.billing.gating import (
     is_admin_metering_bypass,
     is_dev_metered_enforcement_bypass,
     is_unrestricted_anonymous_messaging_avatar,
+    is_unrestricted_metered_account,
     parse_metering_bypass_identifiers,
     resolve_metering_bypass,
 )
@@ -749,7 +750,7 @@ def test_identifier_list_accepts_an_already_split_iterable():
 
 
 class _BypassContext:
-    """The five GlobalContext fields resolve_metering_bypass reads."""
+    """The six GlobalContext fields resolve_metering_bypass reads."""
 
     def __init__(
         self,
@@ -758,6 +759,7 @@ class _BypassContext:
         admin_metering_bypass_identifiers=None,
         dev_metered_enforcement_bypass_identifiers=None,
         unrestricted_anonymous_messaging_avatar_identifiers=None,
+        unrestricted_metered_account_identifiers=None,
     ):
         self.dev = dev
         self.admin_user_id = admin_user_id
@@ -767,6 +769,9 @@ class _BypassContext:
         )
         self.unrestricted_anonymous_messaging_avatar_identifiers = (
             unrestricted_anonymous_messaging_avatar_identifiers
+        )
+        self.unrestricted_metered_account_identifiers = (
+            unrestricted_metered_account_identifiers
         )
 
 
@@ -954,3 +959,186 @@ def test_full_admin_bypass_still_wins_over_the_demonstration_avatar():
     )
     assert bypass.skips_metering_writes
     assert bypass.usage_response_fields() == {"admin_metering_bypass": True}
+
+
+# ---------------------------------------------------------------------------
+# Unrestricted metered accounts (demonstration and admin testing accounts)
+# ---------------------------------------------------------------------------
+
+_ADMIN_ACCOUNT_EMAIL = "e.woods.business@icloud.com"
+_DEMONSTRATION_ACCOUNT_EMAIL = "eveng1neer.business@gmail.com"
+_UNRESTRICTED_ACCOUNT_EMAILS = (
+    f"{_ADMIN_ACCOUNT_EMAIL},{_DEMONSTRATION_ACCOUNT_EMAIL}"
+)
+# The same account written the two ways Auth0 spells one identity: the top-level
+# user_id carries the "auth0|" provider prefix, identities[0].user_id does not.
+_DEMONSTRATION_ACCOUNT_SUBJECT = "6a64d3874e063740350633ea"
+_DEMONSTRATION_ACCOUNT_USER_ID = f"auth0|{_DEMONSTRATION_ACCOUNT_SUBJECT}"
+
+
+def _authenticated_account(
+    email=_DEMONSTRATION_ACCOUNT_EMAIL,
+    user_id=_DEMONSTRATION_ACCOUNT_USER_ID,
+    email_verified=True,
+) -> dict:
+    """Shape an authenticated Auth0 account the way the auth layer returns one.
+
+    Both user-id spellings are present because both are live in production: the
+    prefixed form at the top level (what resolve_metering_user_id reads) and the
+    bare subject inside identities (what ADMIN_USER_ID and every avatar-ownership
+    check read).
+    """
+    return {
+        "user_id": user_id,
+        "email": email,
+        "email_verified": email_verified,
+        "identities": [{"user_id": str(user_id).split("|")[-1]}],
+        "app_metadata": {
+            "stripe_customer_id": "cus_a_demonstration_customer",
+            "subscription_status": {"tier": "free", "status": "canceled"},
+        },
+    }
+
+
+def _unrestricted_account_context(**overrides):
+    configuration = {
+        "unrestricted_metered_account_identifiers": _UNRESTRICTED_ACCOUNT_EMAILS
+    }
+    configuration.update(overrides)
+    return _BypassContext(**configuration)
+
+
+def test_listed_email_lifts_the_caps_but_keeps_metering():
+    # The whole point of the mode: the demonstration account is never refused for
+    # running past the allotment, yet every token still reaches Stripe and
+    # api_metrics so the cost of the demonstration stays visible where real usage
+    # appears.
+    bypass = resolve_metering_bypass(
+        _authenticated_account(), _unrestricted_account_context()
+    )
+    assert bypass == MeteringBypass(
+        skips_enforcement=True,
+        skips_metering_writes=False,
+        unrestricted_metered_account=True,
+    )
+    assert bypass.usage_response_fields() == {"unrestricted_metered_account": True}
+
+
+def test_listed_account_matches_by_either_user_id_spelling():
+    # An entry written as a user id has to work in both spellings; a list that
+    # silently fails to match is the exact failure that has kept ADMIN_USER_ID
+    # (bare) from ever matching resolve_metering_user_id (prefixed).
+    for configured_identifier in (
+        _DEMONSTRATION_ACCOUNT_USER_ID,
+        _DEMONSTRATION_ACCOUNT_SUBJECT,
+    ):
+        assert is_unrestricted_metered_account(
+            _authenticated_account(email="not-listed@example.com"),
+            configured_identifier,
+        )
+
+
+def test_listed_email_matching_tolerates_whitespace_and_case():
+    assert is_unrestricted_metered_account(
+        _authenticated_account(email=f"  {_ADMIN_ACCOUNT_EMAIL.upper()} "),
+        _UNRESTRICTED_ACCOUNT_EMAILS,
+    )
+
+
+def test_unverified_email_never_inherits_the_exemption():
+    # An unverified address is chosen freely at signup, so honoring one would let
+    # anyone claim a listed address at a second identity provider.
+    account = _authenticated_account(
+        user_id="auth0|some-other-subject", email_verified=False
+    )
+    assert not is_unrestricted_metered_account(account, _UNRESTRICTED_ACCOUNT_EMAILS)
+    assert (
+        resolve_metering_bypass(account, _unrestricted_account_context())
+        == MeteringBypass()
+    )
+
+
+def test_unlisted_account_stays_fully_enforced():
+    account = _authenticated_account(
+        email="someone-else@example.com", user_id="auth0|another-subject"
+    )
+    assert not is_unrestricted_metered_account(account, _UNRESTRICTED_ACCOUNT_EMAILS)
+    assert (
+        resolve_metering_bypass(account, _unrestricted_account_context())
+        == MeteringBypass()
+    )
+
+
+def test_anonymous_requesters_never_match_an_account_entry():
+    # An anonymous requester carries no email and a per-request identity; the
+    # exemptions written for anonymous traffic are the other three lists.
+    anonymous_visitor = _anonymous_user(_HASHED_IP_DEV_GATEWAY)
+    assert not is_unrestricted_metered_account(
+        anonymous_visitor, _UNRESTRICTED_ACCOUNT_EMAILS
+    )
+    # Not even when the visitor's own hashed address is what is listed.
+    assert not is_unrestricted_metered_account(
+        anonymous_visitor, _HASHED_IP_DEV_GATEWAY
+    )
+
+
+def test_blank_identities_never_match_a_blank_entry():
+    for empty_configuration in (None, "", "  ", ",,", "\n"):
+        assert not is_unrestricted_metered_account(
+            _authenticated_account(), empty_configuration
+        )
+    # An account with no email and no user id must not match an empty entry that
+    # survived parsing.
+    blank_account = {
+        "user_id": "",
+        "email": "",
+        "email_verified": True,
+        "app_metadata": {"stripe_customer_id": "cus_not_anonymous"},
+    }
+    assert not is_unrestricted_metered_account(blank_account, " , ,")
+
+
+def test_account_exemption_is_honored_outside_development():
+    # This is the distinction from DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS:
+    # the demonstration account has to work against the deployed API, which runs
+    # with DEV set to FALSE.
+    for production_dev_flag in ("FALSE", "", None, "false-ish"):
+        bypass = resolve_metering_bypass(
+            _authenticated_account(),
+            _unrestricted_account_context(dev=production_dev_flag),
+        )
+        assert bypass.skips_enforcement
+        assert not bypass.skips_metering_writes
+
+
+def test_metered_exemption_wins_over_the_full_admin_bypass():
+    # Regression guard for the resolution ORDER. An account is listed as
+    # unrestricted precisely so its usage keeps reaching both ledgers; letting
+    # the full admin bypass capture the same account would silently stop both
+    # writes, which is the one outcome this list exists to prevent.
+    bypass = resolve_metering_bypass(
+        _authenticated_account(),
+        _unrestricted_account_context(
+            admin_user_id=_DEMONSTRATION_ACCOUNT_USER_ID,
+            admin_metering_bypass_identifiers=_DEMONSTRATION_ACCOUNT_USER_ID,
+        ),
+    )
+    assert not bypass.skips_metering_writes
+    assert bypass.unrestricted_metered_account
+    assert bypass.usage_response_fields() == {"unrestricted_metered_account": True}
+
+
+def test_context_without_the_field_leaves_everyone_enforced():
+    # resolve_metering_bypass reads the field defensively, so a context double
+    # written before the field existed must not raise.
+    class _ContextWithoutTheField:
+        dev = "FALSE"
+        admin_user_id = None
+        admin_metering_bypass_identifiers = None
+        dev_metered_enforcement_bypass_identifiers = None
+        unrestricted_anonymous_messaging_avatar_identifiers = None
+
+    assert (
+        resolve_metering_bypass(_authenticated_account(), _ContextWithoutTheField())
+        == MeteringBypass()
+    )

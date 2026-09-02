@@ -713,6 +713,47 @@ class GlobalContext:
         },
     )
 
+    unrestricted_metered_account_identifiers: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Comma-separated identifiers of accounts that are UNCAPPED "
+                "WITHIN THEIR TIER: the HTTP 402 exhausted-allotment refusal and "
+                "the HTTP 429 token rate limit stop applying, so a listed account "
+                "may run past the allotment of whatever tier the account holds. "
+                "The tier itself is NOT changed and no capability is granted — "
+                "the HTTP 403 tier-capability gate still applies in full, so a "
+                "listed account on the free tier is refused uploads exactly like "
+                "any other free-tier account and reaches uploads by changing "
+                "tier, which a listed account is free to do at any time. "
+                "Every token is STILL metered to Stripe and to api_metrics, so "
+                "the cost of demonstrating and testing the product stays visible "
+                "wherever real usage appears. An entry is preferably the "
+                "account's email address, because Auth0 mints a NEW user id "
+                "whenever an account is deleted and signs up again while the "
+                "email address does not change; the prefixed "
+                "'auth0|<subject>' user id and the bare subject are both "
+                "accepted as well, because those two spellings are already used "
+                "side by side (resolve_metering_user_id returns the prefixed "
+                "form, while admin_user_id and every avatar-ownership check use "
+                "the bare form) and an entry written in either spelling has to "
+                "work. An email entry matches only when the account's email "
+                "address is verified, so an unverified account claiming a listed "
+                "address cannot inherit the exemption. Anonymous requesters "
+                "never match: the exemptions written for anonymous traffic are "
+                "admin_metering_bypass_identifiers, "
+                "dev_metered_enforcement_bypass_identifiers and "
+                "unrestricted_anonymous_messaging_avatar_identifiers. Unlike "
+                "dev_metered_enforcement_bypass_identifiers this list is honored "
+                "in production, which is the whole purpose: a demonstration "
+                "account has to work against the deployed API, which runs "
+                "DEV=FALSE. Leave EMPTY unless an account is genuinely intended "
+                "to be free of every limit, and expect to pay for the usage that "
+                "account meters."
+            )
+        },
+    )
+
     anonymous_user_id: str = field(
         default=None,
         metadata={

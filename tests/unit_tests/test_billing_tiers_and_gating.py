@@ -768,3 +768,94 @@ class TestCustomerHasPaymentMethod:
     def test_no_payment_method_anywhere_is_false(self) -> None:
         assert not customer_has_payment_method({}, [])
         assert not customer_has_payment_method(None)
+
+
+class TestEnforceTierCapability:
+    """The HTTP 403 tier-capability gate and the unrestricted-account exemption.
+
+    ``src.api.webapp`` is imported inside each test rather than at module scope
+    so this suite keeps collecting quickly; the gate is the only 403 in the tier
+    system, so it is worth covering here alongside the tier catalog it reads.
+    """
+
+    @staticmethod
+    def _account(tier: str) -> dict:
+        return {
+            "user_id": "auth0|6a64d3874e063740350633ea",
+            "email": "eveng1neer.business@gmail.com",
+            "email_verified": True,
+            "identities": [{"user_id": "6a64d3874e063740350633ea"}],
+            "app_metadata": {
+                "stripe_customer_id": "cus_a_demonstration_customer",
+                "subscription_status": {"tier": tier, "status": "canceled"},
+            },
+        }
+
+    def test_free_tier_is_refused_the_upload_capability(self, monkeypatch) -> None:
+        from fastapi import HTTPException
+
+        from src.api.webapp import enforce_tier_capability
+
+        monkeypatch.setenv("UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS", "")
+        with pytest.raises(HTTPException) as refusal:
+            enforce_tier_capability(self._account("free"), TierCapability.UPLOAD)
+        assert refusal.value.status_code == 403
+
+    def test_pro_tier_passes_the_upload_capability(self, monkeypatch) -> None:
+        from src.api.webapp import enforce_tier_capability
+
+        monkeypatch.setenv("UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS", "")
+        assert (
+            enforce_tier_capability(self._account("pro"), TierCapability.UPLOAD)
+            is SubscriptionTier.PRO
+        )
+
+    def test_an_unrestricted_account_still_keeps_its_tier_feature_set(
+        self, monkeypatch
+    ) -> None:
+        # Being uncapped is NOT being upgraded. An unrestricted account may run
+        # past its allotment, but the tier still decides which capabilities
+        # exist, so a listed account on the free tier is refused uploads exactly
+        # like anybody else and reaches uploads by changing tier.
+        from fastapi import HTTPException
+
+        from src.api.webapp import enforce_tier_capability
+
+        monkeypatch.setenv(
+            "UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS",
+            "eveng1neer.business@gmail.com",
+        )
+        listed_account = self._account("free")
+        assert (
+            enforce_tier_capability(listed_account, TierCapability.MESSAGE)
+            is SubscriptionTier.FREE
+        )
+        for withheld_capability in (
+            TierCapability.UPLOAD,
+            TierCapability.TRAIN_ADAPTER,
+        ):
+            with pytest.raises(HTTPException) as refusal:
+                enforce_tier_capability(listed_account, withheld_capability)
+            assert refusal.value.status_code == 403
+
+    def test_an_unrestricted_account_gains_capabilities_by_changing_tier(
+        self, monkeypatch
+    ) -> None:
+        # The supported route to a bigger feature set, for a listed account and
+        # for everybody else alike.
+        from src.api.webapp import enforce_tier_capability
+
+        monkeypatch.setenv(
+            "UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS",
+            "eveng1neer.business@gmail.com",
+        )
+        assert (
+            enforce_tier_capability(self._account("pro"), TierCapability.UPLOAD)
+            is SubscriptionTier.PRO
+        )
+        assert (
+            enforce_tier_capability(
+                self._account("premium"), TierCapability.TRAIN_ADAPTER
+            )
+            is SubscriptionTier.PREMIUM
+        )

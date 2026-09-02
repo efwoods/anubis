@@ -492,3 +492,107 @@ async def test_each_meter_reports_its_own_usage_when_read_concurrently(monkeypat
         MESSAGING_METER_ID,
         DOCUMENT_UPLOAD_METER_ID,
     }
+
+
+@pytest.mark.asyncio
+async def test_the_status_endpoint_flags_an_unrestricted_metered_account(monkeypatch):
+    """A never-refused account must not be rendered as having hit a wall.
+
+    The endpoint reports a spent allotment the same way for everybody, so without
+    an explicit flag a portal would draw "0 remaining / exhausted" for an account
+    that enforcement never blocks. The flag is the same key the streamed usage
+    frames and the upload response already carry.
+    """
+    import src.api.webapp as webapp_module
+    from src.api.webapp import verify_subscription_status
+
+    async def _free_status(request, current_user):
+        return {
+            "status": "canceled",
+            "tier": SubscriptionTier.FREE.value,
+            "subscription_id": "sub_demonstration",
+            "customer_id": "cus_demonstration",
+            "email": "eveng1neer.business@gmail.com",
+        }
+
+    monkeypatch.setattr(webapp_module, "check_subscription_status", _free_status)
+    monkeypatch.setenv(
+        "UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS", "eveng1neer.business@gmail.com"
+    )
+
+    stripe_client, _meter_api = _fake_stripe_client([9_000_000.0])
+    demonstration_account = {
+        "user_id": "auth0|6a64d3874e063740350633ea",
+        "email": "eveng1neer.business@gmail.com",
+        "email_verified": True,
+        "identities": [{"user_id": "6a64d3874e063740350633ea"}],
+        "app_metadata": {
+            "stripe_customer_id": "cus_demonstration",
+            "subscription_status": {
+                "status": "canceled",
+                "tier": SubscriptionTier.FREE.value,
+                "customer_id": "cus_demonstration",
+            },
+        },
+    }
+
+    response = await verify_subscription_status(
+        request=_endpoint_request(
+            stripe_client, {UsageMeter.MESSAGING_TOKENS: MESSAGING_METER_ID}
+        ),
+        current_user=demonstration_account,
+    )
+
+    assert response["unrestricted_metered_account"] is True
+    # Usage is still reported in full — the account is unrestricted, not unmetered.
+    messaging = response["meters"][UsageMeter.MESSAGING_TOKENS.value]
+    assert messaging["used_to_date"] == 9_000_000
+    assert messaging["over_allotment"] > 0
+
+
+@pytest.mark.asyncio
+async def test_the_status_endpoint_carries_no_flag_for_an_ordinary_account(monkeypatch):
+    """The flags appear only when something really was bypassed."""
+    import src.api.webapp as webapp_module
+    from src.api.webapp import verify_subscription_status
+
+    async def _free_status(request, current_user):
+        return {
+            "status": "active",
+            "tier": SubscriptionTier.FREE.value,
+            "subscription_id": "sub_ordinary",
+            "customer_id": "cus_ordinary",
+            "email": "someone@example.com",
+        }
+
+    monkeypatch.setattr(webapp_module, "check_subscription_status", _free_status)
+    monkeypatch.setenv("UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS", "")
+    monkeypatch.setenv("ADMIN_METERING_BYPASS_IDENTIFIERS", "")
+    monkeypatch.setenv("DEV_METERED_ENFORCEMENT_BYPASS_IDENTIFIERS", "")
+
+    stripe_client, _meter_api = _fake_stripe_client([1_000.0])
+    ordinary_account = {
+        "user_id": "auth0|an-ordinary-account",
+        "email": "someone@example.com",
+        "email_verified": True,
+        "identities": [{"user_id": "an-ordinary-account"}],
+        "app_metadata": {
+            "stripe_customer_id": "cus_ordinary",
+            "subscription_status": {
+                "status": "active",
+                "tier": SubscriptionTier.FREE.value,
+                "customer_id": "cus_ordinary",
+            },
+        },
+    }
+
+    response = await verify_subscription_status(
+        request=_endpoint_request(
+            stripe_client, {UsageMeter.MESSAGING_TOKENS: MESSAGING_METER_ID}
+        ),
+        current_user=ordinary_account,
+    )
+
+    assert "unrestricted_metered_account" not in response
+    assert "admin_metering_bypass" not in response
+    assert "admin_enforcement_bypass" not in response

@@ -30,6 +30,12 @@ uv.lock
 **.ipynb
 *firebase-key.json
 **store.py**
+# ...but source modules under src/ are always tracked. The broad pattern above
+# was written to hide a runtime artifact, and it silently swallowed
+# src/anubis/utils/secret_store.py and
+# src/anubis/utils/connected_accounts/store.py — new source files that appeared
+# to be committed but were never added. Nothing else under src/ matches.
+!src/**/*store.py
 **init.ipynb**
 **/models/**
 test.ipynb

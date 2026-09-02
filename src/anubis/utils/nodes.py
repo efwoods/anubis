@@ -742,6 +742,57 @@ async def _build_consciousness_system_message_update(
     elif is_personal_avatar:
         system_message_str = system_message_str + DATA_SERVER_CONNECT_PROMPT
 
+    # Mailbox capability, gated identically to the think node's tool gate: the
+    # personal avatar, and the accounts bound to it. Same three-way shape as the
+    # data-analysis block above — connected mailboxes get the capability
+    # guidance plus a status block naming them, an owner with none gets the
+    # connect-on-request section, and anyone else gets nothing.
+    #
+    # A mailbox whose stored password has stopped working is still listed, with
+    # its state, so the avatar can tell the owner which mailbox to reconnect
+    # instead of silently behaving as though the mailbox did not exist.
+    if is_personal_avatar:
+        from src.anubis.utils.connected_accounts import (
+            STATUS_CONNECTED,
+            bound_accounts_for,
+        )
+        from src.anubis.utils.prompts.system_prompts import (
+            CONNECT_MAILBOX_PROMPT,
+            MAILBOX_CAPABILITY_PROMPT,
+        )
+
+        bound_mailboxes = [
+            account
+            for account in await bound_accounts_for(runtime.store, user_id, assistant_id)
+            if account.get("kind") == "mailbox"
+        ]
+        if bound_mailboxes:
+            system_message_str = system_message_str + MAILBOX_CAPABILITY_PROMPT
+            # Naming the mailboxes lets the avatar answer "which of my accounts
+            # can you see?" without spending a tool call, and keeps the model
+            # from inventing an account name that is not connected. Addresses
+            # are included because the owner supplied them and needs to tell two
+            # of their own accounts apart; nothing else about the record is.
+            mailbox_descriptions = ", ".join(
+                f"{account.get('display_label')} ({account.get('account_address')})"
+                + (
+                    ""
+                    if account.get("status") == STATUS_CONNECTED
+                    else " — needs to be reconnected"
+                )
+                for account in bound_mailboxes
+            )
+            system_message_str += (
+                "\n<MAILBOX_STATUS>\n"
+                "The following mailboxes are connected for this avatar: "
+                f"{mailbox_descriptions}. Confirm this plainly when asked, "
+                "naming the mailboxes. Never reveal a mailbox password, app "
+                "password, or authentication token in a reply.\n"
+                "</MAILBOX_STATUS>\n"
+            )
+        else:
+            system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended
     # just above), so measure the prompt's tokens manually NOW and cache the

@@ -556,6 +556,39 @@ class GlobalContext:
 
     """ </Data Analysis (MCP filesystem -> deep agent) tuning> """
 
+    """ <Connected accounts (mailbox and social) for the personal avatar> """
+
+    connected_account_encryption_key: str = field(
+        default=None,
+        metadata={
+            "description": "Fernet key encrypting the third-party credentials the owner connects to their personal avatar (currently mailbox app passwords). This is the only secret in the platform that must be recoverable rather than merely comparable, because the avatar has to present the original credential to a mail server on a later turn. Generate one with src.anubis.utils.secret_store.generate_encryption_key(). Rotating this key invalidates every stored credential, which surfaces to the owner as a request to reconnect the account rather than as silent corruption. Env CONNECTED_ACCOUNT_ENCRYPTION_KEY."
+        },
+    )
+
+    max_connected_accounts_per_user: int = field(
+        default=10,
+        metadata={
+            "description": "Maximum number of external accounts (mailboxes and, later, social accounts) one user may connect simultaneously. POST /connect_mailbox rejects a new account beyond this count. Guards the store against an unbounded set of stale credential records and bounds the cost of listing accounts on every capability check. Mirrors data_analysis_max_devices_per_user. Env MAX_CONNECTED_ACCOUNTS_PER_USER."
+        },
+    )
+
+    mailbox_fetch_max_messages: int = field(
+        default=25,
+        metadata={
+            "description": "Ceiling on how many messages one mailbox search may return, regardless of the limit the model asks for. Keeps a request for 'all my email' from spending the whole context window on message summaries. Env MAILBOX_FETCH_MAX_MESSAGES."
+        },
+    )
+
+    mailbox_request_timeout_seconds: float = field(
+        default=30.0,
+        metadata={
+            "description": "Maximum seconds one IMAP socket operation is given before the mailbox is reported as unreachable for that turn. Mail servers are reached over the public internet from inside a conversation turn, so this is the ceiling a sleeping or throttled server can add to a reply. Env MAILBOX_REQUEST_TIMEOUT_SECONDS."
+        },
+    )
+
+    """ </Connected accounts (mailbox and social) for the personal avatar> """
+
+
     dev: str = field(
         default=None,
         metadata={

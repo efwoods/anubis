@@ -1758,9 +1758,20 @@ async def rotate_api_key(request: Request, email: str, password: str):
 
 
 @security_route.post("/forgot_password")
-async def forgot_password(
-    email: str, request: Request, current_user=Depends(get_current_user)
-):
+async def forgot_password(email: str, request: Request):
+    """
+    Send a password-reset email to ``email``.
+
+    Deliberately UNAUTHENTICATED. A user who has forgotten a password cannot
+    log in, has no refresh token, and — because the API key is shown exactly
+    once at signup — very likely cannot present an API key either. Requiring
+    ``get_current_user`` here made the endpoint reachable only by callers who
+    did not need it, and rejected the login screen's "Forgot password?" button
+    with "Please send API-KEY in request, or Authorization: Bearer
+    <refresh_token>.". The reset link itself is the credential: Auth0 mails it
+    to the address on the account, so possession of the inbox is what
+    authorizes the change, exactly as it is for every other password reset.
+    """
     try:
         headers = await _mgmt_headers(request=request)
         result = await request.app.state.httpx_client.post(
@@ -1774,13 +1785,22 @@ async def forgot_password(
         )
 
         result.raise_for_status()
-        if result.status_code != 200:
-            raise HTTPException(status_code=result.status_code, detail="Error: {e}")
+    except Exception as password_reset_error:
+        # The failure being reported here is Auth0's or the network's, never
+        # the caller's: Auth0 answers /dbconnections/change_password with 200
+        # whether or not the address belongs to an account, so reaching this
+        # branch means the reset could not be attempted at all. The status is
+        # reported as 502 rather than read off ``result``, which does not
+        # exist yet when the management-token fetch or the request itself is
+        # what raised.
+        logger.error("Requesting a password reset failed: %s", password_reset_error)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not send a password reset email right now. Please try again.",
+        )
 
-        # Always return the same message — don't reveal if email exists
-        return {"message": "If that email exists, a password reset link has been sent."}
-    except Exception as e:
-        raise HTTPException(status_code=result.status_code, detail="Error: {e}")
+    # Always return the same message — don't reveal if email exists
+    return {"message": "If that email exists, a password reset link has been sent."}
 
 
 @security_route.delete("/delete_user")

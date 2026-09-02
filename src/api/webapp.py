@@ -832,11 +832,64 @@ def _document_label_and_key(metadata: dict) -> tuple[str | None, str | None]:
     return None, key
 
 
-def _iter_document_labels(store_items) -> Iterator[tuple[str, str | None]]:
-    """Yield (label, key) for each stored Document, de-structuring the same
-    value.document.kwargs.metadata path /list and /delete read. Multiple
-    Documents per source (quote / identity / analysis) yield the same pair; the
-    caller de-dupes."""
+# The two store categories that hold an avatar's reference assets, in the order
+# they are probed. A source is one or the other, never both: the reference image
+# is an image upload, the reference audio an audio/video upload.
+REFERENCE_DOCUMENT_CATEGORIES = ("reference_image", "reference_audio")
+
+
+def _document_reference_role(
+    metadata: dict, item_namespace: tuple | list | None
+) -> str | None:
+    """Name the reference role of one stored Document: the avatar's portrait
+    ("reference_image"), its voice sample ("reference_audio"), or None for an
+    ordinary source document.
+
+    Two independent signals are read because neither one alone is present on
+    every row that represents a reference asset:
+
+    * ``metadata["reference_image"] / ["reference_audio"]`` — the boolean the
+      upload carried. Set on the reference Document by ``process_media_graph``
+      (``src/subgraphs/process_media_graph/utils/nodes.py``), but also set to
+      *False* on every ordinary image, hence the truthiness test.
+    * a corroborating category, taken either from ``metadata["namespace"]`` or
+      from the namespace tuple the row itself lives under. The reference
+      Document is written twice — once under ``(user_id, assistant_id,
+      "reference_image" | "reference_audio")`` keyed by assistant_id, and once
+      through the normal indexing path — and the copy stored under the
+      reference namespace is serialized before the node stamps
+      ``metadata["namespace"]``, so that copy is recognised by its namespace
+      tuple while the indexed copy is recognised by its metadata.
+
+    Requiring the flag *and* a matching category is what keeps an ordinary
+    transcript that merely carries a stale ``reference_audio`` flag from being
+    presented to the user as the avatar's voice sample.
+    """
+    namespace_category = metadata.get("namespace")
+    trailing_namespace_element = (
+        item_namespace[-1]
+        if isinstance(item_namespace, (tuple, list)) and item_namespace
+        else None
+    )
+    for reference_category in REFERENCE_DOCUMENT_CATEGORIES:
+        if not metadata.get(reference_category):
+            continue
+        if (
+            namespace_category == reference_category
+            or trailing_namespace_element == reference_category
+        ):
+            return reference_category
+    return None
+
+
+def _iter_document_labels(
+    store_items,
+) -> Iterator[tuple[str, str | None, str | None]]:
+    """Yield (label, key, reference_role) for each stored Document, de-structuring
+    the same value.document.kwargs.metadata path /list and /delete read. Multiple
+    Documents per source (quote / identity / analysis) yield the same triple; the
+    caller de-dupes. ``reference_role`` is "reference_image", "reference_audio",
+    or None — see _document_reference_role."""
     for item in store_items or []:
         value = getattr(item, "value", None)
         if value is None and isinstance(item, dict):
@@ -850,9 +903,12 @@ def _iter_document_labels(store_items) -> Iterator[tuple[str, str | None]]:
         )
         if not isinstance(metadata, dict):
             continue
+        item_namespace = getattr(item, "namespace", None)
+        if item_namespace is None and isinstance(item, dict):
+            item_namespace = item.get("namespace")
         label, key = _document_label_and_key(metadata)
         if label:
-            yield label, key
+            yield label, key, _document_reference_role(metadata, item_namespace)
 
 
 def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
@@ -1219,6 +1275,17 @@ async def resolve_assistant_for_creator(
             ),
         )
     if user_id != creator_id:
+        # Named in the log because the 403 body deliberately says only that the
+        # caller is not the creator: the two identifiers are what distinguishes a
+        # correct refusal from a credential resolving to the wrong account, and
+        # without them that distinction cannot be made after the fact.
+        logger.warning(
+            "Refusing to let %s %s: assistant %s was created by %s",
+            user_id,
+            action_description,
+            assistant_id,
+            creator_id,
+        )
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1268,11 +1335,29 @@ async def get_public_avatars(
             return [assistant_query.to_assistant() for assistant_query in data]
 
 
-def _assistant_without_metadata_if_public(assistant: dict[str, Any]) -> dict[str, Any]:
+def _assistant_without_metadata_if_public(
+    assistant: dict[str, Any], viewer_user_id: str | None = None
+) -> dict[str, Any]:
+    """Hide a public avatar's metadata from everyone except its creator.
+
+    The metadata carries ``user_id``, so stripping it is what keeps one user's
+    identifier out of another user's listing. It must NOT be stripped from the
+    creator's own copy: ``metadata.user_id`` is the only thing a client can
+    compare against the signed-in user to decide whether that user may
+    administer the avatar. Stripping it from the owner too made every avatar the
+    owner had shared read as someone else's, so the Avatar Settings tab vanished
+    the moment an avatar was made public — including from the personal avatar,
+    the one avatar the product expects a user to share.
+
+    ``viewer_user_id`` is the caller. Passing None keeps the unconditional
+    behaviour, which is what an unauthenticated public listing wants.
+    """
     meta = assistant.get("metadata")
     if isinstance(meta, dict):
         pub = meta.get("is_public")
         if pub is True or (isinstance(pub, str) and pub.lower() == "true"):
+            if viewer_user_id is not None and meta.get("user_id") == viewer_user_id:
+                return assistant
             return {k: v for k, v in assistant.items() if k != "metadata"}
     return assistant
 
@@ -3563,8 +3648,13 @@ async def list_user_avatars(
         if len(response) > 0:
             avatar_list = response
             public_avatars_result.extend(avatar_list)  # public and private avatars
+        # The caller sees their OWN avatars in full, public or not; only other
+        # people's public avatars are stripped.
         sanitized = [
-            _assistant_without_metadata_if_public(a) for a in public_avatars_result
+            _assistant_without_metadata_if_public(
+                a, viewer_user_id=current_user["identities"][0]["user_id"]
+            )
+            for a in public_avatars_result
         ]
         return JSONResponse(sanitized, status_code=200)
     except Exception as e:
@@ -4157,21 +4247,45 @@ async def resume_avatar_message(
     )
 
 
+CONVERSATION_LISTING_DEFAULT_LIMIT = 100
+CONVERSATION_LISTING_MAXIMUM_LIMIT = 1000
+
+
 @app.get("/conversations")
 async def get_all_conversations(
     request: Request,
     assistant_id: str,
+    limit: int = CONVERSATION_LISTING_DEFAULT_LIMIT,
+    offset: int = 0,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
-    """Return all threads for this user + assistant, newest-first."""
+    """Return this user + assistant's threads, newest-first.
+
+    ``limit`` and ``offset`` are passed to the LangGraph software development
+    kit explicitly rather than left to their defaults. ``threads.search``
+    defaults to ``limit=10``, and omitting the argument silently truncated every
+    caller's history to the ten most recent conversations: an account holding
+    forty-nine threads with one avatar was handed ten of them and shown no sign
+    that the other thirty-nine existed. A listing that quietly discards most of
+    its rows is worse than one that refuses, because the client cannot tell the
+    difference between "you have ten conversations" and "you were given ten".
+
+    The ceiling keeps one request from asking the database for an unbounded
+    page; a caller with more threads than the ceiling pages through them with
+    ``offset``.
+    """
     user_id = current_user["identities"][0]["user_id"]
     langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    requested_limit = max(1, min(limit, CONVERSATION_LISTING_MAXIMUM_LIMIT))
+    requested_offset = max(0, offset)
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
         threads = await langgraph_client.threads.search(
             metadata={
                 "thread_metadata": {"user_id": user_id, "assistant_id": assistant_id}
             },
+            limit=requested_limit,
+            offset=requested_offset,
             sort_by="updated_at",
             sort_order="desc",
         )
@@ -7009,15 +7123,41 @@ async def list_avatar_documents(
         ) from exc
 
     # Each source produces several Documents (quote / identity / analysis); the
-    # set de-dupes them down to one entry per source. Playlist videos are listed
-    # as ``{playlist} :: {video}`` and everything else by plain filename — see
-    # _document_label_and_key, shared with /delete_avatar_document so a label
+    # mapping de-dupes them down to one entry per source. Playlist videos are
+    # listed as ``{playlist} :: {video}`` and everything else by plain filename —
+    # see _document_label_and_key, shared with /delete_avatar_document so a label
     # copied out of this list resolves back to the key delete needs.
-    uploaded_documents: set[str] = {
-        label for label, _key in _iter_document_labels(all_document_items)
-    }
+    #
+    # The reference role is folded in per source rather than per Document: of the
+    # several Documents one source produces, only the reference copies carry the
+    # role, so the first non-None role wins and the ordinary siblings never
+    # overwrite it back to None.
+    reference_role_by_document_label: dict[str, str | None] = {}
+    for label, _key, reference_role in _iter_document_labels(all_document_items):
+        if reference_role_by_document_label.get(label) is None:
+            reference_role_by_document_label[label] = reference_role
 
-    return {"uploaded_documents": sorted(uploaded_documents)}
+    uploaded_document_labels = sorted(reference_role_by_document_label)
+
+    return {
+        # Unchanged shape: the plain label list every existing caller reads, and
+        # the exact strings /delete_avatar_document accepts back.
+        "uploaded_documents": uploaded_document_labels,
+        # Same sources, same order, with the reference role attached. A client
+        # that wants to mark which upload is the avatar's portrait or its voice
+        # sample reads this list instead of the bare labels above.
+        "documents": [
+            {
+                "label": label,
+                "reference_role": reference_role_by_document_label[label],
+                "is_reference_image": reference_role_by_document_label[label]
+                == "reference_image",
+                "is_reference_audio": reference_role_by_document_label[label]
+                == "reference_audio",
+            }
+            for label in uploaded_document_labels
+        ],
+    }
 
 
 @app.delete("/delete_avatar_document")
@@ -7056,7 +7196,9 @@ async def delete_avatar_documents(
             (user_id, assistant_id), limit=1_000_000
         )
         label_to_key = {
-            label: key for label, key in _iter_document_labels(existing_items) if key
+            label: key
+            for label, key, _reference_role in _iter_document_labels(existing_items)
+            if key
         }
     except Exception:
         label_to_key = {}

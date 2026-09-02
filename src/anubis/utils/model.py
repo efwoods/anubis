@@ -26,6 +26,25 @@ from src.anubis.utils.tokenizer import count_tokens
 # their raw structured output leaks into the chat (e.g. interleaved fact-correction JSON).
 STRUCTURED_OUTPUT_STREAM_TAG = "structured_output_no_user_stream"
 
+
+def describe_api_key_for_logging(api_key: Optional[str]) -> str:
+    """Describe a provider credential without writing the credential itself.
+
+    These log lines exist to answer one question while debugging a provider
+    call: was a key configured for this model, and roughly which one. Printing
+    the key answered that question and also published a live secret to anyone
+    who could read the container logs — ``docker logs``, Grafana, or a support
+    bundle. The last four characters are enough to tell two configured keys
+    apart, and are not enough to authenticate with.
+
+    :param api_key: The provider credential, or None when none is configured.
+    :returns: A description safe to write to the log.
+    """
+    if not api_key:
+        return "not configured"
+    return f"configured (ends {api_key[-4:]}, {len(api_key)} characters)"
+
+
 # TODO: identify all model call token usage
 
 
@@ -59,7 +78,7 @@ def init_model(
     model_provider = context.model_provider
 
     logger.info(f"dev: {dev}")
-    logger.info(f"api_key: {api_key}")
+    logger.info(f"api_key: {describe_api_key_for_logging(api_key)}")
     logger.info(f"base_url: {base_url}")
     logger.info(f"model_name: {model_name}")
 
@@ -265,7 +284,7 @@ def init_image_description_model():
     model_provider = context.model_provider
 
     logger.info(f"dev: {dev}")
-    logger.info(f"api_key: {api_key}")
+    logger.info(f"api_key: {describe_api_key_for_logging(api_key)}")
     logger.info(f"base_url: {base_url}")
     logger.info(f"model_name: {model_name}")
 

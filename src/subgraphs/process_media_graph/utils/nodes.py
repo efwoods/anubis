@@ -799,13 +799,27 @@ async def convert_media_list_to_text_document(
     existing_namespaces: set = set(state.get("existing_namespaces") or [])
 
     # Drop top-level items already indexed before doing any work.
+    #
+    # A reference image or a reference audio clip is exempt. Those two uploads
+    # DESIGNATE the avatar's portrait and voice sample rather than adding source
+    # material, and designating is a replacement: the item is written to
+    # (user_id, assistant_id, "reference_image" | "reference_audio") keyed by the
+    # assistant, so a new one takes the place of the old one. Skipping it as
+    # already-indexed made setting the portrait from a file whose name this avatar
+    # had already seen do nothing at all while the job still reported success, and
+    # the caller reading the portrait back afterwards then got the OLD image with
+    # no way to tell a silently skipped upload from one that never took effect.
     to_process: list = []
     for media_item in media_list:
-        ns = (media_item.get("metadata", {}) or {}).get("namespace_filename")
-        if ns and ns in existing_namespaces:
+        item_metadata = media_item.get("metadata", {}) or {}
+        ns = item_metadata.get("namespace_filename")
+        designates_reference_asset = bool(
+            item_metadata.get("reference_image") or item_metadata.get("reference_audio")
+        )
+        if ns and ns in existing_namespaces and not designates_reference_asset:
             _emit_media_progress(
                 "skipped_existing",
-                filename=(media_item.get("metadata", {}) or {}).get("filename"),
+                filename=item_metadata.get("filename"),
                 namespace_filename=ns,
             )
             continue

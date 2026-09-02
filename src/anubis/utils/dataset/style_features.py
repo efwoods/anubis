@@ -1,7 +1,7 @@
 """Shared stylometric feature extractor — the single source of truth.
 
 This module computes a flat dictionary of **28 scalar stylometric features** for
-one text (feature-vector version 3; see :data:`STYLE_FEATURE_VECTOR_VERSION`).
+one text (feature-vector version 4; see :data:`STYLE_FEATURE_VECTOR_VERSION`).
 The SAME function is called by the production authenticity evaluator
 (``graph._attach_analyzed_features``), the per-avatar calibration
 (``calibrate_ground_truth``), the bundled-baseline builder

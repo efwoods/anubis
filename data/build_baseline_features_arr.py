@@ -25,27 +25,44 @@ runtime Mahalanobis / IsolationForest calls will raise on the shape mismatch. Th
 script rebuilds all of them from the baseline corpus so the regeneration is
 reproducible and reviewable.
 
-Source corpus: ``data/synthetic_gpt-5-4-nano-baseline-full.jsonl`` — OpenAI
+Source corpus: ``data/unmodified_inference_model_baseline_corpus.jsonl`` — OpenAI
 fine-tuning JSONL, one conversation per line, whose final ``assistant`` message
 is the baseline reply we fingerprint.
 
+The corpus is model-specific even though its name is not: it holds whatever the
+CURRENT inference model (``GlobalContext().model``) produced. Upgrading that model
+invalidates these artifacts just as surely as changing the feature vector does, so
+the full retrain — regenerate the corpus, then refit — belongs to
+``scripts/retrain_chatgpt_baseline.py``. Run this module directly only to refit the
+EXISTING corpus, which is what a feature-vector change (and nothing else) calls for.
+
 Usage::
 
+    # refit the existing corpus (feature-vector change)
     python data/build_baseline_features_arr.py
+
+    # full retrain including corpus regeneration (inference-model upgrade)
+    python scripts/retrain_chatgpt_baseline.py
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import pickle
+import sys
 from pathlib import Path
 from typing import List
 
 import numpy as np
 
-from src.anubis.utils.dataset.key_phrases import discover_key_phrases
-from src.anubis.utils.dataset.style_features import (
+# Allow running as a plain script from the repo root without installing the package
+# (this module lives under data/, so ``src`` is not importable otherwise).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.anubis.utils.dataset.key_phrases import discover_key_phrases  # noqa: E402
+from src.anubis.utils.dataset.style_features import (  # noqa: E402
     FEATURE_NAMES,
     STYLE_FEATURE_VECTOR_VERSION,
     compute_empirical_distribution,
@@ -54,7 +71,9 @@ from src.anubis.utils.dataset.style_features import (
 
 # Repo-root-relative paths (this file lives in data/).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_BASELINE_JSONL = _REPO_ROOT / "data" / "synthetic_gpt-5-4-nano-baseline-full.jsonl"
+BASELINE_CORPUS_PATH = (
+    _REPO_ROOT / "data" / "unmodified_inference_model_baseline_corpus.jsonl"
+)
 _DATASET_DIR = _REPO_ROOT / "src" / "anubis" / "utils" / "dataset"
 _ARR_PATH = _DATASET_DIR / "baseline_features_arr.npy"
 _MODEL_PATH = _DATASET_DIR / "baseline_features_model_b64.pkl"
@@ -68,10 +87,10 @@ _STALE_EXPLAINER_PATH = _REPO_ROOT / "data" / "baseline_features_explainer_b64.p
 _SHAP_BACKGROUND_SIZE = 100
 
 
-def _baseline_assistant_texts() -> List[str]:
+def _baseline_assistant_texts(corpus_path: Path) -> List[str]:
     """Return the final assistant reply from every conversation in the baseline JSONL."""
     texts: List[str] = []
-    with _BASELINE_JSONL.open("r", encoding="utf-8") as handle:
+    with corpus_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
@@ -87,13 +106,23 @@ def _baseline_assistant_texts() -> List[str]:
     return texts
 
 
-def build() -> None:
-    """Rebuild and write all bundled baseline artifacts at the current width."""
+def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> float:
+    """Rebuild and write all bundled baseline artifacts at the current width.
+
+    Returns the recalibrated ``BASELINE_RESPONSE_THRESHOLD``. Callers that write the
+    value out (``scripts/retrain_chatgpt_baseline.py``) use the return; running this
+    module directly just prints it for a hand-copy.
+    """
     import shap
     from sklearn.ensemble import IsolationForest
 
-    texts = _baseline_assistant_texts()
-    print(f"Loaded {len(texts)} baseline assistant replies from {_BASELINE_JSONL.name}")
+    texts = _baseline_assistant_texts(corpus_path)
+    if not texts:
+        raise ValueError(
+            f"No assistant replies found in {corpus_path} — refusing to fit baseline "
+            "artifacts on an empty corpus."
+        )
+    print(f"Loaded {len(texts)} baseline assistant replies from {corpus_path.name}")
 
     # Self-discover the baseline's own signature phrases so the key_phrase_rate
     # column is measured against the SAME phrase set the rows will be scored under
@@ -176,6 +205,7 @@ def build() -> None:
         f"Recalibrated BASELINE_RESPONSE_THRESHOLD = {baseline_response_threshold!r} "
         "(update .env / .env.dev and the GlobalContext default to this value)"
     )
+    return baseline_response_threshold
 
 
 if __name__ == "__main__":

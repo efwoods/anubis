@@ -289,7 +289,12 @@ async def _build_consciousness_system_message_update(
         "reference_image",
     )
     assistant_memory_namespace = (user_id, assistant_id, "memory")
-    style_profile_namespace = (user_id, assistant_id, "style_profile")
+    # Owner-scoped, NOT conversing-user-scoped: calibrate_ground_truth writes the
+    # style profile under (creator_id, assistant_id, "style_profile") and
+    # invalidates that same cache key. Building this from ``user_id`` meant the
+    # cached entry could never be the one the writer invalidates, and could never
+    # hold a hit for anyone but the owner.
+    style_profile_namespace = (creator_id, assistant_id, "style_profile")
 
     """
 
@@ -579,11 +584,11 @@ async def _build_consciousness_system_message_update(
     analyzed_traits = reduce_docs([], analyzed_trait_items)
 
     """ Retrieve Style Profile """
-    # Owner-scoped like every other per-avatar artifact: calibrate_ground_truth
-    # writes it under (creator_id, assistant_id, "style_profile").
-    style_profile_namespace = (creator_id, assistant_id, "style_profile")
-    style_profile_ITEM = await runtime.store.aget(style_profile_namespace, "style_profile")
-
+    # Already fetched once, owner-scoped and through the cache, in the concurrent
+    # gather above. This used to re-read the same key with an uncached ``aget``,
+    # which cost an extra store round-trip on every single turn and left the
+    # gather's copy — keyed on the conversing user — permanently unused, seeding
+    # the 64-entry LRU with a None entry per distinct visitor to the avatar.
     # style_profile_str will be "" if the style profile does not exist
     style_profile_str = getattr(style_profile_ITEM, "value", {}).get("value", "")
 

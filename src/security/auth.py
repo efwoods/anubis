@@ -2129,6 +2129,141 @@ async def verify_login_status(
     }
 
 
+@security_route.post("/create_billing_portal_exchange_code")
+async def create_billing_portal_exchange_code(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Mint a short-lived, single-use code that signs this account in to the
+    customer portal, so a user already signed in here does not sign in a second
+    time to the portal embedded on the billing page.
+
+    The code names the account and says it is authenticated right now; it is not
+    a credential for this API and grants nothing here. The web application hands
+    it to the portal frame, and the portal server spends it against
+    ``/redeem_billing_portal_exchange_code`` to learn which account it is
+    serving. The account's own credential — the refresh token this session
+    authenticates with — never crosses into the portal's origin, which is the
+    entire reason this endpoint exists rather than the web application simply
+    forwarding what it holds.
+
+    Requires a verified email (``get_current_user``), matching the portal's own
+    rule that only a verified account can hold a portal session.
+
+    Returns 503 when ``BILLING_PORTAL_EXCHANGE_SECRET`` is unset. That is a
+    configured-off state, not a failure: the billing page treats it as "no single
+    sign-on available" and the portal shows its ordinary sign-in card.
+    """
+    from src.security import billing_portal_single_sign_on
+
+    shared_secret = (
+        getattr(request.app.state.context, "billing_portal_exchange_secret", None)
+        or ""
+    ).strip()
+    if not shared_secret:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Customer portal single sign-on is not configured on this "
+                "deployment."
+            ),
+        )
+
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(
+            status_code=409,
+            detail="This account has no email address to identify it to the portal.",
+        )
+
+    exchange_code, expires_in_seconds = (
+        billing_portal_single_sign_on.mint_billing_portal_exchange_code(
+            shared_secret, current_user["user_id"], email
+        )
+    )
+    return {
+        "exchange_code": exchange_code,
+        "expires_in_seconds": expires_in_seconds,
+    }
+
+
+@security_route.post("/redeem_billing_portal_exchange_code")
+async def redeem_billing_portal_exchange_code(request: Request):
+    """
+    Spend an exchange code and return the account it names, so the customer
+    portal can mint its own session for that account.
+
+    Machine-to-machine: the caller is the portal server, not a browser and not
+    the account. It authenticates with an HMAC-SHA256 over
+    ``'<timestamp>.<body>'`` in the ``X-Neural-Nexus-Portal-Timestamp`` and
+    ``X-Neural-Nexus-Portal-Signature`` headers, keyed by the shared
+    ``BILLING_PORTAL_EXCHANGE_SECRET`` — the same construction the usage-event
+    push uses in the other direction. Without it, anyone who observed a code
+    could turn it into a customer's email address.
+
+    The response deliberately carries no Neural Nexus credential of any kind:
+    the portal maps the email to its Stripe customer and mints its own session
+    from there, exactly as its password sign-in already does. A portal session
+    created this way therefore holds no refresh token to revoke, so portal
+    sign-out ends the portal session only — the Neural Nexus session it was
+    handed off from is ended from this application, by this application.
+    """
+    from src.security import billing_portal_single_sign_on
+
+    shared_secret = (
+        getattr(request.app.state.context, "billing_portal_exchange_secret", None)
+        or ""
+    ).strip()
+    if not shared_secret:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Customer portal single sign-on is not configured on this "
+                "deployment."
+            ),
+        )
+
+    # The signature covers the exact bytes received, so the body is read raw and
+    # parsed only after the signature has been verified. Letting a parser touch
+    # an unauthenticated body first, and signing a re-serialization of what it
+    # produced, is how signature checks come apart.
+    body = await request.body()
+    try:
+        billing_portal_single_sign_on.verify_redemption_signature(
+            shared_secret,
+            request.headers.get(
+                billing_portal_single_sign_on.REDEMPTION_TIMESTAMP_HEADER_NAME
+            ),
+            request.headers.get(
+                billing_portal_single_sign_on.REDEMPTION_SIGNATURE_HEADER_NAME
+            ),
+            body,
+        )
+    except billing_portal_single_sign_on.BillingPortalExchangeError as signature_error:
+        raise HTTPException(
+            status_code=signature_error.status_code, detail=str(signature_error)
+        ) from signature_error
+
+    try:
+        redemption_document = json.loads(body or b"{}")
+    except ValueError as parse_error:
+        raise HTTPException(
+            status_code=400, detail="Redemption body is not JSON."
+        ) from parse_error
+
+    try:
+        account = billing_portal_single_sign_on.redeem_billing_portal_exchange_code(
+            shared_secret, str(redemption_document.get("exchange_code") or "")
+        )
+    except billing_portal_single_sign_on.BillingPortalExchangeError as redemption_error:
+        raise HTTPException(
+            status_code=redemption_error.status_code, detail=str(redemption_error)
+        ) from redemption_error
+
+    return {"user_id": account["user_id"], "email": account["email"]}
+
+
 import stripe
 from datetime import datetime, timezone
 

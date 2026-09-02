@@ -1013,6 +1013,22 @@ class GlobalContext:
         },
     )
 
+    billing_portal_exchange_secret: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Shared secret for customer-portal single sign-on. It signs the "
+                "short-lived exchange codes issued by "
+                "/create_billing_portal_exchange_code and authenticates the "
+                "portal's call to /redeem_billing_portal_exchange_code, as an "
+                "HMAC-SHA256 over '<timestamp>.<body>'. Must match the portal's "
+                "NN_EXCHANGE_SHARED_SECRET exactly. Empty disables single "
+                "sign-on: both endpoints refuse and the portal shows its own "
+                "sign-in card. Env BILLING_PORTAL_EXCHANGE_SECRET."
+            )
+        },
+    )
+
     message_expected_output_tokens_estimate: int = field(
         default=512,
         metadata={

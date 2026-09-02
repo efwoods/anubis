@@ -331,6 +331,13 @@ class GlobalContext:
         },
     )
 
+    ground_truth_calibration_timeout_seconds: float = field(
+        default=1800.0,
+        metadata={
+            "description": "Ceiling on the once-per-upload refit of the avatar's direct-quote cloud (empirical Mahalanobis threshold + IsolationForest) that runs after a media batch finishes indexing. The fit is quadratic in corpus size before the MAX_CALIBRATION_ROWS subsample caps it, and it is awaited before the batch reports finished, so this bound stops a pathological corpus from wedging an upload's terminal progress event. Exceeding the ceiling is not an error: the upload completes and the direct-quote comparison keeps its previous fit until the next upload or an explicit recalibration. Env GROUND_TRUTH_CALIBRATION_TIMEOUT_SECONDS."
+        },
+    )
+
     standardized_question_analysis_concurrency: int = field(
         default=8,
         metadata={

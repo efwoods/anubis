@@ -91,6 +91,21 @@ async def _load_quote_corpus_by_doc_id(
             quote_namespace, query="*", limit=_QUOTE_CORPUS_READ_LIMIT
         )
     except Exception as exc:  # store backend may reject the wildcard query
+        # When this upload carries new documents there is still something real to
+        # calibrate over, so a failed read-back degrades to "use the new documents
+        # only". When it does not, the store read-back is the ONLY source of the
+        # corpus, and an empty result is then indistinguishable from a genuinely
+        # quote-less avatar — the caller would go on to persist a degenerate,
+        # empty feature dict over a corpus that may hold thousands of rows.
+        # Re-raise instead: every caller wraps this in a best-effort handler, so
+        # the upload still succeeds and simply skips recalibration.
+        if not documents:
+            logger.error(
+                "asearch over quotes failed (%s) and no new documents were passed; "
+                "refusing to calibrate against an unreadable corpus",
+                exc,
+            )
+            raise
         logger.warning("asearch over quotes failed (%s); using new documents only", exc)
         prior_items = []
     for item in prior_items or []:
@@ -225,7 +240,14 @@ async def calibrate_ground_truth(
     doc_id_to_text = await _load_quote_corpus_by_doc_id(
         store, user_id, assistant_id, documents
     )
-    key_phrases_detailed = discover_key_phrases(list(doc_id_to_text.values()))
+    # Phrase mining walks every 2-, 3- and 4-gram of the whole corpus. That is
+    # linear rather than quadratic work, but the corpus is now the avatar's FULL
+    # quote history (this function is driven from the store, not from one
+    # upload's documents), so keep the pure-Python scan off the event loop the
+    # same way the two feature-extraction passes below already are.
+    key_phrases_detailed = await asyncio.to_thread(
+        discover_key_phrases, list(doc_id_to_text.values())
+    )
     discovered_key_phrases = [phrase["phrase"] for phrase in key_phrases_detailed]
 
     # Union the newly-discovered phrases with the previously-stored ones, then
@@ -262,14 +284,31 @@ async def calibrate_ground_truth(
 
     phrases_unchanged = set(key_phrases) == set(previous_key_phrases)
     if phrases_unchanged and existing_features_by_doc_id:
-        # Fast path: the reference phrase set is stable, so existing rows are still
-        # measured against the right phrases. Extract only the NEW documents and
-        # merge (the historical incremental behaviour).
-        new_items = [
-            (document.metadata.get("document_id"), (document.page_content or "").strip())
+        # Fast path: the reference phrase set is stable, so rows already in the
+        # dict were measured against the right phrases and need no recomputation.
+        #
+        # What must be (re)extracted is therefore the CORPUS DELTA — every quote
+        # in the corpus that has no row yet — not merely the documents handed to
+        # this call. The two are not the same set: this function is also driven
+        # with ``documents=[]`` (the post-upload hook and the backfill script read
+        # the corpus straight from the store), and an argument-driven delta would
+        # then be empty, silently leaving every newly indexed quote unmeasured
+        # forever. The passed documents are unioned in on top because a re-upload
+        # can REPLACE the text stored under an existing document_id, so their rows
+        # are stale even though the ids are already present.
+        passed_document_ids = {
+            document.metadata.get("document_id")
             for document in documents
+            if document.metadata.get("document_id")
+        }
+        document_ids_needing_extraction = (
+            set(doc_id_to_text) - set(existing_features_by_doc_id)
+        ) | (passed_document_ids & set(doc_id_to_text))
+        new_items = [
+            (doc_id, doc_id_to_text[doc_id])
+            for doc_id in document_ids_needing_extraction
+            if doc_id_to_text[doc_id]
         ]
-        new_items = [(doc_id, text) for doc_id, text in new_items if doc_id and text]
         new_rows = await asyncio.to_thread(
             lambda: [_feature_row(text, key_phrases) for _, text in new_items]
         )
@@ -366,4 +405,32 @@ async def calibrate_ground_truth(
         ground_truth_text_features_model_namespace,
         key="ground_truth_text_features_model_b64_pkl",
         value={"value": model_str_pkl},
+    )
+
+
+async def calibrate_ground_truth_from_stored_corpus(
+    store: BaseStore, assistant_id: str, *, user_id: str
+) -> None:
+    """Recalibrate an avatar's direct-quote cloud from the quotes already stored.
+
+    ``calibrate_ground_truth`` reads the avatar's full quote corpus out of the
+    store itself (``_load_quote_corpus_by_doc_id``), treating its ``documents``
+    argument only as an upload's not-yet-indexed additions. So every caller that
+    runs AFTER indexing — the post-upload batch hook, the backfill script, the
+    recalibration endpoint — has nothing to thread in and passes no documents.
+
+    This wrapper exists so those three callers share one named entry point rather
+    than each open-coding ``documents=[]``: the empty list is the load-bearing
+    part of the contract, and three independent copies of that decision would be
+    free to drift apart.
+
+    Args:
+        store: LangGraph cross-thread store holding the ``quote`` namespace.
+        assistant_id: The avatar whose direct-quote cloud is being recalibrated.
+        user_id: The avatar OWNER's id — the first element of every owner-scoped
+            namespace, matching what ``calibrate_ground_truth`` writes under and
+            what the message path reads back.
+    """
+    await calibrate_ground_truth(
+        store=store, assistant_id=assistant_id, documents=[], user_id=user_id
     )

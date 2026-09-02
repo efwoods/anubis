@@ -14,12 +14,15 @@ The ``process_media`` graph's ``astream`` is replaced with a fake async stream
 so these tests need no model, store, or network.
 """
 
+import asyncio
+
 import pytest
 
 import src.subgraphs.process_media_graph.process_media_graph_api_endpoint as pme
 from src.anubis.utils.classes.URLDocumentLoaderClass import _classify_url
 from src.api.media_jobs import (
     MediaJob,
+    _calibrate_ground_truth_after_batch,
     create_child_job,
     create_master_job,
     finish_job,
@@ -66,6 +69,255 @@ class _FakeCompiled:
             "custom",
             {"type": "media_progress", "stage": "indexing", "current": 1, "total": 1},
         )
+
+
+class _FakeQuoteCompiled(_FakeCompiled):
+    """A graph run that also reports how many Documents it indexed per namespace.
+
+    This is what tells the batch orchestrator whether an upload actually added
+    direct quotes, and therefore whether the avatar's direct-quote cloud is worth
+    refitting.
+    """
+
+    def __init__(self, namespace_counts: dict, **kwargs):
+        super().__init__(**kwargs)
+        self._namespace_counts = namespace_counts
+
+    async def astream(self, _input, *, config, context, stream_mode, subgraphs):
+        async for item in super().astream(
+            _input,
+            config=config,
+            context=context,
+            stream_mode=stream_mode,
+            subgraphs=subgraphs,
+        ):
+            yield item
+        yield (
+            ("ns",),
+            "custom",
+            {
+                "type": "media_progress",
+                "stage": "indexed_namespace_counts",
+                "namespace_counts": self._namespace_counts,
+            },
+        )
+
+
+class _RecordingCalibration:
+    """Records every direct-quote recalibration the batch orchestrator requests."""
+
+    def __init__(self, raise_exc: Exception | None = None, delay_seconds: float = 0.0):
+        self.calls: list[dict] = []
+        self._raise_exc = raise_exc
+        self._delay_seconds = delay_seconds
+
+    async def __call__(self, *, store, assistant_id, user_id):
+        self.calls.append(
+            {"store": store, "assistant_id": assistant_id, "user_id": user_id}
+        )
+        if self._delay_seconds:
+            await asyncio.sleep(self._delay_seconds)
+        if self._raise_exc is not None:
+            raise self._raise_exc
+
+
+def _batch_of(registry, master, filenames):
+    """Build one child job + item spec per filename under an existing master."""
+    items = []
+    for name in filenames:
+        child = create_child_job(
+            registry,
+            user_id="u1",
+            assistant_id="a1",
+            parent_id=master.job_id,
+            filename=name,
+            namespace_filename=f"ns::{name}",
+        )
+        master.child_ids.append(child.job_id)
+        items.append({"child": child, "media_file": {"filename": name}})
+    return items
+
+
+def _patch_calibration(monkeypatch, recorder):
+    """Point the batch hook's lazily-imported calibration at ``recorder``."""
+    import src.subgraphs.process_media_graph.utils.calibrate_ground_truth as cgt
+
+    monkeypatch.setattr(
+        cgt, "calibrate_ground_truth_from_stored_corpus", recorder, raising=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_calibrates_direct_quote_cloud_exactly_once(monkeypatch):
+    """Eighteen videos must produce ONE refit, not eighteen.
+
+    ``calibrate_ground_truth`` rereads and refits the avatar's entire quote corpus
+    on every call, at a cost quadratic in corpus size, so a per-item hook would
+    redo the whole fit once per file and discard all but the last result.
+    """
+    monkeypatch.setattr(
+        pme, "workflow", _FakeWorkflow(_FakeQuoteCompiled({"quote": 40}))
+    )
+    recorder = _RecordingCalibration()
+    _patch_calibration(monkeypatch, recorder)
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    items = _batch_of(registry, master, ("a.mp4", "b.mp4", "c.mp4"))
+    sentinel_store = object()
+
+    await run_batch_media_job(
+        master,
+        items,
+        config={"configurable": {}},
+        store=sentinel_store,
+        context=None,
+        concurrency=5,
+    )
+
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["assistant_id"] == "a1"
+    assert recorder.calls[0]["user_id"] == "u1"
+    assert recorder.calls[0]["store"] is sentinel_store
+    # Every child's contribution is accumulated onto the master.
+    assert master.indexed_quote_document_count == 120
+    assert master.status == "completed"
+    stages = [event.get("stage") for event in master.events]
+    assert "calibrating" in stages and "calibrating_complete" in stages
+
+
+@pytest.mark.asyncio
+async def test_batch_without_quotes_skips_calibration(monkeypatch):
+    """An upload that added no direct quotes must not pay for a refit.
+
+    A PDF or a biography produces identity Documents only; refitting the
+    direct-quote cloud would reproduce exactly the previous fit.
+    """
+    monkeypatch.setattr(
+        pme,
+        "workflow",
+        _FakeWorkflow(_FakeQuoteCompiled({"identity": 12, "document": 3})),
+    )
+    recorder = _RecordingCalibration()
+    _patch_calibration(monkeypatch, recorder)
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    items = _batch_of(registry, master, ("bio.pdf",))
+
+    await run_batch_media_job(
+        master,
+        items,
+        config={"configurable": {}},
+        store=object(),
+        context=None,
+        concurrency=5,
+    )
+
+    assert recorder.calls == []
+    assert master.indexed_quote_document_count == 0
+    assert master.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_calibration_failure_never_fails_the_upload(monkeypatch):
+    """The documents are already indexed; a failed refit must not undo that."""
+    monkeypatch.setattr(
+        pme, "workflow", _FakeWorkflow(_FakeQuoteCompiled({"quote": 5}))
+    )
+    recorder = _RecordingCalibration(raise_exc=RuntimeError("singular covariance"))
+    _patch_calibration(monkeypatch, recorder)
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    items = _batch_of(registry, master, ("clip.mp3",))
+
+    await run_batch_media_job(
+        master,
+        items,
+        config={"configurable": {}},
+        store=object(),
+        context=None,
+        concurrency=5,
+    )
+
+    assert len(recorder.calls) == 1
+    assert master.status == "completed"
+    assert master.result["items_completed"] == 1
+    stages = [event.get("stage") for event in master.events]
+    assert "calibrating_skipped" in stages
+    assert "calibrating_complete" not in stages
+
+
+@pytest.mark.asyncio
+async def test_calibration_timeout_still_completes_the_upload(monkeypatch):
+    """A pathological corpus must not wedge the batch's terminal event."""
+
+    class _ImpatientContext:
+        ground_truth_calibration_timeout_seconds = 0.01
+
+    monkeypatch.setattr(
+        pme, "workflow", _FakeWorkflow(_FakeQuoteCompiled({"quote": 5}))
+    )
+    recorder = _RecordingCalibration(delay_seconds=5.0)
+    _patch_calibration(monkeypatch, recorder)
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    items = _batch_of(registry, master, ("clip.mp3",))
+
+    await run_batch_media_job(
+        master,
+        items,
+        config={"configurable": {}},
+        store=object(),
+        context=_ImpatientContext(),
+        concurrency=5,
+    )
+
+    assert master.status == "completed"
+    stages = [event.get("stage") for event in master.events]
+    assert "calibrating_skipped" in stages
+
+
+@pytest.mark.asyncio
+async def test_cancelled_batch_never_refits_the_quote_cloud(monkeypatch):
+    """A cancelled batch must not fit a cloud over rows that are being rolled back.
+
+    Cancelling a batch rolls back everything its children indexed. Fitting after
+    that would bake documents into the direct-quote cloud that are about to
+    disappear from the store, leaving a cloud describing a corpus the avatar no
+    longer has — and unlike a skipped fit, nothing later recomputes it.
+
+    The hook is called directly rather than through ``run_batch_media_job``
+    because this guard is only distinguishable when quotes DID index before the
+    cancel: a cancelled batch that reached no children would also be skipped by
+    the ``indexed_quote_document_count <= 0`` gate, so routing through the
+    orchestrator could not tell the two reasons apart.
+    """
+    recorder = _RecordingCalibration()
+    _patch_calibration(monkeypatch, recorder)
+
+    registry: dict[str, MediaJob] = {}
+    master = create_master_job(registry, user_id="u1", assistant_id="a1")
+    # Quotes indexed before the cancel landed, so the "this batch added no
+    # quotes" gate cannot be what refuses the refit here.
+    master.indexed_quote_document_count = 40
+    master.cancelled = True
+
+    await _calibrate_ground_truth_after_batch(master, object(), None)
+
+    assert recorder.calls == []
+    # Skipped before any stage is emitted: a cancelled batch reports the cancel,
+    # not a calibration that never started.
+    stages = [event.get("stage") for event in master.events]
+    assert "calibrating" not in stages
+    assert "calibrating_skipped" not in stages
+
+    # ``force`` is what the explicit recalibration endpoint passes; the cancel
+    # guard is checked ahead of it, so an in-flight cancel still wins.
+    await _calibrate_ground_truth_after_batch(master, object(), None, force=True)
+    assert recorder.calls == []
 
 
 class _FakeErrorCompiled:

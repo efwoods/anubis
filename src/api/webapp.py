@@ -7163,6 +7163,85 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
     )
 
 
+@app.post("/avatar/{assistant_id}/recalibrate_ground_truth")
+async def recalibrate_avatar_ground_truth(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Refit an avatar's direct-quote cloud from the quotes already in the store.
+
+    The cloud an avatar's replies are scored against — the empirical Mahalanobis
+    threshold and the IsolationForest behind
+    ``comparison_to_direct_quote_response_analysis`` — is derived state, refitted
+    after each media upload that adds direct quotes. Two cases leave an avatar
+    without one: quotes ingested before that refit was wired to every upload path,
+    and a refit that was skipped because the batch timed out or failed. In both,
+    the corpus is present and only the fit is missing, so re-uploading the source
+    media to trigger a refit would be pure waste.
+
+    Runs through the media-job registry rather than inline: the fit is quadratic
+    in corpus size, so a large avatar would hold an HTTP connection open far past
+    any sensible request timeout. Returns 202 with the same job/progress/cancel
+    URLs a media upload returns, so callers can reuse the upload progress stream.
+    """
+    _, creator_user_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="recalibrate the authenticity model of that avatar",
+    )
+
+    from src.api.media_jobs import (
+        _calibrate_ground_truth_after_batch,
+        create_master_job,
+        finish_job,
+    )
+
+    registry = app.state.media_jobs
+    # Owner-scoped, matching every other per-avatar artifact: the cloud must be
+    # written under the id the message path reads back, which is the avatar's
+    # creator, never the caller if the two ever diverge.
+    master = create_master_job(registry, creator_user_id, assistant_id)
+
+    async def _run_recalibration() -> None:
+        try:
+            # force: this is an explicit request to fit a corpus already in the
+            # store, so the "did this batch index new quotes" gate does not apply.
+            await _calibrate_ground_truth_after_batch(
+                master, app.state.store, app.state.context, force=True
+            )
+            finish_job(
+                master,
+                result={
+                    "assistant_id": assistant_id,
+                    "message": "Direct-quote calibration finished",
+                },
+            )
+        except asyncio.CancelledError:
+            finish_job(
+                master,
+                cancelled=True,
+                result={"message": "Recalibration cancelled"},
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface every failure on the job
+            logger.exception("Recalibration failed for %s: %s", assistant_id, exc)
+            finish_job(master, error=str(exc))
+
+    master.task = asyncio.create_task(_run_recalibration())
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": master.job_id,
+            "assistant_id": assistant_id,
+            "status_url": f"/media_job/{master.job_id}",
+            "progress_url": f"/media_job/{master.job_id}/progress",
+            "cancel_url": f"/media_job/{master.job_id}/cancel",
+            "message": "Direct-quote calibration started",
+        },
+    )
+
+
 async def _prune_ground_truth_features_for_deleted_docs(
     user_id: str | None, assistant_id: str | None, deleted_document_ids: set[str]
 ) -> None:

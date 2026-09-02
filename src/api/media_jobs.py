@@ -76,6 +76,18 @@ class MediaJob:
     # stamped at submit (or at playlist expansion) so job status/progress can
     # show what the item was billed against.
     estimated_tokens: int | None = None
+    # How many Documents this job indexed into the ``quote`` namespace — the
+    # avatar's direct quotes. ``run_batch_media_job`` recalibrates the avatar's
+    # direct-quote cloud after the batch only when this is non-zero, so a
+    # PDF-only or identity-only upload does not pay for a leave-one-out fit that
+    # would produce exactly the previous result. Counted from the store writes
+    # the graph reports (``indexed_namespace_counts``), and accumulated onto both
+    # the child and its master.
+    #
+    # Lives on the job rather than in ``result`` because a child that ends in
+    # ``error`` is finished with no result dict at all, which would discard the
+    # count for a partially successful item.
+    indexed_quote_document_count: int = 0
     # Append-only history of progress payloads. Subscribers replay from index 0,
     # then wait on ``_updated`` for new appends — this supports late joiners and
     # multiple concurrent subscribers.
@@ -296,6 +308,19 @@ async def run_single_item_job(
                     item_errors.append(str(payload.get("error") or "unknown"))
                 elif stage == "converting_complete":
                     last_complete = payload
+                elif stage == "indexed_namespace_counts":
+                    # Accumulated onto the master as well as the child: the
+                    # once-per-upload recalibration decision is made at the batch
+                    # level, and one video out of eighteen contributing quotes is
+                    # enough to make the whole batch worth recalibrating. The
+                    # payload crosses the graph boundary, so validate its shape
+                    # rather than trusting it.
+                    namespace_counts = payload.get("namespace_counts")
+                    if isinstance(namespace_counts, dict):
+                        quote_document_count = namespace_counts.get("quote", 0)
+                        if isinstance(quote_document_count, int) and quote_document_count > 0:
+                            child.indexed_quote_document_count += quote_document_count
+                            master.indexed_quote_document_count += quote_document_count
 
         # Decide the item's final status from what the graph actually did. A total
         # failure (errors and nothing indexed — e.g. a video with no subtitles and
@@ -335,6 +360,127 @@ async def run_single_item_job(
     except Exception as exc:  # noqa: BLE001 - surface every failure via the child job
         logger.exception("Media item job %s failed: %s", child.job_id, exc)
         finish_job(child, error=str(exc))
+
+
+async def _calibrate_ground_truth_after_batch(
+    master: MediaJob, store: Any, context: Any, *, force: bool = False
+) -> None:
+    """Refit the avatar's direct-quote cloud once, after a whole batch indexes.
+
+    The avatar's replies are scored against a cloud fitted from the target's own
+    direct quotes (empirical Mahalanobis threshold + IsolationForest, read back by
+    the message path). That fit is derived state: it only exists if something
+    recalculates it after new quotes land, and until it does the message path
+    silently reports no direct-quote comparison at all.
+
+    Why the fit happens HERE, once per batch, rather than per media item or inside
+    the graph: ``calibrate_ground_truth`` reads the avatar's ENTIRE quote corpus
+    from the store on every call and refits from scratch, at a cost quadratic in
+    corpus size (leave-one-out covariance estimation). Running it per item would
+    make an eighteen-video upload do the same whole-corpus fit eighteen times over
+    and throw away the first seventeen results. This point is downstream of every
+    ingestion path and of all indexing, and is reached exactly once per upload —
+    playlist children are expanded into the same batch before the gather, so they
+    are included too.
+
+    Never raises. Recalibration failing must not turn a successful upload into a
+    failed one: the documents are already indexed, and the degraded state (no
+    refreshed threshold or model) is the same state the message path already
+    handles by omitting the direct-quote comparison until the next upload or an
+    explicit recalibration.
+    """
+    if master.cancelled:
+        # A cancelled batch has its indexed rows rolled back, so fitting over them
+        # would bake documents into the cloud that are about to disappear.
+        return
+    if not master.assistant_id or store is None:
+        return
+    # ``force`` is set when a caller asked for a recalibration outright rather than
+    # as a side effect of an upload — the point of that request is to fit a corpus
+    # that is ALREADY in the store, so the "did this batch add quotes" gate would
+    # reject exactly the case the caller wants.
+    if not force and master.indexed_quote_document_count <= 0:
+        logger.info(
+            "Batch %s indexed no direct quotes; skipping ground-truth calibration",
+            master.job_id,
+        )
+        return
+
+    # Surfaced on the master's progress stream so a client watching a large upload
+    # can tell the batch is still doing real work rather than having hung between
+    # the last item finishing and the terminal event.
+    add_event(
+        master,
+        {
+            "type": "media_progress",
+            "stage": "calibrating",
+            "quote_documents_indexed": master.indexed_quote_document_count,
+        },
+    )
+
+    # Imported lazily, matching every other call site: the module pulls in numpy,
+    # scikit-learn and the phrase miner, none of which belong in API import cost.
+    from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import (
+        calibrate_ground_truth_from_stored_corpus,
+    )
+
+    calibration_timeout_seconds = getattr(
+        context, "ground_truth_calibration_timeout_seconds", None
+    ) or 1800.0
+
+    try:
+        await asyncio.wait_for(
+            calibrate_ground_truth_from_stored_corpus(
+                store=store,
+                assistant_id=master.assistant_id,
+                user_id=master.user_id,
+            ),
+            timeout=calibration_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Ground-truth calibration for %s exceeded %.0fs; the upload is complete "
+            "and the direct-quote comparison stays on its previous fit",
+            master.assistant_id,
+            calibration_timeout_seconds,
+        )
+        add_event(
+            master,
+            {
+                "type": "media_progress",
+                "stage": "calibrating_skipped",
+                "reason": f"timed out after {calibration_timeout_seconds:.0f}s",
+            },
+        )
+        return
+    except asyncio.CancelledError:
+        # A batch cancel tore this down; let the orchestrator's handler see it.
+        raise
+    except Exception as calibration_error:  # noqa: BLE001 - best-effort derived state
+        logger.warning(
+            "calibrate_ground_truth failed for %s (%s); the upload is complete and "
+            "the direct-quote comparison stays on its previous fit",
+            master.assistant_id,
+            calibration_error,
+        )
+        add_event(
+            master,
+            {
+                "type": "media_progress",
+                "stage": "calibrating_skipped",
+                "reason": str(calibration_error),
+            },
+        )
+        return
+
+    add_event(
+        master,
+        {
+            "type": "media_progress",
+            "stage": "calibrating_complete",
+            "quote_documents_indexed": master.indexed_quote_document_count,
+        },
+    )
 
 
 async def run_batch_media_job(
@@ -448,6 +594,15 @@ async def run_batch_media_job(
         # failed item from aborting the gather (each child already recorded its own
         # outcome via run_single_item_job).
         await asyncio.gather(*child_tasks, return_exceptions=True)
+
+        # Refit the avatar's direct-quote cloud from everything this batch just
+        # indexed. Awaited inside the master's own task, before the batch is
+        # reported finished: an upload is not really done until the avatar can be
+        # scored against its own quotes, and keeping the await here means a batch
+        # cancel tears the fit down with the rest of the batch, the time it takes
+        # lands in the master's duration, and subscribers see the stage. A
+        # detached task would escape cancellation and could outlive the registry.
+        await _calibrate_ground_truth_after_batch(master, store, context)
 
         children = [spec["child"] for spec in items]
         statuses = [c.status for c in children]

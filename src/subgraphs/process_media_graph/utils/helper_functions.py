@@ -1197,18 +1197,13 @@ async def process_text_to_document(
             media_item=media_item,
             classification_metadata=classification_metadata,
         )
-        """ CALIBRATE GROUND TRUTH """
-        # Calibration is derived state (threshold + IsolationForest); a failure
-        # here must degrade to "no ground-truth comparison yet", never abort the
-        # upload — the quote Documents below must still reach the vectorstore.
-        from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-        try:
-            await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=documents, user_id=user_id)
-        except Exception as calibration_error:  # noqa: BLE001 - best-effort derived artifacts
-            logger.warning(
-                "calibrate_ground_truth failed (%s); continuing ingestion without recalibration",
-                calibration_error,
-            )
+        # NOTE: the direct-quote cloud is NOT recalibrated here any more. Doing it
+        # per media item refit the avatar's whole quote corpus once per file, so a
+        # batch of N uploads paid N quadratic fits and discarded all but the last.
+        # ``_calibrate_ground_truth_after_batch`` (src/api/media_jobs.py) now runs
+        # exactly one fit after the whole batch finishes indexing, which also means
+        # it sees these Documents already in the store rather than having to
+        # receive them as an argument.
 
         # Expected metadata (treated same as quotes below in next classified situation; only target information): 
         # vectorstore_acceptable: True

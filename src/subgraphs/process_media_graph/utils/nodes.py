@@ -1352,19 +1352,10 @@ async def process_media_item_task(
                             final_documents.append(document)
 
                         # FINAL DOCUMENTS ARE USED TO CALIBRATE THE GROUND_TRUTH_FEATURES
-                """ CALIBRATE GROUND TRUTH """
-                # Calibration is derived state (threshold + IsolationForest); a
-                # failure here must degrade to "no ground-truth comparison yet",
-                # never abort the upload — the statement Documents must still
-                # reach the vectorstore.
-                from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import calibrate_ground_truth
-                try:
-                    await calibrate_ground_truth(store=store, assistant_id=assistant_id, documents=final_documents, user_id=user_id)
-                except Exception as calibration_error:  # noqa: BLE001 - best-effort derived artifacts
-                    logger.warning(
-                        "calibrate_ground_truth failed (%s); continuing ingestion without recalibration",
-                        calibration_error,
-                    )
+                # NOTE: the direct-quote cloud is NOT recalibrated here any more.
+                # See the matching note in helper_functions.process_text_to_document:
+                # ``_calibrate_ground_truth_after_batch`` (src/api/media_jobs.py)
+                # runs exactly one fit per upload batch, after indexing.
 
                 return final_documents
 

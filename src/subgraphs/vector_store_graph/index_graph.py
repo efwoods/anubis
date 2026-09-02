@@ -19,6 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from src.subgraphs.vector_store_graph.utils.helper_functions import batch_index_documents_vectorstore
+from langgraph.config import get_stream_writer
 from langchain_core.runnables import RunnableConfig
 from src.anubis.utils.utility import extract_user_id_assistant_id, remove_docs_update
 
@@ -52,6 +53,36 @@ def _file_identity(doc: Document) -> str:
     """Original-file key for a Document (its uploaded filename)."""
     meta = doc.metadata or {}
     return meta.get("filename") or meta.get("namespace_filename") or "unknown"
+
+
+def _emit_indexed_namespace_counts(namespace_counts: dict[str, int]) -> None:
+    """Report how many Documents were indexed into each store namespace.
+
+    The upload's batch orchestrator uses the ``quote`` entry to decide whether an
+    upload actually added direct quotes, and therefore whether recalibrating the
+    avatar's direct-quote cloud is worth the leave-one-out fit. Counting is done
+    HERE, after the store write, rather than by reading the graph's document
+    buffer from the "updates" stream: the buffer holds documents that were merely
+    QUEUED, so a file that failed to index would otherwise be counted as though
+    the corpus had grown.
+
+    Mirrors ``_emit_index_progress`` — a bare-except no-op outside a streaming
+    context (a plain ``ainvoke``), because progress reporting must never be able
+    to break indexing.
+    """
+    if not namespace_counts:
+        return
+    try:
+        writer = get_stream_writer()
+        writer(
+            {
+                "type": "media_progress",
+                "stage": "indexed_namespace_counts",
+                "namespace_counts": namespace_counts,
+            }
+        )
+    except Exception:  # pragma: no cover - progress must never break indexing
+        pass
 
 
 async def index_docs(
@@ -134,6 +165,21 @@ async def index_docs(
                 },
             )
             entry["document_ids"].append((doc.metadata or {}).get("document_id"))
+
+    # Count only what actually reached the store: a document belonging to a file
+    # in ``failed_file_keys`` was not written, so counting it would overstate the
+    # corpus. ``namespace`` is the same metadata key the indexer keys the store
+    # namespace off of (batch_index_documents_vectorstore), defaulting the same
+    # way, so these counts match the rows that now exist.
+    indexed_namespace_counts: dict[str, int] = {}
+    for doc in docs:
+        if _file_identity(doc) in failed_file_keys:
+            continue
+        namespace = (doc.metadata or {}).get("namespace") or "document"
+        indexed_namespace_counts[namespace] = (
+            indexed_namespace_counts.get(namespace, 0) + 1
+        )
+    _emit_indexed_namespace_counts(indexed_namespace_counts)
 
     logger.info(f"breakpoint after batch_index_documents_vectorstore")
 

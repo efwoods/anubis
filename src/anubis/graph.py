@@ -22,7 +22,8 @@ load_dotenv()
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Literal
+from collections import OrderedDict
+from typing import Any, Literal
 
 from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.types import Command, interrupt
@@ -152,6 +153,92 @@ def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
     avatar_response.response_metadata.update({"sentiment": sentiment})
 
 
+def _publishable_avatar_key_phrase_rate(
+    avatar_key_phrases: Any, ground_truth_features_dict: dict
+) -> float | None:
+    """Return the avatar-referenced key_phrase_rate, or None when it is unknown.
+
+    ``extract_style_features`` yields 0.0 for an empty phrase set, which a client
+    cannot tell apart from a genuine "this reply reuses none of the avatar's
+    signature phrases". An avatar with no calibrated phrase profile has an
+    UNKNOWN rate, not a zero one, so publish null there. NaN is unpublishable for
+    the same reason the features block above sanitizes it: the metadata copy must
+    be strict JSON or the terminal SSE frame is invalid.
+    """
+    if not avatar_key_phrases:
+        return None
+    avatar_referenced_rate = ground_truth_features_dict.get("key_phrase_rate")
+    if not isinstance(avatar_referenced_rate, float) or not math.isfinite(
+        avatar_referenced_rate
+    ):
+        return None
+    return avatar_referenced_rate
+
+
+# Bounded, process-local cache of per-avatar ground-truth SHAP explainers.
+#
+# Rebuilding the explainer on every reply costs a kmeans summarization of the
+# quote corpus plus the KernelExplainer constructor. Measured against a 156-row
+# corpus that is ~50 ms of a ~435 ms ground-truth SHAP step. The remaining
+# ~385 ms is ``shap_values`` itself, which re-runs model.predict across the
+# background sample for each new candidate and therefore cannot be cached at all
+# — the ChatGPT baseline pole pays exactly the same per-reply cost.
+#
+# Deliberately NOT persisted to the store the way the baseline explainer is:
+# pickling one of these for a 156-row corpus produces a ~66 MB base64 blob (it
+# drags the whole IsolationForest and SHAP's internal state along), so reading it
+# back would cost far more per message than the 50 ms it saves, and a restored
+# copy does not even reproduce the same values. The kmeans half of the saving
+# grows with corpus size, so this cache earns more as an avatar ingests more
+# media, which is the direction every avatar moves.
+#
+# Keyed by avatar and validated against the exact serialized model the store just
+# returned, so a recalibration — which rewrites that blob — can never be served a
+# stale explainer and no separate invalidation hook is needed.
+_GROUND_TRUTH_EXPLAINER_CACHE_MAX_ENTRIES = 32
+_ground_truth_explainer_cache: "OrderedDict[tuple[str, str], tuple[str, int, Any]]" = (
+    OrderedDict()
+)
+
+
+def _cached_ground_truth_explainer(
+    user_id: str, assistant_id: str, model_b64_pkl: str, feature_width: int
+) -> Any | None:
+    """Return this avatar's cached SHAP explainer, or None if one must be built.
+
+    The serialized model is compared in full rather than fingerprinted: it is the
+    same string the store returned this turn, and a direct string comparison is a
+    memcmp measured in microseconds against the ~50 ms rebuild it guards.
+    """
+    entry = _ground_truth_explainer_cache.get((user_id, assistant_id))
+    if entry is None:
+        return None
+    cached_model_b64_pkl, cached_feature_width, explainer = entry
+    if cached_model_b64_pkl != model_b64_pkl or cached_feature_width != feature_width:
+        return None
+    _ground_truth_explainer_cache.move_to_end((user_id, assistant_id))
+    return explainer
+
+
+def _remember_ground_truth_explainer(
+    user_id: str,
+    assistant_id: str,
+    model_b64_pkl: str,
+    feature_width: int,
+    explainer: Any,
+) -> None:
+    """Cache this avatar's explainer, evicting the least recently used entry."""
+    cache_key = (user_id, assistant_id)
+    _ground_truth_explainer_cache[cache_key] = (
+        model_b64_pkl,
+        feature_width,
+        explainer,
+    )
+    _ground_truth_explainer_cache.move_to_end(cache_key)
+    while len(_ground_truth_explainer_cache) > _GROUND_TRUTH_EXPLAINER_CACHE_MAX_ENTRIES:
+        _ground_truth_explainer_cache.popitem(last=False)
+
+
 async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime[GlobalContext], assistant_id: str, user_id: str) -> None:
     """ analyze the avatar_response features, compare against unmodified chatgpt responses and any existing direct quotes if possible.
     Update the metadata with the feature analysis and the results of comparison.
@@ -216,12 +303,14 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                     for name, value in features_dict.items()
                 },
                 "key_phrase_rate_description": (
-                    "The key_phrase_rate is the rate of detected avatar "
-                    "signature key phrases per total word when compared "
-                    "against the ground truth dataset (direct quotes of the "
-                    "avatar), and is the rate of baseline ChatGPT signature "
-                    "key phrases per total word when compared against the "
-                    "baseline ChatGPT dataset."
+                    "key_phrase_rate is the rate of baseline ChatGPT signature "
+                    "key phrases per total word, the reference set the baseline "
+                    "ChatGPT comparison is measured against. "
+                    "key_phrase_rate_against_avatar_signature_phrases is the "
+                    "same reply measured against the avatar's own discovered "
+                    "signature phrases, the reference set the direct-quote "
+                    "comparison is measured against, and is null until the "
+                    "avatar has a calibrated signature phrase profile."
                 ),
             }
         }
@@ -337,6 +426,26 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
             update_key_phrases_only=True,
             features_dict=features_dict,
         )
+
+        # Publish the avatar-referenced rate alongside the baseline-referenced
+        # one. Both were already computed; only the baseline number reached the
+        # client, so a reply dense with the target's own recurring phrasing still
+        # reported key_phrase_rate 0.0 — the single most misleading number in the
+        # features block, because it reads as "sounds nothing like the avatar"
+        # when it actually means "was scored against ChatGPT's phrases".
+        # Added as a NEW key rather than replacing key_phrase_rate: that value is
+        # the input to the baseline comparison and clients already read it.
+        # Null, not 0.0, when the avatar has no calibrated phrase set — an
+        # uncalibrated avatar has an UNKNOWN rate, and reporting zero there would
+        # be indistinguishable from a genuine zero.
+        published_features = avatar_response.response_metadata.get("features")
+        if isinstance(published_features, dict):
+            published_features["key_phrase_rate_against_avatar_signature_phrases"] = (
+                _publishable_avatar_key_phrase_rate(
+                    avatar_key_phrases, ground_truth_features_dict
+                )
+            )
+
         # Compare against ground truth quotes if available:
         ground_truth_text_features_model_namespace = (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl")
 
@@ -439,17 +548,38 @@ async def _attach_analyzed_features(avatar_response: AIMessage, runtime: Runtime
                 == 1
             )
 
-            # KernelExplainer weights model.predict over EVERY background row per
-            # explanation, so passing the full corpus (which can be thousands of
-            # quote rows after calibration) makes this step effectively hang.
-            # Summarize to a bounded background sample using kmeans clustering — standard SHAP practice.
-            if ground_truth_text_features_arr.shape[0] > 100:
-                shap_background = await asyncio.to_thread(
-                    shap.kmeans, ground_truth_text_features_arr, 100
+            # Reuse this avatar's explainer across replies when the fitted model
+            # has not changed; see _cached_ground_truth_explainer for why this is
+            # a process-local cache rather than a persisted artifact.
+            explainer = _cached_ground_truth_explainer(
+                user_id,
+                assistant_id,
+                ground_truth_text_features_model_b64_pkl,
+                len(FEATURE_NAMES),
+            )
+            if explainer is None:
+                # KernelExplainer weights model.predict over EVERY background row per
+                # explanation, so passing the full corpus (which can be thousands of
+                # quote rows after calibration) makes this step effectively hang.
+                # Summarize to a bounded background sample using kmeans clustering — standard SHAP practice.
+                if ground_truth_text_features_arr.shape[0] > 100:
+                    shap_background = await asyncio.to_thread(
+                        shap.kmeans, ground_truth_text_features_arr, 100
+                    )
+                else:
+                    shap_background = ground_truth_text_features_arr
+                explainer = await asyncio.to_thread(
+                    shap.KernelExplainer,
+                    ground_truth_text_features_model.predict,
+                    shap_background,
                 )
-            else:
-                shap_background = ground_truth_text_features_arr
-            explainer = shap.KernelExplainer(ground_truth_text_features_model.predict, shap_background)
+                _remember_ground_truth_explainer(
+                    user_id,
+                    assistant_id,
+                    ground_truth_text_features_model_b64_pkl,
+                    len(FEATURE_NAMES),
+                    explainer,
+                )
             # KernelExplainer.shap_values re-runs model.predict across the background
             # sample — the dominant CPU cost of this block — so keep it off the loop.
             ground_truth_shap_values = await asyncio.to_thread(

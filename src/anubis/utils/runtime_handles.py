@@ -17,7 +17,7 @@ and ``think`` runs the deep agent without durable interrupts.
 import asyncio
 import threading
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 _deep_agent_checkpointer: Optional[object] = None
 
@@ -31,6 +31,29 @@ def set_deep_agent_checkpointer(checkpointer: object) -> None:
 def get_deep_agent_checkpointer() -> Optional[object]:
     """Return the shared deep-agent checkpointer, or ``None`` if unset."""
     return _deep_agent_checkpointer
+
+
+# The in-chat ``update_avatar_identity_with_media`` tool starts the same media
+# batch that ``POST /update_avatar_identity_with_media`` starts, but the batch
+# runner lives in ``src/api/webapp.py`` (it needs ``app.state`` and the entry
+# builders there), and a graph module cannot import the web application without
+# a circular import. The lifespan publishes the starter here; the tool reads it.
+# ``None`` (``langgraph dev``, unit tests without the lifespan) makes the tool
+# report that identity updates are unavailable instead of failing the turn.
+IdentityMediaJobStarter = Callable[..., Awaitable[dict[str, Any]]]
+
+_identity_media_job_starter: IdentityMediaJobStarter | None = None
+
+
+def set_identity_media_job_starter(starter: IdentityMediaJobStarter) -> None:
+    """Publish the coroutine function that starts an identity media batch from chat."""
+    global _identity_media_job_starter
+    _identity_media_job_starter = starter
+
+
+def get_identity_media_job_starter() -> IdentityMediaJobStarter | None:
+    """Return the published starter, or ``None`` when the lifespan has not run."""
+    return _identity_media_job_starter
 
 
 # Process-wide ``SentenceTransformer`` reused across fact-correction calls. The

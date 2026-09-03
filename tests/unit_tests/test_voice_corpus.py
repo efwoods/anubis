@@ -329,3 +329,68 @@ async def test_speak_returns_audio_in_the_active_voice(monkeypatch):
     assert response.headers["x-voice-kind"] == "instant"
     assert recorded["characters"] == len("hello there")
     assert recorded["cost_usd"] == pytest.approx(0.05 * 11 / 1000)
+
+
+@pytest.mark.asyncio
+async def test_a_plan_refusal_parks_the_professional_voice_until_retried(monkeypatch):
+    """ElevenLabs offers professional cloning to the Creator plan and above.
+
+    The refusal must not be retried on every later clip (each attempt is a
+    vendor call that fails the same way), the instant voice must keep working,
+    and an explicit retry after the upgrade must pick the flow back up.
+    """
+    vendor = _FakeVendor().install(monkeypatch)
+    attempts = []
+
+    async def _refuse(context, *, name, language="en", description=""):
+        attempts.append(name)
+        raise elevenlabs_client.ElevenLabsError(
+            "Creating a PVC requires you to be on the Creator plan or above."
+        )
+
+    monkeypatch.setattr(elevenlabs_client, "create_professional_voice", _refuse)
+    repository = InMemoryMediaAssetRepository()
+    context = _context()
+    record = await _add(repository, context, 1800, personal=True)
+    assert record["professional_state"] == "plan_required"
+    assert record["detail"]["professional_error_kind"] == "plan_required"
+    assert "Creator plan" in record["detail"]["professional_error"]
+    assert record["detail"]["professional_help_url"].startswith("https://elevenlabs.io/")
+    assert record["instant_voice_id"] == "ivc-1"
+    assert len(attempts) == 1
+
+    # Later clips keep accumulating but do not knock on the vendor again.
+    record = await _add(repository, context, 300, personal=True)
+    assert record["professional_state"] == "plan_required"
+    assert len(attempts) == 1
+
+    status = await corpus.voice_status_for(
+        repository,
+        context,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=True,
+    )
+    assert status.professional_state == "plan_required"
+    assert status.detail["professional_error_kind"] == "plan_required"
+    assert status.active_voice == "instant"
+
+    # The owner upgrades the ElevenLabs account and retries.
+    async def _accept(context, *, name, language="en", description=""):
+        vendor.professional.append(name)
+        return "pvc-1"
+
+    monkeypatch.setattr(elevenlabs_client, "create_professional_voice", _accept)
+    record = await corpus.retry_professional_voice(
+        repository, context, user_id=USER_ID, assistant_id=ASSISTANT_ID, avatar_name="Evan"
+    )
+    assert record["professional_state"] == "awaiting_verification"
+    assert record["professional_voice_id"] == "pvc-1"
+    assert "professional_error" not in record["detail"]
+
+
+def test_plan_refusal_detection_reads_the_vendor_wording():
+    assert corpus.is_plan_refusal(
+        "Creating a PVC requires you to be on the Creator plan or above."
+    )
+    assert not corpus.is_plan_refusal("Connection reset by peer")

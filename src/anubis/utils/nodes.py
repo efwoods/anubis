@@ -860,6 +860,40 @@ async def _build_consciousness_system_message_update(
         except Exception:  # noqa: BLE001 - the inbox must never fail a turn
             logger.debug("Inbox status unavailable for the prompt", exc_info=True)
 
+    # Learning from media in conversation — the avatar's creator only, and only
+    # when the message endpoint found the caller's tier allows uploads (the flag
+    # is set per request in ``configurable``). The files attached to this turn
+    # are named so the model can pick them by filename; the bytes stay in the
+    # endpoint's attachment record and never enter the prompt.
+    if config.get("configurable", {}).get("identity_media_update_allowed") is True:
+        try:
+            from src.anubis.utils.prompts.system_prompts import (
+                IDENTITY_MEDIA_UPDATE_PROMPT,
+            )
+            from src.api.chat_attachments import describe_turn_attachments
+
+            system_message_str = system_message_str + IDENTITY_MEDIA_UPDATE_PROMPT
+            attached = describe_turn_attachments(
+                config.get("configurable", {}).get("thread_id")
+            )
+            if attached:
+                attachment_lines = "; ".join(
+                    f"{item['filename']} ({item['mime_type']}, {item['size_bytes']} bytes)"
+                    for item in attached
+                )
+                system_message_str += (
+                    "\n<ATTACHED_MEDIA>\n"
+                    f"Files attached to this turn: {attachment_lines}.\n"
+                    "</ATTACHED_MEDIA>\n"
+                )
+            else:
+                system_message_str += (
+                    "\n<ATTACHED_MEDIA>\nNo files are attached to this turn.\n"
+                    "</ATTACHED_MEDIA>\n"
+                )
+        except Exception:  # noqa: BLE001 - the block must never fail a turn
+            logger.debug("Attached-media block unavailable for the prompt", exc_info=True)
+
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended
     # just above), so measure the prompt's tokens manually NOW and cache the

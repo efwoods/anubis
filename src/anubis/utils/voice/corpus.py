@@ -33,6 +33,7 @@ from src.anubis.utils.media_assets.repository import (
     VOICE_STATE_FAILED,
     VOICE_STATE_FINE_TUNED,
     VOICE_STATE_NOT_STARTED,
+    VOICE_STATE_PLAN_REQUIRED,
     VOICE_STATE_TRAINING,
 )
 from src.anubis.utils.voice import elevenlabs_client
@@ -42,6 +43,20 @@ logger = logging.getLogger(__name__)
 CLIP_SOURCE_RECORDER = "recorder"
 CLIP_SOURCE_REFERENCE_UPLOAD = "reference_upload"
 CLIP_SOURCE_MEDIA_UPLOAD = "media_upload"
+
+# Professional voice cloning is only offered to ElevenLabs accounts on the
+# Creator plan or above; the vendor says so in the refusal text.
+PROFESSIONAL_VOICE_PLAN_HELP_URL = (
+    "https://elevenlabs.io/docs/eleven-api/guides/how-to/voices/"
+    "professional-voice-cloning"
+)
+_PLAN_REFUSAL_MARKERS = ("creator plan", "requires you to be on", "upgrade your plan")
+
+
+def is_plan_refusal(error_text: str) -> bool:
+    """Whether a vendor error says the ElevenLabs plan is too low for the request."""
+    lowered = (error_text or "").lower()
+    return any(marker in lowered for marker in _PLAN_REFUSAL_MARKERS)
 
 
 @dataclass
@@ -285,10 +300,19 @@ async def prepare_professional_voice(
             assistant_id,
             clone_error,
         )
-        record["professional_state"] = VOICE_STATE_FAILED
+        plan_refused = is_plan_refusal(str(clone_error))
+        # A plan refusal is not transient: every later clip would hit the same
+        # wall, so the record parks in ``plan_required`` until the owner asks
+        # for a retry (``retry_professional_voice``) after upgrading the
+        # ElevenLabs account. The instant voice keeps working meanwhile.
+        record["professional_state"] = (
+            VOICE_STATE_PLAN_REQUIRED if plan_refused else VOICE_STATE_FAILED
+        )
         record["detail"] = {
             **record.get("detail", {}),
             "professional_error": str(clone_error),
+            "professional_error_kind": "plan_required" if plan_refused else "vendor",
+            "professional_help_url": PROFESSIONAL_VOICE_PLAN_HELP_URL,
         }
         await repository.upsert_voice(record)
         return record
@@ -300,12 +324,47 @@ async def prepare_professional_voice(
         **{
             k: v
             for k, v in record.get("detail", {}).items()
-            if k != "professional_error"
+            if k
+            not in (
+                "professional_error",
+                "professional_error_kind",
+                "professional_help_url",
+            )
         },
         "professional_sample_seconds": used_seconds,
     }
     await repository.upsert_voice(record)
     return record
+
+
+async def retry_professional_voice(
+    repository: Any,
+    context: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    avatar_name: str = "",
+) -> dict[str, Any]:
+    """Retry professional clone preparation after a plan refusal or vendor failure.
+
+    Resets a ``plan_required`` or ``failed`` record to ``collecting`` and runs
+    ``prepare_professional_voice`` once. Any other state is returned untouched.
+    """
+    record = await _voice_record(repository, user_id, assistant_id)
+    if record.get("professional_state") not in (
+        VOICE_STATE_PLAN_REQUIRED,
+        VOICE_STATE_FAILED,
+    ):
+        return record
+    record["professional_state"] = VOICE_STATE_COLLECTING
+    await repository.upsert_voice(record)
+    return await prepare_professional_voice(
+        repository,
+        context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        avatar_name=avatar_name,
+    )
 
 
 async def submit_verification_and_train(
@@ -497,6 +556,13 @@ async def voice_status_for(
             k: v
             for k, v in (record.get("detail") or {}).items()
             if k
-            in ("instant_error", "professional_error", "vendor_state", "training_model")
+            in (
+                "instant_error",
+                "professional_error",
+                "professional_error_kind",
+                "professional_help_url",
+                "vendor_state",
+                "training_model",
+            )
         },
     )

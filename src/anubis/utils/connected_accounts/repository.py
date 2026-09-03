@@ -36,6 +36,8 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from src.anubis.utils.postgres_ddl import execute_ddl_script
+
 logger = logging.getLogger(__name__)
 
 CONNECTED_ACCOUNTS_TABLE_NAME = "connected_accounts"
@@ -321,9 +323,7 @@ async def ensure_connected_accounts_table(pool: Any) -> None:
     facade then falls back to the legacy store namespace for this process.
     """
     try:
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(_CREATE_CONNECTED_ACCOUNTS_TABLE_SQL)
+        await execute_ddl_script(pool, _CREATE_CONNECTED_ACCOUNTS_TABLE_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error(
             "Could not ensure %s table exists: %s",

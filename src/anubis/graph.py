@@ -989,11 +989,34 @@ async def think(
             connected_accounts=connected_accounts,
         )
 
+    # Learning from media in conversation: the creator of THIS avatar (not a
+    # visitor), and only when the message endpoint found the caller's tier
+    # allows uploads — it sets ``identity_media_update_allowed`` per request
+    # after resolving both. Personal and non-personal avatars alike: every
+    # avatar's identity is taught by its creator.
+    identity_media_tools: list[Any] = []
+    if (
+        config.get("configurable", {}).get("identity_media_update_allowed") is True
+        and _user_owns_avatar(config, state)
+    ):
+        from src.anubis.utils.tools.identity.identity_media_tools import (
+            build_identity_media_tools,
+        )
+
+        identity_media_tools = build_identity_media_tools(
+            deep_agent_run_context,
+            user_id=state["user_state"]["user_id"],
+            assistant_id=state["assistant_state"]["assistant_id"],
+            assistant_ctx=dict(config.get("configurable", {}).get("assistant_ctx") or {}),
+            thread_id=outer_thread,
+        )
+
     extra_tools = [
         *(analysis_extra_tools or []),
         *browser_toolkit_tools,
         *mailbox_tools,
         *connection_tools,
+        *identity_media_tools,
     ]
     deep_agent = build_avatar_deep_agent(
         runtime.context,

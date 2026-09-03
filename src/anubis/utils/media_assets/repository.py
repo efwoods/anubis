@@ -36,6 +36,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from src.anubis.utils.postgres_ddl import execute_ddl_script
+
 logger = logging.getLogger(__name__)
 
 ASSET_KIND_STILL = "still"
@@ -48,6 +50,10 @@ VOICE_STATE_AWAITING_VERIFICATION = "awaiting_verification"
 VOICE_STATE_TRAINING = "training"
 VOICE_STATE_FINE_TUNED = "fine_tuned"
 VOICE_STATE_FAILED = "failed"
+# The vendor refused to create the professional voice because the ElevenLabs
+# account lacks the required plan (Creator or above). Nothing retries by
+# itself from this state; the owner upgrades and asks for a retry.
+VOICE_STATE_PLAN_REQUIRED = "plan_required"
 
 JOB_STATE_PENDING = "pending"
 JOB_STATE_RUNNING = "running"
@@ -736,9 +742,7 @@ def get_media_asset_repository() -> Any | None:
 async def ensure_media_asset_tables(pool: Any) -> None:
     """Create the media tables if they do not exist. Best-effort at boot."""
     try:
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(_CREATE_TABLES_SQL)
+        await execute_ddl_script(pool, _CREATE_TABLES_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure the avatar media tables exist: %s", table_error)
 

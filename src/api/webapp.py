@@ -1001,6 +1001,10 @@ async def message_graph_sse(
             if payload.get("type") == "assistant_token":
                 accumulated_chunks.append(payload.get("text") or "")
                 yield f"data: {json.dumps(payload)}\n\n"
+            elif payload.get("type") == "media_job_started":
+                # The in-chat identity-update tool started a media batch; the
+                # client follows it on GET /media_job/{job_id}/progress.
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
             elif payload.get("type") == "keepalive":
                 # SSE comment frame emitted during post-reply analysis (Go Emotions
                 # + SHAP), which yields no tokens yet gates the terminal ``done``
@@ -1471,6 +1475,9 @@ async def lifespan(app: FastAPI):
         app.state.store = store
         # Registry for background media-processing jobs (see src/api/media_jobs.py).
         app.state.media_jobs = {}
+        # The in-chat update_avatar_identity_with_media tool starts media
+        # batches through this published starter (see runtime_handles).
+        runtime_handles.set_identity_media_job_starter(start_identity_media_job_from_chat)
         checkpointer = AsyncPostgresSaver(app.state.pool)
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
@@ -4557,6 +4564,57 @@ async def process_files_for_message(
     return combined_text, None, []
 
 
+def _identity_media_update_allowed(
+    current_user: dict, assistant_metadata: dict, user_id: str
+) -> bool:
+    """Whether this caller may teach this avatar from media in conversation.
+
+    The avatar's creator (``metadata.user_id``) on a tier with the UPLOAD
+    capability — the same two gates ``/update_avatar_identity_with_media``
+    applies, so the chat tool can never do what the settings upload refuses.
+    """
+    if is_anonymous_user(current_user):
+        return False
+    if (assistant_metadata or {}).get("user_id") != user_id:
+        return False
+    try:
+        enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    except HTTPException:
+        return False
+    return True
+
+
+async def _remember_turn_attachments_for_identity_tool(
+    thread_id: str, files: list[UploadFile] | None, current_user: dict
+) -> None:
+    """Re-read this turn's uploads and record them for the identity-update tool."""
+    from src.api.chat_attachments import TurnAttachment, remember_turn_attachments
+
+    attachments: list[TurnAttachment] = []
+    for upload in files or []:
+        if upload is None or not (getattr(upload, "filename", None) or "").strip():
+            continue
+        try:
+            await upload.seek(0)
+            content = await upload.read()
+        except Exception:  # noqa: BLE001 - a file that cannot be re-read is skipped
+            logger.debug("Could not re-read %r for the identity tool", upload.filename)
+            continue
+        if not content:
+            continue
+        attachments.append(
+            TurnAttachment(
+                filename=upload.filename,
+                mime_type=(upload.content_type or "application/octet-stream")
+                .split(";")[0]
+                .strip()
+                .lower(),
+                content=content,
+            )
+        )
+    remember_turn_attachments(thread_id, attachments, current_user)
+
+
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,
@@ -4646,6 +4704,13 @@ async def message_avatar(
                     "description": assistant.get("description", None),
                     "metadata": assistant.get("metadata", {}),
                 },
+                # Learning from media in conversation: the avatar's creator, on a
+                # tier that allows uploads. Resolved here — where the caller and
+                # the avatar are both known — and read by ``think`` (tool) and
+                # ``load_consciousness`` (prompt block). Never true for a visitor.
+                "identity_media_update_allowed": _identity_media_update_allowed(
+                    current_user, assistant.get("metadata", {}) or {}, user_id
+                ),
             }
         }
 
@@ -4655,6 +4720,7 @@ async def message_avatar(
         config_update = {
             "configurable": {
                 "user_ctx": {"name": user_name, "description": user_description},
+                "identity_media_update_allowed": False,
             }
         }
 
@@ -4728,6 +4794,15 @@ async def message_avatar(
     # update with user information
     config_update["configurable"]["thread_id"] = thread_id
     config["configurable"].update(config_update["configurable"])
+
+    # Keep this turn's raw files for the in-chat identity-update tool. The
+    # content built above is what the model reads; the tool needs the bytes as
+    # uploaded (the media graph classifies and converts them itself). Recorded
+    # only when the tool can be offered, so a visitor's files are never kept.
+    if config_update["configurable"].get("identity_media_update_allowed") is True:
+        await _remember_turn_attachments_for_identity_tool(
+            thread_id, files, current_user
+        )
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
     config["configurable"]["include_quality_metrics"] = include_quality_metrics
@@ -6307,6 +6382,47 @@ async def submit_avatar_voice_verification(
     )
 
 
+@app.post("/avatar_voice/professional/retry")
+async def retry_avatar_professional_voice(
+    assistant_id: str = Form(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retry professional clone preparation after the vendor refused it.
+
+    ElevenLabs offers professional voice cloning to accounts on the Creator plan
+    or above; a refusal parks the voice in ``plan_required`` and nothing retries
+    by itself. Once the ElevenLabs account is upgraded (or a transient vendor
+    failure has passed) the owner retries from the Voice panel.
+    """
+    from src.anubis.utils.voice.corpus import retry_professional_voice
+
+    repository = _voice_repository_or_503()
+    assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "retry that avatar's professional voice"
+    )
+    if not is_personal:
+        raise HTTPException(
+            status_code=403, detail="Professional voice cloning is for the personal avatar."
+        )
+    record = await retry_professional_voice(
+        repository,
+        app.state.context,
+        user_id=current_user["identities"][0]["user_id"],
+        assistant_id=assistant_id,
+        avatar_name=assistant.get("name") or "",
+    )
+    return JSONResponse(
+        {
+            "professional_state": record.get("professional_state"),
+            "detail": {
+                key: value
+                for key, value in (record.get("detail") or {}).items()
+                if key.startswith("professional_")
+            },
+        }
+    )
+
+
 @app.post("/transcribe")
 async def transcribe_recording(
     assistant_id: str = Form(...),
@@ -7819,6 +7935,409 @@ async def _estimate_media_entries_tokens(media_files: list) -> int:
     return sum(estimates)
 
 
+async def _start_media_batch(
+    *,
+    user_id: str,
+    assistant_id: str,
+    config: dict,
+    media_files: list,
+    playlist_urls: list[str],
+    rejected_items: list[dict],
+    current_user: dict,
+    create_reference_media_from_playlist: bool = False,
+) -> dict:
+    """Estimate, enforce, meter, and start one media batch; return the 202 body.
+
+    Shared by ``POST /update_avatar_identity_with_media`` and the in-chat
+    ``update_avatar_identity_with_media`` tool (``start_identity_media_job_from_chat``)
+    so both paths bill and run media identically. Raises ``HTTPException`` when
+    the allotment or rate limit refuses the batch.
+    """
+    # ------------------------------------------------------------------
+    # Pre-request token estimation (fail-closed), then enforcement, then
+    # metering — all BEFORE any model call happens. Every entry gets a
+    # typed estimate (image dimensions, audio/video durations, extracted
+    # text word counts); playlists are enumerated now so their videos'
+    # durations are billed accurately at submit.
+    # ------------------------------------------------------------------
+    estimated_tokens_total = await _estimate_media_entries_tokens(media_files)
+
+    playlist_estimated_tokens = 0
+    if playlist_urls:
+        from src.anubis.utils.utility import get_remote_playlist_video_durations
+
+        estimation_context = GlobalContext()
+        playlist_analysis_passes = int(
+            estimation_context.estimated_analysis_passes_per_document or 0
+        )
+        for playlist_url in playlist_urls:
+            try:
+                playlist_video_durations = await get_remote_playlist_video_durations(
+                    playlist_url
+                )
+            except Exception as playlist_error:  # noqa: BLE001 - fail-closed
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Could not enumerate playlist {playlist_url!r} to "
+                        f"estimate token usage: {playlist_error} "
+                        "The request was not processed."
+                    ),
+                ) from playlist_error
+            if not playlist_video_durations:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Playlist {playlist_url!r} contains no videos to "
+                        "estimate. The request was not processed."
+                    ),
+                )
+            for video_duration_seconds in playlist_video_durations:
+                playlist_estimated_tokens += estimate_media_item_tokens(
+                    "video",
+                    duration_seconds=(
+                        video_duration_seconds
+                        if video_duration_seconds > 0
+                        else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+                    ),
+                    include_analysis=True,
+                    analysis_passes=playlist_analysis_passes,
+                )
+    estimated_tokens_total += playlist_estimated_tokens
+
+    # Enforce allotment and token rate with this request's estimate so an
+    # over-budget upload is refused before anything is spent (admin
+    # testing bypass happens inside the helpers).
+    await enforce_remaining_allotment(
+        app.state,
+        current_user,
+        UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+        estimated_request_tokens=estimated_tokens_total,
+    )
+    media_upload_rate_limit_context = GlobalContext()
+    await enforce_token_rate_limit(
+        app.state,
+        current_user,
+        meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
+        window_seconds=int(
+            media_upload_rate_limit_context.media_upload_rate_limit_window_seconds
+            or 0
+        ),
+        tokens_per_window=int(
+            media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
+            or 0
+        ),
+        estimated_request_tokens=estimated_tokens_total,
+    )
+
+    # Report the estimate against the document-upload meter (Stripe +
+    # local api_metrics). Billing WRITES stay fail-open — only estimation
+    # is fail-closed. The admin testing account is never metered; a dev
+    # enforcement-only bypass still is.
+    upload_metering_bypass = resolve_metering_bypass(current_user)
+    if not upload_metering_bypass.skips_metering_writes and estimated_tokens_total > 0:
+        try:
+            await report_meter_event(
+                app.state.stripe,
+                UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                resolve_stripe_customer_id(current_user),
+                estimated_tokens_total,
+            )
+            await persist_api_metrics_row(
+                getattr(app.state, "pool", None),
+                inference_type="document_upload",
+                total_tokens=estimated_tokens_total,
+                user_id=resolve_metering_user_id(current_user),
+                stripe_customer_id=resolve_stripe_customer_id(current_user),
+                assistant_id=assistant_id,
+                meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
+            )
+        except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
+            logger.error("Failed to meter upload usage: %s", upload_metering_error)
+
+    store = app.state.store
+
+    # Collect every namespace_filename already indexed for this avatar. The
+    # store layout ((user_id, assistant_id, <category>)) mirrors what
+    # /list_avatar_documents exposes; keys are read from
+    # value.document.kwargs.metadata.namespace_filename. This set is handed to
+    # the media graph, which skips any incoming item — or expanded playlist /
+    # linktree child — whose key is already present, so re-uploading a large
+    # playlist only processes new entries (the user's "skip what's already
+    # uploaded" requirement). To refresh an existing item, delete it first via
+    # DELETE /delete_avatar_document, then re-upload.
+    try:
+        existing_items = await store.asearch(
+            (user_id, assistant_id), limit=1_000_000
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not read this avatar's existing media to skip "
+                f"already-indexed items: {exc}"
+            ),
+        ) from exc
+
+    existing_namespaces: set[str] = set()
+    for item in existing_items or []:
+        value = getattr(item, "value", None)
+        if value is None and isinstance(item, dict):
+            value = item.get("value")
+        if not isinstance(value, dict):
+            continue
+        document = value.get("document")
+        if not isinstance(document, dict):
+            continue
+        kwargs_blob = document.get("kwargs")
+        if not isinstance(kwargs_blob, dict):
+            continue
+        metadata = kwargs_blob.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        stored_filename = metadata.get("namespace_filename")
+        if isinstance(stored_filename, str) and stored_filename.strip():
+            existing_namespaces.add(stored_filename.strip())
+
+    incoming_filenames = [
+        name
+        for name in (
+            (entry.get("namespace_filename") or "").strip() for entry in media_files
+        )
+        if name
+    ]
+    already_indexed = sorted(
+        {name for name in incoming_filenames if name in existing_namespaces}
+    )
+    if already_indexed:
+        logger.info(
+            "Skipping %d top-level item(s) already indexed for this avatar: %s",
+            len(already_indexed),
+            already_indexed,
+        )
+
+    # Media processing (diarization, PDFs, YouTube playlists, indexing) can run
+    # well past the request timeout, so start it as a background job and return
+    # immediately. Each top-level item gets its own child job (its own progress
+    # stream + independently cancellable); a master job aggregates them and is
+    # the handle to cancel the whole batch. Progress is streamed via
+    # GET /media_job/{job_id}/progress for either id; cancel via
+    # POST /media_job/{job_id}/cancel. Bytes are already in ``media_files`` and
+    # ``store`` / ``context`` are long-lived app resources, so the task is safe
+    # after return. ``existing_namespaces`` lets the graph skip already-indexed
+    # items and the children that expand from playlists/linktrees.
+    registry = app.state.media_jobs
+    master = create_master_job(registry, user_id, assistant_id)
+
+    items: list = []
+    item_descriptors: list = []
+    for media_file in media_files:
+        child = create_child_job(
+            registry,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            parent_id=master.job_id,
+            filename=media_file.get("filename"),
+            namespace_filename=media_file.get("namespace_filename"),
+            estimated_tokens=media_file.get("estimated_tokens"),
+        )
+        master.child_ids.append(child.job_id)
+        items.append({"child": child, "media_file": media_file})
+        item_descriptors.append(
+            {
+                "job_id": child.job_id,
+                "filename": child.filename,
+                "status": child.status,
+                "estimated_tokens": media_file.get("estimated_tokens"),
+                "status_url": f"/media_job/{child.job_id}",
+                "progress_url": f"/media_job/{child.job_id}/progress",
+                "cancel_url": f"/media_job/{child.job_id}/cancel",
+            }
+        )
+
+    # Playlists are enumerated inside the background task (off the request
+    # path); each binds its URL + flags into an async expander that mints one
+    # child job per video under this master once it resolves.
+    deferred_expanders = [
+        functools.partial(
+            _expand_youtube_playlist_to_media_entries,
+            playlist_url,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            create_reference_media_from_playlist=create_reference_media_from_playlist,
+        )
+        for playlist_url in playlist_urls
+    ]
+
+    master.task = asyncio.create_task(
+        run_batch_media_job(
+            master,
+            items,
+            config,
+            store,
+            app.state.context,
+            concurrency=max(1, app.state.context.media_processing_concurrency),
+            existing_namespaces=sorted(existing_namespaces),
+            registry=registry,
+            deferred_expanders=deferred_expanders,
+        )
+    )
+
+    # Media now runs as a background job, so per-file indexing failures can
+    # no longer be reported synchronously here. The failed-file logic that
+    # fixed the silent-success bug lives in ``run_media_job``: it captures
+    # ``failed_to_index_files`` from the graph and surfaces it on the job
+    # result, delivered to clients via the SSE ``done`` event on
+    # ``/media_job/{job_id}/progress``.
+    return {
+        "job_id": master.job_id,
+        "status": master.status,
+        "status_url": f"/media_job/{master.job_id}",
+        "progress_url": f"/media_job/{master.job_id}/progress",
+        "cancel_url": f"/media_job/{master.job_id}/cancel",
+        "items_accepted": len(media_files),
+        "filenames": [m.get("filename") for m in media_files],
+        "items": item_descriptors,
+        # Items that could not be turned into a job (mislabeled media
+        # type, unreachable URL, malformed CSV). The rest of the batch
+        # still runs; these are reported so the caller can fix and
+        # re-upload just the ones that were skipped.
+        "items_rejected": len(rejected_items),
+        "rejected": rejected_items,
+        # Playlists resolve to their per-video child jobs in the background;
+        # those child ids surface on the master's progress stream as
+        # ``playlist_child_added`` events rather than in this response.
+        "playlists_expanding": len(playlist_urls),
+        # The full pre-request estimate (playlist videos included) that
+        # was checked against the allotment and reported to the meter,
+        # plus where the caller now stands against the allotment.
+        "estimated_tokens_total": estimated_tokens_total,
+        "usage": await _build_meter_usage_snapshot(
+            app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
+        ),
+        **upload_metering_bypass.usage_response_fields(),
+        "message": (
+            "Media processing started"
+            + (
+                f"; enumerating {len(playlist_urls)} playlist(s) in the "
+                "background"
+                if playlist_urls
+                else ""
+            )
+            + (
+                f"; skipped {len(rejected_items)} unprocessable item(s)"
+                if rejected_items
+                else ""
+            )
+        ),
+    }
+
+
+async def start_identity_media_job_from_chat(
+    *,
+    user_id: str,
+    assistant_id: str,
+    assistant_ctx: dict,
+    current_user: dict,
+    attachments: list,
+    urls: list[str],
+    reference_image: bool = False,
+    reference_audio: bool = False,
+) -> dict:
+    """Start the media batch the in-chat identity-update tool asked for.
+
+    ``attachments`` are ``TurnAttachment`` records of the current turn; ``urls``
+    come from the conversation. Builds the same media entries the upload
+    endpoint builds, then hands them to ``_start_media_batch``. Refusals
+    (allotment, rate limit, every item rejected) come back as a ``status``
+    dictionary rather than raising, because the caller is a tool inside a turn.
+    """
+    config = {
+        "configurable": {
+            "user_id": user_id,
+            "user_ctx": {"name": None, "description": None},
+            "assistant_id": assistant_id,
+            "assistant_ctx": {
+                "name": assistant_ctx.get("name"),
+                "description": assistant_ctx.get("description"),
+                "assistant_id": assistant_id,
+                "metadata": assistant_ctx.get("metadata") or {},
+            },
+        }
+    }
+    reference_mode = bool(reference_image or reference_audio)
+    media_files: list = []
+    rejected_items: list[dict] = []
+    playlist_urls: list[str] = []
+    for attachment in attachments:
+        try:
+            media_files.extend(
+                await _build_media_entries_for_file(
+                    attachment.filename,
+                    attachment.content,
+                    attachment.mime_type,
+                    reference_image=bool(reference_image),
+                    reference_audio=bool(reference_audio),
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                )
+            )
+        except Exception as file_entry_error:  # noqa: BLE001 - per-item skip
+            rejected_items.append(
+                _rejected_media_item(attachment.filename, file_entry_error)
+            )
+    single_url = len(attachments) == 0 and len(urls) == 1
+    for url in urls:
+        if _is_youtube_playlist_url_str(url) and not reference_mode:
+            playlist_urls.append(url)
+            continue
+        try:
+            media_files.extend(
+                await _build_media_entries_for_url(
+                    url,
+                    reference_image=bool(reference_image),
+                    reference_audio=bool(reference_audio),
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    rich=single_url or reference_mode,
+                )
+            )
+        except Exception as url_entry_error:  # noqa: BLE001 - per-item skip
+            rejected_items.append(_rejected_media_item(url, url_entry_error))
+    if not media_files and not playlist_urls:
+        return {
+            "status": "rejected",
+            "detail": "Nothing could be processed.",
+            "rejected": rejected_items,
+        }
+    try:
+        started = await _start_media_batch(
+            user_id=user_id,
+            assistant_id=assistant_id,
+            config=config,
+            media_files=media_files,
+            playlist_urls=playlist_urls,
+            rejected_items=rejected_items,
+            current_user=current_user,
+        )
+    except HTTPException as refusal:
+        return {
+            "status": "refused",
+            "status_code": refusal.status_code,
+            "detail": refusal.detail,
+        }
+    return {
+        "status": "started",
+        "job_id": started.get("job_id"),
+        "items_accepted": started.get("items_accepted", 0),
+        "filenames": started.get("filenames", []),
+        "items_rejected": started.get("items_rejected", 0),
+        "rejected": started.get("rejected", []),
+        "playlists_expanding": started.get("playlists_expanding", 0),
+        "message": started.get("message"),
+    }
+
+
 @app.post("/update_avatar_identity_with_media")
 async def update_avatar_identity_with_media(
     files: OptionalUploadFiles = None,
@@ -8123,286 +8642,18 @@ async def update_avatar_identity_with_media(
             for entry in media_files:
                 entry["create_reference_media_from_playlist"] = True
 
-        # ------------------------------------------------------------------
-        # Pre-request token estimation (fail-closed), then enforcement, then
-        # metering — all BEFORE any model call happens. Every entry gets a
-        # typed estimate (image dimensions, audio/video durations, extracted
-        # text word counts); playlists are enumerated now so their videos'
-        # durations are billed accurately at submit.
-        # ------------------------------------------------------------------
-        estimated_tokens_total = await _estimate_media_entries_tokens(media_files)
-
-        playlist_estimated_tokens = 0
-        if playlist_urls:
-            from src.anubis.utils.utility import get_remote_playlist_video_durations
-
-            estimation_context = GlobalContext()
-            playlist_analysis_passes = int(
-                estimation_context.estimated_analysis_passes_per_document or 0
-            )
-            for playlist_url in playlist_urls:
-                try:
-                    playlist_video_durations = await get_remote_playlist_video_durations(
-                        playlist_url
-                    )
-                except Exception as playlist_error:  # noqa: BLE001 - fail-closed
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"Could not enumerate playlist {playlist_url!r} to "
-                            f"estimate token usage: {playlist_error} "
-                            "The request was not processed."
-                        ),
-                    ) from playlist_error
-                if not playlist_video_durations:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"Playlist {playlist_url!r} contains no videos to "
-                            "estimate. The request was not processed."
-                        ),
-                    )
-                for video_duration_seconds in playlist_video_durations:
-                    playlist_estimated_tokens += estimate_media_item_tokens(
-                        "video",
-                        duration_seconds=(
-                            video_duration_seconds
-                            if video_duration_seconds > 0
-                            else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
-                        ),
-                        include_analysis=True,
-                        analysis_passes=playlist_analysis_passes,
-                    )
-        estimated_tokens_total += playlist_estimated_tokens
-
-        # Enforce allotment and token rate with this request's estimate so an
-        # over-budget upload is refused before anything is spent (admin
-        # testing bypass happens inside the helpers).
-        await enforce_remaining_allotment(
-            app.state,
-            current_user,
-            UsageMeter.DOCUMENT_UPLOAD_TOKENS,
-            estimated_request_tokens=estimated_tokens_total,
-        )
-        media_upload_rate_limit_context = GlobalContext()
-        await enforce_token_rate_limit(
-            app.state,
-            current_user,
-            meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
-            window_seconds=int(
-                media_upload_rate_limit_context.media_upload_rate_limit_window_seconds
-                or 0
-            ),
-            tokens_per_window=int(
-                media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
-                or 0
-            ),
-            estimated_request_tokens=estimated_tokens_total,
-        )
-
-        # Report the estimate against the document-upload meter (Stripe +
-        # local api_metrics). Billing WRITES stay fail-open — only estimation
-        # is fail-closed. The admin testing account is never metered; a dev
-        # enforcement-only bypass still is.
-        upload_metering_bypass = resolve_metering_bypass(current_user)
-        if not upload_metering_bypass.skips_metering_writes and estimated_tokens_total > 0:
-            try:
-                await report_meter_event(
-                    app.state.stripe,
-                    UsageMeter.DOCUMENT_UPLOAD_TOKENS,
-                    resolve_stripe_customer_id(current_user),
-                    estimated_tokens_total,
-                )
-                await persist_api_metrics_row(
-                    getattr(app.state, "pool", None),
-                    inference_type="document_upload",
-                    total_tokens=estimated_tokens_total,
-                    user_id=resolve_metering_user_id(current_user),
-                    stripe_customer_id=resolve_stripe_customer_id(current_user),
-                    assistant_id=assistant_id,
-                    meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
-                )
-            except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
-                logger.error("Failed to meter upload usage: %s", upload_metering_error)
-
-        store = app.state.store
-
-        # Collect every namespace_filename already indexed for this avatar. The
-        # store layout ((user_id, assistant_id, <category>)) mirrors what
-        # /list_avatar_documents exposes; keys are read from
-        # value.document.kwargs.metadata.namespace_filename. This set is handed to
-        # the media graph, which skips any incoming item — or expanded playlist /
-        # linktree child — whose key is already present, so re-uploading a large
-        # playlist only processes new entries (the user's "skip what's already
-        # uploaded" requirement). To refresh an existing item, delete it first via
-        # DELETE /delete_avatar_document, then re-upload.
-        try:
-            existing_items = await store.asearch(
-                (user_id, assistant_id), limit=1_000_000
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Could not read this avatar's existing media to skip "
-                    f"already-indexed items: {exc}"
-                ),
-            ) from exc
-
-        existing_namespaces: set[str] = set()
-        for item in existing_items or []:
-            value = getattr(item, "value", None)
-            if value is None and isinstance(item, dict):
-                value = item.get("value")
-            if not isinstance(value, dict):
-                continue
-            document = value.get("document")
-            if not isinstance(document, dict):
-                continue
-            kwargs_blob = document.get("kwargs")
-            if not isinstance(kwargs_blob, dict):
-                continue
-            metadata = kwargs_blob.get("metadata")
-            if not isinstance(metadata, dict):
-                continue
-            stored_filename = metadata.get("namespace_filename")
-            if isinstance(stored_filename, str) and stored_filename.strip():
-                existing_namespaces.add(stored_filename.strip())
-
-        incoming_filenames = [
-            name
-            for name in (
-                (entry.get("namespace_filename") or "").strip() for entry in media_files
-            )
-            if name
-        ]
-        already_indexed = sorted(
-            {name for name in incoming_filenames if name in existing_namespaces}
-        )
-        if already_indexed:
-            logger.info(
-                "Skipping %d top-level item(s) already indexed for this avatar: %s",
-                len(already_indexed),
-                already_indexed,
-            )
-
-        # Media processing (diarization, PDFs, YouTube playlists, indexing) can run
-        # well past the request timeout, so start it as a background job and return
-        # immediately. Each top-level item gets its own child job (its own progress
-        # stream + independently cancellable); a master job aggregates them and is
-        # the handle to cancel the whole batch. Progress is streamed via
-        # GET /media_job/{job_id}/progress for either id; cancel via
-        # POST /media_job/{job_id}/cancel. Bytes are already in ``media_files`` and
-        # ``store`` / ``context`` are long-lived app resources, so the task is safe
-        # after return. ``existing_namespaces`` lets the graph skip already-indexed
-        # items and the children that expand from playlists/linktrees.
-        registry = app.state.media_jobs
-        master = create_master_job(registry, user_id, assistant_id)
-
-        items: list = []
-        item_descriptors: list = []
-        for media_file in media_files:
-            child = create_child_job(
-                registry,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                parent_id=master.job_id,
-                filename=media_file.get("filename"),
-                namespace_filename=media_file.get("namespace_filename"),
-                estimated_tokens=media_file.get("estimated_tokens"),
-            )
-            master.child_ids.append(child.job_id)
-            items.append({"child": child, "media_file": media_file})
-            item_descriptors.append(
-                {
-                    "job_id": child.job_id,
-                    "filename": child.filename,
-                    "status": child.status,
-                    "estimated_tokens": media_file.get("estimated_tokens"),
-                    "status_url": f"/media_job/{child.job_id}",
-                    "progress_url": f"/media_job/{child.job_id}/progress",
-                    "cancel_url": f"/media_job/{child.job_id}/cancel",
-                }
-            )
-
-        # Playlists are enumerated inside the background task (off the request
-        # path); each binds its URL + flags into an async expander that mints one
-        # child job per video under this master once it resolves.
-        deferred_expanders = [
-            functools.partial(
-                _expand_youtube_playlist_to_media_entries,
-                playlist_url,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                create_reference_media_from_playlist=create_reference_media_from_playlist,
-            )
-            for playlist_url in playlist_urls
-        ]
-
-        master.task = asyncio.create_task(
-            run_batch_media_job(
-                master,
-                items,
-                config,
-                store,
-                app.state.context,
-                concurrency=max(1, app.state.context.media_processing_concurrency),
-                existing_namespaces=sorted(existing_namespaces),
-                registry=registry,
-                deferred_expanders=deferred_expanders,
-            )
-        )
-
-        # Media now runs as a background job, so per-file indexing failures can
-        # no longer be reported synchronously here. The failed-file logic that
-        # fixed the silent-success bug lives in ``run_media_job``: it captures
-        # ``failed_to_index_files`` from the graph and surfaces it on the job
-        # result, delivered to clients via the SSE ``done`` event on
-        # ``/media_job/{job_id}/progress``.
         return JSONResponse(
             status_code=202,
-            content={
-                "job_id": master.job_id,
-                "status": master.status,
-                "status_url": f"/media_job/{master.job_id}",
-                "progress_url": f"/media_job/{master.job_id}/progress",
-                "cancel_url": f"/media_job/{master.job_id}/cancel",
-                "items_accepted": len(media_files),
-                "filenames": [m.get("filename") for m in media_files],
-                "items": item_descriptors,
-                # Items that could not be turned into a job (mislabeled media
-                # type, unreachable URL, malformed CSV). The rest of the batch
-                # still runs; these are reported so the caller can fix and
-                # re-upload just the ones that were skipped.
-                "items_rejected": len(rejected_items),
-                "rejected": rejected_items,
-                # Playlists resolve to their per-video child jobs in the background;
-                # those child ids surface on the master's progress stream as
-                # ``playlist_child_added`` events rather than in this response.
-                "playlists_expanding": len(playlist_urls),
-                # The full pre-request estimate (playlist videos included) that
-                # was checked against the allotment and reported to the meter,
-                # plus where the caller now stands against the allotment.
-                "estimated_tokens_total": estimated_tokens_total,
-                "usage": await _build_meter_usage_snapshot(
-                    app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
-                ),
-                **upload_metering_bypass.usage_response_fields(),
-                "message": (
-                    "Media processing started"
-                    + (
-                        f"; enumerating {len(playlist_urls)} playlist(s) in the "
-                        "background"
-                        if playlist_urls
-                        else ""
-                    )
-                    + (
-                        f"; skipped {len(rejected_items)} unprocessable item(s)"
-                        if rejected_items
-                        else ""
-                    )
-                ),
-            },
+            content=await _start_media_batch(
+                user_id=user_id,
+                assistant_id=assistant_id,
+                config=config,
+                media_files=media_files,
+                playlist_urls=playlist_urls,
+                rejected_items=rejected_items,
+                current_user=current_user,
+                create_reference_media_from_playlist=create_reference_media_from_playlist,
+            ),
         )
 
     except HTTPException:

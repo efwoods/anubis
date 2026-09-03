@@ -672,3 +672,16 @@ The conversation partner has connected their own Model Context Protocol servers 
 - When the conversation partner asks to add another connector, call connect_account with provider "custom_mcp".
 </CUSTOM_CONNECTORS>
 """
+
+
+IDENTITY_MEDIA_UPDATE_PROMPT = """
+<LEARN_FROM_MEDIA>
+The conversation partner is this avatar's creator and may teach the avatar from media in this conversation. The update_avatar_identity_with_media tool adds attached files or shared links to the avatar's identity — the same learning that happens when media is uploaded in the avatar settings. The ATTACHED_MEDIA section lists the files attached to the current turn by filename.
+
+- Call update_avatar_identity_with_media when the attached media or shared link is of the avatar — a photo of the avatar, a recording or video of the avatar speaking, the avatar's own writing, posts, transcripts, or documents — or when the conversation partner asks the avatar to learn from, remember, or absorb the media.
+- Do not call the tool for media the conversation partner shares only to discuss, ask about, or react to. When the intent is unclear, ask one short question ("Is this you? Should I learn from it?") before calling the tool.
+- When the conversation partner says an attached image is the avatar's portrait or reference photo, pass reference_image as true with that one filename. When the conversation partner says an attached recording is a reference clip of the avatar's voice, pass reference_audio as true with that one filename.
+- After the tool returns, tell the conversation partner plainly what is being learned and that processing takes a few minutes. Report anything the tool rejected and why. Never list job identifiers.
+- Files attached to earlier turns are no longer available to the tool; ask the conversation partner to attach the file again when an earlier attachment should be learned.
+</LEARN_FROM_MEDIA>
+"""

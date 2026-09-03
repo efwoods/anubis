@@ -24,6 +24,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from src.anubis.utils.postgres_ddl import execute_ddl_script
+
 logger = logging.getLogger(__name__)
 
 # Item states.
@@ -657,8 +659,6 @@ def get_inbox_repository() -> Any | None:
 async def ensure_inbox_tables(pool: Any) -> None:
     """Create the inbox tables if they do not exist. Best-effort at boot."""
     try:
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(_CREATE_TABLES_SQL)
+        await execute_ddl_script(pool, _CREATE_TABLES_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure the inbox tables exist: %s", table_error)

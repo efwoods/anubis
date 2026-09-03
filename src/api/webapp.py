@@ -6451,6 +6451,130 @@ async def _meter_speech_characters(
         logger.debug("Could not report speech meter event", exc_info=True)
 
 
+@app.post("/lip_sync")
+async def start_lip_sync_clip(
+    request: Request,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Render a lip-synced video of the avatar saying a reply.
+
+    Body: ``assistant_id``, ``text``, ``emotion``. Premium capability
+    (``VIDEO_RESPONSES``) and the ``LIP_SYNC_ENABLED`` switch both apply. A
+    phrase already rendered for this emotion is answered ``completed`` at once;
+    otherwise a generation starts and ``GET /lip_sync/{generation_id}`` is
+    polled. Seconds are metered when the clip completes.
+    """
+    from src.anubis.utils.media_generation.lip_sync import (
+        lip_sync_enabled,
+        start_lip_sync,
+    )
+    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.corpus import resolve_active_voice_id
+
+    repository = _voice_repository_or_503()
+    if not lip_sync_enabled(app.state.context):
+        raise HTTPException(status_code=503, detail="Video replies are not enabled.")
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    text = str(body.get("text") or "").strip()[:2000]
+    emotion = str(body.get("emotion") or "neutral").strip().lower() or "neutral"
+    if not assistant_id or not text:
+        raise HTTPException(status_code=400, detail="assistant_id and text are required.")
+    enforce_tier_capability(current_user, TierCapability.VIDEO_RESPONSES)
+
+    _kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
+    if voice_id is None:
+        raise HTTPException(
+            status_code=409, detail="This avatar has no cloned voice yet; record one in settings."
+        )
+    try:
+        result = await start_lip_sync(
+            app.state.context,
+            repository,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            text=text,
+            emotion=emotion,
+            voice_id=voice_id,
+        )
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+    if result["status"] == "completed":
+        return JSONResponse(
+            {"status": "completed", "video_url": f"/avatar_emotion_media/{result['asset_id']}", "cached": True}
+        )
+    return JSONResponse(
+        status_code=202,
+        content={"status": "pending", "generation_id": result["job_id"]},
+    )
+
+
+@app.get("/lip_sync/{generation_id}")
+async def get_lip_sync_clip(
+    generation_id: str,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Status of a lip-sync generation; ``video_url`` once the clip is stored."""
+    from src.anubis.utils.media_generation.lip_sync import poll_lip_sync
+    from src.anubis.utils.voice import elevenlabs_client
+
+    repository = _voice_repository_or_503()
+    job = await repository.get_job(generation_id)
+    if job is None or job.get("job_kind") != "lip_sync":
+        raise HTTPException(status_code=404, detail="No such generation.")
+    try:
+        result = await poll_lip_sync(app.state.context, repository, job=job)
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+    if result.get("newly_completed"):
+        detail = job.get("detail") or {}
+        seconds = float(detail.get("estimated_seconds") or 0.0)
+        await _meter_video_seconds(
+            current_user,
+            assistant_id=job["assistant_id"],
+            seconds=seconds,
+            cost_usd=float(
+                getattr(app.state.context, "elevenlabs_lip_sync_cost_per_second_usd", None) or 0.14
+            )
+            * seconds,
+        )
+    if result["status"] == "completed":
+        return JSONResponse(
+            {"status": "completed", "video_url": f"/avatar_emotion_media/{result['asset_id']}"}
+        )
+    return JSONResponse({"status": result["status"]})
+
+
+async def _meter_video_seconds(
+    current_user: dict, *, assistant_id: str, seconds: float, cost_usd: float
+) -> None:
+    """Record lip-sync spend locally and, when the meter exists, to Stripe."""
+    video_meter = getattr(UsageMeter, "VIDEO_GENERATION_SECONDS", None)
+    try:
+        await persist_api_metrics_row(
+            app.state.pool,
+            inference_type="lip_sync",
+            total_tokens=int(round(seconds)),
+            cost_usd=cost_usd,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            model_name=getattr(app.state.context, "elevenlabs_lip_sync_model", None),
+            meter_event_name=getattr(video_meter, "value", None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not record lip-sync metrics", exc_info=True)
+    if video_meter is None:
+        return
+    try:
+        stripe_customer_id = await resolve_stripe_customer_id(app.state, current_user)
+        await report_meter_event(
+            app.state.stripe, video_meter, stripe_customer_id, max(1, int(round(seconds)))
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not report video meter event", exc_info=True)
+
+
 @app.get("/avatar_reference_image")
 async def get_avatar_reference_image(
     request: Request,

@@ -989,16 +989,13 @@ async def think(
             connected_accounts=connected_accounts,
         )
 
-    # Learning from media in conversation: the creator of THIS avatar (not a
-    # visitor), and only when the message endpoint found the caller's tier
-    # allows uploads — it sets ``identity_media_update_allowed`` per request
-    # after resolving both. Personal and non-personal avatars alike: every
-    # avatar's identity is taught by its creator.
+    # Learning from media in conversation: the creator of THIS avatar, never a
+    # visitor. Personal and non-personal avatars alike — every avatar's identity
+    # is taught by its creator. The subscription tier (UPLOAD capability) and
+    # the upload allotment are enforced when the tool runs, by the same code
+    # path the settings upload uses, so no per-request flag is needed here.
     identity_media_tools: list[Any] = []
-    if (
-        config.get("configurable", {}).get("identity_media_update_allowed") is True
-        and _user_owns_avatar(config, state)
-    ):
+    if _user_owns_avatar(config, state):
         from src.anubis.utils.tools.identity.identity_media_tools import (
             build_identity_media_tools,
         )

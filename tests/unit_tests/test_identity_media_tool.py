@@ -1,8 +1,8 @@
 """Learning from media in conversation.
 
-- The message endpoint offers ``update_avatar_identity_with_media`` only to the
-  avatar's creator on a tier that may upload, and records the turn's raw files
-  for it.
+- The message endpoint records the turn's raw files; the graph offers
+  ``update_avatar_identity_with_media`` to the avatar's creator, and the starter
+  re-checks ownership and the upload tier — no per-request flag anywhere.
 - The tool selects attachments by filename, validates the reference flags, and
   hands the batch to the published starter — never touching the graph state.
 - The starter builds the same media entries the upload endpoint builds and
@@ -179,37 +179,6 @@ async def test_a_starter_failure_becomes_a_status_not_an_exception():
     assert result == {"status": "error", "detail": "boom"}
 
 
-# --------------------------------------------------------------------------- endpoint gate
-
-
-def test_only_the_creator_on_an_uploading_tier_may_learn_from_chat(monkeypatch):
-    from src.api import webapp as webapp_module
-
-    creator_metadata = {"user_id": USER_ID}
-    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
-    assert webapp_module._identity_media_update_allowed(
-        CURRENT_USER, creator_metadata, USER_ID
-    )
-    # A visitor on someone else's avatar.
-    assert not webapp_module._identity_media_update_allowed(
-        CURRENT_USER, {"user_id": "someone-else"}, USER_ID
-    )
-    # Anonymous callers never qualify.
-    monkeypatch.setattr(webapp_module, "is_anonymous_user", lambda user: True)
-    assert not webapp_module._identity_media_update_allowed(
-        CURRENT_USER, creator_metadata, USER_ID
-    )
-    monkeypatch.setattr(webapp_module, "is_anonymous_user", lambda user: False)
-
-    def _refuse(*args, **kwargs):
-        raise HTTPException(status_code=403, detail="upgrade")
-
-    monkeypatch.setattr(webapp_module, "enforce_tier_capability", _refuse)
-    assert not webapp_module._identity_media_update_allowed(
-        CURRENT_USER, creator_metadata, USER_ID
-    )
-
-
 # --------------------------------------------------------------------------- starter
 
 
@@ -247,6 +216,7 @@ async def test_the_chat_starter_builds_entries_and_starts_the_shared_batch(monke
             "message": "Media processing started",
         }
 
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
     monkeypatch.setattr(webapp_module, "_build_media_entries_for_file", _file_entries)
     monkeypatch.setattr(webapp_module, "_build_media_entries_for_url", _url_entries)
     monkeypatch.setattr(webapp_module, "_start_media_batch", _batch)
@@ -289,11 +259,12 @@ async def test_the_chat_starter_turns_refusals_and_rejections_into_statuses(
     async def _broken(filename, content, mime_type, **kwargs):
         raise RuntimeError("unsupported media type")
 
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
     monkeypatch.setattr(webapp_module, "_build_media_entries_for_file", _broken)
     rejected = await webapp_module.start_identity_media_job_from_chat(
         user_id=USER_ID,
         assistant_id=ASSISTANT_ID,
-        assistant_ctx={"metadata": {}},
+        assistant_ctx={"metadata": {"user_id": USER_ID}},
         current_user=CURRENT_USER,
         attachments=[PORTRAIT],
         urls=[],
@@ -312,7 +283,7 @@ async def test_the_chat_starter_turns_refusals_and_rejections_into_statuses(
     refused = await webapp_module.start_identity_media_job_from_chat(
         user_id=USER_ID,
         assistant_id=ASSISTANT_ID,
-        assistant_ctx={"metadata": {}},
+        assistant_ctx={"metadata": {"user_id": USER_ID}},
         current_user=CURRENT_USER,
         attachments=[PORTRAIT],
         urls=[],
@@ -321,4 +292,44 @@ async def test_the_chat_starter_turns_refusals_and_rejections_into_statuses(
         "status": "refused",
         "status_code": 402,
         "detail": "allotment spent",
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_chat_starter_enforces_ownership_and_the_upload_tier(monkeypatch):
+    from src.api import webapp as webapp_module
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("nothing should be built for a refused caller")
+
+    monkeypatch.setattr(webapp_module, "_build_media_entries_for_file", _never)
+    monkeypatch.setattr(webapp_module, "_start_media_batch", _never)
+
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+    visitor = await webapp_module.start_identity_media_job_from_chat(
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        assistant_ctx={"metadata": {"user_id": "someone-else"}},
+        current_user=CURRENT_USER,
+        attachments=[PORTRAIT],
+        urls=[],
+    )
+    assert visitor["status"] == "refused" and visitor["status_code"] == 403
+
+    def _free_tier(*args, **kwargs):
+        raise HTTPException(status_code=403, detail="Upgrade to upload media.")
+
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", _free_tier)
+    free = await webapp_module.start_identity_media_job_from_chat(
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        assistant_ctx={"metadata": {"user_id": USER_ID}},
+        current_user=CURRENT_USER,
+        attachments=[PORTRAIT],
+        urls=[],
+    )
+    assert free == {
+        "status": "refused",
+        "status_code": 403,
+        "detail": "Upgrade to upload media.",
     }

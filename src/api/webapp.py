@@ -4564,26 +4564,6 @@ async def process_files_for_message(
     return combined_text, None, []
 
 
-def _identity_media_update_allowed(
-    current_user: dict, assistant_metadata: dict, user_id: str
-) -> bool:
-    """Whether this caller may teach this avatar from media in conversation.
-
-    The avatar's creator (``metadata.user_id``) on a tier with the UPLOAD
-    capability — the same two gates ``/update_avatar_identity_with_media``
-    applies, so the chat tool can never do what the settings upload refuses.
-    """
-    if is_anonymous_user(current_user):
-        return False
-    if (assistant_metadata or {}).get("user_id") != user_id:
-        return False
-    try:
-        enforce_tier_capability(current_user, TierCapability.UPLOAD)
-    except HTTPException:
-        return False
-    return True
-
-
 async def _remember_turn_attachments_for_identity_tool(
     thread_id: str, files: list[UploadFile] | None, current_user: dict
 ) -> None:
@@ -4704,13 +4684,6 @@ async def message_avatar(
                     "description": assistant.get("description", None),
                     "metadata": assistant.get("metadata", {}),
                 },
-                # Learning from media in conversation: the avatar's creator, on a
-                # tier that allows uploads. Resolved here — where the caller and
-                # the avatar are both known — and read by ``think`` (tool) and
-                # ``load_consciousness`` (prompt block). Never true for a visitor.
-                "identity_media_update_allowed": _identity_media_update_allowed(
-                    current_user, assistant.get("metadata", {}) or {}, user_id
-                ),
             }
         }
 
@@ -4720,7 +4693,6 @@ async def message_avatar(
         config_update = {
             "configurable": {
                 "user_ctx": {"name": user_name, "description": user_description},
-                "identity_media_update_allowed": False,
             }
         }
 
@@ -4797,9 +4769,10 @@ async def message_avatar(
 
     # Keep this turn's raw files for the in-chat identity-update tool. The
     # content built above is what the model reads; the tool needs the bytes as
-    # uploaded (the media graph classifies and converts them itself). Recorded
-    # only when the tool can be offered, so a visitor's files are never kept.
-    if config_update["configurable"].get("identity_media_update_allowed") is True:
+    # uploaded (the media graph classifies and converts them itself). The graph
+    # offers the tool to the avatar's creator only, and the tool's starter
+    # re-checks ownership, tier, and allotment before anything is processed.
+    if not is_anonymous_user(current_user):
         await _remember_turn_attachments_for_identity_tool(
             thread_id, files, current_user
         )
@@ -8265,6 +8238,24 @@ async def start_identity_media_job_from_chat(
             },
         }
     }
+    # The same two gates ``POST /update_avatar_identity_with_media`` applies:
+    # only the avatar's creator, on a tier with the UPLOAD capability. The
+    # graph already offers the tool to the creator alone; this is the check
+    # that holds even if a tool call arrives some other way.
+    if (assistant_ctx.get("metadata") or {}).get("user_id") != user_id:
+        return {
+            "status": "refused",
+            "status_code": 403,
+            "detail": "Only the avatar's creator can update its identity.",
+        }
+    try:
+        enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    except HTTPException as refusal:
+        return {
+            "status": "refused",
+            "status_code": refusal.status_code,
+            "detail": refusal.detail,
+        }
     reference_mode = bool(reference_image or reference_audio)
     media_files: list = []
     rejected_items: list[dict] = []

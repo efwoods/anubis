@@ -860,12 +860,12 @@ async def _build_consciousness_system_message_update(
         except Exception:  # noqa: BLE001 - the inbox must never fail a turn
             logger.debug("Inbox status unavailable for the prompt", exc_info=True)
 
-    # Learning from media in conversation — the avatar's creator only, and only
-    # when the message endpoint found the caller's tier allows uploads (the flag
-    # is set per request in ``configurable``). The files attached to this turn
-    # are named so the model can pick them by filename; the bytes stay in the
-    # endpoint's attachment record and never enter the prompt.
-    if config.get("configurable", {}).get("identity_media_update_allowed") is True:
+    # Learning from media in conversation — the avatar's creator only (the
+    # same owner check the ``think`` node applies before attaching the tool;
+    # the subscription tier is enforced when the tool runs). The files attached
+    # to this turn are named so the model can pick them by filename; the bytes
+    # stay in the endpoint's attachment record and never enter the prompt.
+    if avatar_owner_id is not None and avatar_owner_id == user_id:
         try:
             from src.anubis.utils.prompts.system_prompts import (
                 IDENTITY_MEDIA_UPDATE_PROMPT,

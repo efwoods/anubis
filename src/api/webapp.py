@@ -1424,6 +1424,14 @@ async def lifespan(app: FastAPI):
     await connected_accounts_repository.migrate_store_connected_accounts_to_table(
         app.state.pool
     )
+    # Generated avatar media (emotion stills, idle loops, lip-sync clips, voice
+    # clips) and the durable media jobs live in their own BYTEA tables.
+    from src.anubis.utils import media_assets as media_assets_package
+
+    await media_assets_package.ensure_media_asset_tables(app.state.pool)
+    media_assets_package.set_media_asset_repository(
+        media_assets_package.PostgresMediaAssetRepository(app.state.pool)
+    )
     # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
     # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
     # requires pasting JSON into the env or a manual edit. This is only the INITIAL
@@ -5832,6 +5840,188 @@ async def _tabular_json_to_statements_payload(
     return await _rows_to_statements_payload(
         headers=headers, rows=rows, source_filename=source_filename
     )
+
+
+async def _assistant_owner_for_media(assistant_id: str, current_user: dict) -> str | None:
+    """The owner of an avatar, for reading its public media as any chatter."""
+    langgraph_client = get_client(headers={"API-KEY": current_user["API_KEY"]})
+    try:
+        assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not load assistant: {exc}"
+        ) from exc
+    return (assistant.get("metadata") or {}).get("user_id")
+
+
+@app.get("/avatar_emotion_media")
+async def get_avatar_emotion_media(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """The avatar's emotion media manifest: one still and one idle loop per emotion.
+
+    Read by the chat once per avatar and cached in memory on the client; the
+    entries name asset URLs served by ``GET /avatar_emotion_media/{asset_id}``.
+    Anyone who may chat with the avatar may read this, like the portrait.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_generation.emotion_media import build_manifest
+
+    repository = get_media_asset_repository()
+    if repository is None:
+        return JSONResponse({"emotions": {}, "complete": False, "missing": []})
+    await _assistant_owner_for_media(assistant_id, current_user)
+    assets = await repository.list_emotion_assets(assistant_id)
+    return JSONResponse(build_manifest(assets))
+
+
+@app.get("/avatar_emotion_media/{asset_id}")
+async def get_avatar_emotion_media_asset(
+    asset_id: str,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Stream one generated asset's bytes (an emotion still or an idle loop)."""
+    from src.anubis.utils.media_assets import get_media_asset_repository
+
+    repository = get_media_asset_repository()
+    if repository is None:
+        raise HTTPException(status_code=404, detail="No media is available.")
+    asset = await repository.get_emotion_asset(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="No such asset.")
+    # Asset ids are unguessable and rows are immutable once written, so the
+    # response is cacheable indefinitely; a regenerated asset gets a new id.
+    return Response(
+        content=asset["bytes"],
+        media_type=asset.get("mime_type") or "application/octet-stream",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+async def _run_emotion_media_job(
+    job_id: str, user_id: str, assistant_id: str, reference_image_data_uri: str, only_missing: bool
+) -> None:
+    from src.anubis.utils.billing.metering import persist_api_metrics_row
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_assets.repository import (
+        JOB_STATE_COMPLETED,
+        JOB_STATE_FAILED,
+        JOB_STATE_RUNNING,
+    )
+    from src.anubis.utils.media_generation.emotion_media import (
+        generate_emotion_media_for_avatar,
+    )
+
+    repository = get_media_asset_repository()
+    if repository is None:
+        return
+    await repository.update_job(job_id, state=JOB_STATE_RUNNING)
+
+    async def _record_metric(inference_type, cost_usd, model_name, request_id):
+        try:
+            await persist_api_metrics_row(
+                app.state.pool,
+                inference_type=inference_type,
+                cost_usd=cost_usd,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                model_name=model_name,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not record %s cost", inference_type, exc_info=True)
+
+    def _progress(stage, fields):
+        asyncio.create_task(repository.update_job(job_id, detail={"stage": stage, **fields}))
+
+    try:
+        manifest = await generate_emotion_media_for_avatar(
+            app.state.context,
+            repository,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            reference_image_data_uri=reference_image_data_uri,
+            only_missing=only_missing,
+            progress=_progress,
+            metrics=_record_metric,
+        )
+        await repository.update_job(
+            job_id,
+            state=JOB_STATE_COMPLETED if not manifest.get("failures") else JOB_STATE_FAILED,
+            detail={"complete": manifest.get("complete"), "failures": manifest.get("failures")},
+        )
+    except Exception as job_error:  # noqa: BLE001
+        logger.exception("Emotion media job %s failed: %s", job_id, job_error)
+        await repository.update_job(job_id, state=JOB_STATE_FAILED, detail={"error": str(job_error)})
+
+
+@app.post("/avatar_emotion_media/regenerate")
+async def regenerate_avatar_emotion_media(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """(Re)build an avatar's emotion stills and idle loops from its reference image.
+
+    Body: ``assistant_id``, optional ``only_missing`` (default true — retry what
+    failed rather than paying for the whole set again). Runs as a durable job in
+    ``avatar_media_jobs``; poll ``GET /avatar_media_jobs/{job_id}``.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_generation.emotion_media import emotion_media_enabled
+
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    only_missing = bool(body.get("only_missing", True))
+    if not assistant_id:
+        raise HTTPException(status_code=400, detail="assistant_id is required")
+    enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    await resolve_assistant_for_creator(
+        assistant_id, current_user, action_description="regenerate media for that avatar"
+    )
+    repository = get_media_asset_repository()
+    if repository is None or not emotion_media_enabled(app.state.context):
+        raise HTTPException(
+            status_code=503, detail="Emotion media generation is not configured."
+        )
+    user_id = current_user["identities"][0]["user_id"]
+    item = await app.state.store.aget((user_id, assistant_id, "reference_image"), assistant_id)
+    value = (getattr(item, "value", None) or {}) if item is not None else {}
+    reference_image_data_uri = value.get("reference_image_data")
+    if not reference_image_data_uri:
+        raise HTTPException(
+            status_code=404, detail="Upload a reference image before generating emotion media."
+        )
+    job_id = await repository.create_job(
+        user_id=user_id,
+        assistant_id=assistant_id,
+        job_kind="emotion_media",
+        detail={"only_missing": only_missing},
+    )
+    asyncio.create_task(
+        _run_emotion_media_job(job_id, user_id, assistant_id, reference_image_data_uri, only_missing)
+    )
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status_url": f"/avatar_media_jobs/{job_id}"},
+    )
+
+
+@app.get("/avatar_media_jobs/{job_id}")
+async def get_avatar_media_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """State and progress of one durable media job (emotion media, voice clone)."""
+    from src.anubis.utils.media_assets import get_media_asset_repository
+
+    repository = get_media_asset_repository()
+    if repository is None:
+        raise HTTPException(status_code=404, detail="No such job.")
+    job = await repository.get_job(job_id)
+    if job is None or job.get("user_id") != current_user["identities"][0]["user_id"]:
+        raise HTTPException(status_code=404, detail="No such job.")
+    return JSONResponse(job)
 
 
 @app.get("/avatar_reference_image")

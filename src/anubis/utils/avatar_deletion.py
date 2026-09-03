@@ -274,6 +274,16 @@ async def purge_avatar_data(
     deleted_connected_account_count = await delete_connected_accounts_for_assistant(
         pool, assistant_id
     )
+    # Generated media (emotion stills, idle loops, voice clips, clone record)
+    # is keyed to the avatar and has no other owner.
+    from src.anubis.utils.media_assets.repository import (
+        PostgresMediaAssetRepository,
+        delete_media_for_avatar,
+    )
+
+    deleted_media_counts = await delete_media_for_avatar(
+        PostgresMediaAssetRepository(pool), assistant_id
+    )
 
     # The raw SQL above bypassed the store client, so the process-local
     # read-through cache still holds this avatar's reference image and style
@@ -293,6 +303,7 @@ async def purge_avatar_data(
         "store_rows": deleted_store_row_count,
         "api_metric_rows": deleted_metric_row_count,
         "connected_accounts": deleted_connected_account_count,
+        **{f"media_{name}": count for name, count in deleted_media_counts.items()},
     }
     logger.info("Purged avatar %s: %s", assistant_id, counts)
     return counts

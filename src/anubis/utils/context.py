@@ -609,6 +609,87 @@ class GlobalContext:
 
     """ </Connected accounts (mailbox and social) for the personal avatar> """
 
+    """ <Emotion media generation (xAI images and idle-loop videos)> """
+
+    xai_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "Bearer key for the xAI API, used to derive an avatar's six emotion stills from its reference image and to animate each still into a six-second idle loop. Leaving this unset disables emotion media generation without affecting anything else. Env XAI_API_KEY."
+        },
+    )
+
+    emotion_media_generation_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether uploading a reference image also generates the avatar's emotion stills and idle loops. Set to false to skip generation (for example in a test environment) while keeping the rest of the media pipeline. Env EMOTION_MEDIA_GENERATION_ENABLED."
+        },
+    )
+
+    xai_image_edit_model: str = field(
+        default="grok-imagine-image-2.0",
+        metadata={
+            "description": "xAI image-editing model that turns the reference image into an emotion still. Env XAI_IMAGE_EDIT_MODEL."
+        },
+    )
+
+    xai_image_cost_per_image_usd: float = field(
+        default=0.04,
+        metadata={
+            "description": "Vendor price of one generated image, recorded per call in api_metrics as inference_type image_generation. Env XAI_IMAGE_COST_PER_IMAGE_USD."
+        },
+    )
+
+    xai_video_model: str = field(
+        default="grok-imagine-video-1.5",
+        metadata={
+            "description": "xAI image-to-video model that animates an emotion still into an idle loop. Env XAI_VIDEO_MODEL."
+        },
+    )
+
+    xai_video_cost_per_second_usd: float = field(
+        default=0.08,
+        metadata={
+            "description": "Vendor price per second of generated video, recorded per call in api_metrics as inference_type video_generation. Env XAI_VIDEO_COST_PER_SECOND_USD."
+        },
+    )
+
+    xai_idle_loop_duration_seconds: int = field(
+        default=6,
+        metadata={
+            "description": "Length in seconds of each generated idle loop. The prompt requires the first and final frames to match the still so the loop plays seamlessly. Env XAI_IDLE_LOOP_DURATION_SECONDS."
+        },
+    )
+
+    xai_video_resolution: str = field(
+        default="720p",
+        metadata={
+            "description": "Resolution requested for idle loops: 480p, 720p, or 1080p. Env XAI_VIDEO_RESOLUTION."
+        },
+    )
+
+    xai_video_aspect_ratio: str = field(
+        default="9:16",
+        metadata={
+            "description": "Aspect ratio requested for idle loops, matching the portrait framing the voice-mode stage displays. Env XAI_VIDEO_ASPECT_RATIO."
+        },
+    )
+
+    xai_video_poll_interval_seconds: float = field(
+        default=5.0,
+        metadata={
+            "description": "Seconds between status checks while an idle loop renders. Env XAI_VIDEO_POLL_INTERVAL_SECONDS."
+        },
+    )
+
+    xai_video_poll_timeout_seconds: float = field(
+        default=600.0,
+        metadata={
+            "description": "Maximum seconds to wait for one idle loop before recording the generation as failed and moving on. Env XAI_VIDEO_POLL_TIMEOUT_SECONDS."
+        },
+    )
+
+    """ </Emotion media generation (xAI images and idle-loop videos)> """
+
 
     dev: str = field(
         default=None,

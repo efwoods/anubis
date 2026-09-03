@@ -40,6 +40,78 @@ def _emit_media_progress(stage: str, **fields: Any) -> None:
         pass
 
 
+async def _generate_emotion_media_after_reference_image(
+    context: Any, user_id: str, assistant_id: str, reference_image_data_uri: str
+) -> None:
+    """Build the avatar's emotion stills and idle loops from a new reference image.
+
+    Skipped when generation is disabled, no xAI key is configured, or no media
+    repository has been published (the dev server without the FastAPI lifespan).
+    Every failure is logged and reported through progress rather than raised:
+    the reference image itself is already stored, and an upload must not fail
+    because a vendor refused one of thirteen generations.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_generation.emotion_media import (
+        emotion_media_enabled,
+        generate_emotion_media_for_avatar,
+    )
+
+    repository = get_media_asset_repository()
+    if repository is None or not emotion_media_enabled(context):
+        logger.info(
+            "Emotion media generation skipped for %s (repository=%s, enabled=%s)",
+            assistant_id,
+            repository is not None,
+            emotion_media_enabled(context),
+        )
+        return
+
+    pool = getattr(repository, "pool", None)
+
+    async def _record_metric(
+        inference_type: str, cost_usd: float, model_name: str, request_id: str | None
+    ) -> None:
+        if pool is None:
+            return
+        from src.anubis.utils.billing.metering import persist_api_metrics_row
+
+        try:
+            await persist_api_metrics_row(
+                pool,
+                inference_type=inference_type,
+                cost_usd=cost_usd,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                model_name=model_name,
+            )
+        except Exception:  # noqa: BLE001 - metering must not fail generation
+            logger.debug("Could not record %s cost", inference_type, exc_info=True)
+
+    try:
+        manifest = await generate_emotion_media_for_avatar(
+            context,
+            repository,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            reference_image_data_uri=reference_image_data_uri,
+            progress=lambda stage, fields: _emit_media_progress(stage, **fields),
+            metrics=_record_metric,
+        )
+        if manifest.get("failures"):
+            logger.warning(
+                "Emotion media for %s finished with %d failure(s): %s",
+                assistant_id,
+                len(manifest["failures"]),
+                manifest["failures"],
+            )
+    except Exception as generation_error:  # noqa: BLE001
+        logger.exception(
+            "Emotion media generation failed for %s: %s", assistant_id, generation_error
+        )
+        _emit_media_progress("emotion_media_complete", complete=False, error=str(generation_error))
+
+
 def _namespace_for(source: str) -> str:
     """Deterministic store key for a media source.
 
@@ -1146,6 +1218,16 @@ async def process_media_item_task(
                 # cache; drop the cached copy so the new reference image is
                 # picked up on the next message.
                 invalidate_store_cache_entry(namespace, assistant_id)
+
+                # The reference image is the neutral emotion. Derive the other
+                # six stills and animate all seven into idle loops, persisting
+                # each as it completes so runtime is a lookup. Progress rides
+                # the same media_progress stream as the upload, and a vendor
+                # failure never fails the upload — the missing assets are
+                # reported and can be regenerated from settings.
+                await _generate_emotion_media_after_reference_image(
+                    runtime.context, user_id, assistant_id, full_uri
+                )
                 doc.metadata.update(
                     {
                         "namespace": "reference_image",

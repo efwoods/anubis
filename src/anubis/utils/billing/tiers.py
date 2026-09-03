@@ -73,6 +73,11 @@ class UsageMeter(StrEnum):
     DOCUMENT_UPLOAD_TOKENS = "document_upload_tokens"
     ADAPTER_TRAINING_UNITS = "adapter_training_units"
     ADAPTER_INFERENCE_TOKENS = "adapter_inference_tokens"
+    # Voice and video responses. Speech is billed by the vendor per character
+    # (one credit per character), lip-sync video per second; both meters bill
+    # the same units so the allotment maps onto vendor cost directly.
+    SPEECH_CHARACTERS = "speech_characters"
+    VIDEO_GENERATION_SECONDS = "video_generation_seconds"
 
 
 class TierCapability(StrEnum):
@@ -81,6 +86,8 @@ class TierCapability(StrEnum):
     MESSAGE = "message"  # send and receive messages (all tiers)
     UPLOAD = "upload"  # update avatar identity with media (pro and premium)
     TRAIN_ADAPTER = "train_adapter"  # train fine-tuning adapters (premium only)
+    AUDIO_RESPONSES = "audio_responses"  # cloned-voice speech (pro and premium)
+    VIDEO_RESPONSES = "video_responses"  # lip-synced video replies (premium only)
 
 
 # Ordered list of every meter's ``event_name``. Reused by the provisioning script
@@ -187,7 +194,13 @@ TIER_DEFINITIONS: Dict[SubscriptionTier, TierDefinition] = {
         tier=SubscriptionTier.PRO,
         display_name="Neural Nexus Pro Tier",
         monthly_base_fee_usd=20.0,
-        capabilities=frozenset({TierCapability.MESSAGE, TierCapability.UPLOAD}),
+        capabilities=frozenset(
+            {
+                TierCapability.MESSAGE,
+                TierCapability.UPLOAD,
+                TierCapability.AUDIO_RESPONSES,
+            }
+        ),
         trial_period_days=30,
         meter_allotments={
             UsageMeter.MESSAGING_TOKENS: MeterAllotment(
@@ -200,6 +213,14 @@ TIER_DEFINITIONS: Dict[SubscriptionTier, TierDefinition] = {
                 monthly_allotment=10_000_000,
                 overage_price_per_million=3.00,
             ),
+            # Speech: vendor cost is ~$0.05 per 1,000 characters (Flash); the
+            # allotment covers roughly two hundred short spoken replies and the
+            # overage is priced at twice vendor cost.
+            UsageMeter.SPEECH_CHARACTERS: MeterAllotment(
+                meter=UsageMeter.SPEECH_CHARACTERS,
+                monthly_allotment=50_000,
+                overage_price_per_million=100.00,
+            ),
         },
     ),
     SubscriptionTier.PREMIUM: TierDefinition(
@@ -211,6 +232,8 @@ TIER_DEFINITIONS: Dict[SubscriptionTier, TierDefinition] = {
                 TierCapability.MESSAGE,
                 TierCapability.UPLOAD,
                 TierCapability.TRAIN_ADAPTER,
+                TierCapability.AUDIO_RESPONSES,
+                TierCapability.VIDEO_RESPONSES,
             }
         ),
         trial_period_days=0,
@@ -235,6 +258,19 @@ TIER_DEFINITIONS: Dict[SubscriptionTier, TierDefinition] = {
                 monthly_allotment=5,  # five trained adapters included per month
                 overage_price_per_unit_usd=5.00,
             ),
+            UsageMeter.SPEECH_CHARACTERS: MeterAllotment(
+                meter=UsageMeter.SPEECH_CHARACTERS,
+                monthly_allotment=200_000,
+                overage_price_per_million=100.00,
+            ),
+            # Lip-sync video: vendor cost is ~$0.14 per second; a few minutes
+            # are included with the base fee and overage is priced at twice
+            # vendor cost so the subscription covers the service.
+            UsageMeter.VIDEO_GENERATION_SECONDS: MeterAllotment(
+                meter=UsageMeter.VIDEO_GENERATION_SECONDS,
+                monthly_allotment=180,
+                overage_price_per_unit_usd=0.28,
+            ),
         },
     ),
 }
@@ -254,9 +290,7 @@ def tier_from_value(value: str | None) -> SubscriptionTier:
         return SubscriptionTier.FREE
 
 
-def tier_has_capability(
-    tier: SubscriptionTier, capability: TierCapability
-) -> bool:
+def tier_has_capability(tier: SubscriptionTier, capability: TierCapability) -> bool:
     """Return whether ``tier`` unlocks ``capability``."""
     return capability in TIER_DEFINITIONS[tier].capabilities
 

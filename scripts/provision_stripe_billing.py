@@ -121,6 +121,8 @@ METER_DISPLAY_NAMES: Dict[UsageMeter, str] = {
     UsageMeter.DOCUMENT_UPLOAD_TOKENS: "Document Upload Tokens",
     UsageMeter.ADAPTER_INFERENCE_TOKENS: "Adapter Inference Tokens",
     UsageMeter.ADAPTER_TRAINING_UNITS: "Adapter Training",
+    UsageMeter.SPEECH_CHARACTERS: "Speech Characters",
+    UsageMeter.VIDEO_GENERATION_SECONDS: "Video Generation Seconds",
 }
 
 

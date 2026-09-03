@@ -690,6 +690,108 @@ class GlobalContext:
 
     """ </Emotion media generation (xAI images and idle-loop videos)> """
 
+    """ <Voice cloning and speech (ElevenLabs)> """
+
+    elevenlabs_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "ElevenLabs key used for instant and professional voice cloning, speech synthesis, and lip-sync video. Pro tier or higher is required for API access and one professional-clone slot. Leaving this unset disables every voice feature without affecting anything else. Env ELEVENLABS_API_KEY."
+        },
+    )
+
+    elevenlabs_instant_voice_clone_minimum_seconds: float = field(
+        default=60.0,
+        metadata={
+            "description": "Seconds of the avatar's own speech required before an instant voice clone is created. Env ELEVENLABS_INSTANT_VOICE_CLONE_MINIMUM_SECONDS."
+        },
+    )
+
+    elevenlabs_instant_voice_clone_target_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Seconds of speech the instant clone is rebuilt from once available; a clone built from less is replaced when the corpus reaches this. Non-personal avatars stop collecting here. Env ELEVENLABS_INSTANT_VOICE_CLONE_TARGET_SECONDS."
+        },
+    )
+
+    elevenlabs_professional_voice_clone_minimum_seconds: float = field(
+        default=1800.0,
+        metadata={
+            "description": "Seconds of the personal avatar's own speech required before a professional voice clone is prepared for verification and training. Env ELEVENLABS_PROFESSIONAL_VOICE_CLONE_MINIMUM_SECONDS."
+        },
+    )
+
+    elevenlabs_professional_voice_clone_maximum_seconds: float = field(
+        default=10800.0,
+        metadata={
+            "description": "Ceiling on the personal avatar's voice corpus; clips beyond this are not stored. Env ELEVENLABS_PROFESSIONAL_VOICE_CLONE_MAXIMUM_SECONDS."
+        },
+    )
+
+    elevenlabs_professional_voice_clone_training_model: str = field(
+        default="eleven_multilingual_v2",
+        metadata={
+            "description": "Model the professional clone is trained against. Env ELEVENLABS_PROFESSIONAL_VOICE_CLONE_TRAINING_MODEL."
+        },
+    )
+
+    professional_voice_clone_poll_interval_seconds: float = field(
+        default=300.0,
+        metadata={
+            "description": "Seconds between checks on a professional clone that is training (training takes three to six hours). Env PROFESSIONAL_VOICE_CLONE_POLL_INTERVAL_SECONDS."
+        },
+    )
+
+    elevenlabs_text_to_speech_model: str = field(
+        default="eleven_flash_v2_5",
+        metadata={
+            "description": "Speech model the cloned voice is rendered with for the speak button and voice mode. Flash is the low-latency choice; eleven_v3 is more expressive and slower. Env ELEVENLABS_TEXT_TO_SPEECH_MODEL."
+        },
+    )
+
+    elevenlabs_text_to_speech_cost_per_1000_characters_usd: float = field(
+        default=0.05,
+        metadata={
+            "description": "Vendor price per thousand characters of speech, recorded per call in api_metrics as inference_type speech_synthesis. Env ELEVENLABS_TEXT_TO_SPEECH_COST_PER_1000_CHARACTERS_USD."
+        },
+    )
+
+    elevenlabs_lip_sync_model: str = field(
+        default="creatify-aurora",
+        metadata={
+            "description": "ElevenLabs lip-sync model (image + audio to video) used for voice-mode replies when video is enabled. Env ELEVENLABS_LIP_SYNC_MODEL."
+        },
+    )
+
+    elevenlabs_lip_sync_resolution: str = field(
+        default="720p",
+        metadata={
+            "description": "Resolution requested for lip-sync clips: 480p or 720p. Env ELEVENLABS_LIP_SYNC_RESOLUTION."
+        },
+    )
+
+    elevenlabs_lip_sync_cost_per_second_usd: float = field(
+        default=0.14,
+        metadata={
+            "description": "Estimated vendor price per second of lip-sync video, recorded per clip in api_metrics as inference_type lip_sync. Env ELEVENLABS_LIP_SYNC_COST_PER_SECOND_USD."
+        },
+    )
+
+    elevenlabs_lip_sync_poll_interval_seconds: float = field(
+        default=5.0,
+        metadata={
+            "description": "Seconds between status checks while a lip-sync clip renders. Env ELEVENLABS_LIP_SYNC_POLL_INTERVAL_SECONDS."
+        },
+    )
+
+    lip_sync_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Process-wide switch for lip-sync video generation; tier capability still applies per user. Env LIP_SYNC_ENABLED."
+        },
+    )
+
+    """ </Voice cloning and speech (ElevenLabs)> """
+
 
     dev: str = field(
         default=None,

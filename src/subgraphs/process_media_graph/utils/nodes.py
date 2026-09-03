@@ -109,7 +109,135 @@ async def _generate_emotion_media_after_reference_image(
         logger.exception(
             "Emotion media generation failed for %s: %s", assistant_id, generation_error
         )
-        _emit_media_progress("emotion_media_complete", complete=False, error=str(generation_error))
+        _emit_media_progress(
+            "emotion_media_complete", complete=False, error=str(generation_error)
+        )
+
+
+def _assistant_is_personal_avatar(config: Any) -> bool:
+    """Whether the media job's avatar is the owner's personal avatar."""
+    metadata = (
+        (config or {})
+        .get("configurable", {})
+        .get("assistant_ctx", {})
+        .get("metadata", {})
+    )
+    return bool(metadata.get("is_personal_avatar_of_creator") is True)
+
+
+def _assistant_name(config: Any) -> str:
+    return str(
+        (config or {}).get("configurable", {}).get("assistant_ctx", {}).get("name")
+        or ""
+    )
+
+
+async def _collect_voice_clip_from_isolated_audio(
+    context: Any,
+    config: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    audio_uri: str,
+    filename: str | None,
+    source_document_name: str | None,
+) -> None:
+    """Isolate the dominant speaker across a reference recording and store it as a clip."""
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.corpus import add_voice_clip, voice_configured
+
+    repository = get_media_asset_repository()
+    if repository is None or not voice_configured(context):
+        return
+    try:
+        isolated = await isolate_dominant_speaker_audio_b64(
+            audio_uri,
+            context=context,
+            filename=filename,
+            content_type="audio/mp3",
+            reference_audio=False,
+        )
+        record = await add_voice_clip(
+            repository,
+            context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            audio_data_uri=isolated.get("audio_base64_preprocessed") or "",
+            duration_seconds=float(isolated.get("duration") or 0.0),
+            source="reference_upload",
+            source_document_name=source_document_name,
+            is_personal_avatar=_assistant_is_personal_avatar(config),
+            avatar_name=_assistant_name(config),
+        )
+        _emit_media_progress(
+            "voice_clip_collected",
+            seconds=float(isolated.get("duration") or 0.0),
+            collected_seconds=float(record.get("collected_seconds") or 0.0),
+        )
+        if record.get("instant_voice_id"):
+            _emit_media_progress("instant_clone_created")
+    except Exception as clip_error:  # noqa: BLE001 - never fail the upload
+        logger.warning(
+            "Voice clip collection skipped for %s: %s", assistant_id, clip_error
+        )
+
+
+async def _collect_voice_clips_from_target_turns(
+    context: Any,
+    config: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_type: str,
+    payload_uri: str,
+    filename: str | None,
+    turns: list,
+) -> None:
+    """Cut the personal avatar's own turns from an ordinary upload into the corpus."""
+    if not _assistant_is_personal_avatar(config) or not payload_uri:
+        return
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.clips import cut_target_turns_to_mp3_data_uri
+    from src.anubis.utils.voice.corpus import add_voice_clip, voice_configured
+
+    repository = get_media_asset_repository()
+    if repository is None or not voice_configured(context):
+        return
+    if not any(turn.get("is_target") for turn in turns or []):
+        return
+    try:
+        if media_type == "video":
+            audio_uri, _audio_name = await asyncio.to_thread(
+                extract_video_audio_b64, payload_uri, filename
+            )
+        else:
+            audio_uri = payload_uri
+        clip_uri, seconds = await cut_target_turns_to_mp3_data_uri(audio_uri, turns)
+        if not clip_uri or seconds <= 0:
+            return
+        record = await add_voice_clip(
+            repository,
+            context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            audio_data_uri=clip_uri,
+            duration_seconds=seconds,
+            source="media_upload",
+            source_document_name=filename,
+            is_personal_avatar=True,
+            avatar_name=_assistant_name(config),
+        )
+        _emit_media_progress(
+            "voice_clip_collected",
+            seconds=seconds,
+            collected_seconds=float(record.get("collected_seconds") or 0.0),
+        )
+        if record.get("instant_voice_id"):
+            _emit_media_progress("instant_clone_created")
+    except Exception as clip_error:  # noqa: BLE001 - never fail the upload
+        logger.warning(
+            "Voice clip collection skipped for %s: %s", assistant_id, clip_error
+        )
 
 
 def _namespace_for(source: str) -> str:
@@ -263,7 +391,9 @@ def _is_full_audio_data_uri(value: str) -> bool:
     return normalized.startswith("data:audio/") and ";base64," in normalized
 
 
-def _parse_json_lines_to_statements_payload(raw_text: str, filename: str) -> Dict[str, Any]:
+def _parse_json_lines_to_statements_payload(
+    raw_text: str, filename: str
+) -> Dict[str, Any]:
     """Parse JSON-Lines text (one JSON object per line) into the statements contract.
 
     Each parsed line object is expected to already be one avatar-identity
@@ -663,26 +793,28 @@ async def process_uploaded_files_and_label_media_type(
                     )
                 elif suffix == ".json" or suffix == ".jsonl":
                     if full_payload_uri:
-                        raw = _decode_data_uri_base64_payload(
-                            full_payload_uri
-                        ).decode("utf-8")
+                        raw = _decode_data_uri_base64_payload(full_payload_uri).decode(
+                            "utf-8"
+                        )
                     else:
-                        raw = file_bytes.decode('utf-8')
+                        raw = file_bytes.decode("utf-8")
                     text_content = _parse_json_or_json_lines_upload(
                         raw_text=raw, filename=filename, suffix=suffix
                     )
-                    media_list.append({
-                        "type": "json",
-                        "content": text_content,
-                        "metadata": {
-                            "filename": filename,
-                            "content_type": content_type,
-                            "size": len(file_bytes or b""),
-                            "user_id": user_id,
-                            "assistant_id": assistant_id,
-                            "namespace_filename": namespace_filename
+                    media_list.append(
+                        {
+                            "type": "json",
+                            "content": text_content,
+                            "metadata": {
+                                "filename": filename,
+                                "content_type": content_type,
+                                "size": len(file_bytes or b""),
+                                "user_id": user_id,
+                                "assistant_id": assistant_id,
+                                "namespace_filename": namespace_filename,
+                            },
                         }
-                    })
+                    )
                 else:  # handle markdown
                     if full_payload_uri:
                         text_content = _decode_data_uri_base64_payload(full_payload_uri)
@@ -1460,9 +1592,7 @@ async def process_media_item_task(
             # instead of raising KeyError so one malformed JSON file cannot
             # crash the batch (tabular JSON is converted to statements at the
             # API edge before this handler ever sees the file).
-            messages = (
-                content.get("messages") if isinstance(content, dict) else None
-            )
+            messages = content.get("messages") if isinstance(content, dict) else None
             if not isinstance(messages, list):
                 logger.warning(
                     "Unrecognized JSON shape in %s: expected a dict with a "
@@ -1500,7 +1630,7 @@ async def process_media_item_task(
                         filename,
                     )
                     continue
-                media_item['content'] = message_content
+                media_item["content"] = message_content
                 documents = await process_text_media_item_target_for_vectorstore(
                     media_item=media_item,
                     user_id=user_id,
@@ -1734,6 +1864,22 @@ async def process_media_item_task(
                 )
                 all_documents.append(doc)
 
+                # The reference recording is also voice-clone material. The
+                # ≤9.5 s clip above anchors the diarizer; the clone wants every
+                # second of the owner speaking, so the same isolation runs once
+                # more without the reference cap and the whole target-only
+                # track is added to the corpus. Every avatar collects toward an
+                # instant clone this way; the personal avatar keeps going.
+                await _collect_voice_clip_from_isolated_audio(
+                    runtime.context,
+                    config,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    audio_uri=audio_uri,
+                    filename=audio_name,
+                    source_document_name=filename,
+                )
+
                 """ Compare the approximate embedding of the transcription to the reference audio embedding """
 
                 # Run the synchronous SentenceTransformer load + encode + similarity
@@ -1802,12 +1948,8 @@ async def process_media_item_task(
                             ref_value.get("reference_audio_data") or None
                         )
                         reference_transcript_text = (
-                            (
-                                (ref_value.get("document") or {}).get("kwargs")
-                                or {}
-                            ).get("page_content")
-                            or ""
-                        )
+                            (ref_value.get("document") or {}).get("kwargs") or {}
+                        ).get("page_content") or ""
                 except Exception as exc:
                     logger.debug("Reference audio lookup failed (continuing): %s", exc)
 
@@ -2128,14 +2270,10 @@ async def process_media_item_task(
                     )
 
                 if attribution_map is None:
-                    _emit_media_progress(
-                        "target_attribution_failed", filename=filename
-                    )
+                    _emit_media_progress("target_attribution_failed", filename=filename)
                 else:
                     promoted_labels = [
-                        label
-                        for label, belongs in attribution_map.items()
-                        if belongs
+                        label for label, belongs in attribution_map.items() if belongs
                     ]
                     for turn in turns:
                         if attribution_map.get(turn["speaker"]):
@@ -2199,6 +2337,23 @@ async def process_media_item_task(
                     t["speaker"] = target_speaker_label
                 turns = coalesce_segments_by_speaker(turns)
                 distinct_speakers = {t["speaker"] for t in turns}
+
+            # The owner's own turns in this upload are voice-clone material for
+            # the PERSONAL avatar only: the diarizer has attributed the target's
+            # turns, so their windows are cut from the audio (no second
+            # diarization) and added to the corpus. Other avatars are not
+            # collected from ordinary uploads — a shared avatar's material may
+            # be anyone's voice.
+            await _collect_voice_clips_from_target_turns(
+                runtime.context,
+                config,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_type=media_type,
+                payload_uri=payload_uri,
+                filename=filename,
+                turns=turns,
+            )
 
             if len(distinct_speakers) > 1:
                 # Multiple speakers -> full dialogue processing. Outputs:
@@ -2462,7 +2617,6 @@ async def _expand_url_media_item(
     parent_create_reference_media_from_playlist = bool(
         (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
     )
-
 
     loader = URLDocumentLoaderClass()
     if semaphore is not None:
@@ -2829,10 +2983,19 @@ async def process_adapter_documents(
             )
             continue
 
-        adapter_rows_prompt_completion_format = [{'prompt': message['messages'][0]['content'], 'completion': message['messages'][1]['content']} for message in adapter_rows]
+        adapter_rows_prompt_completion_format = [
+            {
+                "prompt": message["messages"][0]["content"],
+                "completion": message["messages"][1]["content"],
+            }
+            for message in adapter_rows
+        ]
 
         await _store_dataset(
-            "q_and_a_adapter", source_filename, source_uuid5, adapter_rows_prompt_completion_format
+            "q_and_a_adapter",
+            source_filename,
+            source_uuid5,
+            adapter_rows_prompt_completion_format,
         )
         await _store_dataset(
             "langsmith_factual_q_and_a",

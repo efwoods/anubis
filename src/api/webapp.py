@@ -1,6 +1,7 @@
 # src/anubis/webapp.py
 
 import asyncio
+import time
 import base64
 import functools
 import json
@@ -168,6 +169,8 @@ def tier_from_value_or_400(value: str) -> SubscriptionTier:
 _CAPABILITY_REQUIRED_TIER = {
     TierCapability.UPLOAD: SubscriptionTier.PRO,
     TierCapability.TRAIN_ADAPTER: SubscriptionTier.PREMIUM,
+    TierCapability.AUDIO_RESPONSES: SubscriptionTier.PRO,
+    TierCapability.VIDEO_RESPONSES: SubscriptionTier.PREMIUM,
 }
 
 
@@ -1431,6 +1434,11 @@ async def lifespan(app: FastAPI):
     await media_assets_package.ensure_media_asset_tables(app.state.pool)
     media_assets_package.set_media_asset_repository(
         media_assets_package.PostgresMediaAssetRepository(app.state.pool)
+    )
+    # A professional voice clone trains for hours; its state lives in the
+    # avatar_voice table and is refreshed on a schedule that survives restarts.
+    app.state.voice_training_poller = asyncio.create_task(
+        _poll_training_voice_clones(app.state.context)
     )
     # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
     # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
@@ -6022,6 +6030,425 @@ async def get_avatar_media_job(
     if job is None or job.get("user_id") != current_user["identities"][0]["user_id"]:
         raise HTTPException(status_code=404, detail="No such job.")
     return JSONResponse(job)
+
+
+async def _poll_training_voice_clones(context: Any) -> None:
+    """Refresh every training professional clone until it reports a result."""
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.corpus import refresh_training_state
+
+    interval = float(
+        getattr(context, "professional_voice_clone_poll_interval_seconds", None) or 300.0
+    )
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            repository = get_media_asset_repository()
+            if repository is None or not hasattr(repository, "pool") or repository.pool is None:
+                continue
+            async with repository.pool.connection() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "SELECT assistant_id, user_id FROM avatar_voice "
+                        "WHERE professional_state = 'training';"
+                    )
+                    rows = await cursor.fetchall()
+            for assistant_id, user_id in rows:
+                try:
+                    await refresh_training_state(
+                        repository, context, user_id=user_id, assistant_id=assistant_id
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Training poll failed for %s", assistant_id, exc_info=True)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            logger.debug("Voice training poller iteration failed", exc_info=True)
+
+
+def _voice_repository_or_503() -> Any:
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.corpus import voice_configured
+
+    repository = get_media_asset_repository()
+    if repository is None or not voice_configured(app.state.context):
+        raise HTTPException(status_code=503, detail="Voice features are not configured.")
+    return repository
+
+
+async def _owned_assistant_for_voice(
+    assistant_id: str, current_user: dict, action: str
+) -> tuple[dict, bool]:
+    """Resolve an avatar the caller owns; report whether it is their personal avatar."""
+    assistant, _creator = await resolve_assistant_for_creator(
+        assistant_id, current_user, action_description=action
+    )
+    metadata = assistant.get("metadata") or {}
+    return assistant, metadata.get("is_personal_avatar_of_creator") is True
+
+
+@app.get("/avatar_voice")
+async def get_avatar_voice(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """The avatar's voice status: collected seconds, clones, thresholds, active voice."""
+    from src.anubis.utils.voice.corpus import voice_status_for
+
+    repository = _voice_repository_or_503()
+    _assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "read that avatar's voice"
+    )
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=current_user["identities"][0]["user_id"],
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+    )
+    return JSONResponse(status.as_dict())
+
+
+@app.post("/avatar_voice/samples")
+async def add_avatar_voice_sample(
+    assistant_id: str = Form(...),
+    audio: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Add a recording of the avatar speaking to its voice corpus.
+
+    The settings recorder posts each take here (the two-minute script, or a
+    dropped file). The dominant speaker is isolated first, so a take with
+    background voices contributes only the avatar's speech; the isolated clip
+    is stored, the running total updated, and — once the minimum is reached —
+    the instant clone is created. When no diarizer reference clip exists yet,
+    the take also becomes it.
+    """
+    from src.anubis.utils.utility import isolate_dominant_speaker_audio_b64
+    from src.anubis.utils.voice.corpus import add_voice_clip, voice_status_for
+
+    repository = _voice_repository_or_503()
+    enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "add voice samples to that avatar"
+    )
+    user_id = current_user["identities"][0]["user_id"]
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="The recording is empty.")
+    mime_type = audio.content_type or "audio/webm"
+    data_uri = make_data_uri(mime_type, raw)
+
+    try:
+        isolated = await isolate_dominant_speaker_audio_b64(
+            data_uri,
+            context=app.state.context,
+            filename=audio.filename or "voice-sample",
+            content_type=mime_type,
+            reference_audio=False,
+        )
+    except Exception as isolation_error:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail=f"The recording could not be processed: {isolation_error}",
+        )
+    seconds = float(isolated.get("duration") or 0.0)
+    clip_uri = isolated.get("audio_base64_preprocessed") or ""
+    if seconds <= 0 or not clip_uri:
+        raise HTTPException(
+            status_code=400, detail="No speech was found in the recording."
+        )
+
+    await add_voice_clip(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        audio_data_uri=clip_uri,
+        duration_seconds=seconds,
+        source="recorder",
+        source_document_name=audio.filename,
+        is_personal_avatar=is_personal,
+        avatar_name=assistant.get("name") or "",
+    )
+
+    # The diarizer needs a short single-speaker anchor for later uploads; the
+    # first take supplies it when nothing has been stored yet.
+    reference_namespace = (user_id, assistant_id, "reference_audio")
+    try:
+        existing_reference = await app.state.store.aget(reference_namespace, assistant_id)
+    except Exception:  # noqa: BLE001
+        existing_reference = None
+    if existing_reference is None:
+        try:
+            anchor = await isolate_dominant_speaker_audio_b64(
+                data_uri,
+                context=app.state.context,
+                filename=audio.filename or "voice-sample",
+                content_type=mime_type,
+                reference_audio=True,
+            )
+            await app.state.store.aput(
+                reference_namespace,
+                key=assistant_id,
+                value={
+                    "reference_audio_data": anchor.get("audio_base64_preprocessed"),
+                    "document": {
+                        "page_content": anchor.get("text") or "",
+                        "metadata": {"reference_audio": True, "source": "recorder"},
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not store a diarizer reference from the recording", exc_info=True)
+
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+    )
+    return JSONResponse({"added_seconds": seconds, **status.as_dict()})
+
+
+@app.get("/avatar_voice/verification")
+async def get_avatar_voice_verification(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """The CAPTCHA the owner reads aloud to verify the professional voice."""
+    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.corpus import prepare_professional_voice
+
+    repository = _voice_repository_or_503()
+    assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "verify that avatar's voice"
+    )
+    if not is_personal:
+        raise HTTPException(
+            status_code=403, detail="Professional voice cloning is for the personal avatar."
+        )
+    user_id = current_user["identities"][0]["user_id"]
+    record = await prepare_professional_voice(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        avatar_name=assistant.get("name") or "",
+    )
+    if record.get("professional_state") != "awaiting_verification":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The professional voice is {record.get('professional_state')}; "
+                "verification is only offered while it awaits verification."
+            ),
+        )
+    try:
+        captcha = await elevenlabs_client.get_verification_captcha(
+            app.state.context, voice_id=record["professional_voice_id"]
+        )
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+    return JSONResponse({"voice_id": record["professional_voice_id"], "captcha": captcha})
+
+
+@app.post("/avatar_voice/verification")
+async def submit_avatar_voice_verification(
+    assistant_id: str = Form(...),
+    recording: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Submit the owner's spoken CAPTCHA and start professional training."""
+    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.corpus import submit_verification_and_train
+
+    repository = _voice_repository_or_503()
+    _assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "verify that avatar's voice"
+    )
+    if not is_personal:
+        raise HTTPException(
+            status_code=403, detail="Professional voice cloning is for the personal avatar."
+        )
+    raw = await recording.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="The recording is empty.")
+    try:
+        record = await submit_verification_and_train(
+            repository,
+            app.state.context,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            recording=(recording.filename or "captcha.webm", raw, recording.content_type or "audio/webm"),
+        )
+    except ValueError as state_error:
+        raise HTTPException(status_code=409, detail=str(state_error))
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+    return JSONResponse(
+        {
+            "professional_state": record.get("professional_state"),
+            "training_started_at": record.get("training_started_at"),
+        }
+    )
+
+
+@app.post("/transcribe")
+async def transcribe_recording(
+    assistant_id: str = Form(...),
+    audio: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Turn one spoken utterance into text (dictation and live-audio turns)."""
+    from src.anubis.utils.utility import transcribe_audio
+
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="The recording is empty.")
+    mime_type = audio.content_type or "audio/webm"
+    started = time.perf_counter()
+    try:
+        result = await transcribe_audio(
+            make_data_uri(mime_type, raw),
+            app.state.context,
+            filename=audio.filename or "utterance.webm",
+            reference_audio=False,
+            max_duration_seconds=None,
+        )
+    except Exception as transcription_error:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"The recording could not be transcribed: {transcription_error}"
+        )
+    text = str(result.get("text") or "").strip()
+    try:
+        await persist_api_metrics_row(
+            app.state.pool,
+            inference_type="transcription",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            model_name=getattr(app.state.context, "audio_transcription_model", None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not record transcription metrics", exc_info=True)
+    return JSONResponse({"text": text, "duration_seconds": result.get("duration")})
+
+
+@app.post("/speak")
+async def speak_text(
+    request: Request,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Render text in the avatar's cloned voice and return the audio.
+
+    Body: ``assistant_id``, ``text``. Uses the professional clone once it is
+    fine-tuned, otherwise the instant clone; with neither, answers 409
+    ``voice_not_ready`` and the collected seconds so the client can prompt the
+    owner to record. Characters spoken are recorded in ``api_metrics`` and, when
+    the meter exists, reported to Stripe.
+    """
+    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.corpus import resolve_active_voice_id, voice_status_for
+
+    repository = _voice_repository_or_503()
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    text = str(body.get("text") or "").strip()
+    if not assistant_id or not text:
+        raise HTTPException(status_code=400, detail="assistant_id and text are required.")
+    if len(text) > 5000:
+        text = text[:5000]
+    enforce_tier_capability(current_user, TierCapability.AUDIO_RESPONSES)
+
+    kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
+    if voice_id is None:
+        status = await voice_status_for(
+            repository,
+            app.state.context,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            is_personal_avatar=False,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "voice_not_ready",
+                "detail": (
+                    "This avatar has no cloned voice yet. Record about two minutes of "
+                    "the avatar speaking in settings to create one."
+                ),
+                "collected_seconds": status.collected_seconds,
+                "instant_minimum_seconds": status.instant_minimum_seconds,
+            },
+        )
+
+    model_id = str(
+        getattr(app.state.context, "elevenlabs_text_to_speech_model", None) or "eleven_flash_v2_5"
+    )
+    started = time.perf_counter()
+    try:
+        audio_bytes = await elevenlabs_client.synthesize_speech(
+            app.state.context, voice_id=voice_id, text=text, model_id=model_id
+        )
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+
+    cost_per_thousand = float(
+        getattr(app.state.context, "elevenlabs_text_to_speech_cost_per_1000_characters_usd", None)
+        or 0.05
+    )
+    await _meter_speech_characters(
+        current_user,
+        assistant_id=assistant_id,
+        characters=len(text),
+        cost_usd=cost_per_thousand * len(text) / 1000.0,
+        latency_ms=(time.perf_counter() - started) * 1000.0,
+        model_name=model_id,
+    )
+    return Response(
+        content=audio_bytes,
+        media_type="audio/mpeg",
+        headers={"X-Voice-Kind": kind, "Cache-Control": "no-store"},
+    )
+
+
+async def _meter_speech_characters(
+    current_user: dict,
+    *,
+    assistant_id: str,
+    characters: int,
+    cost_usd: float,
+    latency_ms: float,
+    model_name: str,
+) -> None:
+    """Record speech spend locally and, when the meter exists, to Stripe."""
+    try:
+        await persist_api_metrics_row(
+            app.state.pool,
+            inference_type="speech_synthesis",
+            total_tokens=characters,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            model_name=model_name,
+            meter_event_name=getattr(getattr(UsageMeter, "SPEECH_CHARACTERS", None), "value", None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not record speech metrics", exc_info=True)
+    speech_meter = getattr(UsageMeter, "SPEECH_CHARACTERS", None)
+    if speech_meter is None:
+        return
+    try:
+        stripe_customer_id = await resolve_stripe_customer_id(app.state, current_user)
+        await report_meter_event(
+            app.state.stripe, speech_meter, stripe_customer_id, int(characters)
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not report speech meter event", exc_info=True)
 
 
 @app.get("/avatar_reference_image")

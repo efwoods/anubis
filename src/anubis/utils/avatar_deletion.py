@@ -217,6 +217,38 @@ async def delete_api_metrics_for_user(pool: Any, user_id: str) -> int:
             return cursor.rowcount
 
 
+async def delete_connected_accounts_for_assistant(pool: Any, assistant_id: str) -> int:
+    """Remove every connected account bound to one avatar (credentials included)."""
+    from src.anubis.utils.connected_accounts.repository import (
+        PostgresConnectedAccountRepository,
+    )
+
+    try:
+        return await PostgresConnectedAccountRepository(pool).delete_for_avatar(
+            assistant_id
+        )
+    except Exception:  # noqa: BLE001 - the table may not exist on an old install
+        logger.debug(
+            "Could not delete connected accounts for avatar %s", assistant_id, exc_info=True
+        )
+        return 0
+
+
+async def delete_connected_accounts_for_user(pool: Any, user_id: str) -> int:
+    """Remove every connected account a user ever connected (account deletion)."""
+    from src.anubis.utils.connected_accounts.repository import (
+        PostgresConnectedAccountRepository,
+    )
+
+    try:
+        return await PostgresConnectedAccountRepository(pool).delete_for_user(user_id)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "Could not delete connected accounts for user %s", user_id, exc_info=True
+        )
+        return 0
+
+
 async def purge_avatar_data(
     pool: Any,
     langgraph_sdk_client: Any,
@@ -237,6 +269,11 @@ async def purge_avatar_data(
     deleted_metric_row_count = await delete_api_metrics_for_assistant(
         pool, assistant_id
     )
+    # Connected accounts carry encrypted third-party credentials bound to this
+    # avatar; they must not outlive the avatar they were connected for.
+    deleted_connected_account_count = await delete_connected_accounts_for_assistant(
+        pool, assistant_id
+    )
 
     # The raw SQL above bypassed the store client, so the process-local
     # read-through cache still holds this avatar's reference image and style
@@ -255,6 +292,7 @@ async def purge_avatar_data(
         "threads": deleted_thread_count,
         "store_rows": deleted_store_row_count,
         "api_metric_rows": deleted_metric_row_count,
+        "connected_accounts": deleted_connected_account_count,
     }
     logger.info("Purged avatar %s: %s", assistant_id, counts)
     return counts

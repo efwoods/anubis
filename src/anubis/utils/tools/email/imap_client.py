@@ -29,6 +29,7 @@ Every call here is BLOCKING
 from __future__ import annotations
 
 import email
+import email.utils
 import imaplib
 import logging
 import re
@@ -465,4 +466,99 @@ def append_draft(
         "drafts_mailbox": credentials.drafts_mailbox,
         "to": to_address,
         "subject": subject,
+    }
+
+
+class MailboxSendError(RuntimeError):
+    """The submission server accepted the session but refused the message."""
+
+
+def send_message(
+    credentials: MailboxCredentials,
+    *,
+    to_address: str,
+    subject: str,
+    body_text: str,
+    in_reply_to: str | None = None,
+    cc_addresses: list[str] | None = None,
+) -> dict[str, Any]:
+    """Transmit a message through the provider's SMTP submission server.
+
+    The owner asked for sending — "send it" — and drafting alone was the earlier
+    landing's deliberate limit, so this function is the single code path that
+    transmits. The tool layer gates it on the provider row's ``send_supported``
+    and the ``MAILBOX_SEND_ENABLED`` switch, and the prompt instructs the avatar
+    to send only when the owner explicitly asks in the conversation; the future
+    inbox triage graph sends only through its confidence gate or an accepted
+    approval.
+
+    Same app password as IMAP: Google accepts an app password on the submission
+    port (587, STARTTLS) exactly as on IMAP, so no second credential is needed.
+
+    Raises:
+        MailboxAuthenticationError: The submission server rejected the login.
+        MailboxUnreachableError: The server could not be reached.
+        MailboxSendError: The server refused the recipients or the message.
+    """
+    import smtplib
+
+    if not credentials.smtp_host:
+        raise MailboxSendError(
+            "This mailbox provider declares no submission server, so nothing can be sent."
+        )
+
+    message = EmailMessage()
+    message["From"] = credentials.account_address
+    message["To"] = to_address
+    if cc_addresses:
+        message["Cc"] = ", ".join(cc_addresses)
+    message["Subject"] = subject
+    message["Date"] = email.utils.formatdate(localtime=True)
+    message["Message-ID"] = email.utils.make_msgid()
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+        message["References"] = in_reply_to
+    message.set_content(body_text)
+
+    recipients = [to_address, *(cc_addresses or [])]
+    try:
+        with smtplib.SMTP(
+            credentials.smtp_host,
+            credentials.smtp_port,
+            timeout=credentials.timeout_seconds,
+        ) as session:
+            session.ehlo()
+            session.starttls()
+            session.ehlo()
+            try:
+                session.login(credentials.account_address, credentials.password)
+            except smtplib.SMTPAuthenticationError as authentication_error:
+                raise MailboxAuthenticationError(
+                    "The submission server rejected the address and password."
+                ) from authentication_error
+            refused = session.send_message(message, to_addrs=recipients)
+    except (MailboxAuthenticationError, MailboxSendError):
+        raise
+    except smtplib.SMTPRecipientsRefused as refused_error:
+        raise MailboxSendError(
+            f"The server refused every recipient: {refused_error.recipients}"
+        ) from refused_error
+    except smtplib.SMTPException as smtp_error:
+        raise MailboxUnreachableError(
+            f"The submission server failed while sending: {smtp_error}"
+        ) from smtp_error
+    except OSError as socket_error:
+        raise MailboxUnreachableError(
+            f"The submission server could not be reached: {socket_error}"
+        ) from socket_error
+
+    if refused:
+        raise MailboxSendError(f"The server refused some recipients: {refused}")
+
+    return {
+        "status": "sent",
+        "to": to_address,
+        "cc": list(cc_addresses or []),
+        "subject": subject,
+        "rfc822_message_id": message["Message-ID"],
     }

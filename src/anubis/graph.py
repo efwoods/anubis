@@ -923,22 +923,28 @@ async def think(
             ),
         ]
 
-    # Browser capability gate: a process-wide environment switch
-    # (BROWSER_TOOLS_ENABLED) rather than a per-user connection — the browser
-    # tools read the public web and carry no per-user credentials. Keyed on
-    # the outer workflow thread so each conversation browses in a dedicated
+    # Browser capability gate: the process-wide environment switch
+    # (BROWSER_TOOLS_ENABLED) AND the personal avatar. The browser follows
+    # links out of the owner's own mail and will carry the owner's signed-in
+    # sessions, so a shared avatar or a demoted one must never drive it. Keyed
+    # on the outer workflow thread so each conversation browses in a dedicated
     # Chromium process (isolated pages, cookies, history). Returns an empty
     # list when the gate is off or Chromium is unavailable, so this line
     # never degrades the turn.
-    browser_toolkit_tools = await get_browser_toolkit_tools(
-        deep_agent_run_context, conversation_key=outer_thread
-    )
+    browser_toolkit_tools: list[Any] = []
+    if is_personal_avatar:
+        browser_toolkit_tools = await get_browser_toolkit_tools(
+            deep_agent_run_context, conversation_key=outer_thread
+        )
 
-    # Mailbox capability gate: the connected accounts bound to THIS avatar, and
+    # Connected-account capability gate: the accounts bound to THIS avatar, and
     # only when this avatar is the owner's personal avatar. Same two-part gate as
     # the data-analysis tools, and for a stronger reason — these tools carry the
-    # owner's own mail credentials, so a shared avatar or a demoted one must
-    # reach nothing. No environment switch: a connected account is the gate.
+    # owner's own credentials, so a shared avatar or a demoted one must reach
+    # nothing. No environment switch: a connected account is the gate. Tools are
+    # built per account KIND through the factory table, so a mailbox, a custom
+    # Model Context Protocol server, and whatever kind lands next all attach
+    # through this one block.
     mailbox_tools: list[Any] = []
     connection_tools: list[Any] = []
     if is_personal_avatar and runtime.store is not None:
@@ -946,7 +952,9 @@ async def think(
         from src.anubis.utils.connected_accounts.connection_tools import (
             build_connection_tools,
         )
-        from src.anubis.utils.tools.email.mailbox_tools import build_mailbox_tools
+        from src.anubis.utils.connected_accounts.tool_factories import (
+            build_tools_for_accounts,
+        )
 
         owner_user_id = state["user_state"]["user_id"]
         answering_assistant_id = state["assistant_state"]["assistant_id"]
@@ -955,7 +963,7 @@ async def think(
             owner_user_id,
             answering_assistant_id,
         )
-        mailbox_tools = build_mailbox_tools(runtime.context, connected_accounts)
+        mailbox_tools = await build_tools_for_accounts(runtime.context, connected_accounts)
         # Offered whether or not anything is connected. The owner with no mailbox
         # is precisely the owner who needs to connect one, so gating the connect
         # tool on having a connection would leave no way in.

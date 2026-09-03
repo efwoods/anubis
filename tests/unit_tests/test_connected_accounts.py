@@ -424,7 +424,12 @@ def test_a_mailbox_is_never_a_social_account():
 
 
 def test_a_non_mailbox_provider_cannot_be_connected_with_a_password(monkeypatch):
-    """A social provider has no IMAP server; the endpoint must refuse, not crash."""
+    """A social provider has no IMAP server; the endpoint must refuse, not crash.
+
+    Social providers are declared coming soon, so the refusal is a 501 carrying
+    the coming-soon message rather than a 400 about the missing mail server;
+    either way nothing may be stored.
+    """
 
     async def _run():
         store_api = _StoreAPI()
@@ -433,7 +438,8 @@ def test_a_non_mailbox_provider_cannot_be_connected_with_a_password(monkeypatch)
             await webapp_module.connect_mailbox(
                 request=_body(provider="youtube"), current_user=_current_user()
             )
-        assert raised.value.status_code == 400
+        assert raised.value.status_code in (400, 501)
+        assert "coming soon" in raised.value.detail.lower()
         assert store_api.items == {}
 
     import asyncio

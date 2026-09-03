@@ -10,8 +10,10 @@ scales and whether it can misbehave:
 - **Nothing raises.** A dead server, a rotated password, or a missing key all
   become results the model can read and relay. A raised exception inside a tool
   costs the whole turn and tells the owner nothing useful.
-- **Nothing sends.** There is no send tool, and the draft path writes to the
-  drafts folder. This is the guarantee the whole landing rests on.
+- **Sending is explicit and gated.** The draft path only ever writes to the
+  drafts folder; the one tool that transmits exists solely for providers that
+  declare ``send_supported`` and only while ``MAILBOX_SEND_ENABLED`` is on, and
+  it is the only code path that reaches a submission server.
 - **Message parsing survives real mail** — encoded headers, HTML-only bodies,
   attachments, and runaway link counts.
 """
@@ -24,7 +26,10 @@ import pytest
 
 from src.anubis.utils import secret_store
 from src.anubis.utils.tools.email import imap_client
-from src.anubis.utils.tools.email.mailbox_tools import build_mailbox_tools
+from src.anubis.utils.tools.email.mailbox_tools import (
+    MAILBOX_TOOL_NAMES,
+    build_mailbox_tools,
+)
 
 
 def _context(key=None):
@@ -69,22 +74,30 @@ def test_the_tool_set_is_flat_regardless_of_account_count():
         [_record(context, f"user{index}@x.com", f"user{index}") for index in range(5)],
     )
 
-    assert set(one) == {
-        "search_mailbox_messages",
-        "read_mailbox_message",
-        "read_mailbox_thread",
-        "draft_mailbox_reply",
-    }
+    assert set(one) == set(MAILBOX_TOOL_NAMES)
     assert set(five) == set(one), "adding mailboxes must not add tools"
 
 
-def test_no_tool_can_send_email():
-    """The guarantee the landing rests on: drafting exists, sending does not."""
-    context = _context()
-    tools = _tools(context, [_record(context, "a@x.com", "a")])
+def test_sending_is_a_single_gated_tool():
+    """Drafting never transmits; transmitting is one tool, switchable off.
 
-    assert not any("send" in name for name in tools)
-    assert "draft_mailbox_reply" in tools
+    With sending enabled (the default) the send tool is present alongside the
+    draft tool. With MAILBOX_SEND_ENABLED off the send tool is withheld entirely
+    rather than present-but-refusing, so a draft-only deployment exposes no
+    surface that could ever transmit.
+    """
+    context = _context()
+    enabled = _tools(context, [_record(context, "a@x.com", "a")])
+    assert "send_mailbox_message" in enabled
+    assert "draft_mailbox_reply" in enabled
+
+    context.mailbox_send_enabled = "false"
+    disabled = _tools(context, [_record(context, "a@x.com", "a")])
+    assert "send_mailbox_message" not in disabled
+    assert "draft_mailbox_reply" in disabled
+    assert not any(name.startswith("send") for name in disabled), (
+        "a draft-only deployment must expose nothing that transmits"
+    )
 
 
 def test_an_avatar_with_no_mailbox_gets_no_tools():
@@ -450,7 +463,7 @@ def test_the_connect_card_describes_the_provider_form(monkeypatch):
     assert card["provider"] == "gmail"
     assert card["display_name"] == "Gmail"
     assert card["tool_count"] == len(MAILBOX_TOOL_NAMES)
-    assert card["connect_endpoint"] == "/connect_mailbox"
+    assert card["connect_endpoint"] == "/connect_account"
     assert card["credential_help_url"] == "https://myaccount.google.com/apppasswords"
 
     fields = {field["name"]: field for field in card["fields"]}
@@ -473,13 +486,14 @@ def test_an_unknown_provider_is_refused_without_raising(monkeypatch):
     assert cards == [], "an unknown provider must not raise a card"
 
 
-def test_a_social_provider_cannot_be_connected_as_a_mailbox(monkeypatch):
-    # Gmail is kind="mailbox" and the social rows are kind="social"; this tool
-    # connects mailboxes only, so a social name must be refused rather than
-    # rendering a mailbox sign-in form for an account that has none.
+def test_a_coming_soon_provider_is_answered_without_a_card(monkeypatch):
+    # The social rows are declared coming soon: the tool must answer with that
+    # message rather than rendering a sign-in form for an account that cannot be
+    # connected yet.
     tools, cards = _connect_tool(monkeypatch, {"type": "apply"})
     result = asyncio.run(tools["connect_mailbox_account"].coroutine(provider="twitch"))
-    assert result["status"] == "unsupported_provider"
+    assert result["status"] == "coming_soon"
+    assert "coming soon" in result["message"].lower()
     assert cards == []
 
 

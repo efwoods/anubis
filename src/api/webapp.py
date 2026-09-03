@@ -1410,6 +1410,20 @@ async def lifespan(app: FastAPI):
     # (meter + tier price ids) so metering and subscription endpoints can use them.
     await ensure_api_metrics_table(app.state.pool)
     await ensure_anonymous_billing_customers_table(app.state.pool)
+    # Connected accounts (mailboxes, custom connectors) live in their own table,
+    # keyed by user and personal avatar rather than by an identity provider's
+    # namespace. Publish the repository process-wide so graph nodes and tools —
+    # which cannot import this module — read the same table the routes write,
+    # then copy any legacy store records across once (never overwriting).
+    from src.anubis.utils.connected_accounts import repository as connected_accounts_repository
+
+    await connected_accounts_repository.ensure_connected_accounts_table(app.state.pool)
+    connected_accounts_repository.set_repository(
+        connected_accounts_repository.PostgresConnectedAccountRepository(app.state.pool)
+    )
+    await connected_accounts_repository.migrate_store_connected_accounts_to_table(
+        app.state.pool
+    )
     # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
     # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
     # requires pasting JSON into the env or a manual edit. This is only the INITIAL
@@ -2728,13 +2742,10 @@ async def _resolve_personal_avatar_capability_statuses(
     # `connected_accounts/providers.py`.
     from src.anubis.utils.connected_accounts import (
         STATUS_CONNECTED,
-        connected_account_namespace,
         public_account_view,
     )
 
-    accounts = await _search_namespace_records(
-        client, connected_account_namespace(user_id)
-    )
+    accounts = await _connected_account_records(client, user_id)
     connected_mailboxes = [
         public_account_view(account)
         for account in accounts
@@ -2790,75 +2801,95 @@ async def _resolve_personal_avatar_for_connection(
     return personal_avatar
 
 
-@app.post("/connect_mailbox")
-async def connect_mailbox(
-    request: Request,
-    current_user: dict = Depends(get_current_user),
-):
-    """Connect one of the owner's email accounts to their personal avatar.
+async def _connected_account_records(client: Any, user_id: str) -> list[dict[str, Any]]:
+    """Every connected-account record for a user, from the table or the legacy store.
 
-    Body: ``provider`` (default "gmail"), ``email_address``, ``app_password``.
-
-    The credential is proved against the real mail server BEFORE anything is
-    written, so a bad credential is rejected while the owner still has the
-    connect form in front of them rather than failing on the first mail call
-    days later. Only then is it encrypted and stored; the plaintext is never
-    persisted and never logged.
-
-    On Gmail the password must be a 16-character app password, not the account
-    password: Google stopped accepting account passwords over IMAP on
-    2025-03-14, and creating an app password requires 2-Step Verification. A
-    rejected credential says exactly that and links to the page that issues one,
-    because "authentication failed" alone sends people to re-type the same wrong
-    secret.
+    The repository is published by the lifespan; when it is absent (the dev
+    server without the lifespan, or unit tests) the legacy store namespace is
+    read through the SDK client the route already holds.
     """
-    # save_connected_account is deliberately NOT used here: it writes through the
-    # in-process BaseStore, while an endpoint authenticates as the user and must
-    # go through the SDK StoreClient, as every other endpoint in this module does.
-    from src.anubis.utils.connected_accounts import (
-        account_key,
-        build_account_record,
-        connected_account_namespace,
-        deduplicate_label,
-        derive_display_label,
-        get_provider,
-        public_account_view,
-    )
-    from src.anubis.utils.secret_store import (
-        SecretEncryptionNotConfiguredError,
-        encrypt_secret,
-    )
-    from src.anubis.utils.tools.email.imap_client import (
-        MailboxAuthenticationError,
-        MailboxCredentials,
-        MailboxUnreachableError,
-        verify_credentials,
+    from src.anubis.utils.connected_accounts import connected_account_namespace
+    from src.anubis.utils.connected_accounts.repository import get_repository
+
+    repository = get_repository()
+    if repository is not None:
+        try:
+            return await repository.list_for_user(user_id)
+        except Exception:
+            logger.debug("Could not list connected accounts for %s", user_id, exc_info=True)
+            return []
+    return await _search_namespace_records(client, connected_account_namespace(user_id))
+
+
+async def _get_connected_account_record(
+    client: Any, user_id: str, key: str
+) -> dict[str, Any] | None:
+    from src.anubis.utils.connected_accounts import connected_account_namespace
+    from src.anubis.utils.connected_accounts.repository import get_repository
+
+    repository = get_repository()
+    if repository is not None:
+        return await repository.get(user_id, key)
+    item = await client.store.get_item(list(connected_account_namespace(user_id)), key=key)
+    value = (item or {}).get("value") if isinstance(item, dict) else None
+    return dict(value) if value else None
+
+
+async def _put_connected_account_record(
+    client: Any, user_id: str, record: dict[str, Any]
+) -> None:
+    from src.anubis.utils.connected_accounts import connected_account_namespace
+    from src.anubis.utils.connected_accounts.repository import get_repository
+
+    repository = get_repository()
+    if repository is not None:
+        await repository.upsert(user_id, record)
+        return
+    await client.store.put_item(
+        list(connected_account_namespace(user_id)),
+        key=record["account_key"],
+        value=record,
     )
 
-    body = await request.json()
-    provider_name = str(body.get("provider") or "gmail").strip().lower()
-    email_address = str(body.get("email_address") or "").strip()
-    app_password = str(body.get("app_password") or "")
+
+async def _delete_connected_account_record(client: Any, user_id: str, key: str) -> None:
+    from src.anubis.utils.connected_accounts import connected_account_namespace
+    from src.anubis.utils.connected_accounts.repository import get_repository
+
+    repository = get_repository()
+    if repository is not None:
+        await repository.delete(user_id, key)
+        return
+    await client.store.delete_item(list(connected_account_namespace(user_id)), key=key)
+
+
+async def _connect_account_from_fields(
+    request: Request,
+    current_user: dict,
+    provider_name: str,
+    fields: dict[str, Any],
+) -> JSONResponse:
+    """Shared body of ``/connect_account`` and its ``/connect_mailbox`` alias.
+
+    The provider's credential mechanism chooses the handler that PROVES the
+    connection (a real mail login, a real tool listing) before anything is
+    stored; the plaintext credential is encrypted by the handler and never
+    persisted or logged in the clear. The cap is enforced here, once, for every
+    mechanism, and reconnecting an account the owner already has refreshes that
+    record rather than counting against the cap — otherwise rotating an app
+    password would eventually lock the owner out of their own mailbox.
+    """
+    from src.anubis.utils.connected_accounts import get_provider, public_account_view
+    from src.anubis.utils.connected_accounts.connect_handlers import (
+        ConnectRefused,
+        ConnectRequest,
+        connect_account,
+    )
+    from src.anubis.utils.connected_accounts.providers import KIND_MCP_SERVER
 
     provider = get_provider(provider_name)
     if provider is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown provider {provider_name!r}.",
-        )
-    if not provider.is_mailbox:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{provider.display_name} is not a mailbox and cannot be "
-                "connected with an email address and password."
-            ),
-        )
-    if not email_address or not app_password:
-        raise HTTPException(
-            status_code=400,
-            detail="Both email_address and app_password are required.",
-        )
+        raise HTTPException(status_code=400, detail=f"Unknown provider {provider_name!r}.")
 
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
@@ -2867,13 +2898,37 @@ async def connect_mailbox(
         client, request, current_user, token
     )
 
-    namespace = connected_account_namespace(user_id)
-    existing_records = await _search_namespace_records(client, namespace)
-    key = account_key(provider.name, email_address)
-    # Reconnecting an account the owner already has must refresh that record
-    # rather than count against the cap, otherwise rotating an app password
-    # eventually locks the owner out of their own mailbox.
-    if not any(record.get("account_key") == key for record in existing_records):
+    existing_records = await _connected_account_records(client, user_id)
+    try:
+        record = await connect_account(
+            ConnectRequest(
+                provider=provider,
+                fields=fields,
+                assistant_id=personal_avatar.get("assistant_id"),
+                context=app.state.context,
+                existing_records=existing_records,
+            )
+        )
+    except ConnectRefused as refused:
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail)
+
+    key = record["account_key"]
+    if not any(existing.get("account_key") == key for existing in existing_records):
+        if provider.kind == KIND_MCP_SERVER:
+            maximum = int(
+                getattr(app.state.context, "max_custom_mcp_connectors_per_user", 10) or 10
+            )
+            already = sum(
+                1 for existing in existing_records if existing.get("kind") == KIND_MCP_SERVER
+            )
+            if already >= maximum:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"A maximum of {maximum} custom connectors may be connected. "
+                        "Disconnect one before connecting another."
+                    ),
+                )
         maximum = int(app.state.context.max_connected_accounts_per_user)
         if len(existing_records) >= maximum:
             raise HTTPException(
@@ -2884,54 +2939,11 @@ async def connect_mailbox(
                 ),
             )
 
-    credentials = MailboxCredentials(
-        account_address=email_address,
-        password=app_password,
-        imap_host=provider.imap_host,
-        imap_port=provider.imap_port,
-        smtp_host=provider.smtp_host,
-        smtp_port=provider.smtp_port,
-        drafts_mailbox=provider.drafts_mailbox,
-        timeout_seconds=float(app.state.context.mailbox_request_timeout_seconds),
-    )
-    try:
-        await asyncio.to_thread(verify_credentials, credentials)
-    except MailboxAuthenticationError:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{provider.display_name} rejected that address and password. "
-                "Use a 16-character app password, not your account password — "
-                "Google stopped accepting account passwords for mail access on "
-                "14 March 2025. Creating one requires 2-Step Verification: "
-                f"{provider.credential_help_url}"
-            ),
-        )
-    except MailboxUnreachableError as unreachable_error:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Could not reach {provider.display_name} to check the "
-                f"credential: {unreachable_error}"
-            ),
-        )
+    await _put_connected_account_record(client, user_id, record)
+    if provider.kind == KIND_MCP_SERVER:
+        from src.anubis.utils.connected_accounts.mcp_server_tools import forget_cached_tools
 
-    try:
-        encrypted_secret = encrypt_secret(app_password, app.state.context)
-    except SecretEncryptionNotConfiguredError as configuration_error:
-        raise HTTPException(status_code=503, detail=str(configuration_error))
-
-    label = deduplicate_label(
-        derive_display_label(email_address), existing_records, key
-    )
-    record = build_account_record(
-        provider=provider,
-        account_address=email_address,
-        display_label=label,
-        encrypted_secret=encrypted_secret,
-        assistant_id=personal_avatar.get("assistant_id"),
-    )
-    await client.store.put_item(list(namespace), key=key, value=record)
+        forget_cached_tools((record.get("transport") or {}).get("server_url") or "")
 
     return JSONResponse(
         content={"connected": True, "account": public_account_view(record)},
@@ -2939,31 +2951,83 @@ async def connect_mailbox(
     )
 
 
+@app.post("/connect_account")
+async def connect_account_route(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect one of the owner's accounts to their personal avatar.
+
+    Body: ``provider`` plus the fields that provider's connect card declares,
+    either flat (``email_address``, ``app_password``) or under ``fields``. The
+    catalog (``GET /connectable_providers``) says which fields each provider
+    needs, so a new provider is connected through this same route with no client
+    change. Coming-soon providers answer 501 with a plain message; providers
+    connected by running a daemon answer 400 with the pairing instructions.
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A JSON object body is required.")
+    provider_name = str(body.get("provider") or "").strip().lower()
+    if not provider_name:
+        raise HTTPException(status_code=400, detail="A provider is required.")
+    fields = dict(body.get("fields") or {})
+    for name, value in body.items():
+        if name not in ("provider", "fields", "assistant_id"):
+            fields.setdefault(name, value)
+    return await _connect_account_from_fields(request, current_user, provider_name, fields)
+
+
+@app.post("/connect_mailbox")
+async def connect_mailbox(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect one of the owner's email accounts to their personal avatar.
+
+    Body: ``provider`` (default "gmail"), ``email_address``, ``app_password``.
+    Kept as an alias of ``POST /connect_account`` for clients that predate the
+    generic route; the behaviour — prove by real login, encrypt, store, never
+    log the plaintext — is identical because both routes share one body.
+    """
+    body = await request.json()
+    provider_name = str(body.get("provider") or "gmail").strip().lower()
+    fields = {
+        "email_address": body.get("email_address"),
+        "app_password": body.get("app_password"),
+    }
+    return await _connect_account_from_fields(request, current_user, provider_name, fields)
+
+
 @app.get("/connectable_providers")
 async def connectable_providers(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Describe the accounts that can be connected, and the form each one needs.
+    """Describe every account that can be connected, and the form each one needs.
 
     The same card description the avatar raises mid-conversation, served for the
-    settings screen. Both surfaces read this one description so a provider's
-    labels, fields, and help text cannot drift into two versions — which matters
-    most for the app-password explanation, the only place an owner is told that
-    a Google account password will never authenticate.
+    settings screen and the New Connector picker. Both surfaces read this one
+    description so a provider's labels, fields, and help text cannot drift into
+    two versions — which matters most for the app-password explanation, the only
+    place an owner is told that a Google account password will never
+    authenticate. Providers come back in catalog order (featured first, then by
+    category) with their availability, so a coming-soon row renders disabled.
 
     Carries no user data: it is the static registry, projected for a client.
     """
     from src.anubis.utils.connected_accounts.connection_tools import (
         build_connect_card,
     )
-    from src.anubis.utils.connected_accounts.providers import mailbox_providers
+    from src.anubis.utils.connected_accounts.providers import (
+        CATEGORY_ORDER,
+        catalog_providers,
+    )
 
     return JSONResponse(
         content={
-            "providers": [
-                build_connect_card(provider) for provider in mailbox_providers()
-            ]
+            "categories": list(CATEGORY_ORDER),
+            "providers": [build_connect_card(provider) for provider in catalog_providers()],
         },
         status_code=200,
     )
@@ -2981,21 +3045,238 @@ async def list_connected_accounts(
     caller and returning it would only help an attacker who later obtained the
     encryption key.
     """
-    from src.anubis.utils.connected_accounts import (
-        connected_account_namespace,
-        public_account_view,
-    )
+    from src.anubis.utils.connected_accounts import public_account_view
 
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
     client = get_client(headers={"API-KEY": f"{token}"})
     await _resolve_personal_avatar_for_connection(client, request, current_user, token)
 
-    records = await _search_namespace_records(
-        client, connected_account_namespace(user_id)
-    )
+    records = await _connected_account_records(client, user_id)
     return JSONResponse(
         content={"accounts": [public_account_view(record) for record in records]},
+        status_code=200,
+    )
+
+
+async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any]]:
+    """The device rows ``GET /list_mcp_connections`` returns, as a reusable helper."""
+    from src.anubis.utils.tools.data_analysis import relay as relay_registry
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_connection_namespace,
+        mcp_registration_namespace,
+    )
+
+    registrations = await _search_namespace_records(
+        client, mcp_registration_namespace(user_id)
+    )
+    connections = await _search_namespace_records(
+        client, mcp_connection_namespace(user_id)
+    )
+    connection_by_device = {
+        record.get("device_id"): record
+        for record in connections
+        if record.get("device_id")
+    }
+
+    devices: list[dict[str, Any]] = []
+    seen_device_ids: set[str] = set()
+    for registration in registrations:
+        registration_device_id = registration.get("device_id")
+        if not registration_device_id:
+            continue
+        seen_device_ids.add(registration_device_id)
+        connection = connection_by_device.get(registration_device_id) or {}
+        devices.append(
+            {
+                "device_id": registration_device_id,
+                "device_label": registration.get("device_label")
+                or connection.get("device_label"),
+                "platform": registration.get("platform") or connection.get("platform"),
+                "server_name": registration.get("server_name"),
+                "connection_mode": registration.get("connection_mode"),
+                "online": relay_registry.is_online(registration_device_id),
+                "last_seen_at": registration.get("last_seen_at"),
+                "connected": connection.get("status") == "connected",
+                "bound_assistant_id": connection.get("assistant_id"),
+                "connected_at": connection.get("connected_at"),
+            }
+        )
+
+    # A connection whose registration record is gone (the daemon unregistered on
+    # shutdown but the avatar keeps the adopted connection) still belongs in the
+    # listing, otherwise a user sees a machine vanish while the avatar still
+    # holds tools for the machine.
+    for device_identifier, connection in connection_by_device.items():
+        if device_identifier in seen_device_ids:
+            continue
+        devices.append(
+            {
+                "device_id": device_identifier,
+                "device_label": connection.get("device_label"),
+                "platform": connection.get("platform"),
+                "server_name": connection.get("server_name"),
+                "connection_mode": None,
+                "online": relay_registry.is_online(device_identifier),
+                "last_seen_at": None,
+                "connected": connection.get("status") == "connected",
+                "bound_assistant_id": connection.get("assistant_id"),
+                "connected_at": connection.get("connected_at"),
+            }
+        )
+
+    devices.sort(key=lambda device: str(device.get("device_label") or ""))
+    return devices
+
+
+@app.get("/list_connections")
+async def list_connections(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Everything the personal avatar is connected to, in one row shape.
+
+    Accounts (mailboxes, custom connectors) and devices (machines running the
+    Neural Nexus daemon) are stored differently because their lifecycles differ,
+    but the owner should not have to know that: the "+" menu and the settings
+    screen render this one list. Keys are prefixed ``account:`` / ``device:`` so
+    ``POST /set_connection_state`` can route a toggle to the right store, and
+    every row names its own ``disconnect_endpoint``.
+    """
+    from src.anubis.utils.connected_accounts.listing import (
+        account_connection_view,
+        device_connection_view,
+    )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+
+    account_records = await _connected_account_records(client, user_id)
+    device_rows = await _device_rows_for_user(client, user_id)
+    connections = [account_connection_view(record) for record in account_records] + [
+        device_connection_view(device) for device in device_rows
+    ]
+    return JSONResponse(
+        content={
+            "personal_avatar_id": personal_avatar.get("assistant_id"),
+            "connection_count": len(connections),
+            "connections": connections,
+        },
+        status_code=200,
+    )
+
+
+@app.post("/set_connection_state")
+async def set_connection_state(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Toggle one connection on or off from the "+" menu or the settings screen.
+
+    Body: ``connection_key`` (``account:...`` or ``device:...``) and
+    ``connected`` (boolean). Off means DISCONNECT: the account's record and its
+    encrypted credential are deleted, or the device's adopted connection is
+    dropped. On cannot restore a deleted credential, so for an account it
+    returns the provider's connect card description for the client to open —
+    the same card the avatar raises in chat — and for a device it clears the
+    per-avatar suppression marker so ``mcp_auto_adopt`` binds the machine on
+    the next turn.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.connection_tools import build_connect_card
+    from src.anubis.utils.connected_accounts.listing import split_connection_key
+
+    body = await request.json()
+    connection_key = str((body or {}).get("connection_key") or "").strip()
+    connected = bool((body or {}).get("connected"))
+    try:
+        source_kind, identifier = split_connection_key(connection_key)
+    except ValueError as key_error:
+        raise HTTPException(status_code=400, detail=str(key_error))
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+
+    if source_kind == "account":
+        existing = await _get_connected_account_record(client, user_id, identifier)
+        if not connected:
+            if existing is None:
+                raise HTTPException(
+                    status_code=404, detail=f"No connected account {identifier!r}."
+                )
+            await _delete_connected_account_record(client, user_id, identifier)
+            if existing.get("kind") == "mcp_server":
+                from src.anubis.utils.connected_accounts.mcp_server_tools import (
+                    forget_cached_tools,
+                )
+
+                forget_cached_tools((existing.get("transport") or {}).get("server_url") or "")
+            return JSONResponse(
+                content={"connection_key": connection_key, "connected": False},
+                status_code=200,
+            )
+        provider_name = identifier.split(":", 1)[0]
+        provider = get_provider(provider_name)
+        if provider is None:
+            raise HTTPException(status_code=400, detail=f"Unknown provider {provider_name!r}.")
+        if existing is not None and existing.get("status") == "connected":
+            return JSONResponse(
+                content={"connection_key": connection_key, "connected": True},
+                status_code=200,
+            )
+        return JSONResponse(
+            content={
+                "connection_key": connection_key,
+                "connected": False,
+                "action": "open_connect_card",
+                "card": build_connect_card(provider, [existing] if existing else []),
+            },
+            status_code=200,
+        )
+
+    # Devices.
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_connection_declined_namespace,
+        mcp_connection_namespace,
+    )
+
+    assistant_id = personal_avatar.get("assistant_id")
+    declined_namespace = list(mcp_connection_declined_namespace(user_id, assistant_id))
+    if not connected:
+        await client.store.delete_item(list(mcp_connection_namespace(user_id)), key=identifier)
+        # Mark the device declined for this avatar so auto-adopt does not
+        # silently re-bind the machine on the next turn — that is what made an
+        # explicit disconnect appear not to work before the marker existed.
+        await client.store.put_item(
+            declined_namespace,
+            key=identifier,
+            value={"device_id": identifier, "declined_at": datetime.now(timezone.utc).isoformat()},
+        )
+        return JSONResponse(
+            content={"connection_key": connection_key, "connected": False},
+            status_code=200,
+        )
+    try:
+        await client.store.delete_item(declined_namespace, key=identifier)
+    except Exception:
+        logger.debug("No suppression marker to clear for device %s", identifier)
+    return JSONResponse(
+        content={
+            "connection_key": connection_key,
+            "connected": True,
+            "message": (
+                "The machine will be connected on the next conversation turn if the "
+                "Neural Nexus daemon is running on the machine."
+            ),
+        },
         status_code=200,
     )
 
@@ -3014,8 +3295,6 @@ async def disconnect_account(
     what let one caller destroy every record it could see. Repeating it here
     would put every mailbox a user owns behind a single missing argument.
     """
-    from src.anubis.utils.connected_accounts import connected_account_namespace
-
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
     client = get_client(headers={"API-KEY": f"{token}"})
@@ -3027,23 +3306,237 @@ async def disconnect_account(
             detail="An account_key is required; name the account to disconnect.",
         )
 
-    namespace = list(connected_account_namespace(user_id))
     # Existence is checked before deleting rather than inferred from the delete
-    # call: the store client does not report a missing key as an error, so a
-    # delete alone would answer "disconnected" for an account that was never
-    # connected — and an owner who mistyped a key would believe a live mailbox
-    # had been removed.
-    existing = await client.store.get_item(namespace, key=account_key)
+    # call: a delete alone would answer "disconnected" for an account that was
+    # never connected — and an owner who mistyped a key would believe a live
+    # mailbox had been removed.
+    existing = await _get_connected_account_record(client, user_id, account_key)
     if not existing:
         raise HTTPException(
             status_code=404,
             detail=f"No connected account {account_key!r} to disconnect.",
         )
-    await client.store.delete_item(namespace, key=account_key)
+    await _delete_connected_account_record(client, user_id, account_key)
+    if existing.get("kind") == "mcp_server":
+        from src.anubis.utils.connected_accounts.mcp_server_tools import forget_cached_tools
+
+        forget_cached_tools((existing.get("transport") or {}).get("server_url") or "")
 
     return JSONResponse(
         content={"disconnected": True, "account_key": account_key},
         status_code=200,
+    )
+
+
+def _writing_sample_text_from_sent_messages(messages: list[dict[str, Any]]) -> str:
+    """Render the owner's sent messages as one plain-text document for ingestion.
+
+    Quoted replies and signatures are trimmed so the identity pipeline learns
+    from the owner's own sentences rather than from whatever the owner was
+    replying to. Each message keeps its subject and recipient as context lines,
+    which the quote-extraction pass uses as the prompt that elicited the text.
+    """
+    import re as regular_expressions
+
+    sections: list[str] = []
+    for message in messages:
+        body = str(message.get("body_text") or "")
+        kept_lines: list[str] = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(">"):
+                continue
+            if regular_expressions.match(
+                r"^On .+ wrote:$|^-{2,}\s*$|^Sent from my ", stripped
+            ):
+                break
+            kept_lines.append(line.rstrip())
+        text = "\n".join(kept_lines).strip()
+        if not text:
+            continue
+        sections.append(
+            f"Subject: {message.get('subject') or ''}\n"
+            f"To: {', '.join(message.get('recipients') or []) if isinstance(message.get('recipients'), list) else message.get('recipients') or ''}\n"
+            f"Date: {message.get('sent_at') or ''}\n\n{text}"
+        )
+    return "\n\n---\n\n".join(sections)
+
+
+@app.post("/import_mailbox_writing_samples")
+async def import_mailbox_writing_samples(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Pull the owner's sent mail into the personal avatar's identity.
+
+    Body: ``account_key`` (optional when exactly one mailbox is connected),
+    ``limit`` (default 50, capped by ``MAILBOX_FETCH_MAX_MESSAGES`` × 4).
+
+    This is the "pull data to update the identity" lever for a mailbox: the
+    owner's own sent messages are the best evidence of how the owner writes, so
+    they are fetched from the provider's sent folder, stripped of quoted text and
+    signatures, and fed through the SAME background media job an uploaded text
+    file takes. That way they land in the ``quote`` / ``identity`` namespaces the
+    avatar already grounds on, are metered as an upload, and show up in the
+    documents list under one namespace per import — never a second ingestion
+    path to keep in step with the first.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.secret_store import SecretDecryptionError, decrypt_secret
+    from src.anubis.utils.tools.email.imap_client import (
+        MailboxAuthenticationError,
+        MailboxCredentials,
+        MailboxUnreachableError,
+        search_messages,
+    )
+
+    enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    requested_key = str(body.get("account_key") or "").strip()
+    fetch_ceiling = int(app.state.context.mailbox_fetch_max_messages or 25) * 4
+    limit = max(1, min(int(body.get("limit") or 50), fetch_ceiling))
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = personal_avatar.get("assistant_id")
+
+    mailboxes = [
+        record
+        for record in await _connected_account_records(client, user_id)
+        if record.get("kind") == "mailbox"
+        and record.get("status") == "connected"
+        and record.get("assistant_id") == assistant_id
+    ]
+    if requested_key:
+        mailboxes = [record for record in mailboxes if record.get("account_key") == requested_key]
+    if not mailboxes:
+        raise HTTPException(
+            status_code=404,
+            detail="No connected mailbox matches; connect a mailbox first.",
+        )
+    if len(mailboxes) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Several mailboxes are connected; pass account_key to say which "
+                f"one to import from: {[record.get('account_key') for record in mailboxes]}"
+            ),
+        )
+    record = mailboxes[0]
+    provider = get_provider(str(record.get("provider") or ""))
+    sent_folder = record.get("sent_mailbox") or (provider.sent_mailbox if provider else None)
+    if not sent_folder:
+        raise HTTPException(
+            status_code=400, detail="This mailbox provider exposes no sent folder."
+        )
+
+    try:
+        credentials = MailboxCredentials(
+            account_address=record["account_address"],
+            password=decrypt_secret(record["encrypted_secret"], app.state.context),
+            imap_host=record["imap_host"],
+            imap_port=int(record.get("imap_port") or 993),
+            smtp_host=record.get("smtp_host"),
+            smtp_port=int(record.get("smtp_port") or 587),
+            drafts_mailbox=record.get("drafts_mailbox") or "Drafts",
+            timeout_seconds=float(app.state.context.mailbox_request_timeout_seconds),
+        )
+    except SecretDecryptionError:
+        raise HTTPException(
+            status_code=409,
+            detail="The stored mailbox credential could not be read; reconnect the mailbox.",
+        )
+    try:
+        messages = await asyncio.to_thread(
+            search_messages, credentials, None, limit, sent_folder
+        )
+    except MailboxAuthenticationError:
+        raise HTTPException(
+            status_code=409, detail="The mailbox rejected its saved password; reconnect it."
+        )
+    except MailboxUnreachableError as unreachable_error:
+        raise HTTPException(status_code=503, detail=str(unreachable_error))
+
+    text = _writing_sample_text_from_sent_messages(messages)
+    if not text.strip():
+        raise HTTPException(
+            status_code=404, detail="No sent messages with readable text were found."
+        )
+
+    content = text.encode("utf-8")
+    label = str(record.get("display_label") or "mailbox")
+    stamp = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
+    filename = f"sent_mail_{label}_{stamp}.txt"
+    media_entries = await _build_media_entries_for_file(
+        filename,
+        content,
+        "text/plain",
+        reference_image=False,
+        reference_audio=False,
+        user_id=user_id,
+        assistant_id=assistant_id,
+    )
+    for entry in media_entries:
+        entry["estimated_tokens"] = max(1, len(content) // 4)
+
+    config = {
+        "configurable": {
+            "user_id": user_id,
+            "user_ctx": {"name": None, "description": None},
+            "assistant_id": assistant_id,
+            "assistant_ctx": {
+                "name": personal_avatar.get("name"),
+                "description": personal_avatar.get("description"),
+                "assistant_id": assistant_id,
+                "metadata": personal_avatar.get("metadata") or {},
+            },
+        }
+    }
+    registry = app.state.media_jobs
+    master = create_master_job(registry, user_id, assistant_id)
+    items: list = []
+    for media_file in media_entries:
+        child = create_child_job(
+            registry,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            parent_id=master.job_id,
+            filename=media_file.get("filename"),
+            namespace_filename=media_file.get("namespace_filename"),
+            estimated_tokens=media_file.get("estimated_tokens"),
+        )
+        master.child_ids.append(child.job_id)
+        items.append({"child": child, "media_file": media_file})
+    master.task = asyncio.create_task(
+        run_batch_media_job(
+            master,
+            items,
+            config,
+            app.state.store,
+            app.state.context,
+            concurrency=max(1, app.state.context.media_processing_concurrency),
+            existing_namespaces=[],
+            registry=registry,
+            deferred_expanders=[],
+        )
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": master.job_id,
+            "status": master.status,
+            "status_url": f"/media_job/{master.job_id}",
+            "progress_url": f"/media_job/{master.job_id}/progress",
+            "cancel_url": f"/media_job/{master.job_id}/cancel",
+            "account_key": record.get("account_key"),
+            "messages_imported": len(messages),
+            "filename": filename,
+        },
     )
 
 
@@ -3356,77 +3849,14 @@ async def list_mcp_connections(
 
     Presence comes from the in-process relay registry rather than from the stored
     heartbeat, because the live socket is the authoritative signal for relay-mode
-    machines. Host directory paths are deliberately omitted.
+    machines. Host directory paths are deliberately omitted. The same rows feed
+    ``GET /list_connections`` through ``_device_rows_for_user``.
     """
-    from src.anubis.utils.tools.data_analysis import relay as relay_registry
-    from src.anubis.utils.tools.data_analysis.backend import (
-        mcp_connection_namespace,
-        mcp_registration_namespace,
-    )
-
     user_id = current_user["identities"][0]["user_id"]
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
 
-    registrations = await _search_namespace_records(
-        client, mcp_registration_namespace(user_id)
-    )
-    connections = await _search_namespace_records(
-        client, mcp_connection_namespace(user_id)
-    )
-    connection_by_device = {
-        record.get("device_id"): record
-        for record in connections
-        if record.get("device_id")
-    }
-
-    devices: list[dict[str, Any]] = []
-    seen_device_ids: set[str] = set()
-    for registration in registrations:
-        registration_device_id = registration.get("device_id")
-        if not registration_device_id:
-            continue
-        seen_device_ids.add(registration_device_id)
-        connection = connection_by_device.get(registration_device_id) or {}
-        devices.append(
-            {
-                "device_id": registration_device_id,
-                "device_label": registration.get("device_label")
-                or connection.get("device_label"),
-                "platform": registration.get("platform") or connection.get("platform"),
-                "server_name": registration.get("server_name"),
-                "connection_mode": registration.get("connection_mode"),
-                "online": relay_registry.is_online(registration_device_id),
-                "last_seen_at": registration.get("last_seen_at"),
-                "connected": connection.get("status") == "connected",
-                "bound_assistant_id": connection.get("assistant_id"),
-                "connected_at": connection.get("connected_at"),
-            }
-        )
-
-    # A connection whose registration record is gone (the daemon unregistered on
-    # shutdown but the avatar keeps the adopted connection) still belongs in the
-    # listing, otherwise a user sees a machine vanish while the avatar still
-    # holds tools for the machine.
-    for device_identifier, connection in connection_by_device.items():
-        if device_identifier in seen_device_ids:
-            continue
-        devices.append(
-            {
-                "device_id": device_identifier,
-                "device_label": connection.get("device_label"),
-                "platform": connection.get("platform"),
-                "server_name": connection.get("server_name"),
-                "connection_mode": None,
-                "online": relay_registry.is_online(device_identifier),
-                "last_seen_at": None,
-                "connected": connection.get("status") == "connected",
-                "bound_assistant_id": connection.get("assistant_id"),
-                "connected_at": connection.get("connected_at"),
-            }
-        )
-
-    devices.sort(key=lambda device: str(device.get("device_label") or ""))
+    devices = await _device_rows_for_user(client, user_id)
     return JSONResponse(
         content={"user_id": user_id, "device_count": len(devices), "devices": devices},
         status_code=200,

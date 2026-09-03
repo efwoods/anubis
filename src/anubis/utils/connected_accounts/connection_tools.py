@@ -14,13 +14,14 @@ THE CREDENTIAL NEVER PASSES THROUGH THIS TOOL
     to rest in PostgreSQL in plaintext, inside thread state that
     ``GET /conversations/{thread_id}/messages`` reads back to the client.
 
-    Instead the card posts the credential straight to ``POST /connect_mailbox``,
-    which proves it against the real mail server, encrypts it, and stores it.
-    Only then does the client resume this run, and the resume value carries
-    nothing but ``{"type": "apply"}``. This tool then re-reads the store to learn
-    what was actually connected, so its answer is grounded in stored state rather
-    than in anything the client claimed. Any credential-looking key that arrives
-    in a resume value is ignored, never stored, and never echoed into the reply.
+    Instead the card posts the credential straight to the provider's
+    ``connect_endpoint`` (``POST /connect_account``), which proves it against
+    the real server, encrypts it, and stores it. Only then does the client
+    resume this run, and the resume value carries nothing but
+    ``{"type": "apply"}``. This tool then re-reads storage to learn what was
+    actually connected, so its answer is grounded in stored state rather than in
+    anything the client claimed. Any credential-looking key that arrives in a
+    resume value is ignored, never stored, and never echoed into the reply.
 
 The card is described from the provider registry rather than from strings held
 in the client, so a new provider ships its own card by adding a registry row.
@@ -42,8 +43,8 @@ logger = logging.getLogger(__name__)
 # run as paused rather than guessing at a form.
 CONNECT_ACCOUNT_INTERRUPT_KIND = "connect_account"
 
-# The endpoint the card posts the credential to. Named in the payload so the
-# client does not hardcode a route this module could later change.
+# Kept for callers that imported the old constant; the endpoint a card posts to
+# now comes from the provider row (``connect_endpoint``).
 CONNECT_MAILBOX_ENDPOINT = "/connect_mailbox"
 
 
@@ -56,6 +57,7 @@ def _describe_fields(provider: Any) -> list[dict[str, Any]]:
             "input_type": field_spec.input_type,
             "placeholder": field_spec.placeholder,
             "help_text": field_spec.help_text,
+            "required": bool(getattr(field_spec, "required", True)),
         }
         for field_spec in provider.connect_fields
     ]
@@ -98,18 +100,27 @@ def build_connect_card(
     Returns:
         The card description, carrying no credential and no ciphertext.
     """
-    from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
 
+    tool_names = tool_names_for(provider)
     return {
         "kind": CONNECT_ACCOUNT_INTERRUPT_KIND,
         "provider": provider.name,
         "display_name": provider.display_name,
         "card_description": provider.card_description,
+        "summary": provider.summary,
+        "category": provider.category,
+        "featured": bool(provider.featured),
+        "availability": provider.availability,
         "icon_key": provider.icon_key,
-        "tool_count": len(MAILBOX_TOOL_NAMES) if provider.is_mailbox else 0,
+        "tool_count": len(tool_names),
+        "tool_names": tool_names,
         "credential_mechanism": provider.credential_mechanism,
         "credential_help_url": provider.credential_help_url,
-        "connect_endpoint": CONNECT_MAILBOX_ENDPOINT,
+        "connect_endpoint": provider.connect_endpoint,
+        "uses_form": bool(provider.uses_form),
+        "pairing_instructions": provider.pairing_instructions or None,
+        "install_url": provider.install_url,
         "fields": _describe_fields(provider),
         "already_connected": _connected_views(
             list(connected_accounts or []), provider.name
@@ -128,8 +139,8 @@ def build_connection_tools(
 ) -> list[Any]:
     """Build the per-turn account-connection tool set.
 
-    Unlike ``build_mailbox_tools`` this returns a tool even when nothing is
-    connected — an owner with no mailbox is exactly the owner who needs to ask
+    Unlike the account tool factories this returns a tool even when nothing is
+    connected — an owner with no accounts is exactly the owner who needs to ask
     for one, and a tool set that appears only after connecting would leave no
     way to connect.
 
@@ -146,39 +157,58 @@ def build_connection_tools(
         The tools to append to this turn's tool list.
     """
     from src.anubis.utils.connected_accounts.providers import (
+        catalog_providers,
         get_provider,
-        mailbox_providers,
     )
 
     @tool
-    async def connect_mailbox_account(provider: str = "gmail") -> dict[str, Any]:
-        """Ask the owner to connect one of their email accounts, in this chat.
+    async def connect_account(provider: str = "gmail") -> dict[str, Any]:
+        """Ask the owner to connect one of their accounts, in this chat.
 
-        Call this tool when the owner asks to connect, link, or add an email
-        account, or asks the assistant to read email when no mailbox is
-        connected yet. Calling this tool presents the owner with a sign-in card
-        in the conversation; the owner supplies the email address and an app
-        password on that card. Do not ask the owner to type an email address or
-        a password into the chat, and never repeat a password the owner sends.
+        Call this tool when the owner asks to connect, link, or add an account
+        (an email account, a custom connector, a machine), or asks the assistant
+        to do something that needs an account that is not connected yet — read
+        email, send a message, use a tool from one of their servers. Calling this
+        tool presents the owner with a connect card in the conversation; the
+        owner completes it there. Do not ask the owner to type an address, a
+        password, or a token into the chat, and never repeat one the owner sends.
 
         The run pauses while the owner completes the card. When the run resumes
-        this tool reports which accounts are connected, and the mailbox tools
+        this tool reports which accounts are connected, and the account's tools
         become available in the same turn, so a request that prompted the
         connection can be carried out immediately afterwards.
 
         Args:
-            provider: Which email provider to connect. Defaults to "gmail".
+            provider: Which provider to connect. Defaults to "gmail". Other
+                values: "custom_mcp" for the owner's own server, "desktop_mcp"
+                for one of the owner's machines, or any provider named in the
+                catalog.
         """
         provider_name = str(provider or "gmail").strip().lower()
         resolved_provider = get_provider(provider_name)
-        if resolved_provider is None or not resolved_provider.is_mailbox:
-            supported = [entry.name for entry in mailbox_providers()]
+        if resolved_provider is None:
+            supported = [entry.name for entry in catalog_providers()]
             return {
                 "status": "unsupported_provider",
                 "error": (
-                    f"No email provider named {provider!r} can be connected. "
-                    f"Email providers that can be connected: {supported}."
+                    f"No provider named {provider!r} can be connected. "
+                    f"Providers in the catalog: {supported}."
                 ),
+            }
+        if not resolved_provider.is_available:
+            return {
+                "status": "coming_soon",
+                "provider": resolved_provider.name,
+                "message": resolved_provider.coming_soon_message(),
+            }
+        if not resolved_provider.uses_form:
+            # A machine connects itself when the owner runs the daemon; there is
+            # no card to complete, so the instructions are the whole answer.
+            return {
+                "status": "instructions",
+                "provider": resolved_provider.name,
+                "message": resolved_provider.pairing_instructions,
+                "install_url": resolved_provider.install_url,
             }
 
         card = build_connect_card(resolved_provider, connected_accounts)
@@ -189,9 +219,9 @@ def build_connection_tools(
         decision = interrupt(card)
 
         # Only the decision type is read. A resume value carrying an
-        # `email_address` or `app_password` is ignored on purpose — see the
-        # module docstring. The credential's only path into this system is the
-        # connect endpoint, which verifies and encrypts it.
+        # `email_address`, `app_password`, or `bearer_token` is ignored on
+        # purpose — see the module docstring. The credential's only path into
+        # this system is the connect endpoint, which verifies and encrypts it.
         decision = decision if isinstance(decision, dict) else {}
         decision_type = str(decision.get("type") or "apply").strip().lower()
 
@@ -201,8 +231,8 @@ def build_connection_tools(
                 "provider": resolved_provider.name,
                 "message": (
                     f"The owner closed the {resolved_provider.display_name} "
-                    "sign-in card without connecting an account. No mailbox was "
-                    "connected and no credential was stored."
+                    "connect card without connecting. Nothing was connected and "
+                    "no credential was stored."
                 ),
             }
 
@@ -225,34 +255,54 @@ def build_connection_tools(
                 ),
             }
 
-        from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
+        from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
 
         connected_now = _connected_views(refreshed_accounts, resolved_provider.name)
         if not connected_now:
             # The card was dismissed after sign-in failed, or the sign-in never
-            # completed. Reporting success here would have the avatar claim a
-            # mailbox it cannot read, so say plainly that nothing was connected.
+            # completed. Reporting success here would have the avatar claim an
+            # account it cannot reach, so say plainly that nothing was connected.
+            hint = (
+                " Note that a Gmail account needs a 16-character app password "
+                "rather than the account password."
+                if resolved_provider.is_mailbox
+                else ""
+            )
             return {
                 "status": "not_connected",
                 "provider": resolved_provider.name,
                 "message": (
                     f"No {resolved_provider.display_name} account is connected. "
-                    "The sign-in was not completed. Offer to try again, and note "
-                    "that a Gmail account needs a 16-character app password "
-                    "rather than the account password."
+                    "The sign-in was not completed. Offer to try again." + hint
                 ),
             }
 
+        newest_record = next(
+            (
+                record
+                for record in refreshed_accounts
+                if record.get("account_key") == connected_now[-1].get("account_key")
+            ),
+            None,
+        )
+        available_tools = tool_names_for(resolved_provider, newest_record)
         return {
             "status": "connected",
             "provider": resolved_provider.name,
             "accounts": connected_now,
-            "available_tools": list(MAILBOX_TOOL_NAMES),
+            "available_tools": available_tools,
             "message": (
-                f"{resolved_provider.display_name} is connected. The mailbox "
-                "can now be searched, read, and replied to with draft replies. "
-                "Drafts are saved to the mailbox; nothing is ever sent."
+                f"{resolved_provider.display_name} is connected. Its tools are "
+                "available now, in this turn. Carry on with what the owner asked."
             ),
         }
 
-    return [connect_mailbox_account]
+    # The former name stays callable for one release so an in-flight prompt or
+    # a cached tool call keeps working.
+    connect_mailbox_account = tool("connect_mailbox_account")(connect_account.coroutine)
+    connect_mailbox_account.description = (
+        "Alias of connect_account. Prefer connect_account. "
+        + connect_account.description
+    )
+
+    return [connect_account, connect_mailbox_account]

@@ -793,6 +793,33 @@ async def _build_consciousness_system_message_update(
         else:
             system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
 
+        # Custom connectors — the owner's own Model Context Protocol servers —
+        # gated identically. Their tools are attached with the connector's name
+        # as a prefix, so the block names each connector and its tool count and
+        # nothing else: the server address and the access token never appear.
+        from src.anubis.utils.prompts.system_prompts import CUSTOM_CONNECTOR_PROMPT
+
+        bound_connectors = [
+            account
+            for account in await bound_accounts_for(runtime.store, user_id, assistant_id)
+            if account.get("kind") == "mcp_server"
+        ]
+        if bound_connectors:
+            system_message_str = system_message_str + CUSTOM_CONNECTOR_PROMPT
+            connector_descriptions = ", ".join(
+                f"{account.get('display_label')} "
+                f"({len((account.get('transport') or {}).get('tool_names') or [])} tools)"
+                for account in bound_connectors
+            )
+            system_message_str += (
+                "\n<CONNECTOR_STATUS>\n"
+                "The following custom connectors are connected for this avatar: "
+                f"{connector_descriptions}. Confirm this plainly when asked, naming "
+                "the connectors. Never reveal a connector's server address or "
+                "access token in a reply.\n"
+                "</CONNECTOR_STATUS>\n"
+            )
+
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended
     # just above), so measure the prompt's tokens manually NOW and cache the

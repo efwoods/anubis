@@ -586,6 +586,27 @@ class GlobalContext:
         },
     )
 
+    mailbox_send_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the personal avatar may transmit email through a connected mailbox's submission server when the owner explicitly asks in conversation. Set to false to keep the avatar draft-only while still reading mail; the send tool is then withheld and the avatar says the draft is waiting. Env MAILBOX_SEND_ENABLED."
+        },
+    )
+
+    max_custom_mcp_connectors_per_user: int = field(
+        default=10,
+        metadata={
+            "description": "Maximum number of custom Model Context Protocol servers (custom connectors) one user may connect simultaneously. POST /connect_account refuses a new custom connector beyond this count. Each connector's tool list is fetched and attached to every turn, so this bounds the per-turn tool count and the prompt describing it. Env MAX_CUSTOM_MCP_CONNECTORS_PER_USER."
+        },
+    )
+
+    mcp_connector_probe_timeout_seconds: float = field(
+        default=20.0,
+        metadata={
+            "description": "Maximum seconds a custom Model Context Protocol server is given to list its tools, both when the owner connects the server (the address is proved before it is stored) and when the avatar loads the server's tools for a turn. A server that does not answer in time contributes no tools for that turn. Env MCP_CONNECTOR_PROBE_TIMEOUT_SECONDS."
+        },
+    )
+
     """ </Connected accounts (mailbox and social) for the personal avatar> """
 
 

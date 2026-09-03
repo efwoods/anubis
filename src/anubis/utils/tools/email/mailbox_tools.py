@@ -20,6 +20,12 @@ becomes a result the model can read and relay ("your work mailbox needs to be
 reconnected"), because a raised exception inside a tool costs the whole turn and
 tells the owner nothing actionable.
 
+**Sending is a tool, gated twice.** ``send_mailbox_message`` exists because the
+owner asked for it ("send it" → sent). It is only built for providers whose
+registry row declares ``send_supported`` and only while ``MAILBOX_SEND_ENABLED``
+is on, and the capability prompt tells the avatar to send solely when the owner
+explicitly asks in the conversation — otherwise it drafts.
+
 Every mail call is blocking, so each one is dispatched with ``asyncio.to_thread``
 — see the note in ``imap_client``.
 """
@@ -42,7 +48,9 @@ MAILBOX_TOOL_NAMES: tuple[str, ...] = (
     "search_mailbox_messages",
     "read_mailbox_message",
     "read_mailbox_thread",
+    "read_sent_mailbox_messages",
     "draft_mailbox_reply",
+    "send_mailbox_message",
 )
 
 
@@ -91,6 +99,9 @@ def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[An
         return []
 
     fetch_limit = int(getattr(context, "mailbox_fetch_max_messages", None) or 25)
+    send_enabled = str(
+        getattr(context, "mailbox_send_enabled", None) or "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
 
     def _labels() -> list[str]:
         return [str(record.get("display_label") or "") for record in mailbox_accounts]
@@ -312,11 +323,12 @@ def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[An
         in_reply_to: str | None = None,
         account_label: str | None = None,
     ) -> dict[str, Any]:
-        """Save a draft reply in the owner's mailbox. This never sends anything.
+        """Save a draft reply in the owner's mailbox without sending it.
 
         The draft is written to the mailbox's drafts folder for the owner to
-        review and send themselves. You cannot send email — say so plainly if
-        asked to, and tell the owner the draft is waiting in their drafts folder.
+        review. Use this whenever the owner has not explicitly asked for the
+        message to be sent; when the owner does say to send, use
+        send_mailbox_message instead.
 
         Write the draft in the owner's own voice. Pass the original message's
         rfc822_message_id as in_reply_to so the draft threads under the
@@ -350,9 +362,122 @@ def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[An
             result["account_label"] = record.get("display_label")
         return result
 
-    return [
+    @tool
+    async def read_sent_mailbox_messages(
+        limit: int = 10,
+        query: str | None = None,
+        account_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Read messages the owner sent, to learn how the owner actually writes.
+
+        Use this before writing anything in the owner's voice — an email, a
+        reply, a note — so the register, greeting, sentence length, and sign-off
+        match the owner's own sent mail rather than a generic template. Results
+        come back newest first with shortened bodies; read a specific message
+        with read_mailbox_message when a summary is not enough.
+
+        Args:
+            limit: How many sent messages to read.
+            query: Optional search within the sent folder (Gmail syntax on Gmail).
+            account_label: Which mailbox to read from. Only needed when the owner
+                has connected more than one.
+        """
+        from src.anubis.utils.tools.email.imap_client import search_messages
+
+        record, error = _select_account(account_label)
+        if error is not None:
+            return error
+        sent_folder = record.get("sent_mailbox")
+        if not sent_folder:
+            return {
+                "account_label": record.get("display_label"),
+                "error": "This mailbox provider does not expose a sent folder.",
+            }
+        capped = max(1, min(int(limit or 10), fetch_limit))
+        result = await _run(record, search_messages, query, capped, sent_folder)
+        if isinstance(result, dict):
+            return result
+        return {
+            "account_label": record.get("display_label"),
+            "message_count": len(result),
+            "messages": result,
+        }
+
+    @tool
+    async def send_mailbox_message(
+        to: str,
+        subject: str,
+        body: str,
+        in_reply_to: str | None = None,
+        cc: list[str] | None = None,
+        account_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Send an email from the owner's mailbox. Only when the owner explicitly asks.
+
+        Call this tool only when the owner has said, in this conversation, to
+        send the message ("send it", "email her now"). When the owner has not
+        said so, save a draft with draft_mailbox_reply instead and say the draft
+        is waiting. Never send to an address the owner did not name or confirm.
+
+        Write in the owner's own voice — read read_sent_mailbox_messages first
+        when unsure how the owner writes. Pass the original message's
+        rfc822_message_id as in_reply_to so the reply threads correctly.
+
+        Args:
+            to: Recipient address.
+            subject: Subject line.
+            body: The message text, in the owner's voice.
+            in_reply_to: The rfc822_message_id of the message being answered.
+            cc: Additional recipient addresses to copy.
+            account_label: Which mailbox to send from. Only needed when the owner
+                has connected more than one.
+        """
+        from src.anubis.utils.tools.email.imap_client import (
+            MailboxSendError,
+            send_message,
+        )
+
+        record, error = _select_account(account_label)
+        if error is not None:
+            return error
+        if not send_enabled or not record.get("send_supported", True):
+            return {
+                "status": "send_disabled",
+                "account_label": record.get("display_label"),
+                "error": (
+                    "Sending is not enabled for this mailbox. Save a draft with "
+                    "draft_mailbox_reply and tell the owner it is waiting in the "
+                    "drafts folder."
+                ),
+            }
+
+        def _send(credentials: Any) -> dict[str, Any]:
+            try:
+                return send_message(
+                    credentials,
+                    to_address=to,
+                    subject=subject,
+                    body_text=body,
+                    in_reply_to=in_reply_to,
+                    cc_addresses=list(cc or []),
+                )
+            except MailboxSendError as send_error:
+                return {"status": "refused", "error": str(send_error)}
+
+        result = await _run(record, _send)
+        if isinstance(result, dict) and result.get("status") in ("sent", "refused"):
+            result["account_label"] = record.get("display_label")
+        return result
+
+    tools: list[Any] = [
         search_mailbox_messages,
         read_mailbox_message,
         read_mailbox_thread,
+        read_sent_mailbox_messages,
         draft_mailbox_reply,
     ]
+    if send_enabled and any(
+        record.get("send_supported", True) for record in mailbox_accounts
+    ):
+        tools.append(send_mailbox_message)
+    return tools

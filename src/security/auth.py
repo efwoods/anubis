@@ -1873,6 +1873,7 @@ async def delete_user(
 
         from src.anubis.utils.avatar_deletion import (
             delete_api_metrics_for_user,
+            delete_connected_accounts_for_user,
             delete_store_rows_for_user,
             purge_avatar_data,
             search_all_avatars_for_user,
@@ -1894,6 +1895,7 @@ async def delete_user(
         try:
             await delete_store_rows_for_user(pool, user_id)
             await delete_api_metrics_for_user(pool, user_id)
+            await delete_connected_accounts_for_user(pool, user_id)
         except Exception as user_row_error:
             raise HTTPException(
                 status_code=500,

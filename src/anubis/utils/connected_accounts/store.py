@@ -1,4 +1,4 @@
-"""Durable records for the external accounts a user has connected.
+"""Records for the external accounts a user has connected — the facade every caller uses.
 
 Shaped after ``mcp_connection_namespace``
 (``src/anubis/utils/tools/data_analysis/backend.py``), deliberately, including
@@ -11,11 +11,11 @@ delete production's record, because both wrote the same key into a shared store.
 The same mistake here would mean a user's second mailbox evicting the first. The
 key is therefore ``"{provider}:{account_address}"`` — unique per account, stable
 across reconnects of the same account, and self-describing when read straight
-out of the store.
+out of storage.
 
 **The plaintext credential is never in a record.** ``encrypted_secret`` holds
 Fernet ciphertext produced by ``src/anubis/utils/secret_store.py``. Nothing in
-this module decrypts; the tool layer does that at the moment it dials the mail
+this module decrypts; the tool layer does that at the moment it dials the
 server, which keeps the plaintext out of anything that logs or serializes a
 record.
 
@@ -24,6 +24,15 @@ avatar the account was connected for, mirroring how a connection record names
 the avatar a device is bound to. A demoted avatar therefore loses access without
 the record having to be rewritten, and :func:`bound_accounts_for` is the single
 gate the tool layer consults.
+
+**Where records live.** When the FastAPI lifespan has published a repository
+(``repository.set_repository``), every function here reads and writes the
+``connected_accounts`` Postgres table and ignores the ``store`` argument. When
+nothing is published — ``langgraph dev``, unit tests that never run the
+lifespan, or a boot where the table could not be created — the functions fall
+back to the legacy cross-thread store namespace ``(user_id, "connected_account")``.
+The ``store`` parameter is kept on every signature so call sites are identical
+in both modes.
 """
 
 from __future__ import annotations
@@ -32,6 +41,8 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from src.anubis.utils.connected_accounts.repository import get_repository
+
 logger = logging.getLogger(__name__)
 
 CONNECTED_ACCOUNT_NAMESPACE_KIND = "connected_account"
@@ -39,24 +50,23 @@ CONNECTED_ACCOUNT_NAMESPACE_KIND = "connected_account"
 # Status values a record may carry. "connected" is the only status the tool
 # layer acts on; "needs_reconnect" is written when a stored credential stops
 # authenticating, so the avatar can tell the owner which account to fix instead
-# of failing every mail call with an opaque error.
+# of failing every call with an opaque error.
 STATUS_CONNECTED = "connected"
 STATUS_NEEDS_RECONNECT = "needs_reconnect"
 
 
 def connected_account_namespace(user_id: str) -> tuple[str, str]:
-    """Store namespace holding one record per connected external account.
+    """Legacy store namespace holding one record per connected external account.
 
     Scoped to the user (a two-element tuple) and keyed INSIDE that namespace by
-    :func:`account_key`, so a user who connects a personal Gmail account, a work
-    Gmail account, and later a social account has three coexisting records
-    rather than three generations of one overwritten record.
+    :func:`account_key`. Still read when no repository is published, and read
+    once by the lifespan migration that copies these records into the table.
     """
     return (user_id, CONNECTED_ACCOUNT_NAMESPACE_KIND)
 
 
 def account_key(provider_name: str, account_address: str) -> str:
-    """Build the per-account store key.
+    """Build the per-account key.
 
     Lower-cased on both halves because the key must be stable across reconnects,
     and a user who types "Evan@Example.com" one day and "evan@example.com" the
@@ -114,8 +124,9 @@ def build_account_record(
     provider: Any,
     account_address: str,
     display_label: str,
-    encrypted_secret: str,
+    encrypted_secret: str | None,
     assistant_id: str,
+    transport: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the stored value for one connected account.
 
@@ -123,6 +134,11 @@ def build_account_record(
     so a record read years later still describes how to reach the server even if
     the registry row has since changed — the same reason a Model Context
     Protocol connection record stores its own URL instead of recomputing one.
+
+    ``transport`` carries provider-kind-specific details that are not part of
+    every record — a custom Model Context Protocol server's URL, transport, and
+    the tool names its probe returned — so the record shape stays one dictionary
+    for every kind while each kind keeps what it needs.
     """
     now = datetime.now(UTC).isoformat()
     return {
@@ -138,6 +154,9 @@ def build_account_record(
         "smtp_host": provider.smtp_host,
         "smtp_port": provider.smtp_port,
         "drafts_mailbox": provider.drafts_mailbox,
+        "sent_mailbox": provider.sent_mailbox,
+        "send_supported": bool(provider.send_supported),
+        "transport": dict(transport or {}),
         "assistant_id": assistant_id,
         "status": STATUS_CONNECTED,
         "connected_at": now,
@@ -154,8 +173,11 @@ def public_account_view(record: dict[str, Any]) -> dict[str, Any]:
     first time someone forgets to update a removal list. Neither the plaintext
     credential (never stored) nor the ciphertext is included — the ciphertext is
     useless to a caller and its exposure only helps an attacker who later
-    obtains the key.
+    obtains the key. Of the transport details only the tool names are shown: a
+    custom server's URL may embed a credential, and the owner typed the URL and
+    does not need it read back.
     """
+    transport = record.get("transport") or {}
     return {
         "account_key": record.get("account_key"),
         "provider": record.get("provider"),
@@ -166,17 +188,27 @@ def public_account_view(record: dict[str, Any]) -> dict[str, Any]:
         "connected_at": record.get("connected_at"),
         "last_verified_at": record.get("last_verified_at"),
         "assistant_id": record.get("assistant_id"),
+        "tool_names": list(transport.get("tool_names") or []),
     }
 
 
 async def read_connected_accounts(store: Any, user_id: str) -> list[dict[str, Any]]:
     """Return every connected-account record for a user.
 
-    Returns an empty list when the namespace is empty or the store is
-    unreachable: every caller treats "no accounts" and "cannot tell" the same
-    way, and a store hiccup must never fail a conversation turn whose real work
-    is something else.
+    Returns an empty list when nothing is stored or storage is unreachable:
+    every caller treats "no accounts" and "cannot tell" the same way, and a
+    storage hiccup must never fail a conversation turn whose real work is
+    something else.
     """
+    repository = get_repository()
+    if repository is not None:
+        try:
+            return await repository.list_for_user(user_id)
+        except Exception:
+            logger.debug(
+                "Could not read connected accounts for user %s", user_id, exc_info=True
+            )
+            return []
     if store is None:
         return []
     namespace = connected_account_namespace(user_id)
@@ -204,7 +236,7 @@ async def bound_accounts_for(
     record is in the connected state, and it is bound to the avatar currently
     answering. Binding to the avatar rather than to the user is what stops a
     second avatar of the same owner — or an avatar demoted out of the personal
-    role — from reaching the owner's mail.
+    role — from reaching the owner's accounts.
     """
     return [
         record
@@ -229,7 +261,27 @@ async def save_connected_account(
             "Cannot save a connected account without an account key; the record "
             "key is the account key."
         )
+    repository = get_repository()
+    if repository is not None:
+        await repository.upsert(user_id, record)
+        return
     await store.aput(connected_account_namespace(user_id), key=key, value=record)
+
+
+async def get_connected_account(
+    store: Any, user_id: str, key: str
+) -> dict[str, Any] | None:
+    """Return one record by key, or ``None``."""
+    if not key:
+        return None
+    repository = get_repository()
+    if repository is not None:
+        return await repository.get(user_id, key)
+    if store is None:
+        return None
+    item = await store.aget(connected_account_namespace(user_id), key)
+    value = getattr(item, "value", None)
+    return dict(value) if value else None
 
 
 async def clear_connected_account(store: Any, user_id: str, key: str) -> bool:
@@ -246,7 +298,12 @@ async def clear_connected_account(store: Any, user_id: str, key: str) -> bool:
         so the endpoint can answer 404 rather than reporting a success that
         removed nothing.
     """
-    if store is None or not key:
+    if not key:
+        return False
+    repository = get_repository()
+    if repository is not None:
+        return await repository.delete(user_id, key)
+    if store is None:
         return False
     namespace = connected_account_namespace(user_id)
     existing = await store.aget(namespace, key)
@@ -259,20 +316,18 @@ async def clear_connected_account(store: Any, user_id: str, key: str) -> bool:
 async def mark_account_needs_reconnect(store: Any, user_id: str, key: str) -> None:
     """Flag an account whose stored credential stopped authenticating.
 
-    Best-effort: a failure to record the flag must not turn a already-failing
-    mail call into a raised exception. The flag is what lets the avatar say
-    which account needs attention instead of silently returning nothing.
+    Best-effort: a failure to record the flag must not turn an already-failing
+    call into a raised exception. The flag is what lets the avatar say which
+    account needs attention instead of silently returning nothing.
     """
-    if store is None or not key:
+    if not key:
         return
     try:
-        namespace = connected_account_namespace(user_id)
-        item = await store.aget(namespace, key)
-        record = dict(getattr(item, "value", None) or {})
+        record = await get_connected_account(store, user_id, key)
         if not record:
             return
         record["status"] = STATUS_NEEDS_RECONNECT
-        await store.aput(namespace, key=key, value=record)
+        await save_connected_account(store, user_id, record)
     except Exception:
         logger.debug(
             "Could not flag connected account %s as needing reconnect",

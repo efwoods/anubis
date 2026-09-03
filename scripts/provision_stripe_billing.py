@@ -189,6 +189,10 @@ def _allotment_unit_noun(meter: UsageMeter) -> str:
     """Return the plural unit noun the customer reads for one meter."""
     if meter is UsageMeter.ADAPTER_TRAINING_UNITS:
         return "trained adapters"
+    if meter is UsageMeter.SPEECH_CHARACTERS:
+        return "spoken characters"
+    if meter is UsageMeter.VIDEO_GENERATION_SECONDS:
+        return "seconds of video"
     return "tokens"
 
 

@@ -964,6 +964,20 @@ async def think(
             answering_assistant_id,
         )
         mailbox_tools = await build_tools_for_accounts(runtime.context, connected_accounts)
+        # The agent inbox is the personal avatar's: report and resolve pending
+        # items in conversation, or trigger a poll now.
+        from src.anubis.utils.inbox.inbox_tools import build_inbox_tools
+        from src.anubis.utils.inbox.repository import get_inbox_repository
+
+        if get_inbox_repository() is not None:
+            mailbox_tools = [
+                *mailbox_tools,
+                *build_inbox_tools(
+                    runtime.context,
+                    user_id=owner_user_id,
+                    assistant_id=answering_assistant_id,
+                ),
+            ]
         # Offered whether or not anything is connected. The owner with no mailbox
         # is precisely the owner who needs to connect one, so gating the connect
         # tool on having a connection would leave no way in.

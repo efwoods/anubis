@@ -1440,6 +1440,12 @@ async def lifespan(app: FastAPI):
     app.state.voice_training_poller = asyncio.create_task(
         _poll_training_voice_clones(app.state.context)
     )
+    # The agent inbox: items, learned preferences, and poll cursors in their own
+    # tables; the triage graph runs in-process on the shared checkpointer.
+    from src.anubis.utils import inbox as inbox_package
+
+    await inbox_package.ensure_inbox_tables(app.state.pool)
+    inbox_package.set_inbox_repository(inbox_package.PostgresInboxRepository(app.state.pool))
     # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
     # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
     # requires pasting JSON into the env or a manual edit. This is only the INITIAL
@@ -1471,6 +1477,12 @@ async def lifespan(app: FastAPI):
         # Publish the shared checkpointer so the deep agent (rebuilt each turn inside
         # the ``think`` node) can reuse it and make HITL ``interrupt``s durable.
         runtime_handles.set_deep_agent_checkpointer(checkpointer)
+        from src.anubis.utils.inbox import poller as inbox_poller
+
+        inbox_poller.set_inbox_runtime(checkpointer, store)
+        app.state.inbox_poller = asyncio.create_task(
+            inbox_poller.poll_forever(app.state.context)
+        )
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
@@ -6573,6 +6585,124 @@ async def _meter_video_seconds(
         )
     except Exception:  # noqa: BLE001
         logger.debug("Could not report video meter event", exc_info=True)
+
+
+def _inbox_repository_or_503() -> Any:
+    from src.anubis.utils.inbox import get_inbox_repository
+
+    repository = get_inbox_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="The agent inbox is not configured.")
+    return repository
+
+
+@app.get("/inbox/items")
+async def list_inbox_items(
+    request: Request,
+    state: str = "open",
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    """The owner's inbox items: ``state=open`` (default), ``all``, or one state."""
+    from src.anubis.utils.inbox.repository import OPEN_STATES, public_item_view
+
+    repository = _inbox_repository_or_503()
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = personal_avatar.get("assistant_id")
+    states = None
+    if state == "open":
+        states = OPEN_STATES
+    elif state and state != "all":
+        states = (state,)
+    items = await repository.list_items(
+        assistant_id=assistant_id, states=states, limit=max(1, min(int(limit), 200))
+    )
+    return JSONResponse(
+        {
+            "personal_avatar_id": assistant_id,
+            "pending_count": await repository.count_open(assistant_id),
+            "items": [public_item_view(item) for item in items],
+        }
+    )
+
+
+@app.get("/inbox/count")
+async def inbox_count(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """How many items await the owner — the badge."""
+    repository = _inbox_repository_or_503()
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    return JSONResponse(
+        {"pending_count": await repository.count_open(personal_avatar.get("assistant_id"))}
+    )
+
+
+@app.post("/inbox/items/{item_id}/decide")
+async def decide_inbox_item(
+    item_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Deliver the owner's decision to a pending item.
+
+    Body: ``{"type": "accept"|"edit"|"ignore"|"response", "args": ...}`` — the
+    Agent Inbox ``HumanResponse`` shape. ``edit`` carries
+    ``{"action":"send_reply","args":{"subject","body"}}``; ``response`` carries
+    free text. The paused graph resumes, sends when the decision says so, and
+    records the decision as a preference for this sender and kind of message.
+    """
+    from src.anubis.utils.inbox.poller import resume_inbox_item
+    from src.anubis.utils.inbox.repository import public_item_view
+
+    repository = _inbox_repository_or_503()
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    item = await repository.get_item(item_id)
+    if item is None or item.get("assistant_id") != personal_avatar.get("assistant_id"):
+        raise HTTPException(status_code=404, detail="No such inbox item.")
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    decision_type = str(body.get("type") or "").strip().lower()
+    if decision_type not in ("accept", "edit", "ignore", "response"):
+        raise HTTPException(
+            status_code=400, detail="type must be accept, edit, ignore, or response."
+        )
+    human_response = {"type": decision_type, "args": body.get("args")}
+    updated = await resume_inbox_item(
+        app.state.context, item_id=item_id, human_response=human_response
+    )
+    return JSONResponse({"item": public_item_view(updated or item)})
+
+
+@app.post("/inbox/poll")
+async def poll_inbox_now(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check the owner's connected mailboxes now and triage anything new."""
+    from src.anubis.utils.inbox.poller import poll_connected_mailboxes
+
+    _inbox_repository_or_503()
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    await _resolve_personal_avatar_for_connection(client, request, current_user, token)
+    result = await poll_connected_mailboxes(
+        app.state.context, only_user_id=current_user["identities"][0]["user_id"]
+    )
+    return JSONResponse(result)
 
 
 @app.get("/avatar_reference_image")

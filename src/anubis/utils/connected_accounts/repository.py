@@ -85,6 +85,12 @@ WHERE user_id = %s
 ORDER BY connected_at ASC;
 """
 
+_SELECT_BY_KIND_SQL = f"""
+SELECT record, user_id FROM {CONNECTED_ACCOUNTS_TABLE_NAME}
+WHERE kind = %s AND status = %s
+ORDER BY connected_at ASC;
+"""
+
 _SELECT_ONE_SQL = f"""
 SELECT record FROM {CONNECTED_ACCOUNTS_TABLE_NAME}
 WHERE user_id = %s AND connection_key = %s;
@@ -180,6 +186,17 @@ class InMemoryConnectedAccountRepository:
         """Delete one record; report whether anything was removed."""
         return self.records.get(user_id, {}).pop(connection_key, None) is not None
 
+    async def list_by_kind(
+        self, kind: str, status: str = "connected"
+    ) -> list[dict[str, Any]]:
+        """Return every user's records of one kind in one status (for pollers)."""
+        return [
+            {**record, "user_id": record.get("user_id") or owner}
+            for owner, records in self.records.items()
+            for record in records.values()
+            if record.get("kind") == kind and record.get("status") == status
+        ]
+
 
 class PostgresConnectedAccountRepository:
     """Repository over the application's psycopg connection pool."""
@@ -247,6 +264,24 @@ class PostgresConnectedAccountRepository:
             async with connection.cursor() as cursor:
                 await cursor.execute(_DELETE_ONE_SQL, (user_id, connection_key))
                 return bool(cursor.rowcount and cursor.rowcount > 0)
+
+    async def list_by_kind(
+        self, kind: str, status: str = "connected"
+    ) -> list[dict[str, Any]]:
+        """Return every user's records of one kind in one status (for pollers)."""
+        async with self._pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(_SELECT_BY_KIND_SQL, (kind, status))
+                rows = await cursor.fetchall()
+        records = []
+        for row in rows:
+            if isinstance(row[0], dict):
+                record = dict(row[0])
+                # The owner is a table column, not a record field; the poller
+                # needs it to run the triage as that owner.
+                record.setdefault("user_id", row[1])
+                records.append(record)
+        return records
 
     async def delete_for_avatar(self, assistant_id: str) -> int:
         """Remove every account bound to one avatar (avatar deletion)."""

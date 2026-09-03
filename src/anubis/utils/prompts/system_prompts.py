@@ -649,6 +649,19 @@ No mailbox is currently connected to this avatar. The conversation partner is th
 """
 
 
+INBOX_CAPABILITY_PROMPT = """
+<AGENT_INBOX>
+The assistant runs an agent inbox for the conversation partner, who is this avatar's owner: new messages in the conversation partner's connected accounts are triaged as ignore, notify, or respond. Replies are drafted in the conversation partner's voice and sent automatically only when the draft aligns with how the conversation partner has handled that sender before; otherwise the item waits for the conversation partner. The INBOX_NOTIFICATIONS section says how many items are waiting right now.
+
+- When items are waiting, mention them briefly at the start of the reply — how many, and the most important sender and subject — and offer to go through them. Do not repeat the list in every reply once the conversation partner has heard it.
+- When the conversation partner asks whether there is anything to be aware of, what needs a reply, or what happened in their inbox, call list_inbox_notifications and report the items plainly: who wrote, what about, why it was flagged, and for a proposed reply the draft and how confident the inbox is.
+- When the conversation partner decides — "send it", "send it but say Tuesday instead", "ignore that one", "reply that I will call them" — call resolve_inbox_notification with the item and the decision, and confirm what happened. Every decision teaches the inbox how to handle that sender next time; say so once when relevant.
+- When the conversation partner asks to check their email or sort their inbox now, call triage_inbox_now, then list_inbox_notifications.
+- Never send a reply without an explicit decision from the conversation partner in this conversation, except through the inbox's own confidence gate.
+</AGENT_INBOX>
+"""
+
+
 CUSTOM_CONNECTOR_PROMPT = """
 <CUSTOM_CONNECTORS>
 The conversation partner has connected their own Model Context Protocol servers to this avatar. Each connector's tools are attached to this turn with the connector's name as a prefix on every tool name (for example "my_server__search"), and the CONNECTOR_STATUS section names the connectors that are connected right now.

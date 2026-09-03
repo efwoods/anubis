@@ -792,6 +792,38 @@ class GlobalContext:
 
     """ </Voice cloning and speech (ElevenLabs)> """
 
+    """ <Agent inbox (triage of incoming messages for the personal avatar)> """
+
+    inbox_poll_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the API polls every connected mailbox on a schedule and triages new mail through the inbox graph. Set to false to triage only on demand (POST /inbox/poll or the avatar's triage_inbox_now tool). Env INBOX_POLL_ENABLED."
+        },
+    )
+
+    inbox_poll_interval_seconds: float = field(
+        default=300.0,
+        metadata={
+            "description": "Seconds between scheduled inbox polls of every connected mailbox. Env INBOX_POLL_INTERVAL_SECONDS."
+        },
+    )
+
+    inbox_fetch_max_messages: int = field(
+        default=20,
+        metadata={
+            "description": "Ceiling on unseen messages fetched from one mailbox per poll, so a flooded inbox is triaged in batches rather than all at once. Env INBOX_FETCH_MAX_MESSAGES."
+        },
+    )
+
+    inbox_auto_send_confidence: float = field(
+        default=0.9,
+        metadata={
+            "description": "Confidence (alignment with the owner's recorded preferences times the decision prior) at or above which the inbox graph sends a drafted reply without asking the owner. Below it, the draft waits for the owner's approval. Env INBOX_AUTO_SEND_CONFIDENCE."
+        },
+    )
+
+    """ </Agent inbox (triage of incoming messages for the personal avatar)> """
+
 
     dev: str = field(
         default=None,

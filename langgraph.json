@@ -1,15 +1,20 @@
 {
   "$schema": "https://raw.githubusercontent.com/langchain-ai/langgraph/main/libs/cli/langgraph/schemas/config.schema.json",
-  "dependencies": ["."],
+  "dependencies": [
+    "."
+  ],
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
-    "process_media": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:workflow"
+    "process_media": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:workflow",
+    "inbox": "./src/subgraphs/inbox/graph.py:inbox_graph"
   },
   "store": {
     "index": {
       "dims": 640,
       "embed": "huggingface:microsoft/harrier-oss-v1-270m",
-      "fields": ["document.kwargs.page_content"]
+      "fields": [
+        "document.kwargs.page_content"
+      ]
     }
   },
   "env": ".env",

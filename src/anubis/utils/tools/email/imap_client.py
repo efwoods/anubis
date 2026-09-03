@@ -562,3 +562,46 @@ def send_message(
         "subject": subject,
         "rfc822_message_id": message["Message-ID"],
     }
+
+
+def fetch_unseen_messages(
+    credentials: MailboxCredentials,
+    *,
+    after_uid: int | None = None,
+    limit: int = 20,
+    mailbox: str = "INBOX",
+) -> list[dict[str, Any]]:
+    """Return unread messages newer than ``after_uid``, oldest first.
+
+    The inbox poller calls this on a schedule. UIDs are monotonic within a
+    folder, so remembering the highest UID seen is enough to fetch only what
+    arrived since the last poll; ``UNSEEN`` additionally skips mail the owner
+    has already read in their own client, which the avatar has no business
+    triaging. The folder is opened read-only so peeking never marks anything as
+    read — the owner should still see the message as new.
+    """
+    connection = _connect(credentials)
+    try:
+        _select_mailbox(connection, mailbox, readonly=True)
+        criteria = ["UNSEEN"]
+        if after_uid:
+            criteria.append(f"UID {int(after_uid) + 1}:*")
+        status, data = connection.uid("SEARCH", None, *criteria)
+        if status != "OK":
+            raise MailboxUnreachableError("The mail server rejected the unseen search.")
+        identifiers = [
+            identifier.decode("ascii", errors="ignore")
+            for identifier in (data[0].split() if data and data[0] else [])
+        ]
+        if after_uid:
+            identifiers = [uid for uid in identifiers if int(uid) > int(after_uid)]
+        identifiers = identifiers[: max(1, int(limit))]
+        messages: list[dict[str, Any]] = []
+        for message_uid in identifiers:
+            fetched = _fetch_one(connection, message_uid)
+            if fetched is not None:
+                fetched.setdefault("uid", message_uid)
+                messages.append(fetched)
+        return messages
+    finally:
+        _close(connection)

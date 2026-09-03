@@ -820,6 +820,46 @@ async def _build_consciousness_system_message_update(
                 "</CONNECTOR_STATUS>\n"
             )
 
+    # Agent inbox — the personal avatar only. The count and the top subjects
+    # are named so the avatar raises pending items at the start of a
+    # conversation without spending a tool call, and never invents one.
+    if is_personal_avatar:
+        try:
+            from src.anubis.utils.inbox.repository import (
+                OPEN_STATES,
+                get_inbox_repository,
+            )
+            from src.anubis.utils.prompts.system_prompts import INBOX_CAPABILITY_PROMPT
+
+            inbox_repository = get_inbox_repository()
+            if inbox_repository is not None:
+                system_message_str = system_message_str + INBOX_CAPABILITY_PROMPT
+                pending_items = await inbox_repository.list_items(
+                    assistant_id=assistant_id, states=OPEN_STATES, limit=5
+                )
+                pending_count = await inbox_repository.count_open(assistant_id)
+                if pending_count:
+                    headlines = "; ".join(
+                        f"{item.get('sender') or 'unknown sender'} — "
+                        f"{item.get('subject') or '(no subject)'} "
+                        f"[{item.get('decision') or 'notify'}]"
+                        for item in pending_items
+                    )
+                    system_message_str += (
+                        "\n<INBOX_NOTIFICATIONS>\n"
+                        f"{pending_count} item(s) are waiting for the conversation "
+                        f"partner in the agent inbox: {headlines}. Mention them briefly "
+                        "and offer to go through them.\n"
+                        "</INBOX_NOTIFICATIONS>\n"
+                    )
+                else:
+                    system_message_str += (
+                        "\n<INBOX_NOTIFICATIONS>\nNo items are waiting in the agent "
+                        "inbox right now.\n</INBOX_NOTIFICATIONS>\n"
+                    )
+        except Exception:  # noqa: BLE001 - the inbox must never fail a turn
+            logger.debug("Inbox status unavailable for the prompt", exc_info=True)
+
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended
     # just above), so measure the prompt's tokens manually NOW and cache the

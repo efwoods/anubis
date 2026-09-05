@@ -288,6 +288,16 @@ class GlobalState(TypedDict):
 
     route_decision: str = ""
 
+    """ Conversation compaction """
+
+    # The deep agent's summarization event (cutoff index + summary message),
+    # mirrored from the deep agent's private state so a compacted conversation
+    # is reused on the next turn instead of being summarized again. Written by
+    # ``think`` (see ``_run_avatar_deep_agent_turn``) and read back into the deep
+    # agent's input on the following turn.
+    conversation_summary_event: Optional[Dict[str, Any]] = None
+    conversation_summary_session_id: Optional[str] = None
+
     """ Model Metrics """
     structured_response_calls_count: int = 0
     structured_response_prompt_tokens: int = 0

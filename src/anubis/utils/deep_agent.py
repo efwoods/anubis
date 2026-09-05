@@ -31,11 +31,14 @@ from deepagents.graph import DeepAgentState
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import add_messages
-from typing_extensions import Required
+from typing_extensions import NotRequired, Required
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.middleware.consciousness_refresh_gate import (
     ConsciousnessRefreshGate,
+)
+from src.anubis.utils.middleware.avatar_summarization import (
+    build_avatar_summarization_middleware,
 )
 from src.anubis.utils.middleware.dynamic_consciousness_prompt import (
     DynamicConsciousnessPrompt,
@@ -116,6 +119,16 @@ class AvatarDeepAgentState(DeepAgentState):
     current_user_emotions: str
     current_assistant_emotions: str
 
+    conversation_summary_event: NotRequired[dict[str, Any] | None]
+    conversation_summary_session_id: NotRequired[str | None]
+    """Public mirror of the summarization event, carried across turns.
+
+    ``AvatarSummarizationMiddleware`` reads this key when the deep agent's own
+    private event is absent (every turn runs on a fresh deep-agent thread) and
+    writes the newest event back to it; the outer ``think`` node forwards the
+    value between the outer conversation state and this input.
+    """
+
 
 def build_avatar_deep_agent(
     context: GlobalContext | None = None,
@@ -159,18 +172,18 @@ def build_avatar_deep_agent(
 
     model = init_chat_model_unbound(context)
 
-    # ``create_deep_agent`` always installs its own
-    # ``SummarizationMiddleware`` (via
-    # ``deepagents.middleware.summarization.create_summarization_middleware``)
-    # with model-aware fraction/token defaults. Passing another
-    # ``SummarizationMiddleware`` instance here would collide on
-    # ``middleware.name == "SummarizationMiddleware"`` and trip the
-    # duplicate-middleware assertion in ``create_agent``. We therefore
-    # rely on the built-in summarization and only inject avatar-specific
-    # middleware (consciousness refresh gate + dynamic prompt). The
-    # ``deep_agent_summarization_*`` env vars are kept on
-    # ``GlobalContext`` as future hooks for a harness-profile-based
-    # override path.
+    # ``create_deep_agent`` installs its own ``SummarizationMiddleware`` (via
+    # ``deepagents.middleware.summarization.create_summarization_middleware``).
+    # deepagents merges caller-supplied middleware by NAME and replaces a
+    # same-named default in place, so the avatar's summarizer below — which
+    # keeps the name ``"SummarizationMiddleware"`` — takes the built-in's slot
+    # rather than running beside the built-in. The avatar's summarizer honours
+    # ``DEEP_AGENT_SUMMARIZATION_MAX_TOKENS`` / ``..._KEEP_LAST_N_MESSAGES``,
+    # summarizes with a conversation-oriented prompt (relationship facts, tone,
+    # ambient observations, open threads), and mirrors the summarization event
+    # onto the public ``conversation_summary_event`` key so the outer workflow
+    # carries the compaction across turns (the deep agent runs on a fresh
+    # thread every turn, which would otherwise discard the event).
 
     tools: list[Any] = [
         *IDENTITY_TOOLS,
@@ -184,6 +197,7 @@ def build_avatar_deep_agent(
         load_consciousness_tool_name=LOAD_CONSCIOUSNESS_TOOL_NAME,
     )
     dynamic_prompt = DynamicConsciousnessPrompt()
+    summarization = build_avatar_summarization_middleware(context, model, backend)
 
     analysis_tool_count = len(extra_tools) if extra_tools else 0
     logger.info(
@@ -198,7 +212,7 @@ def build_avatar_deep_agent(
         model=model,
         tools=tools,
         system_prompt=None,
-        middleware=[refresh_gate, dynamic_prompt],
+        middleware=[refresh_gate, dynamic_prompt, summarization],
         state_schema=AvatarDeepAgentState,
         checkpointer=checkpointer,
         store=store,

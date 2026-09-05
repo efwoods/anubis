@@ -17,6 +17,7 @@ from datetime import datetime, timezone, UTC
 
 # Add metrics imports
 from time import time_ns
+from types import SimpleNamespace
 from typing import Annotated, Any, List, Literal, Optional
 from uuid import UUID, uuid4
 
@@ -123,7 +124,10 @@ from src.anubis.utils.avatar_deletion import (
 )
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
-from src.anubis.utils.store_cache import invalidate_store_cache_entry
+from src.anubis.utils.store_cache import (
+    invalidate_store_cache_entry,
+    invalidate_store_cache_for_assistant,
+)
 from src.api.media_jobs import (
     MediaJob,
     create_child_job,
@@ -641,7 +645,12 @@ async def _meter_message_usage(
         prompt_tokens = int(token_usage.get("prompt_tokens") or 0)
         completion_tokens = int(token_usage.get("completion_tokens") or 0)
         total_tokens = billable_tokens_from_metadata(response_metadata)
-        model_name = (response_metadata or {}).get("model_name")
+        # langchain_openai stamps model_name on the streamed reply; other providers
+        # may not, so fall back to the configured model rather than dropping the
+        # turn from the per-model Prometheus counters below.
+        model_name = (response_metadata or {}).get("model_name") or getattr(
+            getattr(app_state, "context", None), "model", None
+        )
         cost_usd = float((response_metadata or {}).get("total_cost") or 0.0)
 
         stripe_customer_id = resolve_stripe_customer_id(current_user)
@@ -741,6 +750,9 @@ async def _meter_message_usage(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
+            # Dollar cost of this turn at the configured MODEL_PROMPT_COST /
+            # MODEL_COMPLETION_COST rates (derived in graph._attach_token_usage_metadata).
+            "cost_usd": cost_usd,
             **usage_snapshot,
             **metering_bypass.usage_response_fields(),
         }
@@ -929,6 +941,61 @@ def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
     return last_ai
 
 
+async def _meter_image_description_usage(
+    app_state,
+    current_user: dict,
+    payload: dict,
+    *,
+    assistant_id: Optional[str],
+    thread_id: Optional[str],
+    request_id: Optional[str],
+) -> None:
+    """Record one image-description call from the graph (``api_metrics`` + Stripe).
+
+    Emitted by ``resolve_human_message_images`` as an ``image_description_usage``
+    stream event. Best-effort like every other metering write; the admin
+    testing account and the dev enforcement-only bypass skip the writes the
+    same way the messaging meter does.
+    """
+    try:
+        metering_bypass = resolve_metering_bypass(
+            current_user, assistant_id=assistant_id
+        )
+        if metering_bypass.skips_metering_writes:
+            return
+        total_tokens = int(payload.get("total_tokens") or 0)
+        stripe_customer_id = resolve_stripe_customer_id(current_user)
+        if total_tokens > 0:
+            await report_meter_event(
+                app_state.stripe,
+                UsageMeter.MESSAGING_TOKENS,
+                stripe_customer_id,
+                total_tokens,
+                idempotency_identifier=(
+                    f"{request_id}:image_description:{payload.get('source') or ''}"
+                    if request_id
+                    else None
+                ),
+            )
+        await persist_api_metrics_row(
+            getattr(app_state, "pool", None),
+            inference_type="image_description",
+            prompt_tokens=int(payload.get("input_tokens") or 0),
+            completion_tokens=int(payload.get("output_tokens") or 0),
+            total_tokens=total_tokens,
+            cost_usd=float(payload.get("total_cost") or 0.0),
+            latency_ms=float(payload.get("latency_ms") or 0.0),
+            user_id=resolve_metering_user_id(current_user),
+            stripe_customer_id=stripe_customer_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            model_name=payload.get("model_name"),
+            meter_event_name=UsageMeter.MESSAGING_TOKENS.value,
+        )
+    except Exception:  # noqa: BLE001 - metering never fails the stream
+        logger.debug("Could not meter an image description", exc_info=True)
+
+
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -964,6 +1031,7 @@ async def message_graph_sse(
     """
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
+    ambient_decision: dict | None = None
 
     # Pre-call estimate + allotment snapshot (reporting only).
     if (
@@ -1001,6 +1069,12 @@ async def message_graph_sse(
             if payload.get("type") == "assistant_token":
                 accumulated_chunks.append(payload.get("text") or "")
                 yield f"data: {json.dumps(payload)}\n\n"
+            elif payload.get("type") == "status":
+                # The deep agent started or finished a tool. Forwarded so the
+                # client can say what the avatar is doing during a token-less
+                # stretch such as a data-analysis turn. The frame carries the
+                # human-readable phrase and the tool name, never tool arguments.
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
             elif payload.get("type") == "media_job_started":
                 # The in-chat identity-update tool started a media batch; the
                 # client follows it on GET /media_job/{job_id}/progress.
@@ -1012,6 +1086,27 @@ async def message_graph_sse(
                 # reset the client's idle-read timer, preventing a premature
                 # "Error in input stream" while the metadata is computed.
                 yield ": keepalive\n\n"
+            elif payload.get("type") == "ambient_decision":
+                # The graph triaged an ambient observation (ignore / respond /
+                # notify). Forwarded as its own frame so the client knows the
+                # decision before any reply tokens, and repeated on ``done``.
+                ambient_decision = {
+                    key: value for key, value in payload.items() if key != "type"
+                }
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
+            elif payload.get("type") == "image_description_usage":
+                # One vision call described an attached image (a typed turn's
+                # attachment or an ambient snapshot). Metered here because the
+                # graph node has no request context; never surfaced as a frame.
+                if app_state is not None and current_user is not None:
+                    await _meter_image_description_usage(
+                        app_state,
+                        current_user,
+                        payload,
+                        assistant_id=assistant_id,
+                        thread_id=thread_id,
+                        request_id=request_id,
+                    )
         elif mode == "updates" and isinstance(payload, dict):
             ai = _latest_ai_from_stream_update(payload)
             if ai is not None:
@@ -1059,11 +1154,24 @@ async def message_graph_sse(
     )
     if response_metadata:
         done["response_metadata"] = response_metadata
+    if ambient_decision is not None:
+        done["ambient"] = ambient_decision
 
     # Always accrue actual model API usage BEFORE the terminal frame. Reporting
     # the usage block on ``done`` is optional (``include_usage_metrics``);
-    # metering failure is fail-open and just omits the usage block.
-    if app_state is not None and current_user is not None:
+    # metering failure is fail-open and just omits the usage block. An ignored
+    # ambient observation produced no reply and no model usage, so the
+    # messaging meter is left alone (the vision calls were metered above).
+    ignored_ambient_turn = (
+        ambient_decision is not None
+        and ambient_decision.get("decision") == "ignore"
+        and last_ai is None
+    )
+    if (
+        app_state is not None
+        and current_user is not None
+        and not ignored_ambient_turn
+    ):
         turn_usage = await _meter_message_usage(
             app_state=app_state,
             current_user=current_user,
@@ -1092,6 +1200,13 @@ class FeedbackData(BaseModel):
     rating: Optional[float] = None  # 1-5 scale for 'rating' type
     comment: Optional[str] = None
     edited_response: Optional[str] = None  # User edited the response
+
+
+class ConnectMcpRequest(BaseModel):
+    """Bind a Neural Nexus machine to the personal avatar immediately."""
+
+    device_id: Optional[str] = None
+    device_label: Optional[str] = None
 
 
 class MessageResponse(BaseModel):
@@ -1493,6 +1608,19 @@ async def lifespan(app: FastAPI):
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
+        # Keep the unmodified-inference-model style baseline in step with MODEL:
+        # a boot whose MODEL differs from the model recorded with the committed
+        # baseline retrains it ONCE (coordinated through the shared store) or adopts
+        # a sibling container's published result. Never blocks or fails startup.
+        try:
+            from src.anubis.utils.dataset.baseline_provenance import (
+                ensure_baseline_matches_model,
+            )
+
+            app.state.baseline_retrain_task = await ensure_baseline_matches_model(app.state)
+        except Exception as baseline_check_error:  # noqa: BLE001 - startup must not fail
+            logger.error("Baseline provenance check failed: %s", baseline_check_error)
+            app.state.baseline_retrain_task = None
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
@@ -3871,6 +3999,115 @@ async def disconnect_mcp(
         )
 
 
+@app.post("/connect_mcp")
+async def connect_mcp(
+    request: Request,
+    body: ConnectMcpRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Bind a reachable Neural Nexus machine to the personal avatar now.
+
+    ``mcp_auto_adopt`` only runs at the start of a graph turn. A Connect-now
+    click cannot wait for the next message: this endpoint clears suppression
+    and writes the connection immediately so the daemon is attached this
+    instant if it is reachable.
+    """
+    from src.anubis.utils.personal_avatar import resolve_personal_avatar
+    from src.anubis.utils.tools.data_analysis.discovery import (
+        clear_declined,
+        resolve_available_connections,
+        save_user_connection,
+    )
+
+    store = request.app.state.store
+    context = request.app.state.context
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The connection store is not available right now.",
+        )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    try:
+        personal_avatar = await resolve_personal_avatar(
+            client, request, current_user, token
+        )
+    except Exception as resolution_error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error resolving the personal avatar: {resolution_error}",
+        )
+    if personal_avatar is None:
+        raise HTTPException(
+            status_code=500,
+            detail="The personal avatar could not be provisioned.",
+        )
+    assistant_id = personal_avatar.get("assistant_id")
+    if not assistant_id:
+        raise HTTPException(
+            status_code=500,
+            detail="The personal avatar has no identifier.",
+        )
+
+    available = await resolve_available_connections(
+        store, user_id, context, ignore_failure_backoff=True
+    )
+    requested_device_id = (body.device_id if body else None) or None
+    requested_label = (body.device_label if body else None) or None
+    if requested_device_id:
+        requested_device_id = requested_device_id.removeprefix("device:")
+
+    selected = available
+    if requested_device_id:
+        selected = [
+            connection
+            for connection in available
+            if connection.device_id == requested_device_id
+        ]
+    elif requested_label:
+        lowered = requested_label.strip().lower()
+        selected = [
+            connection
+            for connection in available
+            if (connection.device_label or "").strip().lower() == lowered
+        ]
+
+    if not selected:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No Neural Nexus machine is reachable right now. "
+                "Confirm the daemon is running, then connect again."
+            ),
+        )
+
+    connected_labels: list[str] = []
+    for connection in selected:
+        await save_user_connection(
+            store,
+            user_id,
+            connection=connection,
+            assistant_id=assistant_id,
+        )
+        await clear_declined(store, user_id, assistant_id, connection.device_id)
+        connected_labels.append(connection.device_label or connection.device_id)
+
+    return JSONResponse(
+        content={
+            "connected": True,
+            "connected_devices": connected_labels,
+            "message": (
+                "Connected to "
+                + ", ".join(connected_labels)
+                + " now."
+            ),
+        },
+        status_code=200,
+    )
+
+
 @app.get("/list_mcp_connections")
 async def list_mcp_connections(
     current_user: dict = Depends(get_current_user),
@@ -4451,6 +4688,87 @@ async def list_user_avatars(
         raise HTTPException(detail=error, status_code=500)
 
 
+def enforce_ambient_request(
+    current_user: dict,
+    *,
+    files: OptionalUploadFiles,
+    image_filenames: list,
+    sources: Optional[str],
+    captured_at: Optional[str],
+    voice_mode: bool,
+    thread_id: Optional[str],
+) -> dict:
+    """Gate an ``ambient=true`` turn and build the hidden message's tag.
+
+    Ambient observations are webcam / screen snapshots the browser sends on a
+    timer, so the checks here are the ones a typed turn does not need: the
+    deployment switch, a signed-in caller (an anonymous visitor on a shared
+    avatar never watches through the owner's allotment), at least one attached
+    file, a per-image size ceiling, and a per-thread minimum interval that a
+    misconfigured or hostile client cannot beat (429 with ``Retry-After``).
+    Returns the ``additional_kwargs`` that mark the ``HumanMessage`` hidden and
+    carry the observation record the graph's triage node completes.
+    """
+    from src.anubis.utils.ambient.observations import (
+        ambient_throttle,
+        build_ambient_additional_kwargs,
+        resolve_sources,
+    )
+
+    ambient_context = GlobalContext()
+    if str(ambient_context.ambient_capture_enabled or "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        raise HTTPException(
+            status_code=404, detail="Ambient vision is not enabled on this deployment."
+        )
+    if is_anonymous_user(current_user):
+        raise HTTPException(
+            status_code=403, detail="Ambient vision requires a signed-in user."
+        )
+    attached = list(files or [])
+    if not attached:
+        raise HTTPException(
+            status_code=422,
+            detail="An ambient observation needs at least one attached snapshot.",
+        )
+    max_bytes = int(ambient_context.ambient_capture_max_image_bytes or 0)
+    for attached_file in attached:
+        size = getattr(attached_file, "size", None)
+        if max_bytes and size and int(size) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Snapshot {attached_file.filename or ''} is larger than the "
+                    f"{max_bytes} byte ceiling for ambient observations."
+                ),
+            )
+    seconds_to_wait = ambient_throttle.check_and_mark(
+        thread_id, float(ambient_context.ambient_capture_min_interval_seconds or 0)
+    )
+    if seconds_to_wait is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Ambient observations on this conversation are limited to one every "
+                f"{ambient_context.ambient_capture_min_interval_seconds:g} seconds."
+            ),
+            headers={"Retry-After": str(int(seconds_to_wait) + 1)},
+        )
+    resolved_sources = resolve_sources(
+        [attached_file.filename or "" for attached_file in attached], sources
+    )
+    return build_ambient_additional_kwargs(
+        sources=resolved_sources,
+        captured_at=captured_at,
+        voice_mode=voice_mode,
+        image_filenames=list(image_filenames or []),
+    )
+
+
 async def process_files_for_message(
     files: OptionalUploadFiles = None,
     message: str = "",
@@ -4613,8 +4931,21 @@ async def message_avatar(
     include_quality_metrics: bool = Form(True),
     include_usage_metrics: bool = Form(True),
     adapter: bool = Form(False),
+    ambient: bool = Form(False),
+    sources: Optional[str] = Form(None),
+    captured_at: Optional[str] = Form(None),
+    voice_mode: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
+    # ``ambient=true`` marks this turn as an ambient observation: the attached
+    # files are webcam / screen snapshots (``sources`` names each file's origin,
+    # aligned with ``files``; ``captured_at`` is the browser's timestamp;
+    # ``voice_mode`` says whether the conversation partner is in voice mode).
+    # The turn is stored hidden in the thread, described into text, and
+    # triaged by the graph as ignore / respond / notify. A future microphone
+    # clip rides the same call as another source, so the avatar always receives
+    # one message per capture tick. Signed-in callers only; the API enforces a
+    # minimum interval per thread.
     # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
     # data-collection / preference-learning pipeline is intentionally deferred
     # while the upload + evaluation pipeline ships first; the parameters exist
@@ -4661,6 +4992,17 @@ async def message_avatar(
         multimodal_content,
         image_filenames,
     ) = await process_files_for_message(files, message=message)
+    ambient_additional_kwargs: dict | None = None
+    if ambient:
+        ambient_additional_kwargs = enforce_ambient_request(
+            current_user,
+            files=files,
+            image_filenames=image_filenames,
+            sources=sources,
+            captured_at=captured_at,
+            voice_mode=voice_mode,
+            thread_id=thread_id,
+        )
 
     user_name = your_name
     user_description = your_description
@@ -4794,7 +5136,8 @@ async def message_avatar(
         human_message = HumanMessage(
             id=str(uuid4()),
             content=multimodal_content,
-            additional_kwargs={"image_filenames": image_filenames},
+            additional_kwargs=ambient_additional_kwargs
+            or {"image_filenames": image_filenames},
         )
     else:
         # Use text-only content
@@ -4805,7 +5148,37 @@ async def message_avatar(
                 human_message_content = file_text_content
         else:
             human_message_content = message
-        human_message = HumanMessage(id=str(uuid4()), content=human_message_content)
+        if ambient_additional_kwargs is not None:
+            # An ambient observation without an image (for example a
+            # microphone-only capture): keep the observation header so the
+            # triage node still recognises the turn.
+            from src.anubis.utils.ambient.observations import observation_header
+
+            human_message_content = (
+                observation_header(ambient_additional_kwargs["ambient"])
+                + "\n"
+                + (human_message_content or "")
+            )
+        human_message_additional_kwargs = ambient_additional_kwargs or {}
+        if ambient_additional_kwargs is None:
+            from src.anubis.utils.client_harvest_turns import (
+                CLIENT_HARVEST_MESSAGE_KIND,
+                is_client_harvest_marker_text,
+            )
+
+            # A browser harvest (follow-up chips, a profile description) is
+            # machine traffic: hidden from the transcript like an ambient
+            # observation, and dropped from later turns' model input.
+            if is_client_harvest_marker_text(human_message_content):
+                human_message_additional_kwargs = {
+                    "hidden": True,
+                    "kind": CLIENT_HARVEST_MESSAGE_KIND,
+                }
+        human_message = HumanMessage(
+            id=str(uuid4()),
+            content=human_message_content,
+            additional_kwargs=human_message_additional_kwargs,
+        )
 
     conversation_title_data = (
         conversation_title if conversation_title != "" else thread_id
@@ -5129,9 +5502,14 @@ async def get_thread_messages(
     request: Request,
     thread_id: str,
     assistant_id: str,
+    include_hidden: bool = False,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Return the message history for a single thread.
+
+    Hidden turns — ambient webcam/screen observations the conversation partner
+    never typed — are dropped unless ``include_hidden=true``; the avatar's
+    replies to them stay in the transcript.
 
     ``assistant_id`` is not decoration: the thread is verified to belong to that
     avatar AND to this caller before any message is returned. Without the check
@@ -5167,9 +5545,64 @@ async def get_thread_messages(
     try:
         state = await langgraph_client.threads.get_state(thread_id=thread_id)
         messages = state.get("values", {}).get("messages", []) if state else []
+        if not include_hidden:
+            from src.anubis.utils.ambient.observations import is_hidden_message
+            from src.anubis.utils.client_harvest_turns import (
+                without_stale_client_harvest_turns,
+            )
+
+            # Harvest turns from earlier browser builds were stored without
+            # the hidden flag; drop them and their JSON replies here too.
+            messages = without_stale_client_harvest_turns(
+                [message for message in messages if not is_hidden_message(message)]
+            )
         return JSONResponse({"messages": messages})
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
+
+
+@app.post("/ambient_preferences/{assistant_id}")
+async def record_ambient_preference_route(
+    assistant_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record the conversation partner's decision on an ambient notification card.
+
+    Body, in the Agent Inbox ``HumanResponse`` shape plus the observation it
+    answers: ``{"observation_id", "observation_kind", "summary",
+    "type": "ignore" | "response" | "accept", "args": text | null}``. The
+    decision is stored as a preference in the LangGraph store and recalled as
+    precedent the next time a similar scene is triaged; nothing is resumed and
+    no reply is generated (a reply is simply the next ordinary turn).
+    """
+    from src.anubis.utils.ambient.preferences import record_ambient_preference
+
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    decision_type = str(body.get("type") or "").strip().lower()
+    if decision_type not in ("accept", "ignore", "response"):
+        raise HTTPException(
+            status_code=400, detail="type must be accept, ignore, or response."
+        )
+    note = body.get("args")
+    note = note.strip() if isinstance(note, str) else None
+    recorded = await record_ambient_preference(
+        getattr(app.state, "store", None),
+        current_user["identities"][0]["user_id"],
+        assistant_id.strip(),
+        observation_kind=str(body.get("observation_kind") or "other"),
+        summary=str(body.get("summary") or ""),
+        decision=decision_type,
+        note=note,
+    )
+    return JSONResponse(
+        {
+            "recorded": recorded is not None,
+            "observation_id": body.get("observation_id"),
+            "preference": recorded,
+        }
+    )
 
 
 ALLOWED_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
@@ -5333,14 +5766,30 @@ def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
 
 
 async def probe_remote_url_content_type(url: str) -> str:
-    """Best-effort Content-Type for a remote URL (HEAD, then ranged GET + sniff)."""
+    """Best-effort Content-Type for a remote URL (HEAD, then ranged GET + sniff).
+
+    Known MediaWiki article URLs (Fandom, Wikipedia, wiki.gg) are ``text/html``
+    even when the HTML skin is Cloudflare-challenged: the parse API on the
+    same host is what ``fetch_remote_url_bytes`` will actually download.
+    A failed HEAD (403 challenge page) must not be treated as the type.
+    """
+    from src.anubis.utils.classes.URLDocumentLoaderClass import (
+        mediawiki_article_api_target,
+    )
+
+    if mediawiki_article_api_target(url):
+        return "text/html"
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
         head_ct = ""
         try:
             head = await client.head(url)
-            head_ct = (
-                (head.headers.get("content-type") or "").split(";")[0].strip().lower()
-            )
+            if head.status_code < 400:
+                head_ct = (
+                    (head.headers.get("content-type") or "")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
         except Exception:
             pass
         if head_ct and head_ct != "application/octet-stream":
@@ -5383,10 +5832,43 @@ async def fetch_remote_url_bytes(
     url: str,
     max_bytes: int = MAX_REMOTE_URL_DOWNLOAD_BYTES,
 ) -> tuple[bytes, str]:
-    """Download a URL and return (body, Content-Type without parameters)."""
+    """Download a URL and return (body, Content-Type without parameters).
+
+    MediaWiki article URLs are fetched through the parse API so Fandom
+    ``/wiki/…`` pages (Cloudflare-challenged HTML skins) still ingest.
+    """
+    from src.anubis.utils.classes.URLDocumentLoaderClass import (
+        ARTICLE_FETCH_USER_AGENT,
+        fetch_mediawiki_article_html,
+    )
+
+    mediawiki = await fetch_mediawiki_article_html(url)
+    if mediawiki is not None:
+        body, header_ct = mediawiki
+        if len(body) > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Remote resource exceeds maximum download size ({max_bytes} bytes)."
+                ),
+            )
+        return body, header_ct
     async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+        try:
+            r = await client.get(
+                url, headers={"User-Agent": ARTICLE_FETCH_USER_AGENT}
+            )
+            r.raise_for_status()
+        except httpx.HTTPStatusError as fetch_error:
+            status = (
+                fetch_error.response.status_code
+                if fetch_error.response is not None
+                else "unknown"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not fetch URL (HTTP {status}).",
+            ) from fetch_error
         body = r.content
         if len(body) > max_bytes:
             raise HTTPException(
@@ -5968,7 +6450,14 @@ async def get_avatar_emotion_media_asset(
 
 
 async def _run_emotion_media_job(
-    job_id: str, user_id: str, assistant_id: str, reference_image_data_uri: str, only_missing: bool
+    job_id: str,
+    user_id: str,
+    assistant_id: str,
+    reference_image_data_uri: str,
+    only_missing: bool,
+    emotions: tuple[str, ...] | None = None,
+    asset_kinds: tuple[str, ...] | None = None,
+    extra_prompt: str | None = None,
 ) -> None:
     from src.anubis.utils.billing.metering import persist_api_metrics_row
     from src.anubis.utils.media_assets import get_media_asset_repository
@@ -6010,6 +6499,9 @@ async def _run_emotion_media_job(
             assistant_id=assistant_id,
             reference_image_data_uri=reference_image_data_uri,
             only_missing=only_missing,
+            emotions=emotions,
+            asset_kinds=asset_kinds,
+            extra_prompt=extra_prompt,
             progress=_progress,
             metrics=_record_metric,
         )
@@ -6031,18 +6523,36 @@ async def regenerate_avatar_emotion_media(
     """(Re)build an avatar's emotion stills and idle loops from its reference image.
 
     Body: ``assistant_id``, optional ``only_missing`` (default true — retry what
-    failed rather than paying for the whole set again). Runs as a durable job in
-    ``avatar_media_jobs``; poll ``GET /avatar_media_jobs/{job_id}``.
+    failed rather than paying for the whole set again), optional ``emotion`` and
+    ``asset_kind`` (``still`` or ``idle_loop``) to redo one asset, optional
+    ``prompt`` appended to that generation so the owner can improve a video or
+    portrait. Runs as a durable job in ``avatar_media_jobs``; poll
+    ``GET /avatar_media_jobs/{job_id}``.
     """
     from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_assets.repository import (
+        ASSET_KIND_IDLE_LOOP,
+        ASSET_KIND_STILL,
+    )
     from src.anubis.utils.media_generation.emotion_media import emotion_media_enabled
+    from src.anubis.utils.media_generation.prompts import BASE_EMOTIONS
 
     body = await request.json()
     body = body if isinstance(body, dict) else {}
     assistant_id = str(body.get("assistant_id") or "").strip()
-    only_missing = bool(body.get("only_missing", True))
+    emotion = str(body.get("emotion") or "").strip() or None
+    asset_kind = str(body.get("asset_kind") or "").strip() or None
+    extra_prompt = str(body.get("prompt") or "").strip() or None
+    targeted = bool(emotion or asset_kind or extra_prompt)
+    only_missing = bool(body.get("only_missing", not targeted))
     if not assistant_id:
         raise HTTPException(status_code=400, detail="assistant_id is required")
+    if emotion and emotion not in BASE_EMOTIONS:
+        raise HTTPException(status_code=400, detail=f"Unknown emotion {emotion!r}.")
+    if asset_kind and asset_kind not in (ASSET_KIND_STILL, ASSET_KIND_IDLE_LOOP):
+        raise HTTPException(
+            status_code=400, detail="asset_kind must be still or idle_loop."
+        )
     enforce_tier_capability(current_user, TierCapability.UPLOAD)
     await resolve_assistant_for_creator(
         assistant_id, current_user, action_description="regenerate media for that avatar"
@@ -6064,14 +6574,74 @@ async def regenerate_avatar_emotion_media(
         user_id=user_id,
         assistant_id=assistant_id,
         job_kind="emotion_media",
-        detail={"only_missing": only_missing},
+        detail={
+            "only_missing": only_missing,
+            "emotion": emotion,
+            "asset_kind": asset_kind,
+            "prompt": extra_prompt,
+        },
     )
     asyncio.create_task(
-        _run_emotion_media_job(job_id, user_id, assistant_id, reference_image_data_uri, only_missing)
+        _run_emotion_media_job(
+            job_id,
+            user_id,
+            assistant_id,
+            reference_image_data_uri,
+            only_missing,
+            emotions=(emotion,) if emotion else None,
+            asset_kinds=(asset_kind,) if asset_kind else None,
+            extra_prompt=extra_prompt,
+        )
     )
     return JSONResponse(
         status_code=202,
         content={"job_id": job_id, "status_url": f"/avatar_media_jobs/{job_id}"},
+    )
+
+
+@app.delete("/avatar_emotion_media/{asset_id}")
+async def delete_avatar_emotion_media_asset(
+    asset_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete one generated emotion still or idle loop."""
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_assets.repository import ASSET_KIND_LIP_SYNC
+
+    repository = get_media_asset_repository()
+    if repository is None:
+        raise HTTPException(status_code=404, detail="No such asset.")
+    asset = await repository.get_emotion_asset(asset_id)
+    if asset is None or asset.get("asset_kind") == ASSET_KIND_LIP_SYNC:
+        raise HTTPException(status_code=404, detail="No such asset.")
+    await resolve_assistant_for_creator(
+        asset["assistant_id"],
+        current_user,
+        action_description="delete generated media for that avatar",
+    )
+    await repository.delete_emotion_asset(asset_id)
+    return Response(status_code=204)
+
+
+@app.get("/avatar_media_jobs")
+async def list_avatar_media_jobs(
+    assistant_id: str,
+    job_kind: str | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """List this avatar's durable media jobs, newest first."""
+    from src.anubis.utils.media_assets import get_media_asset_repository
+
+    await resolve_assistant_for_creator(
+        assistant_id, current_user, action_description="list media jobs for that avatar"
+    )
+    repository = get_media_asset_repository()
+    if repository is None:
+        return JSONResponse({"jobs": []})
+    jobs = await repository.list_jobs(assistant_id=assistant_id, job_kind=job_kind)
+    user_id = current_user["identities"][0]["user_id"]
+    return JSONResponse(
+        {"jobs": [job for job in jobs if job.get("user_id") == user_id]}
     )
 
 
@@ -6165,6 +6735,7 @@ async def get_avatar_voice(
         user_id=current_user["identities"][0]["user_id"],
         assistant_id=assistant_id,
         is_personal_avatar=is_personal,
+        store=app.state.store,
     )
     return JSONResponse(status.as_dict())
 
@@ -6186,6 +6757,10 @@ async def add_avatar_voice_sample(
     """
     from src.anubis.utils.utility import isolate_dominant_speaker_audio_b64
     from src.anubis.utils.voice.corpus import add_voice_clip, voice_status_for
+    from src.anubis.utils.voice.reference_audio import (
+        read_reference_audio,
+        store_reference_audio,
+    )
 
     repository = _voice_repository_or_503()
     enforce_tier_capability(current_user, TierCapability.UPLOAD)
@@ -6198,14 +6773,18 @@ async def add_avatar_voice_sample(
         raise HTTPException(status_code=400, detail="The recording is empty.")
     mime_type = audio.content_type or "audio/webm"
     data_uri = make_data_uri(mime_type, raw)
+    sample_filename = audio.filename or "voice-sample.webm"
 
     try:
+        # Recorder takes are one person talking; keep that single speaker so
+        # the take yields a clip with a duration instead of the passthrough.
         isolated = await isolate_dominant_speaker_audio_b64(
             data_uri,
             context=app.state.context,
-            filename=audio.filename or "voice-sample",
+            filename=sample_filename,
             content_type=mime_type,
             reference_audio=False,
+            allow_single_speaker=True,
         )
     except Exception as isolation_error:  # noqa: BLE001
         raise HTTPException(
@@ -6227,37 +6806,35 @@ async def add_avatar_voice_sample(
         audio_data_uri=clip_uri,
         duration_seconds=seconds,
         source="recorder",
-        source_document_name=audio.filename,
+        source_document_name=sample_filename,
         is_personal_avatar=is_personal,
         avatar_name=assistant.get("name") or "",
     )
 
     # The diarizer needs a short single-speaker anchor for later uploads; the
-    # first take supplies it when nothing has been stored yet.
-    reference_namespace = (user_id, assistant_id, "reference_audio")
-    try:
-        existing_reference = await app.state.store.aget(reference_namespace, assistant_id)
-    except Exception:  # noqa: BLE001
-        existing_reference = None
-    if existing_reference is None:
+    # first take supplies it when nothing has been stored yet. The helper
+    # stores a listable Document under the same filename as the clip above so
+    # the document list can show which recording is the reference.
+    if await read_reference_audio(app.state.store, user_id, assistant_id) is None:
         try:
             anchor = await isolate_dominant_speaker_audio_b64(
                 data_uri,
                 context=app.state.context,
-                filename=audio.filename or "voice-sample",
+                filename=sample_filename,
                 content_type=mime_type,
                 reference_audio=True,
             )
-            await app.state.store.aput(
-                reference_namespace,
-                key=assistant_id,
-                value={
-                    "reference_audio_data": anchor.get("audio_base64_preprocessed"),
-                    "document": {
-                        "page_content": anchor.get("text") or "",
-                        "metadata": {"reference_audio": True, "source": "recorder"},
-                    },
-                },
+            await store_reference_audio(
+                app.state.store,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                audio_data_uri=anchor.get("audio_base64_preprocessed") or "",
+                transcript_text=anchor.get("text") or "",
+                filename=sample_filename,
+                namespace_filename=_namespace_safe_formatted_filename(sample_filename),
+                duration_seconds=anchor.get("duration"),
+                source="recorder",
+                replace=False,
             )
         except Exception:  # noqa: BLE001
             logger.debug("Could not store a diarizer reference from the recording", exc_info=True)
@@ -6268,8 +6845,95 @@ async def add_avatar_voice_sample(
         user_id=user_id,
         assistant_id=assistant_id,
         is_personal_avatar=is_personal,
+        store=app.state.store,
     )
     return JSONResponse({"added_seconds": seconds, **status.as_dict()})
+
+
+@app.post("/avatar_voice/reference")
+async def set_avatar_voice_reference(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Point the avatar's reference clip at a different upload.
+
+    Body: ``assistant_id``, ``source_document_name``. The named upload must
+    already have speech in the voice corpus; the longest stored clip cut from
+    that upload is re-isolated into a short single-speaker reference and
+    replaces the stored reference. Nothing else changes: the avatar's identity
+    documents and the trained voice are untouched.
+    """
+    from src.anubis.utils.utility import isolate_dominant_speaker_audio_b64
+    from src.anubis.utils.voice.corpus import (
+        clip_data_uri,
+        longest_clip_for_document,
+        voice_status_for,
+    )
+    from src.anubis.utils.voice.reference_audio import store_reference_audio
+
+    repository = _voice_repository_or_503()
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    source_document_name = str(body.get("source_document_name") or "").strip()
+    if not assistant_id or not source_document_name:
+        raise HTTPException(
+            status_code=400, detail="assistant_id and source_document_name are required."
+        )
+    _assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "change that avatar's reference audio"
+    )
+    user_id = current_user["identities"][0]["user_id"]
+
+    clip = await longest_clip_for_document(repository, assistant_id, source_document_name)
+    if clip is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No stored speech for {source_document_name}. Only uploads that "
+                "contributed to the voice can become the reference."
+            ),
+        )
+    try:
+        anchor = await isolate_dominant_speaker_audio_b64(
+            clip_data_uri(clip),
+            context=app.state.context,
+            filename=source_document_name,
+            content_type=clip.get("mime_type") or "audio/mpeg",
+            reference_audio=True,
+            allow_single_speaker=True,
+        )
+    except Exception as isolation_error:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail=f"The clip could not be prepared as a reference: {isolation_error}",
+        )
+    anchor_uri = anchor.get("audio_base64_preprocessed") or ""
+    if not anchor_uri or not anchor.get("duration"):
+        raise HTTPException(
+            status_code=400, detail="No usable speech was found in that upload."
+        )
+    await store_reference_audio(
+        app.state.store,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        audio_data_uri=anchor_uri,
+        transcript_text=anchor.get("text") or "",
+        filename=source_document_name,
+        namespace_filename=_namespace_safe_formatted_filename(source_document_name),
+        duration_seconds=anchor.get("duration"),
+        source="owner_selection",
+        replace=True,
+    )
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+        store=app.state.store,
+    )
+    return JSONResponse(status.as_dict())
 
 
 @app.get("/avatar_voice/verification")
@@ -9006,6 +9670,23 @@ async def list_avatar_documents(
 
     uploaded_document_labels = sorted(reference_role_by_document_label)
 
+    # Seconds of the avatar's speech stored per upload, so the client can show
+    # which uploads feed the voice model. Best-effort: no repository or a read
+    # failure leaves every document at zero.
+    from src.anubis.utils.media_assets import get_media_asset_repository
+
+    voice_seconds_by_label: dict[str, float] = {}
+    voice_repository = get_media_asset_repository()
+    if voice_repository is not None:
+        try:
+            from src.anubis.utils.voice.corpus import voice_seconds_by_document
+
+            voice_seconds_by_label = voice_seconds_by_document(
+                await voice_repository.list_voice_clips(assistant_id)
+            )
+        except Exception as voice_error:  # noqa: BLE001
+            logger.debug("Voice seconds unavailable for %s: %s", assistant_id, voice_error)
+
     return {
         # Unchanged shape: the plain label list every existing caller reads, and
         # the exact strings /delete_avatar_document accepts back.
@@ -9021,6 +9702,8 @@ async def list_avatar_documents(
                 == "reference_image",
                 "is_reference_audio": reference_role_by_document_label[label]
                 == "reference_audio",
+                "voice_seconds": round(voice_seconds_by_label.get(label, 0.0), 1),
+                "in_voice_corpus": label in voice_seconds_by_label,
             }
             for label in uploaded_document_labels
         ],
@@ -9153,6 +9836,33 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
     invalidate_store_cache_entry(
         (user_id, assistant_id, "reference_image"), assistant_id
     )
+    invalidate_store_cache_entry(
+        (user_id, assistant_id, "reference_audio"), assistant_id
+    )
+
+    # A deleted upload's speech leaves the voice corpus too, so the seconds the
+    # settings panel reports stay truthful. The trained voice is never rebuilt
+    # or removed here. Best-effort, like the feature prune below.
+    from src.anubis.utils.media_assets import get_media_asset_repository
+
+    voice_repository = get_media_asset_repository()
+    if voice_repository is not None:
+        try:
+            from src.anubis.utils.voice.corpus import forget_document_clips
+
+            await forget_document_clips(
+                voice_repository,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                source_document_name=display_name,
+            )
+        except Exception as voice_error:  # noqa: BLE001
+            logger.warning(
+                "voice clip prune failed for %s / %s: %s",
+                assistant_id,
+                display_name,
+                voice_error,
+            )
 
     # Prune the deleted documents' rows from the stylometric "direct quote"
     # feature corpus (a {document_id: [len(FEATURE_NAMES) floats]} dict in the store), then
@@ -9170,6 +9880,330 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
     return JSONResponse(
         content=f"Successfully deleted: {display_name}", status_code=200
     )
+
+
+# ---------------------------------------------------------------------------
+# What an avatar has learned about its own identity (owner-only)
+# ---------------------------------------------------------------------------
+
+# The four store groups that hold what an avatar has learned about ITSELF, keyed
+# by the store namespace's third element and valued by the ``learned_from`` name
+# the API reports. Each group lives under ``(creator_id, assistant_id, <group>)``
+# — the same namespaces ``load_consciousness`` reads every turn
+# (src/anubis/utils/nodes.py) and the conversational correction tools sweep
+# (identity_tools._correction_namespaces). Facts about the *user* live under
+# ``(assistant_id, user_id, "identity")`` and are deliberately not listed here.
+#
+# ``identity`` is a prefix: the media pipeline writes atomic facts under
+# ``(creator_id, assistant_id, "identity", <filename uuid5>)``, and a prefix
+# search sweeps those sub-namespaces along with the root.
+IDENTITY_FACT_GROUPS: dict[str, str] = {
+    "identity_memory": "conversation",
+    "identity": "media",
+    "analysis": "analysis",
+    "memory": "memory",
+}
+
+_FACT_CONTEXT_TAG_PATTERN = re.compile(
+    r"<FACT_CONTEXT>(.*?)</FACT_CONTEXT>", re.DOTALL
+)
+
+
+def _store_item_namespace(item) -> tuple:
+    namespace = getattr(item, "namespace", None)
+    if namespace is None and isinstance(item, dict):
+        namespace = item.get("namespace")
+    return tuple(namespace) if namespace else ()
+
+
+def _store_item_key(item) -> str | None:
+    key = getattr(item, "key", None)
+    if key is None and isinstance(item, dict):
+        key = item.get("key")
+    return key
+
+
+def _store_item_updated_at(item) -> str | None:
+    updated_at = getattr(item, "updated_at", None)
+    if updated_at is None and isinstance(item, dict):
+        updated_at = item.get("updated_at")
+    if isinstance(updated_at, datetime):
+        return updated_at.isoformat()
+    return str(updated_at) if updated_at else None
+
+
+def _identity_fact_row(item, *, learned_from: str) -> dict | None:
+    """Shape one store item into a ``/avatar_identity_facts`` row.
+
+    Returns ``None`` when the item carries no recoverable fact — a raw transcript
+    chunk or reference row that shares the ``identity`` prefix with the atomic
+    biographical facts, or an analysis/memory row with empty content.
+    """
+    from src.anubis.utils.tools.identity.identity_tools import (
+        _extract_clean_fact,
+        _item_document_id,
+        _item_document_kwargs,
+        _page_content_is_wrapped,
+    )
+
+    document_kwargs = _item_document_kwargs(item)
+    metadata = document_kwargs.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    page_content = document_kwargs.get("page_content") or ""
+    is_wrapped = _page_content_is_wrapped(page_content)
+
+    if learned_from == "media":
+        # Only the atomic first-person facts the media pipeline extracted count
+        # as "learned"; the verbatim transcript and description chunks stored
+        # beside them are sources, and Data Uploaded already lists those.
+        is_biographical_fact = (
+            metadata.get("classified_situation") == "biographical_facts"
+        )
+        if not (is_biographical_fact or is_wrapped):
+            return None
+
+    feature = metadata.get("feature") if learned_from == "analysis" else None
+    feature_statement = metadata.get(feature) if isinstance(feature, str) else None
+    if isinstance(feature_statement, str) and feature_statement.strip():
+        fact = feature_statement.strip()
+    else:
+        fact = _extract_clean_fact(item)
+    if not fact:
+        return None
+
+    context = metadata.get("fact_context")
+    if not context and is_wrapped:
+        context_match = _FACT_CONTEXT_TAG_PATTERN.search(page_content)
+        context = context_match.group(1).strip() if context_match else None
+    if not context:
+        context = (
+            metadata.get("supporting_reason")
+            or metadata.get("concise_context_summary")
+            or None
+        )
+
+    source_label = None
+    if learned_from in ("media", "analysis"):
+        source_label, _key = _document_label_and_key(metadata)
+
+    namespace = _store_item_namespace(item)
+    key = _store_item_key(item)
+    created_at = metadata.get("created_at") or _store_item_updated_at(item)
+    return {
+        "fact_id": _item_document_id(item) or key,
+        "fact": fact,
+        "context": context,
+        "learned_from": learned_from,
+        "feature": feature if isinstance(feature, str) else None,
+        "source_label": source_label,
+        "namespace": list(namespace),
+        "key": key,
+        "created_at": created_at,
+        "corrected_from": metadata.get("corrected_from"),
+    }
+
+
+def _identity_fact_sort_key(row: dict) -> str:
+    return row.get("created_at") or ""
+
+
+@app.get("/avatar_identity_facts")
+async def list_avatar_identity_facts(
+    assistant_id: str, current_user: dict = Depends(get_current_user)
+):
+    """Everything the avatar has learned about its own identity, newest first.
+
+    Four groups, reported as ``learned_from``: ``conversation`` (facts the owner
+    told the avatar in chat), ``media`` (first-person biographical facts extracted
+    from uploads), ``analysis`` (derived traits such as beliefs and values), and
+    ``memory`` (episodic memories from the owner's own conversations).
+
+    Only the creator of the avatar may read this — the same creator check
+    ``/list_avatar_documents`` applies — so a visitor chatting with a public
+    avatar learns nothing about what the avatar was taught.
+    """
+    _assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="view what that avatar has learned",
+    )
+    store = app.state.store
+    facts: list[dict] = []
+    counts = {learned_from: 0 for learned_from in IDENTITY_FACT_GROUPS.values()}
+    for namespace_group, learned_from in IDENTITY_FACT_GROUPS.items():
+        namespace = (creator_id, assistant_id, namespace_group)
+        try:
+            items = await store.asearch(namespace, limit=1_000_000)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not read what this avatar has learned: {exc}",
+            ) from exc
+        for item in items or []:
+            row = _identity_fact_row(item, learned_from=learned_from)
+            if row is None:
+                continue
+            facts.append(row)
+            counts[learned_from] += 1
+    facts.sort(key=_identity_fact_sort_key, reverse=True)
+    return {"facts": facts, "counts": counts}
+
+
+def _owned_fact_namespace(
+    namespace_value, *, creator_id: str, assistant_id: str
+) -> tuple:
+    """Validate a namespace the client sends back from the facts listing.
+
+    The tuple must be one of the avatar's own fact groups under the creator's id,
+    so a caller cannot reach another avatar's rows by naming a different tuple.
+    """
+    if not isinstance(namespace_value, (list, tuple)) or len(namespace_value) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="namespace must be the list returned by /avatar_identity_facts.",
+        )
+    namespace = tuple(str(part) for part in namespace_value)
+    if (
+        namespace[0] != creator_id
+        or namespace[1] != assistant_id
+        or namespace[2] not in IDENTITY_FACT_GROUPS
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="That fact does not belong to this avatar.",
+        )
+    return namespace
+
+
+async def _load_owned_fact_item(
+    store, *, creator_id: str, assistant_id: str, body: dict
+) -> tuple[tuple, str, object]:
+    namespace = _owned_fact_namespace(
+        body.get("namespace"), creator_id=creator_id, assistant_id=assistant_id
+    )
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required.")
+    item = await store.aget(namespace, key)
+    if item is None:
+        raise HTTPException(status_code=404, detail="No such fact.")
+    return namespace, key, item
+
+
+@app.delete("/avatar_identity_facts")
+async def delete_avatar_identity_fact(
+    request: Request,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Forget one learned fact. Body: ``{namespace, key}`` from the listing."""
+    _assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="delete what that avatar has learned",
+    )
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    store = app.state.store
+    namespace, key, _item = await _load_owned_fact_item(
+        store, creator_id=creator_id, assistant_id=assistant_id, body=body
+    )
+    await store.adelete(namespace, key)
+    # load_consciousness reads these namespaces through a process-wide
+    # read-through cache; drop the avatar's entries so the forgotten fact does
+    # not ground the next reply.
+    invalidate_store_cache_for_assistant(assistant_id)
+    return Response(status_code=204)
+
+
+@app.put("/avatar_identity_facts")
+async def update_avatar_identity_fact(
+    request: Request,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Rewrite one learned fact in place.
+
+    Body: ``{namespace, key, fact, context?}``. The rewrite goes through the same
+    helper the conversational ``edit_identity_fact`` tool uses, so the stored
+    format (the ``<FACT>`` wrapper for identity facts, the plain event and
+    context paragraphs for episodic memories) is preserved, the row re-embeds
+    under the same key,
+    and ``corrected_from`` / ``correction_origin`` record the owner's edit.
+    """
+    from src.anubis.utils.tools.identity.identity_tools import (
+        FactMatch,
+        _apply_fact_rewrite,
+        _item_document_kwargs,
+    )
+
+    _assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="edit what that avatar has learned",
+    )
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    corrected_fact = str(body.get("fact") or "").strip()
+    if not corrected_fact:
+        raise HTTPException(status_code=400, detail="fact is required.")
+
+    store = app.state.store
+    namespace, key, item = await _load_owned_fact_item(
+        store, creator_id=creator_id, assistant_id=assistant_id, body=body
+    )
+    learned_from = IDENTITY_FACT_GROUPS[namespace[2]]
+    current_row = _identity_fact_row(item, learned_from=learned_from) or {}
+
+    corrected_context = body.get("context")
+    if corrected_context is None:
+        corrected_context = current_row.get("context") or ""
+    corrected_context = str(corrected_context).strip()
+
+    match = FactMatch(
+        item=item,
+        namespace=namespace,
+        key=key,
+        kind="fact",
+        matched_text=current_row.get("fact"),
+        score=1.0,
+    )
+    change = await _apply_fact_rewrite(
+        store, match, corrected_fact, corrected_context, user_modified=True
+    )
+
+    updated_document = change.document
+    feature = (_item_document_kwargs(item).get("metadata") or {}).get("feature")
+    extra_metadata: dict[str, str] = {}
+    if updated_document is not None:
+        # Media-ingested facts carry the fact only inside the <FACT> span (no
+        # ``metadata.fact``), so the rewrite helper cannot record what it
+        # replaced; record it here from the fact the listing showed.
+        if (
+            updated_document.metadata.get("corrected_from") is None
+            and current_row.get("fact")
+        ):
+            extra_metadata["corrected_from"] = current_row["fact"]
+        # Analysis rows keep the statement under ``metadata[<feature>]`` too
+        # (that is what the trait loaders read), so mirror the edit there.
+        if learned_from == "analysis" and isinstance(feature, str):
+            extra_metadata[feature] = corrected_fact
+    if extra_metadata:
+        updated_document.metadata.update(extra_metadata)
+        await store.aput(
+            namespace, key=key, value={"document": updated_document.to_json()}
+        )
+
+    invalidate_store_cache_for_assistant(assistant_id)
+
+    updated_item = SimpleNamespace(
+        namespace=namespace,
+        key=key,
+        value={"document": updated_document.to_json()} if updated_document else {},
+        updated_at=datetime.now(tz=UTC),
+    )
+    return _identity_fact_row(updated_item, learned_from=learned_from) or {}
 
 
 @app.post("/avatar/{assistant_id}/recalibrate_ground_truth")

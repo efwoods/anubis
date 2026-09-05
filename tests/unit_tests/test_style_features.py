@@ -335,3 +335,83 @@ def test_recompute_ground_truth_artifacts_tolerates_nan_rows():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The baseline fitter (data/build_baseline_features_arr.py)
+# ---------------------------------------------------------------------------
+def _fixture_corpus(tmp_path, line_count: int = 30):
+    """The first lines of the tracked corpus, so the fit sees realistic replies."""
+    from data.build_baseline_features_arr import BASELINE_CORPUS_PATH
+
+    if not BASELINE_CORPUS_PATH.exists():
+        pytest.skip(f"{BASELINE_CORPUS_PATH.name} is not present")
+    with BASELINE_CORPUS_PATH.open("r", encoding="utf-8") as handle:
+        lines = [next(handle) for _ in range(line_count)]
+    corpus_path = tmp_path / "corpus.jsonl"
+    corpus_path.write_text("".join(lines), encoding="utf-8")
+    return corpus_path
+
+
+def _redirect_artifacts(monkeypatch, directory):
+    import data.build_baseline_features_arr as build_module
+
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "_ARR_PATH": directory / "baseline_features_arr.npy",
+        "_MODEL_PATH": directory / "baseline_features_model_b64.pkl",
+        "_EXPLAINER_PATH": directory / "baseline_features_explainer_b64.pkl",
+        "_KEY_PHRASES_PATH": directory / "baseline_key_phrases.json",
+        "_STALE_EXPLAINER_PATH": directory / "stale_explainer.pkl",
+    }
+    for name, path in paths.items():
+        monkeypatch.setattr(build_module, name, path)
+    return paths
+
+
+def test_build_writes_every_artifact_at_the_current_width(tmp_path, monkeypatch):
+    from data.build_baseline_features_arr import BaselineBuildResult, build
+
+    corpus_path = _fixture_corpus(tmp_path)
+    paths = _redirect_artifacts(monkeypatch, tmp_path / "artifacts")
+
+    result = build(corpus_path)
+
+    assert isinstance(result, BaselineBuildResult)
+    assert result.feature_width == N_FEATURES
+    assert result.row_count == 30
+    assert result.key_phrase_count == len(json.loads(paths["_KEY_PHRASES_PATH"].read_text()))
+    assert np.isfinite(result.baseline_response_threshold)
+    matrix = np.load(paths["_ARR_PATH"], allow_pickle=False)
+    assert matrix.shape == (30, N_FEATURES)
+    forest = pickle.loads(base64.b64decode(paths["_MODEL_PATH"].read_bytes().decode("utf-8")))
+    assert forest.n_features_in_ == N_FEATURES
+    explainer = pickle.loads(
+        base64.b64decode(paths["_EXPLAINER_PATH"].read_bytes().decode("utf-8"))
+    )
+    assert np.asarray(explainer.data.data).shape[1] == N_FEATURES
+
+
+def test_build_is_reproducible_for_the_same_corpus(tmp_path, monkeypatch):
+    """Two fits of one corpus must yield one forest.
+
+    The IsolationForest is seeded so the committed pickle can be regenerated from
+    the committed corpus byte for byte; without that, nobody could tell a
+    legitimate refit from a stray one.
+    """
+    from data.build_baseline_features_arr import build
+
+    corpus_path = _fixture_corpus(tmp_path)
+    first = _redirect_artifacts(monkeypatch, tmp_path / "first")
+    first_result = build(corpus_path)
+    second = _redirect_artifacts(monkeypatch, tmp_path / "second")
+    second_result = build(corpus_path)
+
+    assert first["_MODEL_PATH"].read_bytes() == second["_MODEL_PATH"].read_bytes()
+    assert np.array_equal(
+        np.load(first["_ARR_PATH"], allow_pickle=False),
+        np.load(second["_ARR_PATH"], allow_pickle=False),
+    )
+    assert first_result.baseline_response_threshold == pytest.approx(
+        second_result.baseline_response_threshold
+    )

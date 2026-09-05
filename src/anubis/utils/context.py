@@ -824,6 +824,38 @@ class GlobalContext:
 
     """ </Agent inbox (triage of incoming messages for the personal avatar)> """
 
+    """ <Ambient vision (webcam / screen snapshots as hidden conversation context)> """
+
+    ambient_capture_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether POST /message/{assistant_id} accepts ambient observations (ambient=true: webcam and screen snapshots described into hidden conversation context and triaged as ignore / respond / notify). Set to false to refuse them with 404. Env AMBIENT_CAPTURE_ENABLED."
+        },
+    )
+
+    ambient_capture_min_interval_seconds: float = field(
+        default=10.0,
+        metadata={
+            "description": "Server-side floor, in seconds, between two ambient observations on the same conversation thread; a faster client receives 429 with Retry-After. The browser paces itself with VITE_AMBIENT_CAPTURE_INTERVAL_SECONDS (default 30). Env AMBIENT_CAPTURE_MIN_INTERVAL_SECONDS."
+        },
+    )
+
+    ambient_capture_max_image_bytes: int = field(
+        default=2_000_000,
+        metadata={
+            "description": "Largest snapshot accepted as an ambient observation, in bytes per image; larger uploads receive 413. Env AMBIENT_CAPTURE_MAX_IMAGE_BYTES."
+        },
+    )
+
+    ambient_preference_recall_limit: int = field(
+        default=8,
+        metadata={
+            "description": "How many of the conversation partner's recorded ambient-observation decisions (dismissals, replies, notes on notification cards) are recalled by similarity from the store and handed to the triage classifier as precedent. Env AMBIENT_PREFERENCE_RECALL_LIMIT."
+        },
+    )
+
+    """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
+
 
     dev: str = field(
         default=None,
@@ -1318,10 +1350,31 @@ class GlobalContext:
     )
 
     baseline_response_threshold: float = field(
-        default=47.66322963655769,
+        default=49.9148420404602,
         metadata={
             "description": "Pre-calculated IQR threshold for the empirical representation of the squared mahalanobis distances of the features presented from the unmodified chatgpt responses using a leave-one-out method. Recalibrated and written back by scripts/retrain_chatgpt_baseline.py whenever the inference model is upgraded, and by data/build_baseline_features_arr.py whenever the feature vector changes (current: 28-wide v4 vector)."
         }
+    )
+
+    baseline_auto_retrain_on_model_change: bool = field(
+        default=True,
+        metadata={
+            "description": "When TRUE (the default), an API boot whose MODEL differs from the model recorded in data/unmodified_inference_model_baseline_corpus.meta.json triggers ONE retrain of the unmodified-inference-model style baseline (scripts/retrain_chatgpt_baseline.py, run detached in this container) coordinated through a lock row in the shared LangGraph store, so every other container or checkout booting with that MODEL adopts the published result instead of regenerating. Set FALSE to only log the mismatch. Env BASELINE_AUTO_RETRAIN_ON_MODEL_CHANGE."
+        },
+    )
+
+    baseline_auto_retrain_lock_stale_after_seconds: int = field(
+        default=7200,
+        metadata={
+            "description": "Age in seconds after which a baseline_retrain_lock row in the store is considered abandoned (the container that took it died mid-retrain) and may be taken over by the next boot. A full retrain takes minutes, so two hours is generous. Env BASELINE_AUTO_RETRAIN_LOCK_STALE_AFTER_SECONDS."
+        },
+    )
+
+    baseline_auto_retrain_poll_seconds: int = field(
+        default=60,
+        metadata={
+            "description": "How often, in seconds, a boot that found another container already retraining the baseline for its MODEL re-reads the store provenance row, so it can adopt the published artifacts as soon as that retrain finishes. Env BASELINE_AUTO_RETRAIN_POLL_SECONDS."
+        },
     )
 
     def __post_init__(self):

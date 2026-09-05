@@ -26,6 +26,11 @@ from langgraph.store.base import BaseStore
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.store_cache import invalidate_store_cache_entry
+from src.anubis.utils.voice.reference_audio import (
+    read_reference_audio,
+    reference_audio_lock,
+    store_reference_audio,
+)
 
 
 def _emit_media_progress(stage: str, **fields: Any) -> None:
@@ -150,12 +155,16 @@ async def _collect_voice_clip_from_isolated_audio(
     if repository is None or not voice_configured(context):
         return
     try:
+        # A voice sample is usually one person talking. Without
+        # ``allow_single_speaker`` the isolation passes such audio through
+        # with ``duration`` ``None`` and the corpus gains nothing.
         isolated = await isolate_dominant_speaker_audio_b64(
             audio_uri,
             context=context,
             filename=filename,
             content_type="audio/mp3",
             reference_audio=False,
+            allow_single_speaker=True,
         )
         record = await add_voice_clip(
             repository,
@@ -193,8 +202,8 @@ async def _collect_voice_clips_from_target_turns(
     filename: str | None,
     turns: list,
 ) -> None:
-    """Cut the personal avatar's own turns from an ordinary upload into the corpus."""
-    if not _assistant_is_personal_avatar(config) or not payload_uri:
+    """Cut the avatar's own turns from an ordinary upload into the corpus."""
+    if not payload_uri:
         return
     from src.anubis.utils.media_assets import get_media_asset_repository
     from src.anubis.utils.voice.clips import cut_target_turns_to_mp3_data_uri
@@ -224,7 +233,7 @@ async def _collect_voice_clips_from_target_turns(
             duration_seconds=seconds,
             source="media_upload",
             source_document_name=filename,
-            is_personal_avatar=True,
+            is_personal_avatar=_assistant_is_personal_avatar(config),
             avatar_name=_assistant_name(config),
         )
         _emit_media_progress(
@@ -1734,20 +1743,22 @@ async def process_media_item_task(
             create_reference_media_from_playlist = bool(
                 metadata.get("create_reference_media_from_playlist", False)
             )
+            # The server decides the reference: the first audio or video upload
+            # for an avatar becomes the diarizer's reference clip. Later uploads
+            # keep the stored reference and are processed as ordinary speech.
+            promoted_to_reference = False
             if not reference_audio and not create_reference_media_from_playlist:
-                reference_namespace = (user_id, assistant_id, "reference_audio")
-                ref_item = await store.aget(reference_namespace, key=assistant_id)
-                if not ref_item and not reference_audio:
-                    return [
-                        Document(
-                            page_content=f"{media_type.capitalize()} missing reference audio reference audio is required for audio and video distillation to text.",
-                            metadata={
-                                "status": "error",
-                                "error": f"missing_{media_type}_reference_audio",
-                                "filename": filename,
-                            },
-                        )
-                    ]
+                stored_reference = await read_reference_audio(
+                    store, user_id, assistant_id
+                )
+                if stored_reference is None:
+                    reference_audio = True
+                    promoted_to_reference = True
+                    logger.info(
+                        "No stored reference audio for %s; promoting %s to the reference clip",
+                        assistant_id,
+                        filename,
+                    )
 
             payload_uri = _full_data_uri_from_media_dict(media_item)
             audio_url = ""
@@ -1773,6 +1784,7 @@ async def process_media_item_task(
             if (
                 media_type == "audio"
                 and reference_audio
+                and not promoted_to_reference
                 and payload_uri
                 and not _is_full_audio_data_uri(payload_uri)
             ):
@@ -1802,6 +1814,8 @@ async def process_media_item_task(
             # Reference-audio: persist for known-speaker labelling on later
             # uploads. Do not diarize the reference itself. Will be the same text spoken for most people.
             # ---------------------------------------------------------------
+            voice_clip_collected_for_item = False
+            reference_written = False
             if (media_type == "audio" or media_type == "video") and reference_audio:
                 # Reference clip pipeline: extract a single-speaker, speech-bearing
                 # mp3 (the dominant speaker by total speech time across diarized,
@@ -1817,112 +1831,113 @@ async def process_media_item_task(
                     audio_uri = payload_uri
                     audio_name = filename
 
-                transcription_dict = await isolate_dominant_speaker_audio_b64(
-                    audio_uri,
-                    context=runtime.context,
-                    filename=audio_name,
-                    content_type="audio/mp3",
-                    reference_audio=reference_audio,
-                )
-
-                # The helper returns a coherent triple: the encoded mp3 of the
-                # dominant speaker's clip, its duration, and the transcript
-                # ``text`` that matches that clip (same key as the OpenAI
-                # transcription API and ``transcribe_audio_diarize``).
-                ref_payload_uri = transcription_dict.get(
-                    "audio_base64_preprocessed", ""
-                )
-                transcription_text = transcription_dict.get("text") or ""
-                ref_duration = transcription_dict.get("duration")
-
-                ref_namespace = (user_id, assistant_id, "reference_audio")
-                doc = Document(
-                    page_content=transcription_text,
-                    metadata={
-                        "user_id": user_id,
-                        "assistant_id": assistant_id,
-                        "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                        "processing_task_id": str(uuid4()),
-                        "type": "audio",
-                        "reference_audio": True,
-                        "duration": ref_duration,
-                        "filename": filename,
-                        "namespace": "reference_audio",
-                        "vectorstore_acceptable": False,
-                        "adapter_acceptable": False,
-                        "analysis_acceptable": False,
-                        "namespace_filename": namespace_filename,
-                    },
-                )
-                await store.aput(
-                    ref_namespace,
-                    key=assistant_id,
-                    value={
-                        "reference_audio_data": ref_payload_uri,
-                        "document": doc.to_json(),
-                    },
-                )
-                all_documents.append(doc)
-
-                # The reference recording is also voice-clone material. The
-                # ≤9.5 s clip above anchors the diarizer; the clone wants every
-                # second of the owner speaking, so the same isolation runs once
-                # more without the reference cap and the whole target-only
-                # track is added to the corpus. Every avatar collects toward an
-                # instant clone this way; the personal avatar keeps going.
-                await _collect_voice_clip_from_isolated_audio(
-                    runtime.context,
-                    config,
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    audio_uri=audio_uri,
-                    filename=audio_name,
-                    source_document_name=filename,
-                )
-
-                """ Compare the approximate embedding of the transcription to the reference audio embedding """
-
-                # Run the synchronous SentenceTransformer load + encode + similarity
-                # off the event loop: it is CPU/GPU-bound and would otherwise freeze
-                # the single asyncio loop, starving the media-job SSE stream and any
-                # concurrent request (e.g. the progress endpoint's auth call).
-                def _compute_reference_similarity() -> Any:
-                    from sentence_transformers import SentenceTransformer
-
-                    model = SentenceTransformer(runtime.context.embedding_model)
-                    embedding = model.encode(transcription_text)
-                    reference_audio_sentence = (
-                        "The quick fox jumped over the brown lazy dog."
+                # Concurrent items of one batch take the avatar's lock so exactly
+                # one of them writes the reference; the others see the stored
+                # clip and continue as ordinary speech.
+                async with reference_audio_lock(user_id, assistant_id):
+                    existing_reference = await read_reference_audio(
+                        store, user_id, assistant_id
                     )
-                    reference_audio_embedding = model.encode(reference_audio_sentence)
-                    return model.similarity(embedding, reference_audio_embedding)
+                    if existing_reference is not None:
+                        logger.info(
+                            "Reference audio for %s already stored (%s); processing %s as ordinary speech",
+                            assistant_id,
+                            existing_reference.get("filename"),
+                            filename,
+                        )
+                    else:
+                        transcription_dict = await isolate_dominant_speaker_audio_b64(
+                            audio_uri,
+                            context=runtime.context,
+                            filename=audio_name,
+                            content_type="audio/mp3",
+                            reference_audio=True,
+                        )
+                        # The helper returns a coherent triple: the encoded mp3 of
+                        # the dominant speaker's clip, its duration, and the
+                        # transcript ``text`` that matches that clip.
+                        ref_payload_uri = transcription_dict.get(
+                            "audio_base64_preprocessed", ""
+                        )
+                        transcription_text = transcription_dict.get("text") or ""
+                        ref_duration = transcription_dict.get("duration")
+                        reference_document = await store_reference_audio(
+                            store,
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                            audio_data_uri=ref_payload_uri,
+                            transcript_text=transcription_text,
+                            filename=filename,
+                            namespace_filename=namespace_filename,
+                            duration_seconds=ref_duration,
+                            source="upload",
+                            replace=False,
+                            lock_already_held=True,
+                        )
+                        if reference_document is not None:
+                            all_documents.append(reference_document)
+                            reference_written = True
 
-                similarity = await asyncio.to_thread(_compute_reference_similarity)
-                if similarity >= 0.80:
-                    # The reference upload IS the calibration sentence, so it
-                    # carries no real content beyond the voice sample. We've
-                    # already stored the reference clip for known-speaker
-                    # labelling, so we're done: return just the reference doc.
+                if reference_written:
+                    # The reference recording is also voice-clone material. The
+                    # ≤9.5 s clip above anchors the diarizer; the clone wants
+                    # every second of the avatar speaking, so the same isolation
+                    # runs once more without the reference cap and the whole
+                    # target-only track is added to the corpus.
+                    await _collect_voice_clip_from_isolated_audio(
+                        runtime.context,
+                        config,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        audio_uri=audio_uri,
+                        filename=audio_name,
+                        source_document_name=filename,
+                    )
+                    voice_clip_collected_for_item = True
+
+                    # Compare the reference transcript to the calibration
+                    # sentence. Run the synchronous SentenceTransformer load +
+                    # encode + similarity off the event loop: the work is
+                    # CPU/GPU-bound and would otherwise freeze the single asyncio
+                    # loop, starving the media-job SSE stream and any concurrent
+                    # request (e.g. the progress endpoint's auth call).
+                    def _compute_reference_similarity() -> Any:
+                        from sentence_transformers import SentenceTransformer
+
+                        model = SentenceTransformer(runtime.context.embedding_model)
+                        embedding = model.encode(transcription_text)
+                        reference_audio_sentence = (
+                            "The quick fox jumped over the brown lazy dog."
+                        )
+                        reference_audio_embedding = model.encode(
+                            reference_audio_sentence
+                        )
+                        return model.similarity(embedding, reference_audio_embedding)
+
+                    similarity = await asyncio.to_thread(_compute_reference_similarity)
+                    if similarity >= 0.80:
+                        # The reference upload IS the calibration sentence, so
+                        # the recording carries no real content beyond the voice
+                        # sample. The reference clip is stored; return just the
+                        # reference document.
+                        logger.info(
+                            "Reference audio matches calibration sentence (similarity=%s); skipping content processing",
+                            similarity,
+                        )
+                        return all_documents
+
+                    # Dissimilar -> the upload carries real content. Treat the
+                    # original audio as a normal (non-reference) upload from here
+                    # on: the diarization body below pulls the reference clip
+                    # just stored (for known-speaker labelling), diarizes the full
+                    # payload_uri, identifies speakers, and routes dialogue /
+                    # monologue / biographical facts exactly like any other audio
+                    # document. The body extends ``all_documents`` (already
+                    # holding the reference document) and returns the list.
                     logger.info(
-                        "Reference audio matches calibration sentence (similarity=%s); skipping content processing",
+                        "Reference audio dissimilar to calibration sentence (similarity=%s); diarizing original payload as a non-reference upload",
                         similarity,
                     )
-                    return all_documents
-
-                # Dissimilar -> the reference upload carries real content. Treat
-                # the original audio as a normal (non-reference) upload from
-                # here on: flip the flag so the diarization body below pulls the
-                # reference clip we just stored (for known-speaker labelling),
-                # diarizes the full payload_uri, identifies speakers, and routes
-                # multi-speaker dialogue / target monologue / non-target
-                # biographical facts exactly like any other audio document
-                # rather than blanket-labelling every segment as the target.
-                # The body extends ``all_documents`` (already holding the
-                # reference doc) and returns it.
-                logger.info(
-                    "Reference audio dissimilar to calibration sentence (similarity=%s); diarizing original payload as a non-reference upload",
-                    similarity,
-                )
                 reference_audio = False
 
             # ---------------------------------------------------------------
@@ -1938,20 +1953,16 @@ async def process_media_item_task(
             if (
                 not create_reference_media_from_playlist
             ):  # Every entity is the target during create_reference_media_from_playlist
-                try:
-                    ref_item = await store.aget(
-                        (user_id, assistant_id, "reference_audio"), assistant_id
+                stored_reference = await read_reference_audio(
+                    store, user_id, assistant_id
+                )
+                if stored_reference is not None:
+                    encoded_reference_audio = (
+                        stored_reference.get("audio_data_uri") or None
                     )
-                    if ref_item is not None:
-                        ref_value = getattr(ref_item, "value", {}) or {}
-                        encoded_reference_audio = (
-                            ref_value.get("reference_audio_data") or None
-                        )
-                        reference_transcript_text = (
-                            (ref_value.get("document") or {}).get("kwargs") or {}
-                        ).get("page_content") or ""
-                except Exception as exc:
-                    logger.debug("Reference audio lookup failed (continuing): %s", exc)
+                    reference_transcript_text = (
+                        stored_reference.get("transcript_text") or ""
+                    )
 
             if not payload_uri:
                 # URL-only path - the upload pipeline currently base64-encodes
@@ -2338,22 +2349,22 @@ async def process_media_item_task(
                 turns = coalesce_segments_by_speaker(turns)
                 distinct_speakers = {t["speaker"] for t in turns}
 
-            # The owner's own turns in this upload are voice-clone material for
-            # the PERSONAL avatar only: the diarizer has attributed the target's
-            # turns, so their windows are cut from the audio (no second
-            # diarization) and added to the corpus. Other avatars are not
-            # collected from ordinary uploads — a shared avatar's material may
-            # be anyone's voice.
-            await _collect_voice_clips_from_target_turns(
-                runtime.context,
-                config,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                media_type=media_type,
-                payload_uri=payload_uri,
-                filename=filename,
-                turns=turns,
-            )
+            # The avatar's own turns in this upload are voice-clone material for
+            # every avatar: the diarizer has attributed the target's turns, so
+            # their windows are cut from the audio (no second diarization) and
+            # added to the corpus. An item that was just stored as the reference
+            # has already contributed its whole target-only track above.
+            if not voice_clip_collected_for_item:
+                await _collect_voice_clips_from_target_turns(
+                    runtime.context,
+                    config,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    media_type=media_type,
+                    payload_uri=payload_uri,
+                    filename=filename,
+                    turns=turns,
+                )
 
             if len(distinct_speakers) > 1:
                 # Multiple speakers -> full dialogue processing. Outputs:

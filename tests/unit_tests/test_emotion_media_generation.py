@@ -357,3 +357,94 @@ async def test_regeneration_creates_a_durable_job(monkeypatch):
     job = list(repository.jobs.values())[0]
     assert job["state"] == "completed", job
     assert len(await repository.list_emotion_assets(ASSISTANT_ID)) == 14
+
+
+@pytest.mark.asyncio
+async def test_a_targeted_loop_regenerates_only_that_loop(monkeypatch):
+    _fake_vendor(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await generate_emotion_media_for_avatar(
+        _context(),
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        reference_image_data_uri=REFERENCE,
+    )
+    calls = _fake_vendor(monkeypatch)
+    manifest = await generate_emotion_media_for_avatar(
+        _context(),
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        reference_image_data_uri=REFERENCE,
+        only_missing=False,
+        emotions=("joy",),
+        asset_kinds=(ASSET_KIND_IDLE_LOOP,),
+    )
+    assert calls["edits"] == []
+    assert calls["videos"] == ["joy"]
+    assert manifest["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_extra_prompt_is_appended_to_the_generation(monkeypatch):
+    captured = {"videos": []}
+
+    async def _edit_image(context, *, reference_image_data_uri, prompt):
+        raise AssertionError("stills should not run for a targeted loop")
+
+    async def _generate_idle_loop(context, *, still_image_data_uri, prompt):
+        captured["videos"].append(prompt)
+        return {
+            "bytes": b"loop-joy",
+            "mime_type": "video/mp4",
+            "request_id": "vid-joy",
+            "model": "grok-imagine-video-1.5",
+            "duration_seconds": 6.0,
+        }
+
+    monkeypatch.setattr(xai_client, "edit_image", _edit_image)
+    monkeypatch.setattr(xai_client, "generate_idle_loop", _generate_idle_loop)
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_emotion_asset(
+        {
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "emotion": "joy",
+            "asset_kind": ASSET_KIND_STILL,
+            "mime_type": "image/jpeg",
+            "bytes": b"still-joy",
+        }
+    )
+    await generate_emotion_media_for_avatar(
+        _context(),
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        reference_image_data_uri=REFERENCE,
+        only_missing=False,
+        emotions=("joy",),
+        asset_kinds=(ASSET_KIND_IDLE_LOOP,),
+        extra_prompt="blink more slowly",
+    )
+    assert captured["videos"], "the loop should have been generated"
+    assert idle_loop_prompt_for("joy") in captured["videos"][0]
+    assert "blink more slowly" in captured["videos"][0]
+
+
+@pytest.mark.asyncio
+async def test_delete_emotion_asset_removes_one_row():
+    repository = InMemoryMediaAssetRepository()
+    asset_id = await repository.upsert_emotion_asset(
+        {
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "emotion": "joy",
+            "asset_kind": ASSET_KIND_STILL,
+            "mime_type": "image/jpeg",
+            "bytes": b"still-joy",
+        }
+    )
+    assert await repository.delete_emotion_asset(asset_id) is True
+    assert await repository.get_emotion_asset(asset_id) is None
+    assert await repository.delete_emotion_asset(asset_id) is False

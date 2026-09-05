@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import base64
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -115,6 +115,8 @@ class VoiceStatus:
     clip_count: int
     verification_requested_at: str | None = None
     training_started_at: str | None = None
+    clips: list[dict[str, Any]] = field(default_factory=list)
+    reference_audio_document: str | None = None
     detail: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -182,10 +184,11 @@ async def ensure_instant_voice(
     assistant_id: str,
     avatar_name: str = "",
 ) -> dict[str, Any]:
-    """Create (or upgrade) the instant clone when the corpus allows it.
+    """Create the instant clone once the corpus reaches the minimum.
 
-    Idempotent: nothing happens below the minimum, or when a clone already
-    exists that was built from at least the target seconds.
+    Idempotent: nothing happens below the minimum, and a clone that exists is
+    never rebuilt — the first instant voice is final. Later clips only grow
+    the corpus (toward the personal avatar's professional clone).
     """
     thresholds = VoiceThresholds.from_context(context)
     record = await _voice_record(repository, user_id, assistant_id)
@@ -196,13 +199,7 @@ async def ensure_instant_voice(
         await repository.upsert_voice(record)
         return record
 
-    existing_id = record.get("instant_voice_id")
-    built_from = float(record.get("instant_voice_seconds") or 0.0)
-    should_build = existing_id is None or (
-        built_from < thresholds.instant_target
-        and collected >= thresholds.instant_target
-    )
-    if not should_build:
+    if record.get("instant_voice_id"):
         await repository.upsert_voice(record)
         return record
 
@@ -229,8 +226,6 @@ async def ensure_instant_voice(
         await repository.upsert_voice(record)
         return record
 
-    if existing_id and existing_id != voice_id:
-        await elevenlabs_client.delete_voice(context, existing_id)
     record["instant_voice_id"] = voice_id
     record["instant_voice_seconds"] = used_seconds
     record["detail"] = {
@@ -456,11 +451,11 @@ async def add_voice_clip(
         return await _voice_record(repository, user_id, assistant_id)
 
     collected_before = float(await repository.total_voice_seconds(assistant_id))
-    ceiling = (
-        thresholds.professional_maximum
-        if is_personal_avatar
-        else thresholds.instant_target
-    )
+    # Every avatar keeps every clip: the clips are the pool the owner can pick
+    # a reference from and the seconds the settings panel reports. The
+    # professional maximum bounds storage for every avatar; the instant clone
+    # is built once and never rebuilt (see ensure_instant_voice).
+    ceiling = thresholds.professional_maximum
     if collected_before >= ceiling:
         logger.info(
             "Voice corpus for %s already holds %.0fs (ceiling %.0fs); clip not stored",
@@ -519,6 +514,65 @@ async def resolve_active_voice_id(
     return "none", None
 
 
+def voice_seconds_by_document(clips: list[dict[str, Any]]) -> dict[str, float]:
+    """Seconds of stored speech per source document name."""
+    seconds_by_document: dict[str, float] = {}
+    for clip in clips:
+        document_name = clip.get("source_document_name")
+        if not document_name:
+            continue
+        seconds_by_document[document_name] = seconds_by_document.get(
+            document_name, 0.0
+        ) + float(clip.get("duration_seconds") or 0.0)
+    return seconds_by_document
+
+
+async def forget_document_clips(
+    repository: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    source_document_name: str,
+) -> dict[str, Any]:
+    """Drop a deleted document's clips and recompute the collected seconds.
+
+    The trained voice is never touched: deleting speech lowers the count the
+    panel shows, nothing more.
+    """
+    removed = await repository.delete_voice_clips_for_document(
+        assistant_id, source_document_name
+    )
+    record = await _voice_record(repository, user_id, assistant_id)
+    record["collected_seconds"] = float(
+        await repository.total_voice_seconds(assistant_id)
+    )
+    await repository.upsert_voice(record)
+    if removed:
+        logger.info(
+            "Removed %d voice clip(s) of %s for %s", removed, source_document_name, assistant_id
+        )
+    return record
+
+
+async def longest_clip_for_document(
+    repository: Any, assistant_id: str, source_document_name: str
+) -> dict[str, Any] | None:
+    """Return the longest stored clip cut from one document, with bytes, or ``None``."""
+    clips = await repository.list_voice_clips(assistant_id, include_bytes=True)
+    matching = [
+        clip for clip in clips if clip.get("source_document_name") == source_document_name
+    ]
+    if not matching:
+        return None
+    return max(matching, key=lambda clip: float(clip.get("duration_seconds") or 0.0))
+
+
+def clip_data_uri(clip: dict[str, Any]) -> str:
+    """Return a data URI for a stored clip's bytes."""
+    mime_type = clip.get("mime_type") or "audio/mpeg"
+    return f"data:{mime_type};base64," + base64.b64encode(clip.get("bytes") or b"").decode()
+
+
 async def voice_status_for(
     repository: Any,
     context: Any,
@@ -526,13 +580,25 @@ async def voice_status_for(
     user_id: str,
     assistant_id: str,
     is_personal_avatar: bool,
+    store: Any | None = None,
 ) -> VoiceStatus:
-    """Assemble the status the settings Voice panel renders."""
+    """Assemble the status the settings Voice panel renders.
+
+    With ``store`` given, the status also names the document the reference
+    clip was cut from.
+    """
     thresholds = VoiceThresholds.from_context(context)
     record = await _voice_record(repository, user_id, assistant_id)
     collected = float(await repository.total_voice_seconds(assistant_id))
     clips = await repository.list_voice_clips(assistant_id)
     active, active_id = await resolve_active_voice_id(repository, assistant_id)
+    reference_audio_document: str | None = None
+    if store is not None:
+        from src.anubis.utils.voice.reference_audio import read_reference_audio
+
+        stored_reference = await read_reference_audio(store, user_id, assistant_id)
+        if stored_reference is not None:
+            reference_audio_document = stored_reference.get("filename")
     return VoiceStatus(
         assistant_id=assistant_id,
         collected_seconds=collected,
@@ -552,6 +618,17 @@ async def voice_status_for(
         clip_count=len(clips),
         verification_requested_at=record.get("verification_requested_at"),
         training_started_at=record.get("training_started_at"),
+        clips=[
+            {
+                "clip_id": clip.get("clip_id"),
+                "source": clip.get("source"),
+                "source_document_name": clip.get("source_document_name"),
+                "duration_seconds": float(clip.get("duration_seconds") or 0.0),
+                "created_at": clip.get("created_at"),
+            }
+            for clip in clips
+        ],
+        reference_audio_document=reference_audio_document,
         detail={
             k: v
             for k, v in (record.get("detail") or {}).items()

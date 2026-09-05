@@ -5,9 +5,9 @@ Pinned down:
 - **Only the target's seconds count.** A clip is stored with the duration the
   isolator reports for the target speaker, never the length of the upload.
 - **Thresholds drive the clones.** Below 60 s nothing is cloned; at 60 s an
-  instant clone is created once; reaching 120 s rebuilds it from the fuller
-  corpus and retires the first; a non-personal avatar stops collecting at the
-  target while the personal avatar keeps going.
+  instant clone is created once and never rebuilt — the first voice is final.
+  Every avatar keeps storing clips afterwards (the pool the owner picks a
+  reference from, and the seconds the panel reports).
 - **The professional clone is prepared only for the personal avatar** once 30
   minutes is reached, and only moves to training after the spoken CAPTCHA.
 - **The active voice prefers the professional clone once fine-tuned.**
@@ -118,7 +118,7 @@ async def test_nothing_is_cloned_below_the_minimum(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_instant_clone_is_created_once_at_the_minimum_and_rebuilt_at_the_target(
+async def test_the_instant_clone_is_created_once_at_the_minimum_and_never_rebuilt(
     monkeypatch,
 ):
     vendor = _FakeVendor().install(monkeypatch)
@@ -127,24 +127,113 @@ async def test_the_instant_clone_is_created_once_at_the_minimum_and_rebuilt_at_t
     record = await _add(repository, _context(), 30)
     assert record["instant_voice_id"] == "ivc-1"
     assert record["instant_voice_seconds"] == 75
-    # More audio below the target changes nothing.
+    # More audio, even past the old 120 s target, never trains another voice.
     record = await _add(repository, _context(), 20)
-    assert record["instant_voice_id"] == "ivc-1"
-    # Reaching the target rebuilds from the fuller corpus and retires the first.
     record = await _add(repository, _context(), 40)
-    assert record["instant_voice_id"] == "ivc-2"
-    assert vendor.deleted == ["ivc-1"]
-    assert record["instant_voice_seconds"] >= 120
+    assert record["instant_voice_id"] == "ivc-1"
+    assert vendor.instant == [("Evan (instant)", 2)]
+    assert vendor.deleted == []
+    assert record["collected_seconds"] == 135
 
 
 @pytest.mark.asyncio
-async def test_a_non_personal_avatar_stops_collecting_at_the_target(monkeypatch):
+async def test_a_non_personal_avatar_keeps_its_clips_after_the_voice_exists(monkeypatch):
     _FakeVendor().install(monkeypatch)
     repository = InMemoryMediaAssetRepository()
     await _add(repository, _context(), 130)
-    await _add(repository, _context(), 60)
-    assert await repository.total_voice_seconds(ASSISTANT_ID) == 130
+    record = await _add(repository, _context(), 60)
+    assert await repository.total_voice_seconds(ASSISTANT_ID) == 190
+    assert len(repository.clips) == 2
+    assert record["instant_voice_id"] == "ivc-1"
+
+
+class _ReferenceStore:
+    """A dictionary-backed stand-in for the LangGraph store."""
+
+    def __init__(self):
+        self.rows = {}
+
+    async def aget(self, namespace, key):
+        value = self.rows.get((namespace, key))
+        return None if value is None else SimpleNamespace(value=value)
+
+    async def aput(self, namespace, key, value):
+        self.rows[(namespace, key)] = value
+
+
+@pytest.mark.asyncio
+async def test_voice_status_lists_clips_and_the_reference_document(monkeypatch):
+    from src.anubis.utils.voice.reference_audio import store_reference_audio
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    store = _ReferenceStore()
+    await corpus.add_voice_clip(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        audio_data_uri=CLIP,
+        duration_seconds=12,
+        source="reference_upload",
+        source_document_name="Mom.m4a",
+    )
+    await store_reference_audio(
+        store,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        audio_data_uri=CLIP,
+        transcript_text="hello",
+        filename="Mom.m4a",
+        namespace_filename="mom-key",
+        duration_seconds=3.0,
+        source="upload",
+    )
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+        store=store,
+    )
+    assert status.reference_audio_document == "Mom.m4a"
+    assert [clip["source_document_name"] for clip in status.clips] == ["Mom.m4a"]
+    assert status.clips[0]["duration_seconds"] == 12
+    assert corpus.voice_seconds_by_document(status.clips) == {"Mom.m4a": 12}
+
+
+@pytest.mark.asyncio
+async def test_forgetting_a_document_removes_its_clips_and_recomputes_seconds(
+    monkeypatch,
+):
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    for name, seconds in (("Mom.m4a", 40), ("talk.mp4", 50)):
+        await corpus.add_voice_clip(
+            repository,
+            _context(),
+            user_id=USER_ID,
+            assistant_id=ASSISTANT_ID,
+            audio_data_uri=CLIP,
+            duration_seconds=seconds,
+            source="media_upload",
+            source_document_name=name,
+        )
+    record = await corpus.forget_document_clips(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        source_document_name="Mom.m4a",
+    )
+    assert record["collected_seconds"] == 50
+    assert record["instant_voice_id"] == "ivc-1"  # the trained voice stays
     assert len(repository.clips) == 1
+    assert await corpus.longest_clip_for_document(
+        repository, ASSISTANT_ID, "Mom.m4a"
+    ) is None
+    longest = await corpus.longest_clip_for_document(repository, ASSISTANT_ID, "talk.mp4")
+    assert corpus.clip_data_uri(longest).startswith("data:audio/mpeg;base64,")
 
 
 @pytest.mark.asyncio

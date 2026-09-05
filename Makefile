@@ -1,4 +1,4 @@
-.PHONY: all format lint test tests test_watch integration_tests docker_tests help extended_tests
+.PHONY: all format lint test tests test_watch integration_tests docker_tests help extended_tests retrain_baseline recreate_dev_api
 
 # Default target executed when no arguments are given to make.
 all: help
@@ -20,6 +20,29 @@ test_profile:
 
 extended_tests:
 	python -m pytest --only-extended $(TEST_FILE)
+
+
+######################
+# INFERENCE-MODEL SWITCH
+######################
+
+# The dev API container. Its interpreter carries the PINNED scikit-learn, so the
+# baseline pickles it fits are the ones the deployment can load, and its network
+# resolves the store URI (host.docker.internal does not resolve on the host).
+DEV_API_CONTAINER ?= anubis-dev-langgraph-api-dev-1
+
+# Switch the inference model and rebuild every baseline artifact in one command
+# (wraps scripts/switch_inference_model.sh, which can also be run directly):
+#   make retrain_baseline ARGS='--model gpt-5.6-luna --model-provider OPEN_AI \
+#       --model-prompt-cost 0.0000002 --model-completion-cost 0.0000012'
+# Then `make recreate_dev_api`: env_file is read when a container is CREATED, so
+# the rewritten MODEL / costs / BASELINE_RESPONSE_THRESHOLD only reach the API
+# after a recreate (a plain restart keeps the old values).
+retrain_baseline:
+	API_CONTAINER=$(DEV_API_CONTAINER) ./scripts/switch_inference_model.sh $(ARGS)
+
+recreate_dev_api:
+	docker compose --env-file .env.dev up -d --force-recreate --no-deps langgraph-api-dev
 
 
 ######################
@@ -64,4 +87,6 @@ help:
 	@echo 'tests                        - run unit tests'
 	@echo 'test TEST_FILE=<test_file>   - run all tests in file'
 	@echo 'test_watch                   - run unit tests in watch mode'
+	@echo 'retrain_baseline ARGS=...    - switch MODEL + costs and rebuild the style baseline (in the dev container)'
+	@echo 'recreate_dev_api             - recreate the dev API container so it adopts the rewritten env'
 

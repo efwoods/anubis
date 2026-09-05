@@ -147,3 +147,51 @@ async def test_an_unknown_thread_is_a_404_not_a_500(monkeypatch):
         )
 
     assert rejection.value.status_code == 404
+
+
+HIDDEN_MESSAGE = {
+    "type": "human",
+    "content": "[AMBIENT_OBSERVATION id=o1 sources=webcam decision=ignore]\nwebcam: typing",
+    "additional_kwargs": {"hidden": True, "kind": "ambient_observation"},
+}
+
+
+@pytest.mark.asyncio
+async def test_hidden_ambient_turns_are_dropped_from_the_transcript(monkeypatch):
+    threads_api = _install_client(monkeypatch, _owned_thread_metadata())
+
+    async def get_state(thread_id):
+        return {"values": {"messages": [*STORED_MESSAGES, HIDDEN_MESSAGE]}}
+
+    monkeypatch.setattr(threads_api, "get_state", get_state)
+
+    response = await webapp_module.get_thread_messages(
+        request=SimpleNamespace(),
+        thread_id=THREAD_ID,
+        assistant_id=ASSISTANT_ID,
+        current_user=_current_user(),
+    )
+    import json
+
+    assert json.loads(response.body)["messages"] == STORED_MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_hidden_turns_are_returned_when_asked_for(monkeypatch):
+    threads_api = _install_client(monkeypatch, _owned_thread_metadata())
+
+    async def get_state(thread_id):
+        return {"values": {"messages": [*STORED_MESSAGES, HIDDEN_MESSAGE]}}
+
+    monkeypatch.setattr(threads_api, "get_state", get_state)
+
+    response = await webapp_module.get_thread_messages(
+        request=SimpleNamespace(),
+        thread_id=THREAD_ID,
+        assistant_id=ASSISTANT_ID,
+        include_hidden=True,
+        current_user=_current_user(),
+    )
+    import json
+
+    assert json.loads(response.body)["messages"] == [*STORED_MESSAGES, HIDDEN_MESSAGE]

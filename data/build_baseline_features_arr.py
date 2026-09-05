@@ -52,6 +52,7 @@ import json
 import os
 import pickle
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
@@ -87,6 +88,18 @@ _STALE_EXPLAINER_PATH = _REPO_ROOT / "data" / "baseline_features_explainer_b64.p
 _SHAP_BACKGROUND_SIZE = 100
 
 
+def _display_path(path: Path) -> str:
+    """Render a path relative to the repo root when it is inside it, else absolutely.
+
+    The artifact paths are module constants that tests redirect into a temp
+    directory; ``relative_to`` would raise there and crash a fit that succeeded.
+    """
+    try:
+        return str(path.relative_to(_REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _baseline_assistant_texts(corpus_path: Path) -> List[str]:
     """Return the final assistant reply from every conversation in the baseline JSONL."""
     texts: List[str] = []
@@ -106,12 +119,37 @@ def _baseline_assistant_texts(corpus_path: Path) -> List[str]:
     return texts
 
 
-def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> float:
+# Seed for the IsolationForest fit. An unseeded forest draws different subsamples
+# and split thresholds on every fit, so two refits of the IDENTICAL corpus produced
+# two different pickles (and two different SHAP explainers) — which made it
+# impossible to tell "the committed artifact was regenerated from the committed
+# corpus" from "someone fitted something else". With a fixed seed the committed
+# corpus reproduces the committed pickle byte for byte.
+_ISOLATION_FOREST_RANDOM_STATE = 0
+
+
+@dataclass(frozen=True)
+class BaselineBuildResult:
+    """What one ``build()`` produced, for the caller to record as provenance.
+
+    ``baseline_response_threshold`` is the value that must be written to
+    ``BASELINE_RESPONSE_THRESHOLD``; the counts describe the corpus the artifacts
+    were fitted on so the provenance sidecar can say what the cloud contains.
+    """
+
+    baseline_response_threshold: float
+    row_count: int
+    feature_width: int
+    key_phrase_count: int
+
+
+def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> BaselineBuildResult:
     """Rebuild and write all bundled baseline artifacts at the current width.
 
-    Returns the recalibrated ``BASELINE_RESPONSE_THRESHOLD``. Callers that write the
-    value out (``scripts/retrain_chatgpt_baseline.py``) use the return; running this
-    module directly just prints it for a hand-copy.
+    Returns a :class:`BaselineBuildResult` whose threshold is the recalibrated
+    ``BASELINE_RESPONSE_THRESHOLD``. Callers that write the value out
+    (``scripts/retrain_chatgpt_baseline.py``) use the return; running this module
+    directly just prints it for a hand-copy.
     """
     import shap
     from sklearn.ensemble import IsolationForest
@@ -136,7 +174,7 @@ def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> float:
     )
     print(
         f"Discovered {len(baseline_key_phrases)} baseline key phrases -> "
-        f"{_KEY_PHRASES_PATH.relative_to(_REPO_ROOT)}"
+        f"{_display_path(_KEY_PHRASES_PATH)}"
     )
 
     feature_rows = [
@@ -164,12 +202,14 @@ def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> float:
     )
 
     np.save(_ARR_PATH, feature_matrix, allow_pickle=False)
-    print(f"Wrote {_ARR_PATH.relative_to(_REPO_ROOT)}")
+    print(f"Wrote {_display_path(_ARR_PATH)}")
 
-    model = IsolationForest().fit(feature_matrix)
+    model = IsolationForest(random_state=_ISOLATION_FOREST_RANDOM_STATE).fit(
+        feature_matrix
+    )
     model_b64 = base64.b64encode(pickle.dumps(model))
     _MODEL_PATH.write_bytes(model_b64)
-    print(f"Wrote {_MODEL_PATH.relative_to(_REPO_ROOT)}")
+    print(f"Wrote {_display_path(_MODEL_PATH)}")
 
     # Pre-build and persist the SHAP explainer so the runtime loads it instead of
     # rebuilding a KernelExplainer (kmeans + repeated model.predict) on first use.
@@ -182,12 +222,12 @@ def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> float:
     explainer = shap.KernelExplainer(model.predict, background)
     explainer_b64 = base64.b64encode(pickle.dumps(explainer))
     _EXPLAINER_PATH.write_bytes(explainer_b64)
-    print(f"Wrote {_EXPLAINER_PATH.relative_to(_REPO_ROOT)}")
+    print(f"Wrote {_display_path(_EXPLAINER_PATH)}")
 
     # Remove the pre-move orphan so there is a single source of truth.
     if _STALE_EXPLAINER_PATH.exists():
         _STALE_EXPLAINER_PATH.unlink()
-        print(f"Removed stale {_STALE_EXPLAINER_PATH.relative_to(_REPO_ROOT)}")
+        print(f"Removed stale {_display_path(_STALE_EXPLAINER_PATH)}")
 
     # Recalibrate BASELINE_RESPONSE_THRESHOLD: the Tukey upper fence
     # (Q3 + 1.5*IQR) of the leave-one-out squared-Mahalanobis empirical
@@ -205,7 +245,12 @@ def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> float:
         f"Recalibrated BASELINE_RESPONSE_THRESHOLD = {baseline_response_threshold!r} "
         "(update .env / .env.dev and the GlobalContext default to this value)"
     )
-    return baseline_response_threshold
+    return BaselineBuildResult(
+        baseline_response_threshold=baseline_response_threshold,
+        row_count=int(feature_matrix.shape[0]),
+        feature_width=int(feature_matrix.shape[1]),
+        key_phrase_count=len(baseline_key_phrases),
+    )
 
 
 if __name__ == "__main__":

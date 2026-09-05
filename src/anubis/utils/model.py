@@ -26,6 +26,39 @@ from src.anubis.utils.tokenizer import count_tokens
 # their raw structured output leaks into the chat (e.g. interleaved fact-correction JSON).
 STRUCTURED_OUTPUT_STREAM_TAG = "structured_output_no_user_stream"
 
+# Inference models that reject the ``top_p`` sampling parameter: OpenAI answers
+# every request with HTTP 400 "Unsupported parameter: 'top_p' is not supported
+# with this model" (observed for gpt-5.6-luna on 2026-09-03; ``temperature`` is
+# still accepted). Matched by prefix on MODEL so point releases stay covered.
+TOP_P_UNSUPPORTED_MODEL_PREFIXES = ("gpt-5.6-luna",)
+# Inference models that only accept function tools on the chat-completions
+# endpoint when reasoning is switched off: OpenAI answers a tool-bound request
+# with HTTP 400 "Function tools with reasoning_effort are not supported for
+# gpt-5.6-luna in /v1/chat/completions. To use function tools, use /v1/responses
+# or set reasoning_effort to 'none'" (observed 2026-09-03; the default effort,
+# and 'low', both fail). Every avatar turn binds the identity tools, so these
+# models are always called with reasoning_effort='none'.
+REASONING_EFFORT_NONE_MODEL_PREFIXES = ("gpt-5.6-luna",)
+
+
+def openai_sampling_parameters(model_name: str | None) -> dict[str, Any]:
+    """Return the per-model ``ChatOpenAI`` keyword arguments the inference path sends.
+
+    The low-temperature, low-top_p pairing is the sampling regime every avatar
+    reply has used; it is kept wherever the model accepts it. For a model in
+    :data:`TOP_P_UNSUPPORTED_MODEL_PREFIXES` only ``temperature`` is sent, since
+    sending ``top_p`` fails the whole call rather than being ignored; for a model
+    in :data:`REASONING_EFFORT_NONE_MODEL_PREFIXES` ``reasoning_effort="none"`` is
+    added so tool-bound calls stay on the chat-completions endpoint.
+    """
+    parameters: dict[str, Any] = {"temperature": 0.1}
+    normalized_model_name = (model_name or "").strip()
+    if not normalized_model_name.startswith(TOP_P_UNSUPPORTED_MODEL_PREFIXES):
+        parameters["top_p"] = 0.1
+    if normalized_model_name.startswith(REASONING_EFFORT_NONE_MODEL_PREFIXES):
+        parameters["reasoning_effort"] = "none"
+    return parameters
+
 
 def describe_api_key_for_logging(api_key: Optional[str]) -> str:
     """Describe a provider credential without writing the credential itself.
@@ -111,8 +144,7 @@ def init_model(
             model = ChatOpenAI(
                 model=model_name,
                 base_url=base_url,
-                temperature=0.1,
-                top_p=0.1,
+                **openai_sampling_parameters(model_name),
                 api_key=api_key,
                 # Report token usage on streamed responses for the metering layer.
                 stream_usage=True,
@@ -127,8 +159,7 @@ def init_model(
             model = ChatOpenAI(
                 model=model_name,
                 base_url=base_url,
-                temperature=0.1,
-                top_p=0.1,
+                **openai_sampling_parameters(model_name),
                 api_key=api_key,
             )
             model = model.with_structured_output(schema=response_format)
@@ -190,8 +221,7 @@ def init_model(
             model = ChatOpenAI(
                 model=model_name,
                 base_url=base_url,
-                temperature=0.1,
-                top_p=0.1,
+                **openai_sampling_parameters(model_name),
                 api_key=api_key,
             ).bind_tools(
                 # method='json_schema',
@@ -204,8 +234,7 @@ def init_model(
             model = ChatOpenAI(
                 model=model_name,
                 base_url=base_url,
-                temperature=0.1,
-                top_p=0.1,
+                **openai_sampling_parameters(model_name),
                 api_key=api_key,
             )
             model = model.with_structured_output(schema=response_format)
@@ -236,8 +265,7 @@ def init_chat_model_unbound(context: Optional[GlobalContext] = None):
         return ChatOpenAI(
             model=model_name,
             base_url=base_url,
-            temperature=0.1,
-            top_p=0.1,
+            **openai_sampling_parameters(model_name),
             api_key=api_key,
             # Include token usage on the final streamed chunk so per-turn
             # usage_metadata reaches the metering layer (Stripe billing meters,

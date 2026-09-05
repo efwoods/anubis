@@ -187,6 +187,10 @@ class InMemoryMediaAssetRepository:
         asset = self.assets.get(asset_id)
         return dict(asset) if asset else None
 
+    async def delete_emotion_asset(self, asset_id: str) -> bool:
+        """Delete one asset by id. Returns whether a row was removed."""
+        return self.assets.pop(asset_id, None) is not None
+
     async def delete_emotion_assets_for_avatar(
         self, assistant_id: str, asset_kinds: tuple[str, ...] | None = None
     ) -> int:
@@ -236,6 +240,21 @@ class InMemoryMediaAssetRepository:
                 if clip["assistant_id"] == assistant_id
             )
         )
+
+    async def delete_voice_clips_for_document(
+        self, assistant_id: str, source_document_name: str
+    ) -> int:
+        """Delete the clips cut from one of the avatar's documents."""
+        before = len(self.clips)
+        self.clips = {
+            clip_id: clip
+            for clip_id, clip in self.clips.items()
+            if not (
+                clip["assistant_id"] == assistant_id
+                and clip.get("source_document_name") == source_document_name
+            )
+        }
+        return before - len(self.clips)
 
     async def delete_voice_clips_for_avatar(self, assistant_id: str) -> int:
         """Delete an avatar's clips."""
@@ -448,6 +467,15 @@ class PostgresMediaAssetRepository:
         )
         return self._asset_row(row, include_bytes=True) if row else None
 
+    async def delete_emotion_asset(self, asset_id: str) -> bool:
+        """Delete one asset by id. Returns whether a row was removed."""
+        return bool(
+            await self._execute(
+                "DELETE FROM avatar_emotion_media WHERE asset_id = %s;",
+                (asset_id,),
+            )
+        )
+
     async def delete_emotion_assets_for_avatar(
         self, assistant_id: str, asset_kinds: tuple[str, ...] | None = None
     ) -> int:
@@ -530,6 +558,19 @@ class PostgresMediaAssetRepository:
             (assistant_id,),
         )
         return float(row[0] if row else 0.0)
+
+    async def delete_voice_clips_for_document(
+        self, assistant_id: str, source_document_name: str
+    ) -> int:
+        """Delete the clips cut from one of the avatar's documents."""
+        return int(
+            await self._execute(
+                "DELETE FROM avatar_voice_clips WHERE assistant_id = %s "
+                "AND source_document_name = %s;",
+                (assistant_id, source_document_name),
+            )
+            or 0
+        )
 
     async def delete_voice_clips_for_avatar(self, assistant_id: str) -> int:
         """Delete an avatar's clips."""

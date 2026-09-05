@@ -470,3 +470,70 @@ def test_legacy_singleton_connection_recovers_device_id_from_relay_url():
         assert await store.aget(namespace, discovery.LEGACY_CONNECTION_KEY) is None
 
     asyncio.run(run())
+
+
+def test_bound_relay_record_without_live_socket_is_marked_offline():
+    """A relay-mode record with no socket in THIS process must not be dialed.
+
+    Development and production share one Postgres store, so a record written by
+    the other process carries the other process's loopback bridge address.
+    Such a device is offline for this process: the connection is still returned
+    (so the prompt can name the machine as offline) but with ``online=False`` so
+    the think node withholds the tools instead of dialing a dead port.
+    """
+
+    async def run():
+        store = InMemoryStore()
+        other_process_bridge = McpConnection(
+            url="http://127.0.0.1:8000/mcp/relay/prod-only-device",
+            transport="streamable_http",
+            server_name="Ubuntu-OS-Filesystem",
+            allowed_roots=("/data",),
+            device_secret="mcp_dev_prod",
+            device_id="prod-only-device",
+            device_label="linux-pc",
+        )
+        live = McpConnection(
+            url="http://127.0.0.1:9600/mcp/relay/live-device",
+            transport="streamable_http",
+            server_name="Ubuntu-OS-Filesystem-dev",
+            allowed_roots=("/data",),
+            device_secret="mcp_dev_live",
+            device_id="live-device",
+            device_label="linux-pc-dev",
+        )
+        # A tunnel/local record has no relay socket by design; reachability is
+        # only learned by dialing, so the record stays ``online``.
+        tunnel = McpConnection(
+            url="https://laptop.example.com/mcp",
+            transport="streamable_http",
+            server_name="macOS-Filesystem",
+            allowed_roots=("/Users/me",),
+            device_secret="mcp_dev_tunnel",
+            device_id="tunnel-device",
+            device_label="macOS",
+        )
+        for connection in (other_process_bridge, live, tunnel):
+            await save_user_connection(
+                store, "u1", connection=connection, assistant_id="a1"
+            )
+        _register(
+            _FakeWebSocket(),
+            device_id="live-device",
+            user_id="u1",
+            secret="mcp_dev_live",
+        )
+
+        bound = {
+            connection.device_id: connection
+            for connection in await bound_connections_for(store, "u1", "a1")
+        }
+        assert set(bound) == {"prod-only-device", "live-device", "tunnel-device"}
+        assert bound["prod-only-device"].online is False
+        assert bound["live-device"].online is True
+        assert bound["tunnel-device"].online is True
+        # The offline marker is derived, never written back to the store.
+        saved = await store.aget(("u1", "mcp_connection"), "prod-only-device")
+        assert saved is not None and "online" not in saved.value
+
+    asyncio.run(run())

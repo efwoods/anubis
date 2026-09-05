@@ -37,7 +37,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -103,6 +103,13 @@ class McpConnection:
     device_id: str = ""
     device_label: str = UNKNOWN_DEVICE_LABEL
     platform: str = UNKNOWN_PLATFORM
+    # Whether THIS API process can reach the device right now. ``True`` for a
+    # connection rebuilt from a live relay session and for tunnel/local
+    # connections (whose reachability is only learned by dialing them).
+    # ``False`` for a relay-mode record whose device holds no relay socket in
+    # this process: the socket is the only path to a relay device, so no stored
+    # URL can reach the machine. Derived on every read, never persisted.
+    online: bool = True
 
     def to_store_value(self, *, assistant_id: str) -> dict[str, Any]:
         """Serialize as this device's connection record, bound to one avatar."""
@@ -584,6 +591,10 @@ async def bound_connections_for(
     local-mode adoption — cannot keep data analysis permanently broken. The
     refreshed record is written back only when something actually changed, so a
     healthy turn performs no extra store writes.
+
+    A relay-mode record whose device has no live socket in this process is
+    returned with ``online=False`` rather than dropped, so the prompt can still
+    name the machine (as offline) while the tool layer withholds the machine.
     """
     records = await read_user_connections(store, user_id)
     if not records:
@@ -601,7 +612,20 @@ async def bound_connections_for(
         device_id = record.get("device_id") or ""
         live_session = relay.get_session(device_id) if device_id else None
         if live_session is None:
-            connections.append(McpConnection.from_mapping(record))
+            stored_connection = McpConnection.from_mapping(record)
+            if device_id_from_relay_url(stored_connection.url):
+                # A relay-mode device with no socket in this process is offline
+                # for this process, whatever the stored URL says. That URL is a
+                # loopback bridge address, and the development and production
+                # API processes share one Postgres store, so the address may
+                # belong to the OTHER process (production writes port 8000,
+                # development port 9600). Dialing it reaches at best this
+                # process's own bridge, which answers 503. Mark the machine
+                # offline instead so the tools skip the machine and the prompt
+                # names the machine as offline, with no network round-trip.
+                connections.append(replace(stored_connection, online=False))
+            else:
+                connections.append(stored_connection)
             continue
 
         connection = relay.connection_from_session(live_session)

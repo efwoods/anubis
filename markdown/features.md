@@ -70,6 +70,7 @@ OCR for images of handwritten documents to text
     ip is returned for anonymous user
     New anonymous user is created w/ preferences stored in db per ip for suggestions
     Slim image for the container inference
+
     RAG for Menu w/ initial suggestion from previous messages
     studio UI
     QR Code use cases
@@ -115,3 +116,5 @@ OCR for images of handwritten documents to text
     subscribe to channels for updates from social media
 
 # URL facts need to be rewritten and stored in a db to prevent copyright violations
+
+

@@ -1589,9 +1589,17 @@ async def isolate_dominant_speaker_audio_b64(
     filename: Optional[str] = None,
     content_type: Optional[str] = None,
     reference_audio: Optional[bool] = False,
+    allow_single_speaker: Optional[bool] = None,
 ) -> dict:
     """Diarize input audio, pick the dominant speech-bearing speaker, and
     return a coherent triple describing the produced clip.
+
+    ``allow_single_speaker`` decides what a recording with only one speaker
+    yields. ``None`` (the default) keeps the historical rule: a reference clip
+    keeps that speaker, while dominant-speaker isolation passes the original
+    audio through unchanged with ``duration`` ``None``. Voice-corpus callers
+    pass ``True`` so a single-speaker recording — the usual voice sample —
+    still produces a target-only clip with a real duration and transcript.
 
     Returns:
         ``{"audio_base64_preprocessed": <data URI>,
@@ -1675,7 +1683,11 @@ async def isolate_dominant_speaker_audio_b64(
         selection = _select_dominant_speaker_segments(
             (diar or {}).get("segments") or [],
             short_fallback_s=short_fallback_s,
-            allow_single_speaker=bool(reference_audio),
+            allow_single_speaker=(
+                bool(reference_audio)
+                if allow_single_speaker is None
+                else bool(allow_single_speaker)
+            ),
         )
         if selection is None:
             logger.info(

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.config import get_stream_writer
 from langgraph.runtime import Runtime
 
 from src.anubis.utils.billing.system_prompt_estimate_cache import (
@@ -110,10 +111,39 @@ def _text_from_content_block(block: dict) -> str | None:
     return None
 
 
+def _stream_writer_or_noop():
+    """The run's stream writer, or a no-op outside a streamed run."""
+    try:
+        return get_stream_writer()
+    except Exception:  # noqa: BLE001 - no active run
+        return lambda _payload: None
+
+
 async def resolve_human_message_images(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
-    """Replace multimodal HumanMessage (base64 image blocks) with plain text descriptions."""
+    """Replace multimodal HumanMessage (base64 image blocks) with plain text descriptions.
+
+    The rewritten message keeps the original ``id`` and ``additional_kwargs``
+    (minus the consumed ``image_filenames``), so an ambient observation stays
+    hidden and tagged after the images are gone. An ambient observation is
+    described with ``DESCRIBE_AMBIENT_IMAGE_PROMPT`` (what the person is doing,
+    what is on the screen) and each section is labelled by source
+    (``webcam`` / ``screen``) under an ``[AMBIENT_OBSERVATION ...]`` header
+    the triage node reads. Every description's usage is folded into the
+    ``image_model_*`` state channels and emitted as an
+    ``image_description_usage`` stream event so the API can meter the call.
+
+    A ``microphone`` source is passed through as a placeholder line: audio
+    observations ride the same call, and transcribing them here is the seam
+    for that follow-up.
+    """
+    from src.anubis.utils.ambient.observations import (
+        ambient_details,
+        is_ambient_observation,
+        observation_header,
+    )
+
     msgs = state.get("messages") or []
     if not msgs:
         return {}
@@ -137,11 +167,25 @@ async def resolve_human_message_images(
         )
         return {}
 
-    filenames = (last.additional_kwargs or {}).get("image_filenames") or []
-    descriptor = ImageDescriptionClass()
+    additional_kwargs = dict(last.additional_kwargs or {})
+    filenames = additional_kwargs.pop("image_filenames", None) or []
+    ambient = ambient_details(last) if is_ambient_observation(last) else None
+    sources = list((ambient or {}).get("sources") or [])
+    if ambient is not None:
+        from src.anubis.utils.schema import DESCRIBE_AMBIENT_IMAGE_PROMPT
+
+        descriptor = ImageDescriptionClass(system_prompt=DESCRIBE_AMBIENT_IMAGE_PROMPT)
+    else:
+        descriptor = ImageDescriptionClass()
+    writer = _stream_writer_or_noop()
     img_index = 0
     text_chunks: list[str] = []
     image_sections: list[str] = []
+    usage_calls = 0
+    usage_prompt_tokens = 0
+    usage_completion_tokens = 0
+    usage_total_cost = 0.0
+    usage_latencies: list[float] = []
 
     for block in content:
         if not isinstance(block, dict):
@@ -153,14 +197,39 @@ async def resolve_human_message_images(
                 if img_index < len(filenames)
                 else f"image_{img_index + 1}"
             )
+            label = (
+                sources[img_index]
+                if ambient is not None and img_index < len(sources)
+                else fname
+            )
             img_index += 1
             try:
                 meta = await descriptor.describe(url, fname)
                 desc = (meta.get("description") or "").strip()
+                usage_calls += 1
+                usage_prompt_tokens += int(meta.get("input_tokens") or 0)
+                usage_completion_tokens += int(meta.get("output_tokens") or 0)
+                usage_total_cost += float(meta.get("total_cost") or 0.0)
+                usage_latencies.append(float(meta.get("latency_ms") or 0.0))
+                writer(
+                    {
+                        "type": "image_description_usage",
+                        "source": label,
+                        "input_tokens": int(meta.get("input_tokens") or 0),
+                        "output_tokens": int(meta.get("output_tokens") or 0),
+                        "total_tokens": int(meta.get("total_tokens") or 0),
+                        "total_cost": float(meta.get("total_cost") or 0.0),
+                        "latency_ms": float(meta.get("latency_ms") or 0.0),
+                        "model_name": meta.get("model_name"),
+                    }
+                )
             except Exception as exc:
                 logger.exception("Image describe failed for %s: %s", fname, exc)
                 desc = "[Image could not be described.]"
-            image_sections.append(f"[{fname}]\n{desc}")
+            if ambient is not None:
+                image_sections.append(f"{label}: {desc}")
+            else:
+                image_sections.append(f"[{fname}]\n{desc}")
             continue
         tx = _text_from_content_block(block)
         if tx:
@@ -168,18 +237,57 @@ async def resolve_human_message_images(
 
     base_text = "\n\n".join(text_chunks).strip()
     out_parts: list[str] = []
-    if base_text:
-        out_parts.append(base_text)
-    if image_sections:
-        out_parts.append("---\nImage descriptions:\n" + "\n\n".join(image_sections))
-    final_text = "\n\n".join(out_parts)
+    if ambient is not None:
+        for source in sources[img_index:]:
+            if source == "microphone":
+                image_sections.append(
+                    "microphone: (audio transcription is not yet enabled for ambient observations)"
+                )
+        out_parts.append(observation_header(ambient))
+        if base_text:
+            out_parts.append(base_text)
+        out_parts.append("\n\n".join(image_sections))
+        final_text = "\n".join(part for part in out_parts if part)
+    else:
+        if base_text:
+            out_parts.append(base_text)
+        if image_sections:
+            out_parts.append("---\nImage descriptions:\n" + "\n\n".join(image_sections))
+        final_text = "\n\n".join(out_parts)
 
-    return {
+    update: dict = {
         "messages": [
             RemoveMessage(id=last.id),
-            HumanMessage(content=final_text),
+            HumanMessage(
+                id=last.id, content=final_text, additional_kwargs=additional_kwargs
+            ),
         ]
     }
+    if usage_calls:
+        previous_calls = int(state.get("image_model_calls_count") or 0)
+        previous_latencies = list(state.get("image_model_response_latency_list_ms") or [])
+        all_latencies = previous_latencies + usage_latencies
+        update.update(
+            {
+                "image_model_calls_count": previous_calls + usage_calls,
+                "image_model_prompt_tokens": int(state.get("image_model_prompt_tokens") or 0)
+                + usage_prompt_tokens,
+                "image_model_completion_tokens": int(
+                    state.get("image_model_completion_tokens") or 0
+                )
+                + usage_completion_tokens,
+                "image_model_total_tokens": int(state.get("image_model_total_tokens") or 0)
+                + usage_prompt_tokens
+                + usage_completion_tokens,
+                "image_model_total_cost": float(state.get("image_model_total_cost") or 0.0)
+                + usage_total_cost,
+                "image_model_response_latency_list_ms": usage_latencies,
+                "image_model_average_latency_ms": (
+                    sum(all_latencies) / len(all_latencies) if all_latencies else 0.0
+                ),
+            }
+        )
+    return update
 
 
 async def _build_consciousness_system_message_update(
@@ -722,18 +830,55 @@ async def _build_consciousness_system_message_update(
         and assistant_metadata.get("is_personal_avatar_of_creator") is True
     )
     if bound_mcp_connections and is_personal_avatar:
-        system_message_str = system_message_str + DATA_ANALYSIS_CAPABILITY_PROMPT
+        # A bound machine is either reachable from this API process right now
+        # (a live relay socket, or a tunnel/local address) or offline. Only the
+        # reachable machines receive tools in ``think``; the prompt must agree
+        # with the tools, so the capability guidance is added only when at
+        # least one machine is reachable, and the offline machines are named
+        # as offline so the avatar neither invents results for the offline
+        # machines nor claims the offline machines cannot be seen at all.
+        online_connections = [
+            connection for connection in bound_mcp_connections if connection.online
+        ]
+        offline_connections = [
+            connection
+            for connection in bound_mcp_connections
+            if not connection.online
+        ]
+        if online_connections:
+            system_message_str = system_message_str + DATA_ANALYSIS_CAPABILITY_PROMPT
         # Naming the connected machines in the prompt lets the avatar answer
         # "which of my machines can you see?" without spending a tool call, and
         # keeps the model from inventing a machine name that is not connected.
-        connected_machine_names = ", ".join(
-            connection.device_label for connection in bound_mcp_connections
+        online_machine_names = ", ".join(
+            connection.device_label for connection in online_connections
         )
+        offline_machine_names = ", ".join(
+            connection.device_label for connection in offline_connections
+        )
+        if online_connections:
+            presence_sentence = (
+                "The Neural Nexus MCP data server is connected for this avatar "
+                "and reachable right now on the following machines: "
+                f"{online_machine_names}. "
+            )
+        else:
+            presence_sentence = (
+                "The Neural Nexus MCP data server is connected for this avatar, "
+                "but none of the connected machines is reachable right now, so "
+                "no file or data-analysis tool is available this turn. "
+            )
+        if offline_connections:
+            presence_sentence += (
+                "The following connected machines are offline right now and "
+                f"cannot be reached this turn: {offline_machine_names}. When "
+                "asked, say plainly that those machines are offline; never "
+                "invent results for an offline machine. "
+            )
         system_message_str += (
             "\n<MCP_CONNECTION_STATUS>\n"
-            "The Neural Nexus MCP data server is connected for this avatar on "
-            f"the following machines: {connected_machine_names}. "
-            "Confirm this plainly when asked, naming the machines. Never reveal "
+            + presence_sentence
+            + "Confirm this plainly when asked, naming the machines. Never reveal "
             "any machine's address, port, transport, or host directory paths in "
             "a reply — the machine names above are the only connection detail "
             "that may appear in a reply.\n"
@@ -893,6 +1038,21 @@ async def _build_consciousness_system_message_update(
                 )
         except Exception:  # noqa: BLE001 - the block must never fail a turn
             logger.debug("Attached-media block unavailable for the prompt", exc_info=True)
+
+    # Ambient vision: once the conversation partner shares a webcam or a screen,
+    # the thread carries hidden ``[AMBIENT_OBSERVATION ...]`` turns.
+    # The capability block explains those turns to the model; a thread without
+    # any observation keeps its prompt unchanged.
+    try:
+        from src.anubis.utils.ambient.observations import is_ambient_observation
+        from src.anubis.utils.prompts.system_prompts import (
+            AMBIENT_VISION_CAPABILITY_PROMPT,
+        )
+
+        if any(is_ambient_observation(message) for message in state.get("messages") or []):
+            system_message_str = system_message_str + AMBIENT_VISION_CAPABILITY_PROMPT
+    except Exception:  # noqa: BLE001 - the block must never fail a turn
+        logger.debug("Ambient-vision block unavailable for the prompt", exc_info=True)
 
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended

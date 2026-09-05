@@ -57,8 +57,21 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import MessagesState
 from langgraph.runtime import Runtime
 
+from src.anubis.utils.ambient.observations import ambient_details
+from src.anubis.utils.client_harvest_turns import without_stale_client_harvest_turns
+from src.anubis.utils.ambient.triage_node import (
+    AMBIENT_TRIAGE_NODE,
+    ambient_triage,
+    route_after_ambient_triage,
+    route_after_image_resolution,
+)
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.deep_agent import build_avatar_deep_agent
+from src.anubis.utils.middleware.avatar_summarization import (
+    CONVERSATION_SUMMARY_EVENT_KEY,
+    CONVERSATION_SUMMARY_SESSION_ID_KEY,
+    clamp_summary_event,
+)
 from src.anubis.utils.graph_interrupts import (
     build_interrupt_resume_command,
     collect_pending_interrupts,
@@ -108,7 +121,9 @@ def _coalesce_ai_message(full: AIMessage | AIMessageChunk) -> AIMessage:
 
 
 def _attach_token_usage_metadata(
-    avatar_response: AIMessage, turn_messages: list
+    avatar_response: AIMessage,
+    turn_messages: list,
+    context: GlobalContext | None = None,
 ) -> None:
     """Fold the turn's aggregate token usage into ``response_metadata["token_usage"]``.
 
@@ -119,6 +134,16 @@ def _attach_token_usage_metadata(
     ``completion_tokens`` / ``total_tokens``). ``usage_metadata`` itself is a
     message attribute that never survives the API layer's ``response_metadata``
     serialization, which is why the fold is necessary.
+
+    When ``context`` is given the turn's dollar cost is derived here too, as
+    ``response_metadata["total_cost"]`` = prompt tokens × ``MODEL_PROMPT_COST`` +
+    completion tokens × ``MODEL_COMPLETION_COST`` (both dollars per single token).
+    The API layer reads that key into the Prometheus ``MODEL_COST_TOTAL`` counter
+    and the ``api_metrics.cost_usd`` column; before this derivation nothing on the
+    message path set the key, so both ledgers recorded 0 for every reply. Every
+    turn is priced at the inference model's rates, including an adapter-inference
+    turn, which runs through the Llama wrapper at a different tariff — a known
+    approximation until adapter pricing is configured separately.
     """
     prompt_tokens = 0
     completion_tokens = 0
@@ -140,6 +165,11 @@ def _attach_token_usage_metadata(
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+    if context is not None:
+        avatar_response.response_metadata["total_cost"] = (
+            prompt_tokens * float(context.model_prompt_cost or 0.0)
+            + completion_tokens * float(context.model_completion_cost or 0.0)
+        )
 
 
 def _attach_go_emotions_metadata(avatar_response: AIMessage) -> None:
@@ -772,6 +802,63 @@ def _deep_agent_config(
     return deep_agent_config, outer_thread
 
 
+# Human-readable activity for each tool the deep agent can call, keyed by the
+# tool's registered name. Streamed to the client as a ``status`` frame the moment
+# the tool starts, so a person waiting through a long data-analysis turn (which
+# emits no reply tokens until the analysis is finished) can see what the avatar
+# is doing instead of a silent "thinking" indicator. Tool names absent from this
+# table fall back to a generic phrase built from the name. ``{device}`` is
+# replaced by the ``device_label`` argument when the tool call names a machine.
+_TOOL_ACTIVITY_DESCRIPTIONS: dict[str, str] = {
+    "check_data_server_connection": "Checking which machines are reachable",
+    "discover_data_files": "Listing files on {device}",
+    "preview_data_file": "Previewing a data file on {device}",
+    "ingest_data_files": "Reading data files from {device}",
+    "hydrate_ingested_data": "Loading saved data into the workspace",
+    "list_persisted_data": "Checking previously saved data",
+    "execute": "Running analysis code",
+    "persist_created_artifact": "Saving the report or plot",
+    "connect_data_server": "Connecting to a machine",
+    "disconnect_data_server": "Disconnecting a machine",
+    "write_todos": "Planning the steps",
+    "ls": "Looking through the workspace",
+    "read_file": "Reading a workspace file",
+    "write_file": "Writing a workspace file",
+    "edit_file": "Editing a workspace file",
+    "glob": "Searching the workspace",
+    "grep": "Searching the workspace",
+    "update_avatar_identity_with_media": "Learning from the attached media",
+    # Tools of the machine's own Model Context Protocol server, called from
+    # inside the data-analysis tools above; they stream as nested tool events.
+    "list_all_files": "Listing files on the machine",
+    "get_file_info": "Checking a file on the machine",
+    "preview_data": "Previewing data on the machine",
+    "read_file_bytes": "Reading a file from the machine",
+    "read_files_for_sandbox": "Copying files from the machine into the workspace",
+}
+_DEFAULT_DEVICE_PHRASE = "the connected machines"
+_TOOL_FINISHED_ACTIVITY = "Thinking about the results"
+
+
+def _describe_tool_activity(tool_name: str, tool_input: Any) -> str:
+    """One short present-tense phrase saying what a tool call is doing.
+
+    Only the phrase leaves the server: tool arguments (host paths, addresses)
+    never ride on the frame, so the status can be shown to anyone who can see
+    the conversation.
+    """
+    device_phrase = _DEFAULT_DEVICE_PHRASE
+    if isinstance(tool_input, dict):
+        device_label = tool_input.get("device_label")
+        if isinstance(device_label, str) and device_label.strip():
+            device_phrase = device_label.strip()
+    template = _TOOL_ACTIVITY_DESCRIPTIONS.get(tool_name)
+    if template is None:
+        readable_name = tool_name.replace("_", " ").strip() or "a tool"
+        return f"Using {readable_name}"
+    return template.format(device=device_phrase)
+
+
 async def _stream_deep_agent(
     deep_agent, agent_input, deep_agent_config, context, writer
 ):
@@ -816,6 +903,33 @@ async def _stream_deep_agent(
                     buf["streamed_text"] = True
         elif ev_name == "on_chat_model_end":
             stream_buffers.pop(event.get("run_id"), None)
+        elif ev_name == "on_tool_start":
+            # Say what the avatar is doing. A data-analysis turn spends most of
+            # its wall-clock time inside tools and streams no reply token until
+            # the analysis is done; without these frames the client can only
+            # show a generic "thinking" indicator for the whole stretch.
+            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                continue
+            tool_name = event.get("name") or ""
+            writer(
+                {
+                    "type": "status",
+                    "text": _describe_tool_activity(
+                        tool_name, (event.get("data") or {}).get("input")
+                    ),
+                    "tool": tool_name,
+                }
+            )
+        elif ev_name == "on_tool_end":
+            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                continue
+            writer(
+                {
+                    "type": "status",
+                    "text": _TOOL_FINISHED_ACTIVITY,
+                    "tool": event.get("name") or "",
+                }
+            )
         elif ev_name == "on_chain_end":
             data = event.get("data") or {}
             output = data.get("output")
@@ -909,7 +1023,16 @@ async def think(
                 state["assistant_state"]["assistant_id"],
             )
         ]
-    if connections and is_personal_avatar:
+    # Only machines reachable from THIS process receive tools. A relay-mode
+    # record whose device holds no relay socket here is offline for this turn:
+    # the prompt (``load_consciousness``) still names the machine as offline,
+    # but the fan-out must never dial a bridge address that the OTHER API
+    # process sharing the Postgres store wrote (development and production
+    # share one store, with different bridge ports).
+    live_connections = [
+        connection for connection in connections if connection.online
+    ]
+    if live_connections and is_personal_avatar:
         analysis_bundle = build_analysis_backend(
             deep_agent_run_context,
             state["user_state"]["user_id"],
@@ -919,7 +1042,7 @@ async def think(
         analysis_extra_tools = [
             *(analysis_extra_tools or []),
             *build_data_analysis_tools(
-                deep_agent_run_context, analysis_bundle, connections
+                deep_agent_run_context, analysis_bundle, live_connections
             ),
         ]
 
@@ -1076,6 +1199,14 @@ async def _emit_analysis_keepalives(writer, interval_seconds: float) -> None:
         writer({"type": "keepalive"})
 
 
+def _latest_ambient_observation(messages: list) -> dict[str, Any] | None:
+    """The triage record of the latest human turn when that turn is ambient."""
+    for message in reversed(list(messages)):
+        if isinstance(message, HumanMessage):
+            return ambient_details(message)
+    return None
+
+
 async def _attach_post_reply_analysis(
     final_message: Any,
     *,
@@ -1101,10 +1232,21 @@ async def _attach_post_reply_analysis(
         # does not block the event loop between the streamed reply and the terminal
         # ``done`` SSE frame (which is gated behind this whole block).
         await asyncio.to_thread(_attach_go_emotions_metadata, final_message)
-        _attach_token_usage_metadata(final_message, new_messages)
+        _attach_token_usage_metadata(
+            final_message, new_messages, context=runtime.context or GlobalContext()
+        )
         if config.get("configurable", {}).get("use_adapter_inference"):
             final_message.response_metadata = dict(final_message.response_metadata or {})
             final_message.response_metadata["is_adapter_inference"] = True
+    # A reply to an ambient observation (a hidden webcam/screen turn the
+    # conversation partner never typed) carries the observation's triage record
+    # so the client can render a ``notify`` reply as a notification card — on
+    # the live stream (``done`` forwards ``response_metadata``) and after a
+    # reload (the field is checkpointed on the message).
+    ambient_record = _latest_ambient_observation(state.get("messages") or [])
+    if isinstance(final_message, AIMessage) and ambient_record is not None:
+        final_message.response_metadata = dict(final_message.response_metadata or {})
+        final_message.response_metadata["ambient"] = ambient_record
     # Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata.
     if config.get("configurable", {}).get("include_quality_metrics", False):
@@ -1145,8 +1287,14 @@ async def _run_avatar_deep_agent_turn(
     created artifacts must be attached to the final message before the caller's
     ``finally`` wipes the workspace they were produced in.
     """
+    # The model reads the conversation without past browser harvest turns (the
+    # ``[neural-nexus:...]`` requests for follow-up chips or a description) and
+    # without the JSON lists those produced: a thread that kept one from an
+    # earlier browser build would otherwise teach the avatar to answer every
+    # message as a JSON list, which the browser then hides as leaked JSON.
+    model_facing_messages = without_stale_client_harvest_turns(list(state["messages"]))
     deep_agent_input = {
-        "messages": list(state["messages"]),
+        "messages": model_facing_messages,
         "system_message": list(state.get("system_message") or []),
         "user_identity_documents": list(state.get("user_identity_documents") or []),
         "assistant_identity_documents": list(
@@ -1156,10 +1304,17 @@ async def _run_avatar_deep_agent_turn(
         "user_state": state["user_state"],
         "assistant_state": state["assistant_state"],
         "internal_thoughts": [],
+        # The conversation's summarization event from earlier turns, so the
+        # summarizer reuses the compaction instead of summarizing again.
+        CONVERSATION_SUMMARY_EVENT_KEY: state.get(CONVERSATION_SUMMARY_EVENT_KEY),
+        CONVERSATION_SUMMARY_SESSION_ID_KEY: state.get(
+            CONVERSATION_SUMMARY_SESSION_ID_KEY
+        ),
     }
     # Slice new messages from the deep agent's persisted conversation against the
-    # outer conversation length — stable across the interrupt/resume re-run.
-    input_messages_count = len(state["messages"])
+    # length of what the deep agent was given — stable across the
+    # interrupt/resume re-run.
+    input_messages_count = len(model_facing_messages)
 
     writer = get_stream_writer()
 
@@ -1277,6 +1432,20 @@ async def _run_avatar_deep_agent_turn(
         "messages": [final_message],
         "internal_thoughts": [*intermediate, final_message],
     }
+
+    # Carry the summarizer's event across turns. The deep agent saw the outer
+    # conversation followed by this turn's intermediate tool messages, and only
+    # the final reply is written back, so the cutoff is clamped to the outer
+    # count before the event is stored on the outer thread.
+    summary_event = clamp_summary_event(
+        final_output.get(CONVERSATION_SUMMARY_EVENT_KEY),
+        outer_message_count=input_messages_count,
+    )
+    if summary_event is not None:
+        update[CONVERSATION_SUMMARY_EVENT_KEY] = summary_event
+        update[CONVERSATION_SUMMARY_SESSION_ID_KEY] = final_output.get(
+            CONVERSATION_SUMMARY_SESSION_ID_KEY
+        )
 
     # ``system_message`` replaces via its pinned UUID (add_messages). The document
     # channels are forwarded as replace-snapshots: the deep agent's final lists are
@@ -1444,10 +1613,24 @@ message_workflow = StateGraph(
 message_workflow.add_node("chat", message_interface)
 message_workflow.add_node("resolve_human_message_images", resolve_human_message_images)
 message_workflow.add_node("anubis", anubis)
+message_workflow.add_node(AMBIENT_TRIAGE_NODE, ambient_triage)
 
 message_workflow.add_edge(START, "chat")
 message_workflow.add_edge("chat", "resolve_human_message_images")
-message_workflow.add_edge("resolve_human_message_images", "anubis")
+# An ambient observation (a hidden webcam/screen turn sent through /message
+# with ambient=true) is triaged before the avatar runs: ``ignore`` ends the run
+# with the observation persisted as context, ``respond`` / ``notify`` reach the
+# avatar. Every other turn goes straight to the avatar as before.
+message_workflow.add_conditional_edges(
+    "resolve_human_message_images",
+    route_after_image_resolution,
+    {AMBIENT_TRIAGE_NODE: AMBIENT_TRIAGE_NODE, "anubis": "anubis"},
+)
+message_workflow.add_conditional_edges(
+    AMBIENT_TRIAGE_NODE,
+    route_after_ambient_triage,
+    {END: END, "anubis": "anubis"},
+)
 message_workflow.add_edge("anubis", END)
 
 graph = message_workflow.compile()

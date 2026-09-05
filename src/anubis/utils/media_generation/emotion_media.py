@@ -58,6 +58,14 @@ def _noop_progress(stage: str, fields: dict[str, Any]) -> None:
     return None
 
 
+def _with_extra_prompt(base_prompt: str, extra_prompt: str | None) -> str:
+    """Append the owner's improvement note, when they gave one."""
+    extra = (extra_prompt or "").strip()
+    if not extra:
+        return base_prompt
+    return f"{base_prompt} Additional direction from the owner: {extra}"
+
+
 async def _noop_metrics(
     inference_type: str, cost_usd: float, model_name: str, request_id: str | None
 ) -> None:
@@ -134,6 +142,9 @@ async def generate_emotion_media_for_avatar(
     assistant_id: str,
     reference_image_data_uri: str,
     only_missing: bool = False,
+    emotions: tuple[str, ...] | None = None,
+    asset_kinds: tuple[str, ...] | None = None,
+    extra_prompt: str | None = None,
     progress: ProgressCallback | None = None,
     metrics: MetricsCallback | None = None,
 ) -> dict[str, Any]:
@@ -146,6 +157,10 @@ async def generate_emotion_media_for_avatar(
         assistant_id: The avatar.
         reference_image_data_uri: The neutral reference as a data URI.
         only_missing: Skip emotions whose asset already exists (a retry).
+        emotions: Limit generation to these base emotions. ``None`` means all.
+        asset_kinds: Limit generation to ``still`` and/or ``idle_loop``.
+        extra_prompt: Owner note appended to each generation prompt, for a
+            targeted redo ("make the blink slower").
         progress: Called with ``(stage, fields)`` as assets complete.
         metrics: Awaited with ``(inference_type, cost_usd, model, request_id)``
             per vendor call, for the ``api_metrics`` ledger.
@@ -160,6 +175,12 @@ async def generate_emotion_media_for_avatar(
     record_metric = metrics or _noop_metrics
     failures: list[dict[str, str]] = []
 
+    target_emotions = tuple(emotions) if emotions else BASE_EMOTIONS
+    kinds = tuple(asset_kinds) if asset_kinds else (ASSET_KIND_STILL, ASSET_KIND_IDLE_LOOP)
+    generate_stills = ASSET_KIND_STILL in kinds
+    generate_loops = ASSET_KIND_IDLE_LOOP in kinds
+    is_full_build = emotions is None and asset_kinds is None
+
     existing = await repository.list_emotion_assets(assistant_id)
     have = {(asset["emotion"], asset["asset_kind"]) for asset in existing}
 
@@ -168,52 +189,83 @@ async def generate_emotion_media_for_avatar(
         getattr(context, "xai_video_cost_per_second_usd", None) or 0.08
     )
 
-    # 1. The reference IS the neutral still.
-    neutral_mime, neutral_bytes = xai_client._decode_data_uri(reference_image_data_uri)
-    if not (only_missing and (NEUTRAL_EMOTION, ASSET_KIND_STILL) in have):
-        await _store_still(
-            repository,
-            user_id=user_id,
-            assistant_id=assistant_id,
-            emotion=NEUTRAL_EMOTION,
-            image_bytes=neutral_bytes,
-            mime_type=neutral_mime,
-            vendor=None,
-            request_id=None,
-            prompt=None,
-        )
-        have.add((NEUTRAL_EMOTION, ASSET_KIND_STILL))
-
-    # 2. Six stills, concurrently.
     still_uris: dict[str, str] = {NEUTRAL_EMOTION: reference_image_data_uri}
+
+    async def _load_existing_still_uri(emotion: str) -> None:
+        existing_asset = next(
+            (
+                asset
+                for asset in existing
+                if asset["emotion"] == emotion and asset["asset_kind"] == ASSET_KIND_STILL
+            ),
+            None,
+        )
+        if existing_asset is None:
+            return
+        full = await repository.get_emotion_asset(existing_asset["asset_id"])
+        if full and full.get("bytes"):
+            still_uris[emotion] = xai_client._data_uri(
+                full.get("mime_type") or "image/jpeg", full["bytes"]
+            )
+
+    # 1. The reference IS the neutral still. A targeted redo of one emotion
+    #    leaves it alone; a full build always writes it so the manifest has it.
+    if is_full_build or (
+        generate_stills and NEUTRAL_EMOTION in target_emotions
+    ):
+        neutral_mime, neutral_bytes = xai_client._decode_data_uri(
+            reference_image_data_uri
+        )
+        if not (only_missing and (NEUTRAL_EMOTION, ASSET_KIND_STILL) in have):
+            await _store_still(
+                repository,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                emotion=NEUTRAL_EMOTION,
+                image_bytes=neutral_bytes,
+                mime_type=neutral_mime,
+                vendor=None,
+                request_id=None,
+                prompt=None,
+            )
+            have.add((NEUTRAL_EMOTION, ASSET_KIND_STILL))
+
+    stills_to_make = (
+        [emotion for emotion in GENERATED_EMOTIONS if emotion in target_emotions]
+        if generate_stills
+        else []
+    )
+    loops_to_make = (
+        [emotion for emotion in BASE_EMOTIONS if emotion in target_emotions]
+        if generate_loops
+        else []
+    )
+
+    # Loops need the still they animate, even when this job is not remaking it.
+    for emotion in loops_to_make:
+        if emotion != NEUTRAL_EMOTION and emotion not in still_uris:
+            await _load_existing_still_uri(emotion)
+
+    # 2. Stills, concurrently.
     stills_done = 0
-    stills_total = len(GENERATED_EMOTIONS)
+    stills_total = len(stills_to_make)
 
     async def _make_still(emotion: str) -> None:
         nonlocal stills_done
         if only_missing and (emotion, ASSET_KIND_STILL) in have:
-            existing_asset = next(
-                (
-                    asset
-                    for asset in existing
-                    if asset["emotion"] == emotion
-                    and asset["asset_kind"] == ASSET_KIND_STILL
-                ),
-                None,
-            )
-            if existing_asset is not None:
-                full = await repository.get_emotion_asset(existing_asset["asset_id"])
-                if full and full.get("bytes"):
-                    still_uris[emotion] = xai_client._data_uri(
-                        full.get("mime_type") or "image/jpeg", full["bytes"]
-                    )
+            await _load_existing_still_uri(emotion)
             stills_done += 1
             report_progress(
                 STAGE_STILLS,
-                {"current": stills_done, "total": stills_total, "emotion": emotion},
+                {
+                    "current": stills_done,
+                    "total": stills_total,
+                    "emotion": emotion,
+                    "asset_kind": ASSET_KIND_STILL,
+                },
             )
             return
-        prompt = still_prompt_for(emotion)
+        prompt = _with_extra_prompt(still_prompt_for(emotion), extra_prompt)
         try:
             result = await xai_client.edit_image(
                 context,
@@ -250,17 +302,28 @@ async def generate_emotion_media_for_avatar(
             prompt=prompt,
         )
         still_uris[emotion] = xai_client._data_uri(result["mime_type"], result["bytes"])
+        have.add((emotion, ASSET_KIND_STILL))
         stills_done += 1
         report_progress(
             STAGE_STILLS,
-            {"current": stills_done, "total": stills_total, "emotion": emotion},
+            {
+                "current": stills_done,
+                "total": stills_total,
+                "emotion": emotion,
+                "asset_kind": ASSET_KIND_STILL,
+            },
         )
 
-    await asyncio.gather(*(_make_still(emotion) for emotion in GENERATED_EMOTIONS))
+    if stills_to_make:
+        report_progress(
+            STAGE_STILLS,
+            {"current": 0, "total": stills_total},
+        )
+        await asyncio.gather(*(_make_still(emotion) for emotion in stills_to_make))
 
-    # 3. Seven idle loops, concurrently, each from its still.
+    # 3. Idle loops, concurrently, each from its still.
     loops_done = 0
-    loops_total = len(BASE_EMOTIONS)
+    loops_total = len(loops_to_make)
 
     async def _make_loop(emotion: str) -> None:
         nonlocal loops_done
@@ -268,7 +331,12 @@ async def generate_emotion_media_for_avatar(
             loops_done += 1
             report_progress(
                 STAGE_LOOPS,
-                {"current": loops_done, "total": loops_total, "emotion": emotion},
+                {
+                    "current": loops_done,
+                    "total": loops_total,
+                    "emotion": emotion,
+                    "asset_kind": ASSET_KIND_IDLE_LOOP,
+                },
             )
             return
         still_uri = still_uris.get(emotion)
@@ -281,7 +349,7 @@ async def generate_emotion_media_for_avatar(
                 }
             )
             return
-        prompt = idle_loop_prompt_for(emotion)
+        prompt = _with_extra_prompt(idle_loop_prompt_for(emotion), extra_prompt)
         try:
             result = await xai_client.generate_idle_loop(
                 context, still_image_data_uri=still_uri, prompt=prompt
@@ -324,10 +392,20 @@ async def generate_emotion_media_for_avatar(
         loops_done += 1
         report_progress(
             STAGE_LOOPS,
-            {"current": loops_done, "total": loops_total, "emotion": emotion},
+            {
+                "current": loops_done,
+                "total": loops_total,
+                "emotion": emotion,
+                "asset_kind": ASSET_KIND_IDLE_LOOP,
+            },
         )
 
-    await asyncio.gather(*(_make_loop(emotion) for emotion in BASE_EMOTIONS))
+    if loops_to_make:
+        report_progress(
+            STAGE_LOOPS,
+            {"current": 0, "total": loops_total},
+        )
+        await asyncio.gather(*(_make_loop(emotion) for emotion in loops_to_make))
 
     manifest = build_manifest(await repository.list_emotion_assets(assistant_id))
     manifest["failures"] = failures

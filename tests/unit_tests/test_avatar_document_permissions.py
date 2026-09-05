@@ -80,9 +80,46 @@ async def test_the_creator_may_list_their_own_avatars_documents(monkeypatch):
         current_user=_current_user(CREATOR_ID),
     )
 
-    assert response == {"uploaded_documents": ["Mom.m4a", "resume.pdf"]}
+    assert response["uploaded_documents"] == ["Mom.m4a", "resume.pdf"]
+    assert [document["label"] for document in response["documents"]] == [
+        "Mom.m4a",
+        "resume.pdf",
+    ]
     # The store namespace is scoped by the creator's user id, not by any selection.
     assert store.searched_namespaces == [(CREATOR_ID, ASSISTANT_ID)]
+
+
+@pytest.mark.asyncio
+async def test_listed_documents_report_voice_seconds(monkeypatch):
+    from src.anubis.utils.media_assets import repository as media_repository
+
+    _install(monkeypatch, {"user_id": CREATOR_ID}, documents=("Mom.m4a", "resume.pdf"))
+    repository = media_repository.InMemoryMediaAssetRepository()
+    await repository.add_voice_clip(
+        {
+            "user_id": CREATOR_ID,
+            "assistant_id": ASSISTANT_ID,
+            "source": "media_upload",
+            "source_document_name": "Mom.m4a",
+            "mime_type": "audio/mpeg",
+            "bytes": b"speech",
+            "duration_seconds": 42.26,
+        }
+    )
+    media_repository.set_media_asset_repository(repository)
+    try:
+        response = await webapp_module.list_avatar_documents(
+            assistant_id=ASSISTANT_ID,
+            current_user=_current_user(CREATOR_ID),
+        )
+    finally:
+        media_repository.set_media_asset_repository(None)
+
+    by_label = {document["label"]: document for document in response["documents"]}
+    assert by_label["Mom.m4a"]["in_voice_corpus"] is True
+    assert by_label["Mom.m4a"]["voice_seconds"] == 42.3
+    assert by_label["resume.pdf"]["in_voice_corpus"] is False
+    assert by_label["resume.pdf"]["voice_seconds"] == 0
 
 
 @pytest.mark.asyncio

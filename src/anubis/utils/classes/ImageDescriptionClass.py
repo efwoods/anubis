@@ -10,9 +10,15 @@ from src.anubis.utils.schema import DESCRIBE_IMAGE_PROMPT
 class ImageDescriptionClass:
     """Vision model call for plain-text image descriptions and usage metadata."""
 
-    def __init__(self):
+    def __init__(self, system_prompt: str | None = None):
+        """``system_prompt`` swaps the describing instructions; the default is
+        ``DESCRIBE_IMAGE_PROMPT``. Ambient webcam/screen snapshots pass
+        ``DESCRIBE_AMBIENT_IMAGE_PROMPT`` so the description says what the
+        person is doing and what is on the screen."""
         self.model = init_image_description_model()
-        self.system_message = SystemMessage(content=DESCRIBE_IMAGE_PROMPT)
+        self.system_message = SystemMessage(
+            content=system_prompt or DESCRIBE_IMAGE_PROMPT
+        )
         self.model_name = "gpt-5.4-nano"
         self.model_input_token_cost = 0.0000002
         self.model_output_token_cost = 0.00000125

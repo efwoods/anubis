@@ -16,6 +16,9 @@ items the existing ``process_media_item_task`` can handle:
 * Twitch URL   → fetch with ``WebBaseLoader`` and return as a single
   complete-document text item (``quotes_per_line=False``).
 * Generic article URL → fetch with ``WebBaseLoader`` and return as plain text.
+* MediaWiki article URL (Fandom, Wikipedia, wiki.gg, …) → fetch rendered HTML
+  through ``api.php?action=parse``. Fandom's ``/wiki/…`` skin is behind a
+  Cloudflare bot challenge (HTTP 403); the parse API on the same host is not.
 
 Per workspace ``.cursorrules`` we surface env-var validation by instantiating
 ``GlobalContext()`` at the top of ``load`` and passing the context through to
@@ -24,13 +27,14 @@ nested helpers that need it.
 
 import asyncio
 import base64
+import html as html_lib
 import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -60,6 +64,184 @@ _INSTAGRAM_HOSTS = frozenset(
 _TWITCH_HOSTS = frozenset(
     {"twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"}
 )
+
+# Descriptive UA: Wikimedia rejects generic library defaults, and Fandom's
+# parse API accepts this while still blocking the HTML skin.
+ARTICLE_FETCH_USER_AGENT = (
+    "AnubisAvatarBot/1.0 (https://neuralnexus.site; contact@neuralnexus.site)"
+)
+
+_FANDOM_HOST_SUFFIXES = (".fandom.com", ".wikia.com", ".wikia.org")
+_WIKI_GG_HOST_SUFFIXES = (".wiki.gg",)
+_WIKIMEDIA_HOST_SUFFIXES = (
+    ".wikipedia.org",
+    ".wikimedia.org",
+    ".mediawiki.org",
+    ".wiktionary.org",
+    ".wikibooks.org",
+    ".wikiquote.org",
+    ".wikisource.org",
+    ".wikinews.org",
+    ".wikiversity.org",
+    ".wikivoyage.org",
+    ".wikidata.org",
+)
+_SKIP_MEDIAWIKI_TITLE_PREFIXES = ("special:", "media:")
+
+
+def _host_has_suffix(host: str, suffixes: tuple[str, ...]) -> bool:
+    """Return whether ``host`` is one of the suffix roots or a subdomain of them."""
+    normalized = (host or "").lower().rstrip(".")
+    for suffix in suffixes:
+        root = suffix.lstrip(".")
+        if normalized == root or normalized.endswith(suffix):
+            return True
+    return False
+
+
+def _mediawiki_api_path_for_host(host: str) -> str | None:
+    """Return the MediaWiki API path for a known wiki host, else ``None``.
+
+    Fandom / wiki.gg expose ``/api.php`` at the wiki origin. Wikimedia family
+    wikis expose ``/w/api.php``. Unknown hosts are left alone: GitHub wikis
+    also use a ``/wiki/…`` path and must not be rewritten to a missing API.
+    """
+    if _host_has_suffix(host, _FANDOM_HOST_SUFFIXES) or _host_has_suffix(
+        host, _WIKI_GG_HOST_SUFFIXES
+    ):
+        return "/api.php"
+    if _host_has_suffix(host, _WIKIMEDIA_HOST_SUFFIXES):
+        return "/w/api.php"
+    return None
+
+
+def _mediawiki_article_title(parsed) -> str | None:
+    """Extract a MediaWiki article title from ``/wiki/Title`` or ``title=``."""
+    path = unquote(parsed.path or "")
+    title = ""
+    path_lower = path.lower()
+    if path_lower.startswith("/wiki/"):
+        title = path[len("/wiki/") :]
+    elif path_lower.endswith("/index.php") or path_lower.endswith("/w/index.php"):
+        title = (parse_qs(parsed.query or "").get("title") or [""])[0]
+        title = unquote(title)
+    title = (title or "").strip().strip("/")
+    if not title:
+        return None
+    if title.lower().startswith(_SKIP_MEDIAWIKI_TITLE_PREFIXES):
+        return None
+    return title
+
+
+def mediawiki_article_api_target(url: str) -> tuple[str, str] | None:
+    """Return ``(api.php URL, page title)`` for a known MediaWiki article URL.
+
+    ``None`` when the URL is not a Fandom / Wikimedia / wiki.gg article page
+    (so callers fall through to a normal HTTP fetch).
+    """
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower()
+    api_path = _mediawiki_api_path_for_host(host)
+    if not api_path:
+        return None
+    title = _mediawiki_article_title(parsed)
+    if not title:
+        return None
+    api_url = f"{parsed.scheme or 'https'}://{parsed.netloc}{api_path}"
+    return api_url, title
+
+
+def html_document_from_mediawiki_parse(
+    payload: Dict[str, Any], *, fallback_title: str = ""
+) -> str:
+    """Turn a MediaWiki ``action=parse`` JSON body into a full HTML document.
+
+    The parse API returns the article fragment (``.mw-parser-output``, portable
+    infobox, quote tables) without ``<title>``. Structured extraction reads
+    ``<title>`` and the infobox, so wrap the fragment in a tiny document.
+    """
+    parse = payload.get("parse") if isinstance(payload, dict) else None
+    if not isinstance(parse, dict):
+        return ""
+    title = (parse.get("title") or fallback_title or "").strip()
+    text = parse.get("text") or ""
+    if isinstance(text, dict):
+        text = text.get("*") or ""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    escaped_title = html_lib.escape(title, quote=True)
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        f"<title>{escaped_title}</title></head><body>{text}</body></html>"
+    )
+
+
+def _visible_text_from_html(html_text: str) -> str:
+    """Strip scripts/styles from HTML and return visible text."""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
+    except Exception:
+        return html_text or ""
+
+
+async def fetch_mediawiki_article_html(url: str) -> tuple[bytes, str] | None:
+    """Fetch a MediaWiki article via ``action=parse`` when the URL is a wiki page.
+
+    Returns ``(html_bytes, 'text/html')`` on success, or ``None`` when the URL
+    is not a known wiki article or the parse API does not yield article HTML.
+    Callers then fall back to fetching the URL as a normal page.
+    """
+    target = mediawiki_article_api_target(url)
+    if target is None:
+        return None
+    api_url, page_title = target
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            response = await client.get(
+                api_url,
+                params={
+                    "action": "parse",
+                    "page": page_title,
+                    "prop": "text",
+                    "format": "json",
+                    "redirects": "1",
+                    "formatversion": "2",
+                    "disablelimitreport": "1",
+                    "disableeditsection": "1",
+                },
+                headers={"User-Agent": ARTICLE_FETCH_USER_AGENT},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as fetch_error:
+        logger.warning(
+            "MediaWiki parse API failed for %s via %s: %s",
+            url,
+            api_url,
+            fetch_error,
+        )
+        return None
+    if isinstance(payload, dict) and payload.get("error"):
+        logger.warning(
+            "MediaWiki parse API refused %s: %s",
+            url,
+            payload.get("error"),
+        )
+        return None
+    html_text = html_document_from_mediawiki_parse(
+        payload, fallback_title=page_title
+    )
+    if not html_text:
+        return None
+    return html_text.encode("utf-8"), "text/html"
 
 
 def _is_youtube_playlist_url(parsed) -> bool:
@@ -177,37 +359,49 @@ class URLDocumentLoaderClass:
         quotes_per_line: bool,
         url_kind: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch a generic article URL via ``WebBaseLoader``.
+        """Fetch a generic article URL via MediaWiki parse, else ``WebBaseLoader``.
 
         ``url_kind`` lets the caller tag the produced media item with the
         original routing label (``twitter``, ``instagram``, ``twitch``,
         ``article``). When omitted, falls back to the legacy behavior of
         ``twitter`` for ``quotes_per_line=True`` and ``article`` otherwise.
-        """
-        try:
-            from langchain_community.document_loaders import WebBaseLoader
 
-            loop = asyncio.get_event_loop()
-            docs = await loop.run_in_executor(None, _load_webdocs_sync, url)
-            content = "\n\n".join((d.page_content or "").strip() for d in docs).strip()
-        except Exception as exc:
-            logger.warning(
-                "WebBaseLoader failed for %s, falling back to httpx: %s", url, exc
-            )
-            content = await _httpx_fallback_text(url)
+        Fandom ``/wiki/…`` skins are Cloudflare-challenged; the parse API on
+        the same host is not, so MediaWiki articles skip ``WebBaseLoader``.
+        """
+        raw_html = ""
+        content = ""
+        mediawiki = await fetch_mediawiki_article_html(url)
+        if mediawiki is not None:
+            raw_html = mediawiki[0].decode("utf-8", errors="replace")
+            content = _visible_text_from_html(raw_html).strip()
+        else:
+            try:
+                loop = asyncio.get_event_loop()
+                docs = await loop.run_in_executor(None, _load_webdocs_sync, url)
+                content = "\n\n".join(
+                    (d.page_content or "").strip() for d in docs
+                ).strip()
+            except Exception as exc:
+                logger.warning(
+                    "WebBaseLoader failed for %s, falling back to httpx: %s",
+                    url,
+                    exc,
+                )
+                content = await _httpx_fallback_text(url)
+
+            # Retain the raw HTML so downstream structured-web extraction can
+            # parse biography and quote structures. The plain-text ``content``
+            # is the fallback when the page is not a subject page.
+            try:
+                raw_html = await _httpx_fallback_text(url, return_html=True)
+            except Exception as html_exc:
+                logger.debug(
+                    "raw HTML fetch failed for %s (continuing): %s", url, html_exc
+                )
 
         if not content:
             return []
-
-        # Retain the raw HTML so downstream structured-web extraction can parse
-        # the page's biography and quote structures with BeautifulSoup. The
-        # plain-text ``content`` above is the fallback when the page is not a
-        # subject page (or when this raw fetch fails, e.g. a bot-challenge host).
-        raw_html = ""
-        try:
-            raw_html = await _httpx_fallback_text(url, return_html=True)
-        except Exception as html_exc:
-            logger.debug("raw HTML fetch failed for %s (continuing): %s", url, html_exc)
 
         resolved_url_kind = url_kind or (
             "twitter" if quotes_per_line else "article"
@@ -389,24 +583,26 @@ def _load_webdocs_sync(url: str):
 
 
 async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
-    """Last-resort plain-text or HTML fetch via httpx."""
+    """Last-resort plain-text or HTML fetch via httpx.
+
+    MediaWiki article URLs go through the parse API first so Fandom pages
+    (Cloudflare-challenged HTML skins) still yield the article body.
+    """
+    mediawiki = await fetch_mediawiki_article_html(url)
+    if mediawiki is not None:
+        html_text = mediawiki[0].decode("utf-8", errors="replace")
+        return html_text if return_html else _visible_text_from_html(html_text)
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=30.0
     ) as client:
-        response = await client.get(url, headers={"User-Agent": "anubis/0.0.1"})
+        response = await client.get(
+            url, headers={"User-Agent": ARTICLE_FETCH_USER_AGENT}
+        )
         response.raise_for_status()
         text = response.text
     if return_html:
         return text
-    try:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(text, "html.parser")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
-    except Exception:
-        return text
+    return _visible_text_from_html(text)
 
 
 async def _extract_playlist_entries(url: str) -> tuple[List[Dict[str, Any]], str]:

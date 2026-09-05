@@ -701,6 +701,13 @@ BASELINE_FEATURES_EXPLAINER_PATH = "src/anubis/utils/dataset/baseline_features_e
 # loads these to score a candidate message's key_phrase_rate consistently with
 # the baseline cloud (store-cached as "baseline_key_phrase_profile").
 BASELINE_KEY_PHRASES_PATH = "src/anubis/utils/dataset/baseline_key_phrases.json"
+# Provenance sidecar written next to the baseline corpus by
+# scripts/retrain_chatgpt_baseline.py: WHICH inference model produced the corpus
+# the four artifacts above were fitted on, at what cost, and the threshold that
+# calibration yielded. The artifacts carry no model name themselves (their width
+# is model-independent), so this file is the only committed record that lets a
+# boot detect "MODEL changed, baseline did not" — see baseline_provenance.py.
+BASELINE_PROVENANCE_PATH = "data/unmodified_inference_model_baseline_corpus.meta.json"
 
 
 def load_bundled_baseline_features_arr() -> Any:

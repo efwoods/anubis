@@ -244,3 +244,37 @@ async def test_request_fails_only_when_every_item_is_rejected(
     detail = excinfo.value.detail
     assert isinstance(detail, dict)
     assert len(detail["rejected"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_fandom_wiki_url_is_accepted_instead_of_400(
+    upload_endpoint_environment, monkeypatch
+):
+    """A Fandom character page used to 400: the HTML skin is Cloudflare-
+    challenged. The parse API on the same host is not, so the upload must
+    accept the URL and start a job."""
+    webapp = upload_endpoint_environment
+    html = (
+        b"<html><head><title>Jester Lavorre</title></head>"
+        b"<body><p>bio</p></body></html>"
+    )
+
+    async def fake_mediawiki(url):
+        return html, "text/html"
+
+    monkeypatch.setattr(
+        "src.anubis.utils.classes.URLDocumentLoaderClass.fetch_mediawiki_article_html",
+        fake_mediawiki,
+    )
+
+    response = await webapp.update_avatar_identity_with_media(
+        files=None,
+        url=["https://criticalrole.fandom.com/wiki/Jester_Lavorre"],
+        assistant_id="a1",
+        current_user={"identities": [{"user_id": "u1"}], "API_KEY": "k"},
+    )
+
+    assert response.status_code == 202
+    payload = json.loads(response.body)
+    assert payload["items_accepted"] >= 1
+    assert payload.get("items_rejected", 0) == 0

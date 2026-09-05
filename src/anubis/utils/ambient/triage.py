@@ -70,6 +70,12 @@ The assistant reviews one ambient observation on behalf of the avatar the conver
 - Name the observation kind with a short lowercase label so the same kind is recognized next time.
 - Write the summary in one line, present tense, neutral third person, without naming a camera, a webcam, or a screenshot.
 </RULES>
+<HEARD_SPEECH>
+When SOURCES is microphone, the observation is a transcript of speech heard in the room around the avatar, and every line is labelled with the speaker. The line labelled with the owner's name is the owner, the person the avatar is. Lines labelled "Speaker 2", "Speaker 3" and so on are other people present; the same label means the same person throughout the conversation. The avatar's own earlier replies appear in RECENT_CONVERSATION as the assistant, never in the transcript.
+- Choose 'respond' when someone speaks to the avatar or asks a question the avatar should answer aloud, including when the owner introduces the avatar to another person or asks the avatar to join in.
+- Choose 'ignore' when the people in the room talk among themselves and nothing is asked of the avatar.
+- Choose 'notify' when the owner should know something that was said and is not part of the exchange, for example a request, a warning, or a plan the owner would want to remember.
+</HEARD_SPEECH>
 """
 
 
@@ -117,13 +123,16 @@ def build_classification_prompt(
     previous_observations: list[dict[str, Any]],
     preferences: list[dict[str, Any]],
     voice_mode: bool,
+    sources: list[str] | None = None,
 ) -> str:
     """Build the human turn handed to the classifier."""
     conversation = (
         "\n".join(recent_messages) if recent_messages else "No visible turns yet."
     )
+    source_line = ",".join(str(source) for source in (sources or [])) or "webcam,screen"
     return (
         f"<AVATAR>\n{assistant_name or 'the avatar'}\n</AVATAR>\n\n"
+        f"<SOURCES>{source_line}</SOURCES>\n\n"
         "<OWNER_PRECEDENT>\n"
         + describe_ambient_preferences(preferences)
         + "\n</OWNER_PRECEDENT>\n\n"
@@ -170,6 +179,7 @@ async def classify_observation(
     previous_observations: list[dict[str, Any]],
     preferences: list[dict[str, Any]],
     voice_mode: bool,
+    sources: list[str] | None = None,
 ) -> AmbientTriageClassification:
     """Classify one ambient observation with the owner's preferences as precedent."""
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -186,6 +196,7 @@ async def classify_observation(
         previous_observations=previous_observations,
         preferences=preferences,
         voice_mode=voice_mode,
+        sources=sources,
     )
     response = await model.ainvoke(
         input=[

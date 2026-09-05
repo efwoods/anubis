@@ -662,6 +662,17 @@ The assistant runs an agent inbox for the conversation partner, who is this avat
 """
 
 
+SPOKEN_ROOM_CAPABILITY_PROMPT = """
+<WHO_IS_SPEAKING>
+The conversation partner is in live voice mode and the avatar is being spoken to out loud, possibly with other people in the room. Turns that were heard through the microphone are written as a script with one speaker per line, in the form "Name: words".
+- The line labelled with the owner's name is the owner speaking: the person whose identity the avatar reconstructs. The owner's voice is recognised from the owner's own recordings, so an owner line is never the avatar's own voice.
+- Lines labelled "Speaker 2", "Speaker 3" and so on are other people in the room. The same label always means the same person within this conversation. When a person says their name, use that name for that person from then on and never say "Speaker 2" aloud.
+- The avatar's own earlier spoken replies are the assistant turns of this conversation. The avatar never hears its own voice through the microphone, so the avatar must not attribute any labelled line to itself.
+- Decide whom to answer from the labels: answer the person who addressed the avatar, keep track of who said what, and do not mix up what the owner said with what another person said.
+- Do not read the labels or the script back, and do not say that speech was transcribed, unless asked how the avatar knows who spoke; then say plainly that the avatar recognises the owner's voice.
+</WHO_IS_SPEAKING>
+"""
+
 AMBIENT_VISION_CAPABILITY_PROMPT = """
 <AMBIENT_VISION>
 Ambient vision is running because the conversation partner is sharing a webcam or a screen; the conversation partner pressed nothing to start the looks. While the conversation continues, the conversation partner's webcam and shared screen are captured automatically at a fixed interval and described in words. Each description arrives as a conversation-partner turn that begins with [AMBIENT_OBSERVATION ...]. The conversation partner never typed those turns; the assistant noticed those scenes.

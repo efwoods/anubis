@@ -128,11 +128,26 @@ from src.anubis.utils.store_cache import (
     invalidate_store_cache_entry,
     invalidate_store_cache_for_assistant,
 )
+from src.api.message_stops import (
+    AMBIENT_BUSY_RETRY_AFTER_SECONDS,
+    STOP_REQUESTED,
+    STREAM_ENDED,
+    ActiveMessageTurnRegistry,
+    GraphStreamPump,
+    build_stopped_reply_metadata,
+    discard_ambient_observation,
+    persist_stopped_reply,
+    schedule_background,
+    yield_in_flight_ambient_observations,
+)
 from src.api.media_jobs import (
     MediaJob,
     create_child_job,
     create_master_job,
+    estimate_processing_seconds,
     get_job,
+    job_estimated_media_seconds,
+    job_estimated_processing_seconds,
     request_cancel,
     run_batch_media_job,
 )
@@ -178,7 +193,9 @@ _CAPABILITY_REQUIRED_TIER = {
 }
 
 
-def enforce_tier_capability(current_user: dict, capability: TierCapability) -> SubscriptionTier:
+def enforce_tier_capability(
+    current_user: dict, capability: TierCapability
+) -> SubscriptionTier:
     """Raise HTTP 403 unless the user's resolved tier unlocks ``capability``.
 
     This is the enforcement layer that gates billable work by tier: every tier can
@@ -665,7 +682,9 @@ async def _meter_message_usage(
         # Adapter inference is billed against a separate meter at a different rate;
         # the think node sets is_adapter_inference when the client requested
         # adapter=True and the user is Premium (see use_adapter_inference in config).
-        is_adapter_inference = bool((response_metadata or {}).get("is_adapter_inference"))
+        is_adapter_inference = bool(
+            (response_metadata or {}).get("is_adapter_inference")
+        )
         if is_adapter_inference and tier == SubscriptionTier.PREMIUM:
             meter = UsageMeter.ADAPTER_INFERENCE_TOKENS
             inference_type = "adapter_inference"
@@ -689,7 +708,9 @@ async def _meter_message_usage(
 
         if model_name and total_tokens > 0:
             if prompt_tokens:
-                MODEL_TOKENS_TOTAL.labels(model=model_name, type="prompt").inc(prompt_tokens)
+                MODEL_TOKENS_TOTAL.labels(model=model_name, type="prompt").inc(
+                    prompt_tokens
+                )
             if completion_tokens:
                 MODEL_TOKENS_TOTAL.labels(model=model_name, type="completion").inc(
                     completion_tokens
@@ -996,6 +1017,154 @@ async def _meter_image_description_usage(
         logger.debug("Could not meter an image description", exc_info=True)
 
 
+async def _meter_stopped_turn(
+    response_metadata: dict,
+    *,
+    app_state,
+    current_user: Optional[dict],
+    thread_id: str,
+    assistant_id: str,
+    request_id: str,
+    start_time_ns: int,
+) -> dict | None:
+    """Meter the estimated usage of a reply that ended early.
+
+    Split from ``_finalize_stopped_turn`` because the Stripe meter-event call
+    can take seconds, and a person who pressed Stop is waiting on the stream's
+    terminal frame: the stream sends ``done`` first and runs this afterwards
+    in a background task. Returns the usage block, or ``None``.
+    """
+    if app_state is None or current_user is None:
+        return None
+    return await _meter_message_usage(
+        app_state=app_state,
+        current_user=current_user,
+        response_metadata=response_metadata,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        latency_ms=(time_ns() - start_time_ns) / 1_000_000,
+        request_id=request_id,
+    )
+
+
+async def _finalize_stopped_turn(
+    partial_text: str,
+    *,
+    stopped_by: str,
+    graph,
+    config: dict,
+    app_state,
+    current_user: Optional[dict],
+    thread_id: str,
+    assistant_id: str,
+    user_id: str,
+    conversation_title_value: str | None,
+    request_id: str,
+    langgraph_client_headers: dict,
+    estimated_prompt_tokens: int,
+    start_time_ns: int,
+    meter_inline: bool = True,
+    discard_observation_id: str | None = None,
+) -> dict:
+    """Close out a reply that ended before the avatar finished.
+
+    Records the partial reply on the thread (unless nothing was said), stamps
+    the thread's ``most_recent_message``, and returns the terminal ``done``
+    frame for the stream. The estimated token usage is metered here when
+    ``meter_inline`` is true (nobody is waiting: a disconnected client); the
+    stop route's stream passes false, sends the frame, and meters afterwards.
+    ``stopped_by`` is ``"user"`` for the stop route and ``"disconnect"`` for a
+    client that went away. ``discard_observation_id`` names an ambient
+    observation that was stopped before the graph triaged it; that hidden
+    message is removed from the thread rather than kept as context.
+    """
+    response_metadata = build_stopped_reply_metadata(
+        partial_text,
+        estimated_prompt_tokens=estimated_prompt_tokens,
+        model_name=getattr(getattr(app_state, "context", None), "model", None),
+        stopped_by=stopped_by,
+    )
+    if discard_observation_id:
+        await discard_ambient_observation(graph, config, discard_observation_id)
+    await persist_stopped_reply(
+        graph,
+        config,
+        partial_text,
+        request_id=request_id,
+        response_metadata=response_metadata,
+    )
+    thread_metadata = {
+        "thread_metadata": {
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "most_recent_message": datetime.now(UTC).isoformat(),
+            "conversation_title": conversation_title_value,
+        },
+        "graph_id": "Anubis",
+    }
+    try:
+        langgraph_client = get_client(headers=langgraph_client_headers)
+        await langgraph_client.threads.update(
+            thread_id=thread_id, metadata=thread_metadata
+        )
+    except Exception:  # noqa: BLE001 - metadata is a convenience, the stop is not
+        logger.warning(
+            "Could not update thread %s metadata after a stopped reply",
+            thread_id,
+            exc_info=True,
+        )
+    done: dict = {
+        "type": "done",
+        "stopped": True,
+        "stopped_by": stopped_by,
+        "content": partial_text,
+        "thread_id": thread_id,
+        "request_id": request_id,
+        "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
+        "response_metadata": response_metadata,
+    }
+    if meter_inline:
+        turn_usage = await _meter_stopped_turn(
+            response_metadata,
+            app_state=app_state,
+            current_user=current_user,
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            request_id=request_id,
+            start_time_ns=start_time_ns,
+        )
+        if turn_usage:
+            done["usage"] = turn_usage
+    return done
+
+
+async def _finalize_disconnected_turn(
+    pump: GraphStreamPump,
+    partial_text: str,
+    active_turn=None,
+    **stopped_turn_arguments,
+) -> None:
+    """Background finalizer for a reply whose client disconnected.
+
+    ``active_turn`` is marked finished once the graph run is down and the
+    record is written, so a typed turn waiting on the same thread can start.
+    """
+    try:
+        await pump.aclose()
+        await _finalize_stopped_turn(
+            partial_text, stopped_by="disconnect", **stopped_turn_arguments
+        )
+    except Exception:  # noqa: BLE001 - nothing is listening any more
+        logger.warning(
+            "Could not finalize the disconnected reply %s",
+            stopped_turn_arguments.get("request_id"),
+            exc_info=True,
+        )
+    finally:
+        if active_turn is not None:
+            active_turn.mark_finished()
+
+
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -1015,8 +1184,22 @@ async def message_graph_sse(
     estimated_request_tokens: TokenEstimateBreakdown | None = None,
     estimate_meter: UsageMeter | None = None,
     include_usage_metrics: bool = True,
+    spoken_turn_frame: dict | None = None,
+    ambient: bool = False,
 ):
     """Stream assistant tokens (SSE) then a terminal event with full metadata.
+
+    ``ambient`` marks a hidden webcam / screen observation. Observations yield
+    to the person: a typed or spoken turn (``ambient`` false) first stops any
+    observation still running on the same thread and waits for the run behind
+    that observation to wind down, so the two never write the thread's
+    checkpoint at the same time. An observation stopped before the graph
+    triaged the observation is removed from the thread.
+
+    ``spoken_turn_frame`` (a ``diarize=true`` turn) is sent right after
+    ``turn_started`` as a ``spoken_turn`` frame: the speaker-labelled script and
+    segments of what the microphone heard, so the client can replace its
+    placeholder bubble before any reply token arrives.
 
     When ``include_usage_metrics`` is true, the FIRST frame is a
     ``usage_estimate`` event carrying this request's pre-call ``input_tokens``
@@ -1033,84 +1216,235 @@ async def message_graph_sse(
     last_ai: AIMessage | None = None
     ambient_decision: dict | None = None
 
-    # Pre-call estimate + allotment snapshot (reporting only).
-    if (
-        include_usage_metrics
-        and estimated_request_tokens is not None
-        and app_state is not None
-        and current_user is not None
-    ):
-        usage_estimate_event = {
-            "type": "usage_estimate",
-            "input_tokens": estimated_request_tokens.input_tokens,
-            "usage": await _build_meter_usage_snapshot(
-                app_state, current_user, estimate_meter or UsageMeter.MESSAGING_TOKENS
-            ),
-            "thread_id": thread_id,
+    # The turn is registered before anything is sent so that
+    # ``POST /message/{assistant_id}/stop`` can find it from the moment the
+    # client learns its id; a stop that arrives before the graph stream exists
+    # is remembered and honoured the instant the pump below is attached.
+    turn_registry = getattr(app_state, "active_message_turns", None)
+    active_turn = (
+        turn_registry.register(
+            request_id=request_id,
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            user_id=user_id,
+            ambient=ambient,
+        )
+        if turn_registry is not None
+        else None
+    )
+
+    try:
+        # The first frame names the turn. The client keeps ``request_id`` so it
+        # can end the reply early through the stop route; ``thread_id`` rides
+        # along because a first message on a new conversation has no other way
+        # to learn its thread before the terminal frame.
+        turn_started_event = {
+            "type": "turn_started",
             "request_id": request_id,
+            "thread_id": thread_id,
         }
-        yield f"data: {json.dumps(usage_estimate_event, default=str)}\n\n"
+        yield f"data: {json.dumps(turn_started_event, default=str)}\n\n"
+        if spoken_turn_frame:
+            yield f"data: {json.dumps({'type': 'spoken_turn', **spoken_turn_frame}, default=str)}\n\n"
+
+        # Pre-call estimate + allotment snapshot (reporting only).
+        if (
+            include_usage_metrics
+            and estimated_request_tokens is not None
+            and app_state is not None
+            and current_user is not None
+        ):
+            usage_estimate_event = {
+                "type": "usage_estimate",
+                "input_tokens": estimated_request_tokens.input_tokens,
+                "usage": await _build_meter_usage_snapshot(
+                    app_state,
+                    current_user,
+                    estimate_meter or UsageMeter.MESSAGING_TOKENS,
+                ),
+                "thread_id": thread_id,
+                "request_id": request_id,
+            }
+            yield f"data: {json.dumps(usage_estimate_event, default=str)}\n\n"
+    except BaseException:
+        # Nothing has been streamed from the graph yet (the client left, or the
+        # usage snapshot failed): forget the turn so no stale entry lingers.
+        if turn_registry is not None:
+            turn_registry.unregister(request_id)
+        raise
 
     graph_input = (
         resume_command if resume_command is not None else {"messages": [human_message]}
     )
 
-    async for item in graph.astream(
-        input=graph_input,
+    # The person's turn comes first: an ambient observation still being
+    # processed on this thread is stopped and allowed to wind down before this
+    # run touches the thread. Observations never wait for each other here (the
+    # route refuses a second observation on a busy thread with 409 instead).
+    if not ambient:
+        try:
+            await yield_in_flight_ambient_observations(turn_registry, thread_id)
+        except BaseException:
+            if turn_registry is not None:
+                turn_registry.unregister(request_id)
+            raise
+
+    # The graph is drained on the pump's own task and consumed here through a
+    # queue, so a stop request can wake this generator between frames and the
+    # graph run can be cancelled from outside it (see ``message_stops``).
+    pump = GraphStreamPump(
+        graph.astream(
+            input=graph_input,
+            config=config,
+            context=context,
+            stream_mode=["custom", "updates"],
+            subgraphs=True,
+        )
+    )
+    if active_turn is not None:
+        active_turn.attach_wake(pump.request_stop)
+    stopped_by_user = False
+    disconnected = False
+    stopped_turn_arguments = dict(
+        graph=graph,
         config=config,
-        context=context,
-        stream_mode=["custom", "updates"],
-        subgraphs=True,
-    ):
-        if not isinstance(item, tuple) or len(item) != 3:
-            continue
-        _ns, mode, payload = item
-        if mode == "custom" and isinstance(payload, dict):
-            if payload.get("type") == "assistant_token":
-                accumulated_chunks.append(payload.get("text") or "")
-                yield f"data: {json.dumps(payload)}\n\n"
-            elif payload.get("type") == "status":
-                # The deep agent started or finished a tool. Forwarded so the
-                # client can say what the avatar is doing during a token-less
-                # stretch such as a data-analysis turn. The frame carries the
-                # human-readable phrase and the tool name, never tool arguments.
-                yield f"data: {json.dumps(payload, default=str)}\n\n"
-            elif payload.get("type") == "media_job_started":
-                # The in-chat identity-update tool started a media batch; the
-                # client follows it on GET /media_job/{job_id}/progress.
-                yield f"data: {json.dumps(payload, default=str)}\n\n"
-            elif payload.get("type") == "keepalive":
-                # SSE comment frame emitted during post-reply analysis (Go Emotions
-                # + SHAP), which yields no tokens yet gates the terminal ``done``
-                # frame. Comment lines are ignored by SSE parsers but the bytes
-                # reset the client's idle-read timer, preventing a premature
-                # "Error in input stream" while the metadata is computed.
-                yield ": keepalive\n\n"
-            elif payload.get("type") == "ambient_decision":
-                # The graph triaged an ambient observation (ignore / respond /
-                # notify). Forwarded as its own frame so the client knows the
-                # decision before any reply tokens, and repeated on ``done``.
-                ambient_decision = {
-                    key: value for key, value in payload.items() if key != "type"
-                }
-                yield f"data: {json.dumps(payload, default=str)}\n\n"
-            elif payload.get("type") == "image_description_usage":
-                # One vision call described an attached image (a typed turn's
-                # attachment or an ambient snapshot). Metered here because the
-                # graph node has no request context; never surfaced as a frame.
-                if app_state is not None and current_user is not None:
-                    await _meter_image_description_usage(
-                        app_state,
-                        current_user,
-                        payload,
-                        assistant_id=assistant_id,
-                        thread_id=thread_id,
-                        request_id=request_id,
-                    )
-        elif mode == "updates" and isinstance(payload, dict):
-            ai = _latest_ai_from_stream_update(payload)
-            if ai is not None:
-                last_ai = ai
+        app_state=app_state,
+        current_user=current_user,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        user_id=user_id,
+        conversation_title_value=conversation_title_value,
+        request_id=request_id,
+        langgraph_client_headers=langgraph_client_headers,
+        estimated_prompt_tokens=(
+            estimated_request_tokens.input_tokens
+            if estimated_request_tokens is not None
+            else 0
+        ),
+        start_time_ns=start_time_ns,
+    )
+
+    try:
+        while True:
+            item = await pump.next_item()
+            if item is STREAM_ENDED:
+                break
+            if item is STOP_REQUESTED:
+                stopped_by_user = True
+                break
+            if not isinstance(item, tuple) or len(item) != 3:
+                continue
+            _ns, mode, payload = item
+            if mode == "custom" and isinstance(payload, dict):
+                if payload.get("type") == "assistant_token":
+                    accumulated_chunks.append(payload.get("text") or "")
+                    yield f"data: {json.dumps(payload)}\n\n"
+                elif payload.get("type") == "status":
+                    # The deep agent started or finished a tool. Forwarded so the
+                    # client can say what the avatar is doing during a token-less
+                    # stretch such as a data-analysis turn. The frame carries the
+                    # human-readable phrase and the tool name, never tool arguments.
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                elif payload.get("type") == "media_job_started":
+                    # The in-chat identity-update tool started a media batch; the
+                    # client follows it on GET /media_job/{job_id}/progress.
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                elif payload.get("type") == "keepalive":
+                    # SSE comment frame emitted during post-reply analysis (Go Emotions
+                    # + SHAP), which yields no tokens yet gates the terminal ``done``
+                    # frame. Comment lines are ignored by SSE parsers but the bytes
+                    # reset the client's idle-read timer, preventing a premature
+                    # "Error in input stream" while the metadata is computed.
+                    yield ": keepalive\n\n"
+                elif payload.get("type") == "ambient_decision":
+                    # The graph triaged an ambient observation (ignore / respond /
+                    # notify). Forwarded as its own frame so the client knows the
+                    # decision before any reply tokens, and repeated on ``done``.
+                    ambient_decision = {
+                        key: value for key, value in payload.items() if key != "type"
+                    }
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                elif payload.get("type") == "image_description_usage":
+                    # One vision call described an attached image (a typed turn's
+                    # attachment or an ambient snapshot). Metered here because the
+                    # graph node has no request context; never surfaced as a frame.
+                    if app_state is not None and current_user is not None:
+                        await _meter_image_description_usage(
+                            app_state,
+                            current_user,
+                            payload,
+                            assistant_id=assistant_id,
+                            thread_id=thread_id,
+                            request_id=request_id,
+                        )
+            elif mode == "updates" and isinstance(payload, dict):
+                ai = _latest_ai_from_stream_update(payload)
+                if ai is not None:
+                    last_ai = ai
+    except (asyncio.CancelledError, GeneratorExit):
+        # The client went away mid-reply (tab closed, network dropped, or the
+        # browser aborted the fetch because the stop route was unreachable).
+        # This task is being torn down and its own awaits would be cancelled
+        # again, so winding the graph down and recording what was streamed is
+        # handed to a task the cancellation does not reach.
+        pump.cancel()
+        disconnected = True
+        schedule_background(
+            _finalize_disconnected_turn(
+                pump,
+                "".join(accumulated_chunks),
+                active_turn=active_turn,
+                discard_observation_id=(
+                    human_message.id if ambient and ambient_decision is None else None
+                ),
+                **stopped_turn_arguments,
+            )
+        )
+        raise
+    finally:
+        if turn_registry is not None:
+            turn_registry.unregister(request_id)
+        # A run that ended on its own (or failed) is over now; a stopped run is
+        # marked once the pump has been closed and the record written, and a
+        # disconnected one by the background finalizer.
+        if active_turn is not None and not disconnected and not stopped_by_user:
+            active_turn.mark_finished()
+
+    if stopped_by_user:
+        # The person pressed Stop. Cancel the graph run, keep whatever the
+        # avatar had said so far on the thread, meter the estimated usage, and
+        # end the stream with a ``done`` frame flagged ``stopped`` so the client
+        # finalizes the bubble exactly as it would a completed reply.
+        # Metering runs after the frame is sent: the Stripe meter-event call
+        # can take seconds, and the person is waiting for the composer to
+        # unlock. A stopped ``done`` therefore carries no ``usage`` block.
+        await pump.aclose()
+        try:
+            done = await _finalize_stopped_turn(
+                "".join(accumulated_chunks),
+                stopped_by="user",
+                meter_inline=False,
+                discard_observation_id=(
+                    human_message.id if ambient and ambient_decision is None else None
+                ),
+                **stopped_turn_arguments,
+            )
+        finally:
+            if active_turn is not None:
+                active_turn.mark_finished()
+        yield f"data: {json.dumps(done, default=str)}\n\n"
+        schedule_background(
+            _meter_stopped_turn(
+                done["response_metadata"],
+                app_state=app_state,
+                current_user=current_user,
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                request_id=request_id,
+                start_time_ns=start_time_ns,
+            )
+        )
+        return
 
     thread_metadata = {
         "thread_metadata": {
@@ -1167,11 +1501,7 @@ async def message_graph_sse(
         and ambient_decision.get("decision") == "ignore"
         and last_ai is None
     )
-    if (
-        app_state is not None
-        and current_user is not None
-        and not ignored_ambient_turn
-    ):
+    if app_state is not None and current_user is not None and not ignored_ambient_turn:
         turn_usage = await _meter_message_usage(
             app_state=app_state,
             current_user=current_user,
@@ -1374,8 +1704,14 @@ async def resolve_assistant_for_creator(
     ``action_description`` completes the sentence "Only the creator of this avatar may
     ___" in the 403 detail, so each caller reports the action the caller was refused.
 
+    The administrator is exempt, the same way ``/delete_avatar`` and ``/share_avatar``
+    are: that account may read and correct what any avatar has learned (and the other
+    creator-gated settings this helper protects). Store rows stay keyed by the original
+    ``creator_user_id``, so an admin acting on someone else's avatar does not move the
+    data under the admin's id.
+
     Raises 400 when the avatar cannot be loaded or carries no creator, and 403 when the
-    signed-in caller is not that creator.
+    signed-in caller is not that creator and is not the administrator.
     """
     user_id = current_user["identities"][0]["user_id"]
     token = current_user["API_KEY"]
@@ -1396,7 +1732,8 @@ async def resolve_assistant_for_creator(
                 "cannot verify permissions for this avatar."
             ),
         )
-    if user_id != creator_id:
+    admin_user_id = getattr(getattr(app.state, "context", None), "admin_user_id", None)
+    if user_id != creator_id and user_id != admin_user_id:
         # Named in the log because the 403 body deliberately says only that the
         # caller is not the creator: the two identifiers are what distinguishes a
         # correct refusal from a credential resolving to the wrong account, and
@@ -1537,7 +1874,9 @@ async def lifespan(app: FastAPI):
     # namespace. Publish the repository process-wide so graph nodes and tools —
     # which cannot import this module — read the same table the routes write,
     # then copy any legacy store records across once (never overwriting).
-    from src.anubis.utils.connected_accounts import repository as connected_accounts_repository
+    from src.anubis.utils.connected_accounts import (
+        repository as connected_accounts_repository,
+    )
 
     await connected_accounts_repository.ensure_connected_accounts_table(app.state.pool)
     connected_accounts_repository.set_repository(
@@ -1564,7 +1903,9 @@ async def lifespan(app: FastAPI):
     from src.anubis.utils import inbox as inbox_package
 
     await inbox_package.ensure_inbox_tables(app.state.pool)
-    inbox_package.set_inbox_repository(inbox_package.PostgresInboxRepository(app.state.pool))
+    inbox_package.set_inbox_repository(
+        inbox_package.PostgresInboxRepository(app.state.pool)
+    )
     # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
     # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
     # requires pasting JSON into the env or a manual edit. This is only the INITIAL
@@ -1592,7 +1933,9 @@ async def lifespan(app: FastAPI):
         app.state.media_jobs = {}
         # The in-chat update_avatar_identity_with_media tool starts media
         # batches through this published starter (see runtime_handles).
-        runtime_handles.set_identity_media_job_starter(start_identity_media_job_from_chat)
+        runtime_handles.set_identity_media_job_starter(
+            start_identity_media_job_from_chat
+        )
         checkpointer = AsyncPostgresSaver(app.state.pool)
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
@@ -1617,7 +1960,9 @@ async def lifespan(app: FastAPI):
                 ensure_baseline_matches_model,
             )
 
-            app.state.baseline_retrain_task = await ensure_baseline_matches_model(app.state)
+            app.state.baseline_retrain_task = await ensure_baseline_matches_model(
+                app.state
+            )
         except Exception as baseline_check_error:  # noqa: BLE001 - startup must not fail
             logger.error("Baseline provenance check failed: %s", baseline_check_error)
             app.state.baseline_retrain_task = None
@@ -1633,6 +1978,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+# Replies being generated right now, keyed by request id, so
+# ``POST /message/{assistant_id}/stop`` can end one (see ``message_stops``).
+app.state.active_message_turns = ActiveMessageTurnRegistry()
 
 
 # Middleware for request metrics
@@ -1701,9 +2049,7 @@ async def documentation():
 app.include_router(router=security_route)
 
 
-def _checkout_line_items_for_tier(
-    billing_config, tier: SubscriptionTier
-) -> list[dict]:
+def _checkout_line_items_for_tier(billing_config, tier: SubscriptionTier) -> list[dict]:
     """Build Stripe Checkout line items: the flat base price plus each metered price.
 
     The licensed base price carries ``quantity=1``; metered prices are reported via
@@ -1794,7 +2140,9 @@ async def _change_subscription_tier_for_user(
         # customer.subscription.deleted webhook pins the tier to free at the
         # boundary, so the paid allotment continues until then.
         try:
-            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+            subscription = stripe_client.Subscription.retrieve(
+                subscription_id
+            ).to_dict()
             _release_pending_subscription_schedule(stripe_client, subscription)
             stripe_client.Subscription.modify(
                 subscription_id, cancel_at_period_end=True
@@ -1837,8 +2185,7 @@ async def _change_subscription_tier_for_user(
                             for item in existing_items
                         ],
                         "start_date": current_phase.get("start_date"),
-                        "end_date": current_period_end
-                        or current_phase.get("end_date"),
+                        "end_date": current_period_end or current_phase.get("end_date"),
                     },
                     {
                         "items": [
@@ -1949,8 +2296,7 @@ async def subscribe(
     if billing_config is None:
         # Billing objects not provisioned yet — fall back to the legacy payment link.
         redirect_url = (
-            f"{app.state.context.stripe_payment_url}"
-            f"?locked_prefilled_email={email}"
+            f"{app.state.context.stripe_payment_url}?locked_prefilled_email={email}"
         )
         return {
             "action": "start_checkout",
@@ -1959,9 +2305,7 @@ async def subscribe(
         }
 
     stripe_client = request.app.state.stripe
-    status = await check_subscription_status(
-        request=request, current_user=current_user
-    )
+    status = await check_subscription_status(request=request, current_user=current_user)
     current_status = status.get("status")
     current_tier = tier_from_value(status.get("tier"))
     cancel_at_period_end = False
@@ -1970,7 +2314,9 @@ async def subscribe(
     subscription_id = status.get("subscription_id")
     if subscription_id and current_status in _LIVE_SUBSCRIPTION_STATUSES:
         try:
-            subscription = stripe_client.Subscription.retrieve(subscription_id).to_dict()
+            subscription = stripe_client.Subscription.retrieve(
+                subscription_id
+            ).to_dict()
         except Exception as retrieve_error:
             logger.error(
                 "Could not retrieve subscription %s: %s",
@@ -2269,7 +2615,9 @@ async def manage_subscription(
     }
 
 
-def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Optional[str]:
+def _auth0_user_id_for_customer(
+    stripe_client, customer_id: Optional[str]
+) -> Optional[str]:
     """Look up the Auth0 user id stored on a Stripe customer's metadata."""
     if not customer_id:
         return None
@@ -2277,7 +2625,9 @@ def _auth0_user_id_for_customer(stripe_client, customer_id: Optional[str]) -> Op
         customer = stripe_client.Customer.retrieve(customer_id).to_dict()
         return customer.get("metadata", {}).get("auth0_user_id") or None
     except Exception as lookup_error:
-        logger.error("Could not retrieve Stripe customer %s: %s", customer_id, lookup_error)
+        logger.error(
+            "Could not retrieve Stripe customer %s: %s", customer_id, lookup_error
+        )
         return None
 
 
@@ -2670,13 +3020,9 @@ async def verify_subscription_status(
     # insertion-ordered dict.
     trial_context = resolve_trial_context(current_user)
     canceled_tier_context = resolve_canceled_tier_context(current_user)
-    ordered_meters: dict = dict.fromkeys(
-        TIER_DEFINITIONS[tier].meter_allotments.keys()
-    )
+    ordered_meters: dict = dict.fromkeys(TIER_DEFINITIONS[tier].meter_allotments.keys())
     if trial_context is not None:
-        for trial_meter in TIER_DEFINITIONS[
-            trial_context.trial_tier
-        ].meter_allotments:
+        for trial_meter in TIER_DEFINITIONS[trial_context.trial_tier].meter_allotments:
             ordered_meters.setdefault(trial_meter, None)
     # A retained paid period can likewise grant meters the current tier lacks
     # (refunded premium, resubscribed pro keeps premium's adapter meters until
@@ -2994,7 +3340,9 @@ async def _connected_account_records(client: Any, user_id: str) -> list[dict[str
         try:
             return await repository.list_for_user(user_id)
         except Exception:
-            logger.debug("Could not list connected accounts for %s", user_id, exc_info=True)
+            logger.debug(
+                "Could not list connected accounts for %s", user_id, exc_info=True
+            )
             return []
     return await _search_namespace_records(client, connected_account_namespace(user_id))
 
@@ -3008,7 +3356,9 @@ async def _get_connected_account_record(
     repository = get_repository()
     if repository is not None:
         return await repository.get(user_id, key)
-    item = await client.store.get_item(list(connected_account_namespace(user_id)), key=key)
+    item = await client.store.get_item(
+        list(connected_account_namespace(user_id)), key=key
+    )
     value = (item or {}).get("value") if isinstance(item, dict) else None
     return dict(value) if value else None
 
@@ -3067,7 +3417,9 @@ async def _connect_account_from_fields(
 
     provider = get_provider(provider_name)
     if provider is None:
-        raise HTTPException(status_code=400, detail=f"Unknown provider {provider_name!r}.")
+        raise HTTPException(
+            status_code=400, detail=f"Unknown provider {provider_name!r}."
+        )
 
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
@@ -3094,10 +3446,13 @@ async def _connect_account_from_fields(
     if not any(existing.get("account_key") == key for existing in existing_records):
         if provider.kind == KIND_MCP_SERVER:
             maximum = int(
-                getattr(app.state.context, "max_custom_mcp_connectors_per_user", 10) or 10
+                getattr(app.state.context, "max_custom_mcp_connectors_per_user", 10)
+                or 10
             )
             already = sum(
-                1 for existing in existing_records if existing.get("kind") == KIND_MCP_SERVER
+                1
+                for existing in existing_records
+                if existing.get("kind") == KIND_MCP_SERVER
             )
             if already >= maximum:
                 raise HTTPException(
@@ -3119,7 +3474,9 @@ async def _connect_account_from_fields(
 
     await _put_connected_account_record(client, user_id, record)
     if provider.kind == KIND_MCP_SERVER:
-        from src.anubis.utils.connected_accounts.mcp_server_tools import forget_cached_tools
+        from src.anubis.utils.connected_accounts.mcp_server_tools import (
+            forget_cached_tools,
+        )
 
         forget_cached_tools((record.get("transport") or {}).get("server_url") or "")
 
@@ -3153,7 +3510,9 @@ async def connect_account_route(
     for name, value in body.items():
         if name not in ("provider", "fields", "assistant_id"):
             fields.setdefault(name, value)
-    return await _connect_account_from_fields(request, current_user, provider_name, fields)
+    return await _connect_account_from_fields(
+        request, current_user, provider_name, fields
+    )
 
 
 @app.post("/connect_mailbox")
@@ -3174,7 +3533,9 @@ async def connect_mailbox(
         "email_address": body.get("email_address"),
         "app_password": body.get("app_password"),
     }
-    return await _connect_account_from_fields(request, current_user, provider_name, fields)
+    return await _connect_account_from_fields(
+        request, current_user, provider_name, fields
+    )
 
 
 @app.get("/connectable_providers")
@@ -3205,7 +3566,9 @@ async def connectable_providers(
     return JSONResponse(
         content={
             "categories": list(CATEGORY_ORDER),
-            "providers": [build_connect_card(provider) for provider in catalog_providers()],
+            "providers": [
+                build_connect_card(provider) for provider in catalog_providers()
+            ],
         },
         status_code=200,
     )
@@ -3408,7 +3771,9 @@ async def set_connection_state(
                     forget_cached_tools,
                 )
 
-                forget_cached_tools((existing.get("transport") or {}).get("server_url") or "")
+                forget_cached_tools(
+                    (existing.get("transport") or {}).get("server_url") or ""
+                )
             return JSONResponse(
                 content={"connection_key": connection_key, "connected": False},
                 status_code=200,
@@ -3416,7 +3781,9 @@ async def set_connection_state(
         provider_name = identifier.split(":", 1)[0]
         provider = get_provider(provider_name)
         if provider is None:
-            raise HTTPException(status_code=400, detail=f"Unknown provider {provider_name!r}.")
+            raise HTTPException(
+                status_code=400, detail=f"Unknown provider {provider_name!r}."
+            )
         if existing is not None and existing.get("status") == "connected":
             return JSONResponse(
                 content={"connection_key": connection_key, "connected": True},
@@ -3441,14 +3808,19 @@ async def set_connection_state(
     assistant_id = personal_avatar.get("assistant_id")
     declined_namespace = list(mcp_connection_declined_namespace(user_id, assistant_id))
     if not connected:
-        await client.store.delete_item(list(mcp_connection_namespace(user_id)), key=identifier)
+        await client.store.delete_item(
+            list(mcp_connection_namespace(user_id)), key=identifier
+        )
         # Mark the device declined for this avatar so auto-adopt does not
         # silently re-bind the machine on the next turn — that is what made an
         # explicit disconnect appear not to work before the marker existed.
         await client.store.put_item(
             declined_namespace,
             key=identifier,
-            value={"device_id": identifier, "declined_at": datetime.now(timezone.utc).isoformat()},
+            value={
+                "device_id": identifier,
+                "declined_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
         return JSONResponse(
             content={"connection_key": connection_key, "connected": False},
@@ -3508,7 +3880,9 @@ async def disconnect_account(
         )
     await _delete_connected_account_record(client, user_id, account_key)
     if existing.get("kind") == "mcp_server":
-        from src.anubis.utils.connected_accounts.mcp_server_tools import forget_cached_tools
+        from src.anubis.utils.connected_accounts.mcp_server_tools import (
+            forget_cached_tools,
+        )
 
         forget_cached_tools((existing.get("transport") or {}).get("server_url") or "")
 
@@ -3603,7 +3977,9 @@ async def import_mailbox_writing_samples(
         and record.get("assistant_id") == assistant_id
     ]
     if requested_key:
-        mailboxes = [record for record in mailboxes if record.get("account_key") == requested_key]
+        mailboxes = [
+            record for record in mailboxes if record.get("account_key") == requested_key
+        ]
     if not mailboxes:
         raise HTTPException(
             status_code=404,
@@ -3619,7 +3995,9 @@ async def import_mailbox_writing_samples(
         )
     record = mailboxes[0]
     provider = get_provider(str(record.get("provider") or ""))
-    sent_folder = record.get("sent_mailbox") or (provider.sent_mailbox if provider else None)
+    sent_folder = record.get("sent_mailbox") or (
+        provider.sent_mailbox if provider else None
+    )
     if not sent_folder:
         raise HTTPException(
             status_code=400, detail="This mailbox provider exposes no sent folder."
@@ -3647,7 +4025,8 @@ async def import_mailbox_writing_samples(
         )
     except MailboxAuthenticationError:
         raise HTTPException(
-            status_code=409, detail="The mailbox rejected its saved password; reconnect it."
+            status_code=409,
+            detail="The mailbox rejected its saved password; reconnect it.",
         )
     except MailboxUnreachableError as unreachable_error:
         raise HTTPException(status_code=503, detail=str(unreachable_error))
@@ -3699,6 +4078,8 @@ async def import_mailbox_writing_samples(
             filename=media_file.get("filename"),
             namespace_filename=media_file.get("namespace_filename"),
             estimated_tokens=media_file.get("estimated_tokens"),
+            estimated_media_seconds=media_file.get("estimated_media_seconds"),
+            estimated_processing_seconds=media_file.get("estimated_processing_seconds"),
         )
         master.child_ids.append(child.job_id)
         items.append({"child": child, "media_file": media_file})
@@ -3762,8 +4143,8 @@ async def create_avatar(
 
         if user_id == context.admin_user_id:
             # or is_personal_avatar_of_creator == True
-            # verify there is only a single personal avatar of the creator; 
-            # verfiy the personal avatar of the creator against social media accounts 
+            # verify there is only a single personal avatar of the creator;
+            # verfiy the personal avatar of the creator against social media accounts
             metadata["is_public"] = is_public
 
         token = current_user["API_KEY"]
@@ -3841,9 +4222,7 @@ async def share_avatar(
     # entire basis on which a user is entitled to publish an avatar: it is their
     # own likeness. An avatar they invented, or assembled from someone else's
     # material, carries no such entitlement and stays private.
-    if not is_admin and not assistant_metadata.get(
-        "is_personal_avatar_of_creator"
-    ):
+    if not is_admin and not assistant_metadata.get("is_personal_avatar_of_creator"):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -3890,16 +4269,17 @@ async def share_avatar(
 #             token = current_user["API_KEY"]
 #             client = get_client(headers={"API-KEY": f"{token}"})
 #             namespace = (assistant_id, 'creator_id')
-#             await client.store.put_item(namespace, key='creator_id', value={"value": user_id}) 
+#             await client.store.put_item(namespace, key='creator_id', value={"value": user_id})
 #             return JSONResponse(content="stored creator_id", status_code=200)
 #         except Exception as e:
 #             raise HTTPException(
 #                 status_code=500, detail=f"Error during update of sharing avatar: {e}"
 #             )
-        
+
 #     raise HTTPException(
 #         status_code=401, detail="Users may only share avatars of themselves."
 #     )
+
 
 @app.patch("/modify_avatar")
 async def modify_avatar(
@@ -4125,11 +4505,7 @@ async def connect_mcp(
         content={
             "connected": True,
             "connected_devices": connected_labels,
-            "message": (
-                "Connected to "
-                + ", ".join(connected_labels)
-                + " now."
-            ),
+            "message": ("Connected to " + ", ".join(connected_labels) + " now."),
         },
         status_code=200,
     )
@@ -4253,9 +4629,7 @@ async def mcp_relay(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception:
-        logger.warning(
-            "MCP relay socket error for device %s", device_id, exc_info=True
-        )
+        logger.warning("MCP relay socket error for device %s", device_id, exc_info=True)
     finally:
         if device_id:
             relay_registry.drop_session(device_id, websocket)
@@ -4314,7 +4688,11 @@ async def mcp_relay_bridge(device_id: str, request: Request):
     forwarded_headers["Authorization"] = f"Bearer {session.device_secret}"
 
     try:
-        status_code, response_headers, response_body = await relay_registry.proxy_request(
+        (
+            status_code,
+            response_headers,
+            response_body,
+        ) = await relay_registry.proxy_request(
             device_id,
             method=request.method,
             path=relay_registry.LOCAL_MCP_PATH,
@@ -4325,9 +4703,7 @@ async def mcp_relay_bridge(device_id: str, request: Request):
             ),
         )
     except TimeoutError:
-        return JSONResponse(
-            content={"error": "MCP relay timed out."}, status_code=504
-        )
+        return JSONResponse(content={"error": "MCP relay timed out."}, status_code=504)
     except Exception as proxy_error:
         return JSONResponse(
             content={"error": f"MCP relay failed: {proxy_error}"}, status_code=502
@@ -4716,6 +5092,177 @@ async def list_user_avatars(
         raise HTTPException(detail=error, status_code=500)
 
 
+async def label_spoken_turn_files(
+    app_state,
+    current_user: dict,
+    *,
+    files: OptionalUploadFiles,
+    message: str,
+    assistant_id: str,
+    thread_id: Optional[str],
+    your_name: Optional[str],
+    request_id: Optional[str],
+) -> tuple[list, str, dict | None, dict | None]:
+    """Turn a ``diarize=true`` turn's audio attachment into a speaker-labelled script.
+
+    Returns the remaining (non-audio) files, the message text (the script when
+    the turn carried audio), the ``additional_kwargs`` for the human message and
+    the ``spoken_turn`` stream frame. A turn without audio passes through
+    unchanged. The diarization call is metered as ``api_metrics`` inference type
+    ``diarization``.
+    """
+    from src.anubis.utils.ambient.observations import (
+        SOURCE_MICROPHONE,
+        build_ambient_additional_kwargs,
+    )
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.speakers import (
+        diarize_spoken_turn,
+        speaker_labels_enabled,
+    )
+
+    speaker_context = GlobalContext()
+    if not speaker_labels_enabled(speaker_context):
+        raise HTTPException(
+            status_code=404,
+            detail="Speaker labelling is not enabled on this deployment.",
+        )
+    if is_anonymous_user(current_user):
+        raise HTTPException(
+            status_code=403, detail="Speaker labelling requires a signed-in user."
+        )
+    attached = list(files or [])
+    audio_uploads = []
+    remaining = []
+    for upload in attached:
+        content_type = (
+            (getattr(upload, "content_type", None) or "").split(";")[0].strip().lower()
+        )
+        if content_type.startswith("audio/"):
+            audio_uploads.append(upload)
+        else:
+            remaining.append(upload)
+    if not audio_uploads:
+        return attached, message, None, None
+
+    owner_label = (your_name or "").strip()
+    if not owner_label:
+        try:
+            langgraph_client = get_client(headers={"API-KEY": current_user["API_KEY"]})
+            assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
+            owner_label = str(assistant.get("name") or "").strip()
+        except Exception:  # noqa: BLE001 - the label falls back to "Owner"
+            owner_label = ""
+    user_id = current_user["identities"][0]["user_id"]
+    repository = get_media_asset_repository()
+
+    scripts: list[str] = []
+    segments: list[dict] = []
+    other_speakers: list[str] = []
+    owner_spoke = False
+    owner_identified = False
+    duration_seconds = 0.0
+    for upload in audio_uploads:
+        await upload.seek(0)
+        raw = await upload.read()
+        if not raw:
+            continue
+        try:
+            spoken = await diarize_spoken_turn(
+                raw,
+                mime_type=upload.content_type or "audio/webm",
+                filename=upload.filename or "utterance.webm",
+                context=speaker_context,
+                repository=repository,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                owner_label=owner_label,
+            )
+        except Exception as diarization_error:  # noqa: BLE001
+            logger.exception("Speaker labelling failed")
+            raise HTTPException(
+                status_code=400,
+                detail=f"The recording could not be transcribed: {diarization_error}",
+            )
+        try:
+            await persist_api_metrics_row(
+                app_state.pool,
+                inference_type="diarization",
+                prompt_tokens=int(spoken.usage.get("input_tokens") or 0),
+                completion_tokens=int(spoken.usage.get("output_tokens") or 0),
+                total_tokens=int(spoken.usage.get("total_tokens") or 0),
+                cost_usd=float(spoken.total_cost or 0.0),
+                latency_ms=float(spoken.latency_ms or 0.0),
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                model_name=spoken.model,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not record diarization metrics", exc_info=True)
+        if spoken.script:
+            scripts.append(spoken.script)
+        record = spoken.additional_kwargs()["speakers"]
+        segments.extend(record["segments"])
+        for label in record["other_speakers"]:
+            if label not in other_speakers:
+                other_speakers.append(label)
+        owner_spoke = owner_spoke or bool(record["owner_spoke"])
+        owner_identified = owner_identified or bool(record["owner_identified"])
+        duration_seconds += float(record["duration_seconds"] or 0.0)
+        owner_label = record["owner_label"]
+
+    script = "\n".join(scripts).strip()
+    typed = (message or "").strip()
+    combined = "\n\n".join(part for part in (typed, script) if part)
+    speakers_record = {
+        "owner_label": owner_label,
+        "owner_identified": owner_identified,
+        "owner_spoke": owner_spoke,
+        "others_spoke": bool(other_speakers),
+        "other_speakers": other_speakers,
+        "segments": segments,
+        "duration_seconds": round(duration_seconds, 3),
+    }
+    if other_speakers:
+        additional_kwargs = build_ambient_additional_kwargs(
+            sources=[SOURCE_MICROPHONE],
+            captured_at=datetime.now(UTC).isoformat(),
+            voice_mode=True,
+            hidden=False,
+        )
+        additional_kwargs["speakers"] = speakers_record
+    else:
+        additional_kwargs = {"kind": "spoken_turn", "speakers": speakers_record}
+    frame = {"content": combined, "speakers": speakers_record}
+    return remaining, combined, additional_kwargs, frame
+
+
+def refuse_ambient_observation_on_busy_thread(
+    turn_registry: ActiveMessageTurnRegistry | None, thread_id: str | None
+) -> None:
+    """Answer 409 to an observation arriving while the thread has a turn running.
+
+    The browser skips a capture while a typed turn is in flight; this is the
+    server's own guard against a client that does not. An observation is
+    disposable context, so the observation is refused rather than queued:
+    ``Retry-After`` tells the client when to look again, and the client treats
+    the refusal as pacing, not as a failure.
+    """
+    if turn_registry is None or not thread_id:
+        return
+    if turn_registry.has_turn_on_thread(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Another turn is in flight on this conversation; the ambient "
+                "observation was skipped."
+            ),
+            headers={"Retry-After": str(AMBIENT_BUSY_RETRY_AFTER_SECONDS)},
+        )
+
+
 def enforce_ambient_request(
     current_user: dict,
     *,
@@ -4963,8 +5510,16 @@ async def message_avatar(
     sources: Optional[str] = Form(None),
     captured_at: Optional[str] = Form(None),
     voice_mode: bool = Form(False),
+    diarize: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
+    # ``diarize=true`` marks the attached audio as one live-voice utterance to
+    # be transcribed WITH speaker labels (the owner recognised from the voice
+    # recordings, other people as "Speaker N" remembered per thread). The
+    # script becomes the human turn's text. When someone other than the owner
+    # spoke, the turn is triaged like an ambient observation heard through the
+    # microphone (ignore / respond / notify) while staying visible in the
+    # transcript; an owner-only utterance goes straight to the avatar.
     # ``ambient=true`` marks this turn as an ambient observation: the attached
     # files are webcam / screen snapshots (``sources`` names each file's origin,
     # aligned with ``files``; ``captured_at`` is the browser's timestamp;
@@ -5015,12 +5570,34 @@ async def message_avatar(
         if resolve_use_adapter_inference(current_user, adapter)
         else UsageMeter.MESSAGING_TOKENS
     )
+    spoken_turn_additional_kwargs: dict | None = None
+    spoken_turn_frame: dict | None = None
+    if diarize:
+        (
+            files,
+            message,
+            spoken_turn_additional_kwargs,
+            spoken_turn_frame,
+        ) = await label_spoken_turn_files(
+            request.app.state,
+            current_user,
+            files=files,
+            message=message,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            your_name=your_name,
+            request_id=request.state.request_id,
+        )
     (
         file_text_content,
         multimodal_content,
         image_filenames,
     ) = await process_files_for_message(files, message=message)
     ambient_additional_kwargs: dict | None = None
+    if spoken_turn_additional_kwargs and "ambient" in spoken_turn_additional_kwargs:
+        # Others spoke: the spoken turn is triaged like an observation heard
+        # through the microphone. The tag already carries ``speakers``.
+        ambient_additional_kwargs = spoken_turn_additional_kwargs
     if ambient:
         ambient_additional_kwargs = enforce_ambient_request(
             current_user,
@@ -5030,6 +5607,9 @@ async def message_avatar(
             captured_at=captured_at,
             voice_mode=voice_mode,
             thread_id=thread_id,
+        )
+        refuse_ambient_observation_on_busy_thread(
+            getattr(request.app.state, "active_message_turns", None), thread_id
         )
 
     user_name = your_name
@@ -5107,7 +5687,9 @@ async def message_avatar(
             UsageMeter.MESSAGING_TOKENS.value,
             UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
         ],
-        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        window_seconds=int(
+            message_rate_limit_context.message_rate_limit_window_seconds or 0
+        ),
         tokens_per_window=int(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
@@ -5187,8 +5769,10 @@ async def message_avatar(
                 + "\n"
                 + (human_message_content or "")
             )
-        human_message_additional_kwargs = ambient_additional_kwargs or {}
-        if ambient_additional_kwargs is None:
+        human_message_additional_kwargs = (
+            ambient_additional_kwargs or spoken_turn_additional_kwargs or {}
+        )
+        if ambient_additional_kwargs is None and spoken_turn_additional_kwargs is None:
             from src.anubis.utils.client_harvest_turns import (
                 CLIENT_HARVEST_MESSAGE_KIND,
                 is_client_harvest_marker_text,
@@ -5231,6 +5815,8 @@ async def message_avatar(
                 estimated_request_tokens=estimated_request_tokens,
                 estimate_meter=message_meter,
                 include_usage_metrics=include_usage_metrics,
+                spoken_turn_frame=spoken_turn_frame,
+                ambient=ambient,
             ),
             media_type="text/event-stream",
             headers={
@@ -5268,6 +5854,8 @@ async def message_avatar(
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    if spoken_turn_frame:
+        response_data["spoken_turn"] = spoken_turn_frame
     turn_usage = await _meter_message_usage(
         app_state=request.app.state,
         current_user=current_user,
@@ -5282,6 +5870,56 @@ async def message_avatar(
         if turn_usage:
             response_data["usage"] = turn_usage
     return JSONResponse(response_data, status_code=200)
+
+
+@app.post("/message/{assistant_id}/stop")
+async def stop_avatar_message(
+    request: Request,
+    assistant_id: str,
+    request_id: Optional[str] = Form(None),
+    thread_id: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """End a reply that is still being generated.
+
+    The stream announced its ``request_id`` in its first frame
+    (``turn_started``); pass that, or the ``thread_id`` when the first frame
+    was never seen. The running stream cancels the model call, records what
+    the avatar had said so far on the thread, and ends with a ``done`` frame
+    flagged ``stopped``. Only the caller who started the turn may stop it.
+
+    404 means no reply is being generated for that id in this process — the
+    turn already finished, or another API process is streaming it. A client
+    that gets 404 should abort its own stream; the streaming process treats
+    the disconnect exactly like a stop.
+    """
+    if not (request_id or thread_id):
+        raise HTTPException(
+            status_code=422, detail="Pass request_id or thread_id to stop a reply."
+        )
+    turn_registry = getattr(request.app.state, "active_message_turns", None)
+    active_turn = (
+        turn_registry.find(request_id=request_id, thread_id=thread_id)
+        if turn_registry is not None
+        else None
+    )
+    caller_user_id = current_user["identities"][0]["user_id"]
+    if (
+        active_turn is None
+        or active_turn.user_id != caller_user_id
+        or (active_turn.assistant_id or "") != assistant_id.strip()
+    ):
+        raise HTTPException(
+            status_code=404, detail="No reply is being generated for that request."
+        )
+    active_turn.request_stop()
+    return JSONResponse(
+        {
+            "status": "stopping",
+            "request_id": active_turn.request_id,
+            "thread_id": active_turn.thread_id,
+        }
+    )
 
 
 @app.post("/message/{assistant_id}/resume")
@@ -5386,7 +6024,9 @@ async def resume_avatar_message(
             UsageMeter.MESSAGING_TOKENS.value,
             UsageMeter.ADAPTER_INFERENCE_TOKENS.value,
         ],
-        window_seconds=int(message_rate_limit_context.message_rate_limit_window_seconds or 0),
+        window_seconds=int(
+            message_rate_limit_context.message_rate_limit_window_seconds or 0
+        ),
         tokens_per_window=int(
             message_rate_limit_context.message_rate_limit_tokens_per_window or 0
         ),
@@ -5883,9 +6523,7 @@ async def fetch_remote_url_bytes(
         return body, header_ct
     async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
         try:
-            r = await client.get(
-                url, headers={"User-Agent": ARTICLE_FETCH_USER_AGENT}
-            )
+            r = await client.get(url, headers={"User-Agent": ARTICLE_FETCH_USER_AGENT})
             r.raise_for_status()
         except httpx.HTTPStatusError as fetch_error:
             status = (
@@ -6334,8 +6972,7 @@ def _normalize_tabular_json_to_rows(
             return None
         for column_values in parsed.values():
             if not all(
-                _is_tabular_scalar(cell_value)
-                for cell_value in column_values.values()
+                _is_tabular_scalar(cell_value) for cell_value in column_values.values()
             ):
                 return None
         headers = [str(column_name) for column_name in parsed.keys()]
@@ -6420,7 +7057,9 @@ async def _tabular_json_to_statements_payload(
     )
 
 
-async def _assistant_owner_for_media(assistant_id: str, current_user: dict) -> str | None:
+async def _assistant_owner_for_media(
+    assistant_id: str, current_user: dict
+) -> str | None:
     """The owner of an avatar, for reading its public media as any chatter."""
     langgraph_client = get_client(headers={"API-KEY": current_user["API_KEY"]})
     try:
@@ -6517,7 +7156,9 @@ async def _run_emotion_media_job(
             logger.debug("Could not record %s cost", inference_type, exc_info=True)
 
     def _progress(stage, fields):
-        asyncio.create_task(repository.update_job(job_id, detail={"stage": stage, **fields}))
+        asyncio.create_task(
+            repository.update_job(job_id, detail={"stage": stage, **fields})
+        )
 
     try:
         manifest = await generate_emotion_media_for_avatar(
@@ -6535,12 +7176,19 @@ async def _run_emotion_media_job(
         )
         await repository.update_job(
             job_id,
-            state=JOB_STATE_COMPLETED if not manifest.get("failures") else JOB_STATE_FAILED,
-            detail={"complete": manifest.get("complete"), "failures": manifest.get("failures")},
+            state=JOB_STATE_COMPLETED
+            if not manifest.get("failures")
+            else JOB_STATE_FAILED,
+            detail={
+                "complete": manifest.get("complete"),
+                "failures": manifest.get("failures"),
+            },
         )
     except Exception as job_error:  # noqa: BLE001
         logger.exception("Emotion media job %s failed: %s", job_id, job_error)
-        await repository.update_job(job_id, state=JOB_STATE_FAILED, detail={"error": str(job_error)})
+        await repository.update_job(
+            job_id, state=JOB_STATE_FAILED, detail={"error": str(job_error)}
+        )
 
 
 @app.post("/avatar_emotion_media/regenerate")
@@ -6583,7 +7231,9 @@ async def regenerate_avatar_emotion_media(
         )
     enforce_tier_capability(current_user, TierCapability.UPLOAD)
     await resolve_assistant_for_creator(
-        assistant_id, current_user, action_description="regenerate media for that avatar"
+        assistant_id,
+        current_user,
+        action_description="regenerate media for that avatar",
     )
     repository = get_media_asset_repository()
     if repository is None or not emotion_media_enabled(app.state.context):
@@ -6591,12 +7241,15 @@ async def regenerate_avatar_emotion_media(
             status_code=503, detail="Emotion media generation is not configured."
         )
     user_id = current_user["identities"][0]["user_id"]
-    item = await app.state.store.aget((user_id, assistant_id, "reference_image"), assistant_id)
+    item = await app.state.store.aget(
+        (user_id, assistant_id, "reference_image"), assistant_id
+    )
     value = (getattr(item, "value", None) or {}) if item is not None else {}
     reference_image_data_uri = value.get("reference_image_data")
     if not reference_image_data_uri:
         raise HTTPException(
-            status_code=404, detail="Upload a reference image before generating emotion media."
+            status_code=404,
+            detail="Upload a reference image before generating emotion media.",
         )
     job_id = await repository.create_job(
         user_id=user_id,
@@ -6696,13 +7349,18 @@ async def _poll_training_voice_clones(context: Any) -> None:
     from src.anubis.utils.voice.corpus import refresh_training_state
 
     interval = float(
-        getattr(context, "professional_voice_clone_poll_interval_seconds", None) or 300.0
+        getattr(context, "professional_voice_clone_poll_interval_seconds", None)
+        or 300.0
     )
     while True:
         try:
             await asyncio.sleep(interval)
             repository = get_media_asset_repository()
-            if repository is None or not hasattr(repository, "pool") or repository.pool is None:
+            if (
+                repository is None
+                or not hasattr(repository, "pool")
+                or repository.pool is None
+            ):
                 continue
             async with repository.pool.connection() as connection:
                 async with connection.cursor() as cursor:
@@ -6717,7 +7375,9 @@ async def _poll_training_voice_clones(context: Any) -> None:
                         repository, context, user_id=user_id, assistant_id=assistant_id
                     )
                 except Exception:  # noqa: BLE001
-                    logger.debug("Training poll failed for %s", assistant_id, exc_info=True)
+                    logger.debug(
+                        "Training poll failed for %s", assistant_id, exc_info=True
+                    )
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001
@@ -6730,7 +7390,9 @@ def _voice_repository_or_503() -> Any:
 
     repository = get_media_asset_repository()
     if repository is None or not voice_configured(app.state.context):
-        raise HTTPException(status_code=503, detail="Voice features are not configured.")
+        raise HTTPException(
+            status_code=503, detail="Voice features are not configured."
+        )
     return repository
 
 
@@ -6865,7 +7527,9 @@ async def add_avatar_voice_sample(
                 replace=False,
             )
         except Exception:  # noqa: BLE001
-            logger.debug("Could not store a diarizer reference from the recording", exc_info=True)
+            logger.debug(
+                "Could not store a diarizer reference from the recording", exc_info=True
+            )
 
     status = await voice_status_for(
         repository,
@@ -6906,14 +7570,17 @@ async def set_avatar_voice_reference(
     source_document_name = str(body.get("source_document_name") or "").strip()
     if not assistant_id or not source_document_name:
         raise HTTPException(
-            status_code=400, detail="assistant_id and source_document_name are required."
+            status_code=400,
+            detail="assistant_id and source_document_name are required.",
         )
     _assistant, is_personal = await _owned_assistant_for_voice(
         assistant_id, current_user, "change that avatar's reference audio"
     )
     user_id = current_user["identities"][0]["user_id"]
 
-    clip = await longest_clip_for_document(repository, assistant_id, source_document_name)
+    clip = await longest_clip_for_document(
+        repository, assistant_id, source_document_name
+    )
     if clip is None:
         raise HTTPException(
             status_code=404,
@@ -6979,7 +7646,8 @@ async def get_avatar_voice_verification(
     )
     if not is_personal:
         raise HTTPException(
-            status_code=403, detail="Professional voice cloning is for the personal avatar."
+            status_code=403,
+            detail="Professional voice cloning is for the personal avatar.",
         )
     user_id = current_user["identities"][0]["user_id"]
     record = await prepare_professional_voice(
@@ -7003,7 +7671,9 @@ async def get_avatar_voice_verification(
         )
     except elevenlabs_client.ElevenLabsError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
-    return JSONResponse({"voice_id": record["professional_voice_id"], "captcha": captcha})
+    return JSONResponse(
+        {"voice_id": record["professional_voice_id"], "captcha": captcha}
+    )
 
 
 @app.post("/avatar_voice/verification")
@@ -7022,7 +7692,8 @@ async def submit_avatar_voice_verification(
     )
     if not is_personal:
         raise HTTPException(
-            status_code=403, detail="Professional voice cloning is for the personal avatar."
+            status_code=403,
+            detail="Professional voice cloning is for the personal avatar.",
         )
     raw = await recording.read()
     if not raw:
@@ -7033,7 +7704,11 @@ async def submit_avatar_voice_verification(
             app.state.context,
             user_id=current_user["identities"][0]["user_id"],
             assistant_id=assistant_id,
-            recording=(recording.filename or "captcha.webm", raw, recording.content_type or "audio/webm"),
+            recording=(
+                recording.filename or "captcha.webm",
+                raw,
+                recording.content_type or "audio/webm",
+            ),
         )
     except ValueError as state_error:
         raise HTTPException(status_code=409, detail=str(state_error))
@@ -7067,7 +7742,8 @@ async def retry_avatar_professional_voice(
     )
     if not is_personal:
         raise HTTPException(
-            status_code=403, detail="Professional voice cloning is for the personal avatar."
+            status_code=403,
+            detail="Professional voice cloning is for the personal avatar.",
         )
     record = await retry_professional_voice(
         repository,
@@ -7112,7 +7788,8 @@ async def transcribe_recording(
         )
     except Exception as transcription_error:  # noqa: BLE001
         raise HTTPException(
-            status_code=400, detail=f"The recording could not be transcribed: {transcription_error}"
+            status_code=400,
+            detail=f"The recording could not be transcribed: {transcription_error}",
         )
     text = str(result.get("text") or "").strip()
     try:
@@ -7126,7 +7803,9 @@ async def transcribe_recording(
         )
     except Exception:  # noqa: BLE001
         logger.debug("Could not record transcription metrics", exc_info=True)
-    return JSONResponse({"text": text, "duration_seconds": result.get("duration")})
+    return JSONResponse(
+        {"text": text, "duration_seconds": result.get("file_duration_s")}
+    )
 
 
 @app.post("/speak")
@@ -7151,7 +7830,9 @@ async def speak_text(
     assistant_id = str(body.get("assistant_id") or "").strip()
     text = str(body.get("text") or "").strip()
     if not assistant_id or not text:
-        raise HTTPException(status_code=400, detail="assistant_id and text are required.")
+        raise HTTPException(
+            status_code=400, detail="assistant_id and text are required."
+        )
     if len(text) > 5000:
         text = text[:5000]
     enforce_tier_capability(current_user, TierCapability.AUDIO_RESPONSES)
@@ -7179,7 +7860,8 @@ async def speak_text(
         )
 
     model_id = str(
-        getattr(app.state.context, "elevenlabs_text_to_speech_model", None) or "eleven_flash_v2_5"
+        getattr(app.state.context, "elevenlabs_text_to_speech_model", None)
+        or "eleven_flash_v2_5"
     )
     started = time.perf_counter()
     try:
@@ -7190,7 +7872,11 @@ async def speak_text(
         raise HTTPException(status_code=502, detail=str(vendor_error))
 
     cost_per_thousand = float(
-        getattr(app.state.context, "elevenlabs_text_to_speech_cost_per_1000_characters_usd", None)
+        getattr(
+            app.state.context,
+            "elevenlabs_text_to_speech_cost_per_1000_characters_usd",
+            None,
+        )
         or 0.05
     )
     await _meter_speech_characters(
@@ -7228,7 +7914,9 @@ async def _meter_speech_characters(
             user_id=current_user["identities"][0]["user_id"],
             assistant_id=assistant_id,
             model_name=model_name,
-            meter_event_name=getattr(getattr(UsageMeter, "SPEECH_CHARACTERS", None), "value", None),
+            meter_event_name=getattr(
+                getattr(UsageMeter, "SPEECH_CHARACTERS", None), "value", None
+            ),
         )
     except Exception:  # noqa: BLE001
         logger.debug("Could not record speech metrics", exc_info=True)
@@ -7273,13 +7961,16 @@ async def start_lip_sync_clip(
     text = str(body.get("text") or "").strip()[:2000]
     emotion = str(body.get("emotion") or "neutral").strip().lower() or "neutral"
     if not assistant_id or not text:
-        raise HTTPException(status_code=400, detail="assistant_id and text are required.")
+        raise HTTPException(
+            status_code=400, detail="assistant_id and text are required."
+        )
     enforce_tier_capability(current_user, TierCapability.VIDEO_RESPONSES)
 
     _kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
     if voice_id is None:
         raise HTTPException(
-            status_code=409, detail="This avatar has no cloned voice yet; record one in settings."
+            status_code=409,
+            detail="This avatar has no cloned voice yet; record one in settings.",
         )
     try:
         result = await start_lip_sync(
@@ -7295,7 +7986,11 @@ async def start_lip_sync_clip(
         raise HTTPException(status_code=502, detail=str(vendor_error))
     if result["status"] == "completed":
         return JSONResponse(
-            {"status": "completed", "video_url": f"/avatar_emotion_media/{result['asset_id']}", "cached": True}
+            {
+                "status": "completed",
+                "video_url": f"/avatar_emotion_media/{result['asset_id']}",
+                "cached": True,
+            }
         )
     return JSONResponse(
         status_code=202,
@@ -7328,13 +8023,19 @@ async def get_lip_sync_clip(
             assistant_id=job["assistant_id"],
             seconds=seconds,
             cost_usd=float(
-                getattr(app.state.context, "elevenlabs_lip_sync_cost_per_second_usd", None) or 0.14
+                getattr(
+                    app.state.context, "elevenlabs_lip_sync_cost_per_second_usd", None
+                )
+                or 0.14
             )
             * seconds,
         )
     if result["status"] == "completed":
         return JSONResponse(
-            {"status": "completed", "video_url": f"/avatar_emotion_media/{result['asset_id']}"}
+            {
+                "status": "completed",
+                "video_url": f"/avatar_emotion_media/{result['asset_id']}",
+            }
         )
     return JSONResponse({"status": result["status"]})
 
@@ -7362,7 +8063,10 @@ async def _meter_video_seconds(
     try:
         stripe_customer_id = await resolve_stripe_customer_id(app.state, current_user)
         await report_meter_event(
-            app.state.stripe, video_meter, stripe_customer_id, max(1, int(round(seconds)))
+            app.state.stripe,
+            video_meter,
+            stripe_customer_id,
+            max(1, int(round(seconds))),
         )
     except Exception:  # noqa: BLE001
         logger.debug("Could not report video meter event", exc_info=True)
@@ -7373,7 +8077,9 @@ def _inbox_repository_or_503() -> Any:
 
     repository = get_inbox_repository()
     if repository is None:
-        raise HTTPException(status_code=503, detail="The agent inbox is not configured.")
+        raise HTTPException(
+            status_code=503, detail="The agent inbox is not configured."
+        )
     return repository
 
 
@@ -7424,7 +8130,11 @@ async def inbox_count(
         client, request, current_user, token
     )
     return JSONResponse(
-        {"pending_count": await repository.count_open(personal_avatar.get("assistant_id"))}
+        {
+            "pending_count": await repository.count_open(
+                personal_avatar.get("assistant_id")
+            )
+        }
     )
 
 
@@ -7700,8 +8410,10 @@ async def _build_media_entries_for_file(
                 assistant_id=assistant_id,
             )
         )
-    elif not reference_image and not reference_audio and _is_json_upload(
-        raw_name, mime_type
+    elif (
+        not reference_image
+        and not reference_audio
+        and _is_json_upload(raw_name, mime_type)
     ):
         # A JSON upload may be the same table a CSV would carry (a pandas
         # to_json dump). Convert tabular shapes through the CSV statements
@@ -7731,7 +8443,9 @@ async def _build_media_entries_for_file(
                     "reference_audio": False,
                     "reference_image": False,
                     "base64_encoded_str": make_data_uri(mime_type, content),
-                    "namespace_filename": raw_name if not "." in raw_name else _namespace_safe_formatted_filename(raw_name),
+                    "namespace_filename": raw_name
+                    if not "." in raw_name
+                    else _namespace_safe_formatted_filename(raw_name),
                 }
             )
     elif reference_image:
@@ -7868,8 +8582,7 @@ async def _build_media_entries_for_file(
             # or a client that sends application/octet-stream) would otherwise
             # fall through to the plain-text branch below and be ingested as
             # binary text. The %PDF magic is decisive, so honor it.
-            mime_type == "application/octet-stream"
-            and sniff == "application/pdf"
+            mime_type == "application/octet-stream" and sniff == "application/pdf"
         ):
             effective = "application/pdf"
             entries.append(
@@ -8001,10 +8714,20 @@ async def _expand_youtube_playlist_to_media_entries(
         )
         video_ns = _namespace_safe_formatted_filename(watch_url)
         video_title = (entry.get("title") or "").strip()
+        video_media_seconds = (
+            round(video_duration_seconds, 1)
+            if video_duration_seconds > 0
+            else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
+        )
         media_entries.append(
             {
                 "filename": f"{playlist_label}::{video_title or watch_url}",
                 "estimated_tokens": video_estimated_tokens,
+                "estimated_media_seconds": video_media_seconds,
+                "estimated_processing_seconds": estimate_processing_seconds(
+                    video_media_seconds,
+                    GlobalContext().media_preprocessing_seconds_per_media_second,
+                ),
                 "content_type": "text/html",
                 "content": b"",
                 "page_url": watch_url,
@@ -8373,7 +9096,25 @@ def _extract_pdf_text_from_bytes(pdf_bytes: bytes, filename: str) -> str:
                 pass
 
 
-_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS = 8.0
+def _stamp_media_time_estimate(
+    entry: dict, duration_seconds: float | None, context: GlobalContext
+) -> None:
+    """Record a speech item's probed length and expected processing time.
+
+    ``estimated_media_seconds`` is the audio/video length the token estimate was
+    computed from (the sanctioned fallback when the probe failed);
+    ``estimated_processing_seconds`` is that length times
+    ``media_preprocessing_seconds_per_media_second``. Both ride on the entry into
+    ``create_child_job`` so the upload card and every progress frame can show
+    "about N min" and time remaining.
+    """
+    entry["estimated_media_seconds"] = (
+        round(float(duration_seconds), 1) if duration_seconds else None
+    )
+    entry["estimated_processing_seconds"] = estimate_processing_seconds(
+        entry["estimated_media_seconds"],
+        context.media_preprocessing_seconds_per_media_second,
+    )
 
 
 async def _estimate_tokens_for_media_entry(entry: dict) -> int:
@@ -8405,6 +9146,7 @@ async def _estimate_tokens_for_media_entry(entry: dict) -> int:
             if duration_seconds and duration_seconds > 0
             else ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS
         )
+        _stamp_media_time_estimate(entry, effective_duration, context)
         return estimate_media_item_tokens(
             kind,
             duration_seconds=effective_duration,
@@ -8480,16 +9222,23 @@ async def _estimate_tokens_for_media_entry(entry: dict) -> int:
             from src.anubis.utils.utility import get_remote_video_duration_seconds
 
             duration_seconds = None
+            probe_timeout_seconds = float(
+                context.remote_duration_probe_timeout_seconds or 30.0
+            )
             try:
                 duration_seconds = await asyncio.wait_for(
                     get_remote_video_duration_seconds(page_url),
-                    timeout=_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS,
+                    timeout=probe_timeout_seconds,
                 )
             except Exception as duration_error:  # noqa: BLE001 - sanctioned fallback
+                # ``str(asyncio.TimeoutError())`` is empty, so name the failure
+                # class as well; an empty "()" in this line is a probe timeout.
                 logger.warning(
-                    "Remote duration probe failed for %s (%s); assuming %.0f seconds.",
+                    "Remote duration probe failed for %s (%s: %s; limit %.0f s); assuming %.0f seconds.",
                     page_url,
+                    type(duration_error).__name__,
                     duration_error,
+                    probe_timeout_seconds,
                     ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS,
                 )
             return _estimate_for_duration("video", duration_seconds)
@@ -8529,7 +9278,9 @@ async def _estimate_tokens_for_media_entry(entry: dict) -> int:
                 try:
                     duration_seconds = await asyncio.wait_for(
                         get_remote_video_duration_seconds(page_url),
-                        timeout=_REMOTE_DURATION_PROBE_TIMEOUT_SECONDS,
+                        timeout=float(
+                            context.remote_duration_probe_timeout_seconds or 30.0
+                        ),
                     )
                 except Exception:  # noqa: BLE001 - sanctioned fallback
                     pass
@@ -8594,9 +9345,7 @@ async def _estimate_media_entries_tokens(media_files: list) -> int:
         entry["estimated_tokens"] = estimated
         return estimated
 
-    estimates = await asyncio.gather(
-        *(_estimate_one(entry) for entry in media_files)
-    )
+    estimates = await asyncio.gather(*(_estimate_one(entry) for entry in media_files))
     return sum(estimates)
 
 
@@ -8685,8 +9434,7 @@ async def _start_media_batch(
         current_user,
         meter_event_names=[UsageMeter.DOCUMENT_UPLOAD_TOKENS.value],
         window_seconds=int(
-            media_upload_rate_limit_context.media_upload_rate_limit_window_seconds
-            or 0
+            media_upload_rate_limit_context.media_upload_rate_limit_window_seconds or 0
         ),
         tokens_per_window=int(
             media_upload_rate_limit_context.media_upload_rate_limit_tokens_per_window
@@ -8732,9 +9480,7 @@ async def _start_media_batch(
     # uploaded" requirement). To refresh an existing item, delete it first via
     # DELETE /delete_avatar_document, then re-upload.
     try:
-        existing_items = await store.asearch(
-            (user_id, assistant_id), limit=1_000_000
-        )
+        existing_items = await store.asearch((user_id, assistant_id), limit=1_000_000)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -8805,6 +9551,8 @@ async def _start_media_batch(
             filename=media_file.get("filename"),
             namespace_filename=media_file.get("namespace_filename"),
             estimated_tokens=media_file.get("estimated_tokens"),
+            estimated_media_seconds=media_file.get("estimated_media_seconds"),
+            estimated_processing_seconds=media_file.get("estimated_processing_seconds"),
         )
         master.child_ids.append(child.job_id)
         items.append({"child": child, "media_file": media_file})
@@ -8814,6 +9562,8 @@ async def _start_media_batch(
                 "filename": child.filename,
                 "status": child.status,
                 "estimated_tokens": media_file.get("estimated_tokens"),
+                "estimated_media_seconds": child.estimated_media_seconds,
+                "estimated_processing_seconds": child.estimated_processing_seconds,
                 "status_url": f"/media_job/{child.job_id}",
                 "progress_url": f"/media_job/{child.job_id}/progress",
                 "cancel_url": f"/media_job/{child.job_id}/cancel",
@@ -8877,6 +9627,10 @@ async def _start_media_batch(
         # was checked against the allotment and reported to the meter,
         # plus where the caller now stands against the allotment.
         "estimated_tokens_total": estimated_tokens_total,
+        "estimated_media_seconds_total": job_estimated_media_seconds(registry, master),
+        "estimated_processing_seconds_total": job_estimated_processing_seconds(
+            registry, master
+        ),
         "usage": await _build_meter_usage_snapshot(
             app.state, current_user, UsageMeter.DOCUMENT_UPLOAD_TOKENS
         ),
@@ -8884,8 +9638,7 @@ async def _start_media_batch(
         "message": (
             "Media processing started"
             + (
-                f"; enumerating {len(playlist_urls)} playlist(s) in the "
-                "background"
+                f"; enumerating {len(playlist_urls)} playlist(s) in the background"
                 if playlist_urls
                 else ""
             )
@@ -9090,7 +9843,9 @@ async def update_avatar_identity_with_media(
         # Shared with /list_avatar_documents and /delete_avatar_document, which read
         # and remove the very rows this endpoint writes.
         assistant, _creator_id = await resolve_assistant_for_creator(
-            assistant_id, current_user, action_description="upload media for that avatar"
+            assistant_id,
+            current_user,
+            action_description="upload media for that avatar",
         )
         assistant_meta = assistant.get("metadata") or {}
 
@@ -9388,6 +10143,10 @@ async def list_media_jobs(
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "duration_seconds": job.duration_seconds,
+            "estimated_media_seconds": job_estimated_media_seconds(registry, job),
+            "estimated_processing_seconds": job_estimated_processing_seconds(
+                registry, job
+            ),
             "children_total": len(children),
             "children_completed": statuses.count("completed"),
             "children_error": statuses.count("error"),
@@ -9433,6 +10192,10 @@ async def media_job_status(
             "namespace_filename": j.namespace_filename,
             "status": j.status,
             "estimated_tokens": j.estimated_tokens,
+            "estimated_media_seconds": job_estimated_media_seconds(registry, j),
+            "estimated_processing_seconds": job_estimated_processing_seconds(
+                registry, j
+            ),
             "error": j.error,
             "created_at": j.created_at,
             "started_at": j.started_at,
@@ -9483,16 +10246,31 @@ async def media_job_progress(
     if job.user_id != user_id:
         raise HTTPException(status_code=403, detail="This job belongs to another user.")
 
+    registry = app.state.media_jobs
+
     def _with_timing(payload: dict) -> dict:
-        """Return a copy of ``payload`` stamped with the job's start time and the
-        wall-clock seconds elapsed since processing began, so every SSE ``data:``
-        frame carries timing. ``started_at`` is epoch seconds (set when the job
-        flipped to running); fall back to ``created_at`` if it hasn't yet."""
+        """Return a copy of ``payload`` stamped with the job's start time, the
+        wall-clock seconds elapsed since processing began, and the processing-time
+        estimate (probed media length x ``media_preprocessing_seconds_per_media_second``)
+        with the seconds still expected, so every SSE ``data:`` frame carries
+        timing. ``started_at`` is epoch seconds (set when the job flipped to
+        running); fall back to ``created_at`` if it hasn't yet. The estimate keys
+        are ``None`` for items that are not audio or video.
+        """
         started = job.started_at or job.created_at
+        elapsed_seconds = round(time_ns() / 1_000_000_000 - started, 3)
+        estimated_processing = job_estimated_processing_seconds(registry, job)
         return {
             **payload,
             "started_at": job.started_at,
-            "elapsed_seconds": round(time_ns() / 1_000_000_000 - started, 3),
+            "elapsed_seconds": elapsed_seconds,
+            "estimated_media_seconds": job_estimated_media_seconds(registry, job),
+            "estimated_processing_seconds": estimated_processing,
+            "estimated_remaining_seconds": (
+                round(max(0.0, estimated_processing - elapsed_seconds), 1)
+                if estimated_processing is not None
+                else None
+            ),
         }
 
     async def event_stream(job: MediaJob):
@@ -9610,7 +10388,7 @@ async def cancel_media_job(
     there may be nothing to delete.
     """
     user_id = current_user["identities"][0]["user_id"]
-    job_id = job_id.strip() # remove spaces and newline characters
+    job_id = job_id.strip()  # remove spaces and newline characters
     registry = app.state.media_jobs
     job: Optional[MediaJob] = get_job(registry, job_id)
     if job is None:
@@ -9713,7 +10491,9 @@ async def list_avatar_documents(
                 await voice_repository.list_voice_clips(assistant_id)
             )
         except Exception as voice_error:  # noqa: BLE001
-            logger.debug("Voice seconds unavailable for %s: %s", assistant_id, voice_error)
+            logger.debug(
+                "Voice seconds unavailable for %s: %s", assistant_id, voice_error
+            )
 
     return {
         # Unchanged shape: the plain label list every existing caller reads, and
@@ -9932,9 +10712,7 @@ IDENTITY_FACT_GROUPS: dict[str, str] = {
     "memory": "memory",
 }
 
-_FACT_CONTEXT_TAG_PATTERN = re.compile(
-    r"<FACT_CONTEXT>(.*?)</FACT_CONTEXT>", re.DOTALL
-)
+_FACT_CONTEXT_TAG_PATTERN = re.compile(r"<FACT_CONTEXT>(.*?)</FACT_CONTEXT>", re.DOTALL)
 
 
 def _store_item_namespace(item) -> tuple:
@@ -10208,9 +10986,8 @@ async def update_avatar_identity_fact(
         # Media-ingested facts carry the fact only inside the <FACT> span (no
         # ``metadata.fact``), so the rewrite helper cannot record what it
         # replaced; record it here from the fact the listing showed.
-        if (
-            updated_document.metadata.get("corrected_from") is None
-            and current_row.get("fact")
+        if updated_document.metadata.get("corrected_from") is None and current_row.get(
+            "fact"
         ):
             extra_metadata["corrected_from"] = current_row["fact"]
         # Analysis rows keep the statement under ``metadata[<feature>]`` too
@@ -10345,8 +11122,16 @@ async def _prune_ground_truth_features_for_deleted_docs(
     store = app.state.store
 
     dict_namespace = (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)
-    threshold_namespace = (user_id, assistant_id, "ground_truth_text_empirical_threshold_list_str")
-    model_namespace = (user_id, assistant_id, "ground_truth_text_features_model_b64_pkl")
+    threshold_namespace = (
+        user_id,
+        assistant_id,
+        "ground_truth_text_empirical_threshold_list_str",
+    )
+    model_namespace = (
+        user_id,
+        assistant_id,
+        "ground_truth_text_features_model_b64_pkl",
+    )
     style_profile_namespace = (user_id, assistant_id, "style_profile")
 
     item = await store.aget(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
@@ -10366,8 +11151,12 @@ async def _prune_ground_truth_features_for_deleted_docs(
     if not features_by_doc_id:
         # Corpus is now empty: clear the derived keys.
         await store.adelete(dict_namespace, key=GROUND_TRUTH_FEATURES_DICT_KEY)
-        await store.adelete(threshold_namespace, key="ground_truth_text_empirical_threshold_list_str")
-        await store.adelete(model_namespace, key="ground_truth_text_features_model_b64_pkl")
+        await store.adelete(
+            threshold_namespace, key="ground_truth_text_empirical_threshold_list_str"
+        )
+        await store.adelete(
+            model_namespace, key="ground_truth_text_features_model_b64_pkl"
+        )
         await store.adelete(style_profile_namespace, key="style_profile")
         return
 
@@ -10378,6 +11167,7 @@ async def _prune_ground_truth_features_for_deleted_docs(
     )
 
     from src.anubis.utils.dataset.style_features import build_style_profile_str
+
     style_profile_str = await build_style_profile_str(ground_truth_text_features_arr)
 
     await store.aput(

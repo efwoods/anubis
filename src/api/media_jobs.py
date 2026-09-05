@@ -76,6 +76,15 @@ class MediaJob:
     # stamped at submit (or at playlist expansion) so job status/progress can
     # show what the item was billed against.
     estimated_tokens: int | None = None
+    # Probed length of this child's audio/video in seconds (None for items that
+    # are not speech media) and the wall-clock processing time expected for it:
+    # ``estimated_media_seconds`` x ``media_preprocessing_seconds_per_media_second``
+    # (GlobalContext). Stamped at submit (or at playlist expansion); shown on the
+    # upload card as "about N min" and carried on every progress frame so the
+    # client can show time remaining. A master job reports the sum of its
+    # children (see ``job_estimated_processing_seconds``).
+    estimated_media_seconds: float | None = None
+    estimated_processing_seconds: float | None = None
     # How many Documents this job indexed into the ``quote`` namespace — the
     # avatar's direct quotes. ``run_batch_media_job`` recalibrates the avatar's
     # direct-quote cloud after the batch only when this is non-zero, so a
@@ -145,6 +154,8 @@ def create_child_job(
     filename: Optional[str],
     namespace_filename: Optional[str],
     estimated_tokens: int | None = None,
+    estimated_media_seconds: float | None = None,
+    estimated_processing_seconds: float | None = None,
 ) -> MediaJob:
     """Register and return one per-item child job under ``parent_id``."""
     job = MediaJob(
@@ -155,6 +166,8 @@ def create_child_job(
         filename=filename,
         namespace_filename=namespace_filename,
         estimated_tokens=estimated_tokens,
+        estimated_media_seconds=estimated_media_seconds,
+        estimated_processing_seconds=estimated_processing_seconds,
     )
     registry[job.job_id] = job
     return job
@@ -163,6 +176,69 @@ def create_child_job(
 def get_job(registry: Dict[str, MediaJob], job_id: str) -> Optional[MediaJob]:
     """Return the job for ``job_id``, or ``None`` if unknown/expired."""
     return registry.get(job_id)
+
+
+def estimate_processing_seconds(
+    estimated_media_seconds: float | None,
+    seconds_per_media_second: float | None,
+) -> float | None:
+    """Return the expected wall-clock processing time for a speech item.
+
+    ``estimated_media_seconds`` is the probed audio/video length;
+    ``seconds_per_media_second`` is ``media_preprocessing_seconds_per_media_second``
+    from ``GlobalContext`` (default one second of processing per second of media).
+    Returns ``None`` when the item is not timed media or the factor is unset, so a
+    document or image never shows a bogus countdown.
+    """
+    if estimated_media_seconds is None or seconds_per_media_second is None:
+        return None
+    try:
+        media_seconds = float(estimated_media_seconds)
+        factor = float(seconds_per_media_second)
+    except (TypeError, ValueError):
+        return None
+    if media_seconds <= 0 or factor <= 0:
+        return None
+    return round(media_seconds * factor, 1)
+
+
+def job_estimated_processing_seconds(
+    registry: Dict[str, MediaJob], job: MediaJob
+) -> float | None:
+    """Return the processing-time estimate to show for ``job``.
+
+    A child reports its own estimate. A master reports the sum over its children
+    that carry one (an upper bound: children run concurrently up to the batch's
+    concurrency limit), or ``None`` when no child is timed media.
+    """
+    if not job.is_master:
+        return job.estimated_processing_seconds
+    child_estimates = [
+        registry[child_id].estimated_processing_seconds
+        for child_id in job.child_ids
+        if child_id in registry
+        and registry[child_id].estimated_processing_seconds is not None
+    ]
+    if not child_estimates:
+        return None
+    return round(sum(child_estimates), 1)
+
+
+def job_estimated_media_seconds(
+    registry: Dict[str, MediaJob], job: MediaJob
+) -> float | None:
+    """Return the probed audio/video seconds for ``job`` (a master sums its children)."""
+    if not job.is_master:
+        return job.estimated_media_seconds
+    child_durations = [
+        registry[child_id].estimated_media_seconds
+        for child_id in job.child_ids
+        if child_id in registry
+        and registry[child_id].estimated_media_seconds is not None
+    ]
+    if not child_durations:
+        return None
+    return round(sum(child_durations), 1)
 
 
 def add_event(job: MediaJob, payload: Dict[str, Any]) -> None:
@@ -546,6 +622,12 @@ async def run_batch_media_job(
                         filename=media_file.get("filename"),
                         namespace_filename=media_file.get("namespace_filename"),
                         estimated_tokens=media_file.get("estimated_tokens"),
+                        estimated_media_seconds=media_file.get(
+                            "estimated_media_seconds"
+                        ),
+                        estimated_processing_seconds=media_file.get(
+                            "estimated_processing_seconds"
+                        ),
                     )
                     master.child_ids.append(child.job_id)
                     items.append({"child": child, "media_file": media_file})
@@ -557,6 +639,8 @@ async def run_batch_media_job(
                             "item_job_id": child.job_id,
                             "item_filename": child.filename,
                             "estimated_tokens": child.estimated_tokens,
+                            "estimated_media_seconds": child.estimated_media_seconds,
+                            "estimated_processing_seconds": child.estimated_processing_seconds,
                         },
                     )
 
@@ -643,6 +727,8 @@ def _summarize_children(children: List[MediaJob]) -> List[Dict[str, Any]]:
             "namespace_filename": c.namespace_filename,
             "status": c.status,
             "estimated_tokens": c.estimated_tokens,
+            "estimated_media_seconds": c.estimated_media_seconds,
+            "estimated_processing_seconds": c.estimated_processing_seconds,
             "error": c.error,
         }
         for c in children

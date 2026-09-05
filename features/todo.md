@@ -1,3 +1,5 @@
+# Personal Avatar/Evan is available to offer help as an icon ? to create a pop-up message system with options for sharing the screen and turning the microphone on to communicate; Evan will assist using Neural nexus (share screen, ask questions in realtime about what is on the screen)
+
 # Final updates before launch
 - [ ] preprocessing
 - [ ] adapter training and inference infastructure

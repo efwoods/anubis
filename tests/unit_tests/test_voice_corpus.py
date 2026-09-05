@@ -483,3 +483,61 @@ def test_plan_refusal_detection_reads_the_vendor_wording():
         "Creating a PVC requires you to be on the Creator plan or above."
     )
     assert not corpus.is_plan_refusal("Connection reset by peer")
+
+
+@pytest.mark.asyncio
+async def test_a_status_read_retries_a_failed_instant_clone(monkeypatch):
+    """The clone is built when the corpus crosses the minimum; when the vendor
+    refused that attempt, the next Voice panel read retries instead of waiting
+    for another upload, and a persistent refusal is throttled."""
+    vendor = _FakeVendor().install(monkeypatch)
+    attempts = {"count": 0}
+
+    async def _fail_once(context, *, name, clips, description=""):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise elevenlabs_client.ElevenLabsError(
+                "ElevenLabs rejected the request (400 invalid_labels: Labels must be serialized dictionary object.)"
+            )
+        vendor.instant.append((name, sum(1 for _ in clips)))
+        return "ivc-retry"
+
+    monkeypatch.setattr(elevenlabs_client, "create_instant_voice", _fail_once)
+    repository = InMemoryMediaAssetRepository()
+    record = await _add(repository, _context(), 310)
+    assert record["instant_voice_id"] is None
+    assert "invalid_labels" in record["detail"]["instant_error"]
+    assert record["detail"]["instant_error_at"] > 0
+
+    # Too soon: the refusal is not retried on every refresh.
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+    )
+    assert status.instant_voice_id is None
+    assert attempts["count"] == 1
+
+    monkeypatch.setattr(corpus, "INSTANT_CLONE_RETRY_SECONDS", 0.0)
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+    )
+    assert attempts["count"] == 2
+    assert status.instant_voice_id == "ivc-retry"
+    assert "instant_error" not in status.detail
+
+    # Built once: another read does not touch the vendor again.
+    await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+    )
+    assert attempts["count"] == 2

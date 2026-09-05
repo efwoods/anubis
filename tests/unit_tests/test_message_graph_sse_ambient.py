@@ -110,9 +110,13 @@ async def test_an_ignored_observation_streams_the_decision_then_done(harness):
             ((), "custom", DECISION),
         ]
     )
-    assert [frame["type"] for frame in frames] == ["ambient_decision", "done"]
-    assert frames[0]["decision"] == "ignore"
-    done = frames[1]
+    assert [frame["type"] for frame in frames] == [
+        "turn_started",
+        "ambient_decision",
+        "done",
+    ]
+    assert frames[1]["decision"] == "ignore"
+    done = frames[2]
     assert done["content"] == ""
     assert done["ambient"]["decision"] == "ignore"
     assert done["ambient"]["observation_id"] == "obs-1"
@@ -138,6 +142,7 @@ async def test_a_reply_to_an_observation_streams_tokens_after_the_decision(harne
         ]
     )
     assert [frame["type"] for frame in frames] == [
+        "turn_started",
         "ambient_decision",
         "assistant_token",
         "done",

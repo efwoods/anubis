@@ -20,6 +20,7 @@ from src.api import webapp as webapp_module
 ASSISTANT_ID = "assistant-alpha"
 CREATOR_ID = "6a5e59310832afadd626e583"
 STRANGER_ID = "someone-else"
+ADMIN_ID = "the-admin"
 
 
 def _current_user(user_id):
@@ -253,6 +254,28 @@ async def test_a_stranger_may_not_list_what_an_avatar_learned(monkeypatch):
 
     assert rejection.value.status_code == 403
     assert store.searched_namespaces == []
+
+
+@pytest.mark.asyncio
+async def test_the_admin_may_list_what_someone_elses_avatar_learned(monkeypatch):
+    store = _install(
+        monkeypatch, {"user_id": CREATOR_ID}, items=(_conversation_fact(),)
+    )
+    monkeypatch.setattr(
+        webapp_module.app.state,
+        "context",
+        SimpleNamespace(admin_user_id=ADMIN_ID),
+        raising=False,
+    )
+
+    response = await webapp_module.list_avatar_identity_facts(
+        assistant_id=ASSISTANT_ID, current_user=_current_user(ADMIN_ID)
+    )
+
+    assert response["counts"]["conversation"] == 1
+    assert response["facts"][0]["fact"] == "I was born in Ottawa."
+    # Store stays keyed by the original creator, not the administrator.
+    assert (CREATOR_ID, ASSISTANT_ID, "identity_memory") in store.searched_namespaces
 
 
 @pytest.mark.asyncio

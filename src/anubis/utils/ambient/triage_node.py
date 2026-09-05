@@ -116,6 +116,7 @@ async def ambient_triage(
             previous_observations=previous_observations,
             preferences=preferences,
             voice_mode=bool(ambient.get("voice_mode")),
+            sources=[str(source) for source in (ambient.get("sources") or [])],
         )
         decision_fields = {
             "decision": classification.decision,
@@ -139,9 +140,11 @@ async def ambient_triage(
     updated_ambient = {**ambient, **decision_fields}
     _writer()({"type": "ambient_decision", **updated_ambient})
 
+    # A spoken turn heard in the room stays visible (``hidden`` False); a
+    # webcam / screen observation stays hidden.
     additional_kwargs = {
         **(last.additional_kwargs or {}),
-        "hidden": True,
+        "hidden": bool((last.additional_kwargs or {}).get("hidden", True)),
         "ambient": updated_ambient,
     }
     rewritten = make_hidden_human_message(

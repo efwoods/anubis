@@ -1044,13 +1044,28 @@ async def _build_consciousness_system_message_update(
     # The capability block explains those turns to the model; a thread without
     # any observation keeps its prompt unchanged.
     try:
-        from src.anubis.utils.ambient.observations import is_ambient_observation
+        from src.anubis.utils.ambient.observations import (
+            ambient_details,
+            is_ambient_observation,
+            is_speech_observation,
+        )
         from src.anubis.utils.prompts.system_prompts import (
             AMBIENT_VISION_CAPABILITY_PROMPT,
+            SPOKEN_ROOM_CAPABILITY_PROMPT,
         )
+        from src.anubis.utils.voice.speakers import spoken_turn_of
 
-        if any(is_ambient_observation(message) for message in state.get("messages") or []):
+        thread_messages = state.get("messages") or []
+        seen_scene = any(
+            is_ambient_observation(message)
+            and not is_speech_observation(ambient_details(message) or {})
+            for message in thread_messages
+        )
+        heard_speech = any(spoken_turn_of(message) for message in thread_messages)
+        if seen_scene:
             system_message_str = system_message_str + AMBIENT_VISION_CAPABILITY_PROMPT
+        if heard_speech:
+            system_message_str = system_message_str + SPOKEN_ROOM_CAPABILITY_PROMPT
     except Exception:  # noqa: BLE001 - the block must never fail a turn
         logger.debug("Ambient-vision block unavailable for the prompt", exc_info=True)
 

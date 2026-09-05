@@ -237,6 +237,11 @@ quote blocks (each with its surrounding context). Return exactly one
 <escape_hatches>
 - If a block is clearly non-speech (a section label, a caption), set
   quotes_spoken_by_target False.
+- A quoted span that is the title of a work (an article, a talk, a book, an
+  episode), a nickname, an award name, a headline, or a description of the
+  target written by someone else is not the target's speech; set
+  quotes_spoken_by_target False for such a block even when a verb such as
+  "wrote", "called", or "described" appears next to the span.
 </escape_hatches>
 
 <anti_patterns>

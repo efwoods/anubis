@@ -62,13 +62,45 @@ def _as_file(clip: tuple[str, bytes, str]) -> tuple[str, bytes, str]:
     return (filename or "clip.mp3", payload, mime_type or "audio/mpeg")
 
 
+def _describe_vendor_error(vendor_error: Exception) -> str:
+    """One readable sentence for an SDK failure.
+
+    The SDK's ``ApiError`` stringifies as the whole response (headers, status,
+    body), which is what used to reach the Voice panel. Prefer the API's own
+    ``detail.message`` / ``detail.status`` when the body carries them.
+    """
+    status_code = getattr(vendor_error, "status_code", None)
+    body = getattr(vendor_error, "body", None)
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or "").strip()
+        status = str(detail.get("status") or "").strip()
+        if message or status:
+            parts = [part for part in (status, message) if part]
+            code = f" {status_code}" if status_code else ""
+            return f"ElevenLabs rejected the request ({code.strip()} {': '.join(parts)})".replace(
+                "( ", "("
+            )
+    if isinstance(detail, str) and detail.strip():
+        code = f"{status_code}: " if status_code else ""
+        return f"ElevenLabs rejected the request ({code}{detail.strip()})"
+    return str(vendor_error)
+
+
 async def _run(operation: Any, *args: Any, **kwargs: Any) -> Any:
     try:
         return await asyncio.to_thread(operation, *args, **kwargs)
     except ElevenLabsNotConfiguredError:
         raise
     except Exception as vendor_error:  # noqa: BLE001 - normalized for callers
-        raise ElevenLabsError(str(vendor_error)) from vendor_error
+        raise ElevenLabsError(_describe_vendor_error(vendor_error)) from vendor_error
+
+
+# The SDK (2.65.0) serializes ``labels`` with ``json.dumps`` before its omit
+# filter runs, so leaving the argument out sends the form field ``labels=null``
+# and the API answers 400 ``invalid_labels`` ("Labels must be serialized
+# dictionary object"). An empty dictionary serializes to ``{}``, which passes.
+NO_VOICE_LABELS: dict[str, str] = {}
 
 
 # --- cloning -------------------------------------------------------------------
@@ -89,6 +121,7 @@ async def create_instant_voice(
             name=name,
             files=[_as_file(clip) for clip in clips],
             description=description or None,
+            labels=dict(NO_VOICE_LABELS),
         )
         return str(response.voice_id)
 
@@ -115,7 +148,10 @@ async def create_professional_voice(
     def _create() -> str:
         client = _client(context)
         response = client.voices.pvc.create(
-            name=name, language=language, description=description or None
+            name=name,
+            language=language,
+            description=description or None,
+            labels=dict(NO_VOICE_LABELS),
         )
         return str(response.voice_id)
 

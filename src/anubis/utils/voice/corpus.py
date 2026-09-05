@@ -38,6 +38,11 @@ from src.anubis.utils.media_assets.repository import (
 )
 from src.anubis.utils.voice import elevenlabs_client
 
+# A failed instant clone (a vendor 400, a plan limit) is retried when the Voice
+# panel next reads the status, but no more often than this, so a persistent
+# refusal does not hit the vendor on every settings refresh.
+INSTANT_CLONE_RETRY_SECONDS = 300.0
+
 logger = logging.getLogger(__name__)
 
 CLIP_SOURCE_RECORDER = "recorder"
@@ -222,6 +227,7 @@ async def ensure_instant_voice(
         record["detail"] = {
             **record.get("detail", {}),
             "instant_error": str(clone_error),
+            "instant_error_at": datetime.now(tz=UTC).timestamp(),
         }
         await repository.upsert_voice(record)
         return record
@@ -229,7 +235,9 @@ async def ensure_instant_voice(
     record["instant_voice_id"] = voice_id
     record["instant_voice_seconds"] = used_seconds
     record["detail"] = {
-        k: v for k, v in record.get("detail", {}).items() if k != "instant_error"
+        k: v
+        for k, v in record.get("detail", {}).items()
+        if k not in ("instant_error", "instant_error_at")
     }
     await repository.upsert_voice(record)
     logger.info(
@@ -573,6 +581,24 @@ def clip_data_uri(clip: dict[str, Any]) -> str:
     return f"data:{mime_type};base64," + base64.b64encode(clip.get("bytes") or b"").decode()
 
 
+def _instant_clone_retry_due(
+    record: dict[str, Any],
+    collected_seconds: float,
+    thresholds: VoiceThresholds,
+    context: Any,
+) -> bool:
+    """Whether a status read should retry a failed instant clone now."""
+    if record.get("instant_voice_id") or not voice_configured(context):
+        return False
+    if collected_seconds < thresholds.instant_minimum:
+        return False
+    detail = record.get("detail") or {}
+    if not detail.get("instant_error"):
+        return False
+    failed_at = float(detail.get("instant_error_at") or 0.0)
+    return datetime.now(tz=UTC).timestamp() - failed_at >= INSTANT_CLONE_RETRY_SECONDS
+
+
 async def voice_status_for(
     repository: Any,
     context: Any,
@@ -590,6 +616,17 @@ async def voice_status_for(
     thresholds = VoiceThresholds.from_context(context)
     record = await _voice_record(repository, user_id, assistant_id)
     collected = float(await repository.total_voice_seconds(assistant_id))
+    # The clone is normally built when the clip that crosses the minimum is
+    # stored. When that attempt failed (the panel shows ``instant_error``) the
+    # corpus already holds enough speech, so a status read retries it instead
+    # of waiting for yet another upload.
+    if _instant_clone_retry_due(record, collected, thresholds, context):
+        record = await ensure_instant_voice(
+            repository,
+            context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
     clips = await repository.list_voice_clips(assistant_id)
     active, active_id = await resolve_active_voice_id(repository, assistant_id)
     reference_audio_document: str | None = None

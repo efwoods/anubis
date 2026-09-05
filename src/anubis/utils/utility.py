@@ -8,6 +8,7 @@ import logging
 import math
 import random
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -1053,6 +1054,7 @@ async def transcribe_audio(
         audio_base64,
         truncate_only=False,
         reference_audio=reference_audio,
+        filename=filename,
         max_duration_seconds=max_duration_seconds,
     )
     audio_base64 = preprocessed_audio["audio_base64"]
@@ -1078,6 +1080,58 @@ async def transcribe_audio(
             os.unlink(path)
         except OSError:
             pass
+
+
+
+def _ffmpeg_executable() -> str:
+    """Return the ffmpeg binary moviepy is configured with (the imageio-ffmpeg build by default)."""
+    try:
+        from moviepy.config import FFMPEG_BINARY
+
+        if FFMPEG_BINARY:
+            return str(FFMPEG_BINARY)
+    except Exception:  # noqa: BLE001
+        pass
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _transcode_audio_to_mp3(
+    source_path: str,
+    output_mp3_path: str,
+    max_seconds: float | None = None,
+) -> None:
+    """Re-encode any audio or video file to MP3 with a single ffmpeg call.
+
+    moviepy's reader probes the input with ``ffmpeg -i`` and refuses files that
+    report ``Duration: N/A``. Browser ``MediaRecorder`` output (WebM/Opus from
+    Chromium and Firefox, MP4/AAC from Safari) is written as a live stream with
+    no duration header, so every live-voice utterance and every dictation clip
+    is such a file. ffmpeg itself decodes these streams fine, and the MP3 this
+    writes carries a real duration, so moviepy can read the result afterwards.
+
+    Synchronous; callers run this in a worker thread.
+    """
+    command = [
+        _ffmpeg_executable(),
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        source_path,
+        "-vn",
+    ]
+    if max_seconds is not None and max_seconds > 0:
+        command += ["-t", f"{float(max_seconds):.3f}"]
+    command += ["-codec:a", "mp3", output_mp3_path]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    output_size = (
+        os.path.getsize(output_mp3_path) if os.path.exists(output_mp3_path) else 0
+    )
+    if completed.returncode != 0 or output_size == 0:
+        detail = (completed.stderr or "").strip()[-2000:] or "no ffmpeg output"
+        raise RuntimeError(f"ffmpeg could not convert the audio to mp3: {detail}")
 
 
 async def get_file_size_MB(audio_base64: str) -> float:
@@ -1151,25 +1205,20 @@ async def preprocess_audio(
         # worker thread so the event loop stays free (otherwise a long encode
         # blocks every other request — including auth — and starves cancellation).
         def _convert() -> tuple[float, Optional[int]]:
-            clip = AudioFileClip(src_path)
-            try:
-                full_duration = float(clip.duration or 0.0)
-
-                if reference_audio and truncate_only and full_duration > max_seconds:
-                    sub = clip.subclipped(0, max_seconds)
-                    local_duration = max_seconds
-                else:
-                    sub = clip
-                    local_duration = full_duration
-                try:
-                    sub.write_audiofile(out_mp3_path, codec="mp3", logger=None)
-                finally:
-                    if sub is not clip:
-                        sub.close()
+            # One ffmpeg call re-encodes any container to MP3 (and clips
+            # reference audio to ``max_seconds``). moviepy is only used on the
+            # resulting MP3, which always carries a duration header; the raw
+            # upload may not (browser MediaRecorder output never does).
+            truncate_to_seconds = (
+                max_seconds if (reference_audio and truncate_only) else None
+            )
+            _transcode_audio_to_mp3(
+                src_path, out_mp3_path, max_seconds=truncate_to_seconds
+            )
+            with AudioFileClip(out_mp3_path) as clip:
+                local_duration = float(clip.duration or 0.0)
                 fps = getattr(clip, "fps", None)
                 local_sample_rate = int(fps) if fps else None
-            finally:
-                clip.close()
             return local_duration, local_sample_rate
 
         duration_seconds, sample_rate = await asyncio.to_thread(_convert)

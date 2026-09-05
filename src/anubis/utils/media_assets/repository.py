@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS avatar_voice_clips (
 CREATE INDEX IF NOT EXISTS avatar_voice_clips_assistant_idx
     ON avatar_voice_clips (assistant_id);
 
+CREATE TABLE IF NOT EXISTS avatar_voice_speakers (
+    speaker_id UUID PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    assistant_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    bytes BYTEA NOT NULL,
+    byte_length BIGINT NOT NULL,
+    duration_seconds REAL NOT NULL,
+    sample_text TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS avatar_voice_speakers_thread_idx
+    ON avatar_voice_speakers (assistant_id, thread_id);
 CREATE TABLE IF NOT EXISTS avatar_voice (
     assistant_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -143,6 +158,7 @@ class InMemoryMediaAssetRepository:
         self.voices: dict[str, dict[str, Any]] = {}
         self.jobs: dict[str, dict[str, Any]] = {}
         self.pool = None
+        self.thread_speakers: dict[str, dict[str, Any]] = {}
 
     # -- emotion media -------------------------------------------------------
 
@@ -267,6 +283,42 @@ class InMemoryMediaAssetRepository:
         return before - len(self.clips)
 
     # -- voice record --------------------------------------------------------
+
+    async def add_thread_speaker(self, speaker: dict[str, Any]) -> str:
+        """Remember one other person's voice heard in a conversation thread."""
+        speaker_id = str(uuid4())
+        stored = {**speaker, "speaker_id": speaker_id, "created_at": _now().isoformat()}
+        stored["byte_length"] = len(stored.get("bytes") or b"")
+        self.thread_speakers[speaker_id] = stored
+        return speaker_id
+
+    async def list_thread_speakers(
+        self, assistant_id: str, thread_id: str, include_bytes: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return the remembered speakers of a thread, oldest first."""
+        rows = sorted(
+            (
+                speaker
+                for speaker in self.thread_speakers.values()
+                if speaker["assistant_id"] == assistant_id
+                and speaker["thread_id"] == thread_id
+            ),
+            key=lambda speaker: speaker["created_at"],
+        )
+        if include_bytes:
+            return [dict(row) for row in rows]
+        return [{k: v for k, v in row.items() if k != "bytes"} for row in rows]
+
+    async def delete_thread_speakers(self, assistant_id: str, thread_id: str) -> int:
+        """Forget every remembered speaker of a thread."""
+        doomed = [
+            speaker_id
+            for speaker_id, speaker in self.thread_speakers.items()
+            if speaker["assistant_id"] == assistant_id and speaker["thread_id"] == thread_id
+        ]
+        for speaker_id in doomed:
+            self.thread_speakers.pop(speaker_id, None)
+        return len(doomed)
 
     async def get_voice(self, assistant_id: str) -> dict[str, Any] | None:
         """Return the avatar's voice record, or ``None``."""
@@ -589,6 +641,67 @@ class PostgresMediaAssetRepository:
         "professional_voice_id, professional_state, collected_seconds, "
         "verification_requested_at, training_started_at, detail, updated_at"
     )
+
+    async def add_thread_speaker(self, speaker: dict[str, Any]) -> str:
+        """Remember one other person's voice heard in a conversation thread."""
+        speaker_id = str(uuid4())
+        payload = speaker.get("bytes") or b""
+        await self._execute(
+            """
+            INSERT INTO avatar_voice_speakers
+                (speaker_id, user_id, assistant_id, thread_id, label, mime_type,
+                 bytes, byte_length, duration_seconds, sample_text)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """,
+            (
+                speaker_id,
+                speaker["user_id"],
+                speaker["assistant_id"],
+                speaker["thread_id"],
+                speaker["label"],
+                speaker.get("mime_type") or "audio/mpeg",
+                payload,
+                len(payload),
+                float(speaker.get("duration_seconds") or 0.0),
+                speaker.get("sample_text"),
+            ),
+        )
+        return speaker_id
+
+    async def list_thread_speakers(
+        self, assistant_id: str, thread_id: str, include_bytes: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return the remembered speakers of a thread, oldest first."""
+        columns = (
+            "speaker_id, user_id, assistant_id, thread_id, label, mime_type, "
+            "byte_length, duration_seconds, sample_text, created_at"
+            + (", bytes" if include_bytes else "")
+        )
+        rows = await self._fetchall(
+            f"SELECT {columns} FROM avatar_voice_speakers "
+            "WHERE assistant_id = %s AND thread_id = %s ORDER BY created_at ASC;",
+            (assistant_id, thread_id),
+        )
+        names = [name.strip() for name in columns.split(",")]
+        speakers = []
+        for row in rows:
+            record = dict(zip(names, row))
+            record["speaker_id"] = str(record["speaker_id"])
+            if isinstance(record.get("created_at"), datetime):
+                record["created_at"] = record["created_at"].isoformat()
+            if include_bytes:
+                record["bytes"] = bytes(record["bytes"])
+            speakers.append(record)
+        return speakers
+
+    async def delete_thread_speakers(self, assistant_id: str, thread_id: str) -> int:
+        """Forget every remembered speaker of a thread."""
+        result = await self._execute(
+            "DELETE FROM avatar_voice_speakers WHERE assistant_id = %s AND thread_id = %s;",
+            (assistant_id, thread_id),
+        )
+        rowcount = getattr(result, "rowcount", None)
+        return int(rowcount) if isinstance(rowcount, int) and rowcount >= 0 else 0
 
     async def get_voice(self, assistant_id: str) -> dict[str, Any] | None:
         """Return the avatar's voice record, or ``None``."""

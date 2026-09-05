@@ -254,6 +254,34 @@ class GlobalContext:
         },
     )
 
+    media_preprocessing_seconds_per_media_second: float = field(
+        default=1.0,
+        metadata={
+            "description": (
+                "Wall-clock seconds the media pipeline is expected to spend per "
+                "second of uploaded audio or video (download, speaker isolation, "
+                "diarization, transcription, indexing). Multiplied by the probed "
+                "media duration to produce the processing-time estimate shown on "
+                "the upload progress card and stamped on every progress frame. "
+                "Env MEDIA_PREPROCESSING_SECONDS_PER_MEDIA_SECOND."
+            )
+        },
+    )
+
+    remote_duration_probe_timeout_seconds: float = field(
+        default=30.0,
+        metadata={
+            "description": (
+                "Seconds allowed for the yt_dlp metadata probe that reads a remote "
+                "video's duration at upload time. A YouTube probe takes roughly ten "
+                "seconds; when the probe exceeds this limit the item is estimated "
+                "with ESTIMATED_AUDIO_FALLBACK_DURATION_SECONDS instead, which makes "
+                "both the billing estimate and the processing-time estimate wrong. "
+                "Env REMOTE_DURATION_PROBE_TIMEOUT_SECONDS."
+            )
+        },
+    )
+
     enable_target_speaker_attribution: str = field(
         default="TRUE",
         metadata={
@@ -561,7 +589,7 @@ class GlobalContext:
     connected_account_encryption_key: str = field(
         default=None,
         metadata={
-            "description": "Fernet key encrypting the third-party credentials the owner connects to their personal avatar (currently mailbox app passwords). This is the only secret in the platform that must be recoverable rather than merely comparable, because the avatar has to present the original credential to a mail server on a later turn. Generate one with src.anubis.utils.secret_store.generate_encryption_key(). Rotating this key invalidates every stored credential, which surfaces to the owner as a request to reconnect the account rather than as silent corruption. Env CONNECTED_ACCOUNT_ENCRYPTION_KEY."
+            "description": "Fernet key encrypting the third-party credentials the owner connects to their personal avatar (Google OAuth refresh tokens for Gmail, tokens for custom connectors). This is the only secret in the platform that must be recoverable rather than merely comparable, because the avatar has to present the original credential to a mail server on a later turn. Generate one with src.anubis.utils.secret_store.generate_encryption_key(). Rotating this key invalidates every stored credential, which surfaces to the owner as a request to reconnect the account rather than as silent corruption. Env CONNECTED_ACCOUNT_ENCRYPTION_KEY."
         },
     )
 
@@ -604,6 +632,62 @@ class GlobalContext:
         default=20.0,
         metadata={
             "description": "Maximum seconds a custom Model Context Protocol server is given to list its tools, both when the owner connects the server (the address is proved before it is stored) and when the avatar loads the server's tools for a turn. A server that does not answer in time contributes no tools for that turn. Env MCP_CONNECTOR_PROBE_TIMEOUT_SECONDS."
+        },
+    )
+
+    google_oauth_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Client ID of the Google Cloud OAuth 2.0 web client the connect card opens Google sign-in with (Gmail). Created in the Google Cloud console under Google Auth Platform > Clients; the client's authorized redirect URIs must include {CONNECT_OAUTH_REDIRECT_BASE_URL}/connect_account/oauth/callback. While the consent screen is in Testing publishing status only listed test users can sign in and refresh tokens expire after seven days; the mailbox is then reported as needing reconnection and the card is raised again. Env GOOGLE_OAUTH_CLIENT_ID."
+        },
+    )
+
+    google_oauth_client_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Client secret paired with GOOGLE_OAUTH_CLIENT_ID. Sent only to Google's token endpoint; never logged or returned. Env GOOGLE_OAUTH_CLIENT_SECRET."
+        },
+    )
+
+    connect_oauth_redirect_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "Public base URL of this API as a browser reaches it (for example http://localhost:9600 in development, https://api.neuralnexus.site in production). The OAuth callback the popup returns to is {base}/connect_account/oauth/callback; the same value is registered as the redirect URI with Google and with Model Context Protocol authorization servers during dynamic client registration. Env CONNECT_OAUTH_REDIRECT_BASE_URL."
+        },
+    )
+
+    connect_oauth_popup_target_origins: str = field(
+        default=None,
+        metadata={
+            "description": "Comma-separated browser origins of the Neural Nexus web UI (for example http://localhost:5173,https://neuralnexus.site). The OAuth callback page posts its non-secret result to the window that opened the popup, and only to these origins — never to '*'. Env CONNECT_OAUTH_POPUP_TARGET_ORIGINS."
+        },
+    )
+
+    connect_oauth_state_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Secret that signs the OAuth 'state' parameter carried through the popup, so the callback can trust which user, provider, and avatar a returning login belongs to. Leave empty to derive the signing key from CONNECTED_ACCOUNT_ENCRYPTION_KEY. Env CONNECT_OAUTH_STATE_SECRET."
+        },
+    )
+
+    connect_oauth_state_max_age_seconds: int = field(
+        default=600,
+        metadata={
+            "description": "How long a started OAuth login stays valid before the owner must press Sign in again. Bounds both the signed state and the pending-login record holding the PKCE verifier. Env CONNECT_OAUTH_STATE_MAX_AGE_SECONDS."
+        },
+    )
+
+    connect_oauth_http_timeout_seconds: float = field(
+        default=15.0,
+        metadata={
+            "description": "Timeout for each HTTP call to an OAuth provider during a connection: token exchange, token refresh, userinfo, and Model Context Protocol authorization-server discovery and client registration. Env CONNECT_OAUTH_HTTP_TIMEOUT_SECONDS."
+        },
+    )
+
+    mcp_oauth_client_name: str = field(
+        default="Neural Nexus",
+        metadata={
+            "description": "The client_name this API registers under when a Model Context Protocol server's authorization server supports dynamic client registration; shown on that server's consent screen. Env MCP_OAUTH_CLIENT_NAME."
         },
     )
 
@@ -855,6 +939,35 @@ class GlobalContext:
     )
 
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
+
+    """ <Who is speaking (live voice: label utterances by speaker)> """
+
+    voice_speaker_labels_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether POST /message/{assistant_id} accepts diarize=true on an attached live-voice utterance: the utterance is transcribed with speaker labels (the owner by the voice-clone recordings, other people as Speaker N remembered per thread) instead of plain transcription. Env VOICE_SPEAKER_LABELS_ENABLED."
+        },
+    )
+    voice_speaker_memory_max_speakers: int = field(
+        default=3,
+        metadata={
+            "description": "How many other people (besides the owner) are remembered per conversation thread as reference clips so their Speaker N label stays stable across utterances. The diarizer accepts four known speakers per call, one of which is the owner. Env VOICE_SPEAKER_MEMORY_MAX_SPEAKERS."
+        },
+    )
+    voice_speaker_min_segment_seconds: float = field(
+        default=2.0,
+        metadata={
+            "description": "Shortest stretch of speech (seconds) a new voice must produce in one utterance before a clip of that voice is remembered for later labelling. Env VOICE_SPEAKER_MIN_SEGMENT_SECONDS."
+        },
+    )
+    voice_speaker_reference_max_seconds: float = field(
+        default=9.0,
+        metadata={
+            "description": "Length (seconds, at most ten) of the owner's reference clip cut from the voice-clone recordings and handed to the diarizer as the known owner voice. Env VOICE_SPEAKER_REFERENCE_MAX_SECONDS."
+        },
+    )
+
+    """ </Who is speaking (live voice: label utterances by speaker)> """
 
 
     dev: str = field(

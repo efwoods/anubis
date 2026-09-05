@@ -17,6 +17,7 @@ and segmented text also consumes structured pages.
 import logging
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from langchain_core.documents import Document
 from pydantic import BaseModel
@@ -45,6 +46,81 @@ _BIOGRAPHICAL_PARAGRAPH_HINTS = (
 )
 
 _QUOTE_CHARACTER_PATTERN = re.compile(r"[\"“”‘’]")
+
+# Section headings that mark an encyclopedic biography (a Wikipedia-style
+# article about one person). On such a page the whole article body describes
+# the subject, so biographical prose is every paragraph outside the citation
+# and navigation sections rather than only the sections named in
+# ``_BIOGRAPHICAL_HEADING_HINTS`` (which fit character wikis and homepages).
+_ENCYCLOPEDIC_BIOGRAPHY_HEADING_HINTS = (
+    "early life",
+    "personal life",
+    "later life",
+    "life and career",
+)
+
+# Hosts whose article pages are encyclopedic (the Wikimedia family).
+_ENCYCLOPEDIC_HOST_SUFFIXES = (
+    ".wikipedia.org",
+    ".wikimedia.org",
+    ".wikiquote.org",
+    ".wikisource.org",
+    ".wikinews.org",
+    ".wikibooks.org",
+    ".wikiversity.org",
+    ".wikivoyage.org",
+)
+
+# Sections that hold citations, links, or navigation rather than prose about
+# the subject. Quoted spans inside these sections are titles of cited works,
+# never the subject's own words, and their paragraphs are never biography.
+_BOILERPLATE_SECTION_HEADINGS = frozenset(
+    {
+        "references",
+        "external links",
+        "see also",
+        "notes",
+        "footnotes",
+        "citations",
+        "further reading",
+        "bibliography",
+        "sources",
+        "works cited",
+        "gallery",
+        "navigation",
+    }
+)
+_BOILERPLATE_SECTION_HEADING_PREFIXES = (
+    "references",
+    "external links",
+    "notes and",
+)
+
+# Headings whose tables and lists hold the subject's own lines on any page
+# shape ("Notable quotes", "Quotes", "Dialogue", "Voice lines").
+_QUOTE_SECTION_HEADING_HINTS = (
+    "quote",
+    "dialogue",
+    "voice line",
+    "sayings",
+    "catchphrase",
+)
+
+# On an encyclopedic page a paragraph credits a quoted span to a speaker with
+# a speech verb near the span ("Boeree said ..."). A quoted span in a paragraph
+# with no such cue is a title, a nickname, or an award name, never speech.
+_SPEECH_ATTRIBUTION_CUE_PATTERN = re.compile(
+    r"\b(said|says|saying|stated|states|stating|told|tells|telling|wrote|"
+    r"writes|tweeted|posted|explained|explains|added|remarked|noted|commented|"
+    r"claimed|claims|argued|argues|quoted|quote|according to|asked|replied|"
+    r"responded|announced|declared|admitted|joked|recalled|recalls|described|"
+    r"describes|called|calls|referred to|in (?:her|his|their) words)\b",
+    re.IGNORECASE,
+)
+
+# Context passed per quote block to the attribution model; the surrounding
+# paragraph is enough to judge who spoke without sending the whole page.
+_ATTRIBUTION_CONTEXT_CHARACTER_LIMIT = 1500
 
 
 class QuoteBlockAttribution(BaseModel):
@@ -79,20 +155,64 @@ def _extract_quoted_spans(text: str) -> List[str]:
     the quoted content, so collapsing it yields the true verbatim quote.
     """
     spans = re.findall(r"[\"“]([^\"“”]+)[\"”]", text or "")
-    return [
-        re.sub(r"\s+", " ", span).strip()
-        for span in spans
-        if span.strip()
-    ]
+    return [re.sub(r"\s+", " ", span).strip() for span in spans if span.strip()]
 
 
-def parse_html_into_structured_blocks(
-    html_text: str, *, url: str
-) -> Dict[str, Any]:
+def _normalized_heading(heading: str | None) -> str:
+    return re.sub(r"\s+", " ", (heading or "").strip().lower())
+
+
+def _is_boilerplate_section(heading: str | None) -> bool:
+    """Report whether a heading names a citation, link, or navigation section."""
+    normalized = _normalized_heading(heading)
+    if not normalized:
+        return False
+    if normalized in _BOILERPLATE_SECTION_HEADINGS:
+        return True
+    return normalized.startswith(_BOILERPLATE_SECTION_HEADING_PREFIXES)
+
+
+def _is_quote_section(heading: str | None) -> bool:
+    """Report whether a section heading announces the subject's own lines."""
+    normalized = _normalized_heading(heading)
+    return any(hint in normalized for hint in _QUOTE_SECTION_HEADING_HINTS)
+
+
+def _url_host_has_suffix(url: str | None, suffixes: tuple) -> bool:
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(host) and any(
+        host == suffix.lstrip(".") or host.endswith(suffix) for suffix in suffixes
+    )
+
+
+def page_is_encyclopedic_biography(parsed: Dict[str, Any]) -> bool:
+    """Report whether the parsed page is an encyclopedia article about one person.
+
+    True for Wikimedia-hosted pages and for any page carrying the standard
+    biography section headings ("Early life", "Personal life"). On such a page
+    every prose paragraph outside the boilerplate sections describes the
+    subject, and quoted spans are titles or nicknames unless a speech verb
+    credits them to a speaker.
+    """
+    if _url_host_has_suffix(parsed.get("url"), _ENCYCLOPEDIC_HOST_SUFFIXES):
+        return True
+    return any(
+        any(
+            hint in _normalized_heading(block.get("heading_path"))
+            for hint in _ENCYCLOPEDIC_BIOGRAPHY_HEADING_HINTS
+        )
+        for block in parsed.get("blocks") or []
+    )
+
+
+def parse_html_into_structured_blocks(html_text: str, *, url: str) -> Dict[str, Any]:
     """Parse an HTML page into ordered structured blocks.
 
-    Returns ``{page_title, infobox_subject_name, blocks}`` where each block is
-    ``{heading_path, kind, text, table_rows}``. MediaWiki-aware selectors are
+    Returns ``{url, page_title, infobox_subject_name, blocks}`` where each
+    block is ``{heading_path, kind, text, table_rows}``. MediaWiki-aware selectors are
     tried first (``.mw-headline`` section headings, ``aside.portable-infobox``
     subject name, ``table.wikitable`` rows); a generic fallback (title / h1-h3 /
     paragraphs / tables) covers non-wiki pages such as personal homepages.
@@ -183,6 +303,7 @@ def parse_html_into_structured_blocks(
                 )
 
     return {
+        "url": url,
         "page_title": page_title,
         "infobox_subject_name": infobox_subject_name,
         "blocks": blocks,
@@ -193,17 +314,23 @@ def page_looks_like_subject_page(parsed: Dict[str, Any]) -> bool:
     """Heuristic: does the parsed page describe a single individual subject.
 
     True when a portable infobox subject is present, or when the page carries a
-    biographical section heading, or a biography-style lead paragraph. Used to
-    decide whether to run structured extraction versus falling through to the
-    plain-text route.
+    biographical section heading, or a biography-style lead paragraph, or reads
+    as an encyclopedic biography (see ``page_is_encyclopedic_biography``). Used
+    to decide whether to run structured extraction versus falling through to
+    the plain-text route.
     """
+    if page_is_encyclopedic_biography(parsed):
+        return True
     if parsed.get("infobox_subject_name"):
         # An infobox alone is not decisive (many pages have one); require a
         # biographical signal too, EXCEPT when the page has quote structures.
         pass
     blocks = parsed.get("blocks") or []
     has_bio_heading = any(
-        any(hint in (block.get("heading_path") or "").lower() for hint in _BIOGRAPHICAL_HEADING_HINTS)
+        any(
+            hint in (block.get("heading_path") or "").lower()
+            for hint in _BIOGRAPHICAL_HEADING_HINTS
+        )
         for block in blocks
     )
     has_bio_paragraph = any(
@@ -216,6 +343,7 @@ def page_looks_like_subject_page(parsed: Dict[str, Any]) -> bool:
     )
     has_quote_table = any(
         block.get("kind") == "table"
+        and not _is_boilerplate_section(block.get("heading_path"))
         and any(
             _extract_quoted_spans(" ".join(row))
             for row in (block.get("table_rows") or [])
@@ -227,8 +355,16 @@ def page_looks_like_subject_page(parsed: Dict[str, Any]) -> bool:
 
 def extract_biographical_prose_blocks(
     blocks: List[Dict[str, Any]],
+    *,
+    encyclopedic: bool = False,
 ) -> List[Dict[str, Any]]:
     """Select the biographical prose blocks (paragraphs under bio headings).
+
+    With ``encyclopedic=True`` (a Wikipedia-style article about the subject)
+    every paragraph outside the boilerplate sections is biography: the lead
+    paragraph and sections such as "Early life", "Poker career", "Writing".
+    Otherwise only paragraphs under the character-wiki / homepage biography
+    headings are selected, so game data sections on a character page stay out.
 
     Each returned block keeps its ``heading_path`` as provenance so downstream
     identity Documents record which section a fact came from.
@@ -241,9 +377,11 @@ def extract_biographical_prose_blocks(
         text = (block.get("text") or "").strip()
         if not text:
             continue
-        under_bio_heading = any(
-            hint in heading for hint in _BIOGRAPHICAL_HEADING_HINTS
-        )
+        if encyclopedic:
+            if not _is_boilerplate_section(heading):
+                selected.append(block)
+            continue
+        under_bio_heading = any(hint in heading for hint in _BIOGRAPHICAL_HEADING_HINTS)
         is_bio_paragraph = any(
             hint in text.lower() for hint in _BIOGRAPHICAL_PARAGRAPH_HINTS
         )
@@ -254,6 +392,8 @@ def extract_biographical_prose_blocks(
 
 def _quote_blocks_from_parsed(
     blocks: List[Dict[str, Any]],
+    *,
+    encyclopedic: bool = False,
 ) -> List[Dict[str, Any]]:
     """Extract candidate quote blocks (verbatim) with their context.
 
@@ -261,10 +401,25 @@ def _quote_blocks_from_parsed(
     context cell becomes the genuine context prompt), numbered transcript-style
     rows, and quote-bearing list items. Quotation marks are stripped; text is
     otherwise verbatim.
+
+    Boilerplate sections (References, External links, See also) never yield
+    candidates: their quoted spans are titles of cited works. With
+    ``encyclopedic=True`` tables and lists yield candidates only under a quote
+    heading, and a paragraph yields candidates only when a speech verb credits
+    the span to a speaker; those paragraph candidates carry ``block_index`` and
+    ``context_text`` so the attribution model can decide who spoke them.
     """
     candidates: List[Dict[str, Any]] = []
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
         heading = block.get("heading_path") or ""
+        if _is_boilerplate_section(heading):
+            continue
+        if (
+            encyclopedic
+            and block.get("kind") in ("table", "list")
+            and not _is_quote_section(heading)
+        ):
+            continue
         if block.get("kind") == "table":
             for row in block.get("table_rows") or []:
                 cells = [cell for cell in row if cell]
@@ -284,21 +439,150 @@ def _quote_blocks_from_parsed(
                     candidates.append(
                         {
                             "quote_text": quote,
-                            "context_prompt": " - ".join(context_cells).strip()
-                            or None,
+                            "context_prompt": " - ".join(context_cells).strip() or None,
                             "heading_path": heading,
                         }
                     )
         elif block.get("kind") in ("paragraph", "list"):
-            for quote in _extract_quoted_spans(block.get("text") or ""):
-                candidates.append(
-                    {
-                        "quote_text": quote,
-                        "context_prompt": None,
-                        "heading_path": heading,
-                    }
-                )
+            block_text = block.get("text") or ""
+            if (
+                encyclopedic
+                and block.get("kind") == "paragraph"
+                and not _SPEECH_ATTRIBUTION_CUE_PATTERN.search(block_text)
+            ):
+                continue
+            for quote in _extract_quoted_spans(block_text):
+                candidate = {
+                    "quote_text": quote,
+                    "context_prompt": None,
+                    "heading_path": heading,
+                }
+                if block.get("kind") == "paragraph":
+                    candidate["block_index"] = block_index
+                    candidate["context_text"] = block_text
+                candidates.append(candidate)
     return candidates
+
+
+async def attribute_quote_candidates_to_target(
+    *,
+    target_name: str,
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep only the paragraph-derived candidates the target actually spoke.
+
+    Candidates without ``context_text`` (quote tables and quote lists) are kept
+    as they are. Paragraph candidates are grouped by paragraph and judged in a
+    single structured-output pass with ``QuoteBlockAttributionResponse``; on a
+    model failure every ambiguous paragraph candidate is dropped, so text that
+    may belong to someone else is never credited to the target.
+    """
+    import json
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from src.anubis.utils.model import init_model
+    from src.anubis.utils.prompts.text_dialogue_segmentation_prompt import (
+        QUOTE_BLOCK_ATTRIBUTION_SYSTEM_PROMPT,
+    )
+
+    kept: List[Dict[str, Any]] = [
+        candidate for candidate in candidates if not candidate.get("context_text")
+    ]
+    ambiguous = [candidate for candidate in candidates if candidate.get("context_text")]
+    if not ambiguous:
+        return kept
+
+    grouped: Dict[int, Dict[str, Any]] = {}
+    for candidate in ambiguous:
+        group = grouped.setdefault(
+            int(candidate.get("block_index", -1)),
+            {
+                "heading_path": candidate.get("heading_path") or "",
+                "context_text": candidate.get("context_text") or "",
+                "quotes": [],
+                "candidates": [],
+            },
+        )
+        group["quotes"].append(candidate["quote_text"])
+        group["candidates"].append(candidate)
+    ordered_groups = [grouped[key] for key in sorted(grouped)]
+
+    block_descriptions = []
+    for position, group in enumerate(ordered_groups, start=1):
+        block_descriptions.append(
+            "\n".join(
+                [
+                    f"Block {position}",
+                    f"Section heading: {group['heading_path'] or 'lead section'}",
+                    "Surrounding paragraph: "
+                    + group["context_text"][:_ATTRIBUTION_CONTEXT_CHARACTER_LIMIT],
+                    "Quoted spans: " + json.dumps(group["quotes"]),
+                ]
+            )
+        )
+    human_message = "\n\n".join([f"Target name: {target_name}", *block_descriptions])
+
+    try:
+        model = init_model(
+            model_without_tools=False,
+            response_format=QuoteBlockAttributionResponse,
+        )
+        response = await model.ainvoke(
+            input=[
+                SystemMessage(content=QUOTE_BLOCK_ATTRIBUTION_SYSTEM_PROMPT),
+                HumanMessage(content=human_message),
+            ]
+        )
+        attributions = list(getattr(response, "attributions", []) or [])
+    except Exception as attribution_error:  # noqa: BLE001 - conservative drop
+        logger.warning(
+            "quote attribution failed for %s (%s); dropping %d ambiguous "
+            "paragraph quotes",
+            target_name,
+            attribution_error,
+            len(ambiguous),
+        )
+        return kept
+
+    spoken_positions = {
+        int(getattr(attribution, "block_index", 0))
+        for attribution in attributions
+        if bool(getattr(attribution, "quotes_spoken_by_target", False))
+    }
+    for position, group in enumerate(ordered_groups, start=1):
+        if position in spoken_positions:
+            kept.extend(group["candidates"])
+    return kept
+
+
+def group_prose_blocks_into_sections(
+    blocks: List[Dict[str, Any]],
+    *,
+    character_limit: int,
+) -> List[Dict[str, Any]]:
+    """Join consecutive paragraphs of one section into one ``{heading_path, text}``.
+
+    The biographical-identity pipeline reads at most ``character_limit``
+    characters per call, so a section longer than that is split at paragraph
+    boundaries into several groups instead of being truncated.
+    """
+    groups: List[Dict[str, Any]] = []
+    for block in blocks:
+        heading = block.get("heading_path") or ""
+        text = (block.get("text") or "").strip()
+        if not text:
+            continue
+        current = groups[-1] if groups else None
+        if (
+            current is not None
+            and current["heading_path"] == heading
+            and len(current["text"]) + 2 + len(text) <= character_limit
+        ):
+            current["text"] = f"{current['text']}\n\n{text}"
+            continue
+        groups.append({"heading_path": heading, "text": text})
+    return groups
 
 
 async def infer_target_from_structured_page(
@@ -324,8 +608,7 @@ async def infer_target_from_structured_page(
     human_message = "\n\n".join(
         [
             f"Page title: {page_title or 'unknown'}",
-            f"Infobox subject name (may be empty): "
-            f"{infobox_subject_name or 'none'}",
+            f"Infobox subject name (may be empty): {infobox_subject_name or 'none'}",
             "Leading paragraphs:\n" + "\n".join(leading_paragraphs[:3]),
             "Section heading names: " + json.dumps(heading_names[:30]),
         ]
@@ -352,7 +635,10 @@ async def infer_target_from_structured_page(
 
 
 def extract_direct_quotes_from_blocks(
-    blocks: List[Dict[str, Any]], *, target_name: str
+    blocks: List[Dict[str, Any]],
+    *,
+    target_name: str,
+    encyclopedic: bool = False,
 ) -> List[Dict[str, Any]]:
     """Deterministically extract the target's direct quotes from parsed blocks.
 
@@ -360,9 +646,10 @@ def extract_direct_quotes_from_blocks(
     list of ``{quote_text, context_prompt, heading_path}``. On a wiki character
     page nearly every quoted line under the character's own page is spoken by
     that character, so this returns candidates directly; genuinely ambiguous
-    attribution is resolved by the caller via a single classification pass.
+    attribution is resolved by the caller via a single classification pass
+    (``attribute_quote_candidates_to_target``) on encyclopedic pages.
     """
-    return _quote_blocks_from_parsed(blocks)
+    return _quote_blocks_from_parsed(blocks, encyclopedic=encyclopedic)
 
 
 def _structured_target_not_identifiable_document(
@@ -399,6 +686,7 @@ async def convert_structured_web_page_to_documents(
     when no subject is inferable.
     """
     from src.subgraphs.process_media_graph.utils.helper_functions import (
+        CLASSIFICATION_INPUT_CHAR_LIMIT,
         _build_biographical_identity_documents,
         coalesce_segments_by_speaker,
         process_dialogue_json_to_documents,
@@ -406,6 +694,7 @@ async def convert_structured_web_page_to_documents(
 
     parsed = parse_html_into_structured_blocks(html_text, url=url)
     blocks = parsed.get("blocks") or []
+    encyclopedic = page_is_encyclopedic_biography(parsed)
 
     leading_paragraphs = [
         block["text"]
@@ -413,11 +702,7 @@ async def convert_structured_web_page_to_documents(
         if block.get("kind") == "paragraph" and block.get("text")
     ][:3]
     heading_names = sorted(
-        {
-            block.get("heading_path")
-            for block in blocks
-            if block.get("heading_path")
-        }
+        {block.get("heading_path") for block in blocks if block.get("heading_path")}
     )
 
     inference = await infer_target_from_structured_page(
@@ -429,15 +714,17 @@ async def convert_structured_web_page_to_documents(
     if not inference["has_identifiable_target"]:
         return [_structured_target_not_identifiable_document(media_item)]
 
-    target_name = inference["target_name"] or (
-        parsed.get("infobox_subject_name") or ""
-    )
+    target_name = inference["target_name"] or (parsed.get("infobox_subject_name") or "")
     documents: List[Document] = []
 
     # 1) Direct quotes -> golden-format avatar turns -> dialogue pipeline.
     quote_candidates = extract_direct_quotes_from_blocks(
-        blocks, target_name=target_name
+        blocks, target_name=target_name, encyclopedic=encyclopedic
     )
+    if encyclopedic and quote_candidates:
+        quote_candidates = await attribute_quote_candidates_to_target(
+            target_name=target_name, candidates=quote_candidates
+        )
     if quote_candidates:
         segments: List[Dict[str, Any]] = []
         for candidate in quote_candidates:
@@ -472,8 +759,15 @@ async def convert_structured_web_page_to_documents(
             )
         )
 
-    # 2) Biographical prose sections -> biographical-identity pipeline.
-    for block in extract_biographical_prose_blocks(blocks):
+    # 2) Biographical prose sections -> biographical-identity pipeline. The
+    #    paragraphs of one section are joined into one call (split only when a
+    #    section exceeds the fact extractor's input limit) so a long article
+    #    costs one extraction per section rather than one per paragraph.
+    prose_sections = group_prose_blocks_into_sections(
+        extract_biographical_prose_blocks(blocks, encyclopedic=encyclopedic),
+        character_limit=CLASSIFICATION_INPUT_CHAR_LIMIT,
+    )
+    for block in prose_sections:
         try:
             bio_documents = await _build_biographical_identity_documents(
                 text_content=block["text"],

@@ -68,6 +68,30 @@ NOTIFY_INSTRUCTION = (
     "suggests. Do not take actions and do not call tools."
 )
 
+# Spoken turns heard in the room (a live-voice utterance labelled by speaker).
+RESPOND_INSTRUCTION_SPEECH = (
+    "The assistant heard this spoken aloud in the room; the lines are labelled "
+    "by speaker. The assistant decided to answer aloud. Reply to the person who "
+    "addressed the assistant, in the avatar's own voice, the way the avatar "
+    "would answer someone standing there. Address a labelled speaker by name "
+    "only when the name is a real name, never as 'Speaker 2'. Do not repeat the "
+    "transcript and do not say that the words were transcribed."
+)
+
+NOTIFY_INSTRUCTION_SPEECH = (
+    "The assistant heard this spoken aloud in the room; the lines are labelled "
+    "by speaker. The assistant decided the owner should hear about this. Write "
+    "one short heads-up message to the owner saying what was heard and what the "
+    "assistant suggests. Do not take actions and do not call tools."
+)
+
+ALL_INSTRUCTIONS = (
+    RESPOND_INSTRUCTION,
+    NOTIFY_INSTRUCTION,
+    RESPOND_INSTRUCTION_SPEECH,
+    NOTIFY_INSTRUCTION_SPEECH,
+)
+
 
 def resolve_sources(filenames: list[str], sources_form_value: str | None) -> list[str]:
     """Name the source of each attached file, aligned with ``filenames``.
@@ -103,10 +127,16 @@ def build_ambient_additional_kwargs(
     voice_mode: bool,
     image_filenames: list[str] | None = None,
     observation_id: str | None = None,
+    hidden: bool = True,
 ) -> dict[str, Any]:
-    """Build the ``additional_kwargs`` of an ambient ``HumanMessage`` before triage."""
+    """Build the ``additional_kwargs`` of an ambient ``HumanMessage`` before triage.
+
+    ``hidden=False`` keeps the turn visible in transcripts: a spoken turn heard
+    in the room is shown to the owner as what was heard even though the avatar
+    triages the turn like an observation.
+    """
     additional_kwargs: dict[str, Any] = {
-        "hidden": True,
+        "hidden": bool(hidden),
         "kind": AMBIENT_MESSAGE_KIND,
         "ambient": {
             "observation_id": observation_id or str(uuid4()),
@@ -192,9 +222,15 @@ def split_observation_text(text: str) -> tuple[str | None, str]:
     return first_line, rest.strip()
 
 
+def is_speech_observation(ambient: dict[str, Any]) -> bool:
+    """Whether an observation was heard (microphone only), not seen."""
+    sources = [str(source) for source in (ambient.get("sources") or [])]
+    return bool(sources) and all(source == SOURCE_MICROPHONE for source in sources)
+
+
 def strip_instruction(body: str) -> str:
     """Drop a previously appended respond/notify instruction from a body."""
-    for instruction in (RESPOND_INSTRUCTION, NOTIFY_INSTRUCTION):
+    for instruction in ALL_INSTRUCTIONS:
         marker = "\n\n" + instruction
         if body.endswith(marker):
             return body[: -len(marker)]
@@ -205,10 +241,11 @@ def compose_observation_text(ambient: dict[str, Any], body: str) -> str:
     """Header + body + the instruction matching the triage decision."""
     parts = [observation_header(ambient), body.strip()]
     decision = ambient.get("decision")
+    heard = is_speech_observation(ambient)
     if decision == DECISION_RESPOND:
-        parts.append(RESPOND_INSTRUCTION)
+        parts.append(RESPOND_INSTRUCTION_SPEECH if heard else RESPOND_INSTRUCTION)
     elif decision == DECISION_NOTIFY:
-        parts.append(NOTIFY_INSTRUCTION)
+        parts.append(NOTIFY_INSTRUCTION_SPEECH if heard else NOTIFY_INSTRUCTION)
     return "\n".join(part for part in parts[:2] if part) + (
         "\n\n" + parts[2] if len(parts) > 2 else ""
     )

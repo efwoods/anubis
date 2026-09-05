@@ -1,20 +1,22 @@
 """Mailbox access over IMAP, using the standard library's ``imaplib``.
 
 Why the standard library and not ``langchain_google_community.GmailToolkit``
-    The toolkit builds on a ``googleapiclient`` resource constructed from OAuth
-    credentials. Reading mail through that API needs a scope Google classifies
-    as *restricted*, which obliges a published application to pass OAuth
-    verification and an annual CASA security assessment. Connecting with an app
-    password over IMAP needs no OAuth client at all, so neither requirement ever
-    applies and the credential does not expire. The function names below
-    deliberately track the toolkit's tools (search / get message / get thread /
-    create draft) so a future OAuth-backed implementation can be dropped in
-    behind the same call sites.
+    The toolkit builds on a ``googleapiclient`` resource and the Gmail REST
+    API. The avatar instead speaks IMAP and SMTP directly and authenticates
+    with SASL ``XOAUTH2``: the Google OAuth access token the owner granted
+    through the connect card is presented to ``imap.gmail.com`` and
+    ``smtp.gmail.com`` (scope ``https://mail.google.com/``), so the same six
+    tools work for Gmail and for any other provider that speaks IMAP. The
+    function names below deliberately track the toolkit's tools (search / get
+    message / get thread / create draft) so an API-backed implementation could
+    be dropped in behind the same call sites.
 
-    Since 2025-03-14 a regular Google account password no longer authenticates
-    against IMAP or SMTP; only OAuth 2.0 and app passwords do, and creating an
-    app password requires 2-Step Verification on the account.
-    :func:`verify_credentials` exists to turn that into an actionable message at
+    Two authentication mechanisms are supported by :class:`MailboxCredentials`:
+    ``"password"`` (a plain ``LOGIN`` with an app password, kept for providers
+    that still use one) and ``"xoauth2"`` (an OAuth access token). Since
+    2025-03-14 a regular Google account password no longer authenticates
+    against IMAP or SMTP, which is why Gmail uses OAuth.
+    :func:`verify_credentials` proves either mechanism by a real login at
     connect time instead of a mysterious failure on the first mail call.
 
 Every call here is BLOCKING
@@ -56,8 +58,12 @@ EXTRACTED_LINK_MAX_COUNT = 20
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"')]+")
 
 
+AUTH_MECHANISM_PASSWORD = "password"
+AUTH_MECHANISM_XOAUTH2 = "xoauth2"
+
+
 class MailboxAuthenticationError(RuntimeError):
-    """The mail server rejected the supplied address and password."""
+    """The mail server rejected the supplied address and credential."""
 
 
 class MailboxUnreachableError(RuntimeError):
@@ -68,9 +74,14 @@ class MailboxUnreachableError(RuntimeError):
 class MailboxCredentials:
     """Everything needed to open one mailbox session.
 
-    Built by the tool layer from a stored record plus the decrypted password, so
-    the plaintext exists only for the duration of a call and is never part of a
-    record, a log line, or a tool result.
+    Built by the tool layer from a stored record plus the decrypted credential,
+    so the plaintext exists only for the duration of a call and is never part of
+    a record, a log line, or a tool result.
+
+    ``auth_mechanism`` selects how the session authenticates: ``"password"``
+    sends ``password`` with a plain ``LOGIN``; ``"xoauth2"`` presents
+    ``access_token`` through SASL ``XOAUTH2`` (Google OAuth) and ignores
+    ``password``.
     """
 
     account_address: str
@@ -81,6 +92,23 @@ class MailboxCredentials:
     smtp_port: int = 587
     drafts_mailbox: str = "Drafts"
     timeout_seconds: float = 30.0
+    auth_mechanism: str = AUTH_MECHANISM_PASSWORD
+    access_token: str | None = None
+
+    @property
+    def uses_xoauth2(self) -> bool:
+        """Whether the session authenticates with an OAuth access token."""
+        return self.auth_mechanism == AUTH_MECHANISM_XOAUTH2
+
+
+def xoauth2_initial_response(account_address: str, access_token: str) -> str:
+    """Build the SASL XOAUTH2 initial client response (RFC 7628 / Google).
+
+    The wire format is ``user={address}^Aauth=Bearer {token}^A^A`` where ``^A``
+    is ``\x01``. ``imaplib.authenticate`` and ``smtplib.auth`` base64-encode
+    what this returns, so the raw string is returned here.
+    """
+    return f"user={account_address}\x01auth=Bearer {access_token}\x01\x01"
 
 
 def _decode_header_value(raw_value: Any) -> str:
@@ -206,8 +234,8 @@ def _connect(credentials: MailboxCredentials) -> imaplib.IMAP4_SSL:
     """Open an authenticated IMAP session, mapping failures to typed errors.
 
     An authentication failure and an unreachable server are separated because
-    the caller's remedies differ: the first means the owner must supply a new app
-    password, the second means try again later. Collapsing them would make the
+    the caller's remedies differ: the first means the owner must sign in again,
+    the second means try again later. Collapsing them would make the
     avatar tell a user to re-authenticate every time their network blipped.
     """
     try:
@@ -222,7 +250,30 @@ def _connect(credentials: MailboxCredentials) -> imaplib.IMAP4_SSL:
         ) from connect_error
 
     try:
-        connection.login(credentials.account_address, credentials.password)
+        if credentials.uses_xoauth2:
+            if not credentials.access_token:
+                raise MailboxAuthenticationError(
+                    "No OAuth access token is available for this mailbox."
+                )
+            initial_response = xoauth2_initial_response(
+                credentials.account_address, credentials.access_token
+            ).encode("utf-8")
+            # imaplib calls back once per server challenge; the initial response
+            # carries the whole credential, and an empty reply to any follow-up
+            # challenge (Google sends one carrying a JSON error) ends the exchange
+            # so the server's final NO surfaces as ``IMAP4.error`` below.
+            connection.authenticate(
+                "XOAUTH2",
+                lambda challenge: initial_response if not challenge else b"",
+            )
+        else:
+            connection.login(credentials.account_address, credentials.password)
+    except MailboxAuthenticationError:
+        try:
+            connection.logout()
+        except Exception:
+            pass
+        raise
     except imaplib.IMAP4.error as login_error:
         try:
             connection.logout()
@@ -255,9 +306,8 @@ def verify_credentials(credentials: MailboxCredentials) -> None:
     call days later.
 
     Raises:
-        MailboxAuthenticationError: The server rejected the credential. For
-            Gmail the overwhelmingly likely cause is that the owner supplied
-            their account password rather than an app password.
+        MailboxAuthenticationError: The server rejected the credential — a
+            revoked or expired OAuth token, or a wrong app password.
         MailboxUnreachableError: The server could not be reached.
     """
     connection = _connect(credentials)
@@ -492,8 +542,9 @@ def send_message(
     inbox triage graph sends only through its confidence gate or an accepted
     approval.
 
-    Same app password as IMAP: Google accepts an app password on the submission
-    port (587, STARTTLS) exactly as on IMAP, so no second credential is needed.
+    Same credential as IMAP: Google accepts the OAuth access token (or an app
+    password) on the submission port (587, STARTTLS) exactly as on IMAP, so no
+    second credential is needed.
 
     Raises:
         MailboxAuthenticationError: The submission server rejected the login.
@@ -531,10 +582,26 @@ def send_message(
             session.starttls()
             session.ehlo()
             try:
-                session.login(credentials.account_address, credentials.password)
+                if credentials.uses_xoauth2:
+                    if not credentials.access_token:
+                        raise MailboxAuthenticationError(
+                            "No OAuth access token is available for this mailbox."
+                        )
+                    auth_string = xoauth2_initial_response(
+                        credentials.account_address, credentials.access_token
+                    )
+                    # smtplib base64-encodes the string the authobject returns and
+                    # sends it with the AUTH command as the initial response.
+                    session.auth(
+                        "XOAUTH2",
+                        lambda challenge=None: auth_string,
+                        initial_response_ok=True,
+                    )
+                else:
+                    session.login(credentials.account_address, credentials.password)
             except smtplib.SMTPAuthenticationError as authentication_error:
                 raise MailboxAuthenticationError(
-                    "The submission server rejected the address and password."
+                    "The submission server rejected the address and credential."
                 ) from authentication_error
             refused = session.send_message(message, to_addrs=recipients)
     except (MailboxAuthenticationError, MailboxSendError):

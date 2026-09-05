@@ -2855,13 +2855,28 @@ async def _search_namespace_records(
     caller treats "no devices" and "cannot tell" the same way, and a store hiccup
     must never fail an endpoint whose real job is something else.
     """
+    expected_namespace = list(namespace)
     try:
-        response = await client.store.search_items(list(namespace), limit=100)
+        response = await client.store.search_items(expected_namespace, limit=100)
     except Exception:
         logger.debug("Could not search store namespace %s", namespace, exc_info=True)
         return []
     items = (response or {}).get("items") or []
-    return [item.get("value") or {} for item in items if isinstance(item, dict)]
+    records: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_namespace = item.get("namespace")
+        if item_namespace is not None and list(item_namespace) != expected_namespace:
+            continue
+        value = item.get("value") or {}
+        if not isinstance(value, dict):
+            continue
+        owner = value.get("owner_user_id")
+        if owner and expected_namespace and owner != expected_namespace[0]:
+            continue
+        records.append(value)
+    return records
 
 
 async def _resolve_personal_avatar_capability_statuses(
@@ -3248,6 +3263,11 @@ async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any
         registration_device_id = registration.get("device_id")
         if not registration_device_id:
             continue
+        live_session = relay_registry.get_session(registration_device_id)
+        if live_session is not None and live_session.user_id != user_id:
+            # Leftover store row from a bind that was never this account's
+            # daemon. The socket names the real owner.
+            continue
         seen_device_ids.add(registration_device_id)
         connection = connection_by_device.get(registration_device_id) or {}
         devices.append(
@@ -3258,11 +3278,14 @@ async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any
                 "platform": registration.get("platform") or connection.get("platform"),
                 "server_name": registration.get("server_name"),
                 "connection_mode": registration.get("connection_mode"),
-                "online": relay_registry.is_online(registration_device_id),
+                "online": relay_registry.is_online(registration_device_id, user_id),
                 "last_seen_at": registration.get("last_seen_at"),
                 "connected": connection.get("status") == "connected",
                 "bound_assistant_id": connection.get("assistant_id"),
                 "connected_at": connection.get("connected_at"),
+                "owner_user_id": registration.get("owner_user_id")
+                or connection.get("owner_user_id")
+                or user_id,
             }
         )
 
@@ -3273,6 +3296,9 @@ async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any
     for device_identifier, connection in connection_by_device.items():
         if device_identifier in seen_device_ids:
             continue
+        live_session = relay_registry.get_session(device_identifier)
+        if live_session is not None and live_session.user_id != user_id:
+            continue
         devices.append(
             {
                 "device_id": device_identifier,
@@ -3280,11 +3306,12 @@ async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any
                 "platform": connection.get("platform"),
                 "server_name": connection.get("server_name"),
                 "connection_mode": None,
-                "online": relay_registry.is_online(device_identifier),
+                "online": relay_registry.is_online(device_identifier, user_id),
                 "last_seen_at": None,
                 "connected": connection.get("status") == "connected",
                 "bound_assistant_id": connection.get("assistant_id"),
                 "connected_at": connection.get("connected_at"),
+                "owner_user_id": connection.get("owner_user_id") or user_id,
             }
         )
 
@@ -4390,6 +4417,7 @@ async def mcp_register(
 
     record = {
         "status": "pending_consent",
+        "owner_user_id": user_id,
         "connection_mode": connection_mode,
         "server_name": body.get("server_name") or "Ubuntu-OS-Filesystem",
         # Every mode is driven as a streamable-HTTP client; in relay mode the

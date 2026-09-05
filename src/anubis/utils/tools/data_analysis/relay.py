@@ -117,6 +117,15 @@ def register_session(
     existing = _sessions_by_device.get(device_id)
     if existing is not None and existing.websocket is not websocket:
         _fail_pending(existing, RuntimeError("relay session superseded by reconnect"))
+        # A reconnect under a different account must leave the previous owner's
+        # index. Otherwise ``sessions_for_user(old)`` keeps returning this
+        # socket and that account can adopt a machine it no longer owns.
+        if existing.user_id != user_id:
+            previous_owned = _device_ids_by_user.get(existing.user_id)
+            if previous_owned is not None:
+                previous_owned.discard(device_id)
+                if not previous_owned:
+                    del _device_ids_by_user[existing.user_id]
 
     session = RelaySession(
         device_id=device_id,
@@ -190,9 +199,21 @@ def sessions_for_user(user_id: str) -> list[RelaySession]:
     return sorted(sessions, key=lambda session: session.device_label)
 
 
-def is_online(device_id: str | None) -> bool:
-    """Whether a device currently holds a live relay socket."""
-    return bool(device_id) and device_id in _sessions_by_device
+def is_online(device_id: str | None, user_id: str | None = None) -> bool:
+    """Whether a device currently holds a live relay socket.
+
+    When ``user_id`` is given, the live socket must belong to that account.
+    Presence without an owner check would let one account see another
+    account's machine as online just by knowing the device identifier.
+    """
+    if not device_id:
+        return False
+    session = _sessions_by_device.get(device_id)
+    if session is None:
+        return False
+    if user_id is None:
+        return True
+    return session.user_id == user_id
 
 
 def bridge_url_for_device(device_id: str) -> str:

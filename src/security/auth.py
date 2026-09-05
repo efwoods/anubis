@@ -2148,6 +2148,7 @@ async def verify_login_status(
     return {
         "logged_in": bool(logged_in),
         "email_verified": current_user.get("email_verified") is True,
+        "email": current_user.get("email"),
     }
 
 

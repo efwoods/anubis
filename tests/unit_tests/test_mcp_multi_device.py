@@ -211,6 +211,7 @@ def test_register_keys_the_record_by_device_and_derives_a_label(
         assert set(records) == {"d-ubuntu"}
         assert records["d-ubuntu"]["device_label"] == "Ubuntu"
         assert records["d-ubuntu"]["platform"] == "ubuntu"
+        assert records["d-ubuntu"]["owner_user_id"] == "auth0|u1"
         # Relay URLs are rewritten to the API instance that accepted the call.
         assert records["d-ubuntu"]["mcp_url"] == (
             "http://testserver/mcp/relay/d-ubuntu"
@@ -457,7 +458,9 @@ def test_list_mcp_connections_merges_registration_and_connection_state(
         )
         # …and only the Ubuntu machine holds a live relay socket.
         monkeypatch.setattr(
-            relay, "is_online", lambda device_id: device_id == "d-ubuntu"
+            relay,
+            "is_online",
+            lambda device_id, owner=None: device_id == "d-ubuntu",
         )
 
         response = await webapp_module.list_mcp_connections(current_user=_user())
@@ -472,5 +475,109 @@ def test_list_mcp_connections_merges_registration_and_connection_state(
         assert devices["d-macos"]["connected"] is False
         # Host directory paths never appear in the listing.
         assert all("allowed_roots" not in device for device in payload["devices"])
+        assert devices["d-ubuntu"]["owner_user_id"] == "auth0|u1"
+        assert all(
+            device["owner_user_id"] == "auth0|u1" for device in payload["devices"]
+        )
+
+    asyncio.run(run())
+
+
+def test_list_mcp_connections_hides_another_account_even_when_search_leaks(
+    webapp_with_fake_store,
+):
+    webapp_module, store_client = webapp_with_fake_store
+    import json
+
+    async def run():
+        await webapp_module.mcp_register(
+            request=_FakeRequest(
+                {
+                    "device_id": "linux-pc",
+                    "server_name": "Ubuntu-OS-Filesystem",
+                }
+            ),
+            current_user=_user(),
+        )
+
+        async def leak_every_namespace(namespace, limit=10, **kwargs):
+            items = []
+            for stored_namespace, records in store_client.items.items():
+                for key, value in records.items():
+                    items.append(
+                        {
+                            "namespace": list(stored_namespace),
+                            "key": key,
+                            "value": value,
+                        }
+                    )
+            return {"items": items[:limit]}
+
+        store_client.search_items = leak_every_namespace
+
+        stranger = {
+            "identities": [{"user_id": "auth0|someone-else"}],
+            "API_KEY": "sk-other",
+        }
+        response = await webapp_module.list_mcp_connections(current_user=stranger)
+        payload = json.loads(bytes(response.body))
+        assert payload["devices"] == []
+        assert payload["user_id"] == "auth0|someone-else"
+
+        owner_response = await webapp_module.list_mcp_connections(current_user=_user())
+        owner_payload = json.loads(bytes(owner_response.body))
+        assert [device["device_id"] for device in owner_payload["devices"]] == [
+            "linux-pc"
+        ]
+
+    asyncio.run(run())
+
+
+def test_list_mcp_connections_hides_a_store_row_whose_socket_is_another_account(
+    webapp_with_fake_store,
+):
+    webapp_module, store_client = webapp_with_fake_store
+    import json
+
+    from src.anubis.utils.tools.data_analysis import relay
+    from src.anubis.utils.tools.data_analysis.backend import (
+        mcp_registration_namespace,
+    )
+
+    async def run():
+        stranger = {
+            "identities": [{"user_id": "auth0|someone-else"}],
+            "API_KEY": "sk-other",
+        }
+        await store_client.put_item(
+            list(mcp_registration_namespace("auth0|someone-else")),
+            key="linux-pc-dev",
+            value={
+                "device_id": "linux-pc-dev",
+                "device_label": "linux-pc-dev",
+                "platform": "ubuntu",
+                "server_name": "Ubuntu-OS-Filesystem-dev",
+                "connection_mode": "relay",
+                "last_seen_at": "2026-09-05T13:00:00+00:00",
+            },
+        )
+        try:
+            relay.register_session(
+                device_id="linux-pc-dev",
+                user_id="auth0|u1",
+                device_secret="secret",
+                server_name="Ubuntu-OS-Filesystem-dev",
+                allowed_roots=(),
+                websocket=object(),
+                device_label="linux-pc-dev",
+                platform="ubuntu",
+            )
+
+            response = await webapp_module.list_mcp_connections(current_user=stranger)
+            payload = json.loads(bytes(response.body))
+            assert payload["devices"] == []
+        finally:
+            relay._sessions_by_device.clear()
+            relay._device_ids_by_user.clear()
 
     asyncio.run(run())

@@ -404,20 +404,24 @@ async def resolve_available_connections(
     1. **Live relay sockets** (authoritative). The in-process registry wins over
        a stale store registration — for example when a daemon reconnects under a
        new ``device_id`` while heartbeats only refreshed ``last_seen_at`` on an
-       older record.
+       older record. Only sockets indexed to *this* ``user_id``.
     2. **Registrations for devices with no live socket.** In ``relay`` mode a
        device without a live socket is simply offline this turn, because the
        socket is the only path to that machine. In ``tunnel``/``local`` mode
        presence is inferred from a fresh heartbeat and the stored ``mcp_url``
        becomes the connection.
-    3. **SSE fallback** — only when the user has no registrations and no live
-       sockets at all — dials the co-located discovery endpoint for the
-       same-machine development flow.
 
-    Returns an empty list when nothing is reachable.
+    A co-located Server-Sent-Events announcement is deliberately not consulted.
+    That path is not account-scoped: any signed-in caller on the same host
+    would bind the machine's daemon.
+
+    Returns an empty list when nothing is reachable. ``ignore_failure_backoff``
+    is accepted for callers that still pass it; it has no effect now that
+    discovery is not a fallback.
     """
     from src.anubis.utils.tools.data_analysis import relay
 
+    _ = ignore_failure_backoff
     connections: list[McpConnection] = []
     seen_device_ids: set[str] = set()
 
@@ -443,15 +447,7 @@ async def resolve_available_connections(
             if device_id:
                 seen_device_ids.add(device_id)
 
-    if connections or records:
-        return connections
-
-    announced = await discover_announced_server(
-        context.data_analysis_mcp_discovery_url,
-        float(context.data_analysis_discovery_timeout_seconds),
-        ignore_failure_backoff=ignore_failure_backoff,
-    )
-    return [announced] if announced is not None else []
+    return connections
 
 
 async def save_user_connection(
@@ -473,10 +469,12 @@ async def save_user_connection(
             "Cannot save a Model Context Protocol connection without a device "
             "identifier; the record key is the device identifier."
         )
+    record = connection.to_store_value(assistant_id=assistant_id)
+    record["owner_user_id"] = user_id
     await store.aput(
         mcp_connection_namespace(user_id),
         key=connection.device_id,
-        value=connection.to_store_value(assistant_id=assistant_id),
+        value=record,
     )
 
 

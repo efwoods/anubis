@@ -337,3 +337,14 @@ async def test_ending_a_session_drops_its_cached_copy(monkeypatch):
 
     assert not auth_module._refresh_token_cache
     assert not auth_module._api_key_cache
+
+
+@pytest.mark.asyncio
+async def test_verify_login_status_names_the_account_email():
+    status = await auth_module.verify_login_status(
+        request=SimpleNamespace(),
+        current_user=_account(),
+    )
+    assert status["email"] == "person@example.com"
+    assert status["logged_in"] is True
+    assert status["email_verified"] is True

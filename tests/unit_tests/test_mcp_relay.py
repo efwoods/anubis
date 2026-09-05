@@ -15,8 +15,8 @@ and its macOS / mobile / Windows siblings):
 - ``build_mcp_client`` attaches ``Authorization: Bearer <device_secret>`` only
   when a secret is present;
 - ``resolve_available_connections`` returns every reachable device, treats an
-  offline relay registration as unavailable, and falls back to SSE discovery
-  only when no registration exists.
+  offline relay registration as unavailable, and does not fall through to a
+  machine-local SSE announcement (that path is not account-scoped).
 """
 
 import asyncio
@@ -407,7 +407,12 @@ def test_resolver_skips_relay_registration_when_offline():
     assert connections == []
 
 
-def test_resolver_falls_back_to_sse_without_registration(monkeypatch):
+def test_resolver_does_not_adopt_a_host_sse_server_for_a_stranger(monkeypatch):
+    """A local announce is not this account's machine.
+
+    Falling through to SSE discovery is what let a second account bind
+    linux-pc just by pressing Connect on the same API host.
+    """
     store = InMemoryStore()
     sentinel = McpConnection(
         url="http://localhost:8000/mcp",
@@ -420,9 +425,23 @@ def test_resolver_falls_back_to_sse_without_registration(monkeypatch):
 
     monkeypatch.setattr(discovery, "discover_announced_server", _fake_discover)
     connections = asyncio.run(
-        resolve_available_connections(store, "u1", GlobalContext())
+        resolve_available_connections(store, "other-account", GlobalContext())
     )
-    assert connections == [sentinel]
+    assert connections == []
+
+
+def test_reconnect_under_a_new_account_leaves_the_previous_owner():
+    first = _FakeWebSocket()
+    second = _FakeWebSocket()
+    _register(first, device_id="linux-pc", user_id="owner")
+    _register(second, device_id="linux-pc", user_id="stranger")
+
+    assert [session.user_id for session in relay.sessions_for_user("stranger")] == [
+        "stranger"
+    ]
+    assert relay.sessions_for_user("owner") == []
+    assert relay.is_online("linux-pc", "stranger") is True
+    assert relay.is_online("linux-pc", "owner") is False
 
 
 def test_legacy_singleton_registration_is_migrated_to_a_device_key():

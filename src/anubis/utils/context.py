@@ -859,6 +859,34 @@ class GlobalContext:
         },
     )
 
+    inbox_account_poll_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the agent inbox also polls every non-mailbox connected account (signed-in sites, vendor APIs) for new items addressed to the owner, through the account's own tools. Env INBOX_ACCOUNT_POLL_ENABLED."
+        },
+    )
+
+    inbox_account_poll_interval_seconds: float = field(
+        default=1800.0,
+        metadata={
+            "description": "Minimum seconds between two discovery passes on the same non-mailbox account; each pass costs a model call and, for a signed-in site, a browser visit. Env INBOX_ACCOUNT_POLL_INTERVAL_SECONDS."
+        },
+    )
+
+    inbox_discovery_max_items: int = field(
+        default=10,
+        metadata={
+            "description": "Ceiling on new items one discovery pass may report for one account. Env INBOX_DISCOVERY_MAX_ITEMS."
+        },
+    )
+
+    inbox_discovery_max_steps: int = field(
+        default=8,
+        metadata={
+            "description": "Ceiling on tool calls one discovery or delivery pass may make on one account. Env INBOX_DISCOVERY_MAX_STEPS."
+        },
+    )
+
     """ </Connected accounts (mailbox and social) for the personal avatar> """
 
     """ <Emotion media generation (xAI images and idle-loop videos)> """

@@ -171,6 +171,116 @@ async def resume_inbox_item(
 async def poll_connected_mailboxes(
     context: Any, *, only_user_id: str | None = None
 ) -> dict[str, Any]:
+    """Poll every connected account (mailboxes directly, others through their tools)."""
+    mail_result = await _poll_mailboxes(context, only_user_id=only_user_id)
+    account_result = await poll_other_accounts(context, only_user_id=only_user_id)
+    return {
+        "polled": int(mail_result.get("polled") or 0) + int(account_result.get("polled") or 0),
+        "new_items": int(mail_result.get("new_items") or 0) + int(account_result.get("new_items") or 0),
+        "mailboxes": mail_result,
+        "accounts": account_result,
+        "at": datetime.now(UTC).isoformat(),
+    }
+
+
+async def poll_other_accounts(
+    context: Any, *, only_user_id: str | None = None
+) -> dict[str, Any]:
+    """Find new items on every non-mailbox connected account and triage each one.
+
+    Discovery runs through the account's own tools (see ``sources.py``), so a
+    newly connected kind of account is polled with no code of its own. Each
+    account is visited at most once per ``INBOX_ACCOUNT_POLL_INTERVAL_SECONDS``
+    because a discovery pass costs a model call and, for a signed-in site, a
+    browser visit. A poll asked for by the owner (``only_user_id`` given) skips
+    that spacing.
+    """
+    from src.anubis.utils.connected_accounts.repository import (
+        get_repository as accounts_repository,
+    )
+    from src.anubis.utils.inbox.sources import discover_new_items, is_message_source
+
+    repository = get_inbox_repository()
+    accounts = accounts_repository()
+    if repository is None or accounts is None:
+        return {"polled": 0, "new_items": 0}
+    enabled = str(getattr(context, "inbox_account_poll_enabled", None) or "true").strip().lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return {"polled": 0, "new_items": 0, "disabled": True}
+    interval = float(getattr(context, "inbox_account_poll_interval_seconds", None) or 1800.0)
+    limit = int(getattr(context, "inbox_discovery_max_items", None) or 10)
+    max_steps = int(getattr(context, "inbox_discovery_max_steps", None) or 8)
+    records: list[dict[str, Any]] = list(await accounts.list_all_connected())
+    now = datetime.now(UTC)
+    polled = 0
+    new_items = 0
+    for record in records:
+        if not is_message_source(record) or record.get("kind") == "mailbox":
+            continue
+        account_key = record.get("account_key")
+        user_id = _owner_of(record)
+        assistant_id = record.get("assistant_id")
+        if not (account_key and user_id and assistant_id):
+            continue
+        if only_user_id is not None and user_id != only_user_id:
+            continue
+        poll_state = await repository.get_poll_state(account_key) or {}
+        last_polled = _as_datetime(poll_state.get("last_polled_at"))
+        if last_polled and only_user_id is None and (now - last_polled).total_seconds() < interval:
+            continue
+        polled += 1
+        try:
+            messages, _answer = await discover_new_items(
+                context, _store, record, since=last_polled, limit=limit, max_steps=max_steps
+            )
+        except Exception as discovery_error:  # noqa: BLE001 - one account must not stop the rest
+            logger.warning("Inbox discovery failed for %s: %s", account_key, discovery_error)
+            await repository.set_poll_state(
+                account_key=account_key,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                last_seen_uid=poll_state.get("last_seen_uid"),
+                last_error=str(discovery_error)[:400],
+            )
+            continue
+        for message in messages:
+            result = await run_inbox_for_message(
+                context,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                account_key=account_key,
+                message=message,
+                source_kind=str(record.get("provider") or "account"),
+            )
+            if result is not None:
+                new_items += 1
+        await repository.set_poll_state(
+            account_key=account_key,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            last_seen_uid=poll_state.get("last_seen_uid"),
+            last_error=None,
+        )
+    return {"polled": polled, "new_items": new_items}
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    """Return a timezone-aware datetime from a stored timestamp, or ``None``."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+async def _poll_mailboxes(
+    context: Any, *, only_user_id: str | None = None
+) -> dict[str, Any]:
     """Fetch unseen mail from every connected mailbox and triage each message."""
     from src.anubis.utils.connected_accounts.repository import (
         get_repository as accounts_repository,

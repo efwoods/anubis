@@ -394,6 +394,35 @@ async def send_reply(
 
     draft = state.get("draft") or {}
     message = state["message"]
+    # Items from a non-mailbox account go back through that account's own
+    # tools (a signed-in site, a vendor API); mail keeps the direct SMTP path.
+    if message.get("provider") and state.get("account_key"):
+        from src.anubis.utils.connected_accounts import get_connected_account
+        from src.anubis.utils.inbox.sources import deliver_reply_via_account
+
+        try:
+            record = await get_connected_account(
+                getattr(runtime, "store", None), state["user_id"], str(state.get("account_key"))
+            )
+            if record is None:
+                raise RuntimeError("The account the item arrived on is no longer connected.")
+            if record.get("kind") != "mailbox":
+                delivered = await deliver_reply_via_account(
+                    runtime.context,
+                    getattr(runtime, "store", None),
+                    dict(record, user_id=state["user_id"]),
+                    message=message,
+                    draft_text=str(draft.get("body") or ""),
+                )
+                if not delivered.sent:
+                    return {"outcome": STATE_FAILED, "error": delivered.detail}
+                automatic = not state.get("owner_decision")
+                return {"outcome": STATE_AUTO_SENT if automatic else STATE_SENT}
+        except Exception as send_error:  # noqa: BLE001 - recorded, never raised into the run
+            logger.warning(
+                "Inbox reply could not be posted for %s: %s", state["item_id"], send_error
+            )
+            return {"outcome": STATE_FAILED, "error": str(send_error)}
     try:
         await send_email_reply(
             runtime.context,

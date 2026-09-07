@@ -41,7 +41,9 @@ def _upload(name: str, content_type: str, payload: bytes = b"abc") -> UploadFile
 
 
 def _turn(segments, *, owner_identified=True):
-    others = sorted({segment.speaker for segment in segments if not segment.is_owner})
+    others = sorted(
+        {segment.speaker for segment in segments if not segment.is_owner and not segment.is_avatar}
+    )
     return SpokenTurn(
         script=speakers_module.render_speaker_script(segments),
         segments=segments,
@@ -297,3 +299,59 @@ async def test_message_graph_sse_announces_the_spoken_turn_before_tokens(monkeyp
     ]
     assert frames[1]["content"] == "Evan: Hello"
     assert frames[1]["speakers"]["owner_label"] == "Evan"
+
+
+@pytest.mark.asyncio
+async def test_echo_only_utterance_is_triaged_not_answered(monkeypatch, harness):
+    segments = [
+        LabelledSegment(
+            "Evan (avatar)", "The project kicks off next Monday.", 0.0, 2.0, is_avatar=True
+        )
+    ]
+    _install_fake_diarizer(monkeypatch, _turn(segments))
+    remaining, message, kwargs, frame = await webapp_module.label_spoken_turn_files(
+        SimpleNamespace(pool=None),
+        CURRENT_USER,
+        files=[_upload("utterance.webm", "audio/webm", b"x")],
+        message="",
+        assistant_id="a1",
+        thread_id="t1",
+        your_name="Evan",
+        request_id="r1",
+    )
+    assert message == "Evan (avatar): The project kicks off next Monday."
+    assert kwargs["kind"] == observations.AMBIENT_MESSAGE_KIND, "nothing to answer: triage it"
+    assert kwargs["hidden"] is False
+    assert kwargs["speakers"]["avatar_spoke"] is True
+    assert kwargs["speakers"]["owner_spoke"] is False
+    assert kwargs["speakers"]["other_speakers"] == []
+    assert frame["speakers"]["avatar_label"] == "Evan (avatar)"
+
+
+@pytest.mark.asyncio
+async def test_recent_avatar_reply_texts_reads_the_last_ai_turns_newest_first():
+    class _Threads:
+        async def get_state(self, thread_id):
+            return {
+                "values": {
+                    "messages": [
+                        {"type": "human", "content": "hi"},
+                        {"type": "ai", "content": "First reply."},
+                        {"type": "human", "content": "more"},
+                        {"type": "ai", "content": [{"type": "text", "text": "Second reply."}]},
+                    ]
+                }
+            }
+
+    client = SimpleNamespace(threads=_Threads())
+    assert await webapp_module._recent_avatar_reply_texts(client, "t1") == [
+        "Second reply.",
+        "First reply.",
+    ]
+    assert await webapp_module._recent_avatar_reply_texts(client, None) == []
+
+    class _Broken:
+        async def get_state(self, thread_id):
+            raise RuntimeError("down")
+
+    assert await webapp_module._recent_avatar_reply_texts(SimpleNamespace(threads=_Broken()), "t1") == []

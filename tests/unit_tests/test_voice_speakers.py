@@ -25,6 +25,7 @@ from src.anubis.utils.media_assets.repository import (  # noqa: E402
 from src.anubis.utils.voice import speakers as speakers_module  # noqa: E402
 from src.anubis.utils.voice.speakers import (  # noqa: E402
     LabelledSegment,
+    SpokenTurn,
     diarize_spoken_turn,
     label_segments,
     next_other_speaker_label,
@@ -282,3 +283,49 @@ def test_diarize_spoken_turn_without_owner_recordings_labels_everyone_as_others(
     assert diarizer.calls == [[]]
     assert not turn.owner_identified and not turn.owner_spoke
     assert turn.script == "Speaker 2: Hello there."
+
+
+# --- the avatar's own voice heard through a speaker --------------------------------
+
+from src.anubis.utils.voice.speakers import (  # noqa: E402
+    is_avatar_echo,
+    mark_avatar_echo,
+)
+
+
+def test_is_avatar_echo_matches_fragments_and_near_repeats_only_when_long_enough():
+    replies = ["Sure, the project kicks off next Monday and I will send the plan tonight."]
+    assert is_avatar_echo("the project kicks off next Monday", replies)
+    assert is_avatar_echo("Sure the project kicks off next Monday and I'll send the plan tonight", replies)
+    assert not is_avatar_echo("Yes.", replies), "short lines are never treated as echo"
+    assert not is_avatar_echo("What time does the meeting start tomorrow morning?", replies)
+    assert not is_avatar_echo("the project kicks off next Monday", [])
+
+
+def test_mark_avatar_echo_relabels_owner_lines_that_repeat_replies():
+    segments = [
+        LabelledSegment("Evan", "the project kicks off next Monday and I will send the plan", 0, 3, is_owner=True),
+        LabelledSegment("Evan", "Right, and remind me to call Maria.", 3, 5, is_owner=True),
+        LabelledSegment("Speaker 2", "the project kicks off next Monday and I will send the plan", 5, 8),
+    ]
+    marked = mark_avatar_echo(
+        segments,
+        owner_label="Evan",
+        recent_avatar_replies=["The project kicks off next Monday and I will send the plan tonight."],
+    )
+    assert [segment.speaker for segment in marked] == ["Evan (avatar)", "Evan", "Speaker 2"]
+    assert marked[0].is_avatar and not marked[0].is_owner
+    assert marked[1].is_owner
+    assert not marked[2].is_avatar, "only owner-attributed lines can be the clone's echo"
+    turn = SpokenTurn(
+        script=render_speaker_script(marked[:2]),
+        segments=marked[:2],
+        owner_label="Evan",
+        owner_identified=True,
+        other_speakers=[],
+        duration_seconds=5.0,
+    )
+    assert turn.avatar_spoke and turn.owner_spoke and not turn.others_spoke
+    record = turn.additional_kwargs()["speakers"]
+    assert record["avatar_label"] == "Evan (avatar)"
+    assert record["segments"][0]["is_avatar"] is True

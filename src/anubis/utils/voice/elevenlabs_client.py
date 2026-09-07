@@ -38,6 +38,28 @@ class ElevenLabsError(RuntimeError):
     """The vendor refused or failed a request."""
 
 
+class ElevenLabsVoiceBlockedError(ElevenLabsError):
+    """ElevenLabs has blocked this cloned voice; it can never speak again.
+
+    Raised for the vendor's 403 ``voice_access_denied`` /
+    ``detected_blocked_voice`` refusal, which its moderation applies to a clone
+    it judges to violate its terms — a clone of a public figure, typically.
+    The ban is permanent and belongs to the voice, not to the request: retrying,
+    re-cloning from the same recording, or waiting all produce the same refusal,
+    so callers should record the voice as unusable rather than treat this as a
+    transient vendor failure.
+    """
+
+
+# ``safety_control`` values on ``GET /v1/voices/{voice_id}`` that mean the voice
+# is banned. A usable voice reports ``None``.
+BLOCKED_VOICE_SAFETY_CONTROLS = frozenset({"ENTERPRISE_BAN", "BAN", "BLOCKED"})
+
+# The vendor's own names for the blocked-voice refusal, matched against the
+# error body's ``detail.code`` and ``detail.status``.
+_BLOCKED_VOICE_ERROR_NAMES = frozenset({"voice_access_denied", "detected_blocked_voice"})
+
+
 def _api_key(context: Any) -> str:
     key = str(
         getattr(context, "elevenlabs_api_key", None)
@@ -87,13 +109,29 @@ def _describe_vendor_error(vendor_error: Exception) -> str:
     return str(vendor_error)
 
 
+def _is_blocked_voice_error(vendor_error: Exception) -> bool:
+    """Whether the SDK failure is the permanent blocked-voice refusal."""
+    body = getattr(vendor_error, "body", None)
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(detail, dict):
+        return False
+    named = {
+        str(detail.get("code") or "").strip().lower(),
+        str(detail.get("status") or "").strip().lower(),
+    }
+    return bool(named & _BLOCKED_VOICE_ERROR_NAMES)
+
+
 async def _run(operation: Any, *args: Any, **kwargs: Any) -> Any:
     try:
         return await asyncio.to_thread(operation, *args, **kwargs)
     except ElevenLabsNotConfiguredError:
         raise
     except Exception as vendor_error:  # noqa: BLE001 - normalized for callers
-        raise ElevenLabsError(_describe_vendor_error(vendor_error)) from vendor_error
+        description = _describe_vendor_error(vendor_error)
+        if _is_blocked_voice_error(vendor_error):
+            raise ElevenLabsVoiceBlockedError(description) from vendor_error
+        raise ElevenLabsError(description) from vendor_error
 
 
 # The SDK (2.65.0) serializes ``labels`` with ``json.dumps`` before its omit
@@ -271,6 +309,44 @@ async def get_voice_fine_tuning_state(
 # --- speech -------------------------------------------------------------------------
 
 
+async def voice_safety_control(context: Any, *, voice_id: str) -> str | None:
+    """Return the vendor's moderation verdict on one voice.
+
+    ``None`` for a voice in good standing; a name in
+    ``BLOCKED_VOICE_SAFETY_CONTROLS`` once ElevenLabs has banned it. Read from
+    ``GET /v1/voices/{voice_id}``, which keeps answering for a banned voice even
+    though synthesis with that voice is refused — which is what makes the ban
+    detectable before someone presses speak.
+    """
+
+    def _read() -> str | None:
+        client = _client(context)
+        voice = client.voices.get(voice_id)
+        control = getattr(voice, "safety_control", None)
+        return str(control) if control else None
+
+    return await _run(_read)
+
+
+async def voice_is_blocked(context: Any, *, voice_id: str) -> bool:
+    """Whether ElevenLabs has banned this voice.
+
+    A vendor failure other than the ban itself answers ``False``: an unreachable
+    or erroring ElevenLabs is not evidence that a voice is blocked, and treating
+    it as such would retire a working clone on a network blip.
+    """
+    try:
+        control = await voice_safety_control(context, voice_id=voice_id)
+    except ElevenLabsVoiceBlockedError:
+        return True
+    except (ElevenLabsError, ElevenLabsNotConfiguredError) as lookup_error:
+        logger.warning(
+            "Could not read the safety control for voice %s: %s", voice_id, lookup_error
+        )
+        return False
+    return str(control or "").strip().upper() in BLOCKED_VOICE_SAFETY_CONTROLS
+
+
 async def synthesize_speech(
     context: Any,
     *,
@@ -279,7 +355,10 @@ async def synthesize_speech(
     model_id: str | None = None,
     output_format: str = "mp3_44100_128",
 ) -> bytes:
-    """Speak ``text`` in the cloned voice and return the audio bytes."""
+    """Speak ``text`` in the cloned voice and return the audio bytes.
+
+    Raises ``ElevenLabsVoiceBlockedError`` when the voice has been banned.
+    """
 
     def _convert() -> bytes:
         client = _client(context)

@@ -29,6 +29,7 @@ from src.subgraphs.process_media_graph.utils.helper_functions import (
     _format_dialogue_transcript,
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
+    window_target_speech,
 )
 
 
@@ -346,7 +347,12 @@ async def test_each_nontarget_statement_emits_its_own_identity_document(
     docs = await process_dialogue_json_to_documents(
         payload, user_id="u", assistant_id="a", media_item=_media_item()
     )
-    identity_docs = [d for d in docs if d.metadata.get("namespace") == "identity"]
+    identity_docs = [
+        d
+        for d in docs
+        if d.metadata.get("namespace") == "identity"
+        and not d.metadata.get("spoken_by_target")
+    ]
     assert len(identity_docs) == 2, "expected one Document per non-target statement"
     by_speaker = {d.metadata["speaker"]: d for d in identity_docs}
     assert set(by_speaker.keys()) == {"A", "B"}
@@ -372,7 +378,14 @@ async def test_empty_nontarget_statements_emit_no_documents(
     docs = await process_dialogue_json_to_documents(
         payload, user_id="u", assistant_id="a", media_item=_media_item()
     )
-    assert [d for d in docs if d.metadata.get("namespace") == "identity"] == []
+    # The target's own "Hi." still runs through the (stubbed) fact pipeline;
+    # only the non-target statement must produce nothing.
+    assert [
+        d
+        for d in docs
+        if d.metadata.get("namespace") == "identity"
+        and not d.metadata.get("spoken_by_target")
+    ] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -632,3 +645,109 @@ async def test_process_dialogue_attaches_scene_and_user_context(
         assert q.metadata["scene_summary"].startswith("SCENE::Miranda is redirected")
         assert q.metadata["user_context"]  # always present
     assert quotes[0].metadata["user_context"] == "Agent Miranda?"
+
+
+# ---------------------------------------------------------------------------
+# Facts spoken by the target themself
+# ---------------------------------------------------------------------------
+
+
+def test_window_target_speech_groups_consecutive_target_turns_under_limit():
+    turns = [
+        {"speaker": "T", "text": "I write songs here.", "is_target": True, "start": 0.0, "end": 1.0},
+        {"speaker": "A", "text": "Nice room.", "is_target": False, "start": 1.0, "end": 2.0},
+        {"speaker": "T", "text": "I lost my voice in 2007.", "is_target": True, "start": 2.0, "end": 3.0},
+        {"speaker": "T", "text": "   ", "is_target": True, "start": 3.0, "end": 3.5},
+    ]
+    windows = window_target_speech(turns, limit=200)
+    assert len(windows) == 1
+    assert windows[0]["text"] == "I write songs here. I lost my voice in 2007."
+    assert windows[0]["speaker"] == "T"
+    assert windows[0]["start"] == 0.0
+    assert windows[0]["end"] == 3.0
+
+
+def test_window_target_speech_splits_when_limit_is_exceeded():
+    turns = [
+        {"speaker": "T", "text": "a" * 30, "is_target": True, "start": 0.0, "end": 1.0},
+        {"speaker": "T", "text": "b" * 30, "is_target": True, "start": 1.0, "end": 2.0},
+        {"speaker": "T", "text": "c" * 30, "is_target": True, "start": 2.0, "end": 3.0},
+    ]
+    windows = window_target_speech(turns, limit=65)
+    assert [w["text"] for w in windows] == ["a" * 30 + " " + "b" * 30, "c" * 30]
+    assert (windows[0]["start"], windows[0]["end"]) == (0.0, 2.0)
+    assert (windows[1]["start"], windows[1]["end"]) == (2.0, 3.0)
+
+
+def test_window_target_speech_ignores_nontarget_only_transcripts():
+    turns = [{"speaker": "A", "text": "Grant built robots.", "is_target": False}]
+    assert window_target_speech(turns) == []
+
+
+@pytest.mark.asyncio
+async def test_target_speech_emits_identity_documents(
+    stub_biographical_identity, stub_scene_summary, stub_synthetic_questions
+):
+    """A target who talks about themself must teach the avatar facts, not only
+    quotes: the target turns are windowed and run through the fact pipeline,
+    and the resulting identity Documents are marked as spoken by the target.
+    """
+    payload = {
+        "segments": [
+            {"speaker": "A", "text": "Where do you write?", "is_target": False, "start": 0.0, "end": 1.0},
+            {"speaker": "T", "text": "This is the room where I write songs.", "is_target": True, "start": 1.0, "end": 3.0},
+            {"speaker": "T", "text": "I am getting ready for the Grammys.", "is_target": True, "start": 3.0, "end": 5.0},
+        ],
+        "target_name": "T",
+    }
+    docs = await process_dialogue_json_to_documents(
+        payload, user_id="u", assistant_id="a", media_item=_media_item()
+    )
+    quote_docs = [d for d in docs if d.metadata.get("namespace") == "quote"]
+    assert len(quote_docs) == 1, "consecutive target turns coalesce into one quote"
+    target_facts = [
+        d
+        for d in docs
+        if d.metadata.get("namespace") == "identity"
+        and d.metadata.get("spoken_by_target") is True
+    ]
+    assert len(target_facts) == 1
+    assert target_facts[0].metadata["speaker"] == "T"
+    assert target_facts[0].metadata["start"] == 1.0
+    assert target_facts[0].metadata["end"] == 5.0
+    assert (
+        target_facts[0].page_content
+        == "This is the room where I write songs. I am getting ready for the Grammys."
+    )
+    # The non-target question said nothing biographical but the stub echoes it;
+    # what matters is that it is NOT marked as spoken by the target.
+    other_facts = [
+        d
+        for d in docs
+        if d.metadata.get("namespace") == "identity"
+        and not d.metadata.get("spoken_by_target")
+    ]
+    assert all(d.metadata["speaker"] == "A" for d in other_facts)
+
+
+@pytest.mark.asyncio
+async def test_target_speech_extraction_failure_keeps_quotes(
+    monkeypatch, stub_scene_summary, stub_synthetic_questions
+):
+    async def _boom(**_kwargs):
+        raise RuntimeError("extractor down")
+
+    monkeypatch.setattr(
+        helper_functions, "_build_biographical_identity_documents", _boom
+    )
+    payload = {
+        "segments": [
+            {"speaker": "T", "text": "I write songs.", "is_target": True, "start": 0.0, "end": 1.0},
+        ],
+        "target_name": "T",
+    }
+    docs = await process_dialogue_json_to_documents(
+        payload, user_id="u", assistant_id="a", media_item=_media_item()
+    )
+    assert [d.metadata["namespace"] for d in docs if d.metadata.get("namespace") == "quote"]
+    assert [d for d in docs if d.metadata.get("namespace") == "identity"] == []

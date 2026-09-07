@@ -71,18 +71,24 @@ NOTIFY_INSTRUCTION = (
 # Spoken turns heard in the room (a live-voice utterance labelled by speaker).
 RESPOND_INSTRUCTION_SPEECH = (
     "The assistant heard this spoken aloud in the room; the lines are labelled "
-    "by speaker. The assistant decided to answer aloud. Reply to the person who "
-    "addressed the assistant, in the avatar's own voice, the way the avatar "
-    "would answer someone standing there. Address a labelled speaker by name "
-    "only when the name is a real name, never as 'Speaker 2'. Do not repeat the "
-    "transcript and do not say that the words were transcribed."
+    "by speaker. The line labelled with the assistant's own name is the "
+    "assistant's own person speaking (the same identity as the assistant), and "
+    "the other labelled speakers are the people the assistant is talking with. "
+    "The assistant decided to speak aloud. Answer the other person the way the "
+    "assistant's own person would, in the first person and in that person's own "
+    "voice, continuing what the person said rather than answering the person. "
+    "Address another speaker by name only when the name is a real name, never as "
+    "'Speaker 2'. Do not repeat the transcript and do not say that the words "
+    "were transcribed."
 )
 
 NOTIFY_INSTRUCTION_SPEECH = (
     "The assistant heard this spoken aloud in the room; the lines are labelled "
-    "by speaker. The assistant decided the owner should hear about this. Write "
-    "one short heads-up message to the owner saying what was heard and what the "
-    "assistant suggests. Do not take actions and do not call tools."
+    "by speaker, and the line labelled with the assistant's own name is the "
+    "assistant's own person speaking. The assistant decided that person should "
+    "be reminded of something said. Write one short heads-up saying what was "
+    "heard and what the assistant suggests. Do not take actions and do not call "
+    "tools."
 )
 
 ALL_INSTRUCTIONS = (

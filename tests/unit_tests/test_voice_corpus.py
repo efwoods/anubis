@@ -13,6 +13,15 @@ Pinned down:
 - **The active voice prefers the professional clone once fine-tuned.**
 - **The speak route** refuses without a clone (409, with the collected seconds)
   and serves audio with one.
+- **A voice ElevenLabs has banned is reported as banned**, not as a voice model
+  that is trained and available. The ban is permanent and belongs to the
+  recording, so it is found by asking the vendor before anyone presses speak,
+  it is recorded when a speak attempt meets it, and it is answered with 409
+  ``voice_blocked`` rather than the ``voice_not_ready`` that asks for more
+  speech.
+- **The ban is noted on the avatar itself**, so every screen holding the avatar
+  treats it as one with no voice audio model — text replies in live voice mode,
+  no speak button in chat — without asking the voice route again.
 """
 
 from types import SimpleNamespace
@@ -52,6 +61,10 @@ class _FakeVendor:
         self.trained = []
         self.verified = []
         self.state = "fine_tuning"
+        # Voice ids ElevenLabs has banned. Empty by default: a clone is in good
+        # standing unless a test says otherwise.
+        self.blocked_voice_ids = set()
+        self.safety_lookups = []
 
     def install(self, monkeypatch):
         async def create_instant_voice(context, *, name, clips, description=""):
@@ -85,7 +98,17 @@ class _FakeVendor:
         async def synthesize_speech(
             context, *, voice_id, text, model_id=None, output_format="mp3_44100_128"
         ):
+            if voice_id in self.blocked_voice_ids:
+                raise elevenlabs_client.ElevenLabsVoiceBlockedError(
+                    f"ElevenLabs rejected the request (403 detected_blocked_voice: "
+                    f"Voice '{voice_id}' may violate our Terms of Service and has "
+                    f"been blocked.)"
+                )
             return f"audio:{voice_id}:{text}".encode()
+
+        async def voice_is_blocked(context, *, voice_id):
+            self.safety_lookups.append(voice_id)
+            return voice_id in self.blocked_voice_ids
 
         for name, function in locals().items():
             if name not in ("self", "monkeypatch"):
@@ -541,3 +564,272 @@ async def test_a_status_read_retries_a_failed_instant_clone(monkeypatch):
         is_personal_avatar=False,
     )
     assert attempts["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_status_reports_a_clone_the_vendor_has_banned(monkeypatch):
+    """The settings panel must not call a banned voice trained and available."""
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "instant_voice_id": "ivc-banned",
+            "collected_seconds": 299.1,
+        }
+    )
+    vendor.blocked_voice_ids.add("ivc-banned")
+
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+    )
+
+    assert vendor.safety_lookups == ["ivc-banned"]
+    assert status.instant_voice_blocked is True
+    assert status.instant_voice_blocked_reason
+    # The id and the seconds survive: the corpus is still there, and the owner
+    # is told which voice was refused.
+    assert status.instant_voice_id == "ivc-banned"
+
+
+@pytest.mark.asyncio
+async def test_status_does_not_ask_the_vendor_again_straight_away(monkeypatch):
+    """A healthy verdict is cached, so the panel is not a vendor call per load."""
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "instant_voice_id": "ivc-fine",
+            "collected_seconds": 299.1,
+        }
+    )
+
+    for _ in range(3):
+        status = await corpus.voice_status_for(
+            repository,
+            _context(),
+            user_id=USER_ID,
+            assistant_id=ASSISTANT_ID,
+            is_personal_avatar=False,
+        )
+
+    assert vendor.safety_lookups == ["ivc-fine"]
+    assert status.instant_voice_blocked is False
+
+
+@pytest.mark.asyncio
+async def test_speak_refuses_a_banned_voice_without_calling_the_vendor(monkeypatch):
+    """A ban already on the record is answered without paying for a 403."""
+    from src.api import webapp as webapp_module
+
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "instant_voice_id": "ivc-banned",
+            "detail": {"instant_blocked": True, "instant_blocked_reason": "banned"},
+        }
+    )
+    vendor.blocked_voice_ids.add("ivc-banned")
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    spoken = []
+
+    async def _never_synthesize(*args, **kwargs):
+        spoken.append(kwargs)
+        raise AssertionError("a banned voice must not reach the vendor")
+
+    monkeypatch.setattr(elevenlabs_client, "synthesize_speech", _never_synthesize)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+
+    assert response.status_code == 409
+    body = response.body.decode("utf-8")
+    assert "voice_blocked" in body
+    # Not the "record more speech" refusal: no amount of recording lifts a ban.
+    assert "voice_not_ready" not in body
+    assert spoken == []
+
+
+@pytest.mark.asyncio
+async def test_speak_records_a_ban_it_meets_at_synthesis(monkeypatch):
+    """A ban applied after the last check is remembered, not re-paid for."""
+    from src.api import webapp as webapp_module
+
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "instant_voice_id": "ivc-banned",
+        }
+    )
+    vendor.blocked_voice_ids.add("ivc-banned")
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+
+    assert response.status_code == 409
+    assert "voice_blocked" in response.body.decode("utf-8")
+    stored = await repository.get_voice(ASSISTANT_ID)
+    assert stored["detail"]["instant_blocked"] is True
+
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+    )
+    assert status.instant_voice_blocked is True
+
+
+@pytest.mark.asyncio
+async def test_a_ban_is_not_retried_like_a_failed_clone(monkeypatch):
+    """A banned clone must not sit in the retry loop meant for vendor errors."""
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+
+    async def _blocked_clone(context, *, name, clips, description=""):
+        raise elevenlabs_client.ElevenLabsVoiceBlockedError("blocked at creation")
+
+    monkeypatch.setattr(elevenlabs_client, "create_instant_voice", _blocked_clone)
+    context = _context()
+    await _add(repository, context, 90)
+
+    record = await repository.get_voice(ASSISTANT_ID)
+    assert record["detail"]["instant_blocked"] is True
+    # ``instant_error`` is the retryable failure; a ban is not one of those.
+    assert "instant_error" not in record["detail"]
+    assert vendor.instant == []
+
+
+class _FakeAssistants:
+    """The subset of the LangGraph assistants client the note helper uses."""
+
+    def __init__(self, metadata):
+        self.metadata = dict(metadata)
+        self.updates = []
+
+    async def get(self, assistant_id):
+        return {"assistant_id": assistant_id, "metadata": dict(self.metadata)}
+
+    async def update(self, *, assistant_id, metadata):
+        self.updates.append(metadata)
+        # LangGraph merges metadata by key.
+        self.metadata.update(metadata)
+        return {"assistant_id": assistant_id, "metadata": dict(self.metadata)}
+
+
+def _install_fake_client(monkeypatch, webapp_module, assistants):
+    monkeypatch.setattr(
+        webapp_module,
+        "get_client",
+        lambda *args, **kwargs: SimpleNamespace(assistants=assistants),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_ban_is_noted_on_the_avatar(monkeypatch):
+    """The note is what makes every other screen fall back to text."""
+    from src.api import webapp as webapp_module
+
+    assistants = _FakeAssistants(
+        {"user_id": USER_ID, "is_personal_avatar_of_creator": False}
+    )
+    _install_fake_client(monkeypatch, webapp_module, assistants)
+
+    await webapp_module.note_blocked_voice_on_avatar(
+        ASSISTANT_ID,
+        {"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+        "blocked by the vendor",
+    )
+
+    assert len(assistants.updates) == 1
+    assert assistants.updates[0]["voice_model_blocked"] is True
+    assert assistants.updates[0]["voice_model_blocked_reason"] == "blocked by the vendor"
+    # The note is merged in; nothing else about the avatar is disturbed.
+    assert assistants.metadata["user_id"] == USER_ID
+    assert assistants.metadata["is_personal_avatar_of_creator"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_note_is_written_once(monkeypatch):
+    """An avatar already carrying the note costs a read and no write."""
+    from src.api import webapp as webapp_module
+
+    assistants = _FakeAssistants({"user_id": USER_ID, "voice_model_blocked": True})
+    _install_fake_client(monkeypatch, webapp_module, assistants)
+
+    await webapp_module.note_blocked_voice_on_avatar(
+        ASSISTANT_ID, {"API_KEY": "k", "identities": [{"user_id": USER_ID}]}
+    )
+
+    assert assistants.updates == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_note_does_not_break_the_refusal(monkeypatch):
+    """The note is advisory: speak must still answer 409 when it cannot be written."""
+    from src.api import webapp as webapp_module
+
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "instant_voice_id": "ivc-banned",
+        }
+    )
+    vendor.blocked_voice_ids.add("ivc-banned")
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    def _unreachable_client(*args, **kwargs):
+        raise RuntimeError("LangGraph is unreachable")
+
+    monkeypatch.setattr(webapp_module, "get_client", _unreachable_client)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+
+    assert response.status_code == 409
+    assert "voice_blocked" in response.body.decode("utf-8")
+    stored = await repository.get_voice(ASSISTANT_ID)
+    assert stored["detail"]["instant_blocked"] is True

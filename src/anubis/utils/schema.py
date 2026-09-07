@@ -2037,3 +2037,54 @@ Return only the structured CSVUserTextColumnIdentification object the runtime
 expects. No prose outside the structured fields.
 </output_format>
 """
+
+
+class ReferenceSubjectClassification(BaseModel):
+    """What an avatar's reference image depicts, which decides how its emotion stills and idle loops are generated, and whether the image-to-video vendor's content moderation is likely to refuse the rendered result."""
+
+    subject: Literal["person", "stylized_character", "non_human"] = Field(
+        description=(
+            "person when the image is a photograph or photorealistic render of a real human being with a visible face. "
+            "stylized_character when the image shows a character with a face drawn, painted, or rendered in a non-photographic style: a cartoon, an illustration, an anime figure, a comic-book or video-game character, a mascot, a robot or creature with a face. "
+            "non_human when the image has no face at all: a logo, an emblem, an abstract interface or heads-up display, a diagram, text, an object, a vehicle, a building, a landscape, or an animal shown without a clear face. A single camera lens, a glowing light or eye-like sensor, a speaker grille, or a device with no mouth, no brows, and no other facial features is non_human even when the device is famous for behaving like a character. "
+            "A face means eyes together with a mouth or brows arranged as a face; one lens or one light is not a face. When a face is present but small, still choose person or stylized_character by its rendering style. This value MUST match the conclusion in the reasoning field."
+        )
+    )
+    moderation_reasons: List[
+        Literal[
+            "trademarked_character",
+            "weapon",
+            "violence",
+            "gore",
+            "nudity_or_sexual",
+            "minor",
+            "hate_symbol",
+        ]
+    ] = Field(
+        description=(
+            "Every reason the content moderation of an image-to-video vendor would refuse a video rendered from this image. "
+            "trademarked_character: the recognisable body or face of a well-known copyrighted or branded character (a Marvel, DC, Disney, Pixar, Nintendo, anime, or video-game character, a corporate mascot), whether drawn, rendered, or a costumed actor. An object, prop, emblem, lens, panel, vehicle, or interface that merely comes from a film or franchise is NOT a trademarked character and is not a reason. "
+            "weapon: a gun, blade, or other weapon is visible. "
+            "violence: fighting, a punch or strike, a combat or attack pose, a raised fist aimed at someone, restraint, or an injury being inflicted. "
+            "gore: blood, wounds, or mutilation. "
+            "nudity_or_sexual: nudity, underwear as the focus, or sexualised posing. "
+            "minor: the subject appears to be a child or teenager. "
+            "hate_symbol: a symbol, gesture, or uniform of a hate movement. "
+            "Empty when none apply: an ordinary adult person, an original character, a logo, an object, or a landscape."
+        )
+    )
+    moderation_risk: Literal["low", "high"] = Field(
+        description=(
+            "high when moderation_reasons is not empty, low when moderation_reasons is empty. "
+            "high means the vendor will most likely refuse the rendered video after charging for it, so generation should not be attempted with this image."
+        )
+    )
+    moderation_advice: str = Field(
+        description=(
+            "One or two sentences telling the owner what to change in the reference image so the vendor accepts the result, naming what was found. "
+            "Empty when moderation_risk is low."
+        )
+    )
+    reasoning: str = Field(
+        description="Two or three sentences naming what the image depicts, whether the image contains a face, whether that face is photographic or stylized, and whether any moderation reason is present, ending with the chosen subject and risk."
+    )

@@ -100,10 +100,23 @@ async def extract_personality_from_image(
 
     response_dict = response.model_dump()
 
-    input_tokens = response_dict["response_metadata"]["token_usage"]["prompt_tokens"]
-    output_tokens = response_dict["response_metadata"]["token_usage"][
-        "completion_tokens"
-    ]
+    # ``usage_metadata`` is the provider-independent token count on every
+    # LangChain AI message; ``response_metadata["token_usage"]`` is only present
+    # for some OpenAI client paths, so the description must not depend on it.
+    usage_metadata = getattr(response, "usage_metadata", None) or {}
+    legacy_token_usage = (
+        (response_dict.get("response_metadata") or {}).get("token_usage") or {}
+    )
+    input_tokens = int(
+        usage_metadata.get("input_tokens")
+        or legacy_token_usage.get("prompt_tokens")
+        or 0
+    )
+    output_tokens = int(
+        usage_metadata.get("output_tokens")
+        or legacy_token_usage.get("completion_tokens")
+        or 0
+    )
     total_tokens = input_tokens + output_tokens
 
     total_cost = (

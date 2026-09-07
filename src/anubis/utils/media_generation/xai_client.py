@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from typing import Any
 
@@ -36,6 +37,71 @@ class XaiGenerationError(RuntimeError):
 
 class XaiNotConfiguredError(RuntimeError):
     """No xAI key is configured, so nothing can be generated."""
+
+
+# Failure reasons the client can act on. ``content_moderated`` is xAI refusing
+# the *generated* asset after rendering it (the charge stands); retrying the
+# same reference repeats the charge and almost always the refusal.
+ERROR_CODE_CONTENT_MODERATED = "content_moderated"
+# The refusal was predicted from the reference image before any call was made,
+# so nothing was rendered and nothing was charged.
+ERROR_CODE_MODERATION_PREDICTED = "moderation_predicted"
+# The xAI team is out of credits or at its monthly spending limit: every
+# further call answers the same 403, so the run stops after the first one.
+ERROR_CODE_VENDOR_CREDITS_EXHAUSTED = "vendor_credits_exhausted"
+# Withheld because an earlier call in the same run hit a stop condition.
+ERROR_CODE_NOT_ATTEMPTED = "not_attempted"
+ERROR_CODE_VENDOR = "vendor_error"
+
+_XAI_CODE_TO_ERROR_CODE = {
+    "imagine:content-moderated": ERROR_CODE_CONTENT_MODERATED,
+    "permission-denied": ERROR_CODE_VENDOR_CREDITS_EXHAUSTED,
+}
+
+# Error codes after which the rest of the run is pointless: the same answer
+# would come back for every remaining call, each one billed or wasted.
+STOP_RUN_ERROR_CODES = frozenset({ERROR_CODE_VENDOR_CREDITS_EXHAUSTED})
+
+_ASSET_NOUN = {"still": "portrait", "idle_loop": "emotion video"}
+
+
+def failure_reason(error_text: str, asset_kind: str) -> tuple[str, str]:
+    """Turn a raw xAI error into ``(error_code, message)`` a person can act on.
+
+    The raw text carries the vendor's JSON body when there was one; the code is
+    read from it. ``message`` says what happened and what to do, without
+    asking for a retry when a retry would only repeat the charge.
+    """
+    noun = _ASSET_NOUN.get(asset_kind, "asset")
+    vendor_code = None
+    text = error_text or ""
+    start = text.find("{")
+    if start >= 0:
+        try:
+            body = json.loads(text[start:])
+            vendor_code = str(body.get("code") or "") or None
+        except (ValueError, AttributeError):
+            vendor_code = None
+    error_code = _XAI_CODE_TO_ERROR_CODE.get(vendor_code or "", ERROR_CODE_VENDOR)
+    if error_code == ERROR_CODE_VENDOR_CREDITS_EXHAUSTED:
+        return (
+            error_code,
+            "xAI refused every generation: the xAI team has used all of its "
+            "available credits or reached its monthly spending limit. Nothing "
+            "was generated. Add credits or raise the limit in the xAI console, "
+            "then generate the missing emotion media from settings.",
+        )
+    if error_code == ERROR_CODE_CONTENT_MODERATED:
+        return (
+            error_code,
+            f"xAI's content moderation refused the generated {noun}. The charge "
+            "for the rendering stands, and retrying with the same reference "
+            "image repeats both the charge and the refusal. Use a different "
+            "reference image: a calm head-and-shoulders portrait passes far more "
+            "often than a full-body action pose, a weapon, or a well-known "
+            "trademarked character.",
+        )
+    return (error_code, f"The {noun} could not be generated: {text[:300]}")
 
 
 def _api_key(context: Any) -> str:
@@ -215,9 +281,16 @@ async def generate_idle_loop(
 
 
 __all__ = [
+    "ERROR_CODE_CONTENT_MODERATED",
+    "ERROR_CODE_MODERATION_PREDICTED",
+    "ERROR_CODE_NOT_ATTEMPTED",
+    "ERROR_CODE_VENDOR",
+    "ERROR_CODE_VENDOR_CREDITS_EXHAUSTED",
+    "STOP_RUN_ERROR_CODES",
     "XaiGenerationError",
     "XaiNotConfiguredError",
     "edit_image",
+    "failure_reason",
     "generate_idle_loop",
     "_data_uri",
     "_decode_data_uri",

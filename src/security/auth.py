@@ -851,9 +851,17 @@ async def login_user(email: str, password: str, request: Request) -> dict:
             },
         )
         return response  # access_token, id_token, refresh_token, expires_in
-    except Exception as e:
+    except httpx.HTTPError as exc:
+        # The request never produced a response (DNS failure, connect/read
+        # timeout, connection refused), so there is no upstream status to
+        # forward. Report the identity provider as unavailable rather than
+        # letting the bare exception surface as an opaque 500.
+        logger.warning(
+            "Login request to %s failed (transport): %s", BASE_AUTH_URL, exc
+        )
         raise HTTPException(
-            detail="Error logging in user: {e}", status_code=response.status_code
+            status_code=503,
+            detail=f"Authentication provider unreachable: {exc!r}",
         )
 
 

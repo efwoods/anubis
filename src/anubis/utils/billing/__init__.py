@@ -117,9 +117,13 @@ from src.anubis.utils.billing.tiers import (
     TierCapability,
     TierDefinition,
     UsageMeter,
+    TIER_ORDER,
+    TIER_RANK,
+    minimum_tier_from_value,
     tier_allotment_for_meter,
     tier_from_value,
     tier_has_capability,
+    tier_meets_minimum,
 )
 
 __all__ = [
@@ -133,6 +137,10 @@ __all__ = [
     "tier_from_value",
     "tier_has_capability",
     "tier_allotment_for_meter",
+    "TIER_ORDER",
+    "TIER_RANK",
+    "minimum_tier_from_value",
+    "tier_meets_minimum",
     "StripeBillingConfig",
     "TierStripeIdentifiers",
     "billing_config_source_conflict",

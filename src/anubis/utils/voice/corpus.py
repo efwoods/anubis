@@ -43,6 +43,13 @@ from src.anubis.utils.voice import elevenlabs_client
 # refusal does not hit the vendor on every settings refresh.
 INSTANT_CLONE_RETRY_SECONDS = 300.0
 
+# How long a "this voice is still in good standing" answer from ElevenLabs is
+# trusted before the settings Voice panel asks again. ElevenLabs applies its
+# moderation ban asynchronously — a clone is created, reports healthy, and is
+# banned minutes or hours later — so a one-time check at creation is not enough
+# to keep the panel honest; it is re-read on a status read this often.
+VOICE_SAFETY_RECHECK_SECONDS = 900.0
+
 logger = logging.getLogger(__name__)
 
 CLIP_SOURCE_RECORDER = "recorder"
@@ -108,6 +115,8 @@ class VoiceStatus:
     collected_seconds: float
     instant_voice_id: str | None
     instant_voice_seconds: float
+    instant_voice_blocked: bool
+    instant_voice_blocked_reason: str | None
     professional_voice_id: str | None
     professional_state: str
     active_voice: str  # instant | professional | none
@@ -160,6 +169,96 @@ async def _voice_record(
     record.setdefault("instant_voice_seconds", 0.0)
     record.setdefault("professional_voice_id", None)
     record.setdefault("detail", {})
+    return record
+
+
+BLOCKED_VOICE_MESSAGE = (
+    "ElevenLabs has blocked this avatar's cloned voice for violating its terms "
+    "of service, which it applies to clones of public figures. The block is "
+    "permanent and belongs to the voice: re-cloning the same recording produces "
+    "the same block. Delete the voice model and record or upload speech the "
+    "avatar's owner is entitled to clone."
+)
+
+
+def voice_record_blocked(record: dict[str, Any]) -> bool:
+    """Whether the stored record already knows the instant clone is banned."""
+    return bool((record.get("detail") or {}).get("instant_blocked"))
+
+
+def voice_record_blocked_reason(record: dict[str, Any]) -> str | None:
+    """Return the message to show for a banned instant clone, else None."""
+    detail = record.get("detail") or {}
+    if not detail.get("instant_blocked"):
+        return None
+    return str(detail.get("instant_blocked_reason") or BLOCKED_VOICE_MESSAGE)
+
+
+def _mark_record_blocked(record: dict[str, Any], reason: str | None = None) -> None:
+    """Record the vendor's permanent ban of this avatar's instant clone."""
+    record["detail"] = {
+        **(record.get("detail") or {}),
+        "instant_blocked": True,
+        "instant_blocked_reason": reason or BLOCKED_VOICE_MESSAGE,
+        "instant_blocked_at": datetime.now(tz=UTC).timestamp(),
+        "instant_safety_checked_at": datetime.now(tz=UTC).timestamp(),
+    }
+
+
+async def mark_voice_blocked(
+    repository: Any, user_id: str, assistant_id: str, *, reason: str | None = None
+) -> dict[str, Any]:
+    """Persist that ElevenLabs has banned this avatar's cloned voice.
+
+    Called both by the pre-emptive safety check and by ``POST /speak`` when the
+    ban is met at synthesis time, so the settings Voice panel stops advertising
+    a voice model that cannot speak.
+    """
+    record = await _voice_record(repository, user_id, assistant_id)
+    _mark_record_blocked(record, reason)
+    await repository.upsert_voice(record)
+    logger.warning(
+        "Voice %s for %s is blocked by ElevenLabs",
+        record.get("instant_voice_id"),
+        assistant_id,
+    )
+    return record
+
+
+async def _refresh_voice_safety(
+    repository: Any,
+    context: Any,
+    record: dict[str, Any],
+    *,
+    assistant_id: str,
+) -> dict[str, Any]:
+    """Ask ElevenLabs whether the instant clone is still allowed to speak.
+
+    The point of asking here rather than at synthesis time is that the settings
+    Voice panel is where someone finds out: without this, a banned clone still
+    reads "Voice model trained and available" and the ban only ever surfaces as
+    a speak button that does nothing. Skipped when the answer is already known
+    or was asked for recently — see VOICE_SAFETY_RECHECK_SECONDS.
+    """
+    voice_id = record.get("instant_voice_id")
+    if not voice_id or not voice_configured(context):
+        return record
+    if voice_record_blocked(record):
+        return record
+    detail = record.get("detail") or {}
+    checked_at = float(detail.get("instant_safety_checked_at") or 0.0)
+    now = datetime.now(tz=UTC).timestamp()
+    if now - checked_at < VOICE_SAFETY_RECHECK_SECONDS:
+        return record
+    blocked = await elevenlabs_client.voice_is_blocked(context, voice_id=str(voice_id))
+    if blocked:
+        _mark_record_blocked(record)
+        logger.warning(
+            "Voice %s for %s is blocked by ElevenLabs", voice_id, assistant_id
+        )
+    else:
+        record["detail"] = {**detail, "instant_safety_checked_at": now}
+    await repository.upsert_voice(record)
     return record
 
 
@@ -222,6 +321,19 @@ async def ensure_instant_voice(
             clips=files,
             description="Neural Nexus instant voice clone",
         )
+    except elevenlabs_client.ElevenLabsVoiceBlockedError as blocked_error:
+        # A ban is permanent and belongs to the recording, so this must not be
+        # written as ``instant_error``: that key marks a transient failure the
+        # status read retries every few minutes, and retrying a banned clone
+        # only repeats the refusal.
+        logger.warning(
+            "Instant clone for %s was blocked by ElevenLabs: %s",
+            assistant_id,
+            blocked_error,
+        )
+        _mark_record_blocked(record, str(blocked_error))
+        await repository.upsert_voice(record)
+        return record
     except elevenlabs_client.ElevenLabsError as clone_error:
         logger.warning("Instant clone failed for %s: %s", assistant_id, clone_error)
         record["detail"] = {
@@ -246,7 +358,13 @@ async def ensure_instant_voice(
         assistant_id,
         used_seconds,
     )
-    return record
+    # Ask the vendor immediately whether the clone it just minted is allowed to
+    # speak. ElevenLabs accepts the clone and bans it separately, so the answer
+    # here is "not yet banned" rather than "never will be" — the recheck on
+    # every status read (see _refresh_voice_safety) is what catches the rest.
+    return await _refresh_voice_safety(
+        repository, context, record, assistant_id=assistant_id
+    )
 
 
 async def prepare_professional_voice(
@@ -627,6 +745,9 @@ async def voice_status_for(
             user_id=user_id,
             assistant_id=assistant_id,
         )
+    record = await _refresh_voice_safety(
+        repository, context, record, assistant_id=assistant_id
+    )
     clips = await repository.list_voice_clips(assistant_id)
     active, active_id = await resolve_active_voice_id(repository, assistant_id)
     reference_audio_document: str | None = None
@@ -641,6 +762,8 @@ async def voice_status_for(
         collected_seconds=collected,
         instant_voice_id=record.get("instant_voice_id"),
         instant_voice_seconds=float(record.get("instant_voice_seconds") or 0.0),
+        instant_voice_blocked=voice_record_blocked(record),
+        instant_voice_blocked_reason=voice_record_blocked_reason(record),
         professional_voice_id=record.get("professional_voice_id"),
         professional_state=str(
             record.get("professional_state") or VOICE_STATE_NOT_STARTED
@@ -672,6 +795,8 @@ async def voice_status_for(
             if k
             in (
                 "instant_error",
+                "instant_blocked",
+                "instant_blocked_reason",
                 "professional_error",
                 "professional_error_kind",
                 "professional_help_url",

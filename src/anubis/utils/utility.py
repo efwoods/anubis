@@ -956,24 +956,68 @@ def _transcribe_one_segment_path(
     upload_filename: str,
     context: GlobalContext,
     client: OpenAI,
+    language: str | None = None,
+    prompt: str | None = None,
+    live_voice: bool = False,
 ) -> dict:
+    """Transcribe one on-disk segment.
+
+    ``language`` (ISO-639-1) and ``prompt`` are only passed when given; the
+    live-voice paths set them so the model does not invent a caption in some
+    other language for a silent or noisy clip. With ``live_voice`` the call
+    asks for ``verbose_json`` and keeps only the segments whisper is confident
+    hold speech (see ``transcript_hygiene.keep_confident_segments``).
+    """
+    from src.anubis.utils.voice.transcript_hygiene import keep_confident_segments
+
     start = time_ns()
     with AudioFileClip(path) as clip:
         duration_seconds = float(clip.duration or 0.0)
     transcription_cost = duration_seconds * context.audio_transcription_price_per_minute
     model = context.audio_transcription_model or "whisper-1"
+    optional_arguments: dict = {}
+    if language:
+        optional_arguments["language"] = language
+    if prompt:
+        optional_arguments["prompt"] = prompt
+    # Only whisper-1 reports per-segment confidence; the gpt-4o transcription
+    # models accept no verbose_json, so those keep the plain-text response.
+    verbose = live_voice and "whisper" in str(model).casefold()
+    response_format = "verbose_json" if verbose else "text"
     with open(path, "rb") as audio_f:
         content = _speech_call_with_retry(
             lambda: client.audio.transcriptions.create(
                 file=(upload_filename, audio_f),
                 model=model,
-                response_format="text",
+                response_format=response_format,
+                **optional_arguments,
             ),
             context,
             description=f"transcription({upload_filename})",
         )
+    dropped_segments = 0
+    if live_voice and not isinstance(content, str):
+        segments = getattr(content, "segments", None)
+        if segments is None and isinstance(content, dict):
+            segments = content.get("segments")
+        if segments is not None:
+            content, dropped_segments = keep_confident_segments(
+                list(segments),
+                no_speech_probability_max=float(
+                    getattr(context, "voice_no_speech_probability_max", 0.0) or 0.0
+                ),
+                average_logprob_min=float(
+                    getattr(context, "voice_average_logprob_min", 0.0) or 0.0
+                ),
+                compression_ratio_max=float(
+                    getattr(context, "voice_compression_ratio_max", 0.0) or 0.0
+                ),
+            )
+        else:
+            content = str(getattr(content, "text", "") or "")
     return {
         "text": content,
+        "dropped_segments": dropped_segments,
         "file_duration_s": duration_seconds,
         "total_cost": transcription_cost,
         "latency_ms": (time_ns() - start) / 1e6,
@@ -983,7 +1027,12 @@ def _transcribe_one_segment_path(
 
 
 def _transcribe_saved_path(
-    path: str, upload_filename: str, context: GlobalContext
+    path: str,
+    upload_filename: str,
+    context: GlobalContext,
+    language: str | None = None,
+    prompt: str | None = None,
+    live_voice: bool = False,
 ) -> dict:
     """Transcribe audio on disk; split by time when the file exceeds the Whisper 25 MiB limit.
 
@@ -996,7 +1045,15 @@ def _transcribe_saved_path(
     client = _openai_client_for_speech(context)
 
     if size_bytes <= context.whisper_max_bytes:
-        seg = _transcribe_one_segment_path(path, upload_filename, context, client)
+        seg = _transcribe_one_segment_path(
+            path,
+            upload_filename,
+            context,
+            client,
+            language=language,
+            prompt=prompt,
+            live_voice=live_voice,
+        )
         seg["latency_ms"] = (time_ns() - start_time) / 1e6
         return seg
 
@@ -1017,7 +1074,13 @@ def _transcribe_saved_path(
             try:
                 sub.write_audiofile(chunk_path, logger=None)
                 seg = _transcribe_one_segment_path(
-                    chunk_path, f"chunk_{i}.mp3", context, client
+                    chunk_path,
+                    f"chunk_{i}.mp3",
+                    context,
+                    client,
+                    language=language,
+                    prompt=prompt,
+                    live_voice=live_voice,
                 )
                 parts.append(seg["text"])
                 total_cost += seg["total_cost"]
@@ -1047,7 +1110,22 @@ async def transcribe_audio(
     filename: Optional[str] = None,
     reference_audio: bool = False,
     max_duration_seconds: Optional[float] = 9.0,
+    live_voice: bool = False,
 ) -> dict:
+    """Transcribe one audio payload with the OpenAI transcription model.
+
+    ``live_voice=True`` marks a microphone utterance from voice mode or
+    dictation and turns on the speech-hygiene guards from
+    ``transcript_hygiene``: the configured language hint and prompt are sent,
+    a clip whose peak volume is below ``voice_silence_max_volume_db`` is
+    answered with an empty transcript without calling the model, and a
+    transcript that is only a memorised caption (``MBC 뉴스 이덕영입니다``,
+    ``Thank you for watching``) is dropped. Uploaded media leaves the flag off.
+    """
+    from src.anubis.utils.voice.transcript_hygiene import (
+        clip_is_silent,
+        drop_hallucinated_text,
+    )
 
     # Remove noise and isolate the vocals; if reference audio, truncate to 9 seconds:
     preprocessed_audio = await preprocess_audio(
@@ -1071,7 +1149,35 @@ async def transcribe_audio(
         path = tmp.name
     try:
         name = Path(filename or f"audio{suffix}").name
-        result = await asyncio.to_thread(_transcribe_saved_path, path, name, context)
+        language = live_voice_transcription_language(context) if live_voice else None
+        prompt = (
+            str(getattr(context, "voice_transcription_prompt", "") or "").strip()
+            if live_voice
+            else None
+        )
+        if live_voice and await asyncio.to_thread(
+            clip_is_silent,
+            path,
+            _ffmpeg_executable(),
+            silence_max_volume_db=getattr(context, "voice_silence_max_volume_db", None),
+        ):
+            return {
+                "text": "",
+                "file_duration_s": float(preprocessed_audio.get("duration_seconds") or 0.0),
+                "total_cost": 0.0,
+                "latency_ms": 0.0,
+                "model": context.audio_transcription_model or "whisper-1",
+                "inference_type": "transcription",
+                "skipped_silent": True,
+                "audio_base64_preprocessed": audio_base64,
+            }
+        result = await asyncio.to_thread(
+            _transcribe_saved_path, path, name, context, language, prompt, live_voice
+        )
+        if live_voice:
+            result["text"] = drop_hallucinated_text(
+                str(result.get("text") or ""), description="live-voice transcript"
+            )
         result["audio_base64_preprocessed"] = audio_base64
         return result
 
@@ -1081,6 +1187,19 @@ async def transcribe_audio(
         except OSError:
             pass
 
+
+
+def live_voice_transcription_language(context: GlobalContext) -> str | None:
+    """Return the ISO-639-1 hint for live-voice speech calls, or None when disabled.
+
+    ``VOICE_TRANSCRIPTION_LANGUAGE`` set to ``none`` or ``auto`` lets the
+    speech model guess the language (an empty value keeps the default ``en``,
+    because ``GlobalContext`` treats empty env values as unset).
+    """
+    value = str(getattr(context, "voice_transcription_language", "") or "").strip()
+    if not value or value.casefold() in {"none", "auto", "off"}:
+        return None
+    return value.casefold()
 
 
 def _ffmpeg_executable() -> str:

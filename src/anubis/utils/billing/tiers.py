@@ -290,6 +290,48 @@ def tier_from_value(value: str | None) -> SubscriptionTier:
         return SubscriptionTier.FREE
 
 
+# The tiers ordered from the least to the most capable. A feature whose minimum
+# tier is configurable at deployment time (rather than fixed in the capability
+# sets above) compares the user's tier against a configured minimum through
+# ``tier_meets_minimum`` instead of holding a ``TierCapability`` of the feature's
+# own — emotion media generation (``EMOTION_MEDIA_MINIMUM_TIER``) is the first
+# such feature.
+TIER_ORDER: tuple[SubscriptionTier, ...] = (
+    SubscriptionTier.FREE,
+    SubscriptionTier.PRO,
+    SubscriptionTier.PREMIUM,
+)
+
+TIER_RANK: Dict[SubscriptionTier, int] = {
+    tier: index for index, tier in enumerate(TIER_ORDER)
+}
+
+
+def minimum_tier_from_value(
+    value: str | None, *, default: SubscriptionTier = SubscriptionTier.PREMIUM
+) -> SubscriptionTier:
+    """Coerce a configured minimum-tier string into a ``SubscriptionTier``.
+
+    Unlike ``tier_from_value``, which fails closed to the free tier for a
+    corrupt *user* record, a misconfigured *minimum* must fail closed to the
+    most restrictive setting — falling back to free would hand a premium
+    feature to everyone on a typo in the environment file.
+    """
+    if not value:
+        return default
+    try:
+        return SubscriptionTier(str(value).strip().lower())
+    except ValueError:
+        return default
+
+
+def tier_meets_minimum(
+    tier: SubscriptionTier, minimum_tier: SubscriptionTier
+) -> bool:
+    """Return whether ``tier`` is at least as capable as ``minimum_tier``."""
+    return TIER_RANK[tier] >= TIER_RANK[minimum_tier]
+
+
 def tier_has_capability(tier: SubscriptionTier, capability: TierCapability) -> bool:
     """Return whether ``tier`` unlocks ``capability``."""
     return capability in TIER_DEFINITIONS[tier].capabilities

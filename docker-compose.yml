@@ -27,9 +27,6 @@ services:
     langgraph-api-dev:
         image: evdev3/anubis-langgraph-api:latest
         pull_policy: never
-        dns:
-            - 168.83.129.16
-            - 8.8.8.8
         ports:
             - "${PORT:-8123}:${PORT:-8123}"
             - "${DEBUG_PORT:-5678}:${DEBUG_PORT:-5678}"

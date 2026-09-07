@@ -116,6 +116,28 @@ def _media_fact(key="media-1", fact="I grew up on a farm."):
     )
 
 
+def _researched_fact(key="research-1", fact="I was unveiled in 1921."):
+    """A fact deep research verified on the web and wrote into the identity namespace."""
+    return _item(
+        (CREATOR_ID, ASSISTANT_ID, "identity"),
+        key,
+        Document(
+            page_content=wrap_fact_with_context(fact, "From the county archive."),
+            metadata={
+                "user_id": CREATOR_ID,
+                "assistant_id": ASSISTANT_ID,
+                "document_id": "doc-research-1",
+                "fact": fact,
+                "fact_context": "From the county archive.",
+                "source": "deep_research",
+                "source_urls": ["https://archive.example.org/page", "https://b"],
+                "verification_status": "consistent",
+                "created_at": "2026-09-03T10:00:00+00:00",
+            },
+        ),
+    )
+
+
 def _media_transcript(key="media-transcript"):
     return _item(
         (CREATOR_ID, ASSISTANT_ID, "identity", "uuid5-of-mom-m4a"),
@@ -211,6 +233,7 @@ async def test_the_creator_sees_every_group_and_only_real_facts(monkeypatch):
     assert response["counts"] == {
         "conversation": 1,
         "media": 1,
+        "research": 0,
         "analysis": 1,
         "memory": 1,
     }
@@ -241,6 +264,34 @@ async def test_the_creator_sees_every_group_and_only_real_facts(monkeypatch):
         (CREATOR_ID, ASSISTANT_ID, "analysis"),
         (CREATOR_ID, ASSISTANT_ID, "memory"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_researched_fact_is_its_own_group_and_names_its_sources(monkeypatch):
+    """Deep research shares the media namespace but must not read as an upload."""
+    _install(
+        monkeypatch,
+        {"user_id": CREATOR_ID},
+        items=(_media_fact(), _researched_fact()),
+    )
+
+    response = await webapp_module.list_avatar_identity_facts(
+        assistant_id=ASSISTANT_ID, current_user=_current_user(CREATOR_ID)
+    )
+
+    assert response["counts"]["research"] == 1
+    assert response["counts"]["media"] == 1
+    researched = next(
+        row for row in response["facts"] if row["learned_from"] == "research"
+    )
+    assert researched["fact"] == "I was unveiled in 1921."
+    assert researched["verification_status"] == "consistent"
+    assert researched["source_urls"] == [
+        "https://archive.example.org/page",
+        "https://b",
+    ]
+    # The row is labelled by the page the fact came from, not by a filename.
+    assert researched["source_label"] == "archive.example.org"
 
 
 @pytest.mark.asyncio

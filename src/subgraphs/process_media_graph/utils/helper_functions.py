@@ -763,6 +763,97 @@ async def _attach_target_analysis_context(
             doc.metadata["user_context_synthetic"] = True
 
 
+def window_target_speech(
+    turns: List[Dict[str, Any]], limit: int = CLASSIFICATION_INPUT_CHAR_LIMIT
+) -> List[Dict[str, Any]]:
+    """Group consecutive target turns into text windows of at most ``limit`` chars.
+
+    The fact extractor reads at most ``CLASSIFICATION_INPUT_CHAR_LIMIT``
+    characters per call (see :func:`_classification_slice`), so a long
+    monologue is handed over in order, one window at a time, instead of having
+    everything past the first slice silently dropped. A single turn longer
+    than ``limit`` becomes its own window and is sliced by the extractor.
+
+    Each window carries the concatenated ``text``, the ``speaker`` label of the
+    first turn, and the ``start`` of its first turn and ``end`` of its last.
+    Turns that are not the target's, or that carry no text, are skipped.
+    """
+    windows: List[Dict[str, Any]] = []
+    current: Dict[str, Any] | None = None
+    for turn in turns:
+        if not isinstance(turn, dict) or not turn.get("is_target"):
+            continue
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        if current is not None and len(current["text"]) + 1 + len(text) <= limit:
+            current["text"] = f"{current['text']} {text}"
+            if turn.get("end") is not None:
+                current["end"] = turn.get("end")
+            continue
+        current = {
+            "speaker": str(turn.get("speaker") or "unknown"),
+            "text": text,
+            "start": turn.get("start"),
+            "end": turn.get("end"),
+        }
+        windows.append(current)
+    return windows
+
+
+async def build_target_speech_identity_documents(
+    turns: List[Dict[str, Any]],
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_item: Dict[str, Any],
+    target_name: str | None = None,
+) -> List[Document]:
+    """Extract first-person facts from the target's OWN speech into ``identity``.
+
+    What the target says about themself ("this is the room where I write
+    songs", "I'm getting ready for the Grammys") is biographical source about
+    the target just as much as what other speakers say about them. Storing the
+    verbatim turns under ``quote`` grounds the avatar's style, but the learned
+    facts screen (``/avatar_identity_facts``) and identity retrieval only see
+    the ``identity`` namespace, so without this pass a monologue or an
+    interview taught the avatar nothing it could state as self-knowledge.
+
+    The target turns are windowed by :func:`window_target_speech` and each
+    window runs through the same FactRewriter -> FirstPersonRewriter pipeline
+    as non-target speech. Every emitted Document is stamped with the target's
+    ``speaker`` label, ``spoken_by_target=True`` and the window's timestamps.
+    A window that fails extraction is logged and skipped so one bad window
+    cannot lose the quotes already produced for the transcript.
+    """
+    documents: List[Document] = []
+    for window in window_target_speech(turns):
+        try:
+            window_documents = await _build_biographical_identity_documents(
+                text_content=window["text"],
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_item=media_item,
+                target_name=target_name,
+            )
+        except Exception as exc:  # noqa: BLE001 - add-on pass must not fail the upload
+            logger.warning(
+                "Biographical fact extraction over target speech (speaker=%s) failed: %s",
+                window["speaker"],
+                exc,
+            )
+            continue
+        for document in window_documents:
+            document.metadata["speaker"] = window["speaker"]
+            document.metadata["spoken_by_target"] = True
+            if window.get("start") is not None:
+                document.metadata["start"] = window["start"]
+            if window.get("end") is not None:
+                document.metadata["end"] = window["end"]
+        documents.extend(window_documents)
+    return documents
+
+
 async def process_dialogue_json_to_documents(
     dialogue_payload: Dict[str, Any],
     *,
@@ -878,6 +969,19 @@ async def process_dialogue_json_to_documents(
                 doc.metadata["end"] = seg.get("end")
         documents.extend(statement_docs)
 
+    # The target's own turns are scanned for facts as well, so an interview or
+    # a monologue where the target does most of the talking teaches the avatar
+    # self-knowledge, not only quotes (the docstring's "entire transcript").
+    """ Biographical Documents from the target's own speech """
+    documents.extend(
+        await build_target_speech_identity_documents(
+            segments,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            media_item=media_item,
+            target_name=target_name,
+        )
+    )
     return documents
 
 

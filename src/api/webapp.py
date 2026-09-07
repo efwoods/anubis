@@ -112,8 +112,10 @@ from src.anubis.utils.billing import (
     release_pending_subscription_schedule,
     subscription_has_pending_downgrade_schedule,
     subscription_period_bounds,
+    minimum_tier_from_value,
     tier_allotment_for_meter,
     tier_from_value,
+    tier_meets_minimum,
     token_rate_limit_retry_after_seconds,
 )
 from src.anubis.utils.context import GlobalContext
@@ -219,6 +221,43 @@ def enforce_tier_capability(
     raise HTTPException(
         status_code=403,
         detail=f"Your '{tier.value}' tier does not permit this action.{required_text}",
+    )
+
+
+def resolve_emotion_media_minimum_tier() -> SubscriptionTier:
+    """Return the lowest tier whose owner may generate an avatar's emotion media.
+
+    Emotion media generation is priced by the vendor per image and per second
+    of video, so which tier unlocks the feature is a deployment decision rather
+    than a fixed capability: ``EMOTION_MEDIA_MINIMUM_TIER`` names the tier, and
+    premium — the most capable tier in the catalog — is both the default and
+    what a misconfigured value falls back to.
+    """
+    context = getattr(app.state, "context", None) or GlobalContext()
+    return minimum_tier_from_value(
+        getattr(context, "emotion_media_minimum_tier", None)
+    )
+
+
+def user_may_generate_emotion_media(current_user: dict) -> bool:
+    """Whether this user's tier reaches ``EMOTION_MEDIA_MINIMUM_TIER``."""
+    return tier_meets_minimum(
+        resolve_tier(current_user), resolve_emotion_media_minimum_tier()
+    )
+
+
+def enforce_emotion_media_tier(current_user: dict) -> SubscriptionTier:
+    """Raise HTTP 403 unless the user's tier reaches the emotion-media minimum."""
+    tier = resolve_tier(current_user)
+    minimum_tier = resolve_emotion_media_minimum_tier()
+    if tier_meets_minimum(tier, minimum_tier):
+        return tier
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"Your '{tier.value}' tier does not permit generating emotion media "
+            f"from a reference image. Upgrade to the {minimum_tier.value} tier."
+        ),
     )
 
 
@@ -872,6 +911,62 @@ def _document_label_and_key(metadata: dict) -> tuple[str | None, str | None]:
 # they are probed. A source is one or the other, never both: the reference image
 # is an image upload, the reference audio an audio/video upload.
 REFERENCE_DOCUMENT_CATEGORIES = ("reference_image", "reference_audio")
+
+
+def indexed_namespace_filenames(existing_items: Any) -> set[str]:
+    """The namespace_filename of every document already indexed for an avatar.
+
+    Read from store rows laid out as ((user_id, assistant_id, <category>)),
+    the same layout /list_avatar_documents exposes, taking the key from
+    value.document.kwargs.metadata.namespace_filename. The set is handed to the
+    media graph, which skips any incoming item — or expanded playlist / linktree
+    child — whose key is already present, so re-uploading a large playlist only
+    processes new entries. To refresh an existing item, delete it first via
+    DELETE /delete_avatar_document, then re-upload.
+
+    The reference categories are excluded. A reference clip or portrait
+    DESIGNATES the avatar's voice sample or face; it is not indexed source
+    material, and /list_avatar_documents does not list it. Counting one as
+    already-indexed made the recording a video was used for permanently
+    un-ingestable: uploading a YouTube interview as the reference audio wrote
+    (user_id, assistant_id, "reference_audio") under that URL's
+    namespace_filename, so every later upload of the same URL as identity media
+    was skipped as a duplicate — the audio reached the voice model and the
+    transcript never reached the graph, while the job still reported success.
+    The media graph already exempts an incoming item that designates a reference
+    asset (see determine_media_type); this is that exemption on the other side,
+    for the row such an upload leaves behind.
+    """
+    indexed: set[str] = set()
+    for item in existing_items or []:
+        item_namespace = getattr(item, "namespace", None)
+        if item_namespace is None and isinstance(item, dict):
+            item_namespace = item.get("namespace")
+        category = (
+            item_namespace[2]
+            if isinstance(item_namespace, (list, tuple)) and len(item_namespace) > 2
+            else None
+        )
+        if category in REFERENCE_DOCUMENT_CATEGORIES:
+            continue
+        value = getattr(item, "value", None)
+        if value is None and isinstance(item, dict):
+            value = item.get("value")
+        if not isinstance(value, dict):
+            continue
+        document = value.get("document")
+        if not isinstance(document, dict):
+            continue
+        kwargs_blob = document.get("kwargs")
+        if not isinstance(kwargs_blob, dict):
+            continue
+        metadata = kwargs_blob.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        stored_filename = metadata.get("namespace_filename")
+        if isinstance(stored_filename, str) and stored_filename.strip():
+            indexed.add(stored_filename.strip())
+    return indexed
 
 
 def _document_reference_role(
@@ -1931,6 +2026,8 @@ async def lifespan(app: FastAPI):
         app.state.store = store
         # Registry for background media-processing jobs (see src/api/media_jobs.py).
         app.state.media_jobs = {}
+        # Registry for background deep-research jobs (see src/api/research_jobs.py).
+        app.state.research_jobs = {}
         # The in-chat update_avatar_identity_with_media tool starts media
         # batches through this published starter (see runtime_handles).
         runtime_handles.set_identity_media_job_starter(
@@ -5146,13 +5243,14 @@ async def label_spoken_turn_files(
         return attached, message, None, None
 
     owner_label = (your_name or "").strip()
+    langgraph_client = get_client(headers={"API-KEY": current_user["API_KEY"]})
     if not owner_label:
         try:
-            langgraph_client = get_client(headers={"API-KEY": current_user["API_KEY"]})
             assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
             owner_label = str(assistant.get("name") or "").strip()
         except Exception:  # noqa: BLE001 - the label falls back to "Owner"
             owner_label = ""
+    recent_avatar_replies = await _recent_avatar_reply_texts(langgraph_client, thread_id)
     user_id = current_user["identities"][0]["user_id"]
     repository = get_media_asset_repository()
 
@@ -5160,6 +5258,7 @@ async def label_spoken_turn_files(
     segments: list[dict] = []
     other_speakers: list[str] = []
     owner_spoke = False
+    avatar_spoke = False
     owner_identified = False
     duration_seconds = 0.0
     for upload in audio_uploads:
@@ -5178,6 +5277,7 @@ async def label_spoken_turn_files(
                 assistant_id=assistant_id,
                 thread_id=thread_id,
                 owner_label=owner_label,
+                recent_avatar_replies=recent_avatar_replies,
             )
         except Exception as diarization_error:  # noqa: BLE001
             logger.exception("Speaker labelling failed")
@@ -5209,6 +5309,7 @@ async def label_spoken_turn_files(
             if label not in other_speakers:
                 other_speakers.append(label)
         owner_spoke = owner_spoke or bool(record["owner_spoke"])
+        avatar_spoke = avatar_spoke or bool(record.get("avatar_spoke"))
         owner_identified = owner_identified or bool(record["owner_identified"])
         duration_seconds += float(record["duration_seconds"] or 0.0)
         owner_label = record["owner_label"]
@@ -5218,14 +5319,21 @@ async def label_spoken_turn_files(
     combined = "\n\n".join(part for part in (typed, script) if part)
     speakers_record = {
         "owner_label": owner_label,
+        "avatar_label": f"{owner_label} (avatar)",
         "owner_identified": owner_identified,
         "owner_spoke": owner_spoke,
+        "avatar_spoke": avatar_spoke,
         "others_spoke": bool(other_speakers),
         "other_speakers": other_speakers,
         "segments": segments,
         "duration_seconds": round(duration_seconds, 3),
     }
-    if other_speakers:
+    # Only the person talking, alone, is a direct turn. Anything else heard in
+    # the room (other people, another avatar, this avatar's own playback, or
+    # nothing intelligible) is triaged so the avatar does not answer itself.
+    if not combined:
+        combined = "(nothing intelligible was heard)"
+    if other_speakers or not owner_spoke:
         additional_kwargs = build_ambient_additional_kwargs(
             sources=[SOURCE_MICROPHONE],
             captured_at=datetime.now(UTC).isoformat(),
@@ -5261,6 +5369,40 @@ def refuse_ambient_observation_on_busy_thread(
             ),
             headers={"Retry-After": str(AMBIENT_BUSY_RETRY_AFTER_SECONDS)},
         )
+
+
+async def _recent_avatar_reply_texts(
+    langgraph_client, thread_id: Optional[str], limit: int = 6
+) -> list[str]:
+    """The avatar's last spoken replies in a thread, for echo detection."""
+    if not thread_id:
+        return []
+    try:
+        state = await langgraph_client.threads.get_state(thread_id=thread_id)
+    except Exception:  # noqa: BLE001 - echo detection is best-effort
+        return []
+    values = state.get("values") if isinstance(state, dict) else None
+    messages = (values or {}).get("messages") or []
+    texts: list[str] = []
+    for message in reversed(list(messages)):
+        message_type = (
+            message.get("type") if isinstance(message, dict) else getattr(message, "type", None)
+        )
+        if message_type != "ai":
+            continue
+        content = (
+            message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+        )
+        if isinstance(content, list):
+            content = " ".join(
+                block.get("text", "") for block in content if isinstance(block, dict)
+            )
+        text = str(content or "").strip()
+        if text:
+            texts.append(text)
+        if len(texts) >= limit:
+            break
+    return texts
 
 
 def enforce_ambient_request(
@@ -7087,10 +7229,101 @@ async def get_avatar_emotion_media(
 
     repository = get_media_asset_repository()
     if repository is None:
-        return JSONResponse({"emotions": {}, "complete": False, "missing": []})
-    await _assistant_owner_for_media(assistant_id, current_user)
+        return JSONResponse(
+            {
+                "emotions": {},
+                "complete": False,
+                "missing": [],
+                "last_generation": None,
+                "generation": None,
+            }
+        )
+    owner_user_id = await _assistant_owner_for_media(assistant_id, current_user)
     assets = await repository.list_emotion_assets(assistant_id)
-    return JSONResponse(build_manifest(assets))
+    manifest = build_manifest(assets)
+    manifest["last_generation"] = await _last_emotion_media_generation(
+        repository, assistant_id
+    )
+    manifest["generation"] = _emotion_media_generation_permission(
+        current_user, owner_user_id
+    )
+    return JSONResponse(manifest)
+
+
+def _emotion_media_generation_permission(
+    current_user: dict, owner_user_id: str | None
+) -> dict[str, Any] | None:
+    """Whether this caller may generate the avatar's emotion media, and on what terms.
+
+    The avatar's settings screen shows the generate button behind this answer:
+    the button is offered to the owner alone, is disabled with the required
+    tier named when the owner's tier is below ``EMOTION_MEDIA_MINIMUM_TIER``,
+    and is disabled with no upgrade prompt when the deployment has generation
+    switched off entirely. ``None`` for anyone who is not the owner — a chatter
+    reading the manifest is never shown a control.
+    """
+    from src.anubis.utils.media_generation.emotion_media import emotion_media_enabled
+
+    identities = current_user.get("identities") or []
+    caller_user_id = identities[0].get("user_id") if identities else None
+    if not owner_user_id or caller_user_id != owner_user_id:
+        return None
+    tier = resolve_tier(current_user)
+    minimum_tier = resolve_emotion_media_minimum_tier()
+    configured = emotion_media_enabled(app.state.context)
+    return {
+        "tier": tier.value,
+        "required_tier": minimum_tier.value,
+        "tier_allows": tier_meets_minimum(tier, minimum_tier),
+        "configured": configured,
+        "allowed": configured and tier_meets_minimum(tier, minimum_tier),
+    }
+
+
+async def _last_emotion_media_generation(
+    repository: Any, assistant_id: str
+) -> dict[str, Any] | None:
+    """Why the newest generation run left assets missing, for the settings screen.
+
+    The newest ``emotion_media`` job row (an upload or a regeneration), reduced
+    to its state, the per-asset failures with their ``error_code``, and the
+    summary sentence. ``None`` when no run has been recorded.
+    """
+    from src.anubis.utils.media_generation.emotion_media import summarize_failures
+
+    try:
+        jobs = await repository.list_jobs(
+            assistant_id=assistant_id, job_kind="emotion_media"
+        )
+    except Exception:  # noqa: BLE001 - the manifest must not fail on history
+        logger.debug("Could not read emotion media jobs", exc_info=True)
+        return None
+    if not jobs:
+        return None
+    job = jobs[0]
+    detail = job.get("detail") or {}
+    failures = list(detail.get("failures") or [])
+    summary = detail.get("summary") or summarize_failures(failures)
+    return {
+        "job_id": job.get("job_id"),
+        "state": job.get("state"),
+        "finished_at": job.get("updated_at"),
+        "subject": detail.get("subject"),
+        "withheld": bool(detail.get("withheld", False)),
+        "moderation_risk": detail.get("moderation_risk"),
+        "moderation_reasons": detail.get("moderation_reasons") or [],
+        "error": detail.get("error"),
+        "failures": [
+            {
+                "emotion": f.get("emotion"),
+                "asset_kind": f.get("asset_kind"),
+                "error_code": f.get("error_code"),
+                "message": f.get("message"),
+            }
+            for f in failures
+        ],
+        "summary": summary,
+    }
 
 
 @app.get("/avatar_emotion_media/{asset_id}")
@@ -7125,6 +7358,9 @@ async def _run_emotion_media_job(
     emotions: tuple[str, ...] | None = None,
     asset_kinds: tuple[str, ...] | None = None,
     extra_prompt: str | None = None,
+    subject: str | None = None,
+    assessment: dict[str, Any] | None = None,
+    proceed_despite_moderation_risk: bool = False,
 ) -> None:
     from src.anubis.utils.billing.metering import persist_api_metrics_row
     from src.anubis.utils.media_assets import get_media_asset_repository
@@ -7135,6 +7371,7 @@ async def _run_emotion_media_job(
     )
     from src.anubis.utils.media_generation.emotion_media import (
         generate_emotion_media_for_avatar,
+        summarize_failures,
     )
 
     repository = get_media_asset_repository()
@@ -7171,17 +7408,24 @@ async def _run_emotion_media_job(
             emotions=emotions,
             asset_kinds=asset_kinds,
             extra_prompt=extra_prompt,
+            subject=subject,
+            assessment=assessment,
+            proceed_despite_moderation_risk=proceed_despite_moderation_risk,
             progress=_progress,
             metrics=_record_metric,
         )
+        failures = manifest.get("failures") or []
         await repository.update_job(
             job_id,
-            state=JOB_STATE_COMPLETED
-            if not manifest.get("failures")
-            else JOB_STATE_FAILED,
+            state=JOB_STATE_COMPLETED if not failures else JOB_STATE_FAILED,
             detail={
                 "complete": manifest.get("complete"),
-                "failures": manifest.get("failures"),
+                "failures": failures,
+                "summary": summarize_failures(failures),
+                "subject": manifest.get("subject"),
+                "withheld": manifest.get("withheld", False),
+                "moderation_risk": manifest.get("moderation_risk"),
+                "moderation_reasons": manifest.get("moderation_reasons"),
             },
         )
     except Exception as job_error:  # noqa: BLE001
@@ -7219,6 +7463,11 @@ async def regenerate_avatar_emotion_media(
     emotion = str(body.get("emotion") or "").strip() or None
     asset_kind = str(body.get("asset_kind") or "").strip() or None
     extra_prompt = str(body.get("prompt") or "").strip() or None
+    # The owner's explicit "generate anyway" after a predicted moderation
+    # refusal: attempt the vendor calls at their own cost.
+    proceed_despite_moderation_risk = bool(
+        body.get("proceed_despite_moderation_risk", False)
+    )
     targeted = bool(emotion or asset_kind or extra_prompt)
     only_missing = bool(body.get("only_missing", not targeted))
     if not assistant_id:
@@ -7230,6 +7479,7 @@ async def regenerate_avatar_emotion_media(
             status_code=400, detail="asset_kind must be still or idle_loop."
         )
     enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    enforce_emotion_media_tier(current_user)
     await resolve_assistant_for_creator(
         assistant_id,
         current_user,
@@ -7251,6 +7501,32 @@ async def regenerate_avatar_emotion_media(
             status_code=404,
             detail="Upload a reference image before generating emotion media.",
         )
+    # References stored before they were assessed carry no subject or
+    # moderation risk: assess now and keep the answer with the image.
+    from src.anubis.utils.media_generation.reference_subject import (
+        assessment_from_store_value,
+        assessment_store_fields,
+        classify_reference_subject,
+    )
+
+    assessment = assessment_from_store_value(value)
+    if assessment is None:
+        assessment = await classify_reference_subject(
+            reference_image_data_uri, app.state.context
+        )
+        try:
+            from src.anubis.utils.store_cache import invalidate_store_cache_entry
+
+            reference_namespace = (user_id, assistant_id, "reference_image")
+            await app.state.store.aput(
+                reference_namespace,
+                assistant_id,
+                {**value, **assessment_store_fields(assessment)},
+            )
+            invalidate_store_cache_entry(reference_namespace, assistant_id)
+        except Exception:  # noqa: BLE001 - remembering the assessment is optional
+            logger.debug("Could not store the reference assessment", exc_info=True)
+    subject = assessment["subject"]
     job_id = await repository.create_job(
         user_id=user_id,
         assistant_id=assistant_id,
@@ -7260,6 +7536,10 @@ async def regenerate_avatar_emotion_media(
             "emotion": emotion,
             "asset_kind": asset_kind,
             "prompt": extra_prompt,
+            "subject": subject,
+            "moderation_risk": assessment.get("moderation_risk"),
+            "moderation_reasons": assessment.get("moderation_reasons"),
+            "proceed_despite_moderation_risk": proceed_despite_moderation_risk,
         },
     )
     asyncio.create_task(
@@ -7272,6 +7552,9 @@ async def regenerate_avatar_emotion_media(
             emotions=(emotion,) if emotion else None,
             asset_kinds=(asset_kind,) if asset_kind else None,
             extra_prompt=extra_prompt,
+            subject=subject,
+            assessment=assessment,
+            proceed_despite_moderation_risk=proceed_despite_moderation_risk,
         )
     )
     return JSONResponse(
@@ -7396,6 +7679,58 @@ def _voice_repository_or_503() -> Any:
     return repository
 
 
+# Metadata keys the avatar carries once ElevenLabs has banned its cloned voice.
+# Written on the assistant rather than only on the voice row so every reader of
+# the avatar knows, without a second request: the chat screen hides the speak
+# button and live voice mode answers in text, exactly as they do for an avatar
+# that has no voice audio model at all.
+VOICE_MODEL_BLOCKED_METADATA_KEY = "voice_model_blocked"
+VOICE_MODEL_BLOCKED_REASON_METADATA_KEY = "voice_model_blocked_reason"
+
+
+async def note_blocked_voice_on_avatar(
+    assistant_id: str, current_user: dict, reason: str | None = None
+) -> None:
+    """Record on the avatar itself that its cloned voice has been banned.
+
+    Called wherever the ban is confirmed — the settings status read and the
+    speak route. Idempotent: an avatar already carrying the note is left alone,
+    so the common path costs one metadata read and no write. Never raises: the
+    note makes the refusal legible, and failing to write it must not turn a
+    handled refusal into a failed request.
+    """
+    from src.anubis.utils.voice.corpus import BLOCKED_VOICE_MESSAGE
+
+    try:
+        token = current_user["API_KEY"]
+        client = get_client(headers={"API-KEY": f"{token}"})
+        assistant = await client.assistants.get(assistant_id)
+        metadata = assistant.get("metadata") or {}
+        if metadata.get(VOICE_MODEL_BLOCKED_METADATA_KEY) is True:
+            return
+        # LangGraph merges metadata by key, so this adds the note and leaves
+        # user_id, the personal-avatar flag and the sharing state alone.
+        await client.assistants.update(
+            assistant_id=assistant_id,
+            metadata={
+                VOICE_MODEL_BLOCKED_METADATA_KEY: True,
+                VOICE_MODEL_BLOCKED_REASON_METADATA_KEY: (
+                    reason or BLOCKED_VOICE_MESSAGE
+                ),
+            },
+        )
+        logger.warning(
+            "Noted on avatar %s that its cloned voice is blocked by ElevenLabs",
+            assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - the note is advisory, never fatal
+        logger.warning(
+            "Could not note the blocked voice on avatar %s",
+            assistant_id,
+            exc_info=True,
+        )
+
+
 async def _owned_assistant_for_voice(
     assistant_id: str, current_user: dict, action: str
 ) -> tuple[dict, bool]:
@@ -7427,6 +7762,10 @@ async def get_avatar_voice(
         is_personal_avatar=is_personal,
         store=app.state.store,
     )
+    if status.instant_voice_blocked:
+        await note_blocked_voice_on_avatar(
+            assistant_id, current_user, status.instant_voice_blocked_reason
+        )
     return JSONResponse(status.as_dict())
 
 
@@ -7785,6 +8124,7 @@ async def transcribe_recording(
             filename=audio.filename or "utterance.webm",
             reference_audio=False,
             max_duration_seconds=None,
+            live_voice=True,
         )
     except Exception as transcription_error:  # noqa: BLE001
         raise HTTPException(
@@ -7818,11 +8158,20 @@ async def speak_text(
     Body: ``assistant_id``, ``text``. Uses the professional clone once it is
     fine-tuned, otherwise the instant clone; with neither, answers 409
     ``voice_not_ready`` and the collected seconds so the client can prompt the
-    owner to record. Characters spoken are recorded in ``api_metrics`` and, when
+    owner to record. A clone ElevenLabs has banned answers 409 ``voice_blocked``
+    — a distinct condition from having no clone, and one no amount of further
+    recording fixes. Characters spoken are recorded in ``api_metrics`` and, when
     the meter exists, reported to Stripe.
     """
     from src.anubis.utils.voice import elevenlabs_client
-    from src.anubis.utils.voice.corpus import resolve_active_voice_id, voice_status_for
+    from src.anubis.utils.voice.corpus import (
+        BLOCKED_VOICE_MESSAGE,
+        mark_voice_blocked,
+        resolve_active_voice_id,
+        voice_record_blocked,
+        voice_record_blocked_reason,
+        voice_status_for,
+    )
 
     repository = _voice_repository_or_503()
     body = await request.json()
@@ -7837,12 +8186,31 @@ async def speak_text(
         text = text[:5000]
     enforce_tier_capability(current_user, TierCapability.AUDIO_RESPONSES)
 
+    user_id = current_user["identities"][0]["user_id"]
+
+    def _blocked_voice_response(reason: str | None) -> JSONResponse:
+        """Build the one answer every blocked-voice path returns."""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "voice_blocked",
+                "detail": reason or BLOCKED_VOICE_MESSAGE,
+            },
+        )
+
     kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
+    # A voice already known to be banned is refused without calling the vendor:
+    # the answer cannot change, and the call would be billed for a 403.
+    stored_voice = await repository.get_voice(assistant_id) or {}
+    if voice_id is not None and voice_record_blocked(stored_voice):
+        reason = voice_record_blocked_reason(stored_voice)
+        await note_blocked_voice_on_avatar(assistant_id, current_user, reason)
+        return _blocked_voice_response(reason)
     if voice_id is None:
         status = await voice_status_for(
             repository,
             app.state.context,
-            user_id=current_user["identities"][0]["user_id"],
+            user_id=user_id,
             assistant_id=assistant_id,
             is_personal_avatar=False,
         )
@@ -7868,6 +8236,17 @@ async def speak_text(
         audio_bytes = await elevenlabs_client.synthesize_speech(
             app.state.context, voice_id=voice_id, text=text, model_id=model_id
         )
+    except elevenlabs_client.ElevenLabsVoiceBlockedError as blocked_error:
+        # The ban was applied between the last safety check and this request.
+        # Record it so the settings Voice panel stops advertising the voice and
+        # later speak attempts are refused without a vendor round trip.
+        await mark_voice_blocked(
+            repository, user_id, assistant_id, reason=str(blocked_error)
+        )
+        await note_blocked_voice_on_avatar(
+            assistant_id, current_user, str(blocked_error)
+        )
+        return _blocked_voice_response(str(blocked_error))
     except elevenlabs_client.ElevenLabsError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
 
@@ -9367,6 +9746,17 @@ async def _start_media_batch(
     so both paths bill and run media identically. Raises ``HTTPException`` when
     the allotment or rate limit refuses the batch.
     """
+    # A reference image in this batch generates the avatar's emotion stills and
+    # idle loops, which is gated by EMOTION_MEDIA_MINIMUM_TIER. The media graph
+    # runs outside the request, so the submitter's tier travels with the run
+    # and the graph reads the tier back before spending anything at the vendor.
+    config.setdefault("configurable", {})["subscription_tier"] = resolve_tier(
+        current_user
+    ).value
+    config["configurable"]["emotion_media_minimum_tier"] = (
+        resolve_emotion_media_minimum_tier().value
+    )
+
     # ------------------------------------------------------------------
     # Pre-request token estimation (fail-closed), then enforcement, then
     # metering — all BEFORE any model call happens. Every entry gets a
@@ -9470,15 +9860,8 @@ async def _start_media_batch(
 
     store = app.state.store
 
-    # Collect every namespace_filename already indexed for this avatar. The
-    # store layout ((user_id, assistant_id, <category>)) mirrors what
-    # /list_avatar_documents exposes; keys are read from
-    # value.document.kwargs.metadata.namespace_filename. This set is handed to
-    # the media graph, which skips any incoming item — or expanded playlist /
-    # linktree child — whose key is already present, so re-uploading a large
-    # playlist only processes new entries (the user's "skip what's already
-    # uploaded" requirement). To refresh an existing item, delete it first via
-    # DELETE /delete_avatar_document, then re-upload.
+    # Read what this avatar already holds so the media graph can skip items it
+    # has seen before — see indexed_namespace_filenames for which rows count.
     try:
         existing_items = await store.asearch((user_id, assistant_id), limit=1_000_000)
     except Exception as exc:
@@ -9490,25 +9873,7 @@ async def _start_media_batch(
             ),
         ) from exc
 
-    existing_namespaces: set[str] = set()
-    for item in existing_items or []:
-        value = getattr(item, "value", None)
-        if value is None and isinstance(item, dict):
-            value = item.get("value")
-        if not isinstance(value, dict):
-            continue
-        document = value.get("document")
-        if not isinstance(document, dict):
-            continue
-        kwargs_blob = document.get("kwargs")
-        if not isinstance(kwargs_blob, dict):
-            continue
-        metadata = kwargs_blob.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        stored_filename = metadata.get("namespace_filename")
-        if isinstance(stored_filename, str) and stored_filename.strip():
-            existing_namespaces.add(stored_filename.strip())
+    existing_namespaces = indexed_namespace_filenames(existing_items)
 
     incoming_filenames = [
         name
@@ -10691,6 +11056,314 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
 
 
 # ---------------------------------------------------------------------------
+# Deep research with web-based fact verification (creator-only)
+# ---------------------------------------------------------------------------
+
+
+def _start_deep_research_job(
+    app_state,
+    current_user: dict,
+    *,
+    assistant_id: str,
+    creator_id: str,
+    subject_name: str,
+    subject_description: str | None,
+    research_hint: str | None,
+):
+    """Register and launch one research job; the pipeline runs as a background task."""
+    from src.anubis.utils.research.deep_research import run_deep_research
+    from src.api.research_jobs import add_event as add_research_event
+    from src.api.research_jobs import create_research_job
+    from src.api.research_jobs import finish_job as finish_research_job
+
+    context = app_state.context
+    if str(getattr(context, "deep_research_enabled", "true") or "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        raise HTTPException(
+            status_code=503, detail="Deep research is disabled (DEEP_RESEARCH_ENABLED)."
+        )
+    registry = app_state.research_jobs
+    job = create_research_job(
+        registry,
+        user_id=creator_id,
+        assistant_id=assistant_id,
+        subject_name=subject_name,
+    )
+
+    async def _run() -> None:
+        job.started_at = time.time()
+        job.status = "running"
+        try:
+            summary = await run_deep_research(
+                app_state.store,
+                context,
+                creator_id=creator_id,
+                assistant_id=assistant_id,
+                subject_name=subject_name,
+                subject_description=subject_description,
+                research_hint=research_hint,
+                emit=lambda payload: add_research_event(job, payload),
+                is_cancelled=lambda: job.cancelled,
+            )
+            if summary.get("cancelled"):
+                finish_research_job(
+                    job, cancelled=True, result={"message": "Research cancelled."}
+                )
+                return
+            # Facts written into the avatar's identity change what
+            # load_consciousness reads on the next turn.
+            if summary.get("applied"):
+                invalidate_store_cache_for_assistant(assistant_id)
+            # The source pages read are billed like uploaded documents.
+            tokens_read = int(summary.get("tokens_read") or 0)
+            if tokens_read > 0:
+                metering_bypass = resolve_metering_bypass(
+                    current_user, assistant_id=assistant_id
+                )
+                if not metering_bypass.skips_metering_writes:
+                    stripe_customer_id = resolve_stripe_customer_id(current_user)
+                    await report_meter_event(
+                        app_state.stripe,
+                        UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                        stripe_customer_id,
+                        tokens_read,
+                        idempotency_identifier=f"deep-research:{job.job_id}",
+                    )
+                    await persist_api_metrics_row(
+                        getattr(app_state, "pool", None),
+                        inference_type="deep_research",
+                        prompt_tokens=tokens_read,
+                        completion_tokens=0,
+                        total_tokens=tokens_read,
+                        cost_usd=0.0,
+                        latency_ms=(time.time() - (job.started_at or job.created_at))
+                        * 1000.0,
+                        user_id=resolve_metering_user_id(current_user),
+                        stripe_customer_id=stripe_customer_id,
+                        assistant_id=assistant_id,
+                        thread_id=None,
+                        model_name=None,
+                        meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
+                    )
+            finish_research_job(job, result=summary)
+        except asyncio.CancelledError:
+            finish_research_job(
+                job, cancelled=True, result={"message": "Research cancelled."}
+            )
+            raise
+        except Exception as research_error:  # noqa: BLE001 - surfaced through the job
+            logger.exception(
+                "Deep research job %s failed: %s", job.job_id, research_error
+            )
+            finish_research_job(job, error=str(research_error))
+
+    job.task = asyncio.create_task(_run())
+    return job
+
+
+def _get_owned_research_job(request: Request, job_id: str, user_id: str):
+    from src.api.research_jobs import get_research_job
+
+    job = get_research_job(request.app.state.research_jobs, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired research job.")
+    if job.user_id != user_id:
+        raise HTTPException(
+            status_code=403, detail="This research job belongs to another user."
+        )
+    return job
+
+
+@app.post("/avatar/{assistant_id}/deep_research", status_code=202)
+async def start_avatar_deep_research(
+    request: Request,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Research the avatar's subject on the web and verify the facts against sources.
+
+    Pro and premium (the upload capability). Body: optional ``research_hint``,
+    words that narrow the subject ("the sculptor, not the footballer").
+
+    The research reads what the avatar already holds, searches the web topic by
+    topic, and verifies every claim across sources. Facts the sources do not
+    contradict are added to the avatar's identity as soon as the job finishes;
+    the contradictions wait for the creator at
+    ``GET /avatar/{assistant_id}/research/proposals``. Returns ``202`` with the
+    job id; follow ``GET /research_job/{job_id}/progress``.
+    """
+    enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id, current_user, action_description="research that avatar"
+    )
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - an empty body is a valid request
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    research_hint = str(body.get("research_hint") or "").strip() or None
+    job = _start_deep_research_job(
+        request.app.state,
+        current_user,
+        assistant_id=assistant_id,
+        creator_id=creator_id,
+        subject_name=assistant.get("name") or assistant_id,
+        subject_description=assistant.get("description"),
+        research_hint=research_hint,
+    )
+    return JSONResponse(
+        {
+            "job_id": job.job_id,
+            "status": job.status,
+            "status_url": f"/research_job/{job.job_id}",
+            "progress_url": f"/research_job/{job.job_id}/progress",
+            "proposals_url": f"/avatar/{assistant_id}/research/proposals",
+        },
+        status_code=202,
+    )
+
+
+@app.get("/research_job/{job_id}")
+async def research_job_status(
+    request: Request, job_id: str, current_user: dict = Depends(get_current_user)
+):
+    """One research job's status, result, and latest stage."""
+    job = _get_owned_research_job(
+        request, job_id, current_user["identities"][0]["user_id"]
+    )
+    return JSONResponse(job.snapshot())
+
+
+@app.get("/research_job/{job_id}/progress")
+async def research_job_progress(
+    request: Request, job_id: str, current_user: dict = Depends(get_current_user)
+):
+    """Server-sent progress of one research job: every stage so far, then live, then ``research_done``."""
+    job = _get_owned_research_job(
+        request, job_id, current_user["identities"][0]["user_id"]
+    )
+
+    async def _progress():
+        next_index = 0
+        while True:
+            job.updated.clear()
+            while next_index < len(job.events):
+                yield f"data: {json.dumps(job.events[next_index], default=str)}\n\n"
+                next_index += 1
+            if job.done.is_set() and next_index >= len(job.events):
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {"type": "research_done", **job.snapshot()}, default=str
+                    )
+                    + "\n\n"
+                )
+                return
+            await job.updated.wait()
+
+    return StreamingResponse(
+        _progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/research_job/{job_id}/cancel")
+async def cancel_research_job(
+    request: Request, job_id: str, current_user: dict = Depends(get_current_user)
+):
+    """Ask a running research job to stop at the next stage boundary."""
+    from src.api.research_jobs import request_cancel as request_research_cancel
+
+    job = _get_owned_research_job(
+        request, job_id, current_user["identities"][0]["user_id"]
+    )
+    if job.done.is_set():
+        return JSONResponse(
+            {"job_id": job_id, "status": job.status, "message": "Job already finished."}
+        )
+    request_research_cancel(job)
+    return JSONResponse(
+        {"job_id": job_id, "status": job.status, "message": "Cancellation requested."}
+    )
+
+
+@app.get("/avatar/{assistant_id}/research/proposals")
+async def list_avatar_research_proposals(
+    request: Request, assistant_id: str, current_user: dict = Depends(get_current_user)
+):
+    """List the researched facts the sources disagree on, for the creator's decision."""
+    from src.anubis.utils.research.deep_research import list_proposals
+
+    _assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id, current_user, action_description="review that avatar's research"
+    )
+    proposals = await list_proposals(request.app.state.store, creator_id, assistant_id)
+    return JSONResponse({"assistant_id": assistant_id, "proposals": proposals})
+
+
+class ResearchResolutionItem(BaseModel):
+    """One decision the creator made about one researched fact."""
+
+    fact_id: str
+    action: Literal["accept", "edit", "ignore"]
+    corrected_text: str | None = None
+
+
+class ResearchResolutionRequest(BaseModel):
+    """Every decision the creator made in one pass of the review."""
+
+    items: List[ResearchResolutionItem]
+
+
+@app.post("/avatar/{assistant_id}/research/resolve")
+async def resolve_avatar_research_proposals(
+    request: Request,
+    assistant_id: str,
+    resolution: ResearchResolutionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Apply the creator's decisions on the contradicted facts.
+
+    Accepted and edited facts become identity documents the avatar reads on the
+    next turn and the settings screen lists under what the avatar has learned;
+    ignored facts are dropped.
+    """
+    from src.anubis.utils.research.deep_research import (
+        ProposalResolution,
+        resolve_proposals,
+    )
+
+    _assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id, current_user, action_description="resolve that avatar's research"
+    )
+    result = await resolve_proposals(
+        request.app.state.store,
+        creator_id,
+        assistant_id,
+        [
+            ProposalResolution(
+                fact_id=item.fact_id,
+                action=item.action,
+                corrected_text=item.corrected_text,
+            )
+            for item in resolution.items
+        ],
+    )
+    if result["accepted"] or result["edited"]:
+        invalidate_store_cache_for_assistant(assistant_id)
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
 # What an avatar has learned about its own identity (owner-only)
 # ---------------------------------------------------------------------------
 
@@ -10711,6 +11384,11 @@ IDENTITY_FACT_GROUPS: dict[str, str] = {
     "analysis": "analysis",
     "memory": "memory",
 }
+
+# A fifth group has no namespace of its own: deep research writes into the
+# ``identity`` namespace (so the avatar reads researched facts exactly like
+# uploaded ones) and marks each document with ``RESEARCH_FACT_SOURCE``, which
+# ``_identity_fact_row`` reports as the ``research`` group.
 
 _FACT_CONTEXT_TAG_PATTERN = re.compile(r"<FACT_CONTEXT>(.*?)</FACT_CONTEXT>", re.DOTALL)
 
@@ -10745,6 +11423,9 @@ def _identity_fact_row(item, *, learned_from: str) -> dict | None:
     chunk or reference row that shares the ``identity`` prefix with the atomic
     biographical facts, or an analysis/memory row with empty content.
     """
+    from urllib.parse import urlparse
+
+    from src.anubis.utils.research.deep_research import RESEARCH_FACT_SOURCE
     from src.anubis.utils.tools.identity.identity_tools import (
         _extract_clean_fact,
         _item_document_id,
@@ -10793,6 +11474,22 @@ def _identity_fact_row(item, *, learned_from: str) -> dict | None:
     if learned_from in ("media", "analysis"):
         source_label, _key = _document_label_and_key(metadata)
 
+    # A researched fact lives under the same ``identity`` prefix as the facts
+    # extracted from uploads — the avatar must read every fact the same way —
+    # but the owner needs to tell a fact the web supplied from a fact an upload
+    # supplied, so the metadata mark deep research writes renames the group and
+    # the first source page names the row.
+    if metadata.get("source") == RESEARCH_FACT_SOURCE:
+        learned_from = "research"
+        source_urls = metadata.get("source_urls") or []
+        if source_urls:
+            try:
+                source_label = urlparse(str(source_urls[0])).netloc or str(
+                    source_urls[0]
+                )
+            except Exception:  # noqa: BLE001 - the label is a convenience
+                source_label = str(source_urls[0])
+
     namespace = _store_item_namespace(item)
     key = _store_item_key(item)
     created_at = metadata.get("created_at") or _store_item_updated_at(item)
@@ -10807,6 +11504,8 @@ def _identity_fact_row(item, *, learned_from: str) -> dict | None:
         "key": key,
         "created_at": created_at,
         "corrected_from": metadata.get("corrected_from"),
+        "source_urls": list(metadata.get("source_urls") or []),
+        "verification_status": metadata.get("verification_status"),
     }
 
 
@@ -10820,10 +11519,12 @@ async def list_avatar_identity_facts(
 ):
     """Everything the avatar has learned about its own identity, newest first.
 
-    Four groups, reported as ``learned_from``: ``conversation`` (facts the owner
+    Five groups, reported as ``learned_from``: ``conversation`` (facts the owner
     told the avatar in chat), ``media`` (first-person biographical facts extracted
-    from uploads), ``analysis`` (derived traits such as beliefs and values), and
-    ``memory`` (episodic memories from the owner's own conversations).
+    from uploads), ``research`` (facts deep research verified on the web, which
+    live in the same namespace as the media facts and are told apart by their
+    ``source`` mark), ``analysis`` (derived traits such as beliefs and values),
+    and ``memory`` (episodic memories from the owner's own conversations).
 
     Only the creator of the avatar may read this — the same creator check
     ``/list_avatar_documents`` applies — so a visitor chatting with a public
@@ -10837,6 +11538,9 @@ async def list_avatar_identity_facts(
     store = app.state.store
     facts: list[dict] = []
     counts = {learned_from: 0 for learned_from in IDENTITY_FACT_GROUPS.values()}
+    # Researched facts share the media namespace and are counted under their own
+    # name, so the settings screen can filter them apart.
+    counts.setdefault("research", 0)
     for namespace_group, learned_from in IDENTITY_FACT_GROUPS.items():
         namespace = (creator_id, assistant_id, namespace_group)
         try:
@@ -10851,7 +11555,9 @@ async def list_avatar_identity_facts(
             if row is None:
                 continue
             facts.append(row)
-            counts[learned_from] += 1
+            # The row names its own group: a researched fact is read out of the
+            # media namespace but reported as research.
+            counts[row["learned_from"]] = counts.get(row["learned_from"], 0) + 1
     facts.sort(key=_identity_fact_sort_key, reverse=True)
     return {"facts": facts, "counts": counts}
 

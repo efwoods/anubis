@@ -30,8 +30,10 @@ tell whether the owner spoke at all.
 from __future__ import annotations
 
 import base64
+import difflib
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -45,6 +47,11 @@ logger = logging.getLogger(__name__)
 SPOKEN_TURN_KIND = "spoken_turn"
 DEFAULT_OWNER_LABEL = "Owner"
 OTHER_SPEAKER_LABEL_PREFIX = "Speaker"
+AVATAR_LABEL_SUFFIX = "(avatar)"
+# An owner-attributed line this similar to a recent reply is the avatar's own
+# cloned voice coming out of a speaker, not the person talking.
+AVATAR_ECHO_MIN_CHARACTERS = 20
+AVATAR_ECHO_MIN_RATIO = 0.75
 # The diarizer accepts references between two and ten seconds long.
 REFERENCE_CLIP_MIN_SECONDS = 2.0
 REFERENCE_CLIP_MAX_SECONDS = 10.0
@@ -65,6 +72,7 @@ class LabelledSegment:
     end: float
     is_owner: bool = False
     is_new_speaker: bool = False
+    is_avatar: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         """Serialise for ``additional_kwargs`` and the stream frame."""
@@ -74,6 +82,7 @@ class LabelledSegment:
             "start": round(float(self.start), 3),
             "end": round(float(self.end), 3),
             "is_owner": bool(self.is_owner),
+            "is_avatar": bool(self.is_avatar),
         }
 
 
@@ -100,8 +109,15 @@ class SpokenTurn:
 
     @property
     def others_spoke(self) -> bool:
-        """Whether anyone other than the owner spoke."""
-        return any(not segment.is_owner for segment in self.segments)
+        """Whether anyone other than the owner and the avatar's own echo spoke."""
+        return any(
+            not segment.is_owner and not segment.is_avatar for segment in self.segments
+        )
+
+    @property
+    def avatar_spoke(self) -> bool:
+        """Whether the avatar's own voice was heard coming out of a speaker."""
+        return any(segment.is_avatar for segment in self.segments)
 
     def additional_kwargs(self) -> dict[str, Any]:
         """The ``speakers`` record stored on the human message."""
@@ -109,8 +125,10 @@ class SpokenTurn:
             "kind": SPOKEN_TURN_KIND,
             "speakers": {
                 "owner_label": self.owner_label,
+                "avatar_label": avatar_label_for(self.owner_label),
                 "owner_identified": self.owner_identified,
                 "owner_spoke": self.owner_spoke,
+                "avatar_spoke": self.avatar_spoke,
                 "others_spoke": self.others_spoke,
                 "other_speakers": list(self.other_speakers),
                 "segments": [segment.as_dict() for segment in self.segments],
@@ -188,6 +206,70 @@ def label_segments(
             )
         )
     return labelled, new_label_by_raw_name
+
+
+def avatar_label_for(owner_label: str) -> str:
+    """The label of the avatar's own voice heard in the room."""
+    return f"{owner_label} {AVATAR_LABEL_SUFFIX}"
+
+
+def _normalise_words(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", str(text or "").lower()).strip()
+
+
+def _normalised_words_collapsed(text: str) -> str:
+    return " ".join(_normalise_words(text).split())
+
+
+def is_avatar_echo(text: str, recent_avatar_replies: list[str]) -> bool:
+    """Whether a heard line repeats something the avatar recently said aloud.
+
+    The avatar's cloned voice is the person's voice, so the diarizer attributes
+    the avatar's own playback (from another device, or a speaker the echo
+    canceller did not catch) to the person. The words give the echo away: a
+    line that is a long enough fragment of a recent reply, or close to one, is
+    the avatar and not the person.
+    """
+    heard = _normalised_words_collapsed(text)
+    if len(heard) < AVATAR_ECHO_MIN_CHARACTERS:
+        return False
+    for reply in recent_avatar_replies or []:
+        said = _normalised_words_collapsed(reply)
+        if not said:
+            continue
+        if heard in said:
+            return True
+        ratio = difflib.SequenceMatcher(None, heard, said).ratio()
+        if ratio >= AVATAR_ECHO_MIN_RATIO:
+            return True
+    return False
+
+
+def mark_avatar_echo(
+    segments: list[LabelledSegment],
+    *,
+    owner_label: str,
+    recent_avatar_replies: list[str],
+) -> list[LabelledSegment]:
+    """Relabel owner-attributed lines that repeat the avatar's recent replies."""
+    if not recent_avatar_replies:
+        return segments
+    relabelled: list[LabelledSegment] = []
+    for segment in segments:
+        if segment.is_owner and is_avatar_echo(segment.text, recent_avatar_replies):
+            relabelled.append(
+                LabelledSegment(
+                    avatar_label_for(owner_label),
+                    segment.text,
+                    segment.start,
+                    segment.end,
+                    is_owner=False,
+                    is_avatar=True,
+                )
+            )
+        else:
+            relabelled.append(segment)
+    return relabelled
 
 
 def render_speaker_script(segments: list[LabelledSegment]) -> str:
@@ -324,20 +406,32 @@ def _diarize_mp3_with_known_speakers(
     known_speaker_names: list[str],
     known_speaker_references: list[str],
 ) -> Any:
-    """One synchronous diarizer call with up to four known speakers."""
+    """One synchronous diarizer call with up to four known speakers.
+
+    The configured live-voice language hint rides along so the diarizer does
+    not invent a caption in another language for a noisy clip. The diarizer
+    accepts no prompt, so none is sent.
+    """
     from src.anubis.utils.utility import (
         _openai_client_for_speech,
         _speech_call_with_retry,
+        live_voice_transcription_language,
     )
 
     client = _openai_client_for_speech(context)
     model = context.audio_diarization_model or "gpt-4o-transcribe-diarize"
+    optional_arguments: dict[str, Any] = {}
+    language = live_voice_transcription_language(context)
+    if language:
+        optional_arguments["language"] = language
     extra_body: dict[str, Any] = {}
     if known_speaker_names:
         extra_body = {
             "known_speaker_names": list(known_speaker_names),
             "known_speaker_references": list(known_speaker_references),
         }
+    if extra_body:
+        optional_arguments["extra_body"] = extra_body
     with open(mp3_path, "rb") as audio_file:
         return _speech_call_with_retry(
             lambda: client.audio.transcriptions.create(
@@ -345,7 +439,7 @@ def _diarize_mp3_with_known_speakers(
                 file=(upload_name, audio_file),
                 response_format="diarized_json",
                 chunking_strategy="auto",
-                **({"extra_body": extra_body} if extra_body else {}),
+                **optional_arguments,
             ),
             context,
             description=f"diarization({upload_name})",
@@ -364,10 +458,14 @@ async def diarize_spoken_turn(
     thread_id: str | None,
     owner_label: str,
     diarizer: Any = None,
+    recent_avatar_replies: list[str] | None = None,
 ) -> SpokenTurn:
     """Transcribe one utterance and label every line by speaker.
 
-    ``diarizer`` overrides the OpenAI call (tests pass a fake); the default runs
+    ``recent_avatar_replies`` (the avatar's last spoken replies) lets the
+    avatar's own voice, heard through a speaker and attributed to the person by
+    the diarizer, be relabelled as the avatar. ``diarizer`` overrides the OpenAI
+    call (tests pass a fake); the default runs
     ``_diarize_mp3_with_known_speakers`` in a worker thread.
     """
     import asyncio
@@ -376,6 +474,10 @@ async def diarize_spoken_turn(
         _diarize_token_cost,
         _diarize_usage_tokens_dict,
         preprocess_audio,
+    )
+    from src.anubis.utils.voice.transcript_hygiene import (
+        clip_is_silent,
+        is_known_hallucination,
     )
 
     started = time.perf_counter()
@@ -428,6 +530,27 @@ async def diarize_spoken_turn(
             mp3_file.write(mp3_bytes)
             mp3_path = mp3_file.name
         upload_name = "utterance.mp3"
+        # A clip with no speech in it (a cough, a click, trailing room tone) is
+        # never sent: the diarizer would invent a caption for the silence.
+        if await asyncio.to_thread(
+            clip_is_silent,
+            mp3_path,
+            _ffmpeg_executable(),
+            silence_max_volume_db=getattr(context, "voice_silence_max_volume_db", None),
+        ):
+            return SpokenTurn(
+                script="",
+                segments=[],
+                owner_label=owner_label,
+                owner_identified=bool(owner_reference),
+                other_speakers=[],
+                duration_seconds=duration_seconds,
+                remembered_new_speakers=[],
+                usage={},
+                total_cost=0.0,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                model=str(context.audio_diarization_model or "gpt-4o-transcribe-diarize"),
+            )
         if diarizer is not None:
             response = await diarizer(
                 mp3_path,
@@ -443,12 +566,21 @@ async def diarize_spoken_turn(
                 known_speaker_names=known_names,
                 known_speaker_references=known_references,
             )
-        raw_segments = list(_attribute(response, "segments") or [])
+        raw_segments = [
+            segment
+            for segment in (_attribute(response, "segments") or [])
+            if not is_known_hallucination(str(_attribute(segment, "text") or ""))
+        ]
         segments, new_label_by_raw_name = label_segments(
             raw_segments,
             owner_label=owner_label,
             owner_reference_given=bool(owner_reference),
             remembered_labels=remembered_labels,
+        )
+        segments = mark_avatar_echo(
+            segments,
+            owner_label=owner_label,
+            recent_avatar_replies=list(recent_avatar_replies or []),
         )
         remembered_new = await _remember_new_speakers(
             repository,
@@ -476,7 +608,11 @@ async def diarize_spoken_turn(
             context.audio_diarization_estimated_price_per_minute or 0.0
         )
     other_speakers = sorted(
-        {segment.speaker for segment in segments if not segment.is_owner},
+        {
+            segment.speaker
+            for segment in segments
+            if not segment.is_owner and not segment.is_avatar
+        },
         key=lambda label: (len(label), label),
     )
     return SpokenTurn(

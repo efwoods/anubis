@@ -33,9 +33,6 @@ services:
     langgraph-api-prod:
         image: evdev3/anubis-langgraph-api:latest
         pull_policy: never
-        dns:
-            - 168.83.129.16
-            - 8.8.8.8
         ports:
             - "8124:8000"
         extra_hosts:

@@ -11,6 +11,13 @@ One reference image in; six stills and seven idle loops out, persisted to
    one generation never loses the rest, and the missing ones can be retried by
    ``regenerate_missing_emotion_media``.
 
+The prompt family is chosen by the reference **subject** (a person, a stylized
+character, or a non-human image with no face — see ``prompts.py``); the caller
+classifies the reference once with ``reference_subject.classify_reference_subject``
+and passes the answer in. Each failure carries an ``error_code`` and a
+``message`` (``describe_failure``) so a moderation refusal — which retrying
+only repeats, at the same charge — is told apart from a transient error.
+
 Spend is recorded per call in ``api_metrics`` (``image_generation`` /
 ``video_generation``) with the configured unit costs. Progress is reported
 through the ``progress`` callback so the media-processing graph can forward the
@@ -33,7 +40,12 @@ from src.anubis.utils.media_generation.prompts import (
     GENERATED_EMOTIONS,
     NEUTRAL_EMOTION,
     idle_loop_prompt_for,
+    normalize_reference_subject,
     still_prompt_for,
+)
+from src.anubis.utils.media_generation.reference_subject import (
+    moderation_blocks_generation,
+    moderation_warning,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +68,126 @@ def emotion_media_enabled(context: Any) -> bool:
 
 def _noop_progress(stage: str, fields: dict[str, Any]) -> None:
     return None
+
+
+def describe_failure(
+    emotion: str, asset_kind: str, error: Exception | str
+) -> dict[str, str]:
+    """One failure entry: what did not generate, the vendor's words, and why.
+
+    ``error_code`` is one of the ``xai_client.ERROR_CODE_*`` values so a client
+    can tell a moderation refusal (retrying repeats the charge) from a
+    transient vendor error (retrying is reasonable); ``message`` is the
+    sentence to show a person.
+    """
+    error_text = str(error)
+    error_code, message = xai_client.failure_reason(error_text, asset_kind)
+    return {
+        "emotion": emotion,
+        "asset_kind": asset_kind,
+        "error": error_text,
+        "error_code": error_code,
+        "message": message,
+    }
+
+
+def describe_predicted_failure(
+    emotion: str, asset_kind: str, warning: str
+) -> dict[str, str]:
+    """Describe an asset withheld because the vendor's refusal was predicted."""
+    return {
+        "emotion": emotion,
+        "asset_kind": asset_kind,
+        "error": "Withheld: the reference image would be refused by content moderation.",
+        "error_code": xai_client.ERROR_CODE_MODERATION_PREDICTED,
+        "message": warning,
+    }
+
+
+def summarize_failures(failures: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapse per-asset failures into the counts and sentence a toast shows.
+
+    Returns ``{"failed_stills", "failed_loops", "moderated", "predicted",
+    "message"}``. ``predicted`` counts assets withheld before any call was
+    made (nothing charged); ``moderated`` counts assets the vendor rendered
+    and then refused (charged). ``message`` is empty when nothing failed.
+    """
+    failed_stills = sum(1 for f in failures if f.get("asset_kind") == ASSET_KIND_STILL)
+    failed_loops = sum(
+        1 for f in failures if f.get("asset_kind") == ASSET_KIND_IDLE_LOOP
+    )
+    moderated = sum(
+        1
+        for f in failures
+        if f.get("error_code") == xai_client.ERROR_CODE_CONTENT_MODERATED
+    )
+    predicted = sum(
+        1
+        for f in failures
+        if f.get("error_code") == xai_client.ERROR_CODE_MODERATION_PREDICTED
+    )
+    if not failures:
+        return {
+            "failed_stills": 0,
+            "failed_loops": 0,
+            "moderated": 0,
+            "predicted": 0,
+            "message": "",
+        }
+    stopped = next(
+        (f for f in failures if f.get("error_code") in xai_client.STOP_RUN_ERROR_CODES),
+        None,
+    )
+    if stopped is not None:
+        # The first stop-condition failure explains the whole run; the rest
+        # were not attempted because of it.
+        return {
+            "failed_stills": failed_stills,
+            "failed_loops": failed_loops,
+            "moderated": moderated,
+            "predicted": predicted,
+            "message": str(stopped.get("message") or ""),
+        }
+    if predicted == len(failures):
+        # Every entry carries the same warning sentence; it already says
+        # nothing was charged and what to change.
+        return {
+            "failed_stills": failed_stills,
+            "failed_loops": failed_loops,
+            "moderated": 0,
+            "predicted": predicted,
+            "message": str(failures[0].get("message") or ""),
+        }
+    parts = []
+    if failed_stills:
+        parts.append(f"{failed_stills} portrait{'s' if failed_stills != 1 else ''}")
+    if failed_loops:
+        parts.append(f"{failed_loops} emotion video{'s' if failed_loops != 1 else ''}")
+    what = " and ".join(parts)
+    if moderated == len(failures):
+        message = (
+            f"xAI's content moderation refused {what}. The rendering charge "
+            "stands, and retrying with the same reference image repeats both "
+            "the charge and the refusal. Use a different reference image: a "
+            "calm head-and-shoulders portrait passes far more often than a "
+            "full-body action pose, a weapon, or a well-known trademarked "
+            "character."
+        )
+    elif moderated:
+        message = (
+            f"{what} could not be generated; xAI's content moderation refused "
+            f"{moderated} of them. Retrying repeats the charge for the refused "
+            "ones, so consider a calmer, head-and-shoulders reference image."
+        )
+    else:
+        message = f"{what} could not be generated. Retrying is reasonable."
+    return {
+        "failed_stills": failed_stills,
+        "failed_loops": failed_loops,
+        "moderated": moderated,
+        "predicted": predicted,
+        "message": message,
+    }
 
 
 def _with_extra_prompt(base_prompt: str, extra_prompt: str | None) -> str:
@@ -145,6 +277,9 @@ async def generate_emotion_media_for_avatar(
     emotions: tuple[str, ...] | None = None,
     asset_kinds: tuple[str, ...] | None = None,
     extra_prompt: str | None = None,
+    subject: str | None = None,
+    assessment: dict[str, Any] | None = None,
+    proceed_despite_moderation_risk: bool = False,
     progress: ProgressCallback | None = None,
     metrics: MetricsCallback | None = None,
 ) -> dict[str, Any]:
@@ -161,22 +296,39 @@ async def generate_emotion_media_for_avatar(
         asset_kinds: Limit generation to ``still`` and/or ``idle_loop``.
         extra_prompt: Owner note appended to each generation prompt, for a
             targeted redo ("make the blink slower").
+        subject: What the reference depicts (``person``,
+            ``stylized_character``, ``non_human``); picks the prompt family.
+            ``None`` means ``person``.
+        assessment: The reference assessment from
+            ``reference_subject.classify_reference_subject``. When its
+            ``moderation_risk`` is high, **no vendor call is made**: every
+            requested asset is reported as a ``moderation_predicted`` failure
+            carrying the warning sentence, so nothing is charged for a video
+            the vendor would refuse after rendering.
+        proceed_despite_moderation_risk: The owner's explicit choice to
+            attempt generation anyway, at their own cost.
         progress: Called with ``(stage, fields)`` as assets complete.
         metrics: Awaited with ``(inference_type, cost_usd, model, request_id)``
             per vendor call, for the ``api_metrics`` ledger.
 
     Returns:
         The manifest (see :func:`build_manifest`) plus ``"failures"`` — a list
-        of ``{"emotion", "asset_kind", "error"}`` for anything that did not
-        generate. Never raises for a vendor failure; raises
+        of ``{"emotion", "asset_kind", "error", "error_code", "message"}`` for
+        anything that did not generate (see :func:`describe_failure`) — and
+        ``"subject"``, the prompt family used. Never raises for a vendor failure; raises
         ``XaiNotConfiguredError`` when no key is configured.
     """
     report_progress = progress or _noop_progress
     record_metric = metrics or _noop_metrics
     failures: list[dict[str, str]] = []
+    reference_subject = normalize_reference_subject(
+        subject if subject is not None else (assessment or {}).get("subject")
+    )
 
     target_emotions = tuple(emotions) if emotions else BASE_EMOTIONS
-    kinds = tuple(asset_kinds) if asset_kinds else (ASSET_KIND_STILL, ASSET_KIND_IDLE_LOOP)
+    kinds = (
+        tuple(asset_kinds) if asset_kinds else (ASSET_KIND_STILL, ASSET_KIND_IDLE_LOOP)
+    )
     generate_stills = ASSET_KIND_STILL in kinds
     generate_loops = ASSET_KIND_IDLE_LOOP in kinds
     is_full_build = emotions is None and asset_kinds is None
@@ -190,13 +342,42 @@ async def generate_emotion_media_for_avatar(
     )
 
     still_uris: dict[str, str] = {NEUTRAL_EMOTION: reference_image_data_uri}
+    # Set by the first failure whose code means every further call would fail
+    # the same way (the xAI team is out of credits); the remaining assets are
+    # then reported as not attempted instead of each being tried and billed.
+    stop_reason: dict[str, str] = {}
+
+    def _record_failure(failure: dict[str, str]) -> None:
+        failures.append(failure)
+        if (
+            failure.get("error_code") in xai_client.STOP_RUN_ERROR_CODES
+            and not stop_reason
+        ):
+            stop_reason.update(failure)
+            logger.warning(
+                "Stopping emotion media for %s after %s: %s",
+                assistant_id,
+                failure.get("error_code"),
+                failure.get("error"),
+            )
+
+    def _not_attempted(emotion: str, asset_kind: str) -> dict[str, str]:
+        return {
+            "emotion": emotion,
+            "asset_kind": asset_kind,
+            "error": "Not attempted: an earlier call in this run failed with "
+            f"{stop_reason.get('error_code')}.",
+            "error_code": xai_client.ERROR_CODE_NOT_ATTEMPTED,
+            "message": str(stop_reason.get("message") or ""),
+        }
 
     async def _load_existing_still_uri(emotion: str) -> None:
         existing_asset = next(
             (
                 asset
                 for asset in existing
-                if asset["emotion"] == emotion and asset["asset_kind"] == ASSET_KIND_STILL
+                if asset["emotion"] == emotion
+                and asset["asset_kind"] == ASSET_KIND_STILL
             ),
             None,
         )
@@ -210,9 +391,7 @@ async def generate_emotion_media_for_avatar(
 
     # 1. The reference IS the neutral still. A targeted redo of one emotion
     #    leaves it alone; a full build always writes it so the manifest has it.
-    if is_full_build or (
-        generate_stills and NEUTRAL_EMOTION in target_emotions
-    ):
+    if is_full_build or (generate_stills and NEUTRAL_EMOTION in target_emotions):
         neutral_mime, neutral_bytes = xai_client._decode_data_uri(
             reference_image_data_uri
         )
@@ -241,6 +420,34 @@ async def generate_emotion_media_for_avatar(
         else []
     )
 
+    # Pre-flight: a reference the vendor's moderation would refuse is caught
+    # here, before the first call, and the owner is told what to change. The
+    # neutral still is the owner's own image and has already been stored.
+    if moderation_blocks_generation(assessment) and not proceed_despite_moderation_risk:
+        warning = moderation_warning(assessment)
+        for emotion in stills_to_make:
+            failures.append(
+                describe_predicted_failure(emotion, ASSET_KIND_STILL, warning)
+            )
+        for emotion in loops_to_make:
+            failures.append(
+                describe_predicted_failure(emotion, ASSET_KIND_IDLE_LOOP, warning)
+            )
+        logger.warning(
+            "Emotion media withheld for %s: %s",
+            assistant_id,
+            (assessment or {}).get("moderation_reasons"),
+        )
+        return await _finish(
+            repository,
+            assistant_id,
+            failures,
+            reference_subject,
+            report_progress,
+            assessment=assessment,
+            withheld=True,
+        )
+
     # Loops need the still they animate, even when this job is not remaking it.
     for emotion in loops_to_make:
         if emotion != NEUTRAL_EMOTION and emotion not in still_uris:
@@ -265,7 +472,12 @@ async def generate_emotion_media_for_avatar(
                 },
             )
             return
-        prompt = _with_extra_prompt(still_prompt_for(emotion), extra_prompt)
+        if stop_reason:
+            failures.append(_not_attempted(emotion, ASSET_KIND_STILL))
+            return
+        prompt = _with_extra_prompt(
+            still_prompt_for(emotion, reference_subject), extra_prompt
+        )
         try:
             result = await xai_client.edit_image(
                 context,
@@ -273,12 +485,8 @@ async def generate_emotion_media_for_avatar(
                 prompt=prompt,
             )
         except xai_client.XaiGenerationError as generation_error:
-            failures.append(
-                {
-                    "emotion": emotion,
-                    "asset_kind": ASSET_KIND_STILL,
-                    "error": str(generation_error),
-                }
+            _record_failure(
+                describe_failure(emotion, ASSET_KIND_STILL, generation_error)
             )
             logger.warning(
                 "Emotion still %s failed for %s: %s",
@@ -339,28 +547,27 @@ async def generate_emotion_media_for_avatar(
                 },
             )
             return
+        if stop_reason:
+            failures.append(_not_attempted(emotion, ASSET_KIND_IDLE_LOOP))
+            return
         still_uri = still_uris.get(emotion)
         if not still_uri:
             failures.append(
-                {
-                    "emotion": emotion,
-                    "asset_kind": ASSET_KIND_IDLE_LOOP,
-                    "error": "No still was available to animate.",
-                }
+                describe_failure(
+                    emotion, ASSET_KIND_IDLE_LOOP, "No still was available to animate."
+                )
             )
             return
-        prompt = _with_extra_prompt(idle_loop_prompt_for(emotion), extra_prompt)
+        prompt = _with_extra_prompt(
+            idle_loop_prompt_for(emotion, reference_subject), extra_prompt
+        )
         try:
             result = await xai_client.generate_idle_loop(
                 context, still_image_data_uri=still_uri, prompt=prompt
             )
         except xai_client.XaiGenerationError as generation_error:
-            failures.append(
-                {
-                    "emotion": emotion,
-                    "asset_kind": ASSET_KIND_IDLE_LOOP,
-                    "error": str(generation_error),
-                }
+            _record_failure(
+                describe_failure(emotion, ASSET_KIND_IDLE_LOOP, generation_error)
             )
             logger.warning(
                 "Idle loop %s failed for %s: %s",
@@ -407,10 +614,63 @@ async def generate_emotion_media_for_avatar(
         )
         await asyncio.gather(*(_make_loop(emotion) for emotion in loops_to_make))
 
+    return await _finish(
+        repository,
+        assistant_id,
+        failures,
+        reference_subject,
+        report_progress,
+        assessment=assessment,
+        withheld=False,
+    )
+
+
+async def _finish(
+    repository: Any,
+    assistant_id: str,
+    failures: list[dict[str, str]],
+    reference_subject: str,
+    report_progress: ProgressCallback,
+    *,
+    assessment: dict[str, Any] | None,
+    withheld: bool,
+) -> dict[str, Any]:
+    """Build the manifest and emit the completion frame.
+
+    The frame carries why things failed, not only how many: the upload toast
+    marks the step in error with the reason instead of ticking seven refused
+    videos as done, and says when nothing was charged.
+    """
     manifest = build_manifest(await repository.list_emotion_assets(assistant_id))
     manifest["failures"] = failures
+    manifest["subject"] = reference_subject
+    manifest["withheld"] = withheld
+    manifest["moderation_risk"] = (assessment or {}).get("moderation_risk")
+    manifest["moderation_reasons"] = list(
+        (assessment or {}).get("moderation_reasons") or []
+    )
+    summary = summarize_failures(failures)
     report_progress(
         STAGE_COMPLETE,
-        {"complete": manifest["complete"], "failures": len(failures)},
+        {
+            "complete": manifest["complete"],
+            "failures": len(failures),
+            "failed_stills": summary["failed_stills"],
+            "failed_loops": summary["failed_loops"],
+            "moderated": summary["moderated"],
+            "predicted": summary["predicted"],
+            "withheld": withheld,
+            "failure_message": summary["message"],
+            "failed_assets": [
+                {
+                    "emotion": f["emotion"],
+                    "asset_kind": f["asset_kind"],
+                    "error_code": f.get("error_code"),
+                }
+                for f in failures
+            ],
+            "subject": reference_subject,
+            "moderation_reasons": manifest["moderation_reasons"],
+        },
     )
     return manifest

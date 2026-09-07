@@ -15,6 +15,7 @@ so these tests need no model, store, or network.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -997,3 +998,72 @@ async def test_expand_non_playlist_url_returns_none(monkeypatch):
         "https://www.youtube.com/watch?v=abc123", user_id="u", assistant_id="a"
     )
     assert result is None
+
+
+def _stored_document(namespace, namespace_filename, filename):
+    """One store row in the shape the media pipeline writes."""
+    return SimpleNamespace(
+        namespace=namespace,
+        value={
+            "document": {
+                "lc": 1,
+                "type": "constructor",
+                "id": ["langchain", "schema", "document", "Document"],
+                "kwargs": {
+                    "page_content": "…",
+                    "metadata": {
+                        "namespace_filename": namespace_filename,
+                        "filename": filename,
+                    },
+                },
+            }
+        },
+    )
+
+
+def test_reference_audio_does_not_mark_its_source_as_already_indexed():
+    """A video used as the voice reference must still be ingestable as identity.
+
+    The reference clip is written under the source URL's namespace_filename. When
+    that row counted as an indexed document, re-uploading the same URL through
+    /update_avatar_identity_with_media was skipped as a duplicate: its audio
+    reached the voice model and its transcript never reached the graph, while
+    the job still reported success.
+    """
+    from src.api.webapp import indexed_namespace_filenames
+
+    interview_url = "https://youtu.be/XnbCSboujF4"
+    interview_key = "4382787e-af6c-570a-8135-74a8f096ef19"
+    rows = [
+        _stored_document(
+            ("user-1", "assistant-1", "reference_audio"), interview_key, interview_url
+        ),
+        _stored_document(
+            ("user-1", "assistant-1", "reference_image"), "portrait-key", "face.png"
+        ),
+        _stored_document(
+            ("user-1", "assistant-1", "quote", "doc-1"),
+            "site-key",
+            "https://example.com/",
+        ),
+    ]
+
+    indexed = indexed_namespace_filenames(rows)
+
+    assert interview_key not in indexed
+    assert "portrait-key" not in indexed
+    # Ordinary source documents are still skipped on a re-upload.
+    assert indexed == {"site-key"}
+
+
+def test_indexed_documents_are_still_skipped():
+    """The de-duplication itself is intact: a real document counts as indexed."""
+    from src.api.webapp import indexed_namespace_filenames
+
+    rows = [
+        _stored_document(
+            ("user-1", "assistant-1", "identity", "doc-1"), "talk-key", "talk.mp4"
+        )
+    ]
+
+    assert indexed_namespace_filenames(rows) == {"talk-key"}

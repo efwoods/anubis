@@ -709,6 +709,13 @@ class GlobalContext:
         },
     )
 
+    emotion_media_minimum_tier: str = field(
+        default="premium",
+        metadata={
+            "description": "Lowest subscription tier whose owner may generate an avatar's emotion stills and idle loops from the reference image — free, pro, or premium (premium is the enterprise-grade tier today). A tier below this value never triggers generation on a reference-image upload and is refused by POST /avatar_emotion_media/regenerate. Env EMOTION_MEDIA_MINIMUM_TIER."
+        },
+    )
+
     xai_image_edit_model: str = field(
         default="grok-imagine-image-2.0",
         metadata={
@@ -773,6 +780,59 @@ class GlobalContext:
     )
 
     """ </Emotion media generation (xAI images and idle-loop videos)> """
+
+    """ <Deep research with web-based fact verification> """
+
+    deep_research_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether an avatar's creator may run deep research on the avatar's subject (POST /avatar/{assistant_id}/deep_research). Set to false to disable the research button and the endpoint without affecting the rest of the media pipeline. Env DEEP_RESEARCH_ENABLED."
+        },
+    )
+
+    tavily_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "Tavily search API key. When the key is set, Tavily results (which carry the page content) are merged with the DuckDuckGo results the browser tools read; without the key the research runs on DuckDuckGo alone. Env TAVILY_API_KEY."
+        },
+    )
+
+    deep_research_max_topics: int = field(
+        default=4,
+        metadata={
+            "description": "Maximum research topics one research job delegates to concurrent researchers. Env DEEP_RESEARCH_MAX_TOPICS."
+        },
+    )
+
+    deep_research_max_queries: int = field(
+        default=4,
+        metadata={
+            "description": "Maximum web search queries one researcher runs per round for one topic. Env DEEP_RESEARCH_MAX_QUERIES."
+        },
+    )
+
+    deep_research_max_sources: int = field(
+        default=12,
+        metadata={
+            "description": "Maximum source pages one researcher reads and extracts facts from per round. Env DEEP_RESEARCH_MAX_SOURCES."
+        },
+    )
+
+    deep_research_follow_up_rounds: int = field(
+        default=1,
+        metadata={
+            "description": "How many further search rounds a researcher may run after reflecting that the topic is still unanswered. Zero searches once per topic. Env DEEP_RESEARCH_FOLLOW_UP_ROUNDS."
+        },
+    )
+
+    deep_research_concurrency: int = field(
+        default=4,
+        metadata={
+            "description": "Concurrent page reads and fact-extraction calls per researcher. Env DEEP_RESEARCH_CONCURRENCY."
+        },
+    )
+
+    """ </Deep research with web-based fact verification> """
 
     """ <Voice cloning and speech (ElevenLabs)> """
 
@@ -964,6 +1024,43 @@ class GlobalContext:
         default=9.0,
         metadata={
             "description": "Length (seconds, at most ten) of the owner's reference clip cut from the voice-clone recordings and handed to the diarizer as the known owner voice. Env VOICE_SPEAKER_REFERENCE_MAX_SECONDS."
+        },
+    )
+
+    voice_transcription_language: str = field(
+        default="en",
+        metadata={
+            "description": "ISO-639-1 language hint (for example en) passed to the speech model for live-voice utterances (POST /transcribe and diarize=true turns). A language hint stops the model from inventing captions in other languages for silent or noisy clips. The value none (or auto) lets the model guess the language. Uploaded media is never affected. Env VOICE_TRANSCRIPTION_LANGUAGE."
+        },
+    )
+    voice_transcription_prompt: str = field(
+        default="",
+        metadata={
+            "description": "Optional text prompt handed to whisper-1 for live-voice utterances (POST /transcribe) to steer style and vocabulary; the diarization model does not accept a prompt. Empty sends none. Env VOICE_TRANSCRIPTION_PROMPT."
+        },
+    )
+    voice_no_speech_probability_max: float = field(
+        default=0.6,
+        metadata={
+            "description": "Live-voice transcripts are requested from whisper-1 as verbose_json; a segment whose no_speech_prob is at or above this value is dropped as noise the model captioned anyway. 0 disables the check. Env VOICE_NO_SPEECH_PROBABILITY_MAX."
+        },
+    )
+    voice_average_logprob_min: float = field(
+        default=-1.0,
+        metadata={
+            "description": "A live-voice whisper segment whose avg_logprob is at or below this value (the model was guessing the words) is dropped. 0 disables the check. Env VOICE_AVERAGE_LOGPROB_MIN."
+        },
+    )
+    voice_compression_ratio_max: float = field(
+        default=2.4,
+        metadata={
+            "description": "A live-voice whisper segment whose text compression_ratio is at or above this value (a caption repeated over and over) is dropped. 0 disables the check. Env VOICE_COMPRESSION_RATIO_MAX."
+        },
+    )
+    voice_silence_max_volume_db: float = field(
+        default=-45.0,
+        metadata={
+            "description": "Live-voice clips whose loudest sample (dBFS, measured with ffmpeg volumedetect) is below this value hold no speech and are never sent to the speech model, which would otherwise invent a caption for the silence. Spoken words with browser gain control peak well above -30 dBFS. A value of 0 or higher disables the gate. Env VOICE_SILENCE_MAX_VOLUME_DB."
         },
     )
 

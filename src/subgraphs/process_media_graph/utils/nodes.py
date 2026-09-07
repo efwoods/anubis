@@ -45,8 +45,39 @@ def _emit_media_progress(stage: str, **fields: Any) -> None:
         pass
 
 
+def emotion_media_tier_allows_generation(
+    subscription_tier: str | None, minimum_tier: str | None
+) -> bool:
+    """Whether the submitter's tier reaches the emotion-media minimum tier.
+
+    The tier travels with the media run in the runnable config (written by
+    ``_start_media_batch``). A run that carries no tier at all — the graph
+    driven from LangGraph Studio, a test, a script — is allowed, because the
+    gate belongs to the paid API surface and must not silently disable
+    generation everywhere else.
+    """
+    from src.anubis.utils.billing.tiers import (
+        minimum_tier_from_value,
+        tier_from_value,
+        tier_meets_minimum,
+    )
+
+    if not subscription_tier:
+        return True
+    return tier_meets_minimum(
+        tier_from_value(subscription_tier), minimum_tier_from_value(minimum_tier)
+    )
+
+
 async def _generate_emotion_media_after_reference_image(
-    context: Any, user_id: str, assistant_id: str, reference_image_data_uri: str
+    context: Any,
+    user_id: str,
+    assistant_id: str,
+    reference_image_data_uri: str,
+    subject: str | None = None,
+    assessment: dict[str, Any] | None = None,
+    subscription_tier: str | None = None,
+    minimum_tier: str | None = None,
 ) -> None:
     """Build the avatar's emotion stills and idle loops from a new reference image.
 
@@ -55,11 +86,25 @@ async def _generate_emotion_media_after_reference_image(
     Every failure is logged and reported through progress rather than raised:
     the reference image itself is already stored, and an upload must not fail
     because a vendor refused one of thirteen generations.
+
+    The run is also recorded as an ``emotion_media`` job row in the media
+    repository, with each failure's ``error_code`` and ``message`` in its
+    detail, so the manifest can tell the settings screen why a loop is missing
+    long after the upload toast is gone. ``subject`` is the classified
+    reference subject and picks the prompt family; ``assessment`` is the full
+    reference assessment, and a high moderation risk in it withholds every
+    vendor call so the owner is warned instead of charged for a refusal.
     """
     from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_assets.repository import (
+        JOB_STATE_COMPLETED,
+        JOB_STATE_FAILED,
+        JOB_STATE_RUNNING,
+    )
     from src.anubis.utils.media_generation.emotion_media import (
         emotion_media_enabled,
         generate_emotion_media_for_avatar,
+        summarize_failures,
     )
 
     repository = get_media_asset_repository()
@@ -72,7 +117,43 @@ async def _generate_emotion_media_after_reference_image(
         )
         return
 
+    # Generating the stills and loops is billed per image and per video second
+    # at the vendor, so a tier below EMOTION_MEDIA_MINIMUM_TIER stores the
+    # reference image and generates nothing; the owner's settings screen offers
+    # the generation button once the tier permits the spend.
+    if not emotion_media_tier_allows_generation(subscription_tier, minimum_tier):
+        logger.info(
+            "Emotion media generation skipped for %s: tier %s is below the minimum %s",
+            assistant_id,
+            subscription_tier,
+            minimum_tier,
+        )
+        _emit_media_progress(
+            "emotion_media_skipped",
+            reason="tier",
+            subscription_tier=subscription_tier,
+            required_tier=minimum_tier,
+        )
+        return
+
     pool = getattr(repository, "pool", None)
+    job_id: str | None = None
+    try:
+        job_id = await repository.create_job(
+            user_id=user_id,
+            assistant_id=assistant_id,
+            job_kind="emotion_media",
+            state=JOB_STATE_RUNNING,
+            detail={
+                "source": "upload",
+                "only_missing": False,
+                "subject": subject,
+                "moderation_risk": (assessment or {}).get("moderation_risk"),
+                "moderation_reasons": (assessment or {}).get("moderation_reasons"),
+            },
+        )
+    except Exception:  # noqa: BLE001 - the record is a convenience, not the work
+        logger.debug("Could not record the emotion media job", exc_info=True)
 
     async def _record_metric(
         inference_type: str, cost_usd: float, model_name: str, request_id: str | None
@@ -100,15 +181,32 @@ async def _generate_emotion_media_after_reference_image(
             user_id=user_id,
             assistant_id=assistant_id,
             reference_image_data_uri=reference_image_data_uri,
+            subject=subject,
+            assessment=assessment,
             progress=lambda stage, fields: _emit_media_progress(stage, **fields),
             metrics=_record_metric,
         )
-        if manifest.get("failures"):
+        failures = manifest.get("failures") or []
+        if failures:
             logger.warning(
                 "Emotion media for %s finished with %d failure(s): %s",
                 assistant_id,
-                len(manifest["failures"]),
-                manifest["failures"],
+                len(failures),
+                failures,
+            )
+        if job_id is not None:
+            await repository.update_job(
+                job_id,
+                state=JOB_STATE_FAILED if failures else JOB_STATE_COMPLETED,
+                detail={
+                    "complete": manifest.get("complete"),
+                    "failures": failures,
+                    "summary": summarize_failures(failures),
+                    "subject": manifest.get("subject"),
+                    "withheld": manifest.get("withheld", False),
+                    "moderation_risk": manifest.get("moderation_risk"),
+                    "moderation_reasons": manifest.get("moderation_reasons"),
+                },
             )
     except Exception as generation_error:  # noqa: BLE001
         logger.exception(
@@ -117,6 +215,15 @@ async def _generate_emotion_media_after_reference_image(
         _emit_media_progress(
             "emotion_media_complete", complete=False, error=str(generation_error)
         )
+        if job_id is not None:
+            try:
+                await repository.update_job(
+                    job_id,
+                    state=JOB_STATE_FAILED,
+                    detail={"error": str(generation_error)},
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not record the emotion media failure", exc_info=True)
 
 
 def _assistant_is_personal_avatar(config: Any) -> bool:
@@ -356,6 +463,7 @@ from src.anubis.utils.utility import (
 from src.subgraphs.process_media_graph.utils.helper_functions import (
     CLASSIFICATION_INPUT_CHAR_LIMIT,
     build_all_speakers_quote_documents,
+    build_target_speech_identity_documents,
     coalesce_segments_by_speaker,
     process_dialogue_json_to_documents,
     process_nontarget_text_to_identity_documents,
@@ -1347,12 +1455,40 @@ async def process_media_item_task(
                 namespace = (user_id, assistant_id, "reference_image")
                 doc_json = doc.to_json()
 
+                # What the reference depicts decides how its emotion media is
+                # prompted: a person's stills change only the facial
+                # expression, while a logo or an abstract interface has no
+                # face to change and is colored and lit for each emotion
+                # instead (asking for an expression there invents a person).
+                # Classified once here, kept with the image for regeneration.
+                # The same call predicts whether the video vendor's content
+                # moderation would refuse the rendered result (a trademarked
+                # character, a weapon, a fighting pose...), so that refusal
+                # is caught before anything is rendered and charged.
+                from src.anubis.utils.media_generation.reference_subject import (
+                    assessment_store_fields,
+                    classify_reference_subject,
+                )
+
+                reference_assessment = await classify_reference_subject(
+                    full_uri, runtime.context
+                )
+                reference_subject = reference_assessment["subject"]
+                _emit_media_progress(
+                    "reference_subject",
+                    subject=reference_subject,
+                    reasoning=reference_assessment.get("reasoning", ""),
+                    moderation_risk=reference_assessment.get("moderation_risk"),
+                    moderation_reasons=reference_assessment.get("moderation_reasons"),
+                )
+
                 await store.aput(
                     namespace,
                     key=assistant_id,
                     value={
                         "reference_image_data": full_uri,
                         "document": doc_json,
+                        **assessment_store_fields(reference_assessment),
                     },
                 )
                 # load_consciousness reads this entry through a process-wide
@@ -1366,8 +1502,16 @@ async def process_media_item_task(
                 # the same media_progress stream as the upload, and a vendor
                 # failure never fails the upload — the missing assets are
                 # reported and can be regenerated from settings.
+                configurable = (config or {}).get("configurable") or {}
                 await _generate_emotion_media_after_reference_image(
-                    runtime.context, user_id, assistant_id, full_uri
+                    runtime.context,
+                    user_id,
+                    assistant_id,
+                    full_uri,
+                    subject=reference_subject,
+                    assessment=reference_assessment,
+                    subscription_tier=configurable.get("subscription_tier"),
+                    minimum_tier=configurable.get("emotion_media_minimum_tier"),
                 )
                 doc.metadata.update(
                     {
@@ -2428,6 +2572,18 @@ async def process_media_item_task(
                         assistant_id=assistant_id,
                         media_item=single_media_item,
                         store=store,
+                    )
+                    # A lone target speaker also states facts about themself;
+                    # extract them into ``identity`` so the monologue teaches
+                    # the avatar self-knowledge, not only quotes.
+                    documents = list(documents or []) + list(
+                        await build_target_speech_identity_documents(
+                            [turn],
+                            user_id=user_id,
+                            assistant_id=assistant_id,
+                            media_item=single_media_item,
+                            target_name=target_speaker_label,
+                        )
                     )
                 else:
                     # A non-target lone speaker: only biographical facts about

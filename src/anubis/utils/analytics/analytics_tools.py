@@ -171,9 +171,8 @@ def build_analytics_tools(
         - what users love, hate, dislike, and request: "feedback_summary"
         - projected revenue: "revenue_estimate" (monthly recurring revenue by tier)
 
-        Platform-wide numbers are reserved for the platform administrator with
-        the Neural Nexus business account connected; anyone else receives
-        status "forbidden". Administrator traffic is excluded from the
+        Platform-wide numbers are reserved for the platform administrator;
+        anyone else receives status "forbidden". Administrator traffic is excluded from the
         platform's metrics by design.
 
         Args:
@@ -195,8 +194,7 @@ def build_analytics_tools(
             return {
                 "status": STATUS_FORBIDDEN,
                 "message": (
-                    "Platform-wide metrics are reserved for the platform administrator "
-                    "with the Neural Nexus business account connected."
+                    "Platform-wide metrics are reserved for the platform administrator."
                 ),
             }
         try:

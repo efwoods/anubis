@@ -186,13 +186,15 @@ async def test_save_report_stores_collected_charts_and_lists_them():
 
 @pytest.mark.asyncio
 async def test_platform_metrics_are_forbidden_for_non_admins():
-    tools = _tools(connected_accounts=[{"provider": "neural_nexus"}])
+    tools = _tools(connected_accounts=[])
     result = await tools["query_platform_metrics"].ainvoke({"metric": "messages_per_day"})
     assert result["status"] == "forbidden"
 
+    # The configured administrator passes the gate without any connection;
+    # with no pool published the tool then reports the store as unavailable.
     admin_tools = _tools(context=_context(admin_user_id="owner"), connected_accounts=[])
     result = await admin_tools["query_platform_metrics"].ainvoke({"metric": "messages_per_day"})
-    assert result["status"] == "forbidden"
+    assert result["status"] == "unavailable"
 
     unknown = await tools["query_platform_metrics"].ainvoke({"metric": "nope"})
     assert unknown["status"] == "error"
@@ -203,7 +205,7 @@ async def test_platform_metrics_are_forbidden_for_non_admins():
 async def test_pool_none_answers_unavailable_for_admins_and_finance_and_vendors():
     admin_tools = _tools(
         context=_context(admin_user_id="owner"),
-        connected_accounts=[{"provider": "neural_nexus"}, {"provider": "plaid", "kind": "bank", "display_label": "Chase"}],
+        connected_accounts=[{"provider": "plaid", "kind": "bank", "display_label": "Chase"}],
     )
     platform = await admin_tools["query_platform_metrics"].ainvoke({"metric": "messages_per_day"})
     assert platform["status"] == "unavailable"

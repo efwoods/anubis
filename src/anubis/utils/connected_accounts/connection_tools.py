@@ -280,8 +280,7 @@ def build_connection_tools(
         Call this tool when the owner asks to connect, link, or add an account,
         or asks for something that needs an account that is not connected yet:
         read or send email (gmail), work in repositories (github), report on
-        spending or burn rate (plaid), answer questions about the Neural Nexus
-        business (neural_nexus), read LangSmith / OpenAI / Anthropic usage
+        spending or burn rate (plaid), read LangSmith / OpenAI / Anthropic usage
         (langsmith, openai, anthropic), audit or crawl a website (website),
         post on X (x), read a calendar (google_calendar), or use the tools of a
         Model Context Protocol server (custom_mcp) or any other site

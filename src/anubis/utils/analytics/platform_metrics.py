@@ -1,4 +1,4 @@
-"""Platform metrics for the owner's Neural Nexus business account.
+"""Platform metrics for the platform administrator.
 
 Every function here answers one owner question ("how often do users send
 messages", "which avatars do users speak to most", "what do users dislike")
@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 ADMIN_TRAFFIC_NOTE = "Admin traffic is excluded from api_metrics by design."
 DEFAULT_PERIOD_DAYS = 30
 MESSAGE_INFERENCE_TYPES: tuple[str, ...] = ("message", "adapter_inference")
-PLATFORM_PROVIDER_NAME = "neural_nexus"
 
 SPEND_GROUPINGS: tuple[str, ...] = ("day", "model", "inference_type")
 
@@ -514,14 +513,10 @@ def is_platform_admin(
 ) -> bool:
     """Return whether platform metrics may be shown to this owner.
 
-    True only when the owner has connected the Neural Nexus business account
-    AND the owner is the configured administrator; connecting the account
-    alone never grants platform-wide numbers.
+    True only for the configured platform administrator (``ADMIN_USER_ID``).
+    Platform-wide numbers describe every user, so no connected account can
+    grant them; the ``connected_accounts`` argument is kept for the call
+    sites and is not consulted.
     """
     admin_user_id = str(getattr(context, "admin_user_id", None) or "").strip()
-    if not admin_user_id or not user_id or str(user_id).strip() != admin_user_id:
-        return False
-    return any(
-        str((record or {}).get("provider") or "") == PLATFORM_PROVIDER_NAME
-        for record in (connected_accounts or [])
-    )
+    return bool(admin_user_id and user_id and str(user_id).strip() == admin_user_id)

@@ -34,7 +34,7 @@ Rules:
 - When the owner asks a question that would be useful every week or every month, offer schedule_report; list_report_schedules shows what already runs and cancel_report_schedule stops one.
 - The default period is the last thirty days when the owner names none; say which period the numbers cover.
 - Platform metrics describe real users only: administrator traffic is excluded from the platform's metrics by design. Say so when the owner asks why the owner's own conversations are missing.
-- When a metric needs a connection that is not connected (a bank through "plaid", the Neural Nexus business account through "neural_nexus", a vendor through "langsmith", "openai", or "anthropic"), say plainly which connection is missing and call connect_account with that provider name.
+- When a metric needs a connection that is not connected (a bank through "plaid", a vendor through "langsmith", "openai", or "anthropic"), say plainly which connection is missing and call connect_account with that provider name.
 - When a tool answers with status "forbidden", say that platform-wide numbers are reserved for the platform administrator and offer the owner's own avatar's numbers instead.
 </BUSINESS_ANALYTICS>
 """

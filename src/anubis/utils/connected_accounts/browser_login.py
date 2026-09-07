@@ -142,10 +142,6 @@ async def start_login(
     """Open a browser at the site's sign-in page; return ``{login_id, view_url, nonce}``."""
     await reap_expired_logins()
     start_url = str(site_url or getattr(provider, "login_url", None) or "").strip()
-    if start_url and not start_url.startswith("http") and start_url.startswith("/"):
-        # The API's own login page (the Neural Nexus business account).
-        base = str(getattr(context, "connect_oauth_redirect_base_url", "") or "").rstrip("/")
-        start_url = base + start_url
     if not start_url.startswith("http"):
         raise BrowserSessionError(400, "A site address to sign in to is required.")
     async with _logins_lock:
@@ -399,19 +395,10 @@ async def finish_login(
     home_url = getattr(provider, "home_url", None)
     if not home_url or not str(home_url).startswith("http"):
         home_url = final_url if same_host(final_url, site_hostname) else login.site_url
-    if provider.name == "neural_nexus":
-        home_url = str(getattr(context, "connect_oauth_redirect_base_url", "") or "").rstrip("/") + "/"
     address = site_hostname if provider.name not in ("custom_site",) else f"{site_hostname}#{login.login_id[:8]}"
     key = account_key(provider.name, address)
     label = deduplicate_label(login.name or site_hostname, existing_records, key)
     extra: dict[str, Any] = {}
-    if provider.name == "neural_nexus":
-        extra = {
-            "platform_user_id": user_id,
-            "role": "admin"
-            if user_id and user_id == str(getattr(context, "admin_user_id", "") or "")
-            else "member",
-        }
     record = build_account_record(
         provider=provider,
         account_address=address,

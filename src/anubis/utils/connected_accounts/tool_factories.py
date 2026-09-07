@@ -31,7 +31,6 @@ from src.anubis.utils.connected_accounts.providers import (
     KIND_MAILBOX,
     KIND_MCP_SERVER,
     KIND_MESSAGING,
-    KIND_PLATFORM,
     KIND_SOCIAL,
     KIND_WEBSITE,
     MECHANISM_BROWSER_SESSION,
@@ -122,15 +121,6 @@ def _oauth_vendor_factory(
     return tools
 
 
-def _platform_factory(
-    context: Any, accounts: list[dict[str, Any]], **runtime: Any
-) -> list[Any]:
-    # Platform (Neural Nexus business) accounts contribute the analytics tools,
-    # which the think node attaches separately with the pool; the account is
-    # the admin gate rather than a tool source of its own.
-    return _browser_session_factory(context, accounts, **runtime)
-
-
 TOOL_FACTORIES: dict[str, ToolFactory] = {
     KIND_MAILBOX: _mailbox_factory,
     KIND_MCP_SERVER: _mcp_server_factory,
@@ -142,7 +132,6 @@ TOOL_FACTORIES: dict[str, ToolFactory] = {
     KIND_CALENDAR: _oauth_vendor_factory,
     KIND_HOSTING: _oauth_vendor_factory,
     KIND_MESSAGING: _oauth_vendor_factory,
-    KIND_PLATFORM: _platform_factory,
 }
 
 # Tool names per provider for kinds with a fixed surface, so the connect card
@@ -174,13 +163,6 @@ _VENDOR_API_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "google_analytics": ("analytics_traffic_report",),
     "youtube": ("youtube_channel_stats",),
 }
-_PLATFORM_TOOL_NAMES: tuple[str, ...] = (
-    "query_platform_metrics",
-    "make_chart",
-    "save_report",
-    "schedule_report",
-)
-
 
 def tool_names_for(provider: Any, record: dict[str, Any] | None = None) -> list[str]:
     """Return the tool names an account of this provider contributes.
@@ -204,8 +186,6 @@ def tool_names_for(provider: Any, record: dict[str, Any] | None = None) -> list[
         return list(_BANK_TOOL_NAMES)
     if kind == KIND_WEBSITE:
         return list(_WEBSITE_TOOL_NAMES)
-    if kind == KIND_PLATFORM:
-        return list(_PLATFORM_TOOL_NAMES)
     if name in _VENDOR_API_TOOL_NAMES and mechanism == MECHANISM_OAUTH:
         return list(_VENDOR_API_TOOL_NAMES[name])
     if mechanism == MECHANISM_BROWSER_SESSION:

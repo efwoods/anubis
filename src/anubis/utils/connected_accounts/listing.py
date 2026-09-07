@@ -104,7 +104,6 @@ def account_connection_view(record: dict[str, Any]) -> dict[str, Any]:
         "institution_name": view.get("institution_name"),
         "account_count": view.get("account_count"),
         "site_url": view.get("site_url"),
-        "role": view.get("role"),
     }
 
 
@@ -138,5 +137,4 @@ def device_connection_view(device: dict[str, Any]) -> dict[str, Any]:
         "institution_name": None,
         "account_count": None,
         "site_url": None,
-        "role": None,
     }

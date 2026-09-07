@@ -1190,8 +1190,8 @@ async def think(
             bundle=analysis_bundle,
         )
         # Business analytics: charts, reports, schedules, and — for the
-        # owner's Neural Nexus business account — platform metrics. Personal
-        # avatar only; the pool is published by the lifespan.
+        # platform administrator — platform metrics. Personal avatar only;
+        # the pool is published by the lifespan.
         try:
             from src.anubis.utils.analytics.analytics_tools import (
                 build_analytics_tools,

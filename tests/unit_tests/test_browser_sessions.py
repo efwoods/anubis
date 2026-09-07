@@ -179,23 +179,6 @@ async def test_start_and_finish_store_an_encrypted_session(fake_browser):
 
 
 @pytest.mark.asyncio
-async def test_the_neural_nexus_login_marks_the_admin_role(fake_browser):
-    context = _context()
-    started = await browser_login.start_login(
-        context, user_id="auth0|admin", assistant_id="a", provider=get_provider("neural_nexus")
-    )
-    login = browser_login.get_live_login(started["login_id"])
-    assert login.site_url == "http://localhost:9600/connect_account/neural_nexus/login"
-    login.page.url = "http://localhost:9600/"
-    login.page.html = "<a href='/account'>Account</a>"
-    finished = await browser_login.finish_login(
-        context, login_id=started["login_id"], user_id="auth0|admin", existing_records=[]
-    )
-    assert finished["record"]["transport"]["role"] == "admin"
-    assert public_account_view(finished["record"])["role"] == "admin"
-
-
-@pytest.mark.asyncio
 async def test_logins_are_capped_and_a_custom_site_needs_an_address(fake_browser):
     context = _context()
     await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("openai"))

@@ -75,7 +75,6 @@ KIND_BANK = "bank"
 KIND_DEVELOPER = "developer"
 KIND_WEBSITE = "website"
 KIND_ANALYTICS = "analytics"
-KIND_PLATFORM = "platform"
 KIND_HOSTING = "hosting"
 ALL_KINDS = frozenset(
     {
@@ -89,7 +88,6 @@ ALL_KINDS = frozenset(
         KIND_DEVELOPER,
         KIND_WEBSITE,
         KIND_ANALYTICS,
-        KIND_PLATFORM,
         KIND_HOSTING,
     }
 )
@@ -160,7 +158,6 @@ CATEGORY_DEVICE = "device"
 CATEGORY_CUSTOM = "custom"
 CATEGORY_FINANCE = "finance"
 CATEGORY_DEVELOPMENT = "development"
-CATEGORY_BUSINESS = "business"
 CATEGORY_VENDOR = "vendor"
 CATEGORY_WEB = "web"
 CATEGORY_ANALYTICS = "analytics"
@@ -168,7 +165,6 @@ CATEGORY_HOSTING = "hosting"
 CATEGORY_ORDER: tuple[str, ...] = (
     CATEGORY_MAIL,
     CATEGORY_FINANCE,
-    CATEGORY_BUSINESS,
     CATEGORY_DEVELOPMENT,
     CATEGORY_VENDOR,
     CATEGORY_ANALYTICS,
@@ -579,23 +575,6 @@ ANTHROPIC_PROVIDER = ConnectedAccountProvider(
     recipe_key="anthropic",
 )
 
-NEURAL_NEXUS_PROVIDER = ConnectedAccountProvider(
-    name="neural_nexus",
-    kind=KIND_PLATFORM,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
-    display_name="Neural Nexus",
-    category=CATEGORY_BUSINESS,
-    summary="Usage, conversations, feedback, and revenue of the platform",
-    card_description=(
-        "Sign in to your Neural Nexus business account so the avatar can answer "
-        "questions about users, conversations, features, feedback, and revenue."
-    ),
-    icon_key="neural_nexus",
-    login_url="/connect_account/neural_nexus/login",
-    home_url="/",
-    recipe_key="neural_nexus",
-)
-
 WEBSITE_PROVIDER = ConnectedAccountProvider(
     name="website",
     kind=KIND_WEBSITE,
@@ -813,7 +792,6 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     for provider in (
         GMAIL_PROVIDER,
         PLAID_PROVIDER,
-        NEURAL_NEXUS_PROVIDER,
         GITHUB_PROVIDER,
         CLAUDE_CODE_PROVIDER,
         LANGSMITH_PROVIDER,

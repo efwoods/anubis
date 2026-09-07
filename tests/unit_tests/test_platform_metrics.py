@@ -143,13 +143,12 @@ async def test_growth_active_users_and_spend_groupings():
     assert by_default["columns"][0] == "day"
 
 
-def test_is_platform_admin_requires_both_the_connection_and_the_admin_id():
+def test_is_platform_admin_is_the_configured_admin_id_alone():
     context = SimpleNamespace(admin_user_id="admin")
-    assert is_platform_admin(context, [{"provider": "neural_nexus"}], "admin") is True
-    assert is_platform_admin(context, [{"provider": "neural_nexus"}], "someone") is False
-    assert is_platform_admin(context, [{"provider": "gmail"}], "admin") is False
-    assert is_platform_admin(context, [], "admin") is False
-    assert is_platform_admin(SimpleNamespace(admin_user_id=None), [{"provider": "neural_nexus"}], "admin") is False
+    assert is_platform_admin(context, [], "admin") is True
+    assert is_platform_admin(context, [{"provider": "gmail"}], "admin") is True
+    assert is_platform_admin(context, [{"provider": "gmail"}], "someone") is False
+    assert is_platform_admin(SimpleNamespace(admin_user_id=None), [], "admin") is False
 
 
 @pytest.mark.asyncio

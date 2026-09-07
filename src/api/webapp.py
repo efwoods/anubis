@@ -3743,7 +3743,7 @@ def _after_record_stored(provider: Any, record: dict[str, Any]) -> None:
         forget_cached_tools((record.get("transport") or {}).get("server_url") or "")
     # The first business-category connection seeds the weekly sprint digest
     # and the monthly spend digest; both are deliverable through the inbox.
-    if provider.category in ("finance", "business", "development", "vendor"):
+    if provider.category in ("finance", "development", "vendor"):
         try:
             from src.anubis.utils.analytics.schedules import (
                 get_schedule_repository,
@@ -3962,7 +3962,7 @@ async def connect_account_browser_start(
 ):
     """Open a live browser at a site's sign-in page for the owner to sign in on.
 
-    Body: ``provider`` (langsmith, openai, anthropic, neural_nexus, a social
+    Body: ``provider`` (langsmith, openai, anthropic, a social
     site, custom_site, or website) plus ``site_url`` and ``name`` for a custom
     site. Returns ``{login_id, view_url, nonce, expires_in}``; the card opens
     ``view_url`` (a path on this API) in the window it opened on the click.
@@ -4137,45 +4137,6 @@ async def connect_account_browser_cancel(request: Request, login_id: str):
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
     cancelled = await cancel_login(login_id, str(payload.get("user_id") or ""))
     return JSONResponse(content={"ok": False, "cancelled": cancelled}, status_code=200)
-
-
-@app.get("/connect_account/neural_nexus/login")
-async def connect_account_neural_nexus_login_page(request: Request):
-    """The Neural Nexus business sign-in page shown inside the live browser.
-
-    Posts email and password to this API's own ``/login`` route; on success the
-    page navigates to the home address, which the live-browser finish reads as
-    a signed-in session. Nothing here is served to the app's own users outside
-    the connect flow.
-    """
-    page = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in to Neural Nexus</title>
-<style>body{font-family:system-ui,sans-serif;background:#0b0b0d;color:#e8e8ea;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-form{background:#141418;border:1px solid #26262c;border-radius:16px;padding:2rem;width:22rem;display:flex;flex-direction:column;gap:.75rem}
-h1{font-size:1.2rem;margin:0 0 .5rem}input{padding:.6rem .8rem;border-radius:10px;border:1px solid #333;background:#0b0b0d;color:#fff}
-button{padding:.6rem;border-radius:999px;border:0;background:#f5b301;color:#111;font-weight:600;cursor:pointer}p{color:#a3a3a8;font-size:.85rem;margin:0}</style></head>
-<body><form id="login"><h1>Sign in to Neural Nexus</h1>
-<input name="email" type="email" placeholder="Email" required autocomplete="username">
-<input name="password" type="password" placeholder="Password" required autocomplete="current-password">
-<button type="submit">Sign in</button><p id="status"></p></form>
-<script>
-document.getElementById('login').addEventListener('submit', function (event) {
-  event.preventDefault();
-  var form = event.target; var status = document.getElementById('status');
-  status.textContent = 'Signing in…';
-  fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: form.email.value, password: form.password.value }) })
-    .then(function (response) { return response.json().then(function (body) { return { ok: response.ok, body: body }; }); })
-    .then(function (result) {
-      if (!result.ok) { status.textContent = (result.body && (result.body.detail || result.body.message)) || 'Sign-in failed.'; return; }
-      status.textContent = 'Signed in. Press "I\'m signed in" above.';
-      document.cookie = 'neural_nexus_signed_in=1; path=/; SameSite=Lax';
-      try { localStorage.setItem('neural_nexus_login', JSON.stringify({ at: Date.now(), email: form.email.value })); } catch (e) {}
-      form.innerHTML = '<h1>Signed in as ' + form.email.value + '</h1><p>Press "I\'m signed in" at the top of the window.</p><a href="/account">Account</a>';
-    })
-    .catch(function () { status.textContent = 'Sign-in failed.'; });
-});
-</script></body></html>"""
-    return HTMLResponse(page)
 
 
 @app.post("/connect_account/oauth/start")

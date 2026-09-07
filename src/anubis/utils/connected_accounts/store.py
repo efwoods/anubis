@@ -200,7 +200,6 @@ def public_account_view(record: dict[str, Any]) -> dict[str, Any]:
         else None,
         "site_url": transport.get("site_url"),
         "session_saved_at": browser_session.get("saved_at"),
-        "role": transport.get("role"),
     }
 
 

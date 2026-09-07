@@ -271,6 +271,33 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
         for (namespace, _key) in store.items
     )
 
+    # A press that only knew the request id (the reply was rated before the
+    # terminal frame named the row) is filed under the stored id the thread
+    # resolves from the quoted text, so a reload finds the rating.
+    early = await webapp_module.record_message_feedback_route(
+        request=request,
+        feedback=webapp_module.MessageFeedbackRequest(
+            assistant_id="a1",
+            thread_id="t1",
+            request_id="req-early",
+            feedback_type="dislike",
+            content="hello there",
+        ),
+        current_user=current_user,
+    )
+    early_payload = json.loads(early.body)
+    assert early_payload["message_id"] == "lc_run--1"
+    assert (message_feedback_namespace("u1", "a1"), "lc_run--1") in store.items
+    assert (message_feedback_namespace("u1", "a1"), "req-early") not in store.items
+    # Back to a like for the checks below.
+    await webapp_module.record_message_feedback_route(
+        request=request,
+        feedback=webapp_module.MessageFeedbackRequest(
+            assistant_id="a1", thread_id="t1", message_id="lc_run--1", feedback_type="like"
+        ),
+        current_user=current_user,
+    )
+
     # A feels-off mark with a note keeps the thumb and records what feels fake.
     felt = await webapp_module.record_message_feedback_route(
         request=request,
@@ -371,7 +398,8 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
     assert preferences_payload["message_feedback"] == [
         {
             "message_id": "lc_run--1",
-            "request_id": "req-1",
+            # The newest press that named a request id was the early one.
+            "request_id": "req-early",
             "thread_id": "t1",
             "feedback": {
                 "type": "dislike",

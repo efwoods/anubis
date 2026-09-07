@@ -8000,6 +8000,24 @@ async def record_message_feedback_route(
     elif feedback_type in ("feels_real", "feels_fake"):
         feels = feedback_type
 
+    # A press made before the browser knew the reply's stored id (only the
+    # request id, or only the quoted text) is still filed under the stored
+    # id when the thread can name the reply, so the rating comes back on the
+    # reply after a reload; stored replies carry no request id to match on.
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    resolved_reply: tuple[dict | None, dict | None] | None = None
+    if message_id is None and thread_id:
+        resolved_reply = await _resolve_rated_reply(
+            langgraph_client_headers,
+            thread_id=thread_id,
+            message_id=None,
+            request_id=request_id,
+            content=feedback.content,
+        )
+        resolved_avatar_message = resolved_reply[0]
+        if resolved_avatar_message and resolved_avatar_message.get("id"):
+            message_id = str(resolved_avatar_message["id"])
+
     recorded = await record_message_feedback(
         store,
         user_id,
@@ -8019,7 +8037,7 @@ async def record_message_feedback_route(
     try:
         learning = await _learn_from_message_feedback(
             request.app.state,
-            langgraph_client_headers={"API-KEY": current_user["API_KEY"]},
+            langgraph_client_headers=langgraph_client_headers,
             user_id=user_id,
             assistant_id=assistant_id,
             thread_id=thread_id,
@@ -8030,6 +8048,7 @@ async def record_message_feedback_route(
             feels=feels,
             comment=feedback.comment,
             content=feedback.content,
+            resolved_reply=resolved_reply,
         )
     except Exception as learning_error:  # noqa: BLE001 - the row is saved; learning is best effort
         logger.warning("Message feedback learning failed: %s", learning_error)
@@ -8209,6 +8228,32 @@ def _find_avatar_message_and_prompt(
     return messages[avatar_index], preceding_user_message
 
 
+async def _resolve_rated_reply(
+    langgraph_client_headers: dict,
+    *,
+    thread_id: str | None,
+    message_id: str | None,
+    request_id: str | None,
+    content: str | None,
+) -> tuple[dict | None, dict | None]:
+    """The stored reply a feedback press names, and the user message before it.
+
+    Read from the thread when the thread is known: by stored id, else by the
+    request id the reply streamed under, else by the text the browser quoted.
+    A thread that cannot be read resolves to nothing, and the caller falls
+    back to what the browser sent.
+    """
+    if not thread_id:
+        return None, None
+    try:
+        langgraph_client = get_client(headers=langgraph_client_headers)
+        messages = await _load_thread_message_dicts(langgraph_client, thread_id)
+    except Exception as thread_error:  # noqa: BLE001 - fall back to the browser's text
+        logger.debug("Could not load the rated thread %s: %s", thread_id, thread_error)
+        return None, None
+    return _find_avatar_message_and_prompt(messages, message_id, request_id, content)
+
+
 async def _learn_from_message_feedback(
     app_state,
     *,
@@ -8223,6 +8268,7 @@ async def _learn_from_message_feedback(
     feels: str | None,
     comment: str | None,
     content: str | None,
+    resolved_reply: tuple[dict | None, dict | None] | None = None,
 ) -> dict:
     """Turn one feedback press into continuous-learning records.
 
@@ -8243,17 +8289,17 @@ async def _learn_from_message_feedback(
     store = getattr(app_state, "store", None)
     if store is None:
         return {}
-    avatar_message: dict | None = None
-    preceding_user_message: dict | None = None
-    if thread_id:
-        try:
-            langgraph_client = get_client(headers=langgraph_client_headers)
-            messages = await _load_thread_message_dicts(langgraph_client, thread_id)
-            avatar_message, preceding_user_message = _find_avatar_message_and_prompt(
-                messages, message_id, request_id, content
-            )
-        except Exception as thread_error:  # noqa: BLE001 - fall back to the browser's text
-            logger.debug("Could not load the rated thread %s: %s", thread_id, thread_error)
+    avatar_message, preceding_user_message = (
+        resolved_reply
+        if resolved_reply is not None
+        else await _resolve_rated_reply(
+            langgraph_client_headers,
+            thread_id=thread_id,
+            message_id=message_id,
+            request_id=request_id,
+            content=content,
+        )
+    )
     avatar_text = (
         message_text(avatar_message.get("content")) if avatar_message else ""
     ).strip() or (content or "").strip()

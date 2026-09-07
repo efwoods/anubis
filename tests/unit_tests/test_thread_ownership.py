@@ -119,6 +119,30 @@ async def test_a_thread_is_not_served_to_a_different_user(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_shared_thread_is_readable_by_another_user(monkeypatch):
+    threads_api = _install_client(
+        monkeypatch,
+        {
+            "thread_metadata": {
+                "assistant_id": ASSISTANT_ID,
+                "user_id": OTHER_USER_ID,
+                "shared": True,
+            }
+        },
+    )
+
+    response = await webapp_module.get_thread_messages(
+        request=SimpleNamespace(),
+        thread_id=THREAD_ID,
+        assistant_id=ASSISTANT_ID,
+        current_user=_current_user(),
+    )
+
+    assert response.status_code == 200
+    assert threads_api.state_reads == [THREAD_ID]
+
+
+@pytest.mark.asyncio
 async def test_a_thread_without_ownership_metadata_is_still_readable(monkeypatch):
     """Threads predating the metadata must not become unreachable."""
     threads_api = _install_client(monkeypatch, {})

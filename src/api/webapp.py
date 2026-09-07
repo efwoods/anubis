@@ -6365,10 +6365,14 @@ async def get_thread_messages(
             detail="That conversation does not belong to this avatar.",
         )
     if owning_user_id is not None and owning_user_id != user_id:
-        raise HTTPException(
-            status_code=404,
-            detail="That conversation does not belong to this user.",
-        )
+        # A thread the owner has marked shared is readable by anyone with the
+        # link. Continuing it still requires owning the thread — this endpoint
+        # is get-only.
+        if not thread_metadata.get("shared"):
+            raise HTTPException(
+                status_code=404,
+                detail="That conversation does not belong to this user.",
+            )
 
     try:
         state = await langgraph_client.threads.get_state(thread_id=thread_id)
@@ -9225,7 +9229,7 @@ async def _build_media_entries_for_url(
         )
     elif reference_audio:
         # YouTube watch pages report Content-Type: text/html. Bypass the
-        # audio/* guard for those by pulling the audio track via yt_dlp.
+        # audio/* / video/* guard for those by pulling the audio track via yt_dlp.
         if _is_youtube_url(url_clean):
             from src.anubis.utils.classes.URLDocumentLoaderClass import (
                 _download_youtube_audio_b64,
@@ -9252,27 +9256,35 @@ async def _build_media_entries_for_url(
                 }
             )
         else:
-            await require_url_content_type_prefix(
-                url_clean, "audio/", "Reference audio"
-            )
             body, header_ct = await fetch_remote_url_bytes(url_clean)
             sniff = _sniff_media_category_from_bytes(body[:512])
-            audio_mime = (
+            media_mime = (
                 header_ct
-                if header_ct.startswith("audio/")
-                else (sniff if sniff.startswith("audio/") else header_ct)
+                if header_ct.startswith("audio/") or header_ct.startswith("video/")
+                else (sniff or header_ct)
             )
+            if not (
+                media_mime.startswith("audio/") or media_mime.startswith("video/")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Reference audio URL must resolve to audio/* or "
+                        f"video/* (got {media_mime!r})."
+                    ),
+                )
+            is_video = media_mime.startswith("video/")
             entries.append(
                 {
                     "filename": url_clean,
-                    "content_type": audio_mime,
+                    "content_type": media_mime,
                     "content": b"",
-                    "audio_url": url_clean,
+                    "video_url" if is_video else "audio_url": url_clean,
                     "user_id": user_id,
                     "assistant_id": assistant_id,
                     "reference_audio": True,
                     "reference_image": False,
-                    "base64_encoded_str": make_data_uri(audio_mime, body),
+                    "base64_encoded_str": make_data_uri(media_mime, body),
                     "namespace_filename": url_clean
                     if not "." in url_clean
                     else _namespace_safe_formatted_filename(url_clean),
@@ -10214,7 +10226,8 @@ async def update_avatar_identity_with_media(
 
     With **reference_image=true** or **reference_audio=true** the request must carry
     **exactly one** file or URL (a reference clip/image is a single item): the file
-    or URL must be an allowed still image, or resolve to ``audio/*``, respectively.
+    or URL must be an allowed still image, or resolve to ``audio/*`` or ``video/*``
+    (YouTube watch/shorts links included), respectively.
 
     With **create_reference_media_from_playlist=true** the batch has **no single target speaker**:
     every detected speaker is the avatar. Audio/video items are still diarized (so

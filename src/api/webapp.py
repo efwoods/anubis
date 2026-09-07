@@ -11414,6 +11414,7 @@ def _start_deep_research_job(
     subject_name: str,
     subject_description: str | None,
     research_hint: str | None,
+    assistant_metadata: dict | None = None,
 ):
     """Register and launch one research job; the pipeline runs as a background task."""
     from src.anubis.utils.research.deep_research import run_deep_research
@@ -11463,6 +11464,53 @@ def _start_deep_research_job(
             # load_consciousness reads on the next turn.
             if summary.get("applied"):
                 invalidate_store_cache_for_assistant(assistant_id)
+
+            # Media the research verified goes through the same pipeline an
+            # uploaded link takes, so a video or a PDF behind a verified fact is
+            # transcribed, described, and indexed rather than reduced to the
+            # sentences the page happened to expose. The batch is itself a
+            # background job, so this returns at once and the two run alongside
+            # each other; the pipeline skips anything this avatar already holds,
+            # so re-running the research re-ingests nothing.
+            media_source_urls = list(summary.get("media_source_urls") or [])
+            if media_source_urls:
+                add_research_event(
+                    job,
+                    {
+                        "type": "research_progress",
+                        "stage": "learning_from_media",
+                        "media_sources": len(media_source_urls),
+                    },
+                )
+                try:
+                    media_batch = await start_identity_media_job_from_chat(
+                        user_id=creator_id,
+                        assistant_id=assistant_id,
+                        assistant_ctx={
+                            "name": subject_name,
+                            "description": subject_description,
+                            "metadata": assistant_metadata or {},
+                        },
+                        current_user=current_user,
+                        attachments=[],
+                        urls=media_source_urls,
+                    )
+                except Exception as media_error:  # noqa: BLE001 - research still succeeded
+                    logger.exception(
+                        "Deep research job %s could not start the media batch: %s",
+                        job.job_id,
+                        media_error,
+                    )
+                    media_batch = {"status": "refused", "detail": str(media_error)}
+                summary["media_batch"] = media_batch
+                add_research_event(
+                    job,
+                    {
+                        "type": "research_progress",
+                        "stage": "media_started",
+                        "media_batch": media_batch,
+                    },
+                )
             # The source pages read are billed like uploaded documents.
             tokens_read = int(summary.get("tokens_read") or 0)
             if tokens_read > 0:
@@ -11559,6 +11607,7 @@ async def start_avatar_deep_research(
         subject_name=assistant.get("name") or assistant_id,
         subject_description=assistant.get("description"),
         research_hint=research_hint,
+        assistant_metadata=assistant.get("metadata") or {},
     )
     return JSONResponse(
         {

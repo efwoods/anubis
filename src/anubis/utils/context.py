@@ -818,6 +818,13 @@ class GlobalContext:
         },
     )
 
+    deep_research_max_media_items: int = field(
+        default=24,
+        metadata={
+            "description": "Ceiling on how many verified sources one deep-research run sends through the media pipeline, where each one may be transcribed. Sources are ranked by how many verified facts each supported, so the cap keeps the ones the research leaned on most. Zero switches the media hand-off off entirely. Env DEEP_RESEARCH_MAX_MEDIA_ITEMS."
+        },
+    )
+
     deep_research_follow_up_rounds: int = field(
         default=1,
         metadata={

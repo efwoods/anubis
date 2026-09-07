@@ -55,6 +55,7 @@ from src.anubis.utils.tools.identity.identity_tools import (
     edit_identity_fact,
     learn_information_about_the_user,
     recall_memories,
+    review_researched_facts,
     update_self_identity_mem_from_user_txt,
 )
 from src.anubis.utils.utility import reduce_docs
@@ -69,6 +70,7 @@ IDENTITY_TOOLS = [
     learn_information_about_the_user,
     edit_identity_fact,
     delete_identity_fact,
+    review_researched_facts,
 ]
 """Tools whose successful execution should trigger a ``load_consciousness`` refresh.
 

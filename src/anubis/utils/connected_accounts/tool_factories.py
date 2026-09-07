@@ -27,6 +27,7 @@ from src.anubis.utils.connected_accounts.providers import (
     KIND_ANALYTICS,
     KIND_BANK,
     KIND_CALENDAR,
+    KIND_CRYPTO,
     KIND_DEVELOPER,
     KIND_HOSTING,
     KIND_MAILBOX,
@@ -134,6 +135,7 @@ TOOL_FACTORIES: dict[str, ToolFactory] = {
     KIND_SOCIAL: _oauth_vendor_factory,
     KIND_CALENDAR: _oauth_vendor_factory,
     KIND_HOSTING: _oauth_vendor_factory,
+    KIND_CRYPTO: _oauth_vendor_factory,
     KIND_MESSAGING: _oauth_vendor_factory,
 }
 
@@ -165,6 +167,7 @@ _VENDOR_API_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "google_calendar": ("calendar_events",),
     "google_analytics": ("analytics_traffic_report",),
     "youtube": ("youtube_channel_stats",),
+    "coinbase": ("coinbase_accounts", "coinbase_transactions"),
 }
 
 def tool_names_for(provider: Any, record: dict[str, Any] | None = None) -> list[str]:

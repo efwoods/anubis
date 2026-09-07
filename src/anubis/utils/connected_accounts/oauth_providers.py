@@ -23,6 +23,7 @@ VENDOR_GOOGLE = "google"
 VENDOR_GITHUB = "github"
 VENDOR_X = "x"
 VENDOR_VERCEL = "vercel"
+VENDOR_COINBASE = "coinbase"
 
 GOOGLE_MAIL_SCOPE = "https://mail.google.com/"
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -45,6 +46,13 @@ def _x_identity(userinfo: dict[str, Any]) -> tuple[str, str]:
     data = userinfo.get("data") if isinstance(userinfo.get("data"), dict) else userinfo
     username = str(data.get("username") or "").strip()
     return username.lower(), f"@{username}" if username else "X account"
+
+
+def _coinbase_identity(userinfo: dict[str, Any]) -> tuple[str, str]:
+    data = userinfo.get("data") if isinstance(userinfo.get("data"), dict) else userinfo
+    identifier = str(data.get("id") or data.get("email") or "").strip().lower()
+    label = str(data.get("name") or data.get("email") or "Coinbase").strip()
+    return identifier, label
 
 
 def _vercel_identity(userinfo: dict[str, Any]) -> tuple[str, str]:
@@ -138,6 +146,17 @@ OAUTH_PROVIDERS: dict[str, OAuthProviderConfig] = {
         client_id_field="x_oauth_client_id",
         client_secret_field="x_oauth_client_secret",
         token_auth="basic",
+    ),
+    VENDOR_COINBASE: OAuthProviderConfig(
+        key=VENDOR_COINBASE,
+        authorization_url="https://login.coinbase.com/oauth2/auth",
+        token_url="https://login.coinbase.com/oauth2/token",
+        scopes=("wallet:user:read", "wallet:accounts:read", "wallet:transactions:read"),
+        userinfo_url="https://api.coinbase.com/v2/user",
+        identity_from_userinfo=_coinbase_identity,
+        client_id_field="coinbase_oauth_client_id",
+        client_secret_field="coinbase_oauth_client_secret",
+        userinfo_headers={"CB-VERSION": "2024-10-01"},
     ),
     VENDOR_VERCEL: OAuthProviderConfig(
         key=VENDOR_VERCEL,

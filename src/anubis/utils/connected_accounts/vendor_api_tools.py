@@ -24,7 +24,10 @@ VENDOR_API_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "google_calendar": ("calendar_events",),
     "google_analytics": ("analytics_traffic_report",),
     "youtube": ("youtube_channel_stats",),
+    "coinbase": ("coinbase_accounts", "coinbase_transactions"),
 }
+
+_COINBASE_HEADERS = {"CB-VERSION": "2024-10-01"}
 
 
 def _period(since: str | None, until: str | None, default_days: int = 30) -> tuple[datetime, datetime]:
@@ -358,6 +361,78 @@ def build_vendor_api_tools(context: Any, accounts: list[dict[str, Any]], *, stor
             return await analytics_report(token, property_id=property_id, since=since, until=until)
 
         tools.append(analytics_traffic_report)
+
+    if "coinbase" in providers_present:
+        select_coinbase = _selector(accounts, "coinbase")
+
+        @tool
+        async def coinbase_accounts(connection: str | None = None) -> dict[str, Any]:
+            """List the owner's Coinbase accounts with their balances (read-only).
+
+            Use for "what is my crypto balance" or "what do I hold on Coinbase".
+            """
+            record, error = select_coinbase(connection)
+            if error:
+                return error
+            token, failure = await _bearer(context, store, record)
+            if failure:
+                return failure
+            status_code, document = await _get_json(
+                "https://api.coinbase.com/v2/accounts", token, headers=_COINBASE_HEADERS, params={"limit": 100}
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            accounts_out = []
+            for entry in (document or {}).get("data") or []:
+                if not isinstance(entry, dict):
+                    continue
+                currency = entry.get("currency")
+                accounts_out.append({
+                    "id": entry.get("id"),
+                    "name": entry.get("name"),
+                    "currency": currency.get("code") if isinstance(currency, dict) else currency,
+                    "balance": (entry.get("balance") or {}).get("amount"),
+                    "native_balance": (entry.get("native_balance") or {}).get("amount"),
+                    "type": entry.get("type"),
+                })
+            return {"status": "ok", "accounts": accounts_out}
+
+        @tool
+        async def coinbase_transactions(account_id: str, limit: int = 25, connection: str | None = None) -> dict[str, Any]:
+            """List recent transactions for one Coinbase account (read-only).
+
+            ``account_id`` comes from coinbase_accounts. Use for "my recent
+            crypto transactions".
+            """
+            record, error = select_coinbase(connection)
+            if error:
+                return error
+            token, failure = await _bearer(context, store, record)
+            if failure:
+                return failure
+            status_code, document = await _get_json(
+                f"https://api.coinbase.com/v2/accounts/{account_id}/transactions", token,
+                headers=_COINBASE_HEADERS, params={"limit": max(1, min(int(limit or 25), 100))},
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            transactions = []
+            for entry in (document or {}).get("data") or []:
+                if not isinstance(entry, dict):
+                    continue
+                amount = entry.get("amount") or {}
+                transactions.append({
+                    "type": entry.get("type"),
+                    "status": entry.get("status"),
+                    "amount": amount.get("amount"),
+                    "currency": amount.get("currency"),
+                    "native_amount": (entry.get("native_amount") or {}).get("amount"),
+                    "description": entry.get("description") or (entry.get("details") or {}).get("title"),
+                    "created_at": entry.get("created_at"),
+                })
+            return {"status": "ok", "account_id": account_id, "transactions": transactions}
+
+        tools.extend([coinbase_accounts, coinbase_transactions])
 
     if "youtube" in providers_present:
         select_youtube = _selector(accounts, "youtube")

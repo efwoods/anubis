@@ -719,6 +719,20 @@ class GlobalContext:
         },
     )
 
+    coinbase_oauth_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Client ID of the Coinbase OAuth application the connect card opens Coinbase sign-in with, requesting read-only wallet scopes. Callback {CONNECT_OAUTH_REDIRECT_BASE_URL}/connect_account/oauth/callback. Env COINBASE_OAUTH_CLIENT_ID."
+        },
+    )
+
+    coinbase_oauth_client_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Client secret paired with COINBASE_OAUTH_CLIENT_ID. Sent only to Coinbase's token endpoint; never logged or returned. Env COINBASE_OAUTH_CLIENT_SECRET."
+        },
+    )
+
     vercel_oauth_client_id: str = field(
         default=None,
         metadata={

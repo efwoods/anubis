@@ -3894,29 +3894,10 @@ async def connect_account_plaid_link_token(
             provider=provider,
         )
     except PlaidLinkError as plaid_error:
-        if plaid_error.status_code == 503:
-            # Plaid is not configured on this server: the owner signs in on the
-            # bank's own website in the live browser instead. The card asks for
-            # the bank's sign-in page and an account name, then starts a
-            # browser sign-in for the finance provider.
-            return JSONResponse(
-                content={
-                    "action": "needs_site_url",
-                    "login_mode": "browser_session",
-                    "fallback": "browser_session",
-                    "login_endpoint": "/connect_account/browser/start",
-                    "login_request": {"provider": provider.name},
-                    "message": (
-                        "Sign in on your bank's own website. Enter the address of the "
-                        "bank's sign-in page and a name for this account."
-                    ),
-                    "fields": [
-                        {"name": "site_url", "label": "Bank sign-in page", "input_type": "url", "placeholder": "https://www.bankofamerica.com/", "required": True},
-                        {"name": "name", "label": "Account name", "input_type": "text", "placeholder": "Business checking", "required": False},
-                    ],
-                },
-                status_code=200,
-            )
+        # Financial accounts connect ONLY through Plaid Link (the bank's own
+        # secure login inside Plaid, with multiple institutions and accounts).
+        # There is no browser fallback for a bank; a 503 says Plaid must be
+        # configured on the server.
         raise HTTPException(status_code=plaid_error.status_code, detail=plaid_error.detail)
     except OAuthStateError as state_error:
         raise HTTPException(status_code=503, detail=str(state_error))
@@ -4042,6 +4023,11 @@ async def connect_account_browser_start(
     provider = get_provider(str(body.get("provider") or ""))
     if provider is None:
         raise HTTPException(status_code=400, detail="Unknown provider.")
+    if provider.kind == "bank":
+        raise HTTPException(
+            status_code=400,
+            detail="Financial accounts connect through Plaid, not a browser sign-in.",
+        )
     site_url = str(body.get("site_url") or "").strip() or None
     # Any provider can be signed in to on a page the owner names (a bank's
     # own website when Plaid is not configured, a vendor without an OAuth

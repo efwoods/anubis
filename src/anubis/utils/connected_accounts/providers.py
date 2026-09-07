@@ -76,6 +76,7 @@ KIND_DEVELOPER = "developer"
 KIND_WEBSITE = "website"
 KIND_ANALYTICS = "analytics"
 KIND_HOSTING = "hosting"
+KIND_CRYPTO = "crypto"
 ALL_KINDS = frozenset(
     {
         KIND_MAILBOX,
@@ -89,6 +90,7 @@ ALL_KINDS = frozenset(
         KIND_WEBSITE,
         KIND_ANALYTICS,
         KIND_HOSTING,
+        KIND_CRYPTO,
     }
 )
 
@@ -533,16 +535,37 @@ VERCEL_PROVIDER = ConnectedAccountProvider(
     home_url="https://vercel.com/dashboard",
 )
 
+COINBASE_PROVIDER = ConnectedAccountProvider(
+    name="coinbase",
+    kind=KIND_CRYPTO,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="Coinbase",
+    category=CATEGORY_FINANCE,
+    summary="Your crypto balances and transactions",
+    card_description=(
+        "Ask about your Coinbase balances, holdings, and recent transactions. "
+        "You sign in on Coinbase; the connection is read-only and can never "
+        "move funds."
+    ),
+    icon_key="coinbase",
+    oauth_config_key="coinbase",
+    oauth_scopes=("wallet:user:read", "wallet:accounts:read", "wallet:transactions:read"),
+    login_url="https://www.coinbase.com/signin",
+    home_url="https://www.coinbase.com/dashboard",
+)
+
 PLAID_PROVIDER = ConnectedAccountProvider(
     name="plaid",
     kind=KIND_BANK,
     credential_mechanism=MECHANISM_PLAID_LINK,
     display_name="Finance",
     category=CATEGORY_FINANCE,
-    summary="Bank and card accounts through Plaid",
+    summary="See your finances in chat",
     card_description=(
-        "Connect a bank or card so the avatar can report spending, burn rate, "
-        "and cost per customer."
+        "Ask about balances, recent spending, subscriptions, and investments "
+        "across linked accounts. Your bank sign-in stays with Plaid — Neural "
+        "Nexus never sees or stores your bank credentials. A financial "
+        "connection is read-only and can never move money."
     ),
     icon_key="bank",
 )
@@ -806,6 +829,7 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     for provider in (
         GMAIL_PROVIDER,
         PLAID_PROVIDER,
+        COINBASE_PROVIDER,
         GITHUB_PROVIDER,
         CLAUDE_CODE_PROVIDER,
         LANGSMITH_PROVIDER,

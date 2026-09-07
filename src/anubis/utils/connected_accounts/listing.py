@@ -70,11 +70,15 @@ def account_connection_view(record: dict[str, Any]) -> dict[str, Any]:
         # The owner typed the server URL; the listing shows the tool count
         # rather than reading the URL back (see public_account_view).
         sub_label = f"{len(tool_names)} tools"
+    elif view.get("credential_mechanism") == "browser_session":
+        # A record made by a live sign-in is a session, whatever its provider
+        # row's kind: a bank signed in on its own website reads through the
+        # session and has no Plaid account list, so it must not say "0 accounts".
+        host = view.get("account_address") or ""
+        sub_label = f"Signed in on {str(host).split('#', 1)[0]}" if host else "Signed in"
     elif provider is not None and provider.kind == "bank":
         count = int(view.get("account_count") or 0)
         sub_label = f"{count} account" + ("" if count == 1 else "s")
-    elif provider is not None and provider.credential_mechanism == "browser_session":
-        sub_label = view.get("site_url") or view.get("account_address") or "Signed in"
     elif provider is not None and provider.kind == "website":
         sub_label = view.get("site_url") or view.get("account_address") or ""
     if view.get("status") == "needs_reconnect":

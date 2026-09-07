@@ -51,7 +51,7 @@ def build_finance_tools(context: Any, accounts: list[dict[str, Any]], *, store: 
             return {"status": "unavailable", "error": "The finance module is not installed."}
         user_id = str(record.get("user_id") or "")
         try:
-            cursor_row = await finance.sync_cursor(pool, user_id, str(record.get("account_key") or ""))
+            cursor_row = await finance.read_sync_cursor(pool, user_id, record)
         except Exception:
             cursor_row = None
         minimum = int(getattr(context, "finance_sync_min_interval_minutes", None) or 360)

@@ -2162,6 +2162,22 @@ async def lifespan(app: FastAPI):
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
+        # Scheduled reports (weekly sprint digest, monthly spend digest, and
+        # any report the owner schedules in conversation) run through the
+        # graph on a fresh hidden thread and land in the inbox as notify items.
+        try:
+            from src.anubis.utils.analytics import schedules as report_schedules
+
+            app.state.report_scheduler = asyncio.create_task(
+                report_schedules.run_due_schedules_forever(
+                    app.state.context, run_question=_run_scheduled_report_question
+                )
+            )
+        except ImportError:
+            app.state.report_scheduler = None
+        except Exception as scheduler_error:  # noqa: BLE001 - startup must not fail
+            logger.error("Report scheduler could not start: %s", scheduler_error)
+            app.state.report_scheduler = None
         # Keep the unmodified-inference-model style baseline in step with MODEL:
         # a boot whose MODEL differs from the model recorded with the committed
         # baseline retrains it ONCE (coordinated through the shared store) or adopts
@@ -7422,6 +7438,185 @@ def _message_without_observation_header(message: Any) -> Any:
     if header is None:
         return message
     return {**message, "content": body}
+
+
+async def _run_scheduled_report_question(schedule: dict) -> dict:
+    """Run one scheduled report's question through the graph on a fresh thread.
+
+    The ``run_question`` callable the scheduler is wired with: the config has
+    the same shape as a ``/message`` turn for the owner and the personal
+    avatar, plus ``scheduled=True`` so no tool pauses on a sign-in card. The
+    reply text and the thread id are returned; the scheduler then finds the
+    report the avatar saved for that thread and creates the inbox item.
+    """
+    from langchain_core.messages import HumanMessage
+
+    user_id = str(schedule.get("user_id") or "")
+    assistant_id = str(schedule.get("assistant_id") or "")
+    question = str(schedule.get("question") or "")
+    thread_id = str(uuid4())
+    assistant_name = ""
+    assistant_metadata: dict = {}
+    try:
+        async with app.state.pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT name, metadata FROM assistant WHERE assistant_id = %s",
+                (assistant_id,),
+            )
+            row = await cursor.fetchone()
+        if row:
+            assistant_name = str(row[0] or "")
+            assistant_metadata = dict(row[1] or {}) if isinstance(row[1], dict) else {}
+    except Exception:
+        logger.debug("Could not read the assistant row for a scheduled report", exc_info=True)
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "assistant_ctx": {
+                "assistant_id": assistant_id,
+                "name": assistant_name,
+                "metadata": assistant_metadata,
+            },
+            "user_name": None,
+            "user_description": None,
+            "scheduled": True,
+            "include_quality_metrics": False,
+            "use_adapter_inference": False,
+        },
+        "run_id": str(uuid4()),
+    }
+    instruction = (
+        f"{question}\n\nThis is a scheduled report titled "
+        f"{schedule.get('title') or schedule.get('kind') or 'report'!r}. Use the connected "
+        "accounts and tools, chart every time series with make_chart, and finish by "
+        "calling save_report with kind "
+        f"{schedule.get('kind') or 'custom'!r} and a summary the owner can read in the inbox."
+    )
+    human_message = HumanMessage(
+        id=str(uuid4()),
+        content=instruction,
+        additional_kwargs={"hidden": True, "kind": "scheduled_report", "schedule_id": str(schedule.get("schedule_id") or "")},
+    )
+    result = await app.state.graph.ainvoke(
+        {"messages": [human_message]}, config=config, context=app.state.context
+    )
+    reply_text = ""
+    try:
+        messages = (result or {}).get("messages") or []
+        last = messages[-1] if messages else None
+        content = getattr(last, "content", "") if last is not None else ""
+        reply_text = content if isinstance(content, str) else str(content)
+    except Exception:
+        reply_text = ""
+    return {"thread_id": thread_id, "reply_text": reply_text}
+
+
+def _report_repository_or_503():
+    try:
+        from src.anubis.utils.analytics.reports import get_report_repository
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Reports are not available on this server.")
+    repository = get_report_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Reports are not available on this server.")
+    return repository
+
+
+@app.get("/reports")
+async def list_reports_route(
+    request: Request,
+    assistant_id: Optional[str] = None,
+    q: Optional[str] = None,
+    kind: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the owner's saved reports, newest first, searchable and filterable.
+
+    ``q`` searches the title and summary; ``kind`` filters by report kind;
+    ``since`` / ``until`` bound the creation date (ISO). Every analysis the
+    avatar saves with save_report, and every scheduled digest, appears here.
+    """
+    from src.anubis.utils.analytics.reports import public_report_view
+
+    repository = _report_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    rows = await repository.list(
+        user_id,
+        assistant_id=assistant_id or None,
+        query=(q or "").strip() or None,
+        kind=(kind or "").strip() or None,
+        since=since or None,
+        until=until or None,
+        limit=max(1, min(int(limit or 20), 100)),
+        offset=max(0, int(offset or 0)),
+    )
+    kinds = []
+    if assistant_id:
+        try:
+            kinds = await repository.kinds(user_id, assistant_id)
+        except Exception:
+            kinds = []
+    return JSONResponse(
+        content={"reports": [public_report_view(row) for row in rows], "kinds": kinds, "limit": limit, "offset": offset},
+        status_code=200,
+    )
+
+
+@app.get("/reports/{report_id}")
+async def get_report_route(
+    request: Request,
+    report_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return one saved report (charts inline)."""
+    from src.anubis.utils.analytics.reports import public_report_view
+
+    repository = _report_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.get(user_id, report_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such report.")
+    return JSONResponse(content={"report": public_report_view(row)}, status_code=200)
+
+
+@app.delete("/reports/{report_id}")
+async def delete_report_route(
+    request: Request,
+    report_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete one saved report of the owner."""
+    repository = _report_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    deleted = await repository.delete(user_id, report_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No such report.")
+    return JSONResponse(content={"deleted": True, "report_id": report_id}, status_code=200)
+
+
+@app.get("/report_schedules")
+async def list_report_schedules_route(
+    request: Request,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the scheduled reports of one avatar."""
+    try:
+        from src.anubis.utils.analytics.schedules import get_schedule_repository
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Schedules are not available on this server.")
+    repository = get_schedule_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Schedules are not available on this server.")
+    user_id = current_user["identities"][0]["user_id"]
+    rows = await repository.list_for_avatar(user_id, assistant_id)
+    return JSONResponse(content={"schedules": [dict(row, next_run_at=str(row.get("next_run_at")), last_run_at=str(row.get("last_run_at")) if row.get("last_run_at") else None, created_at=str(row.get("created_at"))) for row in rows]}, status_code=200)
 
 
 async def _pending_interrupt_for_thread(thread_id: str) -> Optional[dict]:

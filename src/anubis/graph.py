@@ -1217,6 +1217,24 @@ async def think(
             logger.debug("Analytics tools are not installed; skipping")
         except Exception:
             logger.exception("Could not build analytics tools; skipping")
+        try:
+            from src.anubis.utils.analytics.development_report import (
+                build_development_report_tools,
+            )
+
+            mailbox_tools = [
+                *mailbox_tools,
+                *build_development_report_tools(
+                    deep_agent_run_context,
+                    live_connections=live_connections,
+                    connected_accounts=connected_accounts,
+                    store=runtime.store,
+                ),
+            ]
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("Could not build the development report tool; skipping")
         # The agent inbox is the personal avatar's: report and resolve pending
         # items in conversation, or trigger a poll now.
         from src.anubis.utils.inbox.inbox_tools import build_inbox_tools

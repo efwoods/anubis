@@ -119,6 +119,16 @@ from src.anubis.utils.billing import (
     token_rate_limit_retry_after_seconds,
 )
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.geo import (
+    GEO_LOCATION_METADATA_KEY,
+    CheckinThrottle,
+    GeoLocationError,
+    avatars_near,
+    build_geo_location,
+    geo_location_of,
+    validate_coordinates,
+    within_bounds,
+)
 from src.anubis.utils.graph_interrupts import collect_pending_interrupts
 from src.anubis.utils.avatar_deletion import (
     purge_avatar_data,
@@ -1912,8 +1922,53 @@ def _assistant_without_metadata_if_public(
         if pub is True or (isinstance(pub, str) and pub.lower() == "true"):
             if viewer_user_id is not None and meta.get("user_id") == viewer_user_id:
                 return assistant
-            return {k: v for k, v in assistant.items() if k != "metadata"}
+            return _assistant_without_metadata(assistant)
     return assistant
+
+
+def _assistant_without_metadata(assistant: dict[str, Any]) -> dict[str, Any]:
+    """Drop the metadata, keeping the real-world pin as a public top-level field.
+
+    A geo-located avatar's pin is the one piece of metadata that is meant to be
+    public: the pin is what places the avatar on the world map and what tells a
+    passer-by that an avatar stands here. Everything else in the metadata — the
+    creator's ``user_id`` above all — stays private, so the pin is lifted out
+    rather than the metadata being kept.
+    """
+    stripped = {k: v for k, v in assistant.items() if k != "metadata"}
+    pin = geo_location_of(assistant)
+    if pin is not None:
+        stripped[GEO_LOCATION_METADATA_KEY] = pin
+    return stripped
+
+
+def _build_geo_location_or_400(
+    *,
+    latitude: Optional[float],
+    longitude: Optional[float],
+    location_name: Optional[str],
+    geofence_radius_meters: Optional[int],
+) -> Optional[dict[str, Any]]:
+    """Build the validated pin for a create or modify request, or None when unpinned.
+
+    A caller that sends one half of a coordinate pair has made a mistake worth
+    reporting rather than a pin worth guessing, so half a pair is a 400.
+    """
+    if latitude is None and longitude is None:
+        return None
+    if latitude is None or longitude is None:
+        raise HTTPException(
+            status_code=400, detail="Send both latitude and longitude."
+        )
+    try:
+        return build_geo_location(
+            latitude,
+            longitude,
+            location_name=location_name,
+            geofence_radius_meters=geofence_radius_meters,
+        )
+    except GeoLocationError as invalid_location:
+        raise HTTPException(status_code=400, detail=str(invalid_location)) from invalid_location
 
 
 import debugpy
@@ -2000,6 +2055,17 @@ async def lifespan(app: FastAPI):
     await inbox_package.ensure_inbox_tables(app.state.pool)
     inbox_package.set_inbox_repository(
         inbox_package.PostgresInboxRepository(app.state.pool)
+    )
+
+    # Geo-located avatars. Two throttles keep a moving phone from flooding the
+    # visit records and from notifying the same visitor about the same avatar on
+    # every position update. Both live in this process, so a deployment with
+    # several workers dedupes per worker rather than per fleet.
+    app.state.geo_checkin_throttle = CheckinThrottle(
+        app.state.context.geo_checkin_min_interval_seconds
+    )
+    app.state.geo_notify_throttle = CheckinThrottle(
+        app.state.context.geo_notify_cooldown_seconds
     )
     # Resolve from STRIPE_BILLING_CONFIG_JSON, else the file written by the compose
     # stripe-provision service (STRIPE_BILLING_CONFIG_FILE) — so a reprovision never
@@ -4404,12 +4470,20 @@ async def modify_avatar(
     new_avatar_name: Optional[str] = None,
     new_avatar_description: Optional[str] = None,
     is_personal_avatar_of_creator: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    location_name: Optional[str] = None,
+    geofence_radius_meters: Optional[int] = None,
+    clear_geo_location: bool = False,
 ):
     # Avatar name changes also need to be applied to the db for consistent identities
     logger.info("breakpoint")
     update_personal_avatar_flag = (
         "is_personal_avatar_of_creator" in request.query_params
     )
+    # The pin may be added, moved, or removed long after the avatar was created,
+    # so this route — not only /create_avatar — is where a place is set.
+    update_geo_location = latitude is not None or longitude is not None
     if not assistant_id:
         raise HTTPException(
             detail="Supply assistant_id for the assistant to modify.", status_code=400
@@ -4418,11 +4492,14 @@ async def modify_avatar(
         not new_avatar_name
         and not new_avatar_description
         and not update_personal_avatar_flag
+        and not update_geo_location
+        and not clear_geo_location
     ):
         raise HTTPException(
             detail=(
                 "Supply at least one of: new avatar name, new avatar description, "
-                "or is_personal_avatar_of_creator."
+                "is_personal_avatar_of_creator, a latitude and longitude, or "
+                "clear_geo_location."
             ),
             status_code=400,
         )
@@ -4434,6 +4511,24 @@ async def modify_avatar(
 
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
+
+    # Moving an avatar in the physical world is the creator's call alone: an
+    # avatar that stands at a memorial must not be re-pinned to a storefront by
+    # a stranger. The name and description paths lean on the LangGraph API key,
+    # but a pin change is gated here the way /share_avatar and /delete_avatar
+    # gate theirs.
+    geo_location = _build_geo_location_or_400(
+        latitude=latitude,
+        longitude=longitude,
+        location_name=location_name,
+        geofence_radius_meters=geofence_radius_meters,
+    )
+    if update_geo_location or clear_geo_location:
+        await resolve_assistant_for_creator(
+            assistant_id,
+            current_user,
+            action_description="change that avatar's real-world location",
+        )
 
     # Build a single update from only the supplied fields. ``metadata`` is merged
     # (not replaced) by the assistant update, so sending only the flag preserves
@@ -4450,6 +4545,12 @@ async def modify_avatar(
         update_kwargs["metadata"] = {
             "is_personal_avatar_of_creator": is_personal_avatar_of_creator
         }
+    if geo_location is not None or clear_geo_location:
+        # The assistant update merges metadata key by key, so writing None here
+        # removes the pin and leaves user_id and is_public untouched.
+        update_kwargs.setdefault("metadata", {})[GEO_LOCATION_METADATA_KEY] = (
+            None if clear_geo_location else geo_location
+        )
 
     try:
         result = await client.assistants.update(**update_kwargs)
@@ -5166,8 +5267,7 @@ async def delete_avatar(
 async def list_public_avatars(assistant_id: Optional[str] = None):
     public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
     return [
-        {k: v for k, v in assistant.items() if k != "metadata"}
-        for assistant in public_avatars_result
+        _assistant_without_metadata(assistant) for assistant in public_avatars_result
     ]
 
 
@@ -5205,6 +5305,194 @@ async def list_user_avatars(
     except Exception as e:
         error = f"Error in listing avatars: {e}"
         raise HTTPException(detail=error, status_code=500)
+
+
+""" Geo-located avatars """
+
+
+async def _public_geo_candidates() -> list[dict[str, Any]]:
+    """Every public avatar, as the map and the proximity search see them.
+
+    Only public avatars are placed on a map or announced to a passer-by: a pin
+    is an invitation to walk up to an avatar, and an avatar its creator has not
+    shared is not inviting anyone. The public listing already strips the
+    metadata and keeps the pin, so the entries returned here carry no creator
+    identifier.
+    """
+    return [
+        _assistant_without_metadata(assistant)
+        for assistant in await get_public_avatars()
+    ]
+
+
+def _resolve_search_radius(requested_radius_meters: Optional[float]) -> float:
+    """Resolve the radius to search, defaulted and capped by the configured limits."""
+    context = app.state.context
+    if requested_radius_meters is None or requested_radius_meters <= 0:
+        return float(context.geo_nearby_default_radius_meters)
+    return float(
+        min(requested_radius_meters, context.geo_nearby_max_radius_meters)
+    )
+
+
+@app.get("/avatars/geo")
+async def list_geo_avatars(
+    min_latitude: Optional[float] = None,
+    min_longitude: Optional[float] = None,
+    max_latitude: Optional[float] = None,
+    max_longitude: Optional[float] = None,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Every public avatar pinned to a place, optionally inside a map viewport.
+
+    This is what the world globe and the local map draw. Omitting the bounding
+    box returns every public pin on Earth; supplying part of the box leaves the
+    remaining sides open, and a box whose minimum longitude exceeds the maximum
+    wraps across the antimeridian the way a map viewport does.
+    """
+    avatars = []
+    for assistant in await _public_geo_candidates():
+        pin = geo_location_of(assistant)
+        if pin is None:
+            continue
+        if not within_bounds(
+            pin,
+            min_latitude=min_latitude,
+            min_longitude=min_longitude,
+            max_latitude=max_latitude,
+            max_longitude=max_longitude,
+        ):
+            continue
+        avatars.append(
+            {
+                "assistant_id": assistant.get("assistant_id"),
+                "name": assistant.get("name"),
+                "description": assistant.get("description"),
+                "geo_location": pin,
+            }
+        )
+    return {"avatars": avatars, "count": len(avatars)}
+
+
+@app.get("/avatars/nearby")
+async def list_nearby_avatars(
+    latitude: float,
+    longitude: float,
+    radius_meters: Optional[float] = None,
+    accuracy_meters: Optional[float] = None,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Public geo-located avatars around a point, nearest first.
+
+    ``accuracy_meters`` is the accuracy the device reported for the position; a
+    reading that is only accurate to eighty meters widens each geofence by that
+    much, so a visitor who is genuinely standing at the place is not told they
+    are outside because the phone is unsure where the phone is.
+    """
+    try:
+        latitude_value, longitude_value = validate_coordinates(latitude, longitude)
+    except GeoLocationError as invalid_location:
+        raise HTTPException(
+            status_code=400, detail=str(invalid_location)
+        ) from invalid_location
+    radius = _resolve_search_radius(radius_meters)
+    return {
+        "latitude": latitude_value,
+        "longitude": longitude_value,
+        "radius_meters": radius,
+        "avatars": avatars_near(
+            latitude_value,
+            longitude_value,
+            await _public_geo_candidates(),
+            radius_meters=radius,
+            accuracy_meters=accuracy_meters,
+        ),
+    }
+
+
+class GeoCheckin(BaseModel):
+    """One position report from a device that is watching for nearby avatars."""
+
+    latitude: float
+    longitude: float
+    accuracy_meters: Optional[float] = None
+
+
+@app.post("/geo/checkin")
+async def geo_checkin(
+    checkin: GeoCheckin,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Record that a person is standing near a geo-located avatar.
+
+    The web application posts here as the device moves. The response says which
+    avatars are nearby, which geofences the person is inside, which of those the
+    application should raise a notification for (at most one notification per
+    person per avatar per cooldown window), and which avatar to open in
+    camera-backed voice mode.
+    """
+    try:
+        latitude_value, longitude_value = validate_coordinates(
+            checkin.latitude, checkin.longitude
+        )
+    except GeoLocationError as invalid_location:
+        raise HTTPException(
+            status_code=400, detail=str(invalid_location)
+        ) from invalid_location
+
+    visitor_id = current_user["identities"][0]["user_id"]
+    radius = _resolve_search_radius(None)
+    nearby = avatars_near(
+        latitude_value,
+        longitude_value,
+        await _public_geo_candidates(),
+        radius_meters=radius,
+        accuracy_meters=checkin.accuracy_meters,
+    )
+    inside = [entry for entry in nearby if entry["inside_geofence"]]
+
+    notify = [
+        entry
+        for entry in inside
+        if app.state.geo_notify_throttle.allow(visitor_id, entry["assistant_id"])
+    ]
+
+    visits_recorded: list[str] = []
+    for entry in inside:
+        assistant_id = entry["assistant_id"]
+        if not app.state.geo_checkin_throttle.allow(visitor_id, assistant_id):
+            continue
+        # A visit is best effort: the notification and the offer to talk matter
+        # to the person standing there, and a failed write must not take those
+        # away.
+        try:
+            visited_at = datetime.now(tz=timezone.utc).isoformat()
+            await app.state.store.aput(
+                (visitor_id, assistant_id, "geo_visit"),
+                key=visited_at,
+                value={
+                    "value": {
+                        "visited_at": visited_at,
+                        "latitude": latitude_value,
+                        "longitude": longitude_value,
+                        "accuracy_meters": checkin.accuracy_meters,
+                        "distance_meters": entry["distance_meters"],
+                    }
+                },
+            )
+            visits_recorded.append(assistant_id)
+        except Exception:  # noqa: BLE001 - a visit record must never fail a check-in
+            logger.warning(
+                "Could not record a geo visit for avatar %s", assistant_id, exc_info=True
+            )
+
+    return {
+        "inside_geofence": inside,
+        "nearby": nearby,
+        "notify": notify,
+        "visits_recorded": visits_recorded,
+        "open_avatar_id": inside[0]["assistant_id"] if inside else None,
+    }
 
 
 async def label_spoken_turn_files(
@@ -5671,6 +5959,7 @@ async def message_avatar(
     captured_at: Optional[str] = Form(None),
     voice_mode: bool = Form(False),
     diarize: bool = Form(False),
+    at_place: bool = Form(False),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # ``diarize=true`` marks the attached audio as one live-voice utterance to
@@ -5890,6 +6179,12 @@ async def message_avatar(
         )
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    # ``at_place=true`` says the person sending this message is standing at the
+    # real-world place the avatar is pinned to, watching that place through a
+    # camera. This changes only how the avatar speaks (the YOUR PLACE section of
+    # the system prompt) — anyone may talk to a geo-located avatar from anywhere,
+    # so this is never a permission check.
+    config["configurable"]["visitor_present_at_place"] = bool(at_place)
     config["configurable"]["include_quality_metrics"] = include_quality_metrics
     config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
         current_user, adapter

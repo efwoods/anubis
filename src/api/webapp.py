@@ -5649,14 +5649,19 @@ async def label_spoken_turn_files(
     # Only the person talking, alone, is a direct turn. Anything else heard in
     # the room (other people, another avatar, this avatar's own playback, or
     # nothing intelligible) is triaged so the avatar does not answer itself.
-    if not combined:
+    nothing_was_heard = not combined
+    if nothing_was_heard:
         combined = "(nothing intelligible was heard)"
     if other_speakers or not owner_spoke:
         additional_kwargs = build_ambient_additional_kwargs(
             sources=[SOURCE_MICROPHONE],
             captured_at=datetime.now(UTC).isoformat(),
             voice_mode=True,
-            hidden=False,
+            # A spoken turn is shown so the owner can see what the room said.
+            # A turn where nothing intelligible was heard has nothing to show,
+            # and showing it put a bare internal header in the transcript as
+            # though the owner had typed it.
+            hidden=nothing_was_heard,
         )
         additional_kwargs["speakers"] = speakers_record
     else:
@@ -6632,6 +6637,31 @@ async def get_all_conversations(
         raise HTTPException(status_code=500, detail=f"Error loading threads: {exc}")
 
 
+def _message_without_observation_header(message: Any) -> Any:
+    """Drop an observation's internal header line from a message bound for a transcript.
+
+    Observations are written with an ``[AMBIENT_OBSERVATION id=... ]`` first
+    line so the avatar can tell a scene it noticed from a turn the person
+    typed. That line is addressed to the model. A visible spoken turn was
+    handing it to the reader as well, who saw the raw header attributed to
+    themselves.
+    """
+    from src.anubis.utils.ambient.observations import (
+        is_ambient_observation,
+        split_observation_text,
+    )
+
+    if not isinstance(message, dict) or not is_ambient_observation(message):
+        return message
+    content = message.get("content")
+    if not isinstance(content, str):
+        return message
+    header, body = split_observation_text(content)
+    if header is None:
+        return message
+    return {**message, "content": body}
+
+
 @app.get("/conversations/{thread_id}/messages")
 async def get_thread_messages(
     request: Request,
@@ -6691,6 +6721,11 @@ async def get_thread_messages(
             messages = without_stale_client_harvest_turns(
                 [message for message in messages if not is_hidden_message(message)]
             )
+            # A spoken turn that IS shown carries the same
+            # ``[AMBIENT_OBSERVATION ...]`` header the avatar reads, which is
+            # framing for the model and not something the owner typed. The
+            # transcript shows what the room said, not the framing.
+            messages = [_message_without_observation_header(m) for m in messages]
         return JSONResponse({"messages": messages})
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")

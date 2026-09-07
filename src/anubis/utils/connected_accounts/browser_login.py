@@ -288,6 +288,20 @@ async def stream_login(websocket: Any, login: LiveLogin, context: Any) -> None:
             if not isinstance(message, dict):
                 continue
             await dispatch_input(login, message, viewport)
+            # Push a fresh frame the instant the owner acts, rather than
+            # waiting for the next scheduled frame, so typing and clicking
+            # feel responsive instead of lagging a frame behind.
+            if str(message.get("type")) in ("text", "key", "mouse", "wheel"):
+                try:
+                    image = await login.page.screenshot(type="jpeg", quality=55)
+                    await _send_frame(
+                        websocket,
+                        base64.b64encode(image).decode("ascii"),
+                        viewport["width"],
+                        viewport["height"],
+                    )
+                except Exception:
+                    pass
     except asyncio.CancelledError:
         raise
     except Exception:

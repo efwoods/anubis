@@ -7391,6 +7391,17 @@ async def get_avatar_emotion_media_asset(
     )
 
 
+_AVATAR_MEDIA_JOB_TASKS: dict[str, asyncio.Task] = {}
+
+
+def _track_avatar_media_job_task(job_id: str, task: asyncio.Task) -> None:
+    """Remember a running job task so POST .../cancel can stop it."""
+    _AVATAR_MEDIA_JOB_TASKS[job_id] = task
+    task.add_done_callback(
+        lambda _done, tracked_id=job_id: _AVATAR_MEDIA_JOB_TASKS.pop(tracked_id, None)
+    )
+
+
 async def _run_emotion_media_job(
     job_id: str,
     user_id: str,
@@ -7407,6 +7418,7 @@ async def _run_emotion_media_job(
     from src.anubis.utils.billing.metering import persist_api_metrics_row
     from src.anubis.utils.media_assets import get_media_asset_repository
     from src.anubis.utils.media_assets.repository import (
+        JOB_STATE_CANCELLED,
         JOB_STATE_COMPLETED,
         JOB_STATE_FAILED,
         JOB_STATE_RUNNING,
@@ -7418,6 +7430,9 @@ async def _run_emotion_media_job(
 
     repository = get_media_asset_repository()
     if repository is None:
+        return
+    current = await repository.get_job(job_id)
+    if current and current.get("state") == JOB_STATE_CANCELLED:
         return
     await repository.update_job(job_id, state=JOB_STATE_RUNNING)
 
@@ -7470,6 +7485,13 @@ async def _run_emotion_media_job(
                 "moderation_reasons": manifest.get("moderation_reasons"),
             },
         )
+    except asyncio.CancelledError:
+        await repository.update_job(
+            job_id,
+            state=JOB_STATE_CANCELLED,
+            detail={"cancelled": True},
+        )
+        raise
     except Exception as job_error:  # noqa: BLE001
         logger.exception("Emotion media job %s failed: %s", job_id, job_error)
         await repository.update_job(
@@ -7584,7 +7606,7 @@ async def regenerate_avatar_emotion_media(
             "proceed_despite_moderation_risk": proceed_despite_moderation_risk,
         },
     )
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_emotion_media_job(
             job_id,
             user_id,
@@ -7599,6 +7621,7 @@ async def regenerate_avatar_emotion_media(
             proceed_despite_moderation_risk=proceed_despite_moderation_risk,
         )
     )
+    _track_avatar_media_job_task(job_id, task)
     return JSONResponse(
         status_code=202,
         content={"job_id": job_id, "status_url": f"/avatar_media_jobs/{job_id}"},
@@ -7666,6 +7689,43 @@ async def get_avatar_media_job(
     if job is None or job.get("user_id") != current_user["identities"][0]["user_id"]:
         raise HTTPException(status_code=404, detail="No such job.")
     return JSONResponse(job)
+
+
+@app.post("/avatar_media_jobs/{job_id}/cancel")
+async def cancel_avatar_media_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Stop a running emotion-media job before further vendor calls.
+
+    A clip already in flight at the vendor may still complete and be charged.
+    The owner confirms spend up front; this is how they take that spend back
+    mid-run.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_assets.repository import (
+        JOB_STATE_CANCELLED,
+        JOB_STATE_PENDING,
+        JOB_STATE_RUNNING,
+    )
+
+    repository = get_media_asset_repository()
+    if repository is None:
+        raise HTTPException(status_code=404, detail="No such job.")
+    job = await repository.get_job(job_id)
+    if job is None or job.get("user_id") != current_user["identities"][0]["user_id"]:
+        raise HTTPException(status_code=404, detail="No such job.")
+    if job.get("state") not in (JOB_STATE_PENDING, JOB_STATE_RUNNING):
+        return JSONResponse({"job_id": job_id, "state": job.get("state")})
+    await repository.update_job(
+        job_id,
+        state=JOB_STATE_CANCELLED,
+        detail={"cancelled": True},
+    )
+    task = _AVATAR_MEDIA_JOB_TASKS.get(job_id)
+    if task is not None:
+        task.cancel()
+    return JSONResponse({"job_id": job_id, "state": JOB_STATE_CANCELLED})
 
 
 async def _poll_training_voice_clones(context: Any) -> None:

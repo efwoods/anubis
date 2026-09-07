@@ -552,6 +552,71 @@ async def test_regeneration_creates_a_durable_job(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_an_owner_can_cancel_a_running_emotion_media_job(monkeypatch):
+    """Confirm starts the spend; cancel stops further image and video calls."""
+    from src.api import webapp as webapp_module
+
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    started = asyncio.Event()
+
+    async def _hang(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(60)
+        raise AssertionError("cancel should have stopped this vendor call")
+
+    monkeypatch.setattr(xai_client, "edit_image", _hang)
+    monkeypatch.setattr(xai_client, "generate_idle_loop", _hang)
+    _fake_subject_classifier(monkeypatch)
+
+    class _Store:
+        async def aget(self, namespace, key):
+            return SimpleNamespace(value={"reference_image_data": REFERENCE})
+
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), store=_Store(), pool=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _resolve(assistant_id, current_user, action_description=""):
+        return ({"assistant_id": assistant_id}, USER_ID)
+
+    monkeypatch.setattr(webapp_module, "resolve_assistant_for_creator", _resolve)
+
+    async def _no_metrics(*args, **kwargs):
+        return None
+
+    from src.anubis.utils.billing import metering
+
+    monkeypatch.setattr(metering, "persist_api_metrics_row", _no_metrics)
+
+    async def _json():
+        return {"assistant_id": ASSISTANT_ID, "only_missing": False}
+
+    owner = _signed_in_owner()
+    response = await webapp_module.regenerate_avatar_emotion_media(
+        request=SimpleNamespace(json=_json),
+        current_user=owner,
+    )
+    assert response.status_code == 202
+    job_id = __import__("json").loads(response.body)["job_id"]
+    await asyncio.wait_for(started.wait(), timeout=1)
+    cancel_response = await webapp_module.cancel_avatar_media_job(
+        job_id=job_id,
+        current_user=owner,
+    )
+    assert cancel_response.status_code == 200
+    assert __import__("json").loads(cancel_response.body)["state"] == "cancelled"
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if repository.jobs[job_id]["state"] == "cancelled":
+            break
+    assert repository.jobs[job_id]["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_a_targeted_loop_regenerates_only_that_loop(monkeypatch):
     _fake_vendor(monkeypatch)
     repository = InMemoryMediaAssetRepository()

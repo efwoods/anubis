@@ -59,6 +59,7 @@ JOB_STATE_PENDING = "pending"
 JOB_STATE_RUNNING = "running"
 JOB_STATE_COMPLETED = "completed"
 JOB_STATE_FAILED = "failed"
+JOB_STATE_CANCELLED = "cancelled"
 
 _CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS avatar_emotion_media (

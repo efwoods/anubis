@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 """ READ ME: STORE NAMESPACE STORAGE AND RETRIEVAL CONDITIONS
 
@@ -534,7 +534,21 @@ class AssistantFactAndContext(BaseModel):
 
     """
 
+    # The model writes this argument's name from memory, and the name stutters
+    # ("...from_the_user"). A model that drops the second "the" used to fail
+    # Pydantic validation outright, and the fact the user asked the avatar to
+    # learn was lost with it — the avatar then answered about the rest of the
+    # message as though nothing had been asked. The near-miss spellings are
+    # accepted so a fumbled argument name never costs someone a fact.
+    model_config = ConfigDict(populate_by_name=True)
+
     fact_shared_about_the_assistant_from_the_user: str = Field(
+        validation_alias=AliasChoices(
+            "fact_shared_about_the_assistant_from_the_user",
+            "fact_shared_about_the_assistant_from_user",
+            "fact_shared_about_assistant_from_the_user",
+            "fact_shared_about_the_assistant",
+        ),
         description="One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing."
     )
     fact_context: str = Field(

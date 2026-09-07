@@ -1397,6 +1397,14 @@ async def message_graph_sse(
     # The graph is drained on the pump's own task and consumed here through a
     # queue, so a stop request can wake this generator between frames and the
     # graph run can be cancelled from outside it (see ``message_stops``).
+    # The identifier LangSmith will give this turn's root run. Pinning it here,
+    # rather than letting the tracer mint one, is what lets the reply carry a
+    # link that opens THIS message's run inside the conversation's thread —
+    # without it the client can only link to the thread and the reader has to
+    # hunt for the turn.
+    langsmith_run_id = str(uuid4())
+    config = {**config, "run_id": langsmith_run_id}
+
     pump = GraphStreamPump(
         graph.astream(
             input=graph_input,
@@ -1572,6 +1580,7 @@ async def message_graph_sse(
             "type": "interrupt",
             "thread_id": thread_id,
             "request_id": request_id,
+            "run_id": langsmith_run_id,
             "interrupt": getattr(pending_interrupts[0], "value", None),
             "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
         }
@@ -1584,6 +1593,9 @@ async def message_graph_sse(
         "content": content,
         "thread_id": thread_id,
         "request_id": request_id,
+        # The turn's LangSmith run, so a reader can open this reply's own trace
+        # rather than the whole conversation's thread.
+        "run_id": langsmith_run_id,
         "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
     }
     response_metadata = (

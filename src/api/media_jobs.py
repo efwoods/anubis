@@ -97,6 +97,9 @@ class MediaJob:
     # ``error`` is finished with no result dict at all, which would discard the
     # count for a partially successful item.
     indexed_quote_document_count: int = 0
+    # Identity documents this job indexed. Fact verification runs after the
+    # batch only when the batch actually taught the avatar something.
+    indexed_identity_document_count: int = 0
     # Append-only history of progress payloads. Subscribers replay from index 0,
     # then wait on ``_updated`` for new appends — this supports late joiners and
     # multiple concurrent subscribers.
@@ -397,6 +400,13 @@ async def run_single_item_job(
                         if isinstance(quote_document_count, int) and quote_document_count > 0:
                             child.indexed_quote_document_count += quote_document_count
                             master.indexed_quote_document_count += quote_document_count
+                        identity_document_count = namespace_counts.get("identity", 0)
+                        if (
+                            isinstance(identity_document_count, int)
+                            and identity_document_count > 0
+                        ):
+                            child.indexed_identity_document_count += identity_document_count
+                            master.indexed_identity_document_count += identity_document_count
 
         # Decide the item's final status from what the graph actually did. A total
         # failure (errors and nothing indexed — e.g. a video with no subtitles and
@@ -436,6 +446,107 @@ async def run_single_item_job(
     except Exception as exc:  # noqa: BLE001 - surface every failure via the child job
         logger.exception("Media item job %s failed: %s", child.job_id, exc)
         finish_job(child, error=str(exc))
+
+
+async def _verify_facts_after_batch(
+    master: MediaJob, store: Any, context: Any, config: Dict[str, Any]
+) -> None:
+    """Fact-check what this batch taught the avatar, once the whole batch has indexed.
+
+    Media used to be indexed and believed. Nothing compared a new claim against
+    what the avatar already held, so an upload could quietly contradict a stored
+    fact and the avatar would hold both. This runs the verification stages deep
+    research already uses — extract the claims, cluster the ones making the same
+    claim alongside the facts the avatar holds, judge each cluster, apply what
+    agrees and hold back what contradicts — over the documents this batch
+    indexed.
+
+    Contradictions are written to the same store the researched ones use, so the
+    owner settles them through the one review, in the conversation and in avatar
+    settings.
+
+    Never raises. The documents are already indexed; an upload that could not be
+    fact-checked must not be reported as a failed upload.
+    """
+    if master.cancelled or store is None or not master.assistant_id:
+        return
+    if master.indexed_identity_document_count <= 0:
+        return
+    try:
+        from src.anubis.utils.research.deep_research import identity_namespace
+        from src.anubis.utils.research.media_fact_verification import (
+            verify_facts_from_media,
+        )
+
+        limit = int(getattr(context, "media_fact_verification_max_documents", 0) or 0)
+        if limit <= 0:
+            return
+
+        # The documents this batch indexed are the newest in the namespace, so
+        # the newest N are read back rather than threaded through every graph.
+        items = await store.asearch(
+            identity_namespace(master.user_id, master.assistant_id), limit=1000
+        )
+        documents = _newest_indexed_documents(items, limit=limit)
+        if not documents:
+            return
+
+        add_event(
+            master,
+            {
+                "type": "media_progress",
+                "stage": "verifying_facts",
+                "documents": len(documents),
+            },
+        )
+        assistant_ctx = (config.get("configurable") or {}).get("assistant_ctx") or {}
+        summary = await verify_facts_from_media(
+            store,
+            context,
+            creator_id=master.user_id,
+            assistant_id=master.assistant_id,
+            subject_name=str(assistant_ctx.get("name") or master.assistant_id),
+            documents=documents,
+            emit=lambda payload: add_event(master, {**payload, "type": "media_progress"}),
+            is_cancelled=lambda: master.cancelled,
+        )
+        add_event(
+            master,
+            {"type": "media_progress", "stage": "facts_verified", **summary},
+        )
+    except Exception as verification_error:  # noqa: BLE001 - the upload still succeeded
+        logger.warning(
+            "Batch %s could not verify the facts it indexed: %s",
+            master.job_id,
+            verification_error,
+            exc_info=True,
+        )
+
+
+def _newest_indexed_documents(items: Any, *, limit: int) -> List[Dict[str, Any]]:
+    """The most recently indexed identity documents, newest first.
+
+    A store item wraps the document as serialized JSON; only the page content and
+    metadata are needed here, so the rest is left alone.
+    """
+    documents: List[Dict[str, Any]] = []
+    for item in items or []:
+        value = getattr(item, "value", None) or {}
+        document = value.get("document") if isinstance(value, dict) else None
+        kwargs = (document or {}).get("kwargs") if isinstance(document, dict) else None
+        if not isinstance(kwargs, dict):
+            continue
+        documents.append(
+            {
+                "page_content": kwargs.get("page_content") or "",
+                "metadata": kwargs.get("metadata") or {},
+            }
+        )
+    documents.sort(
+        key=lambda entry: str((entry.get("metadata") or {}).get("created_at") or ""),
+        reverse=True,
+    )
+    return documents[:limit]
 
 
 async def _calibrate_ground_truth_after_batch(
@@ -687,6 +798,12 @@ async def run_batch_media_job(
         # lands in the master's duration, and subscribers see the stage. A
         # detached task would escape cancellation and could outlive the registry.
         await _calibrate_ground_truth_after_batch(master, store, context)
+
+        # Then check what the batch just taught the avatar against what the
+        # avatar already believed. Same place, same reasons: downstream of every
+        # ingestion path, reached once per upload, and awaited inside the
+        # master's own task so a cancel tears it down with the batch.
+        await _verify_facts_after_batch(master, store, context, config)
 
         children = [spec["child"] for spec in items]
         statuses = [c.status for c in children]

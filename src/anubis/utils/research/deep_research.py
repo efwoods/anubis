@@ -772,10 +772,23 @@ def verified_source_urls(
 # ── writing facts and proposals into the store ──────────────────────────────
 
 
+MEDIA_FACT_SOURCE = "media_verification"
+
+
 def build_identity_document(
-    verified: dict[str, Any], *, creator_id: str, assistant_id: str, subject_name: str
+    verified: dict[str, Any],
+    *,
+    creator_id: str,
+    assistant_id: str,
+    subject_name: str,
+    source: str = RESEARCH_FACT_SOURCE,
 ) -> Document:
-    """One researched fact, shaped like every other fact the avatar has learned."""
+    """One verified fact, shaped like every other fact the avatar has learned.
+
+    ``source`` records where the fact came from — the web, or the media the
+    avatar was taught from — so a later reader can tell a researched claim from
+    one drawn out of the owner's own uploads.
+    """
     from src.anubis.utils.tools.identity.identity_tools import wrap_fact_with_context
 
     document_id = str(uuid.uuid4())
@@ -789,7 +802,7 @@ def build_identity_document(
             "document_id": document_id,
             "fact": verified["proposed_fact"],
             "fact_context": verified.get("fact_context") or "",
-            "source": RESEARCH_FACT_SOURCE,
+            "source": source,
             "source_urls": list(verified.get("supporting_source_urls") or []),
             "verification_status": verified["status"],
             "subject_name": subject_name,

@@ -818,6 +818,20 @@ class GlobalContext:
         },
     )
 
+    media_fact_verification_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the facts in freshly indexed media are extracted, cross-checked against what the avatar already holds, and verified — applying what agrees and holding contradictions for the owner to settle. Env MEDIA_FACT_VERIFICATION_ENABLED."
+        },
+    )
+
+    media_fact_verification_max_documents: int = field(
+        default=40,
+        metadata={
+            "description": "Ceiling on how many freshly indexed documents one media batch fact-checks. Extraction and judging both cost model calls, so a larger upload indexes everything and verifies the first this-many documents. Zero switches the verification off. Env MEDIA_FACT_VERIFICATION_MAX_DOCUMENTS."
+        },
+    )
+
     deep_research_max_media_items: int = field(
         default=24,
         metadata={

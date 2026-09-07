@@ -36,6 +36,7 @@ class GeoLocationError(ValueError):
 
 
 def validate_coordinates(latitude: Any, longitude: Any) -> tuple[float, float]:
+    """Return the coordinate pair as floats, refusing anything off the globe."""
     try:
         latitude_value = float(latitude)
         longitude_value = float(longitude)
@@ -51,6 +52,7 @@ def validate_coordinates(latitude: Any, longitude: Any) -> tuple[float, float]:
 
 
 def validate_geofence_radius(radius_meters: Any) -> int:
+    """Return the geofence radius in whole meters, defaulting when unset."""
     if radius_meters is None:
         return DEFAULT_GEOFENCE_RADIUS_METERS
     try:
@@ -72,7 +74,7 @@ def build_geo_location(
     location_name: str | None = None,
     geofence_radius_meters: Any = None,
 ) -> dict[str, Any]:
-    """The validated ``geo_location`` metadata block."""
+    """Build the validated ``geo_location`` metadata block for an avatar."""
     latitude_value, longitude_value = validate_coordinates(latitude, longitude)
     return {
         "latitude": latitude_value,
@@ -84,7 +86,7 @@ def build_geo_location(
 
 
 def geo_location_of(assistant: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The avatar's ``geo_location`` block from either metadata or a public listing."""
+    """Read an avatar's ``geo_location`` block from metadata or a public listing."""
     if not assistant:
         return None
     metadata = assistant.get("metadata")
@@ -221,10 +223,12 @@ class CheckinThrottle:
     """Per-visitor, per-avatar throttle on recorded visits (process-local)."""
 
     def __init__(self, min_interval_seconds: float):
+        """Throttle each visitor and avatar pair to one event per interval."""
         self.min_interval_seconds = float(min_interval_seconds)
         self._last_recorded: dict[tuple[str, str], float] = {}
 
     def allow(self, visitor_id: str, assistant_id: str, now: float | None = None) -> bool:
+        """Say whether this visitor and avatar pair may record an event now."""
         now = time.monotonic() if now is None else now
         key = (visitor_id, assistant_id)
         last = self._last_recorded.get(key)

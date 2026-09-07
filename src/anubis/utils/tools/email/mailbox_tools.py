@@ -90,7 +90,10 @@ def build_mailbox_tools(
         return []
 
     mailbox_accounts = [
-        record for record in accounts if record.get("kind") == "mailbox"
+        record
+        for record in accounts
+        if record.get("kind") == "mailbox"
+        and record.get("credential_mechanism") != "browser_session"
     ]
     if not mailbox_accounts:
         return []

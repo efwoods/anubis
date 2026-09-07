@@ -2214,9 +2214,26 @@ async def lifespan(app: FastAPI):
         except Exception as baseline_check_error:  # noqa: BLE001 - startup must not fail
             logger.error("Baseline provenance check failed: %s", baseline_check_error)
             app.state.baseline_retrain_task = None
+        # Continuous learning: the background sweep that finalizes conversation
+        # sentiment history, folds ratings into learned preferences, and infers
+        # preferences once an account has gone idle (see learning/bulk_learning.py).
+        app.state.learning_sweeper_task = None
+        if str(app.state.context.learning_sweep_enabled or "").upper() == "TRUE":
+            from src.anubis.utils.learning.bulk_learning import run_learning_sweeper
+
+            app.state.learning_sweeper_task = asyncio.create_task(
+                run_learning_sweeper(app)
+            )
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
+        sweeper_task = getattr(app.state, "learning_sweeper_task", None)
+        if sweeper_task is not None:
+            sweeper_task.cancel()
+            try:
+                await sweeper_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
         purge_task = getattr(app.state, "usage_analytics_purge_task", None)
         if purge_task is not None:
             purge_task.cancel()
@@ -4211,11 +4228,48 @@ async def connect_account_oauth_start(
             server_url=body.get("server_url"),
             name=body.get("name"),
         )
-    except (OAuthFlowError, McpOAuthError) as flow_error:
+    except OAuthFlowError as flow_error:
+        if flow_error.status_code == 503 and provider.login_url:
+            # No OAuth app for this vendor on this server: the owner signs in
+            # on the vendor's own login page in the live browser instead, and
+            # the account is used through the signed-in session. Every
+            # account stays connectable without a vendor console step.
+            return JSONResponse(
+                content=await _start_browser_fallback(
+                    request, current_user, provider, personal_avatar
+                ),
+                status_code=200,
+            )
+        raise HTTPException(status_code=flow_error.status_code, detail=flow_error.detail)
+    except McpOAuthError as flow_error:
         raise HTTPException(status_code=flow_error.status_code, detail=flow_error.detail)
     except OAuthStateError as state_error:
         raise HTTPException(status_code=503, detail=str(state_error))
     return JSONResponse(content=started, status_code=200)
+
+
+async def _start_browser_fallback(
+    request: Request, current_user: dict, provider: Any, personal_avatar: dict
+) -> dict:
+    """Open the live sign-in browser for a vendor whose OAuth app is not configured."""
+    from src.anubis.utils.connected_accounts.browser_login import start_login
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    user_id = current_user["identities"][0]["user_id"]
+    try:
+        started = await start_login(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+            site_url=provider.login_url,
+            name=provider.display_name,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    started["login_mode"] = "browser_session"
+    started["fallback"] = "browser_session"
+    return started
 
 
 @app.get("/connect_account/oauth/callback")
@@ -6697,10 +6751,11 @@ async def message_avatar(
     # clip rides the same call as another source, so the avatar always receives
     # one message per capture tick. Signed-in callers only; the API enforces a
     # minimum interval per thread.
-    # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
-    # data-collection / preference-learning pipeline is intentionally deferred
-    # while the upload + evaluation pipeline ships first; the parameters exist
-    # now so the frontend can wire its UI without a breaking API change later.
+    # ``like`` / ``dislike`` rate the avatar's previous reply on ``thread_id``;
+    # ``feedback`` marks this message as feedback about the avatar (stored and
+    # used from the very next reply). Both are collected by the continuous
+    # learning pipeline (src/anubis/utils/learning/) and folded into learned
+    # preferences by the background sweep once the account has gone idle.
 
     # allow for select avatar in query and anonymous user for a dedicated endpoint
 
@@ -6951,6 +7006,23 @@ async def message_avatar(
 
     # store = app.state.store
     graph = app.state.graph
+
+    # Inline continuous-learning signals carried on the message itself. Best
+    # effort: a failed store write must never cost the user the reply.
+    if (like or dislike or feedback) and thread_id:
+        try:
+            await _apply_inline_message_feedback(
+                request.app.state,
+                langgraph_client_headers=langgraph_client_headers,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                like=like,
+                dislike=dislike,
+                feedback_text=message if feedback else None,
+            )
+        except Exception as inline_feedback_error:  # noqa: BLE001
+            logger.warning("Inline message feedback failed: %s", inline_feedback_error)
 
     # Uploaded files were already processed above (before enforcement) so the
     # pre-call estimate could cover them; reuse those results here.
@@ -7799,7 +7871,10 @@ class MessageFeedbackRequest(BaseModel):
     # The request the reply streamed under, for replies rated before their
     # stored id was known.
     request_id: str | None = None
-    feedback_type: str  # 'like' | 'dislike'
+    # 'like' | 'dislike' | 'rating' | 'comment' | 'feels_real' | 'feels_fake'
+    feedback_type: str
+    # For 'rating': 1-5, where 3 and above counts as positive.
+    rating: float | None = None
     comment: str | None = None
     # The rated reply's text, quoted in the embedded record.
     content: str | None = None
@@ -7811,17 +7886,29 @@ class MessageFeedbackRequest(BaseModel):
     observation_summary: str | None = None
 
 
+MESSAGE_FEEDBACK_TYPES = ("like", "dislike", "rating", "comment", "feels_real", "feels_fake")
+
+
 @app.post("/message_feedback")
 async def record_message_feedback_route(
+    request: Request,
     feedback: MessageFeedbackRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Record a like, a dislike, or a written note on one avatar reply.
+    """Record the conversation partner's reaction to one avatar reply.
 
-    The record lives in the LangGraph store under the caller's own namespace
-    for this avatar, so the transcript route can put the rating back on the
-    reply after a reload and ``GET /avatar_preferences/{assistant_id}`` can
-    return everything the caller has said about this avatar's replies.
+    ``feedback_type`` is ``like`` or ``dislike`` (a thumb), ``rating`` (with
+    ``rating`` on a 1-5 scale; 3 and above counts as positive), ``comment``
+    (a written note; ``comment`` required), or ``feels_real`` / ``feels_fake``
+    (what feels real or off about this reply; ``comment`` optional, the reply
+    itself is the example). A thumb with a ``comment`` records both.
+
+    The row the browser restores lives under ``(user_id, assistant_id,
+    "message_feedback")``. The same press also teaches the avatar: thumbs and
+    ratings become rated-message records the background sweep folds into
+    learned preferences, and notes and feels-real statements are stored for
+    the very next reply (see src/anubis/utils/learning/). Notes and marks that
+    answer a notification card are learned as ambient precedent as well.
     """
     from src.anubis.utils.message_feedback import (
         feedback_view,
@@ -7829,63 +7916,113 @@ async def record_message_feedback_route(
     )
 
     feedback_type = (feedback.feedback_type or "").strip().lower()
-    if feedback_type not in ("like", "dislike"):
-        raise HTTPException(status_code=400, detail="feedback_type must be like or dislike.")
+    if feedback_type not in MESSAGE_FEEDBACK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"feedback_type must be one of: {', '.join(MESSAGE_FEEDBACK_TYPES)}.",
+        )
     if not (feedback.message_id or "").strip() and not (feedback.request_id or "").strip():
         raise HTTPException(
             status_code=400, detail="message_id or request_id is required."
         )
+    if feedback_type == "rating" and feedback.rating is None:
+        raise HTTPException(status_code=400, detail="rating is required for feedback_type=rating.")
+    if feedback_type == "comment" and not (feedback.comment or "").strip():
+        raise HTTPException(status_code=400, detail="comment is required for feedback_type=comment.")
+
+    store = getattr(app.state, "store", None)
+    user_id = current_user["identities"][0]["user_id"]
+    assistant_id = feedback.assistant_id.strip()
+    thread_id = (feedback.thread_id or "").strip() or None
+    message_id = (feedback.message_id or "").strip() or None
+    request_id = (feedback.request_id or "").strip() or None
+
+    thumb: str | None = None
+    feels: str | None = None
+    rating_score: float | None = None
+    if feedback_type in ("like", "dislike"):
+        thumb = feedback_type
+    elif feedback_type == "rating":
+        rating_score = float(feedback.rating)
+        thumb = "like" if rating_score >= 3.0 else "dislike"
+    elif feedback_type in ("feels_real", "feels_fake"):
+        feels = feedback_type
+
     recorded = await record_message_feedback(
-        getattr(app.state, "store", None),
-        current_user["identities"][0]["user_id"],
-        feedback.assistant_id.strip(),
-        thread_id=(feedback.thread_id or "").strip() or None,
-        message_id=(feedback.message_id or "").strip() or None,
-        request_id=(feedback.request_id or "").strip() or None,
-        feedback_type=feedback_type,
+        store,
+        user_id,
+        assistant_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        request_id=request_id,
+        feedback_type=thumb,
         comment=feedback.comment,
         content=feedback.content,
+        feels=feels,
+        rating_score=rating_score,
     )
+
+    # Teach the avatar from the same press (rated message, note, feels-real).
+    learning: dict | None = None
+    try:
+        learning = await _learn_from_message_feedback(
+            request.app.state,
+            langgraph_client_headers={"API-KEY": current_user["API_KEY"]},
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            message_id=message_id,
+            request_id=request_id,
+            thumb=thumb,
+            rating_score=rating_score,
+            feels=feels,
+            comment=feedback.comment,
+            content=feedback.content,
+        )
+    except Exception as learning_error:  # noqa: BLE001 - the row is saved; learning is best effort
+        logger.warning("Message feedback learning failed: %s", learning_error)
+
     ambient_decision = None
-    if (feedback.observation_id or "").strip():
+    if (feedback.observation_id or "").strip() and (thumb or feels):
         from src.anubis.utils.ambient.preferences import (
             ambient_decision_view,
             record_ambient_decision,
             record_ambient_preference,
         )
 
-        store = getattr(app.state, "store", None)
-        user_id = current_user["identities"][0]["user_id"]
         observation_kind = feedback.observation_kind or "other"
         summary = feedback.observation_summary or ""
+        liked = thumb == "like" or (thumb is None and feels == "feels_real")
         await record_ambient_preference(
             store,
             user_id,
-            feedback.assistant_id.strip(),
+            assistant_id,
             observation_kind=observation_kind,
             summary=summary,
-            decision="liked_action" if feedback_type == "like" else "disliked_action",
+            decision="liked_action" if liked else "disliked_action",
             note=feedback.comment,
         )
         ambient_decision = ambient_decision_view(
             await record_ambient_decision(
                 store,
                 user_id,
-                feedback.assistant_id.strip(),
+                assistant_id,
                 observation_id=feedback.observation_id.strip(),
                 observation_kind=observation_kind,
                 summary=summary,
                 decision="rated_after_action",
-                rated_after_action=feedback_type,
+                rated_after_action="like" if liked else "dislike",
             )
         )
     return JSONResponse(
         {
             "recorded": recorded is not None,
+            "feedback_type": feedback_type,
             "ambient_decision": ambient_decision,
-            "message_id": recorded.get("message_id") if recorded else feedback.message_id,
-            "request_id": recorded.get("request_id") if recorded else feedback.request_id,
+            "message_id": recorded.get("message_id") if recorded else message_id,
+            "request_id": recorded.get("request_id") if recorded else request_id,
             "feedback": feedback_view(recorded),
+            "learning": learning,
         }
     )
 
@@ -7904,6 +8041,7 @@ async def get_avatar_preferences_route(
     after every press so what is on screen is what is stored.
     """
     from src.anubis.utils.ambient.preferences import list_ambient_decisions
+    from src.anubis.utils.learning.feedback import list_learned_records
     from src.anubis.utils.message_feedback import feedback_view, list_message_feedback
 
     store = getattr(app.state, "store", None)
@@ -7912,10 +8050,16 @@ async def get_avatar_preferences_route(
         store, user_id, assistant_id.strip(), thread_id=(thread_id or "").strip() or None
     )
     decisions = await list_ambient_decisions(store, user_id, assistant_id.strip())
+    learned = await list_learned_records(store, user_id, assistant_id.strip())
     return JSONResponse(
         {
             "assistant_id": assistant_id.strip(),
             "thread_id": (thread_id or "").strip() or None,
+            # What the avatar has learned about this person: dictated and
+            # inferred preferences, feedback messages, and what feels real.
+            "learned_preferences": learned.get("preferences", []),
+            "feedback_messages": learned.get("feedback_messages", []),
+            "what_feels_real": learned.get("what_feels_real", []),
             "message_feedback": [
                 {
                     "message_id": record.get("message_id"),
@@ -7950,6 +8094,225 @@ async def _with_stored_message_feedback(
     except Exception:  # noqa: BLE001 - a rating must never hide a transcript
         logger.debug("Could not attach message feedback", exc_info=True)
         return messages
+
+
+async def _load_thread_message_dicts(langgraph_client, thread_id: str) -> list[dict]:
+    """The checkpointed messages of one thread as plain dicts (``id``, ``type``, ``content``)."""
+    state = await langgraph_client.threads.get_state(thread_id=thread_id)
+    messages = state.get("values", {}).get("messages", []) if state else []
+    return [message for message in messages if isinstance(message, dict)]
+
+
+def _message_dict_type(message: dict) -> str:
+    return str(message.get("type") or message.get("role") or "")
+
+
+def _message_dict_request_id(message: dict) -> str:
+    response_metadata = message.get("response_metadata") or {}
+    request_id = message.get("request_id") or (
+        response_metadata.get("request_id") if isinstance(response_metadata, dict) else None
+    )
+    return str(request_id or "")
+
+
+def _find_avatar_message_and_prompt(
+    messages: list[dict], message_id: str | None, request_id: str | None = None
+) -> tuple[dict | None, dict | None]:
+    """The avatar message ``message_id`` names (else the one streamed under
+    ``request_id``, else the latest one) and the user message before it."""
+    avatar_index: int | None = None
+    for index, message in enumerate(messages):
+        if _message_dict_type(message) not in ("ai", "assistant"):
+            continue
+        if message.get("tool_calls"):
+            continue
+        if message_id is not None:
+            if message.get("id") == message_id:
+                avatar_index = index
+                break
+            continue
+        if request_id:
+            if _message_dict_request_id(message) == request_id:
+                avatar_index = index
+                break
+            continue
+        avatar_index = index
+    if avatar_index is None:
+        return None, None
+    preceding_user_message = None
+    for message in reversed(messages[:avatar_index]):
+        if _message_dict_type(message) in ("human", "user"):
+            preceding_user_message = message
+            break
+    return messages[avatar_index], preceding_user_message
+
+
+async def _learn_from_message_feedback(
+    app_state,
+    *,
+    langgraph_client_headers: dict,
+    user_id: str,
+    assistant_id: str,
+    thread_id: str | None,
+    message_id: str | None,
+    request_id: str | None,
+    thumb: str | None,
+    rating_score: float | None,
+    feels: str | None,
+    comment: str | None,
+    content: str | None,
+) -> dict:
+    """Turn one feedback press into continuous-learning records.
+
+    A thumb (or a rating) becomes a rated-message record holding the reply and
+    the user message before it; a note becomes a feedback message; a
+    feels-real mark becomes a what-feels-real statement. The reply text comes
+    from the thread when the thread is known, else from the text the browser
+    sent. Returns what was learned, for the response.
+    """
+    from src.anubis.utils.learning.feedback import (
+        store_feedback_message,
+        store_message_rating,
+        store_what_feels_real,
+    )
+    from src.anubis.utils.learning.namespaces import RATING_NEGATIVE, RATING_POSITIVE
+    from src.anubis.utils.learning.sentiment import message_text
+
+    store = getattr(app_state, "store", None)
+    if store is None:
+        return {}
+    avatar_message: dict | None = None
+    preceding_user_message: dict | None = None
+    if thread_id:
+        try:
+            langgraph_client = get_client(headers=langgraph_client_headers)
+            messages = await _load_thread_message_dicts(langgraph_client, thread_id)
+            avatar_message, preceding_user_message = _find_avatar_message_and_prompt(
+                messages, message_id, request_id
+            )
+        except Exception as thread_error:  # noqa: BLE001 - fall back to the browser's text
+            logger.debug("Could not load the rated thread %s: %s", thread_id, thread_error)
+    avatar_text = (
+        message_text(avatar_message.get("content")) if avatar_message else ""
+    ).strip() or (content or "").strip()
+    preceding_text = (
+        message_text(preceding_user_message.get("content")).strip()
+        if preceding_user_message
+        else None
+    )
+    resolved_message_id = (
+        str(avatar_message.get("id"))
+        if avatar_message and avatar_message.get("id")
+        else (message_id or request_id)
+    )
+    learned: dict = {}
+    if thumb in ("like", "dislike") and resolved_message_id and avatar_text:
+        await store_message_rating(
+            store,
+            user_id,
+            assistant_id,
+            rating=RATING_POSITIVE if thumb == "like" else RATING_NEGATIVE,
+            rating_score=rating_score,
+            thread_id=thread_id or "",
+            message_id=resolved_message_id,
+            avatar_message_text=avatar_text,
+            preceding_user_message_text=preceding_text,
+            request_id=request_id,
+        )
+        learned["rating"] = "collected; folded into learned preferences by the background sweep"
+    if (comment or "").strip():
+        document = await store_feedback_message(
+            store,
+            user_id,
+            assistant_id,
+            comment=comment,
+            thread_id=thread_id,
+            message_id=resolved_message_id,
+            related_avatar_message=avatar_text or None,
+        )
+        learned["feedback_message"] = (
+            "immediate; used in the next reply" if document is not None else "duplicate"
+        )
+    if feels in ("feels_real", "feels_fake"):
+        statement = (comment or "").strip()
+        if not statement and avatar_text:
+            label = "feels real" if feels == "feels_real" else "feels fake or off"
+            statement = f"A reply like this one {label}: {avatar_text[:400]}"
+        if statement:
+            document = await store_what_feels_real(
+                store,
+                user_id,
+                assistant_id,
+                statement=statement,
+                statement_context=(
+                    f"About this avatar message: {avatar_text[:400]}" if avatar_text else None
+                ),
+                polarity=feels,
+                source="dictated",
+                thread_id=thread_id,
+                message_id=resolved_message_id,
+            )
+            learned["what_feels_real"] = (
+                "immediate; used in the next reply" if document is not None else "duplicate"
+            )
+    return learned
+
+
+async def _apply_inline_message_feedback(
+    app_state,
+    *,
+    langgraph_client_headers: dict,
+    user_id: str,
+    assistant_id: str,
+    thread_id: str,
+    like: bool,
+    dislike: bool,
+    feedback_text: str | None,
+) -> None:
+    """Apply the ``like`` / ``dislike`` / ``feedback`` fields of one /message call.
+
+    The thumb lands on the thread's latest avatar reply (both the row the
+    browser restores and the learning record); ``feedback_text`` is stored as
+    a feedback message about that reply and used from the very next turn.
+    """
+    from src.anubis.utils.message_feedback import record_message_feedback
+
+    thumb = None
+    if like or dislike:
+        thumb = "like" if like and not dislike else "dislike"
+    if not thumb and not (feedback_text or "").strip():
+        return
+    langgraph_client = get_client(headers=langgraph_client_headers)
+    messages = await _load_thread_message_dicts(langgraph_client, thread_id)
+    avatar_message, _preceding = _find_avatar_message_and_prompt(messages, None)
+    latest_message_id = (
+        str(avatar_message.get("id")) if avatar_message and avatar_message.get("id") else None
+    )
+    if thumb and latest_message_id:
+        await record_message_feedback(
+            app_state.store,
+            user_id,
+            assistant_id,
+            thread_id=thread_id,
+            message_id=latest_message_id,
+            request_id=_message_dict_request_id(avatar_message) or None,
+            feedback_type=thumb,
+            comment=feedback_text,
+        )
+    await _learn_from_message_feedback(
+        app_state,
+        langgraph_client_headers=langgraph_client_headers,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        thread_id=thread_id,
+        message_id=latest_message_id,
+        request_id=None,
+        thumb=thumb,
+        rating_score=None,
+        feels=None,
+        comment=feedback_text,
+        content=None,
+    )
 
 
 ALLOWED_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})

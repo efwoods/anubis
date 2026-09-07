@@ -212,3 +212,34 @@ async def test_pending_interrupt_is_read_from_the_graph_state(installed, monkeyp
 
     webapp_module.app.state.graph = _Idle()
     assert await webapp_module._pending_interrupt_for_thread("thread-1") is None
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_vendor_falls_back_to_the_live_browser(installed, monkeypatch):
+    from src.anubis.utils.connected_accounts import browser_login
+
+    installed.context.github_oauth_client_id = ""
+    installed.context.github_oauth_client_secret = ""
+    opened = {}
+
+    async def _fake_start_login(context, *, user_id, assistant_id, provider, site_url=None, name=None):
+        opened.update({"provider": provider.name, "site_url": site_url, "user_id": user_id})
+        return {"login_id": "login-1", "nonce": "n", "view_url": "/connect_account/browser/login-1?t=tok", "expires_in": 600, "provider": provider.name}
+
+    monkeypatch.setattr(browser_login, "start_login", _fake_start_login)
+    response = await webapp_module.connect_account_oauth_start(
+        request=_json_request({"provider": "github"}), current_user=_current_user()
+    )
+    body = json.loads(response.body)
+    assert body["login_mode"] == "browser_session" and body["fallback"] == "browser_session"
+    assert body["view_url"].startswith("/connect_account/browser/")
+    assert opened == {"provider": "github", "site_url": "https://github.com/login", "user_id": USER_ID}
+
+
+def test_a_live_sign_in_record_uses_session_tools_whatever_the_kind():
+    from src.anubis.utils.connected_accounts.providers import get_provider
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
+
+    record = {"provider": "gmail", "kind": "mailbox", "credential_mechanism": "browser_session"}
+    assert "open_connected_site" in tool_names_for(get_provider("gmail"), record)
+    assert "search_mailbox" not in " ".join(tool_names_for(get_provider("gmail"), record))

@@ -417,6 +417,9 @@ async def finish_login(
         ),
     )
     record["user_id"] = user_id
+    # The row may sign in through OAuth when an app exists; this record was
+    # made by a live sign-in, so the tools must treat the record as a session.
+    record["credential_mechanism"] = "browser_session"
     return {
         "record": record,
         "nonce": login.nonce,

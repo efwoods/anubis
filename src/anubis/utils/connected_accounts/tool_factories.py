@@ -20,6 +20,7 @@ import from the registry and the endpoints.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Awaitable, Callable
 
 from src.anubis.utils.connected_accounts.providers import (
@@ -36,6 +37,8 @@ from src.anubis.utils.connected_accounts.providers import (
     MECHANISM_BROWSER_SESSION,
     MECHANISM_OAUTH,
 )
+
+logger = logging.getLogger(__name__)
 
 ToolFactory = Callable[..., Awaitable[list[Any]] | list[Any]]
 
@@ -175,6 +178,8 @@ def tool_names_for(provider: Any, record: dict[str, Any] | None = None) -> list[
     kind = getattr(provider, "kind", None)
     name = str(getattr(provider, "name", "") or "")
     mechanism = str(getattr(provider, "credential_mechanism", "") or "")
+    if record and record.get("credential_mechanism") == MECHANISM_BROWSER_SESSION:
+        return list(_BROWSER_SESSION_TOOL_NAMES)
     if kind == KIND_MAILBOX:
         from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
 
@@ -208,14 +213,27 @@ async def build_tools_for_accounts(
     module is not installed yet (a phase still being built) is skipped with a
     log line for the same reason.
     """
-    import logging
-
-    logger = logging.getLogger(__name__)
     by_kind: dict[str, list[dict[str, Any]]] = {}
+    session_records: list[dict[str, Any]] = []
     for record in accounts:
+        # A record made by a live sign-in is used through the signed-in
+        # session whatever kind the provider row declares (a Gmail mailbox
+        # signed in on Google's page, a GitHub account signed in on GitHub).
+        if record.get("credential_mechanism") == MECHANISM_BROWSER_SESSION:
+            session_records.append(record)
+            continue
         by_kind.setdefault(str(record.get("kind") or ""), []).append(record)
 
     tools: list[Any] = []
+    if session_records:
+        try:
+            tools.extend(
+                _browser_session_factory(
+                    context, session_records, store=store, pool=pool, bundle=bundle, all_accounts=accounts
+                )
+            )
+        except Exception:
+            logger.exception("Browser-session tool factory failed; skipping")
     for kind, kind_accounts in by_kind.items():
         factory = TOOL_FACTORIES.get(kind)
         if factory is None:

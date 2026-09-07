@@ -364,6 +364,8 @@ GMAIL_PROVIDER = ConnectedAccountProvider(
     icon_key="gmail",
     oauth_config_key="google",
     oauth_scopes=("openid", "email", "https://mail.google.com/"),
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://mail.google.com/mail/",
+    home_url="https://mail.google.com/mail/",
 )
 
 CUSTOM_MCP_PROVIDER = ConnectedAccountProvider(
@@ -437,6 +439,8 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
     summary="Check your schedule",
     card_description="Read your calendar so the avatar knows your schedule.",
     icon_key="google_calendar",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://calendar.google.com/",
+    home_url="https://calendar.google.com/",
     oauth_config_key="google",
     oauth_scopes=(
         "openid",
@@ -454,6 +458,8 @@ GOOGLE_ANALYTICS_PROVIDER = ConnectedAccountProvider(
     summary="Visitors, sessions, and pages for your websites",
     card_description="Read traffic reports for the websites you own.",
     icon_key="google_analytics",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://analytics.google.com/",
+    home_url="https://analytics.google.com/",
     oauth_config_key="google",
     oauth_scopes=(
         "openid",
@@ -471,6 +477,8 @@ YOUTUBE_PROVIDER = ConnectedAccountProvider(
     summary="Your channel's videos, statistics, and comments",
     card_description="Read your channel's videos, statistics, and comments.",
     icon_key="youtube",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://studio.youtube.com/",
+    home_url="https://studio.youtube.com/",
     oauth_config_key="google",
     oauth_scopes=(
         "openid",
@@ -492,6 +500,8 @@ GITHUB_PROVIDER = ConnectedAccountProvider(
     ),
     icon_key="github",
     oauth_config_key="github",
+    login_url="https://github.com/login",
+    home_url="https://github.com/notifications",
 )
 
 X_PROVIDER = ConnectedAccountProvider(
@@ -505,6 +515,8 @@ X_PROVIDER = ConnectedAccountProvider(
     card_description="Read your posts and post replies as you.",
     icon_key="twitter",
     oauth_config_key="x",
+    login_url="https://x.com/i/flow/login",
+    home_url="https://x.com/notifications",
 )
 
 VERCEL_PROVIDER = ConnectedAccountProvider(
@@ -517,6 +529,8 @@ VERCEL_PROVIDER = ConnectedAccountProvider(
     card_description="Read your projects' deployments and usage.",
     icon_key="vercel",
     oauth_config_key="vercel",
+    login_url="https://vercel.com/login",
+    home_url="https://vercel.com/dashboard",
 )
 
 PLAID_PROVIDER = ConnectedAccountProvider(

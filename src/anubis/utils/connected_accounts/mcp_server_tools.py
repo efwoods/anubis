@@ -115,8 +115,10 @@ def _prefixed(tool: Any, slug: str) -> Any:
     return tool
 
 
-async def _tools_for_record(record: dict[str, Any], context: Any) -> list[Any]:
-    from src.anubis.utils.secret_store import decrypt_secret
+async def _tools_for_record(
+    record: dict[str, Any], context: Any, store: Any = None
+) -> list[Any]:
+    from src.anubis.utils.connected_accounts.mcp_oauth import bearer_for_record
 
     transport = record.get("transport") or {}
     server_url = str(transport.get("server_url") or "")
@@ -125,12 +127,17 @@ async def _tools_for_record(record: dict[str, Any], context: Any) -> list[Any]:
     bearer_token: str | None = None
     if record.get("encrypted_secret"):
         try:
-            bearer_token = decrypt_secret(record["encrypted_secret"], context)
+            bearer_token = await bearer_for_record(
+                record, context, store=store, user_id=record.get("user_id")
+            )
         except Exception:
             logger.info(
                 "Custom connector %s has an unreadable token; connecting without it",
                 record.get("display_label"),
             )
+        if bearer_token is None and transport.get("auth_type") == "oauth":
+            # The sign-in lapsed; the record is flagged and the card re-raised.
+            return []
 
     key = (server_url, bool(bearer_token))
     cached = _tools_cache.get(key)
@@ -170,7 +177,7 @@ async def _tools_for_record(record: dict[str, Any], context: Any) -> list[Any]:
 
 
 async def build_mcp_server_tools(
-    context: Any, accounts: list[dict[str, Any]]
+    context: Any, accounts: list[dict[str, Any]], store: Any = None
 ) -> list[Any]:
     """Build the tools of every connected custom Model Context Protocol server.
 
@@ -189,7 +196,7 @@ async def build_mcp_server_tools(
     if not server_records:
         return []
     results = await asyncio.gather(
-        *(_tools_for_record(record, context) for record in server_records),
+        *(_tools_for_record(record, context, store) for record in server_records),
         return_exceptions=True,
     )
     tools: list[Any] = []

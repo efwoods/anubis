@@ -1079,6 +1079,9 @@ async def think(
             build_tools_for_accounts,
         )
 
+        from src.anubis.utils.connected_accounts.store import stale_accounts_for
+        from src.anubis.utils.runtime_handles import get_postgres_pool
+
         owner_user_id = state["user_state"]["user_id"]
         answering_assistant_id = state["assistant_state"]["assistant_id"]
         connected_accounts = await bound_accounts_for(
@@ -1086,7 +1089,48 @@ async def think(
             owner_user_id,
             answering_assistant_id,
         )
-        mailbox_tools = await build_tools_for_accounts(runtime.context, connected_accounts)
+        stale_accounts = await stale_accounts_for(
+            runtime.store, owner_user_id, answering_assistant_id
+        )
+        # A scheduled (unattended) run must never pause on a sign-in card.
+        scheduled_run = bool(
+            (config.get("configurable", {}) or {}).get("scheduled", False)
+        )
+        mailbox_tools = await build_tools_for_accounts(
+            runtime.context,
+            connected_accounts,
+            store=runtime.store,
+            pool=get_postgres_pool(),
+            bundle=analysis_bundle,
+        )
+        # Business analytics: charts, reports, schedules, and — for the
+        # owner's Neural Nexus business account — platform metrics. Personal
+        # avatar only; the pool is published by the lifespan.
+        try:
+            from src.anubis.utils.analytics.analytics_tools import (
+                build_analytics_tools,
+            )
+
+            mailbox_tools = [
+                *mailbox_tools,
+                *build_analytics_tools(
+                    runtime.context,
+                    store=runtime.store,
+                    pool=get_postgres_pool(),
+                    user_id=owner_user_id,
+                    assistant_id=answering_assistant_id,
+                    connected_accounts=connected_accounts,
+                    analysis_bundle=analysis_bundle,
+                    thread_id=outer_thread,
+                    timezone_name=(config.get("configurable", {}) or {}).get(
+                        "user_timezone"
+                    ),
+                ),
+            ]
+        except ImportError:
+            logger.debug("Analytics tools are not installed; skipping")
+        except Exception:
+            logger.exception("Could not build analytics tools; skipping")
         # The agent inbox is the personal avatar's: report and resolve pending
         # items in conversation, or trigger a poll now.
         from src.anubis.utils.inbox.inbox_tools import build_inbox_tools
@@ -1110,6 +1154,8 @@ async def think(
             user_id=owner_user_id,
             assistant_id=answering_assistant_id,
             connected_accounts=connected_accounts,
+            stale_accounts=stale_accounts,
+            allow_interrupt=not scheduled_run,
         )
 
     # Learning from media in conversation: the creator of THIS avatar, never a
@@ -1427,6 +1473,38 @@ async def _run_avatar_deep_agent_turn(
         except Exception:
             # Never lose an already-streamed reply over a display concern.
             logger.exception("Could not collect this turn's analysis artifacts.")
+
+    # Connect cards ride the same channel: every ``connect_account`` result this
+    # turn produced (or the card a "+"-menu acknowledgement turn carried) is
+    # kept on the reply so the transcript shows "Gmail · Added · 6 tools" after
+    # a reload instead of nothing.
+    try:
+        from src.anubis.utils.connected_accounts.connection_cards import (
+            connection_acknowledgement_card,
+            connection_records_from_messages,
+        )
+
+        connection_cards = connection_records_from_messages(
+            new_messages
+        ) or connection_acknowledgement_card(state.get("messages") or [])
+        if connection_cards:
+            final_message.response_metadata = dict(final_message.response_metadata or {})
+            final_message.response_metadata["connections"] = connection_cards
+    except Exception:
+        logger.exception("Could not attach this turn's connection cards.")
+
+    # Charts made with ``make_chart`` this turn, as specs the client renders.
+    try:
+        from src.anubis.utils.analytics.charts import TurnChartCollector
+
+        turn_charts = TurnChartCollector.collect()
+        if turn_charts:
+            final_message.response_metadata = dict(final_message.response_metadata or {})
+            final_message.response_metadata["charts"] = turn_charts
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("Could not attach this turn's charts.")
 
     update: dict[str, Any] = {
         "messages": [final_message],

@@ -19,6 +19,7 @@ typed turn with attachments, and tags the message through ``additional_kwargs``:
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from typing import Any
@@ -32,6 +33,23 @@ DECISION_IGNORE = "ignore"
 DECISION_RESPOND = "respond"
 DECISION_NOTIFY = "notify"
 AMBIENT_DECISIONS = (DECISION_IGNORE, DECISION_RESPOND, DECISION_NOTIFY)
+
+# What the avatar offers to do about a ``notify`` observation once the
+# conversation partner allows it: one verb the avatar will perform (``draft``,
+# ``reply``, ``remind``, ``research``, ``summarize``, ``schedule`` ...). The
+# card puts the verb on the button and the wording beside it. ``none`` is a
+# plain heads-up.
+PROPOSED_ACTION_NONE = "none"
+PROPOSED_ACTION_MAX_LETTERS = 20
+_PROPOSED_ACTION_LETTERS = re.compile(r"[^a-z]")
+
+# The hidden turn that carries an allowed action back to the avatar. The
+# decision recorded on the avatar's reply is ``act`` so the browser can tell a
+# reply the conversation partner asked for from a heads-up card.
+AMBIENT_ACTION_MESSAGE_KIND = "ambient_action"
+DECISION_ACT = "act"
+ACTION_HEADER_PREFIX = "[AMBIENT_ACTION"
+OFFER_LINE_PREFIX = "[AMBIENT_OFFER]"
 
 SOURCE_WEBCAM = "webcam"
 SOURCE_SCREEN = "screen"
@@ -91,11 +109,34 @@ NOTIFY_INSTRUCTION_SPEECH = (
     "tools."
 )
 
+# Appended to a notify instruction when the triage named something the
+# assistant could do once allowed. The offer line under the header names it.
+OFFER_SUFFIX = (
+    " The line beginning with [AMBIENT_OFFER] names what the assistant could do "
+    "next if the conversation partner allows this. End the heads-up with one "
+    "short clause offering exactly that, and wait: the conversation partner "
+    "will choose."
+)
+NOTIFY_INSTRUCTION_WITH_OFFER = NOTIFY_INSTRUCTION + OFFER_SUFFIX
+NOTIFY_INSTRUCTION_SPEECH_WITH_OFFER = NOTIFY_INSTRUCTION_SPEECH + OFFER_SUFFIX
+
 ALL_INSTRUCTIONS = (
     RESPOND_INSTRUCTION,
     NOTIFY_INSTRUCTION,
     RESPOND_INSTRUCTION_SPEECH,
     NOTIFY_INSTRUCTION_SPEECH,
+    NOTIFY_INSTRUCTION_WITH_OFFER,
+    NOTIFY_INSTRUCTION_SPEECH_WITH_OFFER,
+)
+
+ACTION_INSTRUCTION = (
+    "The conversation partner did not type this. The assistant earlier noticed "
+    "the scene described above and offered to do the named action; the "
+    "conversation partner has now allowed the action. Do the action now, in "
+    "the avatar's own voice: speak directly to the conversation partner, and "
+    "use a tool when the action needs one. Do not ask for permission again, do "
+    "not read the scene back, and do not mention a camera or a screenshot "
+    "unless doing so is natural."
 )
 
 
@@ -175,12 +216,89 @@ def is_ambient_observation(message: Any) -> bool:
     return _additional_kwargs_of(message).get("kind") == AMBIENT_MESSAGE_KIND
 
 
+def is_ambient_action(message: Any) -> bool:
+    """Whether a message is the hidden turn carrying an allowed action."""
+    return _additional_kwargs_of(message).get("kind") == AMBIENT_ACTION_MESSAGE_KIND
+
+
 def ambient_details(message: Any) -> dict[str, Any] | None:
-    """Return the ``ambient`` record of an ambient observation, or ``None``."""
-    if not is_ambient_observation(message):
+    """Return the ``ambient`` record of an observation or an allowed action, or ``None``."""
+    if not is_ambient_observation(message) and not is_ambient_action(message):
         return None
     details = _additional_kwargs_of(message).get("ambient")
     return dict(details) if isinstance(details, dict) else {}
+
+
+def normalize_proposed_action(value: Any) -> str:
+    """Coerce a proposed action to one lowercase verb, or ``none``.
+
+    The first word is kept and everything but letters is dropped, so
+    "Draft a reply" becomes ``draft`` and "Reply!" becomes ``reply``.
+    """
+    first_word = str(value or "").strip().split(" ", 1)[0] if value else ""
+    action = _PROPOSED_ACTION_LETTERS.sub("", first_word.lower())[
+        :PROPOSED_ACTION_MAX_LETTERS
+    ]
+    return action or PROPOSED_ACTION_NONE
+
+
+def proposed_offer(ambient: dict[str, Any]) -> tuple[str, str] | None:
+    """Return the ``(action, description)`` a notify observation offers, or ``None``."""
+    if not ambient or ambient.get("decision") != DECISION_NOTIFY:
+        return None
+    action = normalize_proposed_action(ambient.get("proposed_action"))
+    description = str(ambient.get("action_description") or "").strip()
+    if action == PROPOSED_ACTION_NONE or not description:
+        return None
+    return action, description
+
+
+def build_ambient_action_additional_kwargs(
+    *,
+    observation_id: str,
+    observation_kind: str,
+    action: str,
+    action_description: str,
+    summary: str,
+) -> dict[str, Any]:
+    """Build the ``additional_kwargs`` of the hidden turn carrying an allowed action.
+
+    The turn is hidden like an observation but is not one: the triage node
+    does not run on it, and the avatar's reply is stamped with this record
+    (``decision`` ``act``) so a thumb on that reply is learned against the
+    observation it answered.
+    """
+    return {
+        "hidden": True,
+        "kind": AMBIENT_ACTION_MESSAGE_KIND,
+        "ambient": {
+            "observation_id": str(observation_id),
+            "observation_kind": (observation_kind or "other").strip().lower()[:40]
+            or "other",
+            "decision": DECISION_ACT,
+            "action": normalize_proposed_action(action),
+            "action_description": (action_description or "").strip()[:300],
+            "summary": (summary or "").strip()[:300],
+        },
+    }
+
+
+def compose_ambient_action_text(ambient: dict[str, Any]) -> str:
+    """Return the text of the hidden turn that asks the avatar to carry out an allowed action."""
+    header = (
+        f"{ACTION_HEADER_PREFIX} id={ambient.get('observation_id') or ''}"
+        f" kind={ambient.get('observation_kind') or 'other'}"
+        f" action={ambient.get('action') or 'reply'}]"
+    )
+    scene = str(ambient.get("summary") or "").strip()
+    description = str(ambient.get("action_description") or "").strip()
+    lines = [header]
+    if scene:
+        lines.append(f"Scene noticed earlier: {scene}")
+    lines.append(
+        f"Allowed action: {description or 'reply to the conversation partner'}"
+    )
+    return "\n".join(lines) + "\n\n" + ACTION_INSTRUCTION
 
 
 def message_text(message: Any) -> str:
@@ -216,6 +334,8 @@ def observation_header(ambient: dict[str, Any]) -> str:
     decision = ambient.get("decision")
     if decision:
         header += f" decision={decision}"
+    if proposed_offer(ambient) is not None:
+        header += f" proposed_action={normalize_proposed_action(ambient.get('proposed_action'))}"
     return header + "]"
 
 
@@ -239,17 +359,37 @@ def strip_instruction(body: str) -> str:
     for instruction in ALL_INSTRUCTIONS:
         marker = "\n\n" + instruction
         if body.endswith(marker):
-            return body[: -len(marker)]
-    return body
+            body = body[: -len(marker)]
+            break
+    return strip_offer_line(body)
+
+
+def strip_offer_line(body: str) -> str:
+    """Drop the ``[AMBIENT_OFFER]`` line a notify observation was rewritten with."""
+    stripped = (body or "").lstrip()
+    if not stripped.startswith(OFFER_LINE_PREFIX):
+        return body
+    _offer, _newline, rest = stripped.partition("\n")
+    return rest.strip()
 
 
 def compose_observation_text(ambient: dict[str, Any], body: str) -> str:
     """Header + body + the instruction matching the triage decision."""
-    parts = [observation_header(ambient), body.strip()]
+    offer = proposed_offer(ambient)
+    lead = observation_header(ambient)
+    if offer is not None:
+        lead += f"\n{OFFER_LINE_PREFIX} {offer[1]}"
+    parts = [lead, strip_offer_line(body).strip()]
     decision = ambient.get("decision")
     heard = is_speech_observation(ambient)
     if decision == DECISION_RESPOND:
         parts.append(RESPOND_INSTRUCTION_SPEECH if heard else RESPOND_INSTRUCTION)
+    elif decision == DECISION_NOTIFY and offer is not None:
+        parts.append(
+            NOTIFY_INSTRUCTION_SPEECH_WITH_OFFER
+            if heard
+            else NOTIFY_INSTRUCTION_WITH_OFFER
+        )
     elif decision == DECISION_NOTIFY:
         parts.append(NOTIFY_INSTRUCTION_SPEECH if heard else NOTIFY_INSTRUCTION)
     return "\n".join(part for part in parts[:2] if part) + (
@@ -279,6 +419,8 @@ def recent_ambient_observations(
                 "decision": details.get("decision"),
                 "summary": details.get("summary"),
                 "observation_kind": details.get("observation_kind"),
+                "proposed_action": details.get("proposed_action"),
+                "action_description": details.get("action_description"),
                 "text": strip_instruction(body),
             }
         )

@@ -691,6 +691,174 @@ class GlobalContext:
         },
     )
 
+    github_oauth_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Client ID of the GitHub OAuth App the connect card opens GitHub sign-in with. Created at github.com/settings/developers with the callback {CONNECT_OAUTH_REDIRECT_BASE_URL}/connect_account/oauth/callback. Env GITHUB_OAUTH_CLIENT_ID."
+        },
+    )
+
+    github_oauth_client_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Client secret paired with GITHUB_OAUTH_CLIENT_ID. Sent only to GitHub's token endpoint; never logged or returned. Env GITHUB_OAUTH_CLIENT_SECRET."
+        },
+    )
+
+    x_oauth_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Client ID of the X (Twitter) OAuth 2.0 app (developer.x.com, user authentication settings, type Web App) the connect card opens X sign-in with, using PKCE. Env X_OAUTH_CLIENT_ID."
+        },
+    )
+
+    x_oauth_client_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Client secret paired with X_OAUTH_CLIENT_ID, sent as HTTP Basic to X's token endpoint. Env X_OAUTH_CLIENT_SECRET."
+        },
+    )
+
+    vercel_oauth_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Client ID of the Vercel integration the connect card opens Vercel sign-in with. Env VERCEL_OAUTH_CLIENT_ID."
+        },
+    )
+
+    vercel_oauth_client_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Client secret paired with VERCEL_OAUTH_CLIENT_ID. Env VERCEL_OAUTH_CLIENT_SECRET."
+        },
+    )
+
+    plaid_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Plaid client id (dashboard.plaid.com, Team settings, Keys) used by the Finance connector's Plaid Link popup and transaction sync. Env PLAID_CLIENT_ID."
+        },
+    )
+
+    plaid_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Plaid secret for the environment named by PLAID_ENVIRONMENT (the Sandbox secret works with Plaid's test bank credentials; production needs Plaid's approval). Never logged or returned. Env PLAID_SECRET."
+        },
+    )
+
+    plaid_environment: str = field(
+        default="sandbox",
+        metadata={
+            "description": "Which Plaid environment the Finance connector talks to: sandbox or production. Env PLAID_ENVIRONMENT."
+        },
+    )
+
+    plaid_products: str = field(
+        default="transactions",
+        metadata={
+            "description": "Comma-separated Plaid products requested when a bank is linked. Env PLAID_PRODUCTS."
+        },
+    )
+
+    plaid_country_codes: str = field(
+        default="US",
+        metadata={
+            "description": "Comma-separated country codes Plaid Link offers institutions for. Env PLAID_COUNTRY_CODES."
+        },
+    )
+
+    browser_session_keepalive_hours: float = field(
+        default=12.0,
+        metadata={
+            "description": "How often the API revisits every site the owner signed in to through the live browser, re-saving refreshed cookies so the session stays alive for days without a new sign-in. A visit that lands on a login page marks the account as needing sign-in again and notifies the owner through the inbox. Env BROWSER_SESSION_KEEPALIVE_HOURS."
+        },
+    )
+
+    browser_session_keepalive_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the browser-session keepalive task runs in this process. Set to false in a process that must not open browsers. Env BROWSER_SESSION_KEEPALIVE_ENABLED."
+        },
+    )
+
+    browser_session_login_ttl_seconds: int = field(
+        default=900,
+        metadata={
+            "description": "How long a live browser sign-in window stays open waiting for the owner before the login is discarded. Env BROWSER_SESSION_LOGIN_TTL_SECONDS."
+        },
+    )
+
+    browser_session_max_concurrent_logins: int = field(
+        default=3,
+        metadata={
+            "description": "How many live browser sign-in windows this process serves at once; further requests answer 409 until one finishes. Env BROWSER_SESSION_MAX_CONCURRENT_LOGINS."
+        },
+    )
+
+    browser_session_max_open: int = field(
+        default=6,
+        metadata={
+            "description": "How many signed-in browser sessions stay open in this process at once for the connected-site tools; the least recently used is closed beyond this count and reopened from the stored session on demand. Env BROWSER_SESSION_MAX_OPEN."
+        },
+    )
+
+    browser_session_idle_seconds: int = field(
+        default=900,
+        metadata={
+            "description": "Seconds an open browser session may sit unused before the process closes the window (the stored session survives; the next tool call reopens the window). Env BROWSER_SESSION_IDLE_SECONDS."
+        },
+    )
+
+    browser_session_frame_interval_ms: int = field(
+        default=250,
+        metadata={
+            "description": "Milliseconds between frames of a live browser sign-in window when the browser cannot stream frames on the browser's own schedule. Env BROWSER_SESSION_FRAME_INTERVAL_MS."
+        },
+    )
+
+    website_crawl_max_pages: int = field(
+        default=50,
+        metadata={
+            "description": "Ceiling on how many pages one website crawl or audit fetches, regardless of what the model asks for. Env WEBSITE_CRAWL_MAX_PAGES."
+        },
+    )
+
+    report_scheduler_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether scheduled reports (weekly sprint digest, monthly spend digest, and any report the owner schedules in conversation) run in this process and are delivered to the inbox. Env REPORT_SCHEDULER_ENABLED."
+        },
+    )
+
+    report_scheduler_poll_seconds: float = field(
+        default=60.0,
+        metadata={
+            "description": "How often the report scheduler looks for due schedules. Env REPORT_SCHEDULER_POLL_SECONDS."
+        },
+    )
+
+    report_schedule_run_timeout_seconds: float = field(
+        default=600.0,
+        metadata={
+            "description": "Ceiling on one scheduled report run through the graph. Env REPORT_SCHEDULE_RUN_TIMEOUT_SECONDS."
+        },
+    )
+
+    tool_call_log_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether every tool the avatar calls is recorded in the tool_calls table (tool name, avatar, thread, duration) so feature usage per avatar can be reported. Env TOOL_CALL_LOG_ENABLED."
+        },
+    )
+
+    finance_sync_min_interval_minutes: int = field(
+        default=360,
+        metadata={
+            "description": "Minimum minutes between two Plaid transaction syncs of the same institution; a finance question inside that window answers from the stored transactions. Env FINANCE_SYNC_MIN_INTERVAL_MINUTES."
+        },
+    )
+
     """ </Connected accounts (mailbox and social) for the personal avatar> """
 
     """ <Emotion media generation (xAI images and idle-loop videos)> """

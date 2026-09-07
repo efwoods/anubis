@@ -178,10 +178,12 @@ def public_account_view(record: dict[str, Any]) -> dict[str, Any]:
     does not need it read back.
     """
     transport = record.get("transport") or {}
+    browser_session = transport.get("browser_session") or {}
     return {
         "account_key": record.get("account_key"),
         "provider": record.get("provider"),
         "kind": record.get("kind"),
+        "credential_mechanism": record.get("credential_mechanism"),
         "account_address": record.get("account_address"),
         "display_label": record.get("display_label"),
         "status": record.get("status"),
@@ -189,6 +191,16 @@ def public_account_view(record: dict[str, Any]) -> dict[str, Any]:
         "last_verified_at": record.get("last_verified_at"),
         "assistant_id": record.get("assistant_id"),
         "tool_names": list(transport.get("tool_names") or []),
+        # Non-secret presentation details a kind may carry: how many bank
+        # accounts an institution linked, which site a session is for, and when
+        # a browser session was last confirmed alive.
+        "institution_name": transport.get("institution_name"),
+        "account_count": len(transport.get("accounts") or [])
+        if isinstance(transport.get("accounts"), list)
+        else None,
+        "site_url": transport.get("site_url"),
+        "session_saved_at": browser_session.get("saved_at"),
+        "role": transport.get("role"),
     }
 
 
@@ -238,10 +250,33 @@ async def bound_accounts_for(
     second avatar of the same owner — or an avatar demoted out of the personal
     role — from reaching the owner's accounts.
     """
+    bound: list[dict[str, Any]] = []
+    for record in await read_connected_accounts(store, user_id):
+        if (
+            record.get("status") == STATUS_CONNECTED
+            and record.get("assistant_id") == assistant_id
+        ):
+            # Tools that refresh a token need to know whose record to re-save;
+            # the whitelist in ``public_account_view`` keeps this off the API.
+            copied = dict(record)
+            copied.setdefault("user_id", user_id)
+            bound.append(copied)
+    return bound
+
+
+async def stale_accounts_for(
+    store: Any, user_id: str, assistant_id: str
+) -> list[dict[str, Any]]:
+    """Return the accounts bound to this avatar that need the owner to sign in again.
+
+    The avatar names these in conversation and re-raises the connect card, so
+    an expired Google token or a lapsed browser session is fixed in one click
+    rather than discovered as a failing tool call.
+    """
     return [
-        record
+        dict(record, user_id=user_id)
         for record in await read_connected_accounts(store, user_id)
-        if record.get("status") == STATUS_CONNECTED
+        if record.get("status") == STATUS_NEEDS_RECONNECT
         and record.get("assistant_id") == assistant_id
     ]
 

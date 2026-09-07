@@ -17,9 +17,9 @@ and ``think`` runs the deep agent without durable interrupts.
 import asyncio
 import threading
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable
 
-_deep_agent_checkpointer: Optional[object] = None
+_deep_agent_checkpointer: object | None = None
 
 
 def set_deep_agent_checkpointer(checkpointer: object) -> None:
@@ -28,7 +28,7 @@ def set_deep_agent_checkpointer(checkpointer: object) -> None:
     _deep_agent_checkpointer = checkpointer
 
 
-def get_deep_agent_checkpointer() -> Optional[object]:
+def get_deep_agent_checkpointer() -> object | None:
     """Return the shared deep-agent checkpointer, or ``None`` if unset."""
     return _deep_agent_checkpointer
 
@@ -63,7 +63,7 @@ def get_identity_media_job_starter() -> IdentityMediaJobStarter | None:
 # expensive, so it is constructed once on first use and cached here rather than per call.
 # Parallel deep-agent tool calls (e.g. several ``edit_identity_fact`` invocations in one
 # turn) fan out ``asyncio.to_thread`` workers that must not share an encode forward pass.
-_sentence_embedder: Optional[object] = None
+_sentence_embedder: object | None = None
 _embedder_lock = threading.Lock()
 
 
@@ -205,3 +205,22 @@ def get_sentence_embedder() -> object:
             model_kwargs={"torch_dtype": torch.float32},
         )
     return _sentence_embedder
+
+
+# The psycopg connection pool the FastAPI lifespan opens. Analytics tools that
+# run inside the graph (platform metrics, finance, reports, schedules, the
+# tool-call log) read and write application tables through this pool; a graph
+# module cannot import the web application to reach ``app.state.pool``.
+# ``None`` (``langgraph dev``, unit tests) leaves those tools unavailable.
+_postgres_pool: Any | None = None
+
+
+def set_postgres_pool(pool: Any) -> None:
+    """Publish the shared connection pool for graph-side analytics tools."""
+    global _postgres_pool
+    _postgres_pool = pool
+
+
+def get_postgres_pool() -> Any | None:
+    """Return the shared connection pool, or ``None`` when the lifespan has not run."""
+    return _postgres_pool

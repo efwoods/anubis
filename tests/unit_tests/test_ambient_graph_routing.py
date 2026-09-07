@@ -21,6 +21,7 @@ import src.anubis.utils.ambient.triage_node as triage_node_module
 import src.anubis.utils.nodes as nodes_module
 from src.anubis.utils.ambient.observations import (
     NOTIFY_INSTRUCTION,
+    NOTIFY_INSTRUCTION_WITH_OFFER,
     RESPOND_INSTRUCTION,
     build_ambient_additional_kwargs,
 )
@@ -70,6 +71,8 @@ def workflow(monkeypatch):
             summary="A person writes code.",
             salience=0.4,
             reason="test",
+            proposed_action=decisions.get("proposed_action", "none"),
+            action_description=decisions.get("action_description", ""),
         )
 
     monkeypatch.setattr(triage_node_module, "classify_observation", fake_classify)
@@ -195,6 +198,24 @@ async def test_a_notify_decision_asks_for_a_heads_up(workflow):
     messages, _custom = await _run(app, _ambient_turn(), "notify-thread")
     assert avatar_runs[0].content.endswith(NOTIFY_INSTRUCTION)
     assert messages[0].additional_kwargs["ambient"]["needs_owner_action"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_notify_with_an_offer_ends_the_heads_up_by_offering(workflow):
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "notify"
+    decisions["proposed_action"] = "research"
+    decisions["action_description"] = "Research the error on the screen"
+    messages, custom = await _run(app, _ambient_turn(), "offer-thread")
+    assert avatar_runs[0].content.endswith(NOTIFY_INSTRUCTION_WITH_OFFER)
+    assert "[AMBIENT_OFFER] Research the error on the screen" in avatar_runs[0].content
+    ambient = messages[0].additional_kwargs["ambient"]
+    assert ambient["proposed_action"] == "research"
+    assert ambient["action_description"] == "Research the error on the screen"
+    decision_events = [
+        event for event in custom if event.get("type") == "ambient_decision"
+    ]
+    assert decision_events[0]["proposed_action"] == "research"
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,12 @@ What these pin down:
   one is published and the store otherwise, through one set of call sites.
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
 import asyncio
 from types import SimpleNamespace
 
@@ -48,6 +54,11 @@ from src.anubis.utils.connected_accounts.providers import (
     MECHANISM_DEVICE_PAIRING,
 )
 from src.api import webapp as webapp_module
+from src.anubis.utils.connected_accounts.testing_support import (
+    open_authorization,
+    register_coming_soon_provider,
+    use_legacy_gmail,
+)
 
 USER_ID = "auth0-user-abc"
 ASSISTANT_ID = "assistant-personal"
@@ -112,6 +123,7 @@ def _no_published_repository():
 
 
 def _install(monkeypatch, store_api, context=None):
+    use_legacy_gmail(monkeypatch)
     monkeypatch.setattr(
         webapp_module, "get_client", lambda **kwargs: SimpleNamespace(store=store_api)
     )
@@ -138,6 +150,7 @@ def _fake_probe(monkeypatch, tool_names=("search", "fetch"), fail=False):
 
     _probe.calls = []
     monkeypatch.setattr(mcp_server_tools, "probe_server_tools", _probe)
+    open_authorization(monkeypatch)
     return _probe
 
 
@@ -153,8 +166,10 @@ def test_every_catalog_row_is_either_connectable_or_plainly_coming_soon():
             AVAILABILITY_COMING_SOON,
         )
         if provider.is_available:
-            assert provider.uses_form or provider.credential_mechanism == (
-                MECHANISM_DEVICE_PAIRING
+            assert (
+                provider.uses_form
+                or provider.uses_popup
+                or provider.credential_mechanism == MECHANISM_DEVICE_PAIRING
             ), f"{provider.name} is available but has no way to connect"
         assert provider.category in CATEGORY_ORDER
         assert provider.icon_key, f"{provider.name} needs an icon key"
@@ -216,7 +231,8 @@ def test_the_connect_card_carries_the_catalog_fields():
 
 
 @pytest.mark.asyncio
-async def test_a_coming_soon_provider_is_refused_with_its_message():
+async def test_a_coming_soon_provider_is_refused_with_its_message(monkeypatch):
+    register_coming_soon_provider(monkeypatch, "google_calendar")
     with pytest.raises(ConnectRefused) as raised:
         await connect_account(
             ConnectRequest(
@@ -372,6 +388,7 @@ async def test_connect_account_route_accepts_flat_fields_for_gmail(monkeypatch):
 async def test_connect_account_route_refuses_a_coming_soon_provider(monkeypatch):
     store_api = _StoreAPI()
     _install(monkeypatch, store_api)
+    register_coming_soon_provider(monkeypatch, "slack")
     with pytest.raises(webapp_module.HTTPException) as raised:
         await webapp_module.connect_account_route(
             request=_json_request({"provider": "slack"}), current_user=_current_user()
@@ -419,8 +436,12 @@ async def test_the_custom_connector_cap_is_separate_from_the_account_cap(monkeyp
 
 
 def _mailbox_record(context):
+    from src.anubis.utils.connected_accounts.providers import (
+        GMAIL_APP_PASSWORD_PROVIDER,
+    )
+
     return build_account_record(
-        provider=get_provider("gmail"),
+        provider=GMAIL_APP_PASSWORD_PROVIDER,
         account_address="evan@example.com",
         display_label="evan",
         encrypted_secret=secret_store.encrypt_secret("pw", context),
@@ -600,7 +621,7 @@ async def test_the_facade_prefers_a_published_repository_over_the_store():
     await save_connected_account(_ExplodingStore(), USER_ID, record)
     assert await read_connected_accounts(_ExplodingStore(), USER_ID) == [record]
     assert await bound_accounts_for(_ExplodingStore(), USER_ID, ASSISTANT_ID) == [
-        record
+        {**record, "user_id": USER_ID}
     ]
     assert await bound_accounts_for(_ExplodingStore(), USER_ID, "other") == []
     assert await clear_connected_account(

@@ -175,9 +175,7 @@ async def poll_connected_mailboxes(
     from src.anubis.utils.connected_accounts.repository import (
         get_repository as accounts_repository,
     )
-    from src.anubis.utils.secret_store import decrypt_secret
     from src.anubis.utils.tools.email.imap_client import (
-        MailboxCredentials,
         fetch_unseen_messages,
     )
 
@@ -203,16 +201,12 @@ async def poll_connected_mailboxes(
         poll_state = await repository.get_poll_state(account_key) or {}
         after_uid = poll_state.get("last_seen_uid")
         try:
-            credentials = MailboxCredentials(
-                account_address=record["account_address"],
-                password=decrypt_secret(record["encrypted_secret"], context),
-                imap_host=record["imap_host"],
-                imap_port=int(record.get("imap_port") or 993),
-                smtp_host=record.get("smtp_host"),
-                smtp_port=int(record.get("smtp_port") or 587),
-                timeout_seconds=float(
-                    getattr(context, "mailbox_request_timeout_seconds", None) or 30.0
-                ),
+            from src.anubis.utils.connected_accounts.mailbox_credentials import (
+                mailbox_credentials_for,
+            )
+
+            credentials = await mailbox_credentials_for(
+                record, context, store=_store, user_id=user_id
             )
             messages = await asyncio.to_thread(
                 fetch_unseen_messages,

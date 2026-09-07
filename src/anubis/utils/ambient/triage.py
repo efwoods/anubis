@@ -18,6 +18,9 @@ from pydantic import BaseModel, Field
 from src.anubis.utils.ambient.observations import (
     AMBIENT_DECISIONS,
     DECISION_IGNORE,
+    DECISION_NOTIFY,
+    PROPOSED_ACTION_NONE,
+    normalize_proposed_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +60,24 @@ class AmbientTriageClassification(BaseModel):
         description="How much this observation matters right now, from 0.0 to 1.0."
     )
     reason: str = Field(description="One or two sentences justifying the decision.")
+    proposed_action: str = Field(
+        default="none",
+        description=(
+            "For a 'notify' decision only: the one verb, one lowercase word, the "
+            "avatar will perform once the conversation partner allows this — for "
+            "example 'draft', 'reply', 'remind', 'research', 'summarize', "
+            "'schedule', 'explain'. 'none' for a plain heads-up. Always 'none' "
+            "for 'ignore' and 'respond'."
+        ),
+    )
+    action_description: str = Field(
+        default="",
+        description=(
+            "One short imperative line detailing what that verb means here, "
+            "starting with the same verb, for example 'Draft a reply to the "
+            "invoice email'. Empty when proposed_action is 'none'."
+        ),
+    )
 
 
 AMBIENT_CLASSIFY_SYSTEM_PROMPT = """<TASK>
@@ -67,6 +88,8 @@ The assistant reviews one ambient observation on behalf of the avatar the conver
 - Choose 'respond' only when the avatar would naturally speak up as a present friend would: the conversation partner is visibly stuck on something the avatar can help with, something on the screen directly concerns the current conversation, the conversation partner is looking at the avatar as if waiting for the avatar, or a notable change happened that a friend in the room would remark on. When VOICE_MODE is true, choose 'respond' only when speaking aloud would not interrupt the conversation partner.
 - Choose 'notify' when the conversation partner should see something or act in the real world and is not looking at the avatar: an error or alert on the screen, a message or a call that needs a reply, an appointment or a deadline visible on the screen, a safety concern, or anything consequential and ambiguous. Never choose 'notify' for the same situation twice in a row when an earlier observation already carried 'notify' for that situation.
 - The conversation partner's recorded decisions are precedent. A note written by the conversation partner is a standing instruction and overrides every rule above.
+- For a 'notify' decision, name a proposed action when the avatar could usefully do something once the conversation partner allows this. The proposed action is ONE verb, one lowercase word, that the avatar will perform: 'draft' (write the answer to that email or message), 'reply' (say something useful about what was seen), 'remind' (set a reminder), 'research' (look the error or the topic up), 'summarize', 'schedule', 'explain', or another single verb that fits. Detail what the verb means here in action_description, starting with the same verb. Choose 'none' for a plain heads-up. Never propose an action for 'ignore' or 'respond'.
+- The precedent says how the conversation partner treated earlier offers of the same kind: when the conversation partner let the avatar act and liked the result, offer the action again; when the conversation partner replied in person, disliked what the avatar did, or left the notice alone, prefer a plain heads-up or 'ignore'.
 - Name the observation kind with a short lowercase label so the same kind is recognized next time.
 - Write the summary in one line, present tense, neutral third person, without naming a camera, a webcam, or a screenshot.
 </RULES>
@@ -80,6 +103,19 @@ When SOURCES is microphone, the observation is a transcript of speech heard in t
 """
 
 
+# What each recorded decision means, in the classifier's terms.
+DECISION_PHRASES: dict[str, str] = {
+    "accept": "asked for more notices like this",
+    "ignore": "asked for fewer notices like this",
+    "response": "left a note",
+    "allowed_action": "let the avatar do what the avatar offered",
+    "replied_self": "replied in person instead of letting the avatar act",
+    "left_alone": "left the notice alone without choosing anything",
+    "liked_action": "liked what the avatar did after being allowed to act",
+    "disliked_action": "disliked what the avatar did after being allowed to act",
+}
+
+
 def describe_ambient_preferences(preferences: list[dict[str, Any]]) -> str:
     """Render the owner's recorded decisions for the classifier."""
     if not preferences:
@@ -90,9 +126,12 @@ def describe_ambient_preferences(preferences: list[dict[str, Any]]) -> str:
     lines = []
     for preference in preferences:
         kind = preference.get("observation_kind") or "any kind"
+        decision = str(preference.get("decision") or "")
+        phrase = DECISION_PHRASES.get(decision)
+        chose = f"{phrase} ('{decision}')" if phrase else f"chose '{decision}'"
         line = (
-            f"- {kind}: the conversation partner chose "
-            f"'{preference.get('decision')}' {int(preference.get('count') or 1)} time(s)"
+            f"- {kind}: the conversation partner {chose} "
+            f"{int(preference.get('count') or 1)} time(s)"
         )
         if preference.get("summary"):
             line += f" for a scene like: {preference['summary']}"
@@ -156,8 +195,22 @@ def normalize_classification(response: Any) -> AmbientTriageClassification:
     except (TypeError, ValueError):
         salience = 0.0
     salience = min(1.0, max(0.0, salience))
+    proposed_action = normalize_proposed_action(
+        getattr(response, "proposed_action", PROPOSED_ACTION_NONE)
+    )
+    action_description = str(getattr(response, "action_description", "") or "").strip()[
+        :300
+    ]
+    # An offer belongs to a heads-up only, and an offer with no wording is no
+    # offer: the card would have nothing to put on the button.
+    if decision != DECISION_NOTIFY or not action_description:
+        proposed_action = PROPOSED_ACTION_NONE
+    if proposed_action == PROPOSED_ACTION_NONE:
+        action_description = ""
     return AmbientTriageClassification(
         decision=decision,
+        proposed_action=proposed_action,
+        action_description=action_description,
         needs_owner_action=bool(getattr(response, "needs_owner_action", False)),
         observation_kind=(
             str(getattr(response, "observation_kind", "") or "other")

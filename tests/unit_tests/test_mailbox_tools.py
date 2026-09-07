@@ -18,6 +18,12 @@ scales and whether it can misbehave:
   attachments, and runaway link counts.
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
 import asyncio
 from email.message import EmailMessage
 from types import SimpleNamespace
@@ -454,7 +460,9 @@ def test_the_connect_tool_is_offered_when_no_mailbox_is_connected(monkeypatch):
 
 def test_the_connect_card_describes_the_provider_form(monkeypatch):
     from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
+    from src.anubis.utils.connected_accounts.testing_support import use_legacy_gmail
 
+    use_legacy_gmail(monkeypatch)
     tools, cards = _connect_tool(monkeypatch, {"type": "cancel"})
     asyncio.run(tools["connect_mailbox_account"].coroutine())
 
@@ -490,6 +498,9 @@ def test_a_coming_soon_provider_is_answered_without_a_card(monkeypatch):
     # The social rows are declared coming soon: the tool must answer with that
     # message rather than rendering a sign-in form for an account that cannot be
     # connected yet.
+    from src.anubis.utils.connected_accounts.testing_support import register_coming_soon_provider
+
+    register_coming_soon_provider(monkeypatch, "twitch")
     tools, cards = _connect_tool(monkeypatch, {"type": "apply"})
     result = asyncio.run(tools["connect_mailbox_account"].coroutine(provider="twitch"))
     assert result["status"] == "coming_soon"

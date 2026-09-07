@@ -23,11 +23,15 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from src.anubis.utils.connected_accounts.providers import (
+    LOGIN_MODE_FORM,
     MECHANISM_APP_PASSWORD,
     MECHANISM_AUTH0_IDENTITY,
+    MECHANISM_BROWSER_SESSION,
     MECHANISM_DEVICE_PAIRING,
     MECHANISM_MCP_URL,
     MECHANISM_OAUTH,
+    MECHANISM_PLAID_LINK,
+    MECHANISM_URL_ONLY,
     ConnectedAccountProvider,
 )
 from src.anubis.utils.connected_accounts.store import (
@@ -62,6 +66,53 @@ class ConnectRefused(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+class ConnectNeedsLogin(Exception):
+    """The connection needs the owner to sign in through a popup first.
+
+    Raised instead of a record when a provider's flow is not a form: the route
+    answers ``200 {"connected": false, "action": "open_login_popup", ...}`` and
+    the card opens the login endpoint. ``login_request`` is the body the card
+    posts to start the popup (provider, and for a custom connector the server
+    URL and name the owner already typed).
+    """
+
+    def __init__(
+        self,
+        provider: ConnectedAccountProvider,
+        login_request: dict[str, Any],
+        *,
+        login_mode: str | None = None,
+        message: str = "",
+    ) -> None:
+        """Carry the provider, the popup mode, and the body the card posts."""
+        super().__init__(message or f"{provider.display_name} needs a sign-in.")
+        self.provider = provider
+        self.login_mode = login_mode or provider.login_mode
+        self.login_endpoint = provider.login_endpoint
+        self.login_request = dict(login_request)
+        self.message = message or (
+            f"Sign in to {provider.display_name} in the window that opens."
+        )
+
+    def as_response(self) -> dict[str, Any]:
+        """Return the JSON body the route answers with."""
+        from src.anubis.utils.connected_accounts.connection_tools import (
+            build_connect_card,
+        )
+
+        card = build_connect_card(self.provider)
+        card["login_request"] = self.login_request
+        return {
+            "connected": False,
+            "action": "open_login_popup",
+            "login_mode": self.login_mode,
+            "login_endpoint": self.login_endpoint,
+            "login_request": self.login_request,
+            "message": self.message,
+            "card": card,
+        }
 
 
 @dataclass
@@ -200,6 +251,43 @@ async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:
     timeout_seconds = float(
         getattr(request.context, "mcp_connector_probe_timeout_seconds", None) or 20.0
     )
+    if bearer_token is None:
+        # No token typed: ask the server how a client is expected to sign in.
+        # A 401 with authorization metadata means an OAuth popup; a bare 401
+        # means a static token, which the card's form collects.
+        from src.anubis.utils.connected_accounts.mcp_oauth import (
+            AUTHORIZATION_NEEDS_OAUTH,
+            AUTHORIZATION_NEEDS_TOKEN,
+            AUTHORIZATION_UNREACHABLE,
+            probe_authorization,
+        )
+
+        probe = await probe_authorization(server_url, request.context)
+        if probe["status"] == AUTHORIZATION_UNREACHABLE:
+            raise ConnectRefused(
+                400,
+                f"The server at {server_url} could not be reached: "
+                f"{probe.get('error') or 'no answer'}. Check the URL.",
+            )
+        if probe["status"] == AUTHORIZATION_NEEDS_OAUTH:
+            raise ConnectNeedsLogin(
+                provider,
+                {"provider": provider.name, "server_url": server_url, "name": name},
+                login_mode="oauth_popup",
+                message=(
+                    f"{name} asks you to sign in. Sign in in the window that opens."
+                ),
+            )
+        if probe["status"] == AUTHORIZATION_NEEDS_TOKEN:
+            raise ConnectNeedsLogin(
+                provider,
+                {"provider": provider.name, "server_url": server_url, "name": name},
+                login_mode=LOGIN_MODE_FORM,
+                message=(
+                    f"{name} requires an access token. Paste the token the "
+                    "server gave you."
+                ),
+            )
     try:
         tools = await probe_server_tools(server_url, bearer_token, timeout_seconds)
     except McpServerUnreachableError as unreachable_error:
@@ -240,9 +328,112 @@ async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:
     )
 
 
+async def _needs_popup_login(request: ConnectRequest) -> dict[str, Any]:
+    """OAuth, Plaid Link, and browser sign-ins happen in a popup, not a form.
+
+    The card posts to this route only when a client predates popup logins or
+    when the owner typed a site address for a custom site; either way the
+    answer is "open the login popup", with whatever the owner typed carried
+    along so the popup starts on the right page.
+    """
+    provider = request.provider
+    login_request: dict[str, Any] = {"provider": provider.name}
+    for name in ("site_url", "name", "server_url"):
+        value = request.text(name)
+        if value:
+            login_request[name] = value
+    if provider.credential_mechanism == MECHANISM_BROWSER_SESSION and not (
+        provider.login_url or login_request.get("site_url")
+    ):
+        raise ConnectRefused(
+            400, f"A site_url is required to sign in to {provider.display_name}."
+        )
+    raise ConnectNeedsLogin(provider, login_request)
+
+
 async def _refuse_redirect_mechanism(request: ConnectRequest) -> dict[str, Any]:
-    """OAuth and identity linking are declared in the registry but not yet built."""
+    """Identity linking through the login provider is not offered."""
     raise ConnectRefused(501, request.provider.coming_soon_message())
+
+
+def normalize_site_url(site_url: str) -> str:
+    """Return a website address with a scheme, or raise ``ConnectRefused``."""
+    from urllib.parse import urlparse
+
+    candidate = str(site_url or "").strip()
+    if not candidate:
+        raise ConnectRefused(400, "A site_url is required.")
+    if "://" not in candidate:
+        candidate = "https://" + candidate
+    parsed = urlparse(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ConnectRefused(400, f"{site_url!r} is not a website address.")
+    return candidate
+
+
+async def connect_website(request: ConnectRequest) -> dict[str, Any]:
+    """Prove a website address by fetching the home page, then describe it.
+
+    No credential is involved: the record carries the address, the page title
+    the fetch found, and the hostname the crawl is confined to.
+    """
+    provider = request.provider
+    site_url = normalize_site_url(request.text("site_url"))
+    name = request.text("name")
+    from urllib.parse import urlparse
+
+    hostname = urlparse(site_url).hostname or site_url
+    title = ""
+    status_code = None
+    try:
+        import httpx
+
+        timeout_seconds = float(
+            getattr(request.context, "connect_oauth_http_timeout_seconds", None)
+            or 15.0
+        )
+        async with httpx.AsyncClient(
+            timeout=timeout_seconds, follow_redirects=True
+        ) as client:
+            response = await client.get(
+                site_url, headers={"User-Agent": "NeuralNexus/1.0 (+website connector)"}
+            )
+        status_code = response.status_code
+        if status_code >= 400:
+            raise ConnectRefused(
+                400, f"{site_url} answered {status_code}; check the address."
+            )
+        text = response.text or ""
+        lowered = text.lower()
+        start = lowered.find("<title")
+        if start != -1:
+            start = lowered.find(">", start)
+            end = lowered.find("</title>", start)
+            if start != -1 and end != -1:
+                title = " ".join(text[start + 1 : end].split())[:200]
+    except ConnectRefused:
+        raise
+    except Exception as fetch_error:
+        raise ConnectRefused(
+            400, f"{site_url} could not be reached: {fetch_error}"
+        ) from fetch_error
+
+    account_address = hostname.lower()
+    key = account_key(provider.name, account_address)
+    label = deduplicate_label(name or title or hostname, request.existing_records, key)
+    return build_account_record(
+        provider=provider,
+        account_address=account_address,
+        display_label=label,
+        encrypted_secret=None,
+        assistant_id=request.assistant_id,
+        transport={
+            "site_url": site_url,
+            "hostname": hostname,
+            "title": title,
+            "status_code": status_code,
+        },
+    )
 
 
 async def _refuse_device_pairing(request: ConnectRequest) -> dict[str, Any]:
@@ -257,7 +448,10 @@ async def _refuse_device_pairing(request: ConnectRequest) -> dict[str, Any]:
 CONNECT_HANDLERS: dict[str, ConnectHandler] = {
     MECHANISM_APP_PASSWORD: connect_app_password_account,
     MECHANISM_MCP_URL: connect_mcp_server_account,
-    MECHANISM_OAUTH: _refuse_redirect_mechanism,
+    MECHANISM_URL_ONLY: connect_website,
+    MECHANISM_OAUTH: _needs_popup_login,
+    MECHANISM_PLAID_LINK: _needs_popup_login,
+    MECHANISM_BROWSER_SESSION: _needs_popup_login,
     MECHANISM_AUTH0_IDENTITY: _refuse_redirect_mechanism,
     MECHANISM_DEVICE_PAIRING: _refuse_device_pairing,
 }

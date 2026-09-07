@@ -957,8 +957,78 @@ async def _build_consciousness_system_message_update(
                 "password, or authentication token in a reply.\n"
                 "</MAILBOX_STATUS>\n"
             )
-        else:
-            system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+        # The connection offer block is always present for the owner: an
+        # account that is not connected yet is exactly the one the avatar
+        # should offer, and the block also carries the "sign in again" rule.
+        system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+
+        # Every connected account, by kind, plus the accounts whose sign-in
+        # lapsed, so the avatar answers "what can you see?" without a tool
+        # call and re-raises the card for a lapsed one. Labels and addresses
+        # only; never a token, a cookie, or a server address.
+        try:
+            from src.anubis.utils.connected_accounts import get_provider
+            from src.anubis.utils.connected_accounts.store import stale_accounts_for
+
+            bound_all = await bound_accounts_for(runtime.store, user_id, assistant_id)
+            stale_all = await stale_accounts_for(runtime.store, user_id, assistant_id)
+            connected_lines = []
+            for account in bound_all:
+                provider = get_provider(str(account.get("provider") or ""))
+                provider_name = provider.display_name if provider else account.get("provider")
+                detail = account.get("display_label") or account.get("account_address") or ""
+                connected_lines.append(f"{provider_name}: {detail}")
+            stale_lines = []
+            for account in stale_all:
+                provider = get_provider(str(account.get("provider") or ""))
+                provider_name = provider.display_name if provider else account.get("provider")
+                stale_lines.append(
+                    f"{provider_name}: {account.get('display_label') or ''} "
+                    f"(provider name \"{account.get('provider')}\")"
+                )
+            system_message_str += (
+                "\n<CONNECTED_ACCOUNTS>\n"
+                + (
+                    "Connected for this avatar: " + "; ".join(connected_lines) + "."
+                    if connected_lines
+                    else "No accounts are connected for this avatar yet."
+                )
+                + (
+                    " Need to be signed in again: " + "; ".join(stale_lines) + "."
+                    if stale_lines
+                    else ""
+                )
+                + "\n</CONNECTED_ACCOUNTS>\n"
+            )
+            kinds_present = {str(account.get("kind") or "") for account in bound_all}
+            mechanisms_present = {
+                str(account.get("credential_mechanism") or "") for account in bound_all
+            }
+            from src.anubis.utils.prompts.system_prompts import (
+                CONNECTED_SITE_PROMPT,
+                WEBSITE_PROMPT,
+            )
+
+            if "browser_session" in mechanisms_present:
+                system_message_str = system_message_str + CONNECTED_SITE_PROMPT
+            if "website" in kinds_present:
+                system_message_str = system_message_str + WEBSITE_PROMPT
+            try:
+                from src.anubis.utils.analytics.system_prompt_fragments import (
+                    BUSINESS_ANALYTICS_PROMPT,
+                    DEVELOPMENT_ANALYTICS_PROMPT,
+                    FINANCE_PROMPT,
+                )
+
+                system_message_str = system_message_str + BUSINESS_ANALYTICS_PROMPT
+                if "bank" in kinds_present:
+                    system_message_str = system_message_str + FINANCE_PROMPT
+                if "developer" in kinds_present or bool(bound_mcp_connections):
+                    system_message_str = system_message_str + DEVELOPMENT_ANALYTICS_PROMPT
+            except ImportError:
+                pass
+        except Exception:
+            logger.exception("Could not describe connected accounts in the prompt")
 
         # Custom connectors — the owner's own Model Context Protocol servers —
         # gated identically. Their tools are attached with the connector's name

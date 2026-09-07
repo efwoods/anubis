@@ -82,7 +82,12 @@ from src.anubis.utils.huggingface_prefetch import (
 )
 from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
 from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
-from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
+from src.anubis.utils.nodes import (
+    join_user_observation,
+    load_consciousness,
+    observe_user,
+    resolve_human_message_images,
+)
 from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
 from src.anubis.utils.state import GlobalState
@@ -1462,6 +1467,11 @@ async def _run_avatar_deep_agent_turn(
         "user_state": state["user_state"],
         "assistant_state": state["assistant_state"],
         "internal_thoughts": [],
+        # Continuous learning: the immediate emotion reading and the running
+        # sentiment summary of this turn, so a consciousness rebuild inside
+        # the agent (after an identity or learning tool ran) keeps both sections.
+        "current_user_emotions": state.get("current_user_emotions") or "",
+        "current_conversation_sentiment": state.get("current_conversation_sentiment") or "",
         # The conversation's summarization event from earlier turns, so the
         # summarizer reuses the compaction instead of summarizing again.
         CONVERSATION_SUMMARY_EVENT_KEY: state.get(CONVERSATION_SUMMARY_EVENT_KEY),
@@ -1802,17 +1812,27 @@ message_workflow = StateGraph(
 # workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
 message_workflow.add_node("resolve_human_message_images", resolve_human_message_images)
+# Continuous learning: the user's latest message is observed (immediate
+# sentiment, running conversation sentiment, engagement counters, pending
+# learning marker) in parallel with image resolution, so the observation costs
+# the turn only the slower of the two branches; the join waits for both.
+message_workflow.add_node("observe_user", observe_user)
+message_workflow.add_node("join_user_observation", join_user_observation)
 message_workflow.add_node("anubis", anubis)
 message_workflow.add_node(AMBIENT_TRIAGE_NODE, ambient_triage)
 
 message_workflow.add_edge(START, "chat")
 message_workflow.add_edge("chat", "resolve_human_message_images")
+message_workflow.add_edge("chat", "observe_user")
+message_workflow.add_edge(
+    ["resolve_human_message_images", "observe_user"], "join_user_observation"
+)
 # An ambient observation (a hidden webcam/screen turn sent through /message
 # with ambient=true) is triaged before the avatar runs: ``ignore`` ends the run
 # with the observation persisted as context, ``respond`` / ``notify`` reach the
 # avatar. Every other turn goes straight to the avatar as before.
 message_workflow.add_conditional_edges(
-    "resolve_human_message_images",
+    "join_user_observation",
     route_after_image_resolution,
     {AMBIENT_TRIAGE_NODE: AMBIENT_TRIAGE_NODE, "anubis": "anubis"},
 )

@@ -209,6 +209,9 @@ class GlobalState(TypedDict):
     user_is_creator: str = None
 
     current_user_emotions: str
+    # Continuous learning: the running structured sentiment summary of the
+    # current conversation, rendered as prose by the ``observe_user`` node.
+    current_conversation_sentiment: str
     # current_user_beliefs: str
     # current_user_desires: str
     # current_user_fears: str

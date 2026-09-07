@@ -1217,6 +1217,50 @@ class GlobalContext:
 
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
+    """ Continuous Learning & Personalization """
+
+    learning_sweep_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to run the background learning sweep (conversation sentiment history, rating aggregation, preference inference) from the API lifespan. Env LEARNING_SWEEP_ENABLED."
+        },
+    )
+
+    learning_sweep_interval_seconds: int = field(
+        default=300,
+        metadata={
+            "description": "How often, in seconds, the background learning sweep wakes to look for idle accounts with unprocessed conversations. Env LEARNING_SWEEP_INTERVAL_SECONDS."
+        },
+    )
+
+    learning_idle_seconds: int = field(
+        default=600,
+        metadata={
+            "description": "An account is swept only once the user's newest message on that account is at least this many seconds old. Env LEARNING_IDLE_SECONDS."
+        },
+    )
+
+    learning_prompt_retrieval_limit: int = field(
+        default=10,
+        metadata={
+            "description": "Maximum records retrieved per learning section (feedback messages, rated messages, sentiment history, what feels real, preferences) for the system prompt. Env LEARNING_PROMPT_RETRIEVAL_LIMIT."
+        },
+    )
+
+    ask_what_feels_real_after_messages: int = field(
+        default=5,
+        metadata={
+            "description": "Once the user has sent this many messages to an avatar and nothing is recorded about what feels real to the user, the avatar naturally asks. Zero disables the question. Env ASK_WHAT_FEELS_REAL_AFTER_MESSAGES."
+        },
+    )
+
+    conversation_sentiment_per_turn_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to refresh the structured sentiment summary of the current conversation on every user turn (one classification-model call per turn). Env CONVERSATION_SENTIMENT_PER_TURN_ENABLED."
+        },
+    )
+
     """ <Usage analytics (opt-in action log and described page captures)> """
 
     usage_analytics_enabled: str = field(

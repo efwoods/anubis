@@ -251,7 +251,12 @@ async def test_the_routes_record_allowing_replying_leaving_alone_and_rating(
         await decide("act", {"action": "someone"})
     assert bad_actor.value.status_code == 400
 
+    async def fake_thread(_client, _thread_id):
+        return [{"type": "ai", "id": "lc_run--9", "content": "Certainly, esteemed sir."}]
+
+    monkeypatch.setattr(webapp_module, "_load_thread_message_dicts", fake_thread)
     rated = await webapp_module.record_message_feedback_route(
+        request=SimpleNamespace(app=SimpleNamespace(state=webapp_module.app.state)),
         feedback=webapp_module.MessageFeedbackRequest(
             assistant_id="a1",
             thread_id="t1",

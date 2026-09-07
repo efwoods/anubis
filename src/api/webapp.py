@@ -7210,6 +7210,9 @@ async def stop_avatar_message(
         if turn_registry is not None
         else None
     )
+    # The id the reply is stored under, so a client can rate exactly this
+    # reply through POST /message_feedback.
+    response_data["message_id"] = getattr(result["messages"][-1], "id", None)
     caller_user_id = current_user["identities"][0]["user_id"]
     if (
         active_turn is None
@@ -8116,10 +8119,17 @@ def _message_dict_request_id(message: dict) -> str:
 
 
 def _find_avatar_message_and_prompt(
-    messages: list[dict], message_id: str | None, request_id: str | None = None
+    messages: list[dict],
+    message_id: str | None,
+    request_id: str | None = None,
+    content_excerpt: str | None = None,
 ) -> tuple[dict | None, dict | None]:
     """The avatar message ``message_id`` names (else the one streamed under
-    ``request_id``, else the latest one) and the user message before it."""
+    ``request_id``, else the newest one whose text starts with
+    ``content_excerpt``, else the latest one when nothing was named) and the
+    user message before it."""
+    from src.anubis.utils.learning.sentiment import message_text
+
     avatar_index: int | None = None
     for index, message in enumerate(messages):
         if _message_dict_type(message) not in ("ai", "assistant"):
@@ -8170,6 +8180,7 @@ async def _learn_from_message_feedback(
     from the thread when the thread is known, else from the text the browser
     sent. Returns what was learned, for the response.
     """
+    excerpt = (content_excerpt or "").strip()[:200]
     from src.anubis.utils.learning.feedback import (
         store_feedback_message,
         store_message_rating,
@@ -8184,11 +8195,13 @@ async def _learn_from_message_feedback(
     avatar_message: dict | None = None
     preceding_user_message: dict | None = None
     if thread_id:
+            if excerpt and message_text(message.get("content")).strip().startswith(excerpt):
+                avatar_index = index
         try:
             langgraph_client = get_client(headers=langgraph_client_headers)
             messages = await _load_thread_message_dicts(langgraph_client, thread_id)
             avatar_message, preceding_user_message = _find_avatar_message_and_prompt(
-                messages, message_id, request_id
+                messages, message_id, request_id, content
             )
         except Exception as thread_error:  # noqa: BLE001 - fall back to the browser's text
             logger.debug("Could not load the rated thread %s: %s", thread_id, thread_error)

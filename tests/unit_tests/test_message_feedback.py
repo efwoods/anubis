@@ -140,7 +140,9 @@ async def test_feedback_is_listed_per_thread_and_attached_to_the_reply():
     assert attached[1]["feedback"]["type"] == "like"
     assert attached[2]["feedback"] == {
         "type": "dislike",
+        "feels": None,
         "comment": "too long",
+        "rating_score": None,
         "recorded_at": attached[2]["feedback"]["recorded_at"],
     }
     assert attached[3] == "not a dict"
@@ -216,8 +218,19 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(webapp_module.app.state, "store", store, raising=False)
     current_user = {"API_KEY": "k", "identities": [{"user_id": "u1"}]}
+    request = SimpleNamespace(app=SimpleNamespace(state=webapp_module.app.state))
+
+    # The rated thread, as the learning step reads it back from the graph.
+    async def fake_thread(_client, _thread_id):
+        return [
+            {"type": "human", "id": "h1", "content": "how do I make pancakes?"},
+            {"type": "ai", "id": "lc_run--1", "content": "hello there"},
+        ]
+
+    monkeypatch.setattr(webapp_module, "_load_thread_message_dicts", fake_thread)
 
     recorded = await webapp_module.record_message_feedback_route(
+        request=request,
         feedback=webapp_module.MessageFeedbackRequest(
             assistant_id="a1",
             thread_id="t1",
@@ -233,11 +246,76 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
     assert payload["recorded"] is True
     assert payload["feedback"]["type"] == "like"
     assert payload["feedback"]["comment"] == "keep this tone"
+    # The same press taught the avatar: a rated message holding the reply and
+    # the question before it, and the note as a feedback message.
+    assert payload["learning"]["rating"].startswith("collected")
+    assert payload["learning"]["feedback_message"].startswith("immediate")
+    from src.anubis.utils.learning.namespaces import (
+        RATING_POSITIVE,
+        feedback_namespace,
+        rating_namespace,
+        what_feels_real_namespace,
+    )
+
+    rating_rows = [
+        value
+        for (namespace, _key), value in store.items.items()
+        if namespace == rating_namespace("u1", "a1", RATING_POSITIVE)
+    ]
+    assert len(rating_rows) == 1
+    rated_text = rating_rows[0]["document"]["kwargs"]["page_content"]
+    assert "USER: how do I make pancakes?" in rated_text
+    assert "AVATAR (rated positive by the user): hello there" in rated_text
+    assert any(
+        namespace == feedback_namespace("u1", "a1")
+        for (namespace, _key) in store.items
+    )
+
+    # A feels-off mark with a note keeps the thumb and records what feels fake.
+    felt = await webapp_module.record_message_feedback_route(
+        request=request,
+        feedback=webapp_module.MessageFeedbackRequest(
+            assistant_id="a1",
+            thread_id="t1",
+            message_id="lc_run--1",
+            feedback_type="feels_fake",
+            comment="too formal for you",
+        ),
+        current_user=current_user,
+    )
+    felt_payload = json.loads(felt.body)
+    assert felt_payload["feedback"]["type"] == "like"
+    assert felt_payload["feedback"]["feels"] == "feels_fake"
+    assert felt_payload["learning"]["what_feels_real"].startswith("immediate")
+    realness_rows = [
+        value
+        for (namespace, _key), value in store.items.items()
+        if namespace == what_feels_real_namespace("u1", "a1")
+    ]
+    assert len(realness_rows) == 1
+    assert "feels fake" in realness_rows[0]["document"]["kwargs"]["page_content"]
+
+    # A 1-5 rating maps onto the thumb and keeps the score.
+    scored = await webapp_module.record_message_feedback_route(
+        request=request,
+        feedback=webapp_module.MessageFeedbackRequest(
+            assistant_id="a1",
+            thread_id="t1",
+            message_id="lc_run--1",
+            feedback_type="rating",
+            rating=2,
+        ),
+        current_user=current_user,
+    )
+    scored_payload = json.loads(scored.body)
+    assert scored_payload["feedback"]["type"] == "dislike"
+    assert scored_payload["feedback"]["rating_score"] == 2.0
 
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as rejected:
         await webapp_module.record_message_feedback_route(
+            request=request,
             feedback=webapp_module.MessageFeedbackRequest(
                 assistant_id="a1", feedback_type="rating", message_id="x"
             ),
@@ -246,12 +324,22 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
     assert rejected.value.status_code == 400
     with pytest.raises(HTTPException) as unidentified:
         await webapp_module.record_message_feedback_route(
+            request=request,
             feedback=webapp_module.MessageFeedbackRequest(
                 assistant_id="a1", feedback_type="like"
             ),
             current_user=current_user,
         )
     assert unidentified.value.status_code == 400
+    with pytest.raises(HTTPException) as unknown_type:
+        await webapp_module.record_message_feedback_route(
+            request=request,
+            feedback=webapp_module.MessageFeedbackRequest(
+                assistant_id="a1", feedback_type="meh", message_id="x"
+            ),
+            current_user=current_user,
+        )
+    assert unknown_type.value.status_code == 400
 
     class _Request:
         def __init__(self, body):
@@ -286,8 +374,10 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
             "request_id": "req-1",
             "thread_id": "t1",
             "feedback": {
-                "type": "like",
-                "comment": "keep this tone",
+                "type": "dislike",
+                "feels": "feels_fake",
+                "comment": "too formal for you",
+                "rating_score": 2.0,
                 "recorded_at": preferences_payload["message_feedback"][0]["feedback"][
                     "recorded_at"
                 ],
@@ -296,3 +386,10 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
     ]
     assert preferences_payload["ambient_decisions"][0]["observation_id"] == "obs-1"
     assert preferences_payload["ambient_decisions"][0]["rating"] == "ignore"
+    # What the avatar learned rides the same payload.
+    assert [row["text"] for row in preferences_payload["feedback_messages"]] == [
+        "too formal for you",
+        "keep this tone",
+    ]
+    assert preferences_payload["what_feels_real"][0]["polarity"] == "feels_fake"
+    assert preferences_payload["learned_preferences"] == []

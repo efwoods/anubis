@@ -25,6 +25,10 @@ MESSAGE_FEEDBACK_NAMESPACE_SUFFIX = "message_feedback"
 
 FEEDBACK_TYPES = frozenset({"like", "dislike"})
 
+# What the conversation partner said feels real (or off) about the reply. Kept
+# on the same record as the thumb so one press restores the whole row.
+FEELS_TYPES = frozenset({"feels_real", "feels_fake"})
+
 # How much of the rated reply the embedded record quotes. Enough to recall
 # "replies like this one" by similarity, short enough to keep the row small.
 CONTENT_EXCERPT_CHARACTERS = 600
@@ -52,25 +56,55 @@ def _item_value(item: Any) -> dict[str, Any]:
 
 
 def _feedback_page_content(
-    *, feedback_type: str, comment: str | None, content_excerpt: str
+    *,
+    feedback_type: str | None,
+    feels: str | None,
+    comment: str | None,
+    content_excerpt: str,
 ) -> str:
-    verb = "liked" if feedback_type == "like" else "disliked"
-    text = f"The conversation partner {verb} this reply"
+    if feedback_type in FEEDBACK_TYPES:
+        verb = "liked" if feedback_type == "like" else "disliked"
+        text = f"The conversation partner {verb} this reply"
+    elif feels == "feels_real":
+        text = "The conversation partner said this reply feels real"
+    elif feels == "feels_fake":
+        text = "The conversation partner said this reply feels fake or off"
+    else:
+        text = "The conversation partner reacted to this reply"
     if content_excerpt:
         text += f': "{content_excerpt}"'
     text += "."
+    if feedback_type in FEEDBACK_TYPES and feels == "feels_real":
+        text += " The conversation partner said this reply feels real."
+    elif feedback_type in FEEDBACK_TYPES and feels == "feels_fake":
+        text += " The conversation partner said this reply feels fake or off."
     if comment:
         text += f" Feedback from the conversation partner: {comment}"
     return text
 
 
 def feedback_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return the shape the browser keeps on a message: ``{type, comment, recorded_at}``."""
-    if not record or not record.get("feedback_type"):
+    """Return the shape the browser keeps on a message.
+
+    ``{type, feels, comment, rating_score, recorded_at}``: ``type`` is the thumb
+    (``like`` / ``dislike`` / ``None``), ``feels`` is ``feels_real`` /
+    ``feels_fake`` / ``None``.
+    """
+    if not record:
+        return None
+    feedback_type = record.get("feedback_type")
+    feels = record.get("feels")
+    if (
+        feedback_type not in FEEDBACK_TYPES
+        and feels not in FEELS_TYPES
+        and not record.get("comment")
+    ):
         return None
     return {
-        "type": record.get("feedback_type"),
+        "type": feedback_type if feedback_type in FEEDBACK_TYPES else None,
+        "feels": feels if feels in FEELS_TYPES else None,
         "comment": record.get("comment"),
+        "rating_score": record.get("rating_score"),
         "recorded_at": record.get("recorded_at"),
     }
 
@@ -83,19 +117,27 @@ async def record_message_feedback(
     thread_id: str | None,
     message_id: str | None,
     request_id: str | None,
-    feedback_type: str,
+    feedback_type: str | None,
     comment: str | None = None,
     content: str | None = None,
+    feels: str | None = None,
+    rating_score: float | None = None,
 ) -> dict[str, Any] | None:
     """Record (or replace) the conversation partner's feedback on one reply.
 
     A thumb without a note keeps any note already recorded; a note without a
-    new thumb keeps the recorded thumb. Returns the stored record, or ``None``
-    when the store is unavailable or the reply cannot be identified.
+    new thumb keeps the recorded thumb; a feels-real mark keeps the thumb and
+    a thumb keeps the feels-real mark. Returns the stored record, or ``None``
+    when the store is unavailable, the reply cannot be identified, or nothing
+    (no thumb, no feels-real mark, no note) was given.
     """
     if store is None or not user_id or not assistant_id:
         return None
     if feedback_type not in FEEDBACK_TYPES:
+        feedback_type = None
+    if feels not in FEELS_TYPES:
+        feels = None
+    if feedback_type is None and feels is None and not (comment or "").strip():
         return None
     key = message_feedback_key(message_id, request_id)
     if key is None:
@@ -112,8 +154,18 @@ async def record_message_feedback(
     content_excerpt = (content or "").strip()[:CONTENT_EXCERPT_CHARACTERS] or str(
         previous.get("content_excerpt") or ""
     )
+    previous_type = previous.get("feedback_type")
+    final_type = feedback_type or (
+        previous_type if previous_type in FEEDBACK_TYPES else None
+    )
+    previous_feels = previous.get("feels")
+    final_feels = feels or (previous_feels if previous_feels in FEELS_TYPES else None)
+    final_rating_score = (
+        rating_score if rating_score is not None else previous.get("rating_score")
+    )
     page_content = _feedback_page_content(
-        feedback_type=feedback_type,
+        feedback_type=final_type,
+        feels=final_feels,
         comment=final_comment,
         content_excerpt=content_excerpt,
     )
@@ -123,7 +175,8 @@ async def record_message_feedback(
             "user_id": user_id,
             "assistant_id": assistant_id,
             "thread_id": thread_id,
-            "feedback_type": feedback_type,
+            "feedback_type": final_type,
+            "feels": final_feels,
         },
     )
     value = {
@@ -131,7 +184,9 @@ async def record_message_feedback(
         "thread_id": thread_id,
         "message_id": (message_id or "").strip() or previous.get("message_id"),
         "request_id": (request_id or "").strip() or previous.get("request_id"),
-        "feedback_type": feedback_type,
+        "feedback_type": final_type,
+        "feels": final_feels,
+        "rating_score": final_rating_score,
         "comment": final_comment,
         "content_excerpt": content_excerpt,
         "recorded_at": datetime.now(UTC).isoformat(),
@@ -163,7 +218,11 @@ async def list_message_feedback(
     records: list[dict[str, Any]] = []
     for item in items or []:
         value = _item_value(item)
-        if value.get("feedback_type") in FEEDBACK_TYPES:
+        if (
+            value.get("feedback_type") in FEEDBACK_TYPES
+            or value.get("feels") in FEELS_TYPES
+            or value.get("comment")
+        ):
             records.append(value)
     return records
 

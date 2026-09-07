@@ -14,7 +14,20 @@ connected", and "how a connection is made and used":
   mechanism; ``POST /connect_account`` dispatches through it.
 - :mod:`tool_factories` — which tools an account of each kind contributes.
 - :mod:`listing` — the unified row shape accounts and devices share.
-- :mod:`connection_tools` — the in-chat connect card.
+- :mod:`connection_tools` — the in-chat connect card, and direct connects.
+- :mod:`connection_cards` — the persisted card record a reply carries.
+- :mod:`oauth_state`, :mod:`oauth_providers`, :mod:`oauth_flow`,
+  :mod:`pending_logins` — popup sign-in through a vendor's own OAuth page
+  (Google, GitHub, X, Vercel), signed state, PKCE, refresh.
+- :mod:`mcp_oauth` — OAuth for custom Model Context Protocol servers
+  (discovery, dynamic client registration).
+- :mod:`plaid_link` — banks through Plaid Link.
+- :mod:`browser_sessions`, :mod:`browser_login` — the live browser the owner
+  signs in through for sites with no OAuth, and the durable sessions kept.
+- :mod:`browser_session_tools`, :mod:`recipes` — tools inside those sessions
+  and vendor usage recipes; :mod:`website_tools` — crawl and audit websites;
+  :mod:`vendor_api_tools`, :mod:`finance_tools` — API tools per vendor and bank.
+- :mod:`mailbox_credentials` — mailbox credentials for any record mechanism.
 - :mod:`mcp_server_tools` — tools from the owner's own Model Context Protocol servers.
 
 Nothing here talks to a provider's servers at import time. The mailbox client

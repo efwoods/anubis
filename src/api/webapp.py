@@ -2058,9 +2058,22 @@ async def lifespan(app: FastAPI):
     pending_logins_module.set_pending_login_repository(
         pending_logins_module.PostgresPendingLoginRepository(app.state.pool)
     )
+    # Website audits keep a content hash per page so "what changed" can be answered.
+    from src.anubis.utils.connected_accounts.website_tools import (
+        ensure_website_crawls_table,
+    )
+
+    await ensure_website_crawls_table(app.state.pool)
     # Graph-side analytics tools reach the application tables through the
     # same pool; the graph cannot import this module.
     runtime_handles.set_postgres_pool(app.state.pool)
+    # Signed-in browser sessions (sites with no OAuth) are revisited on a
+    # schedule so the owner does not sign in again days later.
+    from src.anubis.utils.connected_accounts import browser_sessions as browser_sessions_module
+
+    app.state.browser_session_keepalive = asyncio.create_task(
+        browser_sessions_module.keepalive_forever(app.state.context, None)
+    )
     try:
         from src.anubis.utils import analytics as analytics_package
 
@@ -2167,6 +2180,14 @@ async def lifespan(app: FastAPI):
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
+        try:
+            from src.anubis.utils.connected_accounts.browser_sessions import (
+                shutdown_browser_sessions,
+            )
+
+            await shutdown_browser_sessions()
+        except Exception:
+            logger.debug("Browser sessions did not shut down cleanly", exc_info=True)
         await pool.close()
 
 
@@ -3754,6 +3775,391 @@ def _popup_result_response(result: dict[str, Any]) -> HTMLResponse:
     return HTMLResponse(
         render_popup_result_html(result, allowed_popup_origins(app.state.context))
     )
+
+
+def _login_token_from_request(request: Request) -> str:
+    """Return the signed login token a popup presents (header or query)."""
+    token = request.headers.get("X-Login-Token") or request.query_params.get("t") or ""
+    if not token:
+        raise HTTPException(status_code=401, detail="A login token is required.")
+    return str(token)
+
+
+def _verify_login_token(token: str, *, mode: str) -> dict:
+    from src.anubis.utils.connected_accounts.oauth_state import (
+        OAuthStateError,
+        state_secret,
+        verify_state,
+    )
+
+    try:
+        payload = verify_state(token, state_secret(app.state.context))
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=401, detail=str(state_error))
+    if payload.get("mode") != mode:
+        raise HTTPException(status_code=401, detail="The login token is for another flow.")
+    return payload
+
+
+@app.post("/connect_account/plaid/link_token")
+async def connect_account_plaid_link_token(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Begin a bank connection through Plaid Link.
+
+    Returns ``{link_url, nonce, expires_in}``; the card opens ``link_url`` (a
+    path on this API) in the window it opened on the click. 503 when Plaid
+    is not configured on this server.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
+    from src.anubis.utils.connected_accounts.plaid_link import (
+        PlaidLinkError,
+        start_plaid_link,
+    )
+
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    provider = get_provider(str((body or {}).get("provider") or "plaid"))
+    if provider is None or provider.login_mode != "plaid_link":
+        raise HTTPException(status_code=400, detail="This provider does not connect through Plaid.")
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    try:
+        started = await start_plaid_link(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+        )
+    except PlaidLinkError as plaid_error:
+        raise HTTPException(status_code=plaid_error.status_code, detail=plaid_error.detail)
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=503, detail=str(state_error))
+    return JSONResponse(content=started, status_code=200)
+
+
+@app.get("/connect_account/plaid/link")
+async def connect_account_plaid_link_page(request: Request, t: str = ""):
+    """The popup page that runs Plaid Link (the login token is the auth)."""
+    from src.anubis.utils.connected_accounts.oauth_flow import allowed_popup_origins
+    from src.anubis.utils.connected_accounts.pending_logins import (
+        get_pending_login_repository,
+    )
+    from src.anubis.utils.connected_accounts.plaid_link import (
+        PLAID_EXCHANGE_PATH,
+        render_link_page_html,
+    )
+
+    payload = _verify_login_token(t, mode="plaid")
+    pending = await get_pending_login_repository().peek(str(payload.get("nonce") or ""))
+    if pending is None or pending.get("status") != "started":
+        return _popup_result_response(
+            {"ok": False, "nonce": payload.get("nonce"), "provider": "plaid", "error": "This bank sign-in has expired. Start the connection again."}
+        )
+    link_token = str((pending.get("payload") or {}).get("link_token") or "")
+    return HTMLResponse(
+        render_link_page_html(
+            link_token=link_token,
+            nonce=str(payload.get("nonce")),
+            login_token=t,
+            allowed_origins=allowed_popup_origins(app.state.context),
+            exchange_path=PLAID_EXCHANGE_PATH,
+        )
+    )
+
+
+@app.post("/connect_account/plaid/exchange")
+async def connect_account_plaid_exchange(request: Request):
+    """Finish a bank connection: exchange the public token and store the item."""
+    from src.anubis.utils.connected_accounts import get_provider, public_account_view
+    from src.anubis.utils.connected_accounts.pending_logins import (
+        get_pending_login_repository,
+    )
+    from src.anubis.utils.connected_accounts.plaid_link import (
+        PlaidLinkError,
+        exchange_public_token,
+    )
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
+
+    payload = _verify_login_token(_login_token_from_request(request), mode="plaid")
+    body = await request.json()
+    public_token = str((body or {}).get("public_token") or "")
+    nonce = str(payload.get("nonce") or "")
+    if not public_token:
+        raise HTTPException(status_code=400, detail="A public_token is required.")
+    pending = await get_pending_login_repository().consume(nonce)
+    if pending is None:
+        return JSONResponse(
+            content={"ok": False, "nonce": nonce, "provider": "plaid", "error": "This bank sign-in was already completed or has expired."},
+            status_code=200,
+        )
+    user_id = str(pending["user_id"])
+    existing_records = await _connected_account_records_without_session(user_id)
+    try:
+        record = await exchange_public_token(
+            app.state.context,
+            public_token=public_token,
+            pending=pending,
+            existing_records=existing_records,
+        )
+        provider = get_provider("plaid")
+        _enforce_connection_caps(existing_records, provider, record)
+        await _store_connected_record_without_session(user_id, record)
+        _after_record_stored(provider, record)
+    except PlaidLinkError as plaid_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "provider": "plaid", "error": plaid_error.detail}, status_code=200)
+    except HTTPException as http_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "provider": "plaid", "error": str(http_error.detail)}, status_code=200)
+    view = public_account_view(record)
+    # The first transaction sync runs in the background so the card answers at once.
+    try:
+        from src.anubis.utils.analytics.finance import sync_transactions
+
+        schedule_background(sync_transactions(app.state.context, app.state.pool, user_id, record))
+    except ImportError:
+        pass
+    except Exception:
+        logger.debug("Could not schedule the first Plaid sync", exc_info=True)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "nonce": nonce,
+            "provider": "plaid",
+            "account_key": view.get("account_key"),
+            "display_label": view.get("display_label"),
+            "account_address": view.get("account_address"),
+            "tool_count": len(tool_names_for(provider, record)),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/connect_account/browser/start")
+async def connect_account_browser_start(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Open a live browser at a site's sign-in page for the owner to sign in on.
+
+    Body: ``provider`` (langsmith, openai, anthropic, neural_nexus, a social
+    site, custom_site, or website) plus ``site_url`` and ``name`` for a custom
+    site. Returns ``{login_id, view_url, nonce, expires_in}``; the card opens
+    ``view_url`` (a path on this API) in the window it opened on the click.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.browser_login import start_login
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A JSON object body is required.")
+    provider = get_provider(str(body.get("provider") or ""))
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Unknown provider.")
+    if provider.login_mode != "browser_session" and provider.name != "website":
+        raise HTTPException(status_code=400, detail=f"{provider.display_name} does not sign in through a browser window.")
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    try:
+        started = await start_login(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+            site_url=body.get("site_url"),
+            name=body.get("name"),
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=503, detail=str(state_error))
+    return JSONResponse(content=started, status_code=200)
+
+
+@app.get("/connect_account/browser/{login_id}")
+async def connect_account_browser_view(request: Request, login_id: str, t: str = ""):
+    """The popup page showing the live sign-in browser (login token is the auth)."""
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.browser_login import (
+        get_live_login,
+        render_login_page_html,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.oauth_flow import allowed_popup_origins
+
+    try:
+        payload = verify_login_token(app.state.context, t, login_id)
+    except BrowserSessionError as session_error:
+        return _popup_result_response({"ok": False, "error": session_error.detail})
+    login = get_live_login(login_id)
+    if login is None or login.user_id != payload.get("user_id"):
+        return _popup_result_response(
+            {"ok": False, "nonce": payload.get("nonce"), "error": "This sign-in window has expired. Start the sign-in again."}
+        )
+    provider = get_provider(login.provider_name)
+    return HTMLResponse(
+        render_login_page_html(
+            login_id=login_id,
+            token=t,
+            nonce=login.nonce,
+            provider_name=login.provider_name,
+            display_name=provider.display_name if provider else login.provider_name,
+            site_url=login.site_url,
+            allowed_origins=allowed_popup_origins(app.state.context),
+            finish_path=f"/connect_account/browser/{login_id}/finish",
+            cancel_path=f"/connect_account/browser/{login_id}/cancel",
+            stream_path=f"/connect_account/browser/{login_id}/stream",
+        )
+    )
+
+
+@app.websocket("/connect_account/browser/{login_id}/stream")
+async def connect_account_browser_stream(websocket: WebSocket, login_id: str):
+    """Stream frames of the sign-in browser to the popup and forward input."""
+    from src.anubis.utils.connected_accounts.browser_login import (
+        get_live_login,
+        stream_login,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = websocket.query_params.get("t") or ""
+    try:
+        payload = verify_login_token(app.state.context, token, login_id)
+    except BrowserSessionError:
+        await websocket.close(code=4401)
+        return
+    login = get_live_login(login_id)
+    if login is None or login.user_id != payload.get("user_id") or login.finished:
+        await websocket.close(code=4404)
+        return
+    if login.streaming:
+        await websocket.close(code=4409)
+        return
+    await websocket.accept()
+    try:
+        await stream_login(websocket, login, app.state.context)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.post("/connect_account/browser/{login_id}/finish")
+async def connect_account_browser_finish(request: Request, login_id: str):
+    """Save the signed-in session as a connected account."""
+    from src.anubis.utils.connected_accounts import get_provider, public_account_view
+    from src.anubis.utils.connected_accounts.browser_login import (
+        finish_login,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_login_token(app.state.context, token, login_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    user_id = str(payload.get("user_id") or "")
+    nonce = payload.get("nonce")
+    existing_records = await _connected_account_records_without_session(user_id)
+    try:
+        finished = await finish_login(
+            app.state.context, login_id=login_id, user_id=user_id, existing_records=existing_records
+        )
+        record = finished["record"]
+        provider = get_provider(str(record.get("provider") or ""))
+        _enforce_connection_caps(existing_records, provider, record)
+        await _store_connected_record_without_session(user_id, record)
+        _after_record_stored(provider, record)
+    except BrowserSessionError as session_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "error": session_error.detail}, status_code=200)
+    except HTTPException as http_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "error": str(http_error.detail)}, status_code=200)
+    view = public_account_view(record)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "nonce": nonce,
+            "provider": record.get("provider"),
+            "account_key": view.get("account_key"),
+            "display_label": view.get("display_label"),
+            "account_address": view.get("account_address"),
+            "tool_count": len(tool_names_for(provider, record)),
+            "heuristic_signed_in": finished.get("heuristic_signed_in"),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/connect_account/browser/{login_id}/cancel")
+async def connect_account_browser_cancel(request: Request, login_id: str):
+    """Close a sign-in window without saving anything."""
+    from src.anubis.utils.connected_accounts.browser_login import (
+        cancel_login,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_login_token(app.state.context, token, login_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    cancelled = await cancel_login(login_id, str(payload.get("user_id") or ""))
+    return JSONResponse(content={"ok": False, "cancelled": cancelled}, status_code=200)
+
+
+@app.get("/connect_account/neural_nexus/login")
+async def connect_account_neural_nexus_login_page(request: Request):
+    """The Neural Nexus business sign-in page shown inside the live browser.
+
+    Posts email and password to this API's own ``/login`` route; on success the
+    page navigates to the home address, which the live-browser finish reads as
+    a signed-in session. Nothing here is served to the app's own users outside
+    the connect flow.
+    """
+    page = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in to Neural Nexus</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0b0d;color:#e8e8ea;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+form{background:#141418;border:1px solid #26262c;border-radius:16px;padding:2rem;width:22rem;display:flex;flex-direction:column;gap:.75rem}
+h1{font-size:1.2rem;margin:0 0 .5rem}input{padding:.6rem .8rem;border-radius:10px;border:1px solid #333;background:#0b0b0d;color:#fff}
+button{padding:.6rem;border-radius:999px;border:0;background:#f5b301;color:#111;font-weight:600;cursor:pointer}p{color:#a3a3a8;font-size:.85rem;margin:0}</style></head>
+<body><form id="login"><h1>Sign in to Neural Nexus</h1>
+<input name="email" type="email" placeholder="Email" required autocomplete="username">
+<input name="password" type="password" placeholder="Password" required autocomplete="current-password">
+<button type="submit">Sign in</button><p id="status"></p></form>
+<script>
+document.getElementById('login').addEventListener('submit', function (event) {
+  event.preventDefault();
+  var form = event.target; var status = document.getElementById('status');
+  status.textContent = 'Signing in…';
+  fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: form.email.value, password: form.password.value }) })
+    .then(function (response) { return response.json().then(function (body) { return { ok: response.ok, body: body }; }); })
+    .then(function (result) {
+      if (!result.ok) { status.textContent = (result.body && (result.body.detail || result.body.message)) || 'Sign-in failed.'; return; }
+      status.textContent = 'Signed in. Press "I\'m signed in" above.';
+      document.cookie = 'neural_nexus_signed_in=1; path=/; SameSite=Lax';
+      try { localStorage.setItem('neural_nexus_login', JSON.stringify({ at: Date.now(), email: form.email.value })); } catch (e) {}
+      form.innerHTML = '<h1>Signed in as ' + form.email.value + '</h1><p>Press "I\'m signed in" at the top of the window.</p><a href="/account">Account</a>';
+    })
+    .catch(function () { status.textContent = 'Sign-in failed.'; });
+});
+</script></body></html>"""
+    return HTMLResponse(page)
 
 
 @app.post("/connect_account/oauth/start")

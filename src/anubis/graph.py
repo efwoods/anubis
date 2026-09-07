@@ -798,6 +798,9 @@ def _deep_agent_config(
         deep_agent_configurable["thread_id"] = str(
             uuid.uuid5(uuid.NAMESPACE_OID, f"{outer_thread}::deepagent::{turn_key}")
         )
+        # The conversation's own thread id, kept for the tool-call log so
+        # feature usage is counted per conversation, not per deep-agent turn.
+        deep_agent_configurable["outer_thread_id"] = str(outer_thread)
     deep_agent_config: RunnableConfig = {"configurable": deep_agent_configurable}
     return deep_agent_config, outer_thread
 
@@ -810,6 +813,32 @@ def _deep_agent_config(
 # table fall back to a generic phrase built from the name. ``{device}`` is
 # replaced by the ``device_label`` argument when the tool call names a machine.
 _TOOL_ACTIVITY_DESCRIPTIONS: dict[str, str] = {
+    "list_git_repositories": "Finding repositories on {device}",
+    "git_log": "Reading commit history on {device}",
+    "git_diff_stat": "Measuring the change on {device}",
+    "git_status": "Checking uncommitted work on {device}",
+    "list_claude_code_sessions": "Listing coding sessions on {device}",
+    "read_claude_code_session": "Reading a coding session on {device}",
+    "connect_account": "Offering an account connection",
+    "open_connected_site": "Opening a connected site",
+    "read_connected_page": "Reading a page of a connected site",
+    "fetch_connected_json": "Reading figures from a connected site",
+    "run_provider_recipe": "Reading vendor usage through the signed-in session",
+    "crawl_website": "Reading the website's pages",
+    "website_audit": "Auditing the website",
+    "website_traffic": "Reading website traffic",
+    "finance_transactions": "Reading bank transactions",
+    "finance_spend_summary": "Summarising spending",
+    "query_platform_metrics": "Querying platform usage",
+    "query_finances": "Querying finances",
+    "query_vendor_usage": "Querying vendor usage",
+    "make_chart": "Drawing a chart",
+    "save_report": "Saving the report",
+    "schedule_report": "Scheduling the report",
+    "forecast_metric": "Forecasting",
+    "github_activity": "Reading GitHub activity",
+    "github_issues": "Reading GitHub issues",
+    "github_pull_requests": "Reading pull requests",
     "check_data_server_connection": "Checking which machines are reachable",
     "discover_data_files": "Listing files on {device}",
     "preview_data_file": "Previewing a data file on {device}",
@@ -837,6 +866,46 @@ _TOOL_ACTIVITY_DESCRIPTIONS: dict[str, str] = {
     "read_files_for_sandbox": "Copying files from the machine into the workspace",
 }
 _DEFAULT_DEVICE_PHRASE = "the connected machines"
+def _record_tool_call_event(
+    event: dict[str, Any], config: dict[str, Any], *, status: str, duration_ms: float
+) -> None:
+    """Log one tool call to the ``tool_calls`` table (fire-and-forget)."""
+    try:
+        from src.anubis.utils.analytics.tool_calls import record_tool_call
+    except ImportError:
+        return
+    configurable = (config or {}).get("configurable", {}) or {}
+    try:
+        record_tool_call(
+            user_id=configurable.get("user_id"),
+            assistant_id=configurable.get("assistant_id"),
+            thread_id=configurable.get("outer_thread_id") or configurable.get("thread_id"),
+            tool_name=str(event.get("name") or ""),
+            status=status,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        logger.debug("Could not record a tool call", exc_info=True)
+
+
+class _ToolCallTimerFallback:
+    """Timer used when the analytics package is absent."""
+
+    def start(self, run_id: Any) -> None:
+        """Ignore the start of a run."""
+
+    def finish(self, run_id: Any) -> float:
+        """Report no duration."""
+        return 0.0
+
+
+try:
+    from src.anubis.utils.analytics.tool_calls import ToolCallTimer as _ToolCallTimer
+
+    _tool_call_timer: Any = _ToolCallTimer()
+except ImportError:
+    _tool_call_timer = _ToolCallTimerFallback()
+
 _TOOL_FINISHED_ACTIVITY = "Thinking about the results"
 
 
@@ -911,6 +980,7 @@ async def _stream_deep_agent(
             if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
                 continue
             tool_name = event.get("name") or ""
+            _tool_call_timer.start(event.get("run_id"))
             writer(
                 {
                     "type": "status",
@@ -923,12 +993,21 @@ async def _stream_deep_agent(
         elif ev_name == "on_tool_end":
             if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
                 continue
+            _record_tool_call_event(
+                event, deep_agent_config, status="success",
+                duration_ms=_tool_call_timer.finish(event.get("run_id")),
+            )
             writer(
                 {
                     "type": "status",
                     "text": _TOOL_FINISHED_ACTIVITY,
                     "tool": event.get("name") or "",
                 }
+            )
+        elif ev_name == "on_tool_error":
+            _record_tool_call_event(
+                event, deep_agent_config, status="error",
+                duration_ms=_tool_call_timer.finish(event.get("run_id")),
             )
         elif ev_name == "on_chain_end":
             data = event.get("data") or {}
@@ -1039,11 +1118,18 @@ async def think(
             state["assistant_state"]["assistant_id"],
             store=runtime.store,
         )
+        from src.anubis.utils.tools.data_analysis.development_tools import (
+            build_development_tools,
+        )
+
         analysis_extra_tools = [
             *(analysis_extra_tools or []),
             *build_data_analysis_tools(
                 deep_agent_run_context, analysis_bundle, live_connections
             ),
+            # Git history and Claude Code sessions on the owner's machines, for
+            # "what happened since", "what is in progress", "how long did it take".
+            *build_development_tools(deep_agent_run_context, live_connections),
         ]
 
     # Browser capability gate: the process-wide environment switch
@@ -1191,6 +1277,14 @@ async def think(
         extra_tools=extra_tools or None,
         backend=analysis_bundle.backend if analysis_bundle is not None else None,
     )
+    # Charts made with ``make_chart`` during this turn are collected on a
+    # context variable and attached to the reply after the run.
+    try:
+        from src.anubis.utils.analytics.charts import TurnChartCollector
+
+        TurnChartCollector.begin_turn()
+    except ImportError:
+        pass
     try:
         return await _run_avatar_deep_agent_turn(
             state,

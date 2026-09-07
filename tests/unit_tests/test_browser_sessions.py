@@ -166,7 +166,7 @@ async def test_start_and_finish_store_an_encrypted_session(fake_browser):
     )
     record = finished["record"]
     assert finished["heuristic_signed_in"] is True
-    assert record["account_key"] == "langsmith:smith.langchain.com"
+    assert record["account_key"].startswith("langsmith:smith.langchain.com#")
     assert record["credential_mechanism"] == "browser_session"
     assert "cookie-value" not in json.dumps(public_account_view(record))
     assert browser_sessions.decrypt_storage_state(record, context)["cookies"][0]["value"] == "cookie-value"
@@ -283,3 +283,38 @@ async def test_keepalive_refreshes_a_live_session(fake_browser, monkeypatch):
     assert result["status"] == "refreshed"
     assert saved and saved[0]["transport"]["browser_session"]["cookie_count"] == 1
     await browser_sessions.forget_session(record["account_key"])
+
+
+@pytest.mark.asyncio
+async def test_two_sign_ins_to_one_site_make_two_accounts_and_reconnect_keeps_one(fake_browser):
+    context = _context()
+    first = await browser_login.start_login(
+        context, user_id="u", assistant_id="a", provider=get_provider("github"), name="work",
+        site_url="https://github.com/login",
+    )
+    login = browser_login.get_live_login(first["login_id"])
+    login.page.url = "https://github.com/notifications"
+    login.page.html = "<a href='/logout'>Sign out</a>"
+    first_record = (await browser_login.finish_login(context, login_id=first["login_id"], user_id="u", existing_records=[]))["record"]
+    second = await browser_login.start_login(
+        context, user_id="u", assistant_id="a", provider=get_provider("github"), name="personal",
+        site_url="https://github.com/login",
+    )
+    login = browser_login.get_live_login(second["login_id"])
+    login.page.url = "https://github.com/notifications"
+    login.page.html = "<a href='/logout'>Sign out</a>"
+    second_record = (await browser_login.finish_login(context, login_id=second["login_id"], user_id="u", existing_records=[first_record]))["record"]
+    assert first_record["account_key"] != second_record["account_key"]
+    assert first_record["display_label"] == "work" and second_record["display_label"] == "personal"
+    assert first_record["credential_mechanism"] == "browser_session"
+
+    again = await browser_login.start_login(
+        context, user_id="u", assistant_id="a", provider=get_provider("github"),
+        site_url="https://github.com/login", reconnect_account_key=first_record["account_key"],
+    )
+    login = browser_login.get_live_login(again["login_id"])
+    login.page.url = "https://github.com/"
+    login.page.html = "<a href='/logout'>Sign out</a>"
+    refreshed = (await browser_login.finish_login(context, login_id=again["login_id"], user_id="u", existing_records=[first_record, second_record]))["record"]
+    assert refreshed["account_key"] == first_record["account_key"]
+    assert refreshed["display_label"] == "work"

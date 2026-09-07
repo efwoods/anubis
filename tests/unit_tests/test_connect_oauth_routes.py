@@ -222,7 +222,7 @@ async def test_an_unconfigured_vendor_falls_back_to_the_live_browser(installed, 
     installed.context.github_oauth_client_secret = ""
     opened = {}
 
-    async def _fake_start_login(context, *, user_id, assistant_id, provider, site_url=None, name=None):
+    async def _fake_start_login(context, *, user_id, assistant_id, provider, site_url=None, name=None, reconnect_account_key=None):
         opened.update({"provider": provider.name, "site_url": site_url, "user_id": user_id})
         return {"login_id": "login-1", "nonce": "n", "view_url": "/connect_account/browser/login-1?t=tok", "expires_in": 600, "provider": provider.name}
 
@@ -243,3 +243,18 @@ def test_a_live_sign_in_record_uses_session_tools_whatever_the_kind():
     record = {"provider": "gmail", "kind": "mailbox", "credential_mechanism": "browser_session"}
     assert "open_connected_site" in tool_names_for(get_provider("gmail"), record)
     assert "search_mailbox" not in " ".join(tool_names_for(get_provider("gmail"), record))
+
+
+@pytest.mark.asyncio
+async def test_a_bank_without_plaid_keys_asks_for_the_banks_website(installed):
+    installed.context.plaid_client_id = ""
+    installed.context.plaid_secret = ""
+    installed.context.plaid_environment = "sandbox"
+    response = await webapp_module.connect_account_plaid_link_token(
+        request=SimpleNamespace(headers={"content-type": "application/json"}, json=_json_request({"provider": "plaid"}).json),
+        current_user=_current_user(),
+    )
+    body = json.loads(response.body)
+    assert body["action"] == "needs_site_url"
+    assert body["login_endpoint"] == "/connect_account/browser/start"
+    assert [field["name"] for field in body["fields"]] == ["site_url", "name"]

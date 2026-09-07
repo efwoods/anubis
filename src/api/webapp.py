@@ -3894,6 +3894,29 @@ async def connect_account_plaid_link_token(
             provider=provider,
         )
     except PlaidLinkError as plaid_error:
+        if plaid_error.status_code == 503:
+            # Plaid is not configured on this server: the owner signs in on the
+            # bank's own website in the live browser instead. The card asks for
+            # the bank's sign-in page and an account name, then starts a
+            # browser sign-in for the finance provider.
+            return JSONResponse(
+                content={
+                    "action": "needs_site_url",
+                    "login_mode": "browser_session",
+                    "fallback": "browser_session",
+                    "login_endpoint": "/connect_account/browser/start",
+                    "login_request": {"provider": provider.name},
+                    "message": (
+                        "Sign in on your bank's own website. Enter the address of the "
+                        "bank's sign-in page and a name for this account."
+                    ),
+                    "fields": [
+                        {"name": "site_url", "label": "Bank sign-in page", "input_type": "url", "placeholder": "https://www.bankofamerica.com/", "required": True},
+                        {"name": "name", "label": "Account name", "input_type": "text", "placeholder": "Business checking", "required": False},
+                    ],
+                },
+                status_code=200,
+            )
         raise HTTPException(status_code=plaid_error.status_code, detail=plaid_error.detail)
     except OAuthStateError as state_error:
         raise HTTPException(status_code=503, detail=str(state_error))
@@ -4019,22 +4042,33 @@ async def connect_account_browser_start(
     provider = get_provider(str(body.get("provider") or ""))
     if provider is None:
         raise HTTPException(status_code=400, detail="Unknown provider.")
-    if provider.login_mode != "browser_session" and provider.name != "website":
-        raise HTTPException(status_code=400, detail=f"{provider.display_name} does not sign in through a browser window.")
+    site_url = str(body.get("site_url") or "").strip() or None
+    # Any provider can be signed in to on a page the owner names (a bank's
+    # own website when Plaid is not configured, a vendor without an OAuth
+    # app); providers with their own login page need no address.
+    if provider.login_mode != "browser_session" and not provider.login_url and not site_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.display_name} needs the address of the page to sign in on (site_url).",
+        )
     token = current_user["API_KEY"]
     user_id = current_user["identities"][0]["user_id"]
     client = get_client(headers={"API-KEY": f"{token}"})
     personal_avatar = await _resolve_personal_avatar_for_connection(
         client, request, current_user, token
     )
+    reconnect_key = str(body.get("reconnect_account_key") or "").strip() or None
+    if reconnect_key and reconnect_key.startswith("account:"):
+        reconnect_key = reconnect_key[len("account:"):]
     try:
         started = await start_login(
             app.state.context,
             user_id=user_id,
             assistant_id=str(personal_avatar.get("assistant_id")),
             provider=provider,
-            site_url=body.get("site_url"),
+            site_url=site_url or provider.login_url,
             name=body.get("name"),
+            reconnect_account_key=reconnect_key,
         )
     except BrowserSessionError as session_error:
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
@@ -4236,7 +4270,12 @@ async def connect_account_oauth_start(
             # account stays connectable without a vendor console step.
             return JSONResponse(
                 content=await _start_browser_fallback(
-                    request, current_user, provider, personal_avatar
+                    request,
+                    current_user,
+                    provider,
+                    personal_avatar,
+                    name=body.get("name"),
+                    reconnect_account_key=body.get("reconnect_account_key"),
                 ),
                 status_code=200,
             )
@@ -4249,13 +4288,22 @@ async def connect_account_oauth_start(
 
 
 async def _start_browser_fallback(
-    request: Request, current_user: dict, provider: Any, personal_avatar: dict
+    request: Request,
+    current_user: dict,
+    provider: Any,
+    personal_avatar: dict,
+    *,
+    name: str | None = None,
+    reconnect_account_key: str | None = None,
 ) -> dict:
     """Open the live sign-in browser for a vendor whose OAuth app is not configured."""
     from src.anubis.utils.connected_accounts.browser_login import start_login
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
 
     user_id = current_user["identities"][0]["user_id"]
+    reconnect_key = str(reconnect_account_key or "").strip() or None
+    if reconnect_key and reconnect_key.startswith("account:"):
+        reconnect_key = reconnect_key[len("account:"):]
     try:
         started = await start_login(
             app.state.context,
@@ -4263,7 +4311,8 @@ async def _start_browser_fallback(
             assistant_id=str(personal_avatar.get("assistant_id")),
             provider=provider,
             site_url=provider.login_url,
-            name=provider.display_name,
+            name=str(name or "").strip() or provider.display_name,
+            reconnect_account_key=reconnect_key,
         )
     except BrowserSessionError as session_error:
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
@@ -7161,6 +7210,9 @@ async def message_avatar(
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    # The id the reply is stored under, so a client can rate exactly this
+    # reply through POST /message_feedback.
+    response_data["message_id"] = getattr(result["messages"][-1], "id", None)
     if spoken_turn_frame:
         response_data["spoken_turn"] = spoken_turn_frame
     turn_usage = await _meter_message_usage(
@@ -7210,9 +7262,6 @@ async def stop_avatar_message(
         if turn_registry is not None
         else None
     )
-    # The id the reply is stored under, so a client can rate exactly this
-    # reply through POST /message_feedback.
-    response_data["message_id"] = getattr(result["messages"][-1], "id", None)
     caller_user_id = current_user["identities"][0]["user_id"]
     if (
         active_turn is None
@@ -8131,6 +8180,7 @@ def _find_avatar_message_and_prompt(
     from src.anubis.utils.learning.sentiment import message_text
 
     avatar_index: int | None = None
+    excerpt = (content_excerpt or "").strip()[:200]
     for index, message in enumerate(messages):
         if _message_dict_type(message) not in ("ai", "assistant"):
             continue
@@ -8145,6 +8195,8 @@ def _find_avatar_message_and_prompt(
             if _message_dict_request_id(message) == request_id:
                 avatar_index = index
                 break
+            if excerpt and message_text(message.get("content")).strip().startswith(excerpt):
+                avatar_index = index
             continue
         avatar_index = index
     if avatar_index is None:
@@ -8180,7 +8232,6 @@ async def _learn_from_message_feedback(
     from the thread when the thread is known, else from the text the browser
     sent. Returns what was learned, for the response.
     """
-    excerpt = (content_excerpt or "").strip()[:200]
     from src.anubis.utils.learning.feedback import (
         store_feedback_message,
         store_message_rating,
@@ -8195,8 +8246,6 @@ async def _learn_from_message_feedback(
     avatar_message: dict | None = None
     preceding_user_message: dict | None = None
     if thread_id:
-            if excerpt and message_text(message.get("content")).strip().startswith(excerpt):
-                avatar_index = index
         try:
             langgraph_client = get_client(headers=langgraph_client_headers)
             messages = await _load_thread_message_dicts(langgraph_client, thread_id)

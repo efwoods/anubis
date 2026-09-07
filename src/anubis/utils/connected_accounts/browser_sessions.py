@@ -37,9 +37,25 @@ logger = logging.getLogger(__name__)
 SESSION_TRANSPORT_KEY = "browser_session"
 DEFAULT_VIEWPORT = {"width": 1280, "height": 800}
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
 )
+
+# Presents the page's JavaScript environment as an ordinary desktop browser.
+ORDINARY_BROWSER_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+window.chrome = window.chrome || { runtime: {}, loadTimes: function () {}, csi: function () {} };
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+  window.navigator.permissions.query = (parameters) =>
+    parameters && parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters);
+}
+"""
 
 _LOGIN_PATH_PATTERN = re.compile(
     r"/(login|log-in|signin|sign-in|sign_in|auth|authenticate|session/new|account/login)",
@@ -106,9 +122,21 @@ async def _ensure_driver() -> Any:
 
 def launch_arguments(context: Any) -> dict[str, Any]:
     """Return the Chromium launch arguments shared with the conversation browsers."""
+    # Sign-in pages of some vendors refuse a browser they recognise as
+    # automated. The flags and the init script below present the session
+    # browser as the ordinary Chromium the owner would sign in with: no
+    # automation banner, no ``navigator.webdriver`` marker, a real user
+    # agent, a plugin list and a ``window.chrome`` object like a desktop.
     arguments: dict[str, Any] = {
         "headless": True,
-        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--lang=en-US,en",
+        ],
+        "ignore_default_args": ["--enable-automation"],
     }
     executable = getattr(context, "browser_chromium_executable_path", None)
     if executable:
@@ -144,7 +172,12 @@ async def new_context(
     }
     if storage_state:
         options["storage_state"] = storage_state
-    return await browser.new_context(**options)
+    browser_context = await browser.new_context(**options)
+    try:
+        await browser_context.add_init_script(ORDINARY_BROWSER_INIT_SCRIPT)
+    except Exception:
+        logger.debug("Could not install the ordinary-browser init script", exc_info=True)
+    return browser_context
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ class LiveLogin:
     finished: bool = False
     streaming: bool = False
     screencast_task: Any | None = None
+    reconnect_account_key: str | None = None
 
 
 _live_logins: dict[str, LiveLogin] = {}
@@ -138,8 +139,13 @@ async def start_login(
     provider: Any,
     site_url: str | None = None,
     name: str | None = None,
+    reconnect_account_key: str | None = None,
 ) -> dict[str, Any]:
-    """Open a browser at the site's sign-in page; return ``{login_id, view_url, nonce}``."""
+    """Open a browser at the site's sign-in page; return ``{login_id, view_url, nonce}``.
+
+    ``reconnect_account_key`` names an existing record whose session lapsed:
+    the finished sign-in then refreshes that record instead of adding one.
+    """
     await reap_expired_logins()
     start_url = str(site_url or getattr(provider, "login_url", None) or "").strip()
     if not start_url.startswith("http"):
@@ -166,6 +172,7 @@ async def start_login(
             browser_context=browser_context,
             page=page,
             expires_at=time.time() + _ttl(context),
+            reconnect_account_key=str(reconnect_account_key or "").strip() or None,
         )
         _live_logins[login_id] = login
     try:
@@ -395,9 +402,27 @@ async def finish_login(
     home_url = getattr(provider, "home_url", None)
     if not home_url or not str(home_url).startswith("http"):
         home_url = final_url if same_host(final_url, site_hostname) else login.site_url
-    address = site_hostname if provider.name not in ("custom_site",) else f"{site_hostname}#{login.login_id[:8]}"
-    key = account_key(provider.name, address)
-    label = deduplicate_label(login.name or site_hostname, existing_records, key)
+    # One record per SIGN-IN, never per site: the owner may hold several
+    # accounts on one site (two GitHub accounts, two banks at one address),
+    # so the address carries a fragment unique to this sign-in. A "sign in
+    # again" refreshes the record named by ``reconnect_account_key``.
+    existing = next(
+        (
+            record
+            for record in existing_records
+            if login.reconnect_account_key
+            and record.get("account_key") == login.reconnect_account_key
+        ),
+        None,
+    )
+    if existing is not None:
+        address = str(existing.get("account_address") or site_hostname)
+        key = str(existing.get("account_key"))
+        label = str(existing.get("display_label") or login.name or site_hostname)
+    else:
+        address = f"{site_hostname}#{login.login_id[:8]}"
+        key = account_key(provider.name, address)
+        label = deduplicate_label(login.name or site_hostname, existing_records, key)
     extra: dict[str, Any] = {}
     record = build_account_record(
         provider=provider,

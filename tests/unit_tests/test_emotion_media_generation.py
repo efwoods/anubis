@@ -29,6 +29,9 @@ from src.anubis.utils.media_generation import reference_subject, xai_client
 from src.anubis.utils.media_generation.emotion_media import (
     build_manifest,
     describe_failure,
+    emotion_media_cost_estimate,
+    full_build_asset_counts,
+    missing_asset_counts,
     generate_emotion_media_for_avatar,
     summarize_failures,
 )
@@ -412,6 +415,61 @@ async def test_regeneration_is_refused_below_the_minimum_tier(monkeypatch):
     assert repository.jobs == {}
 
 
+def test_the_cost_of_a_run_is_the_vendor_arithmetic():
+    """The owner confirms a spend, so the estimate is the unit costs, not a guess."""
+    still_count, idle_loop_count = full_build_asset_counts()
+    # Six stills — the reference IS the neutral still and costs nothing — and
+    # one idle loop per base emotion.
+    assert (still_count, idle_loop_count) == (6, 7)
+
+    estimate = emotion_media_cost_estimate(
+        _context(),
+        still_count=still_count,
+        idle_loop_count=idle_loop_count,
+    )
+
+    assert estimate["stills_usd"] == 0.24  # 6 × $0.04
+    assert estimate["idle_loops_usd"] == 3.36  # 7 × 6 s × $0.08
+    assert estimate["total_usd"] == 3.60
+    assert estimate["idle_loop_seconds"] == 6
+
+
+def test_a_missing_only_run_is_costed_from_what_is_absent():
+    """Only the absent assets are priced, and never the neutral still."""
+    assert missing_asset_counts(
+        ["neutral:still", "anger:still", "anger:idle_loop", "joy:idle_loop"]
+    ) == (1, 2)
+    assert missing_asset_counts([]) == (0, 0)
+    assert missing_asset_counts(None) == (0, 0)
+
+    estimate = emotion_media_cost_estimate(
+        _context(), still_count=1, idle_loop_count=2
+    )
+    assert estimate["total_usd"] == 1.0  # $0.04 + 2 × 6 s × $0.08
+
+
+def test_the_manifest_carries_both_estimates_for_the_confirmation(monkeypatch):
+    """The settings screen shows the owner what a rebuild and a top-up each cost."""
+    from src.api import webapp as webapp_module
+
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None),
+    )
+
+    permission = webapp_module._emotion_media_generation_permission(
+        _signed_in_owner("premium"),
+        USER_ID,
+        {"missing": ["anger:idle_loop"]},
+    )
+
+    assert permission["cost_full_rebuild"]["total_usd"] == 3.60
+    assert permission["cost_full_rebuild"]["idle_loops"] == 7
+    assert permission["cost_missing_only"]["total_usd"] == 0.48
+    assert permission["cost_missing_only"]["stills"] == 0
+
+
 def test_the_manifest_tells_the_owner_whether_generation_is_permitted(monkeypatch):
     """The settings screen reads the tier answer off the manifest, and nobody else does."""
     from src.api import webapp as webapp_module
@@ -423,13 +481,13 @@ def test_the_manifest_tells_the_owner_whether_generation_is_permitted(monkeypatc
     )
 
     premium = webapp_module._emotion_media_generation_permission(
-        _signed_in_owner("premium"), USER_ID
+        _signed_in_owner("premium"), USER_ID, {"missing": []}
     )
     assert premium["allowed"] is True
     assert premium["required_tier"] == "premium"
 
     pro = webapp_module._emotion_media_generation_permission(
-        _signed_in_owner("pro"), USER_ID
+        _signed_in_owner("pro"), USER_ID, {"missing": []}
     )
     assert pro["allowed"] is False
     assert pro["tier"] == "pro"
@@ -437,7 +495,7 @@ def test_the_manifest_tells_the_owner_whether_generation_is_permitted(monkeypatc
     # A chatter who is not the creator is never offered the control.
     assert (
         webapp_module._emotion_media_generation_permission(
-            _signed_in_owner("premium"), "somebody-else"
+            _signed_in_owner("premium"), "somebody-else", {"missing": []}
         )
         is None
     )

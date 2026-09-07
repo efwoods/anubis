@@ -204,6 +204,71 @@ async def _noop_metrics(
     return None
 
 
+def emotion_media_cost_estimate(
+    context: Any, *, still_count: int, idle_loop_count: int
+) -> dict[str, Any]:
+    """Estimate what one generation run of this size costs at the vendor, in US dollars.
+
+    Images are priced per generated still and video per second of idle loop, at
+    the configured unit costs — the same numbers the run records per call in
+    ``api_metrics``. The neutral still is never counted: the reference image is
+    the neutral still, so storing that one costs nothing.
+
+    Args:
+        context: The ``GlobalContext`` holding the xAI unit costs.
+        still_count: Stills that would be generated (never the neutral one).
+        idle_loop_count: Idle loops that would be rendered.
+
+    Returns:
+        The counts, the unit costs, and the totals, so the settings screen can
+        show the owner the arithmetic before spending anything.
+    """
+    image_cost = float(getattr(context, "xai_image_cost_per_image_usd", None) or 0.04)
+    video_cost_per_second = float(
+        getattr(context, "xai_video_cost_per_second_usd", None) or 0.08
+    )
+    idle_loop_seconds = int(getattr(context, "xai_idle_loop_duration_seconds", None) or 6)
+    stills_usd = still_count * image_cost
+    loops_usd = idle_loop_count * idle_loop_seconds * video_cost_per_second
+    return {
+        "stills": still_count,
+        "idle_loops": idle_loop_count,
+        "image_cost_usd": round(image_cost, 4),
+        "video_cost_per_second_usd": round(video_cost_per_second, 4),
+        "idle_loop_seconds": idle_loop_seconds,
+        "stills_usd": round(stills_usd, 2),
+        "idle_loops_usd": round(loops_usd, 2),
+        "total_usd": round(stills_usd + loops_usd, 2),
+    }
+
+
+def full_build_asset_counts() -> tuple[int, int]:
+    """Return the stills and idle loops a complete build generates.
+
+    One still per emotion the vendor draws (every base emotion except neutral,
+    which the reference image already is) and one idle loop per base emotion.
+    """
+    return (len(GENERATED_EMOTIONS), len(BASE_EMOTIONS))
+
+
+def missing_asset_counts(missing: list[str] | tuple[str, ...] | None) -> tuple[int, int]:
+    """Return the stills and idle loops an ``only_missing`` run would generate.
+
+    ``missing`` is the manifest's list of ``"<emotion>:<asset_kind>"`` entries.
+    A missing neutral still is not counted: that one is copied from the
+    reference image rather than generated.
+    """
+    still_count = 0
+    idle_loop_count = 0
+    for entry in missing or ():
+        emotion, _, kind = str(entry).partition(":")
+        if kind == ASSET_KIND_IDLE_LOOP:
+            idle_loop_count += 1
+        elif kind == ASSET_KIND_STILL and emotion != NEUTRAL_EMOTION:
+            still_count += 1
+    return (still_count, idle_loop_count)
+
+
 def build_manifest(assets: list[dict[str, Any]]) -> dict[str, Any]:
     """Shape the stored assets into the manifest the client caches.
 

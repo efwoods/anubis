@@ -15,6 +15,7 @@ from src.anubis.utils.billing.system_prompt_estimate_cache import (
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 from src.anubis.utils.context import AssistantContext, GlobalContext, UserContext
+from src.anubis.utils.geo import geo_location_of, render_avatar_place_section
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.store_cache import aget_through_cache
 from src.anubis.utils.utility import (
@@ -771,6 +772,26 @@ async def _build_consciousness_system_message_update(
     # user_identity = state['user_state'].get('user_identity', [])
     user_name = state["user_state"].get("user_name", "")
 
+    # The real-world place this avatar is pinned to, when the creator pinned the
+    # avatar to one. The pin rides the avatar's LangGraph metadata, which the
+    # request already carries in ``assistant_ctx``; ``at_place`` on the message
+    # request says whether the person is standing at the place right now, so the
+    # avatar can greet a visitor who has walked up to the place instead of
+    # speaking about the place from a distance. Reading both out of ``config``
+    # rather than off ``runtime`` keeps the token-estimation path working.
+    assistant_place_section = render_avatar_place_section(
+        geo_location_of(
+            {
+                "metadata": config.get("configurable", {})
+                .get("assistant_ctx", {})
+                .get("metadata", {})
+            }
+        ),
+        visitor_present=bool(
+            config.get("configurable", {}).get("visitor_present_at_place")
+        ),
+    )
+
     """ Create System Prompt """
 
     populated_identity_template = prompt_builder.build_prompt(
@@ -787,7 +808,8 @@ async def _build_consciousness_system_message_update(
         user_description=user_description,
         user_identity=user_identity,
         system_time=system_time,
-        user_is_creator=user_is_creator
+        user_is_creator=user_is_creator,
+        assistant_place=assistant_place_section,
     )
 
     logger.info(f"populated_template: {populated_identity_template}")

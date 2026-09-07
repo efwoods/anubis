@@ -4214,6 +4214,10 @@ async def create_avatar(
     description: Optional[str] = None,
     is_public: bool = False,
     is_personal_avatar_of_creator: bool = False,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    location_name: Optional[str] = None,
+    geofence_radius_meters: Optional[int] = None,
     current_user: dict = Depends(get_current_user),
 ):
 
@@ -4229,6 +4233,18 @@ async def create_avatar(
             content="User must be logged in to create avatars.", status_code=400
         )
 
+    # An avatar may be pinned to a real-world place at creation. The pin is
+    # optional here and can be added, moved, or removed later through
+    # PATCH /modify_avatar, so a creator is never forced to know the place up
+    # front. Validate before the try block below: that block turns every
+    # exception into a 500, and a bad coordinate is a 400 the caller can fix.
+    geo_location = _build_geo_location_or_400(
+        latitude=latitude,
+        longitude=longitude,
+        location_name=location_name,
+        geofence_radius_meters=geofence_radius_meters,
+    )
+
     try:
         assistant_id = str(uuid4())
         user_id = current_user["identities"][0]["user_id"]
@@ -4237,6 +4253,8 @@ async def create_avatar(
             "is_public": False,
             "is_personal_avatar_of_creator": is_personal_avatar_of_creator,
         }
+        if geo_location is not None:
+            metadata[GEO_LOCATION_METADATA_KEY] = geo_location
 
         if user_id == context.admin_user_id:
             # or is_personal_avatar_of_creator == True
@@ -7245,15 +7263,15 @@ async def get_avatar_emotion_media(
         repository, assistant_id
     )
     manifest["generation"] = _emotion_media_generation_permission(
-        current_user, owner_user_id
+        current_user, owner_user_id, manifest
     )
     return JSONResponse(manifest)
 
 
 def _emotion_media_generation_permission(
-    current_user: dict, owner_user_id: str | None
+    current_user: dict, owner_user_id: str | None, manifest: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """Whether this caller may generate the avatar's emotion media, and on what terms.
+    """Whether this caller may generate the avatar's emotion media, and at what cost.
 
     The avatar's settings screen shows the generate button behind this answer:
     the button is offered to the owner alone, is disabled with the required
@@ -7261,8 +7279,18 @@ def _emotion_media_generation_permission(
     and is disabled with no upgrade prompt when the deployment has generation
     switched off entirely. ``None`` for anyone who is not the owner — a chatter
     reading the manifest is never shown a control.
+
+    The two cost estimates come with the answer, because the owner is asked to
+    confirm the spend before a run starts: ``cost_full_rebuild`` replaces every
+    generated still and idle loop, and ``cost_missing_only`` builds just what
+    the newest run left absent.
     """
-    from src.anubis.utils.media_generation.emotion_media import emotion_media_enabled
+    from src.anubis.utils.media_generation.emotion_media import (
+        emotion_media_cost_estimate,
+        emotion_media_enabled,
+        full_build_asset_counts,
+        missing_asset_counts,
+    )
 
     identities = current_user.get("identities") or []
     caller_user_id = identities[0].get("user_id") if identities else None
@@ -7271,12 +7299,22 @@ def _emotion_media_generation_permission(
     tier = resolve_tier(current_user)
     minimum_tier = resolve_emotion_media_minimum_tier()
     configured = emotion_media_enabled(app.state.context)
+    full_stills, full_loops = full_build_asset_counts()
+    missing_stills, missing_loops = missing_asset_counts(manifest.get("missing"))
     return {
         "tier": tier.value,
         "required_tier": minimum_tier.value,
         "tier_allows": tier_meets_minimum(tier, minimum_tier),
         "configured": configured,
         "allowed": configured and tier_meets_minimum(tier, minimum_tier),
+        "cost_full_rebuild": emotion_media_cost_estimate(
+            app.state.context, still_count=full_stills, idle_loop_count=full_loops
+        ),
+        "cost_missing_only": emotion_media_cost_estimate(
+            app.state.context,
+            still_count=missing_stills,
+            idle_loop_count=missing_loops,
+        ),
     }
 
 

@@ -72,6 +72,7 @@ class DynamicPromptBuilder:
         user_emotions: Optional[List[Document]] = None,
         system_time: Optional[str] = None,
         user_is_creator: Optional[bool] = False,
+        assistant_place: Optional[str] = None,
     ) -> ChatPromptTemplate:
         """
         Build a ChatPromptTemplate with optional components.
@@ -204,6 +205,7 @@ class DynamicPromptBuilder:
             "retrieved_knowledge": retrieved_knowledge_str,
             "retrieved_memories": retrieved_memories_str,
             "analyzed_traits": analyzed_traits_str,
+            "assistant_place": assistant_place or "",
             "style_profile_str": style_profile_str,
             "key_phrases_str": key_phrases_str,
             "direct_quotes": direct_quotes_str,

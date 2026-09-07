@@ -1000,6 +1000,38 @@ class GlobalContext:
 
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
+    """ <Geo-located avatars (avatars pinned to a real-world place)> """
+
+    geo_checkin_min_interval_seconds: int = field(
+        default=300,
+        metadata={
+            "description": "Shortest interval, in seconds, between two recorded visits by the same person to the same geo-located avatar; POST /geo/checkin drops a repeat check-in inside this window so a moving phone cannot flood the visit records. Env GEO_CHECKIN_MIN_INTERVAL_SECONDS."
+        },
+    )
+
+    geo_nearby_default_radius_meters: int = field(
+        default=500,
+        metadata={
+            "description": "Search radius, in meters, used by GET /avatars/nearby and POST /geo/checkin when the caller does not ask for one. Env GEO_NEARBY_DEFAULT_RADIUS_METERS."
+        },
+    )
+
+    geo_nearby_max_radius_meters: int = field(
+        default=50_000,
+        metadata={
+            "description": "Largest search radius, in meters, that GET /avatars/nearby will honor; a larger request is capped at this value. Env GEO_NEARBY_MAX_RADIUS_METERS."
+        },
+    )
+
+    geo_notify_cooldown_seconds: int = field(
+        default=3600,
+        metadata={
+            "description": "Shortest interval, in seconds, between two proximity notifications naming the same geo-located avatar to the same person, so walking in and out of a geofence does not notify repeatedly. Env GEO_NOTIFY_COOLDOWN_SECONDS."
+        },
+    )
+
+    """ </Geo-located avatars (avatars pinned to a real-world place)> """
+
     """ <Who is speaking (live voice: label utterances by speaker)> """
 
     voice_speaker_labels_enabled: str = field(

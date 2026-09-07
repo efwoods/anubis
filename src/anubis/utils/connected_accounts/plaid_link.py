@@ -70,8 +70,9 @@ def _credentials(context: Any) -> tuple[str, str]:
     if not client_id or not secret:
         raise PlaidLinkError(
             503,
-            "Bank connections are not configured on this server "
-            "(PLAID_CLIENT_ID and PLAID_SECRET are empty).",
+            "Bank connections aren't available yet. The owner needs to add Plaid "
+            "keys: a free account at dashboard.plaid.com gives a client id and a "
+            "Sandbox secret under Team Settings, Keys.",
         )
     return client_id, secret
 

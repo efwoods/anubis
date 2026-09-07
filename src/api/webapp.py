@@ -2083,6 +2083,27 @@ async def lifespan(app: FastAPI):
         logger.info("Analytics package not installed; reports and schedules are off.")
     except Exception as analytics_boot_error:  # noqa: BLE001 - startup must not fail
         logger.error("Analytics tables could not be prepared: %s", analytics_boot_error)
+    # Opt-in usage analytics: consent, the action log, and described page
+    # captures live in their own tables; old rows are forgotten on a schedule.
+    app.state.usage_analytics_purge_task = None
+    try:
+        from src.anubis.utils import usage_analytics as usage_analytics_package
+        from src.anubis.utils.usage_analytics import retention as usage_analytics_retention
+
+        await usage_analytics_package.ensure_usage_analytics_tables(app.state.pool)
+        usage_analytics_repository = (
+            usage_analytics_package.publish_usage_analytics_repository(app.state.pool)
+        )
+        app.state.usage_analytics_purge_task = asyncio.create_task(
+            usage_analytics_retention.purge_forever(
+                usage_analytics_repository,
+                int(GlobalContext().usage_analytics_retention_days or 0),
+            )
+        )
+    except Exception as usage_analytics_boot_error:  # noqa: BLE001 - startup must not fail
+        logger.error(
+            "Usage analytics tables could not be prepared: %s", usage_analytics_boot_error
+        )
     # Generated avatar media (emotion stills, idle loops, lip-sync clips, voice
     # clips) and the durable media jobs live in their own BYTEA tables.
     from src.anubis.utils import media_assets as media_assets_package
@@ -2196,6 +2217,9 @@ async def lifespan(app: FastAPI):
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
+        purge_task = getattr(app.state, "usage_analytics_purge_task", None)
+        if purge_task is not None:
+            purge_task.cancel()
         try:
             from src.anubis.utils.connected_accounts.browser_sessions import (
                 shutdown_browser_sessions,
@@ -13478,6 +13502,383 @@ async def _prune_ground_truth_features_for_deleted_docs(
         key="style_profile",
         value={"value": style_profile_str},
     )
+
+
+# ── Usage analytics (opt-in action log and described page captures) ───────────
+#
+# A person who opted in has the browser record every action taken in the web
+# application and capture the page itself (rendered from the document, never a
+# window picker) on an interval and on route changes. Events and captures are
+# accepted only for a signed-in account whose consent row says enabled, and
+# only while USAGE_ANALYTICS_ENABLED is on. Captures are described after the
+# response (a vision call takes seconds); the browser never waits on the call.
+
+
+class UsageAnalyticsConsentRequest(BaseModel):
+    """The body of POST /usage_analytics/consent."""
+
+    enabled: bool
+    # Where the choice was made: signup, avatar_settings, account_settings.
+    source: str | None = None
+
+
+class UsageAnalyticsEventsRequest(BaseModel):
+    """The body of POST /usage_analytics/events: one batch of browser events."""
+
+    session_id: str | None = None
+    assistant_id: str | None = None
+    thread_id: str | None = None
+    route: str | None = None
+    events: list[dict] = []
+
+
+def _usage_analytics_repository_or_503():
+    """Return the published repository, or raise 503 when the lifespan did not bind one."""
+    from src.anubis.utils.usage_analytics import get_usage_analytics_repository
+
+    repository = get_usage_analytics_repository()
+    if repository is None:
+        raise HTTPException(
+            status_code=503, detail="Usage analytics is not available on this server."
+        )
+    return repository
+
+
+def _usage_analytics_feature_enabled(context: GlobalContext) -> bool:
+    return str(context.usage_analytics_enabled or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+async def _usage_analytics_recording_user(current_user: dict, repository) -> str:
+    """Return the user id a recording request records under, or raise the refusal.
+
+    404 when the deployment turned the feature off, 403 for an anonymous
+    caller or an account that has not opted in: the browser stops recording
+    on either answer rather than retrying.
+    """
+    if not _usage_analytics_feature_enabled(GlobalContext()):
+        raise HTTPException(
+            status_code=404, detail="Usage analytics is not enabled on this deployment."
+        )
+    if is_anonymous_user(current_user):
+        raise HTTPException(
+            status_code=403, detail="Usage analytics requires a signed-in user."
+        )
+    user_id = current_user["identities"][0]["user_id"]
+    if not await repository.is_enabled(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="This account has not opted in to usage analytics.",
+        )
+    return user_id
+
+
+def _parse_iso_datetime_or_400(value: Optional[str], name: str) -> Optional[datetime]:
+    if not (value or "").strip():
+        return None
+    from src.anubis.utils.usage_analytics.repository import _as_datetime
+
+    parsed = _as_datetime(value)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail=f"{name} must be an ISO 8601 timestamp.")
+    return parsed
+
+
+@app.get("/usage_analytics/consent")
+async def get_usage_analytics_consent_route(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return whether this account has opted in to usage analytics, and when the choice was made."""
+    from src.anubis.utils.usage_analytics.repository import consent_view
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.get_consent(user_id)
+    return JSONResponse(
+        content={
+            **consent_view(row, user_id),
+            "feature_enabled": _usage_analytics_feature_enabled(GlobalContext()),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/usage_analytics/consent")
+async def set_usage_analytics_consent_route(
+    body: UsageAnalyticsConsentRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Opt this account in to, or out of, usage analytics.
+
+    Opting out stops recording at once; the rows already stored stay until
+    the retention purge or ``DELETE /usage_analytics/data`` removes them.
+    """
+    from src.anubis.utils.usage_analytics.repository import consent_view
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.set_consent(user_id, bool(body.enabled), source=body.source)
+    return JSONResponse(
+        content={
+            **consent_view(row, user_id),
+            "feature_enabled": _usage_analytics_feature_enabled(GlobalContext()),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/usage_analytics/events", status_code=202)
+async def record_usage_analytics_events_route(
+    body: UsageAnalyticsEventsRequest,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Store a batch of actions the browser recorded for a consenting account."""
+    from src.anubis.utils.usage_analytics.events import (
+        UsageEventError,
+        normalise_event_batch,
+    )
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = await _usage_analytics_recording_user(current_user, repository)
+    context = GlobalContext()
+    try:
+        rows = normalise_event_batch(
+            body.events,
+            user_id=user_id,
+            session_id=body.session_id,
+            assistant_id=body.assistant_id,
+            thread_id=body.thread_id,
+            route=body.route,
+            max_events=int(context.usage_analytics_max_events_per_request or 200),
+        )
+    except UsageEventError as event_error:
+        raise HTTPException(status_code=422, detail=str(event_error)) from event_error
+    recorded = await repository.record_events(rows) if rows else 0
+    return JSONResponse(content={"recorded": recorded}, status_code=202)
+
+
+# Per-session floor between captures, so a misconfigured client cannot flood
+# the vision model. Reuses the ambient throttle's bookkeeping, keyed by the
+# browser session rather than by a conversation thread.
+_usage_analytics_capture_throttle = None
+
+
+def _usage_capture_throttle():
+    """Return the process-wide capture throttle, created on first use."""
+    global _usage_analytics_capture_throttle
+    if _usage_analytics_capture_throttle is None:
+        from src.anubis.utils.ambient.observations import AmbientThrottle
+
+        _usage_analytics_capture_throttle = AmbientThrottle()
+    return _usage_analytics_capture_throttle
+
+
+@app.post("/usage_analytics/screenshots", status_code=202)
+async def record_usage_analytics_screenshot_route(
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    assistant_id: Optional[str] = Form(None),
+    thread_id: Optional[str] = Form(None),
+    route: Optional[str] = Form(None),
+    trigger: Optional[str] = Form(None),
+    recent_actions: Optional[str] = Form(None),
+    occurred_at: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Store one capture of the web page and describe the capture in the background.
+
+    ``recent_actions`` is the browser's short list of what the person did
+    before the capture; the describing model reads the list beside the image.
+    The full-size image is discarded once the thumbnail and the description
+    exist.
+    """
+    from src.anubis.utils.usage_analytics import screenshots as capture_module
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = await _usage_analytics_recording_user(current_user, repository)
+    context = GlobalContext()
+    seconds_to_wait = _usage_capture_throttle().check_and_mark(
+        (session_id or "").strip() or user_id,
+        float(context.usage_analytics_capture_min_interval_seconds or 0),
+    )
+    if seconds_to_wait is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Captures are accepted at most every {context.usage_analytics_capture_min_interval_seconds} seconds per session.",
+            headers={"Retry-After": str(max(1, int(seconds_to_wait + 0.999)))},
+        )
+    image_bytes = await file.read()
+    max_bytes = int(context.usage_analytics_max_image_bytes or 0)
+    if not image_bytes:
+        raise HTTPException(status_code=422, detail="The capture is empty.")
+    if max_bytes and len(image_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"The capture is larger than the {max_bytes} byte ceiling.",
+        )
+    image_mime = (file.content_type or "image/png").split(";")[0].strip() or "image/png"
+    try:
+        thumbnail, thumbnail_mime, width, height = capture_module.make_thumbnail(
+            image_bytes, max_width=int(context.usage_analytics_thumbnail_width or 640)
+        )
+    except Exception as thumbnail_error:  # noqa: BLE001 - an unreadable image is a client error
+        raise HTTPException(
+            status_code=422, detail="The capture is not a readable image."
+        ) from thumbnail_error
+    when = _parse_iso_datetime_or_400(occurred_at, "occurred_at") or datetime.now(UTC)
+    recent = (recent_actions or "").strip()[:6000] or None
+    stored = await repository.create_screenshot(
+        {
+            "user_id": user_id,
+            "session_id": (session_id or "").strip() or None,
+            "assistant_id": (assistant_id or "").strip() or None,
+            "thread_id": (thread_id or "").strip() or None,
+            "route": (route or "").strip()[:400] or None,
+            "trigger": (trigger or "").strip()[:60] or None,
+            "recent_actions": recent,
+            "thumbnail": thumbnail,
+            "thumbnail_mime": thumbnail_mime,
+            "width": width,
+            "height": height,
+            "occurred_at": when,
+            "status": capture_module.STATUS_PENDING,
+        }
+    )
+    asyncio.create_task(
+        capture_module.describe_and_store(
+            repository=repository,
+            store=getattr(app.state, "store", None),
+            screenshot_id=stored["id"],
+            user_id=user_id,
+            image_bytes=image_bytes,
+            image_mime=image_mime,
+            recent_actions=recent,
+            route=stored.get("route"),
+            assistant_id=stored.get("assistant_id"),
+            session_id=stored.get("session_id"),
+            occurred_at=when,
+        )
+    )
+    return JSONResponse(
+        content={"screenshot_id": stored["id"], "status": capture_module.STATUS_PENDING},
+        status_code=202,
+    )
+
+
+def _usage_analytics_subject_user_id(current_user: dict, user_id: Optional[str]) -> str:
+    """Return whose rows a read covers: the caller's, or anyone's for the administrator."""
+    caller_id = current_user["identities"][0]["user_id"]
+    requested = (user_id or "").strip()
+    if not requested or requested == caller_id:
+        return caller_id
+    admin_id = (GlobalContext().admin_user_id or "").strip()
+    if admin_id and caller_id == admin_id:
+        return requested
+    raise HTTPException(
+        status_code=403, detail="Only the administrator may read another account's usage analytics."
+    )
+
+
+@app.get("/usage_analytics/summary")
+async def usage_analytics_summary_route(
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return recent action events and described captures, newest first.
+
+    The administrator may pass ``user_id`` to read another account's rows for
+    product analysis; everyone else reads their own.
+    """
+    from src.anubis.utils.usage_analytics.repository import (
+        consent_view,
+        event_view,
+        screenshot_view,
+    )
+
+    repository = _usage_analytics_repository_or_503()
+    subject = _usage_analytics_subject_user_id(current_user, user_id)
+    since_at = _parse_iso_datetime_or_400(since, "since")
+    until_at = _parse_iso_datetime_or_400(until, "until")
+    bounded_limit = max(1, min(int(limit or 100), 500))
+    bounded_offset = max(0, int(offset or 0))
+    events = await repository.list_events(
+        subject,
+        since=since_at,
+        until=until_at,
+        session_id=(session_id or "").strip() or None,
+        limit=bounded_limit,
+        offset=bounded_offset,
+    )
+    screenshots = await repository.list_screenshots(
+        subject,
+        since=since_at,
+        until=until_at,
+        session_id=(session_id or "").strip() or None,
+        limit=bounded_limit,
+        offset=bounded_offset,
+    )
+    consent = await repository.get_consent(subject)
+    return JSONResponse(
+        content={
+            "user_id": subject,
+            "consent": consent_view(consent, subject),
+            "events": [event_view(row) for row in events],
+            "screenshots": [screenshot_view(row) for row in screenshots],
+            "limit": bounded_limit,
+            "offset": bounded_offset,
+        },
+        status_code=200,
+    )
+
+
+@app.get("/usage_analytics/screenshots/{screenshot_id}/thumbnail")
+async def usage_analytics_thumbnail_route(
+    screenshot_id: str,
+    user_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the JPEG thumbnail kept beside one capture's description."""
+    repository = _usage_analytics_repository_or_503()
+    subject = _usage_analytics_subject_user_id(current_user, user_id)
+    found = await repository.get_thumbnail(subject, screenshot_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="No such capture.")
+    thumbnail, mime = found
+    return Response(content=thumbnail, media_type=mime)
+
+
+@app.delete("/usage_analytics/data")
+async def delete_usage_analytics_data_route(
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete every stored event and capture of this account; consent is left as set."""
+    repository = _usage_analytics_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    removed = await repository.delete_user_data(user_id)
+    store = getattr(app.state, "store", None)
+    if store is not None:
+        try:
+            from src.anubis.utils.usage_analytics.screenshots import usage_analytics_namespace
+
+            items = await store.asearch(usage_analytics_namespace(user_id), limit=1000)
+            for item in items or []:
+                key = getattr(item, "key", None)
+                if key:
+                    await store.adelete(usage_analytics_namespace(user_id), key)
+        except Exception:  # noqa: BLE001 - the tables are the record of truth
+            logger.debug("Usage analytics store rows were not deleted", exc_info=True)
+    return JSONResponse(content={"deleted": removed}, status_code=200)
+
 
 
 if __name__ == "__main__":

@@ -1189,6 +1189,52 @@ class GlobalContext:
 
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
+    """ <Usage analytics (opt-in action log and described page captures)> """
+
+    usage_analytics_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the /usage_analytics/* routes accept action events and page captures from a browser whose account opted in. Set to false to refuse them with 404 while keeping consent records. Env USAGE_ANALYTICS_ENABLED."
+        },
+    )
+
+    usage_analytics_capture_min_interval_seconds: float = field(
+        default=10.0,
+        metadata={
+            "description": "Server-side floor, in seconds, between two page captures from the same browser session; a faster client receives 429 with Retry-After. The browser paces itself with VITE_USAGE_ANALYTICS_CAPTURE_INTERVAL_SECONDS (default 30). Env USAGE_ANALYTICS_CAPTURE_MIN_INTERVAL_SECONDS."
+        },
+    )
+
+    usage_analytics_max_image_bytes: int = field(
+        default=3_000_000,
+        metadata={
+            "description": "Largest page capture accepted, in bytes; larger uploads receive 413. Env USAGE_ANALYTICS_MAX_IMAGE_BYTES."
+        },
+    )
+
+    usage_analytics_thumbnail_width: int = field(
+        default=640,
+        metadata={
+            "description": "Width, in pixels, of the JPEG thumbnail kept beside each capture's description; the full-size capture is discarded after the description is made. Env USAGE_ANALYTICS_THUMBNAIL_WIDTH."
+        },
+    )
+
+    usage_analytics_max_events_per_request: int = field(
+        default=200,
+        metadata={
+            "description": "Largest batch of action events one POST /usage_analytics/events accepts. Env USAGE_ANALYTICS_MAX_EVENTS_PER_REQUEST."
+        },
+    )
+
+    usage_analytics_retention_days: int = field(
+        default=90,
+        metadata={
+            "description": "How many days of action events and page captures are kept per consenting user before the purge task deletes them; zero keeps everything. Env USAGE_ANALYTICS_RETENTION_DAYS."
+        },
+    )
+
+    """ </Usage analytics (opt-in action log and described page captures)> """
+
     """ <Geo-located avatars (avatars pinned to a real-world place)> """
 
     geo_checkin_min_interval_seconds: int = field(

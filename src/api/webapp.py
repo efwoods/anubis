@@ -1514,6 +1514,21 @@ async def message_graph_sse(
             )
         )
         raise
+    except Exception as run_error:  # noqa: BLE001 - reported to the client below
+        # The run failed after the response had begun: the model vendor
+        # refusing for want of credit, a metering call inside the loop refused
+        # with 402, the graph raising. A 200 and some frames are already on the
+        # wire, so there is no status code left to say why. Raising here would
+        # cut the connection with no terminating chunk, and the browser reports
+        # that as a network error with no reason attached — the client showed
+        # "the response stream ended unexpectedly" for a spent credit balance.
+        # Say why in a last ``error`` frame and end the stream cleanly instead.
+        logger.exception(
+            "Message turn %s on thread %s failed mid-stream", request_id, thread_id
+        )
+        pump.cancel()
+        yield f"data: {json.dumps(_stream_error_frame(run_error, request_id=request_id, thread_id=thread_id), default=str)}\n\n"
+        return
     finally:
         if turn_registry is not None:
             turn_registry.unregister(request_id)
@@ -7927,13 +7942,33 @@ class MessageFeedbackRequest(BaseModel):
 MESSAGE_FEEDBACK_TYPES = ("like", "dislike", "rating", "comment", "feels_real", "feels_fake")
 
 
+def _feedback_langgraph_headers(request: Request, current_user: dict) -> dict:
+    """The LangGraph credential for reading the rated thread back.
+
+    A signed-in caller reads with the caller's own key; an anonymous visitor
+    (a shared avatar chat) reads with the anonymous key, the same key the
+    visitor's turns were run under.
+    """
+    api_key = current_user.get("API_KEY") if isinstance(current_user, dict) else None
+    if not api_key:
+        api_key = getattr(
+            getattr(request.app.state, "context", None), "anonymous_api_key", None
+        )
+    return {"API-KEY": api_key} if api_key else {}
+
+
 @app.post("/message_feedback")
 async def record_message_feedback_route(
     request: Request,
     feedback: MessageFeedbackRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Record the conversation partner's reaction to one avatar reply.
+
+    Open to anonymous visitors as well as signed-in users: a visitor chatting
+    with a shared avatar is identified by the same hashed address the
+    visitor's turns run under, so the visitor's ratings, notes, and learned
+    preferences follow the visitor across conversations with that avatar.
 
     ``feedback_type`` is ``like`` or ``dislike`` (a thumb), ``rating`` (with
     ``rating`` on a 1-5 scale; 3 and above counts as positive), ``comment``
@@ -7990,7 +8025,7 @@ async def record_message_feedback_route(
     # request id, or only the quoted text) is still filed under the stored
     # id when the thread can name the reply, so the rating comes back on the
     # reply after a reload; stored replies carry no request id to match on.
-    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    langgraph_client_headers = _feedback_langgraph_headers(request, current_user)
     resolved_reply: tuple[dict | None, dict | None] | None = None
     if message_id is None and thread_id:
         resolved_reply = await _resolve_rated_reply(
@@ -8088,9 +8123,12 @@ async def record_message_feedback_route(
 async def get_avatar_preferences_route(
     assistant_id: str,
     thread_id: str | None = None,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Everything this caller has told one avatar through ratings and notes.
+
+    Open to anonymous visitors as well as signed-in users (see
+    ``record_message_feedback_route``).
 
     ``message_feedback`` lists the thumbs and notes on replies (narrowed to
     one thread when ``thread_id`` is given); ``ambient_decisions`` lists the

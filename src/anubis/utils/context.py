@@ -1913,7 +1913,7 @@ class GlobalContext:
     )
 
     baseline_response_threshold: float = field(
-        default=49.9148420404602,
+        default=51.57779076844389,
         metadata={
             "description": "Pre-calculated IQR threshold for the empirical representation of the squared mahalanobis distances of the features presented from the unmodified chatgpt responses using a leave-one-out method. Recalibrated and written back by scripts/retrain_chatgpt_baseline.py whenever the inference model is upgraded, and by data/build_baseline_features_arr.py whenever the feature vector changes (current: 28-wide v4 vector)."
         }

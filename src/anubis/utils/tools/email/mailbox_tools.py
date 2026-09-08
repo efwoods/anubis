@@ -54,30 +54,27 @@ MAILBOX_TOOL_NAMES: tuple[str, ...] = (
 )
 
 
-def _credentials_for(record: dict[str, Any], context: Any) -> Any:
+async def _credentials_for(
+    record: dict[str, Any], context: Any, store: Any = None
+) -> Any:
     """Build live mailbox credentials from a stored record.
 
-    The plaintext password exists only inside this call and the mail session it
-    feeds; it is never returned, logged, or written back to a record.
+    The plaintext credential exists only inside this call and the mail session
+    it feeds; it is never returned, logged, or written back to a record. An
+    OAuth record presents a fresh access token (refreshed through the store).
     """
-    from src.anubis.utils.secret_store import decrypt_secret
-    from src.anubis.utils.tools.email.imap_client import MailboxCredentials
+    from src.anubis.utils.connected_accounts.mailbox_credentials import (
+        mailbox_credentials_for,
+    )
 
-    return MailboxCredentials(
-        account_address=record["account_address"],
-        password=decrypt_secret(record["encrypted_secret"], context),
-        imap_host=record["imap_host"],
-        imap_port=int(record.get("imap_port") or 993),
-        smtp_host=record.get("smtp_host"),
-        smtp_port=int(record.get("smtp_port") or 587),
-        drafts_mailbox=record.get("drafts_mailbox") or "Drafts",
-        timeout_seconds=float(
-            getattr(context, "mailbox_request_timeout_seconds", None) or 30.0
-        ),
+    return await mailbox_credentials_for(
+        record, context, store=store, user_id=record.get("user_id")
     )
 
 
-def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[Any]:
+def build_mailbox_tools(
+    context: Any, accounts: list[dict[str, Any]], store: Any = None
+) -> list[Any]:
     """Build the per-turn mailbox tool set across every connected account.
 
     Args:
@@ -93,7 +90,10 @@ def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[An
         return []
 
     mailbox_accounts = [
-        record for record in accounts if record.get("kind") == "mailbox"
+        record
+        for record in accounts
+        if record.get("kind") == "mailbox"
+        and record.get("credential_mechanism") != "browser_session"
     ]
     if not mailbox_accounts:
         return []
@@ -151,6 +151,9 @@ def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[An
         turn's status block can tell the owner which account to reconnect rather
         than the avatar rediscovering the failure every time.
         """
+        from src.anubis.utils.connected_accounts.oauth_flow import (
+            OAuthReconnectRequired,
+        )
         from src.anubis.utils.secret_store import (
             SecretDecryptionError,
             SecretEncryptionNotConfiguredError,
@@ -162,7 +165,17 @@ def build_mailbox_tools(context: Any, accounts: list[dict[str, Any]]) -> list[An
 
         label = record.get("display_label")
         try:
-            credentials = _credentials_for(record, context)
+            credentials = await _credentials_for(record, context, store)
+        except OAuthReconnectRequired:
+            return {
+                "status": "needs_reconnect",
+                "account_label": label,
+                "error": (
+                    f"Google no longer accepts the saved sign-in for {label}. "
+                    "Ask the owner to sign in with Google again (call "
+                    "connect_account with provider gmail)."
+                ),
+            }
         except SecretEncryptionNotConfiguredError:
             return {
                 "status": "not_configured",

@@ -4,6 +4,8 @@ LEARN_INFORMATION_PUBLIC = """
 When the person you are speaking with shares facts — as a single statement, a description ("this is what I look like"), or a story — you must learn information about the user with the tool LEARN_INFORMATION_ABOUT_THE_USER for every one of those facts before responding. These tools LEARN and STORE facts; they do not retrieve.
 
 - Facts the user reveals about THEMSELVES (their name, appearance, history, experiences, relationships, feelings, opinions, values, beliefs, or goals): call learn_information_about_the_user.
+- PREFERENCES the user dictates about how to be treated in conversation (how to be addressed, topics to cover or avoid, reply format, tone, humor, directness, length): call learn_user_preference, once per distinct preference.
+- Statements about what FEELS REAL, authentic, or genuine about you, and what feels FAKE, scripted, or off: call record_what_feels_real, once per distinct statement, with polarity feels_real or feels_fake.
 
 Decompose what they shared into EVERY distinct, atomic fact. A single message — especially a story — usually contains MANY separate facts. Call the matching tool once for EACH distinct fact — make as many separate tool calls in this turn as there are facts. Do not stop after the first fact. A single sentence is usually MANY facts: clauses joined by commas, "and", or "that" each carry a separate atomic fact — split every one of them into its own tool call. Count the distinct claims before you respond and make exactly that many calls.
 
@@ -70,6 +72,8 @@ When the person you are speaking with shares facts — as a single statement, a 
 
 - Facts about YOU (your name, history, experiences, relationships, preferences, feelings, or anything addressed to "you", "your", "yours", or your given name): call update_self_identity_mem_from_user_txt.
 - Facts the user reveals about THEMSELVES (their name, appearance, history, experiences, relationships, feelings, opinions, values, beliefs, or goals): call learn_information_about_the_user.
+- PREFERENCES the user dictates about how to be treated in conversation (how to be addressed, topics to cover or avoid, reply format, tone, humor, directness, length): call learn_user_preference, once per distinct preference.
+- Statements about what FEELS REAL, authentic, or genuine about you, and what feels FAKE, scripted, or off: call record_what_feels_real, once per distinct statement, with polarity feels_real or feels_fake.
 
 Decompose what they shared into EVERY distinct, atomic fact. A single message — especially a story — usually contains MANY separate facts. Call the matching tool once for EACH distinct fact — make as many separate tool calls in this turn as there are facts. Do not stop after the first fact. A single sentence is usually MANY facts: clauses joined by commas, "and", or "that" each carry a separate atomic fact — split every one of them into its own tool call. Count the distinct claims before you respond and make exactly that many calls.
 

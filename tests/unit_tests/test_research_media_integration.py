@@ -1,0 +1,120 @@
+"""Deep research hands its verified media to the media pipeline, under a cap.
+
+Research used to read a source page's text and nothing more: a video it verified
+a fact from contributed only whatever sentences the page exposed, was never
+transcribed, and never appeared in the avatar's uploaded material. The sources
+behind VERIFIED facts now go through the same pipeline an uploaded link takes.
+
+Transcription is the expensive step, so one run can only send
+``DEEP_RESEARCH_MAX_MEDIA_ITEMS`` sources; the sources that supported the most
+verified facts are the ones kept when the cap bites.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from src.anubis.utils.research.deep_research import verified_source_urls
+from src.anubis.utils.tools.identity.identity_tools import (
+    _research_proposal_preview,
+    review_researched_facts,
+)
+
+
+def _fact(*urls: str) -> dict:
+    return {"supporting_source_urls": list(urls)}
+
+
+""" Which media a run sends through the pipeline """
+
+
+def test_only_sources_behind_verified_facts_are_sent():
+    assert verified_source_urls([], limit=10) == []
+    assert verified_source_urls([_fact()], limit=10) == []
+    assert verified_source_urls([_fact("https://a")], limit=10) == ["https://a"]
+
+
+def test_the_most_corroborating_sources_survive_the_cap():
+    facts = [
+        _fact("https://a", "https://b"),
+        _fact("https://b"),
+        _fact("https://b", "https://c"),
+    ]
+    # b supported three facts, c one, a one; ties break by url so the order is stable.
+    assert verified_source_urls(facts, limit=3) == [
+        "https://b",
+        "https://a",
+        "https://c",
+    ]
+    assert verified_source_urls(facts, limit=1) == ["https://b"]
+
+
+def test_a_zero_cap_switches_the_media_hand_off_off():
+    assert verified_source_urls([_fact("https://a")], limit=0) == []
+    assert verified_source_urls([_fact("https://a")], limit=-1) == []
+
+
+def test_blank_and_repeated_urls_are_not_sent_twice():
+    facts = [_fact("https://a", "", "  "), _fact("https://a")]
+    assert verified_source_urls(facts, limit=10) == ["https://a"]
+
+
+def test_the_cap_has_a_configured_default():
+    from src.anubis.utils.context import GlobalContext
+
+    assert GlobalContext().deep_research_max_media_items == 24
+
+
+""" Resolving a contradiction in the conversation """
+
+
+def test_the_review_tool_is_offered_to_the_avatar():
+    from src.anubis.utils.deep_agent import IDENTITY_TOOL_NAMES
+
+    assert review_researched_facts.name == "review_researched_facts"
+    # Accepting a researched fact changes the identity, so the tool must also
+    # trigger the consciousness refresh the other identity tools trigger.
+    assert "review_researched_facts" in IDENTITY_TOOL_NAMES
+
+
+def test_a_contradiction_renders_in_the_correction_panel_shape():
+    """The owner resolves these with the control they already know from chat."""
+    preview = _research_proposal_preview(
+        0,
+        {
+            "fact_id": "fact-1",
+            "fact": "I was born in Ottawa.",
+            "existing_fact": "I was born in Toronto.",
+            "fact_context": "Place of birth.",
+            "reasoning": "Two sources say Ottawa.",
+            "conflicting_statements": ["born in Ottawa"],
+            "supporting_source_urls": ["https://example.com/a"],
+            "verification_status": "inconsistent",
+        },
+    )
+    # The fields the existing panel reads.
+    for field in (
+        "index",
+        "key",
+        "current_fact_content",
+        "current_fact_context",
+        "document_excerpt",
+        "suggested_edit_fact_content",
+        "default_action",
+        "recommended_action",
+    ):
+        assert field in preview, field
+    assert preview["current_fact_content"] == "I was born in Toronto."
+    assert preview["suggested_edit_fact_content"] == "I was born in Ottawa."
+    # Nobody but the owner can say which version is true, so nothing is
+    # pre-selected and a dismissed panel changes nothing.
+    assert preview["recommended_action"] == "skip"
+    assert preview["default_action"] == "skip"
+    assert "Two sources say Ottawa." in preview["document_excerpt"]
+    assert "https://example.com/a" in preview["document_excerpt"]
+
+
+def test_a_proposal_with_nothing_stored_still_reads_sensibly():
+    preview = _research_proposal_preview(1, {"fact_id": "f", "fact": "I sail."})
+    assert preview["current_fact_content"] == "(nothing stored yet on this point)"
+    assert preview["suggested_edit_fact_content"] == "I sail."

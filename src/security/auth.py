@@ -817,6 +817,9 @@ async def signup_user(
         "api_key": api_key,
         "message": "Save this key. This key is shown only once and used for every api request.",
         "verification": verification_message,
+        # The Auth0 id of the new account, so the signup route can key
+        # account-level records (usage analytics consent) on the id.
+        "user_id": created_user_id,
     }
 
 
@@ -1025,6 +1028,9 @@ class SignupRequest(BaseModel):
     email: str
     password: str
     name: str | None = None
+    # Opt-in usage analytics, chosen on the signup form. None and False both
+    # leave the account opted out; only an explicit True records consent.
+    usage_analytics_opt_in: bool | None = None
 
 
 class LoginRequest(BaseModel):
@@ -1696,7 +1702,38 @@ async def signup(
         request=request,
         background_tasks=background_tasks,
     )
+    # The signup form offers opt-in usage analytics. Consent is recorded here,
+    # after the account exists, keyed by the Auth0 user id; a repository that
+    # is absent (tests, a boot without the tables) or a failed write never
+    # turns a successful signup into an error.
+    if body.usage_analytics_opt_in is not None:
+        await record_signup_usage_analytics_consent(
+            request, user, bool(body.usage_analytics_opt_in)
+        )
     return user
+
+
+async def record_signup_usage_analytics_consent(
+    request: Request, signup_result: dict, enabled: bool
+) -> None:
+    """Store the signup form's usage-analytics choice for the new account."""
+    created_user_id = (signup_result or {}).get("user_id")
+    if not created_user_id:
+        return
+    try:
+        from src.anubis.utils.usage_analytics import get_usage_analytics_repository
+
+        repository = get_usage_analytics_repository()
+        if repository is None:
+            return
+        await repository.set_consent(created_user_id, enabled, source="signup")
+        signup_result["usage_analytics_enabled"] = bool(enabled)
+    except Exception as consent_error:  # noqa: BLE001 - never fail a signup
+        logger.warning(
+            "Usage analytics consent from signup was not stored for %s: %s",
+            created_user_id,
+            consent_error,
+        )
 
 
 @security_route.get("/get_current_user_id")

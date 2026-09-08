@@ -57,7 +57,7 @@ async def test_a_decision_is_stored_as_an_embeddable_document_and_counted():
     assert first["observation_kind"] == "error dialog"
     document = first["document"]
     assert document["kwargs"]["page_content"].startswith(
-        "error dialog: An error dialog is open. -> ignore."
+        "error dialog: An error dialog is open. -> ignore (fewer notices like this)."
     )
     assert "never tell me about terminal errors" in document["kwargs"]["page_content"]
     second = await record_ambient_preference(

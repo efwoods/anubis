@@ -55,8 +55,10 @@ from src.anubis.utils.tools.identity.identity_tools import (
     edit_identity_fact,
     learn_information_about_the_user,
     recall_memories,
+    review_researched_facts,
     update_self_identity_mem_from_user_txt,
 )
+from src.anubis.utils.tools.identity.learning_tools import LEARNING_TOOLS
 from src.anubis.utils.utility import reduce_docs
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,10 @@ IDENTITY_TOOLS = [
     learn_information_about_the_user,
     edit_identity_fact,
     delete_identity_fact,
+    review_researched_facts,
+    # Continuous learning: dictated preferences and what feels real to the user.
+    # Both change what the consciousness loader renders, so they refresh too.
+    *LEARNING_TOOLS,
 ]
 """Tools whose successful execution should trigger a ``load_consciousness`` refresh.
 
@@ -117,6 +123,10 @@ class AvatarDeepAgentState(DeepAgentState):
     retrieved_docs: Annotated[list[Document], operator.add]
 
     current_user_emotions: str
+    # Continuous learning: the rendered running sentiment summary of the
+    # conversation, forwarded from the outer graph so an in-agent
+    # consciousness rebuild keeps the section.
+    current_conversation_sentiment: NotRequired[str]
     current_assistant_emotions: str
 
     conversation_summary_event: NotRequired[dict[str, Any] | None]

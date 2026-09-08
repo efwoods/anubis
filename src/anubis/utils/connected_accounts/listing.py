@@ -70,6 +70,19 @@ def account_connection_view(record: dict[str, Any]) -> dict[str, Any]:
         # The owner typed the server URL; the listing shows the tool count
         # rather than reading the URL back (see public_account_view).
         sub_label = f"{len(tool_names)} tools"
+    elif view.get("credential_mechanism") == "browser_session":
+        # A record made by a live sign-in is a session, whatever its provider
+        # row's kind: a bank signed in on its own website reads through the
+        # session and has no Plaid account list, so it must not say "0 accounts".
+        host = view.get("account_address") or ""
+        sub_label = f"Signed in on {str(host).split('#', 1)[0]}" if host else "Signed in"
+    elif provider is not None and provider.kind == "bank":
+        count = int(view.get("account_count") or 0)
+        sub_label = f"{count} account" + ("" if count == 1 else "s")
+    elif provider is not None and provider.kind == "website":
+        sub_label = view.get("site_url") or view.get("account_address") or ""
+    if view.get("status") == "needs_reconnect":
+        sub_label = "Needs sign-in again"
     return {
         "connection_key": f"{ACCOUNT_KEY_PREFIX}{view.get('account_key')}",
         "source": "account",
@@ -90,6 +103,11 @@ def account_connection_view(record: dict[str, Any]) -> dict[str, Any]:
         "connected_at": view.get("connected_at"),
         "assistant_id": view.get("assistant_id"),
         "disconnect_endpoint": "/disconnect_account",
+        "login_mode": provider.login_mode if provider else "form",
+        "credential_mechanism": view.get("credential_mechanism"),
+        "institution_name": view.get("institution_name"),
+        "account_count": view.get("account_count"),
+        "site_url": view.get("site_url"),
     }
 
 
@@ -118,4 +136,9 @@ def device_connection_view(device: dict[str, Any]) -> dict[str, Any]:
         "assistant_id": device.get("bound_assistant_id"),
         "device_id": device.get("device_id"),
         "disconnect_endpoint": "/disconnect_mcp",
+        "login_mode": "none",
+        "credential_mechanism": "device_pairing",
+        "institution_name": None,
+        "account_count": None,
+        "site_url": None,
     }

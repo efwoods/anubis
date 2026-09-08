@@ -36,7 +36,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.store.base import IndexConfig
 from langgraph.store.postgres import AsyncPostgresStore
@@ -1397,6 +1397,14 @@ async def message_graph_sse(
     # The graph is drained on the pump's own task and consumed here through a
     # queue, so a stop request can wake this generator between frames and the
     # graph run can be cancelled from outside it (see ``message_stops``).
+    # The identifier LangSmith will give this turn's root run. Pinning it here,
+    # rather than letting the tracer mint one, is what lets the reply carry a
+    # link that opens THIS message's run inside the conversation's thread —
+    # without it the client can only link to the thread and the reader has to
+    # hunt for the turn.
+    langsmith_run_id = str(uuid4())
+    config = {**config, "run_id": langsmith_run_id}
+
     pump = GraphStreamPump(
         graph.astream(
             input=graph_input,
@@ -1572,6 +1580,7 @@ async def message_graph_sse(
             "type": "interrupt",
             "thread_id": thread_id,
             "request_id": request_id,
+            "run_id": langsmith_run_id,
             "interrupt": getattr(pending_interrupts[0], "value", None),
             "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
         }
@@ -1584,6 +1593,12 @@ async def message_graph_sse(
         "content": content,
         "thread_id": thread_id,
         "request_id": request_id,
+        # The turn's LangSmith run, so a reader can open this reply's own trace
+        # rather than the whole conversation's thread.
+        "run_id": langsmith_run_id,
+        # The id the reply is stored under, so feedback pressed on the live
+        # bubble is recorded against the same row the transcript reloads.
+        "message_id": getattr(last_ai, "id", None) if last_ai is not None else None,
         "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
     }
     response_metadata = (
@@ -2035,6 +2050,60 @@ async def lifespan(app: FastAPI):
     await connected_accounts_repository.migrate_store_connected_accounts_to_table(
         app.state.pool
     )
+    # Popup sign-ins (Google, GitHub, X, Plaid, live browser) keep their
+    # in-flight state server-side, keyed by the nonce the signed state carries.
+    from src.anubis.utils.connected_accounts import pending_logins as pending_logins_module
+
+    await pending_logins_module.ensure_pending_logins_table(app.state.pool)
+    pending_logins_module.set_pending_login_repository(
+        pending_logins_module.PostgresPendingLoginRepository(app.state.pool)
+    )
+    # Website audits keep a content hash per page so "what changed" can be answered.
+    from src.anubis.utils.connected_accounts.website_tools import (
+        ensure_website_crawls_table,
+    )
+
+    await ensure_website_crawls_table(app.state.pool)
+    # Graph-side analytics tools reach the application tables through the
+    # same pool; the graph cannot import this module.
+    runtime_handles.set_postgres_pool(app.state.pool)
+    # Signed-in browser sessions (sites with no OAuth) are revisited on a
+    # schedule so the owner does not sign in again days later.
+    from src.anubis.utils.connected_accounts import browser_sessions as browser_sessions_module
+
+    app.state.browser_session_keepalive = asyncio.create_task(
+        browser_sessions_module.keepalive_forever(app.state.context, None)
+    )
+    try:
+        from src.anubis.utils import analytics as analytics_package
+
+        await analytics_package.ensure_analytics_tables(app.state.pool)
+        analytics_package.publish_analytics_repositories(app.state.pool)
+    except ImportError:
+        logger.info("Analytics package not installed; reports and schedules are off.")
+    except Exception as analytics_boot_error:  # noqa: BLE001 - startup must not fail
+        logger.error("Analytics tables could not be prepared: %s", analytics_boot_error)
+    # Opt-in usage analytics: consent, the action log, and described page
+    # captures live in their own tables; old rows are forgotten on a schedule.
+    app.state.usage_analytics_purge_task = None
+    try:
+        from src.anubis.utils import usage_analytics as usage_analytics_package
+        from src.anubis.utils.usage_analytics import retention as usage_analytics_retention
+
+        await usage_analytics_package.ensure_usage_analytics_tables(app.state.pool)
+        usage_analytics_repository = (
+            usage_analytics_package.publish_usage_analytics_repository(app.state.pool)
+        )
+        app.state.usage_analytics_purge_task = asyncio.create_task(
+            usage_analytics_retention.purge_forever(
+                usage_analytics_repository,
+                int(GlobalContext().usage_analytics_retention_days or 0),
+            )
+        )
+    except Exception as usage_analytics_boot_error:  # noqa: BLE001 - startup must not fail
+        logger.error(
+            "Usage analytics tables could not be prepared: %s", usage_analytics_boot_error
+        )
     # Generated avatar media (emotion stills, idle loops, lip-sync clips, voice
     # clips) and the durable media jobs live in their own BYTEA tables.
     from src.anubis.utils import media_assets as media_assets_package
@@ -2114,6 +2183,22 @@ async def lifespan(app: FastAPI):
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
+        # Scheduled reports (weekly sprint digest, monthly spend digest, and
+        # any report the owner schedules in conversation) run through the
+        # graph on a fresh hidden thread and land in the inbox as notify items.
+        try:
+            from src.anubis.utils.analytics import schedules as report_schedules
+
+            app.state.report_scheduler = asyncio.create_task(
+                report_schedules.run_due_schedules_forever(
+                    app.state.context, run_question=_run_scheduled_report_question
+                )
+            )
+        except ImportError:
+            app.state.report_scheduler = None
+        except Exception as scheduler_error:  # noqa: BLE001 - startup must not fail
+            logger.error("Report scheduler could not start: %s", scheduler_error)
+            app.state.report_scheduler = None
         # Keep the unmodified-inference-model style baseline in step with MODEL:
         # a boot whose MODEL differs from the model recorded with the committed
         # baseline retrains it ONCE (coordinated through the shared store) or adopts
@@ -2129,9 +2214,37 @@ async def lifespan(app: FastAPI):
         except Exception as baseline_check_error:  # noqa: BLE001 - startup must not fail
             logger.error("Baseline provenance check failed: %s", baseline_check_error)
             app.state.baseline_retrain_task = None
+        # Continuous learning: the background sweep that finalizes conversation
+        # sentiment history, folds ratings into learned preferences, and infers
+        # preferences once an account has gone idle (see learning/bulk_learning.py).
+        app.state.learning_sweeper_task = None
+        if str(app.state.context.learning_sweep_enabled or "").upper() == "TRUE":
+            from src.anubis.utils.learning.bulk_learning import run_learning_sweeper
+
+            app.state.learning_sweeper_task = asyncio.create_task(
+                run_learning_sweeper(app)
+            )
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
+        sweeper_task = getattr(app.state, "learning_sweeper_task", None)
+        if sweeper_task is not None:
+            sweeper_task.cancel()
+            try:
+                await sweeper_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
+        purge_task = getattr(app.state, "usage_analytics_purge_task", None)
+        if purge_task is not None:
+            purge_task.cancel()
+        try:
+            from src.anubis.utils.connected_accounts.browser_sessions import (
+                shutdown_browser_sessions,
+            )
+
+            await shutdown_browser_sessions()
+        except Exception:
+            logger.debug("Browser sessions did not shut down cleanly", exc_info=True)
         await pool.close()
 
 
@@ -3572,11 +3685,11 @@ async def _connect_account_from_fields(
     """
     from src.anubis.utils.connected_accounts import get_provider, public_account_view
     from src.anubis.utils.connected_accounts.connect_handlers import (
+        ConnectNeedsLogin,
         ConnectRefused,
         ConnectRequest,
         connect_account,
     )
-    from src.anubis.utils.connected_accounts.providers import KIND_MCP_SERVER
 
     provider = get_provider(provider_name)
     if provider is None:
@@ -3602,50 +3715,693 @@ async def _connect_account_from_fields(
                 existing_records=existing_records,
             )
         )
+    except ConnectNeedsLogin as needs_login:
+        # Not a failure: the provider signs in through a popup. The card opens
+        # the login endpoint with the request carried here.
+        return JSONResponse(content=needs_login.as_response(), status_code=200)
     except ConnectRefused as refused:
         raise HTTPException(status_code=refused.status_code, detail=refused.detail)
 
+    record["user_id"] = user_id
+    _enforce_connection_caps(existing_records, provider, record)
+    await _put_connected_account_record(client, user_id, record)
+    _after_record_stored(provider, record)
+
+    return JSONResponse(
+        content={"connected": True, "account": public_account_view(record)},
+        status_code=200,
+    )
+
+
+def _enforce_connection_caps(
+    existing_records: list[dict[str, Any]], provider: Any, record: dict[str, Any]
+) -> None:
+    """Refuse a NEW account beyond the per-user caps; reconnects always pass.
+
+    Shared by the form route, the OAuth callback, the Plaid exchange, and the
+    live-browser finish so every way in counts the same accounts.
+    """
+    from src.anubis.utils.connected_accounts.providers import KIND_MCP_SERVER
+
     key = record["account_key"]
-    if not any(existing.get("account_key") == key for existing in existing_records):
-        if provider.kind == KIND_MCP_SERVER:
-            maximum = int(
-                getattr(app.state.context, "max_custom_mcp_connectors_per_user", 10)
-                or 10
-            )
-            already = sum(
-                1
-                for existing in existing_records
-                if existing.get("kind") == KIND_MCP_SERVER
-            )
-            if already >= maximum:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"A maximum of {maximum} custom connectors may be connected. "
-                        "Disconnect one before connecting another."
-                    ),
-                )
-        maximum = int(app.state.context.max_connected_accounts_per_user)
-        if len(existing_records) >= maximum:
+    if any(existing.get("account_key") == key for existing in existing_records):
+        return
+    if provider.kind == KIND_MCP_SERVER:
+        maximum = int(
+            getattr(app.state.context, "max_custom_mcp_connectors_per_user", 10) or 10
+        )
+        already = sum(
+            1 for existing in existing_records if existing.get("kind") == KIND_MCP_SERVER
+        )
+        if already >= maximum:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"A maximum of {maximum} accounts may be connected. "
+                    f"A maximum of {maximum} custom connectors may be connected. "
                     "Disconnect one before connecting another."
                 ),
             )
+    maximum = int(app.state.context.max_connected_accounts_per_user)
+    if len(existing_records) >= maximum:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A maximum of {maximum} accounts may be connected. "
+                "Disconnect one before connecting another."
+            ),
+        )
 
-    await _put_connected_account_record(client, user_id, record)
+
+def _after_record_stored(provider: Any, record: dict[str, Any]) -> None:
+    """Housekeeping once a record is written (cache resets, schedule seeds)."""
+    from src.anubis.utils.connected_accounts.providers import KIND_MCP_SERVER
+
     if provider.kind == KIND_MCP_SERVER:
         from src.anubis.utils.connected_accounts.mcp_server_tools import (
             forget_cached_tools,
         )
 
         forget_cached_tools((record.get("transport") or {}).get("server_url") or "")
+    # The first business-category connection seeds the weekly sprint digest
+    # and the monthly spend digest; both are deliverable through the inbox.
+    if provider.category in ("finance", "development", "vendor"):
+        try:
+            from src.anubis.utils.analytics.schedules import (
+                get_schedule_repository,
+                seed_default_schedules,
+            )
 
+            repository = get_schedule_repository()
+            if repository is not None:
+                schedule_background(
+                    seed_default_schedules(
+                        repository,
+                        user_id=str(record.get("user_id") or ""),
+                        assistant_id=str(record.get("assistant_id") or ""),
+                    )
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("Could not seed default report schedules", exc_info=True)
+
+
+async def _connected_account_records_without_session(user_id: str) -> list[dict[str, Any]]:
+    """Every record for a user when no SDK session exists (popup callbacks)."""
+    from src.anubis.utils.connected_accounts import read_connected_accounts
+
+    return await read_connected_accounts(getattr(app.state, "store", None), user_id)
+
+
+async def _store_connected_record_without_session(
+    user_id: str, record: dict[str, Any]
+) -> None:
+    """Persist a record when the request carries no owner session (popup callbacks)."""
+    from src.anubis.utils.connected_accounts import save_connected_account
+
+    await save_connected_account(getattr(app.state, "store", None), user_id, record)
+
+
+def _popup_result_response(result: dict[str, Any]) -> HTMLResponse:
+    """The HTML a popup ends on; posts a non-secret result to the opener."""
+    from src.anubis.utils.connected_accounts.oauth_flow import (
+        allowed_popup_origins,
+        render_popup_result_html,
+    )
+
+    return HTMLResponse(
+        render_popup_result_html(result, allowed_popup_origins(app.state.context))
+    )
+
+
+def _login_token_from_request(request: Request) -> str:
+    """Return the signed login token a popup presents (header or query)."""
+    token = request.headers.get("X-Login-Token") or request.query_params.get("t") or ""
+    if not token:
+        raise HTTPException(status_code=401, detail="A login token is required.")
+    return str(token)
+
+
+def _verify_login_token(token: str, *, mode: str) -> dict:
+    from src.anubis.utils.connected_accounts.oauth_state import (
+        OAuthStateError,
+        state_secret,
+        verify_state,
+    )
+
+    try:
+        payload = verify_state(token, state_secret(app.state.context))
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=401, detail=str(state_error))
+    if payload.get("mode") != mode:
+        raise HTTPException(status_code=401, detail="The login token is for another flow.")
+    return payload
+
+
+@app.post("/connect_account/plaid/link_token")
+async def connect_account_plaid_link_token(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Begin a bank connection through Plaid Link.
+
+    Returns ``{link_url, nonce, expires_in}``; the card opens ``link_url`` (a
+    path on this API) in the window it opened on the click. 503 when Plaid
+    is not configured on this server.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
+    from src.anubis.utils.connected_accounts.plaid_link import (
+        PlaidLinkError,
+        start_plaid_link,
+    )
+
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    provider = get_provider(str((body or {}).get("provider") or "plaid"))
+    if provider is None or provider.login_mode != "plaid_link":
+        raise HTTPException(status_code=400, detail="This provider does not connect through Plaid.")
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    try:
+        started = await start_plaid_link(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+        )
+    except PlaidLinkError as plaid_error:
+        # Financial accounts connect ONLY through Plaid Link (the bank's own
+        # secure login inside Plaid, with multiple institutions and accounts).
+        # There is no browser fallback for a bank; a 503 says Plaid must be
+        # configured on the server.
+        raise HTTPException(status_code=plaid_error.status_code, detail=plaid_error.detail)
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=503, detail=str(state_error))
+    return JSONResponse(content=started, status_code=200)
+
+
+@app.get("/connect_account/plaid/link")
+async def connect_account_plaid_link_page(request: Request, t: str = ""):
+    """The popup page that runs Plaid Link (the login token is the auth)."""
+    from src.anubis.utils.connected_accounts.oauth_flow import allowed_popup_origins
+    from src.anubis.utils.connected_accounts.pending_logins import (
+        get_pending_login_repository,
+    )
+    from src.anubis.utils.connected_accounts.plaid_link import (
+        PLAID_EXCHANGE_PATH,
+        render_link_page_html,
+    )
+
+    payload = _verify_login_token(t, mode="plaid")
+    pending = await get_pending_login_repository().peek(str(payload.get("nonce") or ""))
+    if pending is None or pending.get("status") != "started":
+        return _popup_result_response(
+            {"ok": False, "nonce": payload.get("nonce"), "provider": "plaid", "error": "This bank sign-in has expired. Start the connection again."}
+        )
+    link_token = str((pending.get("payload") or {}).get("link_token") or "")
+    return HTMLResponse(
+        render_link_page_html(
+            link_token=link_token,
+            nonce=str(payload.get("nonce")),
+            login_token=t,
+            allowed_origins=allowed_popup_origins(app.state.context),
+            exchange_path=PLAID_EXCHANGE_PATH,
+        )
+    )
+
+
+@app.post("/connect_account/plaid/exchange")
+async def connect_account_plaid_exchange(request: Request):
+    """Finish a bank connection: exchange the public token and store the item."""
+    from src.anubis.utils.connected_accounts import get_provider, public_account_view
+    from src.anubis.utils.connected_accounts.pending_logins import (
+        get_pending_login_repository,
+    )
+    from src.anubis.utils.connected_accounts.plaid_link import (
+        PlaidLinkError,
+        exchange_public_token,
+    )
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
+
+    payload = _verify_login_token(_login_token_from_request(request), mode="plaid")
+    body = await request.json()
+    public_token = str((body or {}).get("public_token") or "")
+    nonce = str(payload.get("nonce") or "")
+    if not public_token:
+        raise HTTPException(status_code=400, detail="A public_token is required.")
+    pending = await get_pending_login_repository().consume(nonce)
+    if pending is None:
+        return JSONResponse(
+            content={"ok": False, "nonce": nonce, "provider": "plaid", "error": "This bank sign-in was already completed or has expired."},
+            status_code=200,
+        )
+    user_id = str(pending["user_id"])
+    existing_records = await _connected_account_records_without_session(user_id)
+    try:
+        record = await exchange_public_token(
+            app.state.context,
+            public_token=public_token,
+            pending=pending,
+            existing_records=existing_records,
+        )
+        provider = get_provider("plaid")
+        _enforce_connection_caps(existing_records, provider, record)
+        await _store_connected_record_without_session(user_id, record)
+        _after_record_stored(provider, record)
+    except PlaidLinkError as plaid_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "provider": "plaid", "error": plaid_error.detail}, status_code=200)
+    except HTTPException as http_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "provider": "plaid", "error": str(http_error.detail)}, status_code=200)
+    view = public_account_view(record)
+    # The first transaction sync runs in the background so the card answers at once.
+    try:
+        from src.anubis.utils.analytics.finance import sync_transactions
+
+        schedule_background(sync_transactions(app.state.context, app.state.pool, user_id, record))
+    except ImportError:
+        pass
+    except Exception:
+        logger.debug("Could not schedule the first Plaid sync", exc_info=True)
     return JSONResponse(
-        content={"connected": True, "account": public_account_view(record)},
+        content={
+            "ok": True,
+            "nonce": nonce,
+            "provider": "plaid",
+            "account_key": view.get("account_key"),
+            "display_label": view.get("display_label"),
+            "account_address": view.get("account_address"),
+            "tool_count": len(tool_names_for(provider, record)),
+        },
         status_code=200,
+    )
+
+
+@app.post("/connect_account/browser/start")
+async def connect_account_browser_start(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Open a live browser at a site's sign-in page for the owner to sign in on.
+
+    Body: ``provider`` (langsmith, openai, anthropic, a social
+    site, custom_site, or website) plus ``site_url`` and ``name`` for a custom
+    site. Returns ``{login_id, view_url, nonce, expires_in}``; the card opens
+    ``view_url`` (a path on this API) in the window it opened on the click.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.browser_login import start_login
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A JSON object body is required.")
+    provider = get_provider(str(body.get("provider") or ""))
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Unknown provider.")
+    if provider.kind == "bank":
+        raise HTTPException(
+            status_code=400,
+            detail="Financial accounts connect through Plaid, not a browser sign-in.",
+        )
+    site_url = str(body.get("site_url") or "").strip() or None
+    # Any provider can be signed in to on a page the owner names (a bank's
+    # own website when Plaid is not configured, a vendor without an OAuth
+    # app); providers with their own login page need no address.
+    if provider.login_mode != "browser_session" and not provider.login_url and not site_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.display_name} needs the address of the page to sign in on (site_url).",
+        )
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    reconnect_key = str(body.get("reconnect_account_key") or "").strip() or None
+    if reconnect_key and reconnect_key.startswith("account:"):
+        reconnect_key = reconnect_key[len("account:"):]
+    try:
+        started = await start_login(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+            site_url=site_url or provider.login_url,
+            name=body.get("name"),
+            reconnect_account_key=reconnect_key,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=503, detail=str(state_error))
+    return JSONResponse(content=started, status_code=200)
+
+
+@app.get("/connect_account/browser/{login_id}")
+async def connect_account_browser_view(request: Request, login_id: str, t: str = ""):
+    """The popup page showing the live sign-in browser (login token is the auth)."""
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.browser_login import (
+        get_live_login,
+        render_login_page_html,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.oauth_flow import allowed_popup_origins
+
+    try:
+        payload = verify_login_token(app.state.context, t, login_id)
+    except BrowserSessionError as session_error:
+        return _popup_result_response({"ok": False, "error": session_error.detail})
+    login = get_live_login(login_id)
+    if login is None or login.user_id != payload.get("user_id"):
+        return _popup_result_response(
+            {"ok": False, "nonce": payload.get("nonce"), "error": "This sign-in window has expired. Start the sign-in again."}
+        )
+    provider = get_provider(login.provider_name)
+    return HTMLResponse(
+        render_login_page_html(
+            login_id=login_id,
+            token=t,
+            nonce=login.nonce,
+            provider_name=login.provider_name,
+            display_name=provider.display_name if provider else login.provider_name,
+            site_url=login.site_url,
+            allowed_origins=allowed_popup_origins(app.state.context),
+            finish_path=f"/connect_account/browser/{login_id}/finish",
+            cancel_path=f"/connect_account/browser/{login_id}/cancel",
+            stream_path=f"/connect_account/browser/{login_id}/stream",
+        )
+    )
+
+
+@app.websocket("/connect_account/browser/{login_id}/stream")
+async def connect_account_browser_stream(websocket: WebSocket, login_id: str):
+    """Stream frames of the sign-in browser to the popup and forward input."""
+    from src.anubis.utils.connected_accounts.browser_login import (
+        get_live_login,
+        stream_login,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = websocket.query_params.get("t") or ""
+    try:
+        payload = verify_login_token(app.state.context, token, login_id)
+    except BrowserSessionError:
+        await websocket.close(code=4401)
+        return
+    login = get_live_login(login_id)
+    if login is None or login.user_id != payload.get("user_id") or login.finished:
+        await websocket.close(code=4404)
+        return
+    if login.streaming:
+        await websocket.close(code=4409)
+        return
+    await websocket.accept()
+    try:
+        await stream_login(websocket, login, app.state.context)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.post("/connect_account/browser/{login_id}/finish")
+async def connect_account_browser_finish(request: Request, login_id: str):
+    """Save the signed-in session as a connected account."""
+    from src.anubis.utils.connected_accounts import get_provider, public_account_view
+    from src.anubis.utils.connected_accounts.browser_login import (
+        finish_login,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_login_token(app.state.context, token, login_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    user_id = str(payload.get("user_id") or "")
+    nonce = payload.get("nonce")
+    existing_records = await _connected_account_records_without_session(user_id)
+    try:
+        finished = await finish_login(
+            app.state.context, login_id=login_id, user_id=user_id, existing_records=existing_records
+        )
+        record = finished["record"]
+        provider = get_provider(str(record.get("provider") or ""))
+        _enforce_connection_caps(existing_records, provider, record)
+        await _store_connected_record_without_session(user_id, record)
+        _after_record_stored(provider, record)
+    except BrowserSessionError as session_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "error": session_error.detail}, status_code=200)
+    except HTTPException as http_error:
+        return JSONResponse(content={"ok": False, "nonce": nonce, "error": str(http_error.detail)}, status_code=200)
+    view = public_account_view(record)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "nonce": nonce,
+            "provider": record.get("provider"),
+            "account_key": view.get("account_key"),
+            "display_label": view.get("display_label"),
+            "account_address": view.get("account_address"),
+            "tool_count": len(tool_names_for(provider, record)),
+            "heuristic_signed_in": finished.get("heuristic_signed_in"),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/connect_account/browser/{login_id}/cancel")
+async def connect_account_browser_cancel(request: Request, login_id: str):
+    """Close a sign-in window without saving anything."""
+    from src.anubis.utils.connected_accounts.browser_login import (
+        cancel_login,
+        verify_login_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_login_token(app.state.context, token, login_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    cancelled = await cancel_login(login_id, str(payload.get("user_id") or ""))
+    return JSONResponse(content={"ok": False, "cancelled": cancelled}, status_code=200)
+
+
+@app.post("/connect_account/oauth/start")
+async def connect_account_oauth_start(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Begin a popup sign-in with a vendor's own OAuth page.
+
+    Body: ``provider`` (gmail, google_calendar, google_analytics, youtube,
+    github, x, vercel, or custom_mcp with ``server_url`` and ``name``).
+    Returns ``{authorization_url, nonce, expires_in}``; the card opens the URL
+    in a window it opened synchronously on the click. 503 when the vendor's
+    client id is not configured on this server.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.connected_accounts.mcp_oauth import McpOAuthError
+    from src.anubis.utils.connected_accounts.oauth_flow import (
+        OAuthFlowError,
+        start_oauth,
+    )
+    from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A JSON object body is required.")
+    provider = get_provider(str(body.get("provider") or ""))
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Unknown provider.")
+    if provider.login_mode != "oauth_popup" and provider.name != "custom_mcp":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.display_name} does not sign in through OAuth.",
+        )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    try:
+        started = await start_oauth(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+            server_url=body.get("server_url"),
+            name=body.get("name"),
+        )
+    except OAuthFlowError as flow_error:
+        if flow_error.status_code == 503 and provider.login_url:
+            # No OAuth app for this vendor on this server: the owner signs in
+            # on the vendor's own login page in the live browser instead, and
+            # the account is used through the signed-in session. Every
+            # account stays connectable without a vendor console step.
+            return JSONResponse(
+                content=await _start_browser_fallback(
+                    request,
+                    current_user,
+                    provider,
+                    personal_avatar,
+                    name=body.get("name"),
+                    reconnect_account_key=body.get("reconnect_account_key"),
+                ),
+                status_code=200,
+            )
+        raise HTTPException(status_code=flow_error.status_code, detail=flow_error.detail)
+    except McpOAuthError as flow_error:
+        raise HTTPException(status_code=flow_error.status_code, detail=flow_error.detail)
+    except OAuthStateError as state_error:
+        raise HTTPException(status_code=503, detail=str(state_error))
+    return JSONResponse(content=started, status_code=200)
+
+
+async def _start_browser_fallback(
+    request: Request,
+    current_user: dict,
+    provider: Any,
+    personal_avatar: dict,
+    *,
+    name: str | None = None,
+    reconnect_account_key: str | None = None,
+) -> dict:
+    """Open the live sign-in browser for a vendor whose OAuth app is not configured."""
+    from src.anubis.utils.connected_accounts.browser_login import start_login
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    user_id = current_user["identities"][0]["user_id"]
+    reconnect_key = str(reconnect_account_key or "").strip() or None
+    if reconnect_key and reconnect_key.startswith("account:"):
+        reconnect_key = reconnect_key[len("account:"):]
+    try:
+        started = await start_login(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            provider=provider,
+            site_url=provider.login_url,
+            name=str(name or "").strip() or provider.display_name,
+            reconnect_account_key=reconnect_key,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    started["login_mode"] = "browser_session"
+    started["fallback"] = "browser_session"
+    return started
+
+
+@app.get("/connect_account/oauth/callback")
+async def connect_account_oauth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    """Where a vendor's sign-in page returns. Public: the signed state is the auth.
+
+    Exchanges the code, proves the token, stores the encrypted result, and
+    renders a page that posts a non-secret result to the window that opened
+    the popup, then closes. Every failure renders the same page with
+    ``ok: false`` and a plain message; token-endpoint text never reaches the
+    browser.
+    """
+    from src.anubis.utils.connected_accounts import get_provider, public_account_view
+    from src.anubis.utils.connected_accounts.mcp_oauth import McpOAuthError
+    from src.anubis.utils.connected_accounts.oauth_flow import (
+        OAuthFlowError,
+        complete_oauth,
+    )
+    from src.anubis.utils.connected_accounts.oauth_state import (
+        OAuthStateError,
+        state_secret,
+        verify_state,
+    )
+    from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
+
+    nonce = None
+    provider_name = None
+    try:
+        payload = verify_state(state or "", state_secret(app.state.context))
+        nonce = payload.get("nonce")
+        provider_name = payload.get("provider")
+    except OAuthStateError as state_error:
+        return _popup_result_response({"ok": False, "error": str(state_error)})
+    if error:
+        return _popup_result_response(
+            {
+                "ok": False,
+                "nonce": nonce,
+                "provider": provider_name,
+                "error": "The sign-in was cancelled or refused."
+                if error == "access_denied"
+                else f"The sign-in did not complete ({error}).",
+            }
+        )
+    if not code:
+        return _popup_result_response(
+            {"ok": False, "nonce": nonce, "provider": provider_name, "error": "No code was returned."}
+        )
+
+    user_id = str(payload.get("user_id") or "")
+    existing_records = await _connected_account_records_without_session(user_id)
+    try:
+        record = await complete_oauth(
+            app.state.context,
+            code=code,
+            state=state or "",
+            existing_records=existing_records,
+        )
+        provider = get_provider(str(record.get("provider") or ""))
+        _enforce_connection_caps(existing_records, provider, record)
+        await _store_connected_record_without_session(user_id, record)
+        _after_record_stored(provider, record)
+    except (OAuthFlowError, McpOAuthError) as flow_error:
+        return _popup_result_response(
+            {"ok": False, "nonce": nonce, "provider": provider_name, "error": flow_error.detail}
+        )
+    except HTTPException as http_error:
+        return _popup_result_response(
+            {"ok": False, "nonce": nonce, "provider": provider_name, "error": str(http_error.detail)}
+        )
+    except Exception:
+        logger.exception("OAuth callback failed for provider %s", provider_name)
+        return _popup_result_response(
+            {
+                "ok": False,
+                "nonce": nonce,
+                "provider": provider_name,
+                "error": "The sign-in could not be completed. Start the sign-in again.",
+            }
+        )
+    view = public_account_view(record)
+    return _popup_result_response(
+        {
+            "ok": True,
+            "nonce": nonce,
+            "provider": record.get("provider"),
+            "account_key": view.get("account_key"),
+            "display_label": view.get("display_label"),
+            "account_address": view.get("account_address"),
+            "tool_count": len(tool_names_for(provider, record)),
+        }
     )
 
 
@@ -4167,20 +4923,25 @@ async def import_mailbox_writing_samples(
         )
 
     try:
-        credentials = MailboxCredentials(
-            account_address=record["account_address"],
-            password=decrypt_secret(record["encrypted_secret"], app.state.context),
-            imap_host=record["imap_host"],
-            imap_port=int(record.get("imap_port") or 993),
-            smtp_host=record.get("smtp_host"),
-            smtp_port=int(record.get("smtp_port") or 587),
-            drafts_mailbox=record.get("drafts_mailbox") or "Drafts",
-            timeout_seconds=float(app.state.context.mailbox_request_timeout_seconds),
+        from src.anubis.utils.connected_accounts.mailbox_credentials import (
+            mailbox_credentials_for,
+        )
+        from src.anubis.utils.connected_accounts.oauth_flow import (
+            OAuthReconnectRequired,
+        )
+
+        credentials = await mailbox_credentials_for(
+            record, app.state.context, store=None, user_id=user_id
         )
     except SecretDecryptionError:
         raise HTTPException(
             status_code=409,
             detail="The stored mailbox credential could not be read; reconnect the mailbox.",
+        )
+    except OAuthReconnectRequired:
+        raise HTTPException(
+            status_code=409,
+            detail="Google no longer accepts the saved sign-in; sign in with Google again.",
         )
     try:
         messages = await asyncio.to_thread(
@@ -5637,14 +6398,19 @@ async def label_spoken_turn_files(
     # Only the person talking, alone, is a direct turn. Anything else heard in
     # the room (other people, another avatar, this avatar's own playback, or
     # nothing intelligible) is triaged so the avatar does not answer itself.
-    if not combined:
+    nothing_was_heard = not combined
+    if nothing_was_heard:
         combined = "(nothing intelligible was heard)"
     if other_speakers or not owner_spoke:
         additional_kwargs = build_ambient_additional_kwargs(
             sources=[SOURCE_MICROPHONE],
             captured_at=datetime.now(UTC).isoformat(),
             voice_mode=True,
-            hidden=False,
+            # A spoken turn is shown so the owner can see what the room said.
+            # A turn where nothing intelligible was heard has nothing to show,
+            # and showing it put a bare internal header in the transcript as
+            # though the owner had typed it.
+            hidden=nothing_was_heard,
         )
         additional_kwargs["speakers"] = speakers_record
     else:
@@ -5936,6 +6702,36 @@ async def _remember_turn_attachments_for_identity_tool(
     remember_turn_attachments(thread_id, attachments, current_user)
 
 
+async def _connection_acknowledgement_turn(
+    user_id: str, connection_key: Optional[str]
+) -> tuple[str, dict]:
+    """Build the hidden acknowledgement turn for a connector the "+" menu opened."""
+    from src.anubis.utils.connected_accounts import get_connected_account, get_provider
+    from src.anubis.utils.connected_accounts.connection_cards import (
+        ACKNOWLEDGEMENT_MESSAGE_KIND,
+        CARD_STATUS_CONNECTED,
+        acknowledgement_instruction,
+        connection_card_record,
+    )
+    from src.anubis.utils.connected_accounts.listing import split_connection_key
+
+    key = str(connection_key or "").strip()
+    if key.startswith("account:"):
+        _source, key = split_connection_key(key)
+    if not key:
+        raise HTTPException(status_code=400, detail="connection_key is required.")
+    record = await get_connected_account(getattr(app.state, "store", None), user_id, key)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No connected account {key!r}.")
+    provider = get_provider(str(record.get("provider") or ""))
+    card = connection_card_record(provider, record, status=CARD_STATUS_CONNECTED)
+    return acknowledgement_instruction(card), {
+        "hidden": True,
+        "kind": ACKNOWLEDGEMENT_MESSAGE_KIND,
+        "connection": card,
+    }
+
+
 @app.post("/message/{assistant_id}")
 async def message_avatar(
     request: Request,
@@ -5960,8 +6756,20 @@ async def message_avatar(
     voice_mode: bool = Form(False),
     diarize: bool = Form(False),
     at_place: bool = Form(False),
+    ambient_action_observation_id: Optional[str] = Form(None),
+    ambient_action: Optional[str] = Form(None),
+    ambient_action_description: Optional[str] = Form(None),
+    ambient_action_kind: Optional[str] = Form(None),
+    ambient_action_summary: Optional[str] = Form(None),
+    turn_kind: Optional[str] = Form(None),
+    connection_key: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
+    # ``ambient_action_observation_id`` names a notification card whose offer
+    # the conversation partner just allowed: the turn is a hidden instruction
+    # to carry out ``ambient_action_description`` (``ambient_action`` is the
+    # offer kind, ``reply`` or ``act``); the avatar's reply is stamped with the
+    # observation so a thumb on the reply is learned against the card.
     # ``diarize=true`` marks the attached audio as one live-voice utterance to
     # be transcribed WITH speaker labels (the owner recognised from the voice
     # recordings, other people as "Speaker N" remembered per thread). The
@@ -5978,10 +6786,11 @@ async def message_avatar(
     # clip rides the same call as another source, so the avatar always receives
     # one message per capture tick. Signed-in callers only; the API enforces a
     # minimum interval per thread.
-    # NOTE: ``feedback`` / ``like`` / ``dislike`` are inert placeholders. The
-    # data-collection / preference-learning pipeline is intentionally deferred
-    # while the upload + evaluation pipeline ships first; the parameters exist
-    # now so the frontend can wire its UI without a breaking API change later.
+    # ``like`` / ``dislike`` rate the avatar's previous reply on ``thread_id``;
+    # ``feedback`` marks this message as feedback about the avatar (stored and
+    # used from the very next reply). Both are collected by the continuous
+    # learning pipeline (src/anubis/utils/learning/) and folded into learned
+    # preferences by the background sweep once the account has gone idle.
 
     # allow for select avatar in query and anonymous user for a dedicated endpoint
 
@@ -6059,6 +6868,46 @@ async def message_avatar(
         )
         refuse_ambient_observation_on_busy_thread(
             getattr(request.app.state, "active_message_turns", None), thread_id
+        )
+    ambient_action_additional_kwargs: dict | None = None
+    if (ambient_action_observation_id or "").strip():
+        from src.anubis.utils.ambient.observations import (
+            build_ambient_action_additional_kwargs,
+        )
+
+        if is_anonymous_user(current_user):
+            raise HTTPException(
+                status_code=401,
+                detail="Only a signed-in conversation partner can allow an action.",
+            )
+        if not (ambient_action_description or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="ambient_action_description names what the avatar may do.",
+            )
+        ambient_action_additional_kwargs = build_ambient_action_additional_kwargs(
+            observation_id=ambient_action_observation_id.strip(),
+            observation_kind=ambient_action_kind or "other",
+            action=ambient_action or "reply",
+            action_description=ambient_action_description,
+            summary=ambient_action_summary or "",
+        )
+    # ``turn_kind=connection_acknowledgement`` is the hidden turn the "+" menu
+    # sends once a connector it opened finishes signing in: the avatar
+    # acknowledges the connection in the transcript and the card persists on
+    # that reply. The text is server-authored from the stored record.
+    connection_acknowledgement_additional_kwargs: dict | None = None
+    connection_acknowledgement_text: str | None = None
+    if (turn_kind or "").strip() == "connection_acknowledgement":
+        if is_anonymous_user(current_user):
+            raise HTTPException(
+                status_code=401, detail="Only a signed-in owner can connect accounts."
+            )
+        (
+            connection_acknowledgement_text,
+            connection_acknowledgement_additional_kwargs,
+        ) = await _connection_acknowledgement_turn(
+            current_user["identities"][0]["user_id"], connection_key
         )
 
     user_name = your_name
@@ -6193,6 +7042,23 @@ async def message_avatar(
     # store = app.state.store
     graph = app.state.graph
 
+    # Inline continuous-learning signals carried on the message itself. Best
+    # effort: a failed store write must never cost the user the reply.
+    if (like or dislike or feedback) and thread_id:
+        try:
+            await _apply_inline_message_feedback(
+                request.app.state,
+                langgraph_client_headers=langgraph_client_headers,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                like=like,
+                dislike=dislike,
+                feedback_text=message if feedback else None,
+            )
+        except Exception as inline_feedback_error:  # noqa: BLE001
+            logger.warning("Inline message feedback failed: %s", inline_feedback_error)
+
     # Uploaded files were already processed above (before enforcement) so the
     # pre-call estimate could cover them; reuse those results here.
 
@@ -6224,10 +7090,31 @@ async def message_avatar(
                 + "\n"
                 + (human_message_content or "")
             )
+        if ambient_action_additional_kwargs is not None:
+            from src.anubis.utils.ambient.observations import (
+                compose_ambient_action_text,
+            )
+
+            # The allowed action replaces whatever text rode along: the turn
+            # is the instruction, hidden like an observation.
+            human_message_content = compose_ambient_action_text(
+                ambient_action_additional_kwargs["ambient"]
+            )
+        if connection_acknowledgement_additional_kwargs is not None:
+            human_message_content = connection_acknowledgement_text or ""
         human_message_additional_kwargs = (
-            ambient_additional_kwargs or spoken_turn_additional_kwargs or {}
+            connection_acknowledgement_additional_kwargs
+            or ambient_action_additional_kwargs
+            or ambient_additional_kwargs
+            or spoken_turn_additional_kwargs
+            or {}
         )
-        if ambient_additional_kwargs is None and spoken_turn_additional_kwargs is None:
+        if (
+            ambient_additional_kwargs is None
+            and spoken_turn_additional_kwargs is None
+            and ambient_action_additional_kwargs is None
+            and connection_acknowledgement_additional_kwargs is None
+        ):
             from src.anubis.utils.client_harvest_turns import (
                 CLIENT_HARVEST_MESSAGE_KIND,
                 is_client_harvest_marker_text,
@@ -6309,6 +7196,9 @@ async def message_avatar(
     response_data["total_response_time_ms"] = (time_ns() - start_time) // 1000000
     response_data["thread_id"] = thread_id
     response_data["request_id"] = request.state.request_id
+    # The id the reply is stored under, so a client can rate exactly this
+    # reply through POST /message_feedback.
+    response_data["message_id"] = getattr(result["messages"][-1], "id", None)
     if spoken_turn_frame:
         response_data["spoken_turn"] = spoken_turn_frame
     turn_usage = await _meter_message_usage(
@@ -6620,6 +7510,234 @@ async def get_all_conversations(
         raise HTTPException(status_code=500, detail=f"Error loading threads: {exc}")
 
 
+def _message_without_observation_header(message: Any) -> Any:
+    """Drop an observation's internal header line from a message bound for a transcript.
+
+    Observations are written with an ``[AMBIENT_OBSERVATION id=... ]`` first
+    line so the avatar can tell a scene it noticed from a turn the person
+    typed. That line is addressed to the model. A visible spoken turn was
+    handing it to the reader as well, who saw the raw header attributed to
+    themselves.
+    """
+    from src.anubis.utils.ambient.observations import (
+        is_ambient_observation,
+        split_observation_text,
+    )
+
+    if not isinstance(message, dict) or not is_ambient_observation(message):
+        return message
+    content = message.get("content")
+    if not isinstance(content, str):
+        return message
+    header, body = split_observation_text(content)
+    if header is None:
+        return message
+    return {**message, "content": body}
+
+
+async def _run_scheduled_report_question(schedule: dict) -> dict:
+    """Run one scheduled report's question through the graph on a fresh thread.
+
+    The ``run_question`` callable the scheduler is wired with: the config has
+    the same shape as a ``/message`` turn for the owner and the personal
+    avatar, plus ``scheduled=True`` so no tool pauses on a sign-in card. The
+    reply text and the thread id are returned; the scheduler then finds the
+    report the avatar saved for that thread and creates the inbox item.
+    """
+    from langchain_core.messages import HumanMessage
+
+    user_id = str(schedule.get("user_id") or "")
+    assistant_id = str(schedule.get("assistant_id") or "")
+    question = str(schedule.get("question") or "")
+    thread_id = str(uuid4())
+    assistant_name = ""
+    assistant_metadata: dict = {}
+    try:
+        async with app.state.pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT name, metadata FROM assistant WHERE assistant_id = %s",
+                (assistant_id,),
+            )
+            row = await cursor.fetchone()
+        if row:
+            assistant_name = str(row[0] or "")
+            assistant_metadata = dict(row[1] or {}) if isinstance(row[1], dict) else {}
+    except Exception:
+        logger.debug("Could not read the assistant row for a scheduled report", exc_info=True)
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+            "assistant_ctx": {
+                "assistant_id": assistant_id,
+                "name": assistant_name,
+                "metadata": assistant_metadata,
+            },
+            "user_name": None,
+            "user_description": None,
+            "scheduled": True,
+            "include_quality_metrics": False,
+            "use_adapter_inference": False,
+        },
+        "run_id": str(uuid4()),
+    }
+    instruction = (
+        f"{question}\n\nThis is a scheduled report titled "
+        f"{schedule.get('title') or schedule.get('kind') or 'report'!r}. Use the connected "
+        "accounts and tools, chart every time series with make_chart, and finish by "
+        "calling save_report with kind "
+        f"{schedule.get('kind') or 'custom'!r} and a summary the owner can read in the inbox."
+    )
+    human_message = HumanMessage(
+        id=str(uuid4()),
+        content=instruction,
+        additional_kwargs={"hidden": True, "kind": "scheduled_report", "schedule_id": str(schedule.get("schedule_id") or "")},
+    )
+    result = await app.state.graph.ainvoke(
+        {"messages": [human_message]}, config=config, context=app.state.context
+    )
+    reply_text = ""
+    try:
+        messages = (result or {}).get("messages") or []
+        last = messages[-1] if messages else None
+        content = getattr(last, "content", "") if last is not None else ""
+        reply_text = content if isinstance(content, str) else str(content)
+    except Exception:
+        reply_text = ""
+    return {"thread_id": thread_id, "reply_text": reply_text}
+
+
+def _report_repository_or_503():
+    try:
+        from src.anubis.utils.analytics.reports import get_report_repository
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Reports are not available on this server.")
+    repository = get_report_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Reports are not available on this server.")
+    return repository
+
+
+@app.get("/reports")
+async def list_reports_route(
+    request: Request,
+    assistant_id: Optional[str] = None,
+    q: Optional[str] = None,
+    kind: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the owner's saved reports, newest first, searchable and filterable.
+
+    ``q`` searches the title and summary; ``kind`` filters by report kind;
+    ``since`` / ``until`` bound the creation date (ISO). Every analysis the
+    avatar saves with save_report, and every scheduled digest, appears here.
+    """
+    from src.anubis.utils.analytics.reports import public_report_view
+
+    repository = _report_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    rows = await repository.list(
+        user_id,
+        assistant_id=assistant_id or None,
+        query=(q or "").strip() or None,
+        kind=(kind or "").strip() or None,
+        since=since or None,
+        until=until or None,
+        limit=max(1, min(int(limit or 20), 100)),
+        offset=max(0, int(offset or 0)),
+    )
+    kinds = []
+    if assistant_id:
+        try:
+            kinds = await repository.kinds(user_id, assistant_id)
+        except Exception:
+            kinds = []
+    return JSONResponse(
+        content={"reports": [public_report_view(row) for row in rows], "kinds": kinds, "limit": limit, "offset": offset},
+        status_code=200,
+    )
+
+
+@app.get("/reports/{report_id}")
+async def get_report_route(
+    request: Request,
+    report_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return one saved report (charts inline)."""
+    from src.anubis.utils.analytics.reports import public_report_view
+
+    repository = _report_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.get(user_id, report_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such report.")
+    return JSONResponse(content={"report": public_report_view(row)}, status_code=200)
+
+
+@app.delete("/reports/{report_id}")
+async def delete_report_route(
+    request: Request,
+    report_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete one saved report of the owner."""
+    repository = _report_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    deleted = await repository.delete(user_id, report_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No such report.")
+    return JSONResponse(content={"deleted": True, "report_id": report_id}, status_code=200)
+
+
+@app.get("/report_schedules")
+async def list_report_schedules_route(
+    request: Request,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """List the scheduled reports of one avatar."""
+    try:
+        from src.anubis.utils.analytics.schedules import get_schedule_repository
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Schedules are not available on this server.")
+    repository = get_schedule_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Schedules are not available on this server.")
+    user_id = current_user["identities"][0]["user_id"]
+    rows = await repository.list_for_avatar(user_id, assistant_id)
+    return JSONResponse(content={"schedules": [dict(row, next_run_at=str(row.get("next_run_at")), last_run_at=str(row.get("last_run_at")) if row.get("last_run_at") else None, created_at=str(row.get("created_at"))) for row in rows]}, status_code=200)
+
+
+async def _pending_interrupt_for_thread(thread_id: str) -> Optional[dict]:
+    """The interrupt a thread is paused on, so a reload re-arms the card.
+
+    Read from the graph's checkpoint; ``None`` when the thread is not paused
+    or the state cannot be read (a reload must never fail over this).
+    """
+    graph_instance = getattr(app.state, "graph", None)
+    if graph_instance is None:
+        return None
+    try:
+        from src.anubis.utils.graph_interrupts import collect_pending_interrupts
+
+        snapshot = await graph_instance.aget_state({"configurable": {"thread_id": thread_id}})
+        pending = collect_pending_interrupts(snapshot)
+    except Exception:
+        return None
+    if not pending:
+        return None
+    value = getattr(pending[0], "value", None)
+    if not isinstance(value, dict):
+        return None
+    return {"thread_id": thread_id, "interrupt": value}
+
+
 @app.get("/conversations/{thread_id}/messages")
 async def get_thread_messages(
     request: Request,
@@ -6683,7 +7801,16 @@ async def get_thread_messages(
             messages = without_stale_client_harvest_turns(
                 [message for message in messages if not is_hidden_message(message)]
             )
-        return JSONResponse({"messages": messages})
+            # A spoken turn that IS shown carries the same
+            # ``[AMBIENT_OBSERVATION ...]`` header the avatar reads, which is
+            # framing for the model and not something the owner typed. The
+            # transcript shows what the room said, not the framing.
+            messages = [_message_without_observation_header(m) for m in messages]
+        messages = await _with_stored_message_feedback(
+            messages, user_id=user_id, assistant_id=assistant_id, thread_id=thread_id
+        )
+        pending_interrupt = await _pending_interrupt_for_thread(thread_id)
+        return JSONResponse({"messages": messages, "pending_interrupt": pending_interrupt})
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
 
@@ -6703,32 +7830,586 @@ async def record_ambient_preference_route(
     precedent the next time a similar scene is triaged; nothing is resumed and
     no reply is generated (a reply is simply the next ordinary turn).
     """
-    from src.anubis.utils.ambient.preferences import record_ambient_preference
+    from src.anubis.utils.ambient.preferences import (
+        ACTION_TAKEN_AVATAR,
+        ACTION_TAKEN_OWNER,
+        ambient_decision_view,
+        record_ambient_decision,
+        record_ambient_preference,
+    )
 
     body = await request.json()
     body = body if isinstance(body, dict) else {}
     decision_type = str(body.get("type") or "").strip().lower()
-    if decision_type not in ("accept", "ignore", "response"):
+    if decision_type not in ("accept", "ignore", "response", "act", "left_alone"):
         raise HTTPException(
-            status_code=400, detail="type must be accept, ignore, or response."
+            status_code=400,
+            detail="type must be accept, ignore, response, act, or left_alone.",
         )
-    note = body.get("args")
-    note = note.strip() if isinstance(note, str) else None
+    args = body.get("args")
+    note = args.strip() if isinstance(args, str) and decision_type == "response" else None
+    # ``act`` says who acted on the card: the avatar (the conversation partner
+    # allowed the offer) or the conversation partner (replied in person).
+    action_taken: str | None = None
+    if decision_type == "act":
+        actor = args.get("action") if isinstance(args, dict) else args
+        actor = str(actor or "").strip().lower()
+        if actor not in ("avatar", "owner"):
+            raise HTTPException(
+                status_code=400, detail="act needs args.action of avatar or owner."
+            )
+        action_taken = ACTION_TAKEN_AVATAR if actor == "avatar" else ACTION_TAKEN_OWNER
+    # The aggregated precedent the next triage reads, per observation kind.
+    aggregate_decision = {
+        "act": "allowed_action" if action_taken == ACTION_TAKEN_AVATAR else "replied_self",
+        "left_alone": "left_alone",
+    }.get(decision_type, decision_type)
+    store = getattr(app.state, "store", None)
+    user_id = current_user["identities"][0]["user_id"]
+    observation_kind = str(body.get("observation_kind") or "other")
+    summary = str(body.get("summary") or "")
     recorded = await record_ambient_preference(
-        getattr(app.state, "store", None),
-        current_user["identities"][0]["user_id"],
+        store,
+        user_id,
         assistant_id.strip(),
-        observation_kind=str(body.get("observation_kind") or "other"),
-        summary=str(body.get("summary") or ""),
+        observation_kind=observation_kind,
+        summary=summary,
+        decision=aggregate_decision,
+        note=note,
+    )
+    # The card's own record: which thumb, note, and action this observation
+    # received, so the card shows them again after a reload.
+    decision = await record_ambient_decision(
+        store,
+        user_id,
+        assistant_id.strip(),
+        observation_id=(
+            str(body.get("observation_id") or "").strip() or None
+        ),
+        observation_kind=observation_kind,
+        summary=summary,
         decision=decision_type,
         note=note,
+        action_taken=action_taken,
     )
     return JSONResponse(
         {
             "recorded": recorded is not None,
             "observation_id": body.get("observation_id"),
             "preference": recorded,
+            "decision": ambient_decision_view(decision),
         }
+    )
+
+
+class MessageFeedbackRequest(BaseModel):
+    """A thumb or a note on one avatar reply."""
+
+    assistant_id: str
+    thread_id: str | None = None
+    # The id the reply is stored under (``done.message_id`` on a live turn, the
+    # message ``id`` on a reloaded transcript).
+    message_id: str | None = None
+    # The request the reply streamed under, for replies rated before their
+    # stored id was known.
+    request_id: str | None = None
+    # 'like' | 'dislike' | 'rating' | 'comment' | 'feels_real' | 'feels_fake'
+    feedback_type: str
+    # For 'rating': 1-5, where 3 and above counts as positive.
+    rating: float | None = None
+    comment: str | None = None
+    # The rated reply's text, quoted in the embedded record.
+    content: str | None = None
+    # When the reply carried out an allowed action (or answered an
+    # observation), the observation it belongs to: the thumb is also learned
+    # as precedent for that kind of scene.
+    observation_id: str | None = None
+    observation_kind: str | None = None
+    observation_summary: str | None = None
+
+
+MESSAGE_FEEDBACK_TYPES = ("like", "dislike", "rating", "comment", "feels_real", "feels_fake")
+
+
+@app.post("/message_feedback")
+async def record_message_feedback_route(
+    request: Request,
+    feedback: MessageFeedbackRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record the conversation partner's reaction to one avatar reply.
+
+    ``feedback_type`` is ``like`` or ``dislike`` (a thumb), ``rating`` (with
+    ``rating`` on a 1-5 scale; 3 and above counts as positive), ``comment``
+    (a written note; ``comment`` required), or ``feels_real`` / ``feels_fake``
+    (what feels real or off about this reply; ``comment`` optional, the reply
+    itself is the example). A thumb with a ``comment`` records both.
+
+    The row the browser restores lives under ``(user_id, assistant_id,
+    "message_feedback")``. The same press also teaches the avatar: thumbs and
+    ratings become rated-message records the background sweep folds into
+    learned preferences, and notes and feels-real statements are stored for
+    the very next reply (see src/anubis/utils/learning/). Notes and marks that
+    answer a notification card are learned as ambient precedent as well.
+    """
+    from src.anubis.utils.message_feedback import (
+        feedback_view,
+        record_message_feedback,
+    )
+
+    feedback_type = (feedback.feedback_type or "").strip().lower()
+    if feedback_type not in MESSAGE_FEEDBACK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"feedback_type must be one of: {', '.join(MESSAGE_FEEDBACK_TYPES)}.",
+        )
+    if not (feedback.message_id or "").strip() and not (feedback.request_id or "").strip():
+        raise HTTPException(
+            status_code=400, detail="message_id or request_id is required."
+        )
+    if feedback_type == "rating" and feedback.rating is None:
+        raise HTTPException(status_code=400, detail="rating is required for feedback_type=rating.")
+    if feedback_type == "comment" and not (feedback.comment or "").strip():
+        raise HTTPException(status_code=400, detail="comment is required for feedback_type=comment.")
+
+    store = getattr(app.state, "store", None)
+    user_id = current_user["identities"][0]["user_id"]
+    assistant_id = feedback.assistant_id.strip()
+    thread_id = (feedback.thread_id or "").strip() or None
+    message_id = (feedback.message_id or "").strip() or None
+    request_id = (feedback.request_id or "").strip() or None
+
+    thumb: str | None = None
+    feels: str | None = None
+    rating_score: float | None = None
+    if feedback_type in ("like", "dislike"):
+        thumb = feedback_type
+    elif feedback_type == "rating":
+        rating_score = float(feedback.rating)
+        thumb = "like" if rating_score >= 3.0 else "dislike"
+    elif feedback_type in ("feels_real", "feels_fake"):
+        feels = feedback_type
+
+    # A press made before the browser knew the reply's stored id (only the
+    # request id, or only the quoted text) is still filed under the stored
+    # id when the thread can name the reply, so the rating comes back on the
+    # reply after a reload; stored replies carry no request id to match on.
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    resolved_reply: tuple[dict | None, dict | None] | None = None
+    if message_id is None and thread_id:
+        resolved_reply = await _resolve_rated_reply(
+            langgraph_client_headers,
+            thread_id=thread_id,
+            message_id=None,
+            request_id=request_id,
+            content=feedback.content,
+        )
+        resolved_avatar_message = resolved_reply[0]
+        if resolved_avatar_message and resolved_avatar_message.get("id"):
+            message_id = str(resolved_avatar_message["id"])
+
+    recorded = await record_message_feedback(
+        store,
+        user_id,
+        assistant_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        request_id=request_id,
+        feedback_type=thumb,
+        comment=feedback.comment,
+        content=feedback.content,
+        feels=feels,
+        rating_score=rating_score,
+    )
+
+    # Teach the avatar from the same press (rated message, note, feels-real).
+    learning: dict | None = None
+    try:
+        learning = await _learn_from_message_feedback(
+            request.app.state,
+            langgraph_client_headers=langgraph_client_headers,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            message_id=message_id,
+            request_id=request_id,
+            thumb=thumb,
+            rating_score=rating_score,
+            feels=feels,
+            comment=feedback.comment,
+            content=feedback.content,
+            resolved_reply=resolved_reply,
+        )
+    except Exception as learning_error:  # noqa: BLE001 - the row is saved; learning is best effort
+        logger.warning("Message feedback learning failed: %s", learning_error)
+
+    ambient_decision = None
+    if (feedback.observation_id or "").strip() and (thumb or feels):
+        from src.anubis.utils.ambient.preferences import (
+            ambient_decision_view,
+            record_ambient_decision,
+            record_ambient_preference,
+        )
+
+        observation_kind = feedback.observation_kind or "other"
+        summary = feedback.observation_summary or ""
+        liked = thumb == "like" or (thumb is None and feels == "feels_real")
+        await record_ambient_preference(
+            store,
+            user_id,
+            assistant_id,
+            observation_kind=observation_kind,
+            summary=summary,
+            decision="liked_action" if liked else "disliked_action",
+            note=feedback.comment,
+        )
+        ambient_decision = ambient_decision_view(
+            await record_ambient_decision(
+                store,
+                user_id,
+                assistant_id,
+                observation_id=feedback.observation_id.strip(),
+                observation_kind=observation_kind,
+                summary=summary,
+                decision="rated_after_action",
+                rated_after_action="like" if liked else "dislike",
+            )
+        )
+    return JSONResponse(
+        {
+            "recorded": recorded is not None,
+            "feedback_type": feedback_type,
+            "ambient_decision": ambient_decision,
+            "message_id": recorded.get("message_id") if recorded else message_id,
+            "request_id": recorded.get("request_id") if recorded else request_id,
+            "feedback": feedback_view(recorded),
+            "learning": learning,
+        }
+    )
+
+
+@app.get("/avatar_preferences/{assistant_id}")
+async def get_avatar_preferences_route(
+    assistant_id: str,
+    thread_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Everything this caller has told one avatar through ratings and notes.
+
+    ``message_feedback`` lists the thumbs and notes on replies (narrowed to
+    one thread when ``thread_id`` is given); ``ambient_decisions`` lists the
+    thumb and note each notification card received. The browser reads this
+    after every press so what is on screen is what is stored.
+    """
+    from src.anubis.utils.ambient.preferences import list_ambient_decisions
+    from src.anubis.utils.learning.feedback import list_learned_records
+    from src.anubis.utils.message_feedback import feedback_view, list_message_feedback
+
+    store = getattr(app.state, "store", None)
+    user_id = current_user["identities"][0]["user_id"]
+    feedback_records = await list_message_feedback(
+        store, user_id, assistant_id.strip(), thread_id=(thread_id or "").strip() or None
+    )
+    decisions = await list_ambient_decisions(store, user_id, assistant_id.strip())
+    learned = await list_learned_records(store, user_id, assistant_id.strip())
+    return JSONResponse(
+        {
+            "assistant_id": assistant_id.strip(),
+            "thread_id": (thread_id or "").strip() or None,
+            # What the avatar has learned about this person: dictated and
+            # inferred preferences, feedback messages, and what feels real.
+            "learned_preferences": learned.get("preferences", []),
+            "feedback_messages": learned.get("feedback_messages", []),
+            "what_feels_real": learned.get("what_feels_real", []),
+            "message_feedback": [
+                {
+                    "message_id": record.get("message_id"),
+                    "request_id": record.get("request_id"),
+                    "thread_id": record.get("thread_id"),
+                    "feedback": feedback_view(record),
+                }
+                for record in feedback_records
+            ],
+            "ambient_decisions": decisions,
+        }
+    )
+
+
+async def _with_stored_message_feedback(
+    messages: list, *, user_id: str, assistant_id: str, thread_id: str
+) -> list:
+    """Attach each stored rating to its reply; a store problem changes nothing."""
+    from src.anubis.utils.message_feedback import (
+        attach_message_feedback,
+        list_message_feedback,
+    )
+
+    try:
+        records = await list_message_feedback(
+            getattr(app.state, "store", None),
+            user_id,
+            assistant_id,
+            thread_id=thread_id,
+        )
+        return attach_message_feedback(messages, records)
+    except Exception:  # noqa: BLE001 - a rating must never hide a transcript
+        logger.debug("Could not attach message feedback", exc_info=True)
+        return messages
+
+
+async def _load_thread_message_dicts(langgraph_client, thread_id: str) -> list[dict]:
+    """The checkpointed messages of one thread as plain dicts (``id``, ``type``, ``content``)."""
+    state = await langgraph_client.threads.get_state(thread_id=thread_id)
+    messages = state.get("values", {}).get("messages", []) if state else []
+    return [message for message in messages if isinstance(message, dict)]
+
+
+def _message_dict_type(message: dict) -> str:
+    return str(message.get("type") or message.get("role") or "")
+
+
+def _message_dict_request_id(message: dict) -> str:
+    response_metadata = message.get("response_metadata") or {}
+    request_id = message.get("request_id") or (
+        response_metadata.get("request_id") if isinstance(response_metadata, dict) else None
+    )
+    return str(request_id or "")
+
+
+def _find_avatar_message_and_prompt(
+    messages: list[dict],
+    message_id: str | None,
+    request_id: str | None = None,
+    content_excerpt: str | None = None,
+) -> tuple[dict | None, dict | None]:
+    """The avatar message ``message_id`` names (else the one streamed under
+    ``request_id``, else the newest one whose text starts with
+    ``content_excerpt``, else the latest one when nothing was named) and the
+    user message before it."""
+    from src.anubis.utils.learning.sentiment import message_text
+
+    avatar_index: int | None = None
+    excerpt = (content_excerpt or "").strip()[:200]
+    for index, message in enumerate(messages):
+        if _message_dict_type(message) not in ("ai", "assistant"):
+            continue
+        if message.get("tool_calls"):
+            continue
+        if message_id is not None:
+            if message.get("id") == message_id:
+                avatar_index = index
+                break
+            continue
+        if request_id:
+            if _message_dict_request_id(message) == request_id:
+                avatar_index = index
+                break
+            if excerpt and message_text(message.get("content")).strip().startswith(excerpt):
+                avatar_index = index
+            continue
+        avatar_index = index
+    if avatar_index is None:
+        return None, None
+    preceding_user_message = None
+    for message in reversed(messages[:avatar_index]):
+        if _message_dict_type(message) in ("human", "user"):
+            preceding_user_message = message
+            break
+    return messages[avatar_index], preceding_user_message
+
+
+async def _resolve_rated_reply(
+    langgraph_client_headers: dict,
+    *,
+    thread_id: str | None,
+    message_id: str | None,
+    request_id: str | None,
+    content: str | None,
+) -> tuple[dict | None, dict | None]:
+    """The stored reply a feedback press names, and the user message before it.
+
+    Read from the thread when the thread is known: by stored id, else by the
+    request id the reply streamed under, else by the text the browser quoted.
+    A thread that cannot be read resolves to nothing, and the caller falls
+    back to what the browser sent.
+    """
+    if not thread_id:
+        return None, None
+    try:
+        langgraph_client = get_client(headers=langgraph_client_headers)
+        messages = await _load_thread_message_dicts(langgraph_client, thread_id)
+    except Exception as thread_error:  # noqa: BLE001 - fall back to the browser's text
+        logger.debug("Could not load the rated thread %s: %s", thread_id, thread_error)
+        return None, None
+    return _find_avatar_message_and_prompt(messages, message_id, request_id, content)
+
+
+async def _learn_from_message_feedback(
+    app_state,
+    *,
+    langgraph_client_headers: dict,
+    user_id: str,
+    assistant_id: str,
+    thread_id: str | None,
+    message_id: str | None,
+    request_id: str | None,
+    thumb: str | None,
+    rating_score: float | None,
+    feels: str | None,
+    comment: str | None,
+    content: str | None,
+    resolved_reply: tuple[dict | None, dict | None] | None = None,
+) -> dict:
+    """Turn one feedback press into continuous-learning records.
+
+    A thumb (or a rating) becomes a rated-message record holding the reply and
+    the user message before it; a note becomes a feedback message; a
+    feels-real mark becomes a what-feels-real statement. The reply text comes
+    from the thread when the thread is known, else from the text the browser
+    sent. Returns what was learned, for the response.
+    """
+    from src.anubis.utils.learning.feedback import (
+        store_feedback_message,
+        store_message_rating,
+        store_what_feels_real,
+    )
+    from src.anubis.utils.learning.namespaces import RATING_NEGATIVE, RATING_POSITIVE
+    from src.anubis.utils.learning.sentiment import message_text
+
+    store = getattr(app_state, "store", None)
+    if store is None:
+        return {}
+    avatar_message, preceding_user_message = (
+        resolved_reply
+        if resolved_reply is not None
+        else await _resolve_rated_reply(
+            langgraph_client_headers,
+            thread_id=thread_id,
+            message_id=message_id,
+            request_id=request_id,
+            content=content,
+        )
+    )
+    avatar_text = (
+        message_text(avatar_message.get("content")) if avatar_message else ""
+    ).strip() or (content or "").strip()
+    preceding_text = (
+        message_text(preceding_user_message.get("content")).strip()
+        if preceding_user_message
+        else None
+    )
+    resolved_message_id = (
+        str(avatar_message.get("id"))
+        if avatar_message and avatar_message.get("id")
+        else (message_id or request_id)
+    )
+    learned: dict = {}
+    if thumb in ("like", "dislike") and resolved_message_id and avatar_text:
+        await store_message_rating(
+            store,
+            user_id,
+            assistant_id,
+            rating=RATING_POSITIVE if thumb == "like" else RATING_NEGATIVE,
+            rating_score=rating_score,
+            thread_id=thread_id or "",
+            message_id=resolved_message_id,
+            avatar_message_text=avatar_text,
+            preceding_user_message_text=preceding_text,
+            request_id=request_id,
+        )
+        learned["rating"] = "collected; folded into learned preferences by the background sweep"
+    if (comment or "").strip():
+        document = await store_feedback_message(
+            store,
+            user_id,
+            assistant_id,
+            comment=comment,
+            thread_id=thread_id,
+            message_id=resolved_message_id,
+            related_avatar_message=avatar_text or None,
+        )
+        learned["feedback_message"] = (
+            "immediate; used in the next reply" if document is not None else "duplicate"
+        )
+    if feels in ("feels_real", "feels_fake"):
+        statement = (comment or "").strip()
+        if not statement and avatar_text:
+            label = "feels real" if feels == "feels_real" else "feels fake or off"
+            statement = f"A reply like this one {label}: {avatar_text[:400]}"
+        if statement:
+            document = await store_what_feels_real(
+                store,
+                user_id,
+                assistant_id,
+                statement=statement,
+                statement_context=(
+                    f"About this avatar message: {avatar_text[:400]}" if avatar_text else None
+                ),
+                polarity=feels,
+                source="dictated",
+                thread_id=thread_id,
+                message_id=resolved_message_id,
+            )
+            learned["what_feels_real"] = (
+                "immediate; used in the next reply" if document is not None else "duplicate"
+            )
+    return learned
+
+
+async def _apply_inline_message_feedback(
+    app_state,
+    *,
+    langgraph_client_headers: dict,
+    user_id: str,
+    assistant_id: str,
+    thread_id: str,
+    like: bool,
+    dislike: bool,
+    feedback_text: str | None,
+) -> None:
+    """Apply the ``like`` / ``dislike`` / ``feedback`` fields of one /message call.
+
+    The thumb lands on the thread's latest avatar reply (both the row the
+    browser restores and the learning record); ``feedback_text`` is stored as
+    a feedback message about that reply and used from the very next turn.
+    """
+    from src.anubis.utils.message_feedback import record_message_feedback
+
+    thumb = None
+    if like or dislike:
+        thumb = "like" if like and not dislike else "dislike"
+    if not thumb and not (feedback_text or "").strip():
+        return
+    langgraph_client = get_client(headers=langgraph_client_headers)
+    messages = await _load_thread_message_dicts(langgraph_client, thread_id)
+    avatar_message, _preceding = _find_avatar_message_and_prompt(messages, None)
+    latest_message_id = (
+        str(avatar_message.get("id")) if avatar_message and avatar_message.get("id") else None
+    )
+    if thumb and latest_message_id:
+        await record_message_feedback(
+            app_state.store,
+            user_id,
+            assistant_id,
+            thread_id=thread_id,
+            message_id=latest_message_id,
+            request_id=_message_dict_request_id(avatar_message) or None,
+            feedback_type=thumb,
+            comment=feedback_text,
+        )
+    await _learn_from_message_feedback(
+        app_state,
+        langgraph_client_headers=langgraph_client_headers,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        thread_id=thread_id,
+        message_id=latest_message_id,
+        request_id=None,
+        thumb=thumb,
+        rating_score=None,
+        feels=None,
+        comment=feedback_text,
+        content=None,
     )
 
 
@@ -11475,6 +13156,7 @@ def _start_deep_research_job(
     subject_name: str,
     subject_description: str | None,
     research_hint: str | None,
+    assistant_metadata: dict | None = None,
 ):
     """Register and launch one research job; the pipeline runs as a background task."""
     from src.anubis.utils.research.deep_research import run_deep_research
@@ -11524,6 +13206,53 @@ def _start_deep_research_job(
             # load_consciousness reads on the next turn.
             if summary.get("applied"):
                 invalidate_store_cache_for_assistant(assistant_id)
+
+            # Media the research verified goes through the same pipeline an
+            # uploaded link takes, so a video or a PDF behind a verified fact is
+            # transcribed, described, and indexed rather than reduced to the
+            # sentences the page happened to expose. The batch is itself a
+            # background job, so this returns at once and the two run alongside
+            # each other; the pipeline skips anything this avatar already holds,
+            # so re-running the research re-ingests nothing.
+            media_source_urls = list(summary.get("media_source_urls") or [])
+            if media_source_urls:
+                add_research_event(
+                    job,
+                    {
+                        "type": "research_progress",
+                        "stage": "learning_from_media",
+                        "media_sources": len(media_source_urls),
+                    },
+                )
+                try:
+                    media_batch = await start_identity_media_job_from_chat(
+                        user_id=creator_id,
+                        assistant_id=assistant_id,
+                        assistant_ctx={
+                            "name": subject_name,
+                            "description": subject_description,
+                            "metadata": assistant_metadata or {},
+                        },
+                        current_user=current_user,
+                        attachments=[],
+                        urls=media_source_urls,
+                    )
+                except Exception as media_error:  # noqa: BLE001 - research still succeeded
+                    logger.exception(
+                        "Deep research job %s could not start the media batch: %s",
+                        job.job_id,
+                        media_error,
+                    )
+                    media_batch = {"status": "refused", "detail": str(media_error)}
+                summary["media_batch"] = media_batch
+                add_research_event(
+                    job,
+                    {
+                        "type": "research_progress",
+                        "stage": "media_started",
+                        "media_batch": media_batch,
+                    },
+                )
             # The source pages read are billed like uploaded documents.
             tokens_read = int(summary.get("tokens_read") or 0)
             if tokens_read > 0:
@@ -11620,6 +13349,7 @@ async def start_avatar_deep_research(
         subject_name=assistant.get("name") or assistant_id,
         subject_description=assistant.get("description"),
         research_hint=research_hint,
+        assistant_metadata=assistant.get("metadata") or {},
     )
     return JSONResponse(
         {
@@ -12302,6 +14032,383 @@ async def _prune_ground_truth_features_for_deleted_docs(
         key="style_profile",
         value={"value": style_profile_str},
     )
+
+
+# ── Usage analytics (opt-in action log and described page captures) ───────────
+#
+# A person who opted in has the browser record every action taken in the web
+# application and capture the page itself (rendered from the document, never a
+# window picker) on an interval and on route changes. Events and captures are
+# accepted only for a signed-in account whose consent row says enabled, and
+# only while USAGE_ANALYTICS_ENABLED is on. Captures are described after the
+# response (a vision call takes seconds); the browser never waits on the call.
+
+
+class UsageAnalyticsConsentRequest(BaseModel):
+    """The body of POST /usage_analytics/consent."""
+
+    enabled: bool
+    # Where the choice was made: signup, avatar_settings, account_settings.
+    source: str | None = None
+
+
+class UsageAnalyticsEventsRequest(BaseModel):
+    """The body of POST /usage_analytics/events: one batch of browser events."""
+
+    session_id: str | None = None
+    assistant_id: str | None = None
+    thread_id: str | None = None
+    route: str | None = None
+    events: list[dict] = []
+
+
+def _usage_analytics_repository_or_503():
+    """Return the published repository, or raise 503 when the lifespan did not bind one."""
+    from src.anubis.utils.usage_analytics import get_usage_analytics_repository
+
+    repository = get_usage_analytics_repository()
+    if repository is None:
+        raise HTTPException(
+            status_code=503, detail="Usage analytics is not available on this server."
+        )
+    return repository
+
+
+def _usage_analytics_feature_enabled(context: GlobalContext) -> bool:
+    return str(context.usage_analytics_enabled or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+async def _usage_analytics_recording_user(current_user: dict, repository) -> str:
+    """Return the user id a recording request records under, or raise the refusal.
+
+    404 when the deployment turned the feature off, 403 for an anonymous
+    caller or an account that has not opted in: the browser stops recording
+    on either answer rather than retrying.
+    """
+    if not _usage_analytics_feature_enabled(GlobalContext()):
+        raise HTTPException(
+            status_code=404, detail="Usage analytics is not enabled on this deployment."
+        )
+    if is_anonymous_user(current_user):
+        raise HTTPException(
+            status_code=403, detail="Usage analytics requires a signed-in user."
+        )
+    user_id = current_user["identities"][0]["user_id"]
+    if not await repository.is_enabled(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="This account has not opted in to usage analytics.",
+        )
+    return user_id
+
+
+def _parse_iso_datetime_or_400(value: Optional[str], name: str) -> Optional[datetime]:
+    if not (value or "").strip():
+        return None
+    from src.anubis.utils.usage_analytics.repository import _as_datetime
+
+    parsed = _as_datetime(value)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail=f"{name} must be an ISO 8601 timestamp.")
+    return parsed
+
+
+@app.get("/usage_analytics/consent")
+async def get_usage_analytics_consent_route(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return whether this account has opted in to usage analytics, and when the choice was made."""
+    from src.anubis.utils.usage_analytics.repository import consent_view
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.get_consent(user_id)
+    return JSONResponse(
+        content={
+            **consent_view(row, user_id),
+            "feature_enabled": _usage_analytics_feature_enabled(GlobalContext()),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/usage_analytics/consent")
+async def set_usage_analytics_consent_route(
+    body: UsageAnalyticsConsentRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Opt this account in to, or out of, usage analytics.
+
+    Opting out stops recording at once; the rows already stored stay until
+    the retention purge or ``DELETE /usage_analytics/data`` removes them.
+    """
+    from src.anubis.utils.usage_analytics.repository import consent_view
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.set_consent(user_id, bool(body.enabled), source=body.source)
+    return JSONResponse(
+        content={
+            **consent_view(row, user_id),
+            "feature_enabled": _usage_analytics_feature_enabled(GlobalContext()),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/usage_analytics/events", status_code=202)
+async def record_usage_analytics_events_route(
+    body: UsageAnalyticsEventsRequest,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Store a batch of actions the browser recorded for a consenting account."""
+    from src.anubis.utils.usage_analytics.events import (
+        UsageEventError,
+        normalise_event_batch,
+    )
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = await _usage_analytics_recording_user(current_user, repository)
+    context = GlobalContext()
+    try:
+        rows = normalise_event_batch(
+            body.events,
+            user_id=user_id,
+            session_id=body.session_id,
+            assistant_id=body.assistant_id,
+            thread_id=body.thread_id,
+            route=body.route,
+            max_events=int(context.usage_analytics_max_events_per_request or 200),
+        )
+    except UsageEventError as event_error:
+        raise HTTPException(status_code=422, detail=str(event_error)) from event_error
+    recorded = await repository.record_events(rows) if rows else 0
+    return JSONResponse(content={"recorded": recorded}, status_code=202)
+
+
+# Per-session floor between captures, so a misconfigured client cannot flood
+# the vision model. Reuses the ambient throttle's bookkeeping, keyed by the
+# browser session rather than by a conversation thread.
+_usage_analytics_capture_throttle = None
+
+
+def _usage_capture_throttle():
+    """Return the process-wide capture throttle, created on first use."""
+    global _usage_analytics_capture_throttle
+    if _usage_analytics_capture_throttle is None:
+        from src.anubis.utils.ambient.observations import AmbientThrottle
+
+        _usage_analytics_capture_throttle = AmbientThrottle()
+    return _usage_analytics_capture_throttle
+
+
+@app.post("/usage_analytics/screenshots", status_code=202)
+async def record_usage_analytics_screenshot_route(
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    assistant_id: Optional[str] = Form(None),
+    thread_id: Optional[str] = Form(None),
+    route: Optional[str] = Form(None),
+    trigger: Optional[str] = Form(None),
+    recent_actions: Optional[str] = Form(None),
+    occurred_at: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Store one capture of the web page and describe the capture in the background.
+
+    ``recent_actions`` is the browser's short list of what the person did
+    before the capture; the describing model reads the list beside the image.
+    The full-size image is discarded once the thumbnail and the description
+    exist.
+    """
+    from src.anubis.utils.usage_analytics import screenshots as capture_module
+
+    repository = _usage_analytics_repository_or_503()
+    user_id = await _usage_analytics_recording_user(current_user, repository)
+    context = GlobalContext()
+    seconds_to_wait = _usage_capture_throttle().check_and_mark(
+        (session_id or "").strip() or user_id,
+        float(context.usage_analytics_capture_min_interval_seconds or 0),
+    )
+    if seconds_to_wait is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Captures are accepted at most every {context.usage_analytics_capture_min_interval_seconds} seconds per session.",
+            headers={"Retry-After": str(max(1, int(seconds_to_wait + 0.999)))},
+        )
+    image_bytes = await file.read()
+    max_bytes = int(context.usage_analytics_max_image_bytes or 0)
+    if not image_bytes:
+        raise HTTPException(status_code=422, detail="The capture is empty.")
+    if max_bytes and len(image_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"The capture is larger than the {max_bytes} byte ceiling.",
+        )
+    image_mime = (file.content_type or "image/png").split(";")[0].strip() or "image/png"
+    try:
+        thumbnail, thumbnail_mime, width, height = capture_module.make_thumbnail(
+            image_bytes, max_width=int(context.usage_analytics_thumbnail_width or 640)
+        )
+    except Exception as thumbnail_error:  # noqa: BLE001 - an unreadable image is a client error
+        raise HTTPException(
+            status_code=422, detail="The capture is not a readable image."
+        ) from thumbnail_error
+    when = _parse_iso_datetime_or_400(occurred_at, "occurred_at") or datetime.now(UTC)
+    recent = (recent_actions or "").strip()[:6000] or None
+    stored = await repository.create_screenshot(
+        {
+            "user_id": user_id,
+            "session_id": (session_id or "").strip() or None,
+            "assistant_id": (assistant_id or "").strip() or None,
+            "thread_id": (thread_id or "").strip() or None,
+            "route": (route or "").strip()[:400] or None,
+            "trigger": (trigger or "").strip()[:60] or None,
+            "recent_actions": recent,
+            "thumbnail": thumbnail,
+            "thumbnail_mime": thumbnail_mime,
+            "width": width,
+            "height": height,
+            "occurred_at": when,
+            "status": capture_module.STATUS_PENDING,
+        }
+    )
+    asyncio.create_task(
+        capture_module.describe_and_store(
+            repository=repository,
+            store=getattr(app.state, "store", None),
+            screenshot_id=stored["id"],
+            user_id=user_id,
+            image_bytes=image_bytes,
+            image_mime=image_mime,
+            recent_actions=recent,
+            route=stored.get("route"),
+            assistant_id=stored.get("assistant_id"),
+            session_id=stored.get("session_id"),
+            occurred_at=when,
+        )
+    )
+    return JSONResponse(
+        content={"screenshot_id": stored["id"], "status": capture_module.STATUS_PENDING},
+        status_code=202,
+    )
+
+
+def _usage_analytics_subject_user_id(current_user: dict, user_id: Optional[str]) -> str:
+    """Return whose rows a read covers: the caller's, or anyone's for the administrator."""
+    caller_id = current_user["identities"][0]["user_id"]
+    requested = (user_id or "").strip()
+    if not requested or requested == caller_id:
+        return caller_id
+    admin_id = (GlobalContext().admin_user_id or "").strip()
+    if admin_id and caller_id == admin_id:
+        return requested
+    raise HTTPException(
+        status_code=403, detail="Only the administrator may read another account's usage analytics."
+    )
+
+
+@app.get("/usage_analytics/summary")
+async def usage_analytics_summary_route(
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return recent action events and described captures, newest first.
+
+    The administrator may pass ``user_id`` to read another account's rows for
+    product analysis; everyone else reads their own.
+    """
+    from src.anubis.utils.usage_analytics.repository import (
+        consent_view,
+        event_view,
+        screenshot_view,
+    )
+
+    repository = _usage_analytics_repository_or_503()
+    subject = _usage_analytics_subject_user_id(current_user, user_id)
+    since_at = _parse_iso_datetime_or_400(since, "since")
+    until_at = _parse_iso_datetime_or_400(until, "until")
+    bounded_limit = max(1, min(int(limit or 100), 500))
+    bounded_offset = max(0, int(offset or 0))
+    events = await repository.list_events(
+        subject,
+        since=since_at,
+        until=until_at,
+        session_id=(session_id or "").strip() or None,
+        limit=bounded_limit,
+        offset=bounded_offset,
+    )
+    screenshots = await repository.list_screenshots(
+        subject,
+        since=since_at,
+        until=until_at,
+        session_id=(session_id or "").strip() or None,
+        limit=bounded_limit,
+        offset=bounded_offset,
+    )
+    consent = await repository.get_consent(subject)
+    return JSONResponse(
+        content={
+            "user_id": subject,
+            "consent": consent_view(consent, subject),
+            "events": [event_view(row) for row in events],
+            "screenshots": [screenshot_view(row) for row in screenshots],
+            "limit": bounded_limit,
+            "offset": bounded_offset,
+        },
+        status_code=200,
+    )
+
+
+@app.get("/usage_analytics/screenshots/{screenshot_id}/thumbnail")
+async def usage_analytics_thumbnail_route(
+    screenshot_id: str,
+    user_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the JPEG thumbnail kept beside one capture's description."""
+    repository = _usage_analytics_repository_or_503()
+    subject = _usage_analytics_subject_user_id(current_user, user_id)
+    found = await repository.get_thumbnail(subject, screenshot_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="No such capture.")
+    thumbnail, mime = found
+    return Response(content=thumbnail, media_type=mime)
+
+
+@app.delete("/usage_analytics/data")
+async def delete_usage_analytics_data_route(
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete every stored event and capture of this account; consent is left as set."""
+    repository = _usage_analytics_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    removed = await repository.delete_user_data(user_id)
+    store = getattr(app.state, "store", None)
+    if store is not None:
+        try:
+            from src.anubis.utils.usage_analytics.screenshots import usage_analytics_namespace
+
+            items = await store.asearch(usage_analytics_namespace(user_id), limit=1000)
+            for item in items or []:
+                key = getattr(item, "key", None)
+                if key:
+                    await store.adelete(usage_analytics_namespace(user_id), key)
+        except Exception:  # noqa: BLE001 - the tables are the record of truth
+            logger.debug("Usage analytics store rows were not deleted", exc_info=True)
+    return JSONResponse(content={"deleted": removed}, status_code=200)
+
 
 
 if __name__ == "__main__":

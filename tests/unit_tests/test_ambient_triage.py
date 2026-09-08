@@ -197,7 +197,10 @@ def test_the_prompt_carries_precedent_notes_conversation_and_voice_mode():
     )
     assert "<AVATAR>\nAda\n</AVATAR>" in prompt
     assert "never tell me about terminal errors" in prompt
-    assert "error_dialog: the conversation partner chose 'ignore' 3 time(s)" in prompt
+    assert (
+        "error_dialog: the conversation partner asked for fewer notices like this "
+        "('ignore') 3 time(s)"
+    ) in prompt
     assert "can you help with this bug?" in prompt
     assert "- t1 [ignore] person reads" in prompt
     assert "<VOICE_MODE>true</VOICE_MODE>" in prompt

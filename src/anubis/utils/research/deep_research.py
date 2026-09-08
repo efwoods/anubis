@@ -740,13 +740,55 @@ def partition_verified_facts(
     return to_apply, to_review
 
 
+def verified_source_urls(
+    to_apply: list[dict[str, Any]], *, limit: int
+) -> list[str]:
+    """Rank the source URLs behind facts the research verified, best-supported first.
+
+    Only sources that actually corroborated a fact are handed to the media
+    pipeline. A page the search returned and nothing was verified from is not
+    worth transcribing, and transcription is the expensive step — limit
+    is the ceiling on how many sources one research run may send through, so a
+    single run can never start an unbounded batch of transcriptions.
+
+    Sources are ordered by how many verified facts each one supported, so when
+    the cap bites it keeps the sources the research leaned on most.
+    """
+    if limit <= 0:
+        return []
+    support_count: dict[str, int] = {}
+    for entry in to_apply:
+        for url in entry.get("supporting_source_urls") or []:
+            cleaned = str(url or "").strip()
+            if not cleaned:
+                continue
+            support_count[cleaned] = support_count.get(cleaned, 0) + 1
+    ranked = sorted(
+        support_count.items(), key=lambda pair: (-pair[1], pair[0])
+    )
+    return [url for url, _ in ranked[:limit]]
+
+
 # ── writing facts and proposals into the store ──────────────────────────────
 
 
+MEDIA_FACT_SOURCE = "media_verification"
+
+
 def build_identity_document(
-    verified: dict[str, Any], *, creator_id: str, assistant_id: str, subject_name: str
+    verified: dict[str, Any],
+    *,
+    creator_id: str,
+    assistant_id: str,
+    subject_name: str,
+    source: str = RESEARCH_FACT_SOURCE,
 ) -> Document:
-    """One researched fact, shaped like every other fact the avatar has learned."""
+    """One verified fact, shaped like every other fact the avatar has learned.
+
+    ``source`` records where the fact came from — the web, or the media the
+    avatar was taught from — so a later reader can tell a researched claim from
+    one drawn out of the owner's own uploads.
+    """
     from src.anubis.utils.tools.identity.identity_tools import wrap_fact_with_context
 
     document_id = str(uuid.uuid4())
@@ -760,7 +802,7 @@ def build_identity_document(
             "document_id": document_id,
             "fact": verified["proposed_fact"],
             "fact_context": verified.get("fact_context") or "",
-            "source": RESEARCH_FACT_SOURCE,
+            "source": source,
             "source_urls": list(verified.get("supporting_source_urls") or []),
             "verification_status": verified["status"],
             "subject_name": subject_name,
@@ -949,9 +991,25 @@ async def run_deep_research(
             "proposals": len(proposal_ids),
         }
     )
+    # The media behind what the research actually verified. The caller feeds
+    # these through the same pipeline an uploaded link takes, so a video the
+    # research leaned on is transcribed and learned from rather than reduced to
+    # the few sentences the page happened to expose.
+    media_source_urls = verified_source_urls(
+        to_apply,
+        limit=int(getattr(context, "deep_research_max_media_items", 0) or 0),
+    )
+    emit(
+        {
+            "type": "research_progress",
+            "stage": "verified_media",
+            "media_sources": len(media_source_urls),
+        }
+    )
     return {
         "subject_summary": brief.subject_summary,
         "open_questions": brief.open_questions,
+        "media_source_urls": media_source_urls,
         "topics": [topic.topic for topic in brief.topics],
         "queries": queries_run,
         "sources": [

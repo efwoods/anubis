@@ -25,9 +25,7 @@ async def send_email_reply(
     credential decrypted only for the duration of the SMTP session.
     """
     from src.anubis.utils.connected_accounts import get_connected_account
-    from src.anubis.utils.secret_store import decrypt_secret
     from src.anubis.utils.tools.email.imap_client import (
-        MailboxCredentials,
         send_message,
     )
 
@@ -38,17 +36,12 @@ async def send_email_reply(
         raise RuntimeError(f"No connected mailbox {account_key!r} to reply from.")
     if not record.get("send_supported", True):
         raise RuntimeError("This mailbox provider does not support sending.")
-    credentials = MailboxCredentials(
-        account_address=record["account_address"],
-        password=decrypt_secret(record["encrypted_secret"], context),
-        imap_host=record["imap_host"],
-        imap_port=int(record.get("imap_port") or 993),
-        smtp_host=record.get("smtp_host"),
-        smtp_port=int(record.get("smtp_port") or 587),
-        drafts_mailbox=record.get("drafts_mailbox") or "Drafts",
-        timeout_seconds=float(
-            getattr(context, "mailbox_request_timeout_seconds", None) or 30.0
-        ),
+    from src.anubis.utils.connected_accounts.mailbox_credentials import (
+        mailbox_credentials_for,
+    )
+
+    credentials = await mailbox_credentials_for(
+        record, context, store=None, user_id=user_id
     )
     return await asyncio.to_thread(
         send_message,

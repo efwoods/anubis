@@ -73,6 +73,15 @@ class DynamicPromptBuilder:
         system_time: Optional[str] = None,
         user_is_creator: Optional[bool] = False,
         assistant_place: Optional[str] = None,
+        user_engagement: str | None = None,
+        user_feedback_messages: str | None = None,
+        positively_rated_messages: str | None = None,
+        negatively_rated_messages: str | None = None,
+        current_conversation_sentiment: str | None = None,
+        conversation_sentiment_history: str | None = None,
+        what_feels_real: str | None = None,
+        user_preferences: str | None = None,
+        ask_what_feels_real: bool = False,
     ) -> ChatPromptTemplate:
         """
         Build a ChatPromptTemplate with optional components.
@@ -171,6 +180,25 @@ class DynamicPromptBuilder:
         if user_emotions is None:
             # user_emotions_str = "Unaware of the current emotions of the person or people you are addressing."
             user_emotions_str = ""
+        elif isinstance(user_emotions, str):
+            # The immediate Go Emotions reading of the user's latest message
+            # arrives already rendered as prose (see learning/sentiment.py).
+            user_emotions_str = user_emotions
+        else:
+            user_emotions_str = "\n\n".join(
+                [doc.page_content for doc in user_emotions]
+            )
+
+        # Continuous-learning sections: every one is plain prose already
+        # rendered by ``retrieve_learning_sections``; an empty section is empty.
+        if ask_what_feels_real:
+            from src.anubis.utils.prompts.system_prompts import (
+                WHAT_FEELS_REAL_REQUEST_PROMPT,
+            )
+
+            what_feels_real_request_str = WHAT_FEELS_REAL_REQUEST_PROMPT
+        else:
+            what_feels_real_request_str = ""
 
         # Signature key phrases (the avatar's auto-discovered characteristic
         # phrasings). Injected as its own section; empty string when none exist.
@@ -212,8 +240,17 @@ class DynamicPromptBuilder:
             "user_name": user_name,
             "user_identity": user_identity_str,
             "user_emotions": user_emotions_str,
+            "user_engagement": user_engagement or "",
+            "user_feedback_messages": user_feedback_messages or "",
+            "positively_rated_messages": positively_rated_messages or "",
+            "negatively_rated_messages": negatively_rated_messages or "",
+            "current_conversation_sentiment": current_conversation_sentiment or "",
+            "conversation_sentiment_history": conversation_sentiment_history or "",
+            "what_feels_real": what_feels_real or "",
+            "user_preferences": user_preferences or "",
+            "what_feels_real_request": what_feels_real_request_str,
             "system_time": system_time,
-            "learn_information_prompt_str": learn_information_prompt_str
+            "learn_information_prompt_str": learn_information_prompt_str,
         }
 
         populated_template = prompt.invoke(prompt_vars)

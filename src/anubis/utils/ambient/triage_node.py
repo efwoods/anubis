@@ -125,6 +125,10 @@ async def ambient_triage(
             "observation_kind": classification.observation_kind,
             "salience": classification.salience,
             "needs_owner_action": classification.needs_owner_action,
+            # What the avatar offers to do once allowed; the card shows a
+            # button for this and the allowed action comes back as a turn.
+            "proposed_action": classification.proposed_action,
+            "action_description": classification.action_description,
         }
     except Exception:  # noqa: BLE001 - an undecidable observation is ignored
         logger.exception("Ambient triage failed; ignoring the observation")
@@ -135,6 +139,8 @@ async def ambient_triage(
             "observation_kind": "other",
             "salience": 0.0,
             "needs_owner_action": False,
+            "proposed_action": "none",
+            "action_description": "",
         }
 
     updated_ambient = {**ambient, **decision_fields}

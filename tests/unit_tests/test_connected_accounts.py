@@ -18,7 +18,15 @@ expensive rather than merely untidy:
    coexists with the first, and disconnecting names exactly one account.
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
 from types import SimpleNamespace
+
+import asyncio
 
 import pytest
 
@@ -33,6 +41,7 @@ from src.anubis.utils.connected_accounts import (
     social_providers,
 )
 from src.api import webapp as webapp_module
+from src.anubis.utils.connected_accounts.testing_support import use_legacy_gmail
 
 USER_ID = "auth0-user-abc"
 ASSISTANT_ID = "assistant-personal"
@@ -80,6 +89,7 @@ class _StoreAPI:
 
 def _install(monkeypatch, store_api, context=None):
     """Point the endpoints at a fake SDK client and a resolved personal avatar."""
+    use_legacy_gmail(monkeypatch)
     monkeypatch.setattr(
         webapp_module, "get_client", lambda **kwargs: SimpleNamespace(store=store_api)
     )
@@ -424,28 +434,29 @@ def test_a_mailbox_is_never_a_social_account():
 
 
 def test_a_non_mailbox_provider_cannot_be_connected_with_a_password(monkeypatch):
-    """A social provider has no IMAP server; the endpoint must refuse, not crash.
+    """A social provider has no IMAP server; the endpoint must not store anything.
 
-    Social providers are declared coming soon, so the refusal is a 501 carrying
-    the coming-soon message rather than a 400 about the missing mail server;
-    either way nothing may be stored.
+    YouTube signs in through Google's popup, so posting an address and password
+    to the mailbox alias answers "open the login popup" rather than storing a
+    credential or crashing on a missing mail server.
     """
 
     async def _run():
         store_api = _StoreAPI()
         _install(monkeypatch, store_api)
-        with pytest.raises(webapp_module.HTTPException) as raised:
-            await webapp_module.connect_mailbox(
-                request=_body(provider="youtube"), current_user=_current_user()
-            )
-        assert raised.value.status_code in (400, 501)
-        assert "coming soon" in raised.value.detail.lower()
+        response = await webapp_module.connect_mailbox(
+            request=_body(provider="youtube"), current_user=_current_user()
+        )
+        assert response.status_code == 200
+        import json
+
+        body = json.loads(response.body)
+        assert body["connected"] is False
+        assert body["action"] == "open_login_popup"
+        assert body["login_endpoint"] == "/connect_account/oauth/start"
         assert store_api.items == {}
 
-    import asyncio
-
     asyncio.run(_run())
-
 
 def test_account_keys_are_stable_across_capitalisation():
     """A key that varied by capitalisation would duplicate the same mailbox."""

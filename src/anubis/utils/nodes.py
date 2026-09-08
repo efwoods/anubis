@@ -16,6 +16,19 @@ from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 from src.anubis.utils.context import AssistantContext, GlobalContext, UserContext
 from src.anubis.utils.geo import geo_location_of, render_avatar_place_section
+from src.anubis.utils.learning.bulk_learning import mark_thread_pending
+from src.anubis.utils.learning.engagement import record_engagement
+from src.anubis.utils.learning.feedback import (
+    retrieve_learning_sections,
+    should_ask_what_feels_real,
+)
+from src.anubis.utils.learning.sentiment import (
+    classify_user_message_sentiment,
+    message_text,
+    render_conversation_sentiment,
+    render_immediate_sentiment,
+    update_current_conversation_sentiment,
+)
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.store_cache import aget_through_cache
 from src.anubis.utils.utility import (
@@ -291,6 +304,118 @@ async def resolve_human_message_images(
     return update
 
 
+def _flag_enabled(value: object, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().upper() == "TRUE"
+
+
+async def observe_user(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+):
+    """Read the user's latest message and record engagement, sentiment, and pending learning.
+
+    Runs in the outer workflow in parallel with ``resolve_human_message_images``
+    so the observation costs the turn only the slowest of the two branches.
+    Everything here is best effort: a failed classifier or store write must never
+    cost the user the reply, so every signal is gathered with
+    ``return_exceptions=True`` and a failure simply leaves that section empty.
+
+    Writes:
+      - ``current_user_emotions``: the immediate Go Emotions reading, rendered.
+      - ``current_conversation_sentiment``: the refreshed running summary, rendered.
+    Side effects on the store: the engagement record, the running conversation
+    sentiment record, and the pending-sweep marker for the background learning.
+
+    Hidden ambient observations (webcam or screen snapshots the conversation
+    partner never typed) are not the person's own words and are skipped.
+    """
+    messages = state.get("messages") or []
+    if not messages or not isinstance(messages[-1], HumanMessage):
+        return {}
+    if (config or {}).get("configurable", {}).get("skip_observation"):
+        return {}
+    try:
+        from src.anubis.utils.ambient.observations import is_ambient_observation
+
+        if is_ambient_observation(messages[-1]):
+            return {}
+    except Exception:  # noqa: BLE001 - the observation check must never fail a turn
+        pass
+    latest_text = message_text(messages[-1].content).strip()
+    if not latest_text:
+        return {}
+
+    context = _global_context_from_runtime(runtime)
+    user_id = (state.get("user_state") or {}).get("user_id")
+    assistant_id = (state.get("assistant_state") or {}).get("assistant_id")
+    configurable = config.get("configurable", {}) if config else {}
+    thread_id = configurable.get("thread_id")
+    creator_id = (
+        (configurable.get("assistant_ctx") or {}).get("metadata") or {}
+    ).get("user_id")
+    store = getattr(runtime, "store", None)
+
+    async def _no_signal():
+        return None
+
+    engagement_coroutine = None
+    sentiment_summary_coroutine = None
+    pending_coroutine = None
+    if store is not None and user_id and assistant_id:
+        engagement_coroutine = record_engagement(store, user_id, assistant_id, thread_id)
+        if thread_id and _flag_enabled(
+            getattr(context, "conversation_sentiment_per_turn_enabled", "TRUE")
+        ):
+            sentiment_summary_coroutine = update_current_conversation_sentiment(
+                store, user_id, assistant_id, thread_id, list(messages)
+            )
+        if thread_id:
+            pending_coroutine = mark_thread_pending(
+                store,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                creator_id=creator_id,
+            )
+
+    immediate_sentiment, _engagement, conversation_sentiment, _pending = (
+        await asyncio.gather(
+            classify_user_message_sentiment(latest_text),
+            engagement_coroutine or _no_signal(),
+            sentiment_summary_coroutine or _no_signal(),
+            pending_coroutine or _no_signal(),
+            return_exceptions=True,
+        )
+    )
+    for signal_name, signal in (
+        ("immediate sentiment", immediate_sentiment),
+        ("engagement", _engagement),
+        ("conversation sentiment", conversation_sentiment),
+        ("pending marker", _pending),
+    ):
+        if isinstance(signal, Exception):
+            logger.warning("observe_user: %s failed: %s", signal_name, signal)
+
+    update: dict = {}
+    if isinstance(immediate_sentiment, dict):
+        update["current_user_emotions"] = render_immediate_sentiment(immediate_sentiment)
+    if isinstance(conversation_sentiment, dict):
+        update["current_conversation_sentiment"] = render_conversation_sentiment(
+            conversation_sentiment
+        )
+    return update
+
+
+async def join_user_observation(state: GlobalState):
+    """Join point after the parallel image-resolution and user-observation branches.
+
+    Both branches must finish before the turn is routed (ambient triage or the
+    avatar); the node itself changes nothing.
+    """
+    return {}
+
+
 async def _build_consciousness_system_message_update(
     state, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict:
@@ -404,6 +529,15 @@ async def _build_consciousness_system_message_update(
     # cached entry could never be the one the writer invalidates, and could never
     # hold a hit for anyone but the owner.
     style_profile_namespace = (creator_id, assistant_id, "style_profile")
+    # Continuous learning: every learning section is fetched in one batch keyed
+    # on the conversing user, the avatar, and (for the running sentiment) the
+    # conversation thread. ``config`` carries no thread on the estimation path,
+    # in which case the current-conversation section is simply empty.
+    learning_thread_id = config.get("configurable", {}).get("thread_id")
+    learning_context = _global_context_from_runtime(runtime)
+    learning_retrieval_limit = int(
+        getattr(learning_context, "learning_prompt_retrieval_limit", 10) or 10
+    )
 
     """
 
@@ -442,6 +576,7 @@ async def _build_consciousness_system_message_update(
         retrieved_knowledge_items,
         analyzed_trait_items,
         style_profile_ITEM,
+        learning_sections,
     ) = await asyncio.gather(
         # Fallback name searches only run when the context did not provide a name
         (
@@ -489,6 +624,14 @@ async def _build_consciousness_system_message_update(
         # Cached: the style profile only changes on stylometric recalibration;
         # the write and delete sites invalidate the cache entry (see store_cache.py).
         aget_through_cache(runtime.store, style_profile_namespace, "style_profile"),
+        retrieve_learning_sections(
+            runtime.store,
+            user_id,
+            assistant_id,
+            thread_id=learning_thread_id,
+            query=query if isinstance(query, str) else str(query),
+            limit=learning_retrieval_limit,
+        ),
     )
 
     if assistant_name is not None:
@@ -810,6 +953,23 @@ async def _build_consciousness_system_message_update(
         system_time=system_time,
         user_is_creator=user_is_creator,
         assistant_place=assistant_place_section,
+        # Continuous learning sections (see src/anubis/utils/learning/).
+        user_emotions=state.get("current_user_emotions") or "",
+        user_engagement=learning_sections.user_engagement,
+        user_feedback_messages=learning_sections.user_feedback_messages,
+        positively_rated_messages=learning_sections.positively_rated_messages,
+        negatively_rated_messages=learning_sections.negatively_rated_messages,
+        current_conversation_sentiment=(
+            state.get("current_conversation_sentiment")
+            or learning_sections.current_conversation_sentiment
+        ),
+        conversation_sentiment_history=learning_sections.conversation_sentiment_history,
+        what_feels_real=learning_sections.what_feels_real,
+        user_preferences=learning_sections.user_preferences,
+        ask_what_feels_real=should_ask_what_feels_real(
+            learning_sections,
+            int(getattr(learning_context, "ask_what_feels_real_after_messages", 5) or 0),
+        ),
     )
 
     logger.info(f"populated_template: {populated_identity_template}")
@@ -932,6 +1092,7 @@ async def _build_consciousness_system_message_update(
             account
             for account in await bound_accounts_for(runtime.store, user_id, assistant_id)
             if account.get("kind") == "mailbox"
+            and account.get("credential_mechanism") != "browser_session"
         ]
         if bound_mailboxes:
             system_message_str = system_message_str + MAILBOX_CAPABILITY_PROMPT
@@ -957,8 +1118,78 @@ async def _build_consciousness_system_message_update(
                 "password, or authentication token in a reply.\n"
                 "</MAILBOX_STATUS>\n"
             )
-        else:
-            system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+        # The connection offer block is always present for the owner: an
+        # account that is not connected yet is exactly the one the avatar
+        # should offer, and the block also carries the "sign in again" rule.
+        system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+
+        # Every connected account, by kind, plus the accounts whose sign-in
+        # lapsed, so the avatar answers "what can you see?" without a tool
+        # call and re-raises the card for a lapsed one. Labels and addresses
+        # only; never a token, a cookie, or a server address.
+        try:
+            from src.anubis.utils.connected_accounts import get_provider
+            from src.anubis.utils.connected_accounts.store import stale_accounts_for
+
+            bound_all = await bound_accounts_for(runtime.store, user_id, assistant_id)
+            stale_all = await stale_accounts_for(runtime.store, user_id, assistant_id)
+            connected_lines = []
+            for account in bound_all:
+                provider = get_provider(str(account.get("provider") or ""))
+                provider_name = provider.display_name if provider else account.get("provider")
+                detail = account.get("display_label") or account.get("account_address") or ""
+                connected_lines.append(f"{provider_name}: {detail}")
+            stale_lines = []
+            for account in stale_all:
+                provider = get_provider(str(account.get("provider") or ""))
+                provider_name = provider.display_name if provider else account.get("provider")
+                stale_lines.append(
+                    f"{provider_name}: {account.get('display_label') or ''} "
+                    f"(provider name \"{account.get('provider')}\")"
+                )
+            system_message_str += (
+                "\n<CONNECTED_ACCOUNTS>\n"
+                + (
+                    "Connected for this avatar: " + "; ".join(connected_lines) + "."
+                    if connected_lines
+                    else "No accounts are connected for this avatar yet."
+                )
+                + (
+                    " Need to be signed in again: " + "; ".join(stale_lines) + "."
+                    if stale_lines
+                    else ""
+                )
+                + "\n</CONNECTED_ACCOUNTS>\n"
+            )
+            kinds_present = {str(account.get("kind") or "") for account in bound_all}
+            mechanisms_present = {
+                str(account.get("credential_mechanism") or "") for account in bound_all
+            }
+            from src.anubis.utils.prompts.system_prompts import (
+                CONNECTED_SITE_PROMPT,
+                WEBSITE_PROMPT,
+            )
+
+            if "browser_session" in mechanisms_present:
+                system_message_str = system_message_str + CONNECTED_SITE_PROMPT
+            if "website" in kinds_present:
+                system_message_str = system_message_str + WEBSITE_PROMPT
+            try:
+                from src.anubis.utils.analytics.system_prompt_fragments import (
+                    BUSINESS_ANALYTICS_PROMPT,
+                    DEVELOPMENT_ANALYTICS_PROMPT,
+                    FINANCE_PROMPT,
+                )
+
+                system_message_str = system_message_str + BUSINESS_ANALYTICS_PROMPT
+                if "bank" in kinds_present:
+                    system_message_str = system_message_str + FINANCE_PROMPT
+                if "developer" in kinds_present or bool(bound_mcp_connections):
+                    system_message_str = system_message_str + DEVELOPMENT_ANALYTICS_PROMPT
+            except ImportError:
+                pass
+        except Exception:
+            logger.exception("Could not describe connected accounts in the prompt")
 
         # Custom connectors — the owner's own Model Context Protocol servers —
         # gated identically. Their tools are attached with the connector's name

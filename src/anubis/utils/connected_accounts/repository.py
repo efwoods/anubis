@@ -93,6 +93,12 @@ WHERE kind = %s AND status = %s
 ORDER BY connected_at ASC;
 """
 
+_SELECT_ALL_CONNECTED_SQL = f"""
+SELECT record, user_id FROM {CONNECTED_ACCOUNTS_TABLE_NAME}
+WHERE status = 'connected'
+ORDER BY connected_at ASC;
+"""
+
 _SELECT_ONE_SQL = f"""
 SELECT record FROM {CONNECTED_ACCOUNTS_TABLE_NAME}
 WHERE user_id = %s AND connection_key = %s;
@@ -199,6 +205,15 @@ class InMemoryConnectedAccountRepository:
             if record.get("kind") == kind and record.get("status") == status
         ]
 
+    async def list_all_connected(self) -> list[dict[str, Any]]:
+        """Return every user's connected records of every kind (for pollers)."""
+        return [
+            {**record, "user_id": record.get("user_id") or owner}
+            for owner, records in self.records.items()
+            for record in records.values()
+            if record.get("status") == "connected"
+        ]
+
 
 class PostgresConnectedAccountRepository:
     """Repository over the application's psycopg connection pool."""
@@ -281,6 +296,20 @@ class PostgresConnectedAccountRepository:
                 record = dict(row[0])
                 # The owner is a table column, not a record field; the poller
                 # needs it to run the triage as that owner.
+                record.setdefault("user_id", row[1])
+                records.append(record)
+        return records
+
+    async def list_all_connected(self) -> list[dict[str, Any]]:
+        """Return every user's connected records of every kind (for pollers)."""
+        async with self._pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(_SELECT_ALL_CONNECTED_SQL)
+                rows = await cursor.fetchall()
+        records = []
+        for row in rows:
+            if isinstance(row[0], dict):
+                record = dict(row[0])
                 record.setdefault("user_id", row[1])
                 records.append(record)
         return records

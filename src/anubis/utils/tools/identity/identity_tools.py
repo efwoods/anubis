@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 """ READ ME: STORE NAMESPACE STORAGE AND RETRIEVAL CONDITIONS
 
@@ -534,7 +534,21 @@ class AssistantFactAndContext(BaseModel):
 
     """
 
+    # The model writes this argument's name from memory, and the name stutters
+    # ("...from_the_user"). A model that drops the second "the" used to fail
+    # Pydantic validation outright, and the fact the user asked the avatar to
+    # learn was lost with it — the avatar then answered about the rest of the
+    # message as though nothing had been asked. The near-miss spellings are
+    # accepted so a fumbled argument name never costs someone a fact.
+    model_config = ConfigDict(populate_by_name=True)
+
     fact_shared_about_the_assistant_from_the_user: str = Field(
+        validation_alias=AliasChoices(
+            "fact_shared_about_the_assistant_from_the_user",
+            "fact_shared_about_the_assistant_from_user",
+            "fact_shared_about_assistant_from_the_user",
+            "fact_shared_about_the_assistant",
+        ),
         description="One distinct fact about the assistant shared by the user, REWRITTEN IN FIRST PERSON. The user addresses the assistant in the second person; ONLY the tokens that refer to the assistant — 'you / your / yours / yourself / yourselves' and the assistant's given name — become first person ('I / my / mine / me / myself'). EVERY OTHER PERSON stays in the third person: bare third-person pronouns ('he / she / they / him / her / their') and named people ('your dad', 'your mom') refer to someone OTHER than the assistant and are NOT converted to 'I'/'we' — only flip a target-referring possessive attached to them ('your dad' -> 'my dad'). 'they' for other people stays 'they' (use 'we' only when the group includes the assistant). Sanity check: a rewrite that is impossible about yourself (e.g. 'I married my mother') means a third-person subject was wrongly read as you — keep it third person ('He married my mother'). Change ONLY the grammatical person — preserve every specific (names, places, titles, dates, quoted words), the exact meaning, and the tense; add and remove nothing."
     )
     fact_context: str = Field(
@@ -2710,3 +2724,232 @@ async def update_identity_via_reference_image(
         if message.get("image_url", "") != "":
             image_url = message.get("image_url")
     description = image_to_text(target_image_url=image_url)
+
+
+def _research_proposal_preview(index: int, proposal: dict) -> dict:
+    """One researched contradiction, in the shape the correction panel already renders.
+
+    The panel is built around "here is what you hold, here is the suggested
+    replacement, choose one" — which is exactly the shape of a contradiction
+    between a stored fact and what the sources said. Reusing it means the owner
+    resolves researched facts with the control they already know, rather than
+    learning a second review screen.
+
+    ``recommended_action`` is always ``skip``: a contradiction is precisely the
+    case where nobody but the owner can say which version is true, so nothing is
+    pre-selected for them.
+    """
+    sources = [str(url) for url in (proposal.get("supporting_source_urls") or []) if url]
+    statements = [
+        str(statement)
+        for statement in (proposal.get("conflicting_statements") or [])
+        if statement
+    ]
+    excerpt_parts = []
+    if proposal.get("reasoning"):
+        excerpt_parts.append(str(proposal["reasoning"]))
+    if statements:
+        excerpt_parts.append("Sources said: " + " | ".join(statements[:4]))
+    if sources:
+        excerpt_parts.append("Sources: " + ", ".join(sources[:4]))
+    return {
+        "index": index,
+        "kind": "research_proposal",
+        "namespace": [],
+        "key": proposal.get("fact_id"),
+        "document_id": proposal.get("fact_id"),
+        # What the avatar holds today, which the research disputes.
+        "current_fact_content": proposal.get("existing_fact")
+        or "(nothing stored yet on this point)",
+        "current_fact_context": proposal.get("fact_context") or "",
+        "document_excerpt": "\n\n".join(excerpt_parts)[:1000],
+        # The researched version, pre-filled so the owner can accept or edit it.
+        "suggested_edit_fact_content": proposal.get("fact") or "",
+        "suggested_edit_fact_context": proposal.get("fact_context") or "",
+        "default_action": "skip",
+        "recommended_action": "skip",
+        "verification_status": proposal.get("verification_status"),
+        "source_urls": sources,
+    }
+
+
+@tool("review_researched_facts")
+async def review_researched_facts(
+    # Hide this argument from the model.
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+) -> Command:
+    """
+    <INSTRUCTIONS>
+    Bring the researched facts that CONTRADICT what you already believe to the
+    person you are speaking with, so they can decide which version is true.
+
+    Deep research writes everything the sources agreed on straight into your
+    identity. Only a contradiction waits for a person — a source says one thing
+    and you hold another, and no one but your creator can say which is right.
+    Those contradictions also wait in the avatar's settings; this tool is how
+    they get resolved in conversation instead.
+
+    Call this tool when:
+    - your creator asks what the research found, what needs checking, or asks
+      you to review, verify, or confirm researched facts;
+    - your creator asks about a subject and you are holding a researched
+      contradiction about it.
+
+    Do NOT call this tool to learn a new fact (use
+    update_self_identity_mem_from_user_txt), to change a stored fact on your
+    creator's say-so (use edit_identity_fact), or when the person you are
+    speaking with is not your creator — only your creator may resolve these.
+
+    The tool pauses the conversation and shows your creator each contradiction
+    with the researched version, the version you hold, and the sources. After
+    they answer, report plainly what was kept and what was changed.
+    </INSTRUCTIONS>
+    """
+    from src.anubis.utils.research.deep_research import (
+        ProposalResolution,
+        list_proposals,
+        resolve_proposals,
+    )
+
+    tool_call_id = runtime.tool_call_id
+    assistant_id = runtime.config["configurable"]["assistant_id"]
+    assistant_owner_user_id = (
+        runtime.config["configurable"]["assistant_ctx"]["metadata"].get("user_id")
+    )
+    user_id = runtime.config["configurable"]["user_id"]
+
+    # Researched contradictions are the creator's to settle: they are claims
+    # about who the avatar is, and a visitor has no standing to rewrite them.
+    if not assistant_owner_user_id or assistant_owner_user_id != user_id:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            "Only this avatar's creator can resolve researched facts."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    proposals = await list_proposals(runtime.store, assistant_owner_user_id, assistant_id)
+    if not proposals:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            "No researched facts are waiting to be checked; the "
+                            "sources agreed on everything else and it is already "
+                            "learned."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    # The same panel the owner already knows from correcting a fact in chat:
+    # one editable item per contradiction, every one defaulting to "skip" so a
+    # dismissed panel changes nothing.
+    decision = interrupt(
+        {
+            "kind": "research_verification",
+            "inaccurate_information": "",
+            "correction_kind": "research_verification",
+            "default_action": "skip",
+            "actions": ["accept", "remove", "skip"],
+            "action_labels": {
+                "accept": "Use the researched version",
+                "remove": "Discard the researched fact",
+                "skip": "Decide later",
+            },
+            "matches": [
+                _research_proposal_preview(index, proposal)
+                for index, proposal in enumerate(proposals)
+            ],
+        }
+    )
+
+    decision = decision if isinstance(decision, dict) else {}
+    decision_type = (decision.get("type") or "apply").strip().lower()
+    if decision_type in ("cancel", "reject"):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            "Left every researched fact waiting; nothing was changed."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    # Anything the owner did not act on stays pending, exactly as a skipped
+    # correction leaves its document alone.
+    resolutions: list[ProposalResolution] = []
+    for item in decision.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < len(proposals):
+            continue
+        action = str(item.get("action") or "skip").strip().lower()
+        fact_id = proposals[index].get("fact_id")
+        if not fact_id:
+            continue
+        if action == "remove":
+            resolutions.append(ProposalResolution(fact_id=fact_id, action="ignore"))
+        elif action in ("accept", "edit"):
+            corrected = str(item.get("corrected_text") or "").strip()
+            researched = str(proposals[index].get("fact") or "").strip()
+            if corrected and corrected != researched:
+                resolutions.append(
+                    ProposalResolution(
+                        fact_id=fact_id, action="edit", corrected_text=corrected
+                    )
+                )
+            else:
+                resolutions.append(
+                    ProposalResolution(fact_id=fact_id, action="accept")
+                )
+
+    if not resolutions:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            "Left every researched fact waiting; nothing was changed."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    summary = await resolve_proposals(
+        runtime.store, assistant_owner_user_id, assistant_id, resolutions
+    )
+    still_waiting = max(0, len(proposals) - len(resolutions))
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=(
+                        f"Learned {summary.get('accepted', 0) + summary.get('edited', 0)} "
+                        f"researched fact(s), discarded {summary.get('ignored', 0)}, "
+                        f"and left {still_waiting} waiting."
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            ]
+        }
+    )

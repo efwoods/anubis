@@ -36,31 +36,26 @@ Fields that carry design decisions:
     connected. A ``"coming_soon"`` row renders with a disabled action and its
     connect attempt is refused with a plain message rather than a broken form.
 
-Why Gmail is ``"app_password"`` rather than ``"oauth"``
-    Reading a mailbox through the Gmail API requires an OAuth scope Google
-    classifies as *restricted* (``gmail.readonly``, ``gmail.compose``,
-    ``gmail.modify``, ``https://mail.google.com/``). A published application
-    requesting a restricted scope must pass OAuth verification AND an annual
-    CASA security assessment. Routing the flow through Auth0 does not avoid
-    this, because Google's requirement attaches to the OAuth client, not to the
-    broker in front of it. The escapes are an app in Testing publishing status,
-    whose refresh tokens expire after seven days, or Internal status, which
-    requires every user to be inside one Google Workspace organization.
+How an owner signs in (``login_mode``)
+    The owner never types a credential into Neural Nexus. The connect card's
+    button opens the vendor's OWN sign-in page in a popup: Google's consent
+    screen for Gmail, Calendar, Analytics, and YouTube; GitHub's, X's, and
+    Vercel's authorization pages; Plaid Link for a bank; and, for any site
+    with no OAuth at all, a live browser the API hosts, where the owner signs
+    in on the site's real login page and the signed-in session is kept. The
+    ``login_mode`` property derives the popup kind from the mechanism so the
+    card, the routes, and the tools agree.
 
-    IMAP with an app password needs no OAuth client at all, so no verification
-    and no assessment ever apply, and the credential does not expire. That is
-    why this provider is defined the way it is, and it is also why
-    ``langchain_google_community.GmailToolkit`` is not used here: the toolkit
-    builds on a ``googleapiclient`` resource constructed from OAuth credentials
-    and cannot authenticate with an app password. The tool surface exposed to
-    the model in ``mailbox_tools`` deliberately mirrors that toolkit's tools so
-    the backend can be swapped if an OAuth client is ever verified.
-
-    NOTE for anyone maintaining this: since 2025-03-14 Google no longer accepts
-    a regular account password for IMAP/SMTP. Only OAuth 2.0 and app passwords
-    work, and creating an app password requires 2-Step Verification on the
-    account. The connect endpoint verifies by real login precisely so a user who
-    pastes their account password is told this immediately.
+Gmail through Google sign-in (an accepted trade-off)
+    Reading a mailbox needs the restricted scope ``https://mail.google.com/``.
+    Until the OAuth client passes Google verification and the CASA assessment,
+    the consent screen stays in Testing status: only listed test users may sign
+    in and refresh tokens expire after seven days. An expired token is surfaced
+    as a ``needs_reconnect`` status and the card is raised again; nothing
+    silently breaks. App passwords are deliberately NOT offered: the owner asked
+    for the official Google login and nothing else, and since 2025-03-14 Google
+    accepts only OAuth 2.0 or an app password over IMAP anyway. Existing
+    app-password records keep working through ``mailbox_credentials_for``.
 """
 
 from __future__ import annotations
@@ -76,6 +71,12 @@ KIND_DATA_SOURCE = "data_source"
 KIND_CALENDAR = "calendar"
 KIND_MESSAGING = "messaging"
 KIND_MCP_SERVER = "mcp_server"
+KIND_BANK = "bank"
+KIND_DEVELOPER = "developer"
+KIND_WEBSITE = "website"
+KIND_ANALYTICS = "analytics"
+KIND_HOSTING = "hosting"
+KIND_CRYPTO = "crypto"
 ALL_KINDS = frozenset(
     {
         KIND_MAILBOX,
@@ -84,6 +85,12 @@ ALL_KINDS = frozenset(
         KIND_CALENDAR,
         KIND_MESSAGING,
         KIND_MCP_SERVER,
+        KIND_BANK,
+        KIND_DEVELOPER,
+        KIND_WEBSITE,
+        KIND_ANALYTICS,
+        KIND_HOSTING,
+        KIND_CRYPTO,
     }
 )
 
@@ -93,6 +100,9 @@ MECHANISM_AUTH0_IDENTITY = "auth0_identity"
 MECHANISM_OAUTH = "oauth"
 MECHANISM_MCP_URL = "mcp_url"
 MECHANISM_DEVICE_PAIRING = "device_pairing"
+MECHANISM_PLAID_LINK = "plaid_link"
+MECHANISM_BROWSER_SESSION = "browser_session"
+MECHANISM_URL_ONLY = "url_only"
 ALL_MECHANISMS = frozenset(
     {
         MECHANISM_APP_PASSWORD,
@@ -100,12 +110,46 @@ ALL_MECHANISMS = frozenset(
         MECHANISM_OAUTH,
         MECHANISM_MCP_URL,
         MECHANISM_DEVICE_PAIRING,
+        MECHANISM_PLAID_LINK,
+        MECHANISM_BROWSER_SESSION,
+        MECHANISM_URL_ONLY,
     }
 )
 
-# Mechanisms whose connect flow is a form the owner completes. Everything else
-# is either a redirect (not yet implemented) or a daemon-side registration.
-FORM_MECHANISMS = frozenset({MECHANISM_APP_PASSWORD, MECHANISM_MCP_URL})
+# Mechanisms whose connect flow is a form the owner completes on the card.
+# ``url_only`` is a form too (a website address, no credential).
+FORM_MECHANISMS = frozenset(
+    {MECHANISM_APP_PASSWORD, MECHANISM_MCP_URL, MECHANISM_URL_ONLY}
+)
+
+# How the card signs the owner in. Derived from the mechanism so every surface
+# (the in-chat card, the "+" menu, the settings picker) opens the same thing.
+LOGIN_MODE_FORM = "form"
+LOGIN_MODE_OAUTH_POPUP = "oauth_popup"
+LOGIN_MODE_PLAID_LINK = "plaid_link"
+LOGIN_MODE_BROWSER_SESSION = "browser_session"
+LOGIN_MODE_NONE = "none"
+LOGIN_MODES_BY_MECHANISM: dict[str, str] = {
+    MECHANISM_APP_PASSWORD: LOGIN_MODE_FORM,
+    MECHANISM_MCP_URL: LOGIN_MODE_FORM,
+    MECHANISM_URL_ONLY: LOGIN_MODE_FORM,
+    MECHANISM_OAUTH: LOGIN_MODE_OAUTH_POPUP,
+    MECHANISM_PLAID_LINK: LOGIN_MODE_PLAID_LINK,
+    MECHANISM_BROWSER_SESSION: LOGIN_MODE_BROWSER_SESSION,
+    MECHANISM_AUTH0_IDENTITY: LOGIN_MODE_NONE,
+    MECHANISM_DEVICE_PAIRING: LOGIN_MODE_NONE,
+}
+
+# The login endpoints each popup mode starts from. Named once so the card
+# payload and the routes agree.
+OAUTH_LOGIN_ENDPOINT = "/connect_account/oauth/start"
+PLAID_LOGIN_ENDPOINT = "/connect_account/plaid/link_token"
+BROWSER_LOGIN_ENDPOINT = "/connect_account/browser/start"
+LOGIN_ENDPOINTS_BY_MODE: dict[str, str] = {
+    LOGIN_MODE_OAUTH_POPUP: OAUTH_LOGIN_ENDPOINT,
+    LOGIN_MODE_PLAID_LINK: PLAID_LOGIN_ENDPOINT,
+    LOGIN_MODE_BROWSER_SESSION: BROWSER_LOGIN_ENDPOINT,
+}
 
 # Catalog categories, in the order the manage-connections screen groups them.
 CATEGORY_MAIL = "mail"
@@ -114,8 +158,20 @@ CATEGORY_SOCIAL = "social"
 CATEGORY_MESSAGING = "messaging"
 CATEGORY_DEVICE = "device"
 CATEGORY_CUSTOM = "custom"
+CATEGORY_FINANCE = "finance"
+CATEGORY_DEVELOPMENT = "development"
+CATEGORY_VENDOR = "vendor"
+CATEGORY_WEB = "web"
+CATEGORY_ANALYTICS = "analytics"
+CATEGORY_HOSTING = "hosting"
 CATEGORY_ORDER: tuple[str, ...] = (
     CATEGORY_MAIL,
+    CATEGORY_FINANCE,
+    CATEGORY_DEVELOPMENT,
+    CATEGORY_VENDOR,
+    CATEGORY_ANALYTICS,
+    CATEGORY_WEB,
+    CATEGORY_HOSTING,
     CATEGORY_CALENDAR,
     CATEGORY_SOCIAL,
     CATEGORY_MESSAGING,
@@ -241,6 +297,39 @@ class ConnectedAccountProvider:
     connect_fields: tuple[ConnectFieldSpec, ...] = ()
     pairing_instructions: str = ""
     install_url: str | None = None
+    # Suggested questions shown once the account is connected, so the owner
+    # can start using the connection without wording a query from scratch.
+    # Each is {"label": short chip text, "prompt": the message sent to chat}.
+    starter_prompts: tuple[dict[str, str], ...] = ()
+    # Popup sign-in details. ``oauth_config_key`` names a row of
+    # ``oauth_providers.OAUTH_PROVIDERS``; ``oauth_scopes`` narrows that vendor's
+    # scopes to what this provider needs. ``login_url`` is the page a live
+    # browser sign-in opens; ``home_url`` is what the keepalive revisits and
+    # where connected-site tools start; ``recipe_key`` names the vendor recipe
+    # (``recipes.py``) that knows the site's usage pages.
+    oauth_config_key: str | None = None
+    oauth_scopes: tuple[str, ...] = ()
+    login_url: str | None = None
+    home_url: str | None = None
+    recipe_key: str | None = None
+    # A device-bound provider is connected through a machine running the
+    # daemon rather than through a credential of its own.
+    device_bound: bool = False
+
+    @property
+    def login_mode(self) -> str:
+        """How the card signs the owner in (see ``LOGIN_MODES_BY_MECHANISM``)."""
+        return LOGIN_MODES_BY_MECHANISM.get(self.credential_mechanism, LOGIN_MODE_NONE)
+
+    @property
+    def login_endpoint(self) -> str | None:
+        """The route a popup sign-in starts from, or ``None`` for forms/devices."""
+        return LOGIN_ENDPOINTS_BY_MODE.get(self.login_mode)
+
+    @property
+    def uses_popup(self) -> bool:
+        """Whether the card's button opens a sign-in window."""
+        return self.login_mode in LOGIN_ENDPOINTS_BY_MODE
 
     @property
     def is_mailbox(self) -> bool:
@@ -265,7 +354,7 @@ class ConnectedAccountProvider:
 GMAIL_PROVIDER = ConnectedAccountProvider(
     name="gmail",
     kind=KIND_MAILBOX,
-    credential_mechanism=MECHANISM_APP_PASSWORD,
+    credential_mechanism=MECHANISM_OAUTH,
     display_name="Gmail",
     category=CATEGORY_MAIL,
     summary="Search, read, draft, and send email",
@@ -276,30 +365,18 @@ GMAIL_PROVIDER = ConnectedAccountProvider(
     drafts_mailbox="[Gmail]/Drafts",
     sent_mailbox="[Gmail]/Sent Mail",
     send_supported=True,
-    credential_help_url="https://myaccount.google.com/apppasswords",
-    card_description="Search, read, draft, and send email.",
+    credential_help_url="https://myaccount.google.com/permissions",
+    card_description="Search, read, draft, and send email. Sign in with Google.",
     icon_key="gmail",
-    connect_fields=(
-        ConnectFieldSpec(
-            name="email_address",
-            label="Email address",
-            input_type="email",
-            placeholder="you@gmail.com",
-            help_text="The Gmail address of the mailbox to connect.",
-        ),
-        ConnectFieldSpec(
-            name="app_password",
-            label="App password",
-            input_type="password",
-            placeholder="16-character app password",
-            help_text=(
-                "Not your Google account password. Google stopped accepting "
-                "account passwords for mail access on 14 March 2025, so a "
-                "16-character app password is required. Generating one needs "
-                "2-Step Verification switched on for the account."
-            ),
-        ),
+    starter_prompts=(
+        {"label": 'What needs a reply?', "prompt": 'What emails need a reply, and can you draft responses in my voice?'},
+        {"label": 'Summarize my inbox', "prompt": 'Summarize the important emails from the last three days.'},
+        {"label": 'Unsubscribe candidates', "prompt": 'Which newsletters or senders could I unsubscribe from?'},
     ),
+    oauth_config_key="google",
+    oauth_scopes=("openid", "email", "https://mail.google.com/"),
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://mail.google.com/mail/",
+    home_url="https://mail.google.com/mail/",
 )
 
 CUSTOM_MCP_PROVIDER = ConnectedAccountProvider(
@@ -370,128 +447,430 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
     credential_mechanism=MECHANISM_OAUTH,
     display_name="Google Calendar",
     category=CATEGORY_CALENDAR,
-    summary="Check your schedule and book meetings",
-    availability=AVAILABILITY_COMING_SOON,
-    card_description="Read your calendar and schedule meetings on your behalf.",
+    summary="Check your schedule",
+    card_description="Read your calendar so the avatar knows your schedule.",
     icon_key="google_calendar",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://calendar.google.com/",
+    home_url="https://calendar.google.com/",
+    oauth_config_key="google",
+    oauth_scopes=(
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/calendar.readonly",
+    ),
 )
 
-# The social providers named in _SOCIAL_MEDIA_ACCOUNT_CONNECTION.md. Declared,
-# with no connect flow implemented yet, for two reasons: the registry's shape is
-# only proven by holding more than one kind of row, and `social_providers()`
-# needs real members so the verification gate that reads it is written against
-# actual data rather than an empty tuple. They are marked coming soon, so the
-# catalog shows them with a disabled action and the connect endpoint refuses
-# them plainly until the identity-linking flow lands.
+GOOGLE_ANALYTICS_PROVIDER = ConnectedAccountProvider(
+    name="google_analytics",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="Google Analytics",
+    category=CATEGORY_ANALYTICS,
+    summary="Visitors, sessions, and pages for your websites",
+    card_description="Read traffic reports for the websites you own.",
+    icon_key="google_analytics",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://analytics.google.com/",
+    home_url="https://analytics.google.com/",
+    oauth_config_key="google",
+    oauth_scopes=(
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/analytics.readonly",
+    ),
+)
+
 YOUTUBE_PROVIDER = ConnectedAccountProvider(
     name="youtube",
     kind=KIND_SOCIAL,
-    credential_mechanism=MECHANISM_AUTH0_IDENTITY,
+    credential_mechanism=MECHANISM_OAUTH,
     display_name="YouTube",
     category=CATEGORY_SOCIAL,
-    summary="Your channel's videos, descriptions, and comments",
-    availability=AVAILABILITY_COMING_SOON,
-    auth0_connection="google-oauth2",
-    card_description="Read your channel's videos, descriptions, and comments.",
+    summary="Your channel's videos, statistics, and comments",
+    card_description="Read your channel's videos, statistics, and comments.",
     icon_key="youtube",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://studio.youtube.com/",
+    home_url="https://studio.youtube.com/",
+    oauth_config_key="google",
+    oauth_scopes=(
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/youtube.readonly",
+    ),
 )
 
-TWITTER_PROVIDER = ConnectedAccountProvider(
+GITHUB_PROVIDER = ConnectedAccountProvider(
+    name="github",
+    kind=KIND_DEVELOPER,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="GitHub",
+    category=CATEGORY_DEVELOPMENT,
+    summary="Commits, pull requests, and issues",
+    card_description=(
+        "Read your repositories' commits, pull requests, and issues to report on "
+        "development."
+    ),
+    icon_key="github",
+    oauth_config_key="github",
+    login_url="https://github.com/login",
+    home_url="https://github.com/notifications",
+    starter_prompts=(
+        {"label": 'Last sprint', "prompt": 'What happened in my repositories in the last sprint?'},
+        {"label": 'Feature requests', "prompt": 'Are there open feature requests or bugs I should know about?'},
+        {"label": 'Work in progress', "prompt": 'What is currently in progress across my repositories?'},
+    ),
+)
+
+X_PROVIDER = ConnectedAccountProvider(
     name="twitter",
     kind=KIND_SOCIAL,
-    credential_mechanism=MECHANISM_AUTH0_IDENTITY,
+    credential_mechanism=MECHANISM_OAUTH,
     display_name="X",
     category=CATEGORY_SOCIAL,
-    summary="Your posts, timeline, and bookmarks",
-    availability=AVAILABILITY_COMING_SOON,
-    auth0_connection="twitter",
-    card_description="Read your posts, timeline, and bookmarks; post as you.",
+    summary="Your posts and replies",
+    send_supported=True,
+    card_description="Read your posts and post replies as you.",
     icon_key="twitter",
+    oauth_config_key="x",
+    login_url="https://x.com/i/flow/login",
+    home_url="https://x.com/notifications",
 )
 
+VERCEL_PROVIDER = ConnectedAccountProvider(
+    name="vercel",
+    kind=KIND_HOSTING,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="Vercel",
+    category=CATEGORY_HOSTING,
+    summary="Deployments and usage of your projects",
+    card_description="Read your projects' deployments and usage.",
+    icon_key="vercel",
+    oauth_config_key="vercel",
+    login_url="https://vercel.com/login",
+    home_url="https://vercel.com/dashboard",
+)
+
+COINBASE_PROVIDER = ConnectedAccountProvider(
+    name="coinbase",
+    kind=KIND_CRYPTO,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="Coinbase",
+    category=CATEGORY_FINANCE,
+    summary="Your crypto balances and transactions",
+    card_description=(
+        "Ask about your Coinbase balances, holdings, and recent transactions. "
+        "You sign in on Coinbase; the connection is read-only and can never "
+        "move funds."
+    ),
+    icon_key="coinbase",
+    oauth_config_key="coinbase",
+    oauth_scopes=("wallet:user:read", "wallet:accounts:read", "wallet:transactions:read"),
+    login_url="https://www.coinbase.com/signin",
+    home_url="https://www.coinbase.com/dashboard",
+    starter_prompts=(
+        {"label": 'My balances', "prompt": 'What are my Coinbase balances and total holdings value?'},
+        {"label": 'Recent activity', "prompt": 'Show my recent Coinbase transactions.'},
+        {"label": 'Gains and losses', "prompt": 'How have my holdings changed recently?'},
+    ),
+)
+
+PLAID_PROVIDER = ConnectedAccountProvider(
+    name="plaid",
+    kind=KIND_BANK,
+    credential_mechanism=MECHANISM_PLAID_LINK,
+    display_name="Finance",
+    category=CATEGORY_FINANCE,
+    summary="See your finances in chat",
+    card_description=(
+        "Ask about balances, recent spending, subscriptions, and investments "
+        "across linked accounts. Your bank sign-in stays with Plaid — Neural "
+        "Nexus never sees or stores your bank credentials. A financial "
+        "connection is read-only and can never move money."
+    ),
+    icon_key="bank",
+    starter_prompts=(
+        {"label": 'Subscriptions overview', "prompt": 'What subscriptions and recurring charges am I currently paying for?'},
+        {"label": 'Reduce spending', "prompt": 'Where could I reduce spending, subscriptions, or fees this year?'},
+        {"label": 'Spending breakdown', "prompt": 'How is my money split across categories this month? Chart it.'},
+        {"label": 'Recent large charges', "prompt": 'Show my largest transactions in the last 30 days.'},
+    ),
+)
+
+LANGSMITH_PROVIDER = ConnectedAccountProvider(
+    name="langsmith",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="LangSmith",
+    category=CATEGORY_VENDOR,
+    summary="Traces, runs, and usage of your LangSmith organization",
+    card_description="Sign in to LangSmith so the avatar can read usage and cost.",
+    icon_key="langsmith",
+    login_url="https://smith.langchain.com/",
+    home_url="https://smith.langchain.com/",
+    recipe_key="langsmith",
+)
+
+OPENAI_PROVIDER = ConnectedAccountProvider(
+    name="openai",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="OpenAI",
+    category=CATEGORY_VENDOR,
+    summary="Usage and costs of your OpenAI organization",
+    card_description="Sign in to the OpenAI platform so the avatar can read usage.",
+    icon_key="openai",
+    login_url="https://platform.openai.com/login",
+    home_url="https://platform.openai.com/usage",
+    recipe_key="openai",
+)
+
+ANTHROPIC_PROVIDER = ConnectedAccountProvider(
+    name="anthropic",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="Claude (Anthropic)",
+    category=CATEGORY_VENDOR,
+    summary="Usage and costs of your Anthropic console",
+    card_description="Sign in to the Anthropic console so the avatar can read usage.",
+    icon_key="anthropic",
+    login_url="https://console.anthropic.com/login",
+    home_url="https://console.anthropic.com/settings/usage",
+    recipe_key="anthropic",
+)
+
+WEBSITE_PROVIDER = ConnectedAccountProvider(
+    name="website",
+    kind=KIND_WEBSITE,
+    credential_mechanism=MECHANISM_URL_ONLY,
+    display_name="Website",
+    category=CATEGORY_WEB,
+    summary="Crawl, audit, and report on a website",
+    card_description=(
+        "Add a website by address. The avatar crawls the site and reports on "
+        "content, search visibility, links, accessibility, and changes."
+    ),
+    icon_key="website",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            placeholder="My website",
+            help_text="How the avatar refers to this site in conversation.",
+            required=False,
+        ),
+        ConnectFieldSpec(
+            name="site_url",
+            label="Website address",
+            input_type="url",
+            placeholder="https://example.com",
+            help_text="The site's home page. The address is checked before it is saved.",
+        ),
+    ),
+    starter_prompts=(
+        {"label": 'Audit my site', "prompt": 'Audit my website: content, search visibility, links, and accessibility.'},
+        {"label": 'What changed?', "prompt": 'What changed on my website since the last audit?'},
+        {"label": 'Traffic', "prompt": 'How much traffic did my website get this month?'},
+    ),
+)
+
+CUSTOM_SITE_PROVIDER = ConnectedAccountProvider(
+    name="custom_site",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="Custom site",
+    category=CATEGORY_CUSTOM,
+    summary="Sign in to any website and let the avatar use your account",
+    featured=False,
+    card_description=(
+        "Sign in to any website on its own login page. The avatar keeps the "
+        "signed-in session and can read and act on your account there."
+    ),
+    icon_key="url",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            placeholder="My dashboard",
+            help_text="How the avatar refers to this site in conversation.",
+        ),
+        ConnectFieldSpec(
+            name="site_url",
+            label="Sign-in page address",
+            input_type="url",
+            placeholder="https://example.com/login",
+            help_text="The page where you sign in. Opens in a window for you to sign in on.",
+        ),
+    ),
+)
+
+CLAUDE_CODE_PROVIDER = ConnectedAccountProvider(
+    name="claude_code",
+    kind=KIND_DEVELOPER,
+    credential_mechanism=MECHANISM_DEVICE_PAIRING,
+    display_name="Claude Code",
+    category=CATEGORY_DEVELOPMENT,
+    summary="Coding sessions and repositories on your machines",
+    card_description=(
+        "Read the Claude Code sessions and git repositories on a machine running "
+        "Neural Nexus, to report on what was built and how long it took."
+    ),
+    icon_key="claude_code",
+    pairing_instructions=(
+        "Claude Code sessions and repositories are read through a machine running "
+        "the Neural Nexus daemon. Install the daemon on the machine where you code, "
+        "and it appears here on its own."
+    ),
+    install_url=DAEMON_INSTALL_URL,
+    device_bound=True,
+)
+
+# Social and messaging accounts without an official app yet: the owner signs in
+# on the site's own page in the live browser, and the avatar reads through the
+# signed-in session. When a developer app is created, the row switches to OAuth.
 INSTAGRAM_PROVIDER = ConnectedAccountProvider(
     name="instagram",
     kind=KIND_SOCIAL,
-    credential_mechanism=MECHANISM_AUTH0_IDENTITY,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
     display_name="Instagram",
     category=CATEGORY_SOCIAL,
     summary="Your posts, captions, and comments",
-    availability=AVAILABILITY_COMING_SOON,
-    auth0_connection="instagram",
-    card_description="Read your posts, captions, and comments.",
+    card_description="Sign in to Instagram so the avatar can read your posts.",
     icon_key="instagram",
+    login_url="https://www.instagram.com/accounts/login/",
+    home_url="https://www.instagram.com/",
+    recipe_key="instagram",
 )
 
 TWITCH_PROVIDER = ConnectedAccountProvider(
     name="twitch",
     kind=KIND_SOCIAL,
-    credential_mechanism=MECHANISM_AUTH0_IDENTITY,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
     display_name="Twitch",
     category=CATEGORY_SOCIAL,
     summary="Your channel, streams, and chat history",
-    availability=AVAILABILITY_COMING_SOON,
-    auth0_connection="twitch",
-    card_description="Read your channel, streams, and chat history.",
+    card_description="Sign in to Twitch so the avatar can read your channel.",
     icon_key="twitch",
+    login_url="https://www.twitch.tv/login",
+    home_url="https://www.twitch.tv/",
+    recipe_key="twitch",
 )
 
 FACEBOOK_PROVIDER = ConnectedAccountProvider(
     name="facebook",
     kind=KIND_SOCIAL,
-    credential_mechanism=MECHANISM_AUTH0_IDENTITY,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
     display_name="Facebook",
     category=CATEGORY_SOCIAL,
     summary="Your posts and pages",
-    availability=AVAILABILITY_COMING_SOON,
-    auth0_connection="facebook",
-    card_description="Read your posts and pages.",
+    card_description="Sign in to Facebook so the avatar can read your posts and pages.",
     icon_key="facebook",
+    login_url="https://www.facebook.com/login/",
+    home_url="https://www.facebook.com/",
+    recipe_key="facebook",
 )
 
 LINKEDIN_PROVIDER = ConnectedAccountProvider(
     name="linkedin",
     kind=KIND_SOCIAL,
-    credential_mechanism=MECHANISM_AUTH0_IDENTITY,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
     display_name="LinkedIn",
     category=CATEGORY_SOCIAL,
     summary="Your profile, posts, and messages",
-    availability=AVAILABILITY_COMING_SOON,
-    auth0_connection="linkedin",
-    card_description="Read your profile, posts, and messages.",
+    card_description="Sign in to LinkedIn so the avatar can read your profile and posts.",
     icon_key="linkedin",
+    login_url="https://www.linkedin.com/login",
+    home_url="https://www.linkedin.com/feed/",
+    recipe_key="linkedin",
 )
 
 DISCORD_PROVIDER = ConnectedAccountProvider(
     name="discord",
     kind=KIND_MESSAGING,
-    credential_mechanism=MECHANISM_OAUTH,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
     display_name="Discord",
     category=CATEGORY_MESSAGING,
     summary="Your servers and direct messages",
-    availability=AVAILABILITY_COMING_SOON,
-    card_description="Read and reply in your servers and direct messages.",
+    card_description="Sign in to Discord so the avatar can read your servers.",
     icon_key="discord",
+    login_url="https://discord.com/login",
+    home_url="https://discord.com/channels/@me",
+    recipe_key="discord",
 )
 
 SLACK_PROVIDER = ConnectedAccountProvider(
     name="slack",
     kind=KIND_MESSAGING,
-    credential_mechanism=MECHANISM_OAUTH,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
     display_name="Slack",
     category=CATEGORY_MESSAGING,
     summary="Your workspaces and channels",
-    availability=AVAILABILITY_COMING_SOON,
-    card_description="Read and reply in your workspaces and channels.",
+    card_description="Sign in to Slack so the avatar can read your workspaces.",
     icon_key="slack",
+    login_url="https://slack.com/signin",
+    home_url="https://app.slack.com/",
+    recipe_key="slack",
+)
+
+# The row keeps the historical name "twitter" (icons, welcome page, stored
+# records) while presenting as X; ``get_provider`` accepts "x" as an alias.
+TWITTER_PROVIDER = X_PROVIDER
+
+# The pre-OAuth Gmail row, kept UNREGISTERED: records connected with an app
+# password before Google sign-in landed still carry ``credential_mechanism
+# "app_password"`` and keep working through ``mailbox_credentials_for``; tests of
+# the app-password path register this row under the gmail name. No catalog
+# surface offers an app password to an owner.
+GMAIL_APP_PASSWORD_PROVIDER = ConnectedAccountProvider(
+    name="gmail",
+    kind=KIND_MAILBOX,
+    credential_mechanism=MECHANISM_APP_PASSWORD,
+    display_name="Gmail",
+    category=CATEGORY_MAIL,
+    summary="Search, read, draft, and send email",
+    imap_host="imap.gmail.com",
+    imap_port=993,
+    smtp_host="smtp.gmail.com",
+    smtp_port=587,
+    drafts_mailbox="[Gmail]/Drafts",
+    sent_mailbox="[Gmail]/Sent Mail",
+    send_supported=True,
+    credential_help_url="https://myaccount.google.com/apppasswords",
+    card_description="Search, read, draft, and send email.",
+    icon_key="gmail",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="email_address",
+            label="Email address",
+            input_type="email",
+            placeholder="you@gmail.com",
+            help_text="The Gmail address of the mailbox to connect.",
+        ),
+        ConnectFieldSpec(
+            name="app_password",
+            label="App password",
+            input_type="password",
+            placeholder="16-character app password",
+            help_text="A 16-character Google app password (legacy path).",
+        ),
+    ),
 )
 
 PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     provider.name: provider
     for provider in (
         GMAIL_PROVIDER,
+        PLAID_PROVIDER,
+        COINBASE_PROVIDER,
+        GITHUB_PROVIDER,
+        CLAUDE_CODE_PROVIDER,
+        LANGSMITH_PROVIDER,
+        OPENAI_PROVIDER,
+        ANTHROPIC_PROVIDER,
+        GOOGLE_ANALYTICS_PROVIDER,
+        WEBSITE_PROVIDER,
+        VERCEL_PROVIDER,
         GOOGLE_CALENDAR_PROVIDER,
         YOUTUBE_PROVIDER,
-        TWITTER_PROVIDER,
+        X_PROVIDER,
         INSTAGRAM_PROVIDER,
         TWITCH_PROVIDER,
         FACEBOOK_PROVIDER,
@@ -500,7 +879,22 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
         SLACK_PROVIDER,
         DESKTOP_MCP_PROVIDER,
         CUSTOM_MCP_PROVIDER,
+        CUSTOM_SITE_PROVIDER,
     )
+}
+
+
+# Names a person (or the model) may use for a provider that is registered
+# under another name.
+PROVIDER_NAME_ALIASES: dict[str, str] = {
+    "x": "twitter",
+    "x.com": "twitter",
+    "bank": "plaid",
+    "finance": "plaid",
+    "bank_account": "plaid",
+    "claude": "anthropic",
+    "chatgpt": "openai",
+    "google_mail": "gmail",
 }
 
 
@@ -510,7 +904,8 @@ def get_provider(name: str) -> ConnectedAccountProvider | None:
     The name reaches this function from an endpoint argument or from the model
     echoing back something a human typed, so "Gmail" and "gmail" both resolve.
     """
-    return PROVIDER_REGISTRY.get(str(name or "").strip().lower())
+    key = str(name or "").strip().lower()
+    return PROVIDER_REGISTRY.get(PROVIDER_NAME_ALIASES.get(key, key))
 
 
 def catalog_providers() -> tuple[ConnectedAccountProvider, ...]:
@@ -592,7 +987,11 @@ def validate_registry() -> None:
             raise ValueError(
                 f"Mailbox provider {provider.name!r} must declare an imap_host."
             )
-        if provider.send_supported and not provider.smtp_host:
+        if (
+            provider.kind == KIND_MAILBOX
+            and provider.send_supported
+            and not provider.smtp_host
+        ):
             raise ValueError(
                 f"Provider {provider.name!r} supports sending but declares no "
                 "smtp_host."
@@ -619,6 +1018,30 @@ def validate_registry() -> None:
             raise ValueError(
                 f"Provider {provider.name!r} is connected by pairing a device and "
                 "must declare pairing_instructions."
+            )
+        if provider.credential_mechanism == MECHANISM_OAUTH:
+            from src.anubis.utils.connected_accounts.oauth_providers import (
+                get_oauth_provider,
+            )
+
+            if get_oauth_provider(provider.oauth_config_key or "") is None:
+                raise ValueError(
+                    f"Provider {provider.name!r} signs in with OAuth and must name "
+                    "a known oauth_config_key."
+                )
+        if provider.credential_mechanism == MECHANISM_BROWSER_SESSION and not (
+            provider.login_url or provider.connect_fields
+        ):
+            raise ValueError(
+                f"Provider {provider.name!r} signs in through a live browser and "
+                "must declare a login_url or a site_url field."
+            )
+        if provider.credential_mechanism == MECHANISM_URL_ONLY and not any(
+            field_spec.name == "site_url" for field_spec in provider.connect_fields
+        ):
+            raise ValueError(
+                f"Provider {provider.name!r} is a website and must declare a "
+                "'site_url' field."
             )
 
 

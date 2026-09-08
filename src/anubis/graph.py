@@ -82,7 +82,12 @@ from src.anubis.utils.huggingface_prefetch import (
 )
 from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
 from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
-from src.anubis.utils.nodes import load_consciousness, resolve_human_message_images
+from src.anubis.utils.nodes import (
+    join_user_observation,
+    load_consciousness,
+    observe_user,
+    resolve_human_message_images,
+)
 from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
 from src.anubis.utils.state import GlobalState
@@ -798,6 +803,9 @@ def _deep_agent_config(
         deep_agent_configurable["thread_id"] = str(
             uuid.uuid5(uuid.NAMESPACE_OID, f"{outer_thread}::deepagent::{turn_key}")
         )
+        # The conversation's own thread id, kept for the tool-call log so
+        # feature usage is counted per conversation, not per deep-agent turn.
+        deep_agent_configurable["outer_thread_id"] = str(outer_thread)
     deep_agent_config: RunnableConfig = {"configurable": deep_agent_configurable}
     return deep_agent_config, outer_thread
 
@@ -810,6 +818,32 @@ def _deep_agent_config(
 # table fall back to a generic phrase built from the name. ``{device}`` is
 # replaced by the ``device_label`` argument when the tool call names a machine.
 _TOOL_ACTIVITY_DESCRIPTIONS: dict[str, str] = {
+    "list_git_repositories": "Finding repositories on {device}",
+    "git_log": "Reading commit history on {device}",
+    "git_diff_stat": "Measuring the change on {device}",
+    "git_status": "Checking uncommitted work on {device}",
+    "list_claude_code_sessions": "Listing coding sessions on {device}",
+    "read_claude_code_session": "Reading a coding session on {device}",
+    "connect_account": "Offering an account connection",
+    "open_connected_site": "Opening a connected site",
+    "read_connected_page": "Reading a page of a connected site",
+    "fetch_connected_json": "Reading figures from a connected site",
+    "run_provider_recipe": "Reading vendor usage through the signed-in session",
+    "crawl_website": "Reading the website's pages",
+    "website_audit": "Auditing the website",
+    "website_traffic": "Reading website traffic",
+    "finance_transactions": "Reading bank transactions",
+    "finance_spend_summary": "Summarising spending",
+    "query_platform_metrics": "Querying platform usage",
+    "query_finances": "Querying finances",
+    "query_vendor_usage": "Querying vendor usage",
+    "make_chart": "Drawing a chart",
+    "save_report": "Saving the report",
+    "schedule_report": "Scheduling the report",
+    "forecast_metric": "Forecasting",
+    "github_activity": "Reading GitHub activity",
+    "github_issues": "Reading GitHub issues",
+    "github_pull_requests": "Reading pull requests",
     "check_data_server_connection": "Checking which machines are reachable",
     "discover_data_files": "Listing files on {device}",
     "preview_data_file": "Previewing a data file on {device}",
@@ -837,6 +871,46 @@ _TOOL_ACTIVITY_DESCRIPTIONS: dict[str, str] = {
     "read_files_for_sandbox": "Copying files from the machine into the workspace",
 }
 _DEFAULT_DEVICE_PHRASE = "the connected machines"
+def _record_tool_call_event(
+    event: dict[str, Any], config: dict[str, Any], *, status: str, duration_ms: float
+) -> None:
+    """Log one tool call to the ``tool_calls`` table (fire-and-forget)."""
+    try:
+        from src.anubis.utils.analytics.tool_calls import record_tool_call
+    except ImportError:
+        return
+    configurable = (config or {}).get("configurable", {}) or {}
+    try:
+        record_tool_call(
+            user_id=configurable.get("user_id"),
+            assistant_id=configurable.get("assistant_id"),
+            thread_id=configurable.get("outer_thread_id") or configurable.get("thread_id"),
+            tool_name=str(event.get("name") or ""),
+            status=status,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        logger.debug("Could not record a tool call", exc_info=True)
+
+
+class _ToolCallTimerFallback:
+    """Timer used when the analytics package is absent."""
+
+    def start(self, run_id: Any) -> None:
+        """Ignore the start of a run."""
+
+    def finish(self, run_id: Any) -> float:
+        """Report no duration."""
+        return 0.0
+
+
+try:
+    from src.anubis.utils.analytics.tool_calls import ToolCallTimer as _ToolCallTimer
+
+    _tool_call_timer: Any = _ToolCallTimer()
+except ImportError:
+    _tool_call_timer = _ToolCallTimerFallback()
+
 _TOOL_FINISHED_ACTIVITY = "Thinking about the results"
 
 
@@ -911,6 +985,7 @@ async def _stream_deep_agent(
             if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
                 continue
             tool_name = event.get("name") or ""
+            _tool_call_timer.start(event.get("run_id"))
             writer(
                 {
                     "type": "status",
@@ -923,12 +998,21 @@ async def _stream_deep_agent(
         elif ev_name == "on_tool_end":
             if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
                 continue
+            _record_tool_call_event(
+                event, deep_agent_config, status="success",
+                duration_ms=_tool_call_timer.finish(event.get("run_id")),
+            )
             writer(
                 {
                     "type": "status",
                     "text": _TOOL_FINISHED_ACTIVITY,
                     "tool": event.get("name") or "",
                 }
+            )
+        elif ev_name == "on_tool_error":
+            _record_tool_call_event(
+                event, deep_agent_config, status="error",
+                duration_ms=_tool_call_timer.finish(event.get("run_id")),
             )
         elif ev_name == "on_chain_end":
             data = event.get("data") or {}
@@ -1039,11 +1123,18 @@ async def think(
             state["assistant_state"]["assistant_id"],
             store=runtime.store,
         )
+        from src.anubis.utils.tools.data_analysis.development_tools import (
+            build_development_tools,
+        )
+
         analysis_extra_tools = [
             *(analysis_extra_tools or []),
             *build_data_analysis_tools(
                 deep_agent_run_context, analysis_bundle, live_connections
             ),
+            # Git history and Claude Code sessions on the owner's machines, for
+            # "what happened since", "what is in progress", "how long did it take".
+            *build_development_tools(deep_agent_run_context, live_connections),
         ]
 
     # Browser capability gate: the process-wide environment switch
@@ -1079,6 +1170,9 @@ async def think(
             build_tools_for_accounts,
         )
 
+        from src.anubis.utils.connected_accounts.store import stale_accounts_for
+        from src.anubis.utils.runtime_handles import get_postgres_pool
+
         owner_user_id = state["user_state"]["user_id"]
         answering_assistant_id = state["assistant_state"]["assistant_id"]
         connected_accounts = await bound_accounts_for(
@@ -1086,7 +1180,66 @@ async def think(
             owner_user_id,
             answering_assistant_id,
         )
-        mailbox_tools = await build_tools_for_accounts(runtime.context, connected_accounts)
+        stale_accounts = await stale_accounts_for(
+            runtime.store, owner_user_id, answering_assistant_id
+        )
+        # A scheduled (unattended) run must never pause on a sign-in card.
+        scheduled_run = bool(
+            (config.get("configurable", {}) or {}).get("scheduled", False)
+        )
+        mailbox_tools = await build_tools_for_accounts(
+            runtime.context,
+            connected_accounts,
+            store=runtime.store,
+            pool=get_postgres_pool(),
+            bundle=analysis_bundle,
+        )
+        # Business analytics: charts, reports, schedules, and — for the
+        # platform administrator — platform metrics. Personal avatar only;
+        # the pool is published by the lifespan.
+        try:
+            from src.anubis.utils.analytics.analytics_tools import (
+                build_analytics_tools,
+            )
+
+            mailbox_tools = [
+                *mailbox_tools,
+                *build_analytics_tools(
+                    runtime.context,
+                    store=runtime.store,
+                    pool=get_postgres_pool(),
+                    user_id=owner_user_id,
+                    assistant_id=answering_assistant_id,
+                    connected_accounts=connected_accounts,
+                    analysis_bundle=analysis_bundle,
+                    thread_id=outer_thread,
+                    timezone_name=(config.get("configurable", {}) or {}).get(
+                        "user_timezone"
+                    ),
+                ),
+            ]
+        except ImportError:
+            logger.debug("Analytics tools are not installed; skipping")
+        except Exception:
+            logger.exception("Could not build analytics tools; skipping")
+        try:
+            from src.anubis.utils.analytics.development_report import (
+                build_development_report_tools,
+            )
+
+            mailbox_tools = [
+                *mailbox_tools,
+                *build_development_report_tools(
+                    deep_agent_run_context,
+                    live_connections=live_connections,
+                    connected_accounts=connected_accounts,
+                    store=runtime.store,
+                ),
+            ]
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("Could not build the development report tool; skipping")
         # The agent inbox is the personal avatar's: report and resolve pending
         # items in conversation, or trigger a poll now.
         from src.anubis.utils.inbox.inbox_tools import build_inbox_tools
@@ -1110,6 +1263,8 @@ async def think(
             user_id=owner_user_id,
             assistant_id=answering_assistant_id,
             connected_accounts=connected_accounts,
+            stale_accounts=stale_accounts,
+            allow_interrupt=not scheduled_run,
         )
 
     # Learning from media in conversation: the creator of THIS avatar, never a
@@ -1145,6 +1300,14 @@ async def think(
         extra_tools=extra_tools or None,
         backend=analysis_bundle.backend if analysis_bundle is not None else None,
     )
+    # Charts made with ``make_chart`` during this turn are collected on a
+    # context variable and attached to the reply after the run.
+    try:
+        from src.anubis.utils.analytics.charts import TurnChartCollector
+
+        TurnChartCollector.begin_turn()
+    except ImportError:
+        pass
     try:
         return await _run_avatar_deep_agent_turn(
             state,
@@ -1304,6 +1467,11 @@ async def _run_avatar_deep_agent_turn(
         "user_state": state["user_state"],
         "assistant_state": state["assistant_state"],
         "internal_thoughts": [],
+        # Continuous learning: the immediate emotion reading and the running
+        # sentiment summary of this turn, so a consciousness rebuild inside
+        # the agent (after an identity or learning tool ran) keeps both sections.
+        "current_user_emotions": state.get("current_user_emotions") or "",
+        "current_conversation_sentiment": state.get("current_conversation_sentiment") or "",
         # The conversation's summarization event from earlier turns, so the
         # summarizer reuses the compaction instead of summarizing again.
         CONVERSATION_SUMMARY_EVENT_KEY: state.get(CONVERSATION_SUMMARY_EVENT_KEY),
@@ -1427,6 +1595,38 @@ async def _run_avatar_deep_agent_turn(
         except Exception:
             # Never lose an already-streamed reply over a display concern.
             logger.exception("Could not collect this turn's analysis artifacts.")
+
+    # Connect cards ride the same channel: every ``connect_account`` result this
+    # turn produced (or the card a "+"-menu acknowledgement turn carried) is
+    # kept on the reply so the transcript shows "Gmail · Added · 6 tools" after
+    # a reload instead of nothing.
+    try:
+        from src.anubis.utils.connected_accounts.connection_cards import (
+            connection_acknowledgement_card,
+            connection_records_from_messages,
+        )
+
+        connection_cards = connection_records_from_messages(
+            new_messages
+        ) or connection_acknowledgement_card(state.get("messages") or [])
+        if connection_cards:
+            final_message.response_metadata = dict(final_message.response_metadata or {})
+            final_message.response_metadata["connections"] = connection_cards
+    except Exception:
+        logger.exception("Could not attach this turn's connection cards.")
+
+    # Charts made with ``make_chart`` this turn, as specs the client renders.
+    try:
+        from src.anubis.utils.analytics.charts import TurnChartCollector
+
+        turn_charts = TurnChartCollector.collect()
+        if turn_charts:
+            final_message.response_metadata = dict(final_message.response_metadata or {})
+            final_message.response_metadata["charts"] = turn_charts
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("Could not attach this turn's charts.")
 
     update: dict[str, Any] = {
         "messages": [final_message],
@@ -1612,17 +1812,27 @@ message_workflow = StateGraph(
 # workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
 message_workflow.add_node("resolve_human_message_images", resolve_human_message_images)
+# Continuous learning: the user's latest message is observed (immediate
+# sentiment, running conversation sentiment, engagement counters, pending
+# learning marker) in parallel with image resolution, so the observation costs
+# the turn only the slower of the two branches; the join waits for both.
+message_workflow.add_node("observe_user", observe_user)
+message_workflow.add_node("join_user_observation", join_user_observation)
 message_workflow.add_node("anubis", anubis)
 message_workflow.add_node(AMBIENT_TRIAGE_NODE, ambient_triage)
 
 message_workflow.add_edge(START, "chat")
 message_workflow.add_edge("chat", "resolve_human_message_images")
+message_workflow.add_edge("chat", "observe_user")
+message_workflow.add_edge(
+    ["resolve_human_message_images", "observe_user"], "join_user_observation"
+)
 # An ambient observation (a hidden webcam/screen turn sent through /message
 # with ambient=true) is triaged before the avatar runs: ``ignore`` ends the run
 # with the observation persisted as context, ``respond`` / ``notify`` reach the
 # avatar. Every other turn goes straight to the avatar as before.
 message_workflow.add_conditional_edges(
-    "resolve_human_message_images",
+    "join_user_observation",
     route_after_image_resolution,
     {AMBIENT_TRIAGE_NODE: AMBIENT_TRIAGE_NODE, "anubis": "anubis"},
 )

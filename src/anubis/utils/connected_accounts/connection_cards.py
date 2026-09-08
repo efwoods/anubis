@@ -55,6 +55,7 @@ def connection_card_record(
         "connected_at": view.get("connected_at"),
         "tool_count": len(names),
         "tool_names": names,
+        "starter_prompts": [dict(entry) for entry in getattr(provider, "starter_prompts", ())],
         "error": error,
     }
 

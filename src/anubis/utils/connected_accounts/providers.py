@@ -297,6 +297,10 @@ class ConnectedAccountProvider:
     connect_fields: tuple[ConnectFieldSpec, ...] = ()
     pairing_instructions: str = ""
     install_url: str | None = None
+    # Suggested questions shown once the account is connected, so the owner
+    # can start using the connection without wording a query from scratch.
+    # Each is {"label": short chip text, "prompt": the message sent to chat}.
+    starter_prompts: tuple[dict[str, str], ...] = ()
     # Popup sign-in details. ``oauth_config_key`` names a row of
     # ``oauth_providers.OAUTH_PROVIDERS``; ``oauth_scopes`` narrows that vendor's
     # scopes to what this provider needs. ``login_url`` is the page a live
@@ -364,6 +368,11 @@ GMAIL_PROVIDER = ConnectedAccountProvider(
     credential_help_url="https://myaccount.google.com/permissions",
     card_description="Search, read, draft, and send email. Sign in with Google.",
     icon_key="gmail",
+    starter_prompts=(
+        {"label": 'What needs a reply?', "prompt": 'What emails need a reply, and can you draft responses in my voice?'},
+        {"label": 'Summarize my inbox', "prompt": 'Summarize the important emails from the last three days.'},
+        {"label": 'Unsubscribe candidates', "prompt": 'Which newsletters or senders could I unsubscribe from?'},
+    ),
     oauth_config_key="google",
     oauth_scopes=("openid", "email", "https://mail.google.com/"),
     login_url="https://accounts.google.com/ServiceLogin?continue=https://mail.google.com/mail/",
@@ -504,6 +513,11 @@ GITHUB_PROVIDER = ConnectedAccountProvider(
     oauth_config_key="github",
     login_url="https://github.com/login",
     home_url="https://github.com/notifications",
+    starter_prompts=(
+        {"label": 'Last sprint', "prompt": 'What happened in my repositories in the last sprint?'},
+        {"label": 'Feature requests', "prompt": 'Are there open feature requests or bugs I should know about?'},
+        {"label": 'Work in progress', "prompt": 'What is currently in progress across my repositories?'},
+    ),
 )
 
 X_PROVIDER = ConnectedAccountProvider(
@@ -552,6 +566,11 @@ COINBASE_PROVIDER = ConnectedAccountProvider(
     oauth_scopes=("wallet:user:read", "wallet:accounts:read", "wallet:transactions:read"),
     login_url="https://www.coinbase.com/signin",
     home_url="https://www.coinbase.com/dashboard",
+    starter_prompts=(
+        {"label": 'My balances', "prompt": 'What are my Coinbase balances and total holdings value?'},
+        {"label": 'Recent activity', "prompt": 'Show my recent Coinbase transactions.'},
+        {"label": 'Gains and losses', "prompt": 'How have my holdings changed recently?'},
+    ),
 )
 
 PLAID_PROVIDER = ConnectedAccountProvider(
@@ -568,6 +587,12 @@ PLAID_PROVIDER = ConnectedAccountProvider(
         "connection is read-only and can never move money."
     ),
     icon_key="bank",
+    starter_prompts=(
+        {"label": 'Subscriptions overview', "prompt": 'What subscriptions and recurring charges am I currently paying for?'},
+        {"label": 'Reduce spending', "prompt": 'Where could I reduce spending, subscriptions, or fees this year?'},
+        {"label": 'Spending breakdown', "prompt": 'How is my money split across categories this month? Chart it.'},
+        {"label": 'Recent large charges', "prompt": 'Show my largest transactions in the last 30 days.'},
+    ),
 )
 
 LANGSMITH_PROVIDER = ConnectedAccountProvider(
@@ -639,6 +664,11 @@ WEBSITE_PROVIDER = ConnectedAccountProvider(
             placeholder="https://example.com",
             help_text="The site's home page. The address is checked before it is saved.",
         ),
+    ),
+    starter_prompts=(
+        {"label": 'Audit my site', "prompt": 'Audit my website: content, search visibility, links, and accessibility.'},
+        {"label": 'What changed?', "prompt": 'What changed on my website since the last audit?'},
+        {"label": 'Traffic', "prompt": 'How much traffic did my website get this month?'},
     ),
 )
 

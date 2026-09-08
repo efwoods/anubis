@@ -65,6 +65,14 @@ CONNECT_MAILBOX_ENDPOINT = "/connect_mailbox"
 
 LOGIN_RESULT_MESSAGE_TYPE = "neural-nexus:login-result"
 
+# Shown on every connect card. External connectors reach services Neural Nexus
+# does not run; the owner grants the access and should read what is requested.
+THIRD_PARTY_NOTICE = (
+    "This connector reaches a third-party service that Neural Nexus does not run "
+    "or maintain. Review the permissions before connecting, and use caution when "
+    "granting access to external accounts."
+)
+
 
 def _describe_fields(provider: Any) -> list[dict[str, Any]]:
     """Render a provider's connect fields as plain data for the client."""
@@ -174,6 +182,8 @@ def build_connect_card(
         "already_connected": _connected_views(
             list(connected_accounts or []), provider.name
         ),
+        "starter_prompts": [dict(entry) for entry in getattr(provider, "starter_prompts", ())],
+        "third_party_notice": THIRD_PARTY_NOTICE,
         "actions": ["apply", "cancel"],
     }
 

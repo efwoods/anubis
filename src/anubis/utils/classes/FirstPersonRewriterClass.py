@@ -25,7 +25,7 @@ the vectorstore with the full provenance chain (``original_statement``,
 import asyncio
 import json
 from time import time_ns
-from typing import List
+from typing import List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from src.anubis.utils.tokenizer import count_tokens
@@ -134,31 +134,56 @@ class FirstPersonRewriterClass:
         "modality and apply no modality wrap.)"
     )
 
+    # Sentinel substituted into the prompt when the caller supplies no target
+    # name. The prompt's <target_identity> section tells the model to fall back
+    # to the pronoun convention alone in this case, but a readable placeholder
+    # beats a blank section — a blank one reads as "the target has no name",
+    # which is a fact the model must never conclude.
+    _UNKNOWN_TARGET_PLACEHOLDER = (
+        "(target name not supplied; rely on the pronoun convention in "
+        "<pronoun_referents> alone and treat any statement whose subject is a "
+        "specific named person as Case C.)"
+    )
+
     def __init__(self):
         self.model = init_model(response_format=FirstPersonStatement)
         self.system_prompt_template = FIRST_PERSON_REWRITER_SYSTEM_PROMPT
-        self.system_prompt_tokens = 2300
+        # Scaled from the previous 2300 when <target_identity> and Case D
+        # were added to the prompt, keeping the same chars-per-token ratio
+        # the original estimate was calibrated at.
+        self.system_prompt_tokens = 3100
         self.model_name = "gpt-5.4-nano"
         self.model_input_token_cost_per_million = 0.00000005
         self.model_output_token_cost_per_million = 0.0000004
         self.model_inference_type = "first_person_rewriter_structured_output"
 
     def _build_system_message(
-        self, concise_context_summary: str
+        self, concise_context_summary: str, target_name: Optional[str] = None
     ) -> SystemMessage:
-        """Format the prompt template with the per-call context summary.
+        """Format the prompt template with the per-call context summary and target name.
 
         A new ``SystemMessage`` is built per ``rewrite()`` call (not per
-        statement, since the context is shared across the batch) so we
-        never mutate shared instance state. Concurrent ``rewrite()``
-        calls from different requests therefore cannot race on the
-        system message contents.
+        statement, since the context and the target are shared across the
+        batch) so we never mutate shared instance state. Concurrent
+        ``rewrite()`` calls from different requests therefore cannot race on
+        the system message contents.
+
+        ``target_name`` is what lets the model separate a statement the
+        target made from a statement another speaker made ABOUT the target
+        (Case D in the prompt's ``<subject_triage>``). Without it the model
+        applies the "the speaker is always the target" convention to a
+        colleague's sentence and stores that colleague's life as the
+        target's own self-knowledge.
         """
         summary = (concise_context_summary or "").strip()
         if not summary:
             summary = self._EMPTY_CONTEXT_PLACEHOLDER
+        target = (target_name or "").strip()
+        if not target:
+            target = self._UNKNOWN_TARGET_PLACEHOLDER
         formatted_prompt = self.system_prompt_template.format(
-            concise_context_summary=summary
+            concise_context_summary=summary,
+            target_name=target,
         )
         return SystemMessage(content=formatted_prompt)
 
@@ -173,6 +198,7 @@ class FirstPersonRewriterClass:
         self,
         statements: List[str],
         concise_context_summary: str = "",
+        target_name: Optional[str] = None,
     ) -> dict:
         """Rewrite each third-person statement into first person, in parallel.
 
@@ -186,6 +212,13 @@ class FirstPersonRewriterClass:
         matching first-person modality wrap; see
         :data:`FIRST_PERSON_REWRITER_SYSTEM_PROMPT` for the rules.
 
+        ``target_name`` is likewise formatted into the system prompt once
+        per call and is shared across the batch (every statement came from
+        the same source text about the same target). The model needs it to
+        recognise a statement that another speaker made ABOUT the target
+        and to flip such a statement onto the target's perspective instead
+        of adopting the other speaker's "I".
+
         After all calls return, each output is paired with its
         originating input to form a
         :class:`FirstPersonStatementWithProvenance`, all collected
@@ -194,7 +227,9 @@ class FirstPersonRewriterClass:
         metadata so the caller can record it.
         """
         start_time = time_ns()
-        system_message = self._build_system_message(concise_context_summary)
+        system_message = self._build_system_message(
+            concise_context_summary, target_name
+        )
 
         cleaned_statements: List[str] = [
             (s or "").strip() for s in (statements or [])

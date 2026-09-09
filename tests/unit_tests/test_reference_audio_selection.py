@@ -12,6 +12,11 @@ stubbed out:
 - Two uploads processed concurrently store exactly one reference.
 - A first upload that reads the calibration sentence stores the reference
   only.
+- An upload the isolation could cut no single-speaker clip from stores no
+  reference at all, and the next upload that does yield one takes the place a
+  bad clip would otherwise have held forever.
+- A YouTube channel link never becomes the reference: the link names a body of
+  work, so whichever video the link yielded would be an arbitrary choice.
 """
 
 import asyncio
@@ -43,18 +48,21 @@ class _Store:
         self.rows[(tuple(namespace), key)] = value
 
 
-def _audio_item(filename):
+def _audio_item(filename, *, url_kind=None):
+    metadata = {
+        "filename": filename,
+        "content_type": "audio/mp3",
+        "user_id": USER_ID,
+        "assistant_id": ASSISTANT_ID,
+        "namespace_filename": f"key-{filename}",
+        "reference_audio": False,
+    }
+    if url_kind is not None:
+        metadata["url_kind"] = url_kind
     return {
         "type": "audio",
         "base64_encoded_str": CLIP,
-        "metadata": {
-            "filename": filename,
-            "content_type": "audio/mp3",
-            "user_id": USER_ID,
-            "assistant_id": ASSISTANT_ID,
-            "namespace_filename": f"key-{filename}",
-            "reference_audio": False,
-        },
+        "metadata": metadata,
     }
 
 
@@ -127,9 +135,12 @@ def pipeline(monkeypatch):
     media_repository.set_media_asset_repository(None)
 
 
-async def _process(pipeline, filename, config=None):
+async def _process(pipeline, filename, config=None, *, url_kind=None):
     return await nodes_mod.process_media_item_task(
-        _audio_item(filename), _runtime(), config or {}, store=pipeline.store
+        _audio_item(filename, url_kind=url_kind),
+        _runtime(),
+        config or {},
+        store=pipeline.store,
     )
 
 
@@ -197,3 +208,146 @@ async def test_a_calibration_sentence_upload_stores_the_reference_only(pipeline)
     assert [document.metadata["namespace"] for document in documents] == ["reference_audio"]
     assert pipeline.recorded["classified"] == []
     assert _clips(pipeline) == [("script.webm", "reference_upload", 30.0)]
+
+
+@pytest.mark.asyncio
+async def test_an_upload_with_no_isolated_clip_stores_no_reference(pipeline, monkeypatch):
+    """The isolation's passthrough must never be stored as the anchor.
+
+    ``isolate_dominant_speaker_audio_b64`` hands back the whole original audio
+    with no duration and no transcript when no single speaker stood out. Storing
+    that reply would anchor the avatar to a clip the diarizer rejects outright,
+    and only an explicit owner action could ever undo the write.
+    """
+
+    async def fake_isolate_without_a_clip(
+        audio_uri, *, context, filename, content_type, reference_audio=False, allow_single_speaker=None
+    ):
+        pipeline.recorded["isolations"].append((filename, bool(reference_audio)))
+        if reference_audio:
+            return {
+                "audio_base64_preprocessed": CLIP,
+                "duration": None,
+                "text": "",
+            }
+        return {
+            "audio_base64_preprocessed": CLIP,
+            "duration": 30.0,
+            "text": f"speech from {filename}",
+        }
+
+    monkeypatch.setattr(
+        nodes_mod, "isolate_dominant_speaker_audio_b64", fake_isolate_without_a_clip
+    )
+    await _process(pipeline, "Crowd.m4a")
+
+    assert (
+        await reference_audio.read_reference_audio(pipeline.store, USER_ID, ASSISTANT_ID)
+        is None
+    )
+    # The cut was attempted and the reply was rejected — the upload was not
+    # skipped earlier for being the wrong kind of source. What the upload's
+    # speech then produces is the ordinary non-target path, which this fixture
+    # does not stub, so the documents themselves are not asserted here.
+    assert ("Crowd.m4a", True) in pipeline.recorded["isolations"]
+
+
+@pytest.mark.asyncio
+async def test_the_next_good_upload_replaces_an_unusable_stored_reference(pipeline):
+    """A stored clip that cannot anchor the diarizer counts as no reference.
+
+    Rows written before the clip was checked hold the passthrough, and the
+    avatar would otherwise stay anchored to a clip every later diarization call
+    rejects.
+    """
+    namespace = reference_audio.reference_audio_namespace(USER_ID, ASSISTANT_ID)
+    unusable_document = reference_audio.build_reference_audio_document(
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        transcript_text="",
+        filename="Channel.m4a",
+        namespace_filename="key-Channel.m4a",
+        duration_seconds=None,
+        source="upload",
+    )
+    pipeline.store.rows[(namespace, ASSISTANT_ID)] = {
+        "reference_audio_data": CLIP,
+        "document": unusable_document.to_json(),
+    }
+
+    await _process(pipeline, "Mom.m4a")
+
+    stored = await reference_audio.read_reference_audio(
+        pipeline.store, USER_ID, ASSISTANT_ID
+    )
+    assert stored["filename"] == "Mom.m4a"
+    assert stored["duration_seconds"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_a_usable_stored_reference_is_still_never_replaced(pipeline):
+    await _process(pipeline, "Mom.m4a")
+    await _process(pipeline, "Later.m4a")
+
+    stored = await reference_audio.read_reference_audio(
+        pipeline.store, USER_ID, ASSISTANT_ID
+    )
+    assert stored["filename"] == "Mom.m4a"
+
+
+@pytest.mark.asyncio
+async def test_a_channel_link_never_becomes_the_reference(pipeline):
+    """A channel names a body of work, so no clip from a channel anchors anyone."""
+    await _process(
+        pipeline,
+        "https://www.youtube.com/@imahara",
+        url_kind="youtube_playlist",
+    )
+
+    assert (
+        await reference_audio.read_reference_audio(pipeline.store, USER_ID, ASSISTANT_ID)
+        is None
+    )
+    # No reference cut was even attempted for the channel link.
+    assert (
+        "https://www.youtube.com/@imahara",
+        True,
+    ) not in pipeline.recorded["isolations"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_diarization_does_not_claim_every_speaker_as_the_avatar(
+    pipeline, monkeypatch
+):
+    """A diarizer call that FAILED resolved nobody.
+
+    The fallback transcribes the recording plainly, and the presence of a stored
+    reference used to be read as "so this is the avatar speaking" — which wrote
+    every speaker in a multi-speaker recording into the avatar's own words. A
+    recording nobody could be resolved in yields biographical facts instead.
+    """
+    await _process(pipeline, "Mom.m4a")
+    classified_before = len(pipeline.recorded["classified"])
+    nontarget_calls = []
+
+    async def failing_diarize(**_kwargs):
+        raise RuntimeError("known_speaker_references rejected")
+
+    async def fake_transcribe(*, audio_base64, context, filename, **_ignored):
+        return {"text": "Two people talking about someone else."}
+
+    async def fake_nontarget(**kwargs):
+        nontarget_calls.append(kwargs["text_content"])
+        return [Document(page_content="fact", metadata={"namespace": "identity"})]
+
+    monkeypatch.setattr(nodes_mod, "transcribe_audio_diarize", failing_diarize)
+    monkeypatch.setattr(nodes_mod, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(
+        nodes_mod, "process_nontarget_text_to_identity_documents", fake_nontarget
+    )
+
+    await _process(pipeline, "Panel.m4a")
+
+    assert nontarget_calls == ["Two people talking about someone else."]
+    # Nothing from that recording was routed through the target-speech path.
+    assert len(pipeline.recorded["classified"]) == classified_before

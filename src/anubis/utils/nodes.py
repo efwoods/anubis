@@ -480,6 +480,17 @@ async def _build_consciousness_system_message_update(
         user_name = config.get("user_ctx", {}).get("name", None)
         user_description = config.get("user_ctx", {}).get("description", None)
 
+    # A blank name is as absent as ``None``. The fallback name lookups below
+    # are gated on ``is None``, so an avatar row carrying an empty-string name
+    # skipped the lookup entirely and rendered ``=== YOUR NAME ===`` empty —
+    # leaving the avatar with no anchor by which to notice that an identity
+    # fact naming it in the third person contradicts who it is. Normalising
+    # blank to ``None`` here makes both gates agree on what "missing" means.
+    if isinstance(assistant_name, str) and not assistant_name.strip():
+        assistant_name = None
+    if isinstance(user_name, str) and not user_name.strip():
+        user_name = None
+
     if assistant_description is not None:
         state["assistant_state"].update(
             {"assistant_description": assistant_description}
@@ -560,7 +571,7 @@ async def _build_consciousness_system_message_update(
         return []
 
     """ POSSIBLE IMPROVEMENT: CREATE A `NAME` NAMESPACE FOR STORAGE AND RETRIEVAL EXPLICITLY: """
-    _TASK_DESCRIPTION_USER_NAME = (
+    _TASK_DESCRIPTION_NAME_LOOKUP = (
         "Given the query, FIND THE ANSWER TO THE QUESTION WHAT IS YOUR NAME?"
     )
 
@@ -580,14 +591,18 @@ async def _build_consciousness_system_message_update(
     ) = await asyncio.gather(
         # Fallback name searches only run when the context did not provide a name
         (
-            runtime.store.asearch((user_id, assistant_id, "identity"), query="name")
+            runtime.store.asearch(
+                assistant_identity_namespace,
+                query=f"Instruct: {_TASK_DESCRIPTION_NAME_LOOKUP}\nQuery: {'WHAT IS YOUR NAME?'}",
+                limit=_RETRIEVAL_LIMIT,
+            )
             if assistant_name is None
             else _skip_fallback_name_search()
         ),
         (
             runtime.store.asearch(
                 (assistant_id, user_id, "identity"),
-                query=f"Instruct: {_TASK_DESCRIPTION_USER_NAME}\nQuery: {'WHAT IS YOUR NAME?'}",
+                query=f"Instruct: {_TASK_DESCRIPTION_NAME_LOOKUP}\nQuery: {'WHAT IS YOUR NAME?'}",
                 limit=_RETRIEVAL_LIMIT,
             )
             if user_name is None
@@ -634,9 +649,11 @@ async def _build_consciousness_system_message_update(
         ),
     )
 
-    if assistant_name is not None:
-        state["assistant_state"].update({"assistant_name": assistant_name})
-    else:
+    # Both names are read back out of ``state`` further down, where the prompt is
+    # assembled — so a name recovered by the fallback lookup has to be written
+    # into ``state`` here as well. Assigning only the local variable left the
+    # recovered name behind and rendered the prompt section empty.
+    if assistant_name is None:
         if len(assistant_possible_name) > 0:
             assistant_name = (
                 getattr(assistant_possible_name[0], "value")
@@ -647,10 +664,9 @@ async def _build_consciousness_system_message_update(
             )
         else:
             assistant_name = ""
+    state["assistant_state"].update({"assistant_name": assistant_name})
 
-    if user_name is not None:
-        state["user_state"].update({"user_name": user_name})
-    else:
+    if user_name is None:
         if len(user_possible_name) > 0 and (
             getattr(user_possible_name[0], "score", 0) > _FILTER_SCORE
         ):
@@ -663,6 +679,7 @@ async def _build_consciousness_system_message_update(
             )
         else:
             user_name = ""
+    state["user_state"].update({"user_name": user_name})
 
     """ 
     

@@ -313,8 +313,16 @@ async def _build_identity_documents_from_facts(
         (f.get("rewritten_statement") or "").strip() for f in facts
     ]
     rewriter = FirstPersonRewriterClass()
+    # ``target_name`` must reach the rewriter, not just the metadata below.
+    # The fact extractor upstream deliberately harvests statements made ABOUT
+    # the target by other speakers, so a rewriter that does not know who the
+    # target is converts a colleague's "I have worked with <target> for years"
+    # into the target's own first-person fact, and the avatar ends up
+    # describing itself as its own colleague.
     rewriter_response = await rewriter.rewrite(
-        rewritten_inputs, concise_context_summary=concise_context_summary
+        rewritten_inputs,
+        concise_context_summary=concise_context_summary,
+        target_name=target_name,
     )
     statements = rewriter_response.get("statements") or []
 

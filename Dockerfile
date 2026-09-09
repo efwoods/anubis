@@ -21,11 +21,21 @@ ENV LANGGRAPH_HTTP='{"app": "/deps/anubis/src/api/webapp.py:app"}'
 ENV LANGSERVE_GRAPHS='{"Anubis": "/deps/anubis/src/anubis/graph.py:graph"}'
 
 # -- Ensure user deps didn't inadvertently overwrite langgraph-api --
-# RUN mkdir -p /api/langgraph_api /api/langgraph_runtime /api/langgraph_license \
-#     && touch /api/langgraph_api/__init__.py \
-#              /api/langgraph_runtime/__init__.py \
-#              /api/langgraph_license/__init__.py
-# RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir --no-deps -e /api
+# The install above resolves the whole dependency graph, and langgraph-cli's
+# "inmem" extra declares `langgraph-api>=0.5.35`, so the resolver is free to
+# fetch the PUBLIC langgraph-api from PyPI and write it over the licensed build
+# this image ships (installed editable from /api). The two carry the same
+# version number and not the same code: the licensed langgraph_runtime_postgres
+# under /storage imports names the public build never defines
+# (PREFER_GRPC_CHECKPOINTER), so the server dies at boot with an ImportError
+# before a single request is served. /api/forbidden.txt states the same rule
+# from the image's own side: "Block user overrides of the base api".
+#
+# Reinstalling /api editable puts the licensed package back in front of
+# site-packages; --no-deps so restoring it moves nothing else. This must stay
+# ahead of the layers that strip uv and pip, which is the only window left for
+# repairing an install.
+RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir --no-deps -e /api
 # -- End of ensuring user deps didn't inadvertently overwrite langgraph-api --
 
 # NOTE: no `playwright install` here — the Playwright-managed Chromium

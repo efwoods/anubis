@@ -255,6 +255,51 @@ def _is_youtube_playlist_url(parsed) -> bool:
     return "list" in query and "v" not in query
 
 
+def _is_youtube_channel_url(parsed) -> bool:
+    """Report whether a link names a channel, handle, or user page.
+
+    Such a link is a body of work rather than one video.
+
+    A channel link names everything a person published, so downloading "the"
+    audio behind such a link picks an arbitrary video. Channel links enumerate
+    into their videos instead, the way a playlist does, and every video is then
+    ingested on its own terms.
+    """
+    path = (parsed.path or "").lower().rstrip("/")
+    query = parse_qs(parsed.query or "")
+    if "v" in query:
+        return False
+    return (
+        path.startswith("/@")
+        or path.startswith("/channel/")
+        or path.startswith("/c/")
+        or path.startswith("/user/")
+        or path in ("", "/feed", "/feed/subscriptions")
+    )
+
+
+def channel_videos_url(url: str) -> str:
+    """Point a channel link at the channel's Videos tab.
+
+    ``yt_dlp`` flat-extracts a bare channel URL into the channel's tabs
+    (Videos, Shorts, Live) rather than into videos, so the Videos tab is asked
+    for by name. A link that already names a tab, and a link that is not a
+    channel, are returned unchanged.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001 - an unparseable link is left alone
+        return url
+    if not _is_youtube_channel_url(parsed):
+        return url
+    path = (parsed.path or "").rstrip("/")
+    if path.lower().endswith(("/videos", "/shorts", "/streams", "/live", "/featured")):
+        return url
+    if not path or path in ("/feed", "/feed/subscriptions"):
+        return url
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}{path}/videos"
+
+
 def _classify_url(url: str) -> str:
     """Return a routing label: youtube_playlist / youtube / twitter / linktree / instagram / twitch / article."""
     try:
@@ -263,7 +308,9 @@ def _classify_url(url: str) -> str:
     except Exception:
         return "article"
     if host in _YOUTUBE_HOSTS:
-        if _is_youtube_playlist_url(parsed):
+        # A playlist and a channel are both bodies of work: each enumerates
+        # into single videos rather than being downloaded as one recording.
+        if _is_youtube_playlist_url(parsed) or _is_youtube_channel_url(parsed):
             return "youtube_playlist"
         return "youtube"
     if host in _TWITTER_HOSTS:
@@ -627,17 +674,35 @@ def _extract_playlist_entries_sync(url: str) -> tuple[List[Dict[str, Any]], str]
         "no_warnings": True,
         "noprogress": True,
     }
+    # A channel link is asked for by its Videos tab, because a bare channel URL
+    # flat-extracts into the channel's tabs rather than into videos.
+    extraction_url = channel_videos_url(url)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(extraction_url, download=False)
     except Exception as exc:  # pragma: no cover - logged for the operator
-        logger.exception("yt_dlp playlist extraction failed for %s: %s", url, exc)
+        logger.exception(
+            "yt_dlp playlist extraction failed for %s: %s", extraction_url, exc
+        )
         return [], ""
 
     entries = (info or {}).get("entries") or []
     playlist_title = (info or {}).get("title") or ""
-    # Drop unavailable/private entries that yt_dlp returns as ``None``.
-    return [e for e in entries if isinstance(e, dict)], playlist_title
+    # Drop unavailable/private entries that yt_dlp returns as ``None``, and
+    # flatten the one level of nesting a channel tab can still produce.
+    videos: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("_type") == "playlist":
+            videos.extend(
+                nested
+                for nested in (entry.get("entries") or [])
+                if isinstance(nested, dict)
+            )
+            continue
+        videos.append(entry)
+    return videos, playlist_title
 
 
 async def _download_youtube_audio_b64(url: str) -> tuple[str, str]:
@@ -658,6 +723,10 @@ def _download_youtube_audio_b64_sync(url: str) -> tuple[str, str]:
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
+            # One recording, never a whole playlist or channel. Without this a
+            # link that carries a list downloads every video, and the caller
+            # then keeps an arbitrary one of them.
+            "noplaylist": True,
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -667,16 +736,31 @@ def _download_youtube_audio_b64_sync(url: str) -> tuple[str, str]:
             ],
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)  # download side effect; info unused
+            info = ydl.extract_info(url, download=True)
 
-        # Locate the produced .mp3 (post-processor renames the file).
-        mp3_path: Optional[str] = None
-        for fname in os.listdir(tmpdir):
-            if fname.lower().endswith(".mp3"):
-                mp3_path = os.path.join(tmpdir, fname)
-                break
-        if not mp3_path:
+        # Locate the produced .mp3 (the post-processor renames the file). The
+        # file is chosen by the id of the video that was asked for, so a
+        # directory holding more than one download can never yield audio of a
+        # different recording; directory order decides nothing.
+        produced_mp3_names = sorted(
+            name for name in os.listdir(tmpdir) if name.lower().endswith(".mp3")
+        )
+        if not produced_mp3_names:
             return "", ""
+        requested_video_id = str((info or {}).get("id") or "")
+        preferred_name = f"{requested_video_id}.mp3"
+        chosen_name = (
+            preferred_name
+            if requested_video_id and preferred_name in produced_mp3_names
+            else produced_mp3_names[0]
+        )
+        if requested_video_id and chosen_name != preferred_name:
+            logger.warning(
+                "yt_dlp produced no mp3 named for %s; falling back to %s",
+                requested_video_id,
+                chosen_name,
+            )
+        mp3_path = os.path.join(tmpdir, chosen_name)
 
         with open(mp3_path, "rb") as fh:
             audio_b64 = base64.b64encode(fh.read()).decode("ascii")

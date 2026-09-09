@@ -6,7 +6,8 @@
   "graphs": {
     "Anubis": "./src/anubis/graph.py:graph",
     "process_media": "./src/subgraphs/process_media_graph/process_media_graph_api_endpoint.py:workflow",
-    "inbox": "./src/subgraphs/inbox/graph.py:inbox_graph"
+    "inbox": "./src/subgraphs/inbox/graph.py:inbox_graph",
+    "group_conversation": "./src/subgraphs/group_conversation/graph.py:group_conversation_graph"
   },
   "store": {
     "index": {

@@ -145,6 +145,7 @@ from src.anubis.utils.conversation_titles import (
     MANUAL_TITLE_SOURCE,
     name_conversation_thread,
 )
+from src.api.group_conversations import group_conversations_route
 from src.api.message_stops import (
     AMBIENT_BUSY_RETRY_AFTER_SECONDS,
     STOP_REQUESTED,
@@ -2383,6 +2384,9 @@ async def lifespan(app: FastAPI):
         from src.anubis.utils.inbox import poller as inbox_poller
 
         inbox_poller.set_inbox_runtime(checkpointer, store)
+        from src.anubis.utils.groups.runner import set_group_runtime
+
+        set_group_runtime(checkpointer, store)
         app.state.inbox_poller = asyncio.create_task(
             inbox_poller.poll_forever(app.state.context)
         )
@@ -2529,6 +2533,7 @@ async def documentation():
 
 
 app.include_router(router=security_route)
+app.include_router(router=group_conversations_route)
 
 
 def _checkout_line_items_for_tier(billing_config, tier: SubscriptionTier) -> list[dict]:

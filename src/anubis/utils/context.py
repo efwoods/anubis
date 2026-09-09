@@ -1206,6 +1206,59 @@ class GlobalContext:
 
     """ </Agent inbox (triage of incoming messages for the personal avatar)> """
 
+    """ <Group conversations (Slack, Discord, Twitch)> """
+
+    group_conversation_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Process-wide switch for the avatar taking part in group conversations. When this is not true, the /groups routes answer 404 and no bot can reach the triage graph. Env GROUP_CONVERSATION_ENABLED."
+        },
+    )
+
+    group_conversation_concurrency: int = field(
+        default=4,
+        metadata={
+            "description": "How many messages from one batch are decided in parallel. Each message is one graph run, so this bounds the model calls a single busy room can start at once. Env GROUP_CONVERSATION_CONCURRENCY."
+        },
+    )
+
+    group_max_events_per_request: int = field(
+        default=100,
+        metadata={
+            "description": "Ceiling on the messages one bot may send in a single batch; a larger batch is refused rather than truncated, so a bot is never left believing messages were decided when the messages were dropped. Env GROUP_MAX_EVENTS_PER_REQUEST."
+        },
+    )
+
+    group_auto_respond_confidence: float = field(
+        default=0.9,
+        metadata={
+            "description": "Confidence at or above which the avatar posts a reply in a room without being asked and without the owner seeing the reply first. Below it, the reply waits for the owner. Env GROUP_AUTO_RESPOND_CONFIDENCE."
+        },
+    )
+
+    group_auto_moderate_confidence: float = field(
+        default=0.97,
+        metadata={
+            "description": "Confidence at or above which the avatar carries out a moderation action without the owner. Higher than the reply threshold because moderating somebody is harder to undo than saying something. A timeout or a ban additionally requires the owner to have allowed that same action in that same room before, whatever this value is. Env GROUP_AUTO_MODERATE_CONFIDENCE."
+        },
+    )
+
+    group_recent_events_for_triage: int = field(
+        default=12,
+        metadata={
+            "description": "How many preceding messages from the room are handed to the classifier as context, so the avatar reads the room rather than one line out of context. Env GROUP_RECENT_EVENTS_FOR_TRIAGE."
+        },
+    )
+
+    group_precedent_recall_limit: int = field(
+        default=8,
+        metadata={
+            "description": "How many of the owner's rules and past decisions are retrieved by similarity for each message being decided. Env GROUP_PRECEDENT_RECALL_LIMIT."
+        },
+    )
+
+    """ </Group conversations (Slack, Discord, Twitch)> """
+
     """ <Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
     ambient_capture_enabled: str = field(

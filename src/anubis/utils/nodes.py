@@ -1275,6 +1275,59 @@ async def _build_consciousness_system_message_update(
         except Exception:  # noqa: BLE001 - the inbox must never fail a turn
             logger.debug("Inbox status unavailable for the prompt", exc_info=True)
 
+        # Group conversations — the rooms the avatar takes part in, and what is
+        # waiting from them. Named here so the avatar can raise a waiting room
+        # message without spending a tool call, and never invents one.
+        try:
+            from src.anubis.utils.groups.precedent import (
+                list_channels,
+                list_notifications,
+            )
+
+            # The rooms and their notifications are keyed under the avatar's
+            # creator, which in this branch is the conversation partner.
+            group_store = getattr(runtime, "store", None)
+            creator_id = avatar_owner_id or user_id
+            if group_store is not None and creator_id:
+                channels = await list_channels(group_store, creator_id, assistant_id)
+                waiting = await list_notifications(
+                    group_store, creator_id, assistant_id, unread_only=True
+                )
+                if channels or waiting:
+                    rooms = (
+                        ", ".join(
+                            f"{channel.get('platform')} {channel.get('channel_name') or channel.get('channel_id')}"
+                            for channel in channels[:8]
+                        )
+                        or "none"
+                    )
+                    if waiting:
+                        headlines = "; ".join(
+                            f"{(entry.get('event') or {}).get('author_name') or 'someone'} in "
+                            f"{entry.get('channel_name') or entry.get('channel_id')} "
+                            f"[{entry.get('action') or 'notify'}]"
+                            for entry in waiting[:5]
+                        )
+                        system_message_str += (
+                            "\n<GROUP_CONVERSATIONS>\n"
+                            f"The conversation partner's avatar takes part in these rooms: {rooms}. "
+                            f"{len(waiting)} message(s) from those rooms are waiting for a "
+                            f"decision: {headlines}. Mention them briefly and offer to go "
+                            "through them.\n"
+                            "</GROUP_CONVERSATIONS>\n"
+                        )
+                    else:
+                        system_message_str += (
+                            "\n<GROUP_CONVERSATIONS>\n"
+                            f"The conversation partner's avatar takes part in these rooms: {rooms}. "
+                            "Nothing from those rooms is waiting right now.\n"
+                            "</GROUP_CONVERSATIONS>\n"
+                        )
+        except Exception:  # noqa: BLE001 - a room must never fail a turn
+            logger.debug(
+                "Group conversation status unavailable for the prompt", exc_info=True
+            )
+
     # Learning from media in conversation — the avatar's creator only (the
     # same owner check the ``think`` node applies before attaching the tool;
     # the subscription tier is enforced when the tool runs). The files attached

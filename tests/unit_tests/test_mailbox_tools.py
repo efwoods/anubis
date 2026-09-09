@@ -210,7 +210,7 @@ def test_the_result_limit_is_capped_by_configuration(monkeypatch):
         (
             imap_client.MailboxAuthenticationError("bad"),
             "needs_reconnect",
-            "app password",
+            "connect the mailbox again",
         ),
         (imap_client.MailboxUnreachableError("timeout"), "unreachable", "reached"),
         (RuntimeError("something unexpected"), "error", "went wrong"),
@@ -459,29 +459,38 @@ def test_the_connect_tool_is_offered_when_no_mailbox_is_connected(monkeypatch):
 
 
 def test_the_connect_card_describes_the_provider_form(monkeypatch):
-    from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
-    from src.anubis.utils.connected_accounts.testing_support import use_legacy_gmail
+    """The mailbox card asks for an address and a password, and nothing else.
 
-    use_legacy_gmail(monkeypatch)
+    Two required inputs is the whole point of the generic email row: a person
+    adds an account the way they would in a mail application. The optional
+    server fields exist only for a domain that publishes no settings, and no
+    field, label, or help text may send anyone off to generate a secret.
+    """
+    from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
+
     tools, cards = _connect_tool(monkeypatch, {"type": "cancel"})
-    asyncio.run(tools["connect_mailbox_account"].coroutine())
+    asyncio.run(tools["connect_mailbox_account"].coroutine(provider="email_account"))
 
     card = cards[0]
     assert card["kind"] == "connect_account"
-    assert card["provider"] == "gmail"
-    assert card["display_name"] == "Gmail"
+    assert card["provider"] == "email_account"
+    assert card["display_name"] == "Email account"
     assert card["tool_count"] == len(MAILBOX_TOOL_NAMES)
     assert card["connect_endpoint"] == "/connect_account"
-    assert card["credential_help_url"] == "https://myaccount.google.com/apppasswords"
 
     fields = {field["name"]: field for field in card["fields"]}
-    assert set(fields) == {"email_address", "app_password"}
+    assert set(fields) == {"email_address", "password", "imap_host", "smtp_host"}
+    required = {name for name, spec in fields.items() if spec["required"]}
+    assert required == {"email_address", "password"}
     # The secret is declared as a password input so the client masks it without
     # having to know which of the fields is the secret one.
-    assert fields["app_password"]["input_type"] == "password"
-    # An owner who is not told this types their account password, is rejected,
-    # and types the same password again.
-    assert "app password" in fields["app_password"]["help_text"].lower()
+    assert fields["password"]["input_type"] == "password"
+    card_text = " ".join(
+        str(value)
+        for spec in fields.values()
+        for value in (spec["label"], spec["placeholder"], spec["help_text"])
+    ).lower()
+    assert "app password" not in card_text
 
 
 def test_an_unknown_provider_is_refused_without_raising(monkeypatch):

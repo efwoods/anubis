@@ -12,7 +12,8 @@ Why the standard library and not ``langchain_google_community.GmailToolkit``
     be dropped in behind the same call sites.
 
     Two authentication mechanisms are supported by :class:`MailboxCredentials`:
-    ``"password"`` (a plain ``LOGIN`` with an app password, kept for providers
+    ``"password"`` (a plain ``LOGIN`` with the account password, which is what
+    most mail providers still accept, kept for providers
     that still use one) and ``"xoauth2"`` (an OAuth access token). Since
     2025-03-14 a regular Google account password no longer authenticates
     against IMAP or SMTP, which is why Gmail uses OAuth.
@@ -307,7 +308,7 @@ def verify_credentials(credentials: MailboxCredentials) -> None:
 
     Raises:
         MailboxAuthenticationError: The server rejected the credential — a
-            revoked or expired OAuth token, or a wrong app password.
+            revoked or expired OAuth token, or a wrong password.
         MailboxUnreachableError: The server could not be reached.
     """
     connection = _connect(credentials)

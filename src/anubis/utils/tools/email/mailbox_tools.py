@@ -204,7 +204,7 @@ def build_mailbox_tools(
                 "account_label": label,
                 "error": (
                     f"{label} rejected its saved password. Ask the owner to "
-                    "generate a new app password and connect the mailbox again."
+                    "connect the mailbox again."
                 ),
             }
         except MailboxUnreachableError as unreachable_error:

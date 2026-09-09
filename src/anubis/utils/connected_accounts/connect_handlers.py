@@ -24,12 +24,12 @@ from typing import Any, Awaitable, Callable
 
 from src.anubis.utils.connected_accounts.providers import (
     LOGIN_MODE_FORM,
-    MECHANISM_APP_PASSWORD,
     MECHANISM_AUTH0_IDENTITY,
     MECHANISM_BROWSER_SESSION,
     MECHANISM_DEVICE_PAIRING,
     MECHANISM_MCP_URL,
     MECHANISM_OAUTH,
+    MECHANISM_PASSWORD,
     MECHANISM_PLAID_LINK,
     MECHANISM_URL_ONLY,
     ConnectedAccountProvider,
@@ -145,16 +145,32 @@ def _encrypt(secret: str, context: Any) -> str:
         raise ConnectRefused(503, str(configuration_error))
 
 
-async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any]:
-    """Prove a mailbox address + app password by logging in, then describe it.
+async def connect_password_account(request: ConnectRequest) -> dict[str, Any]:
+    """Prove a mailbox address and account password by logging in, then describe it.
 
-    On Gmail the password must be a 16-character app password, not the account
-    password: Google stopped accepting account passwords over IMAP on
-    2025-03-14, and creating an app password requires 2-Step Verification. A
-    rejected credential says exactly that and links to the page that issues one,
-    because "authentication failed" alone sends people to re-type the same wrong
-    secret.
+    This is the path a desktop mail client takes, and the reason the owner is
+    asked for two things and no more. When the provider row names no servers —
+    the generic email row — they are discovered from the address
+    (``mail_autoconfig``) and written onto the record, so every later turn
+    reaches the mailbox without rediscovering anything.
+
+    Three failures are three different answers, because they need three
+    different actions from the owner:
+
+    * the provider has withdrawn password access — say which company did that
+      and which sign-in it wants instead, since no password will ever work;
+    * nothing answered at the address's domain — ask for the server names;
+    * the server answered and rejected the credential — say the password was
+      refused, and nothing else.
+
+    A single "authentication failed" for all three is what sends a person to
+    type the same rejected password a second time.
     """
+    from src.anubis.utils.connected_accounts.mail_autoconfig import (
+        discover_mail_settings,
+        domain_of,
+        withdrawn_password_provider,
+    )
     from src.anubis.utils.tools.email.imap_client import (
         MailboxAuthenticationError,
         MailboxCredentials,
@@ -164,24 +180,83 @@ async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any
 
     provider = request.provider
     email_address = request.text("email_address")
-    app_password = str(request.fields.get("app_password") or "")
+    # ``app_password`` is the field name older clients posted. Accepted so a
+    # stale browser tab still connects; never offered, never labelled.
+    password = str(
+        request.fields.get("password") or request.fields.get("app_password") or ""
+    )
     if not provider.is_mailbox:
         raise ConnectRefused(
             400,
             f"{provider.display_name} is not a mailbox and cannot be connected "
             "with an email address and password.",
         )
-    if not email_address or not app_password:
-        raise ConnectRefused(400, "Both email_address and app_password are required.")
+    if not email_address or not password:
+        raise ConnectRefused(400, "Both email_address and password are required.")
+
+    overrides: dict[str, Any] = {}
+    imap_host = provider.imap_host
+    imap_port = provider.imap_port
+    smtp_host = provider.smtp_host
+    smtp_port = provider.smtp_port
+    drafts_mailbox = provider.drafts_mailbox
+    username = email_address
+
+    if not imap_host:
+        # The owner may have typed the servers themselves for a domain that
+        # publishes nothing; that always wins over discovery.
+        typed_imap_host = request.text("imap_host")
+        typed_smtp_host = request.text("smtp_host")
+        if typed_imap_host:
+            imap_host = typed_imap_host
+            smtp_host = typed_smtp_host or typed_imap_host
+        else:
+            settings = await discover_mail_settings(email_address)
+            if settings is None:
+                raise ConnectRefused(
+                    400,
+                    f"No mail settings could be found for {domain_of(email_address)}. "
+                    "Enter the incoming and outgoing server names for this "
+                    "account and connect again.",
+                )
+            if not settings.password_authentication:
+                withdrawn_by = settings.password_withdrawn_by or "This provider"
+                raise ConnectRefused(
+                    400,
+                    f"{withdrawn_by} no longer accepts an account password for "
+                    "mail access, so this address cannot be connected with a "
+                    "password. Connect it with the sign-in button for "
+                    f"{withdrawn_by} instead — the same address and password, "
+                    "typed on their own page.",
+                )
+            imap_host = settings.imap_host
+            imap_port = settings.imap_port
+            smtp_host = settings.smtp_host or settings.imap_host
+            smtp_port = settings.smtp_port
+            username = settings.username_for(email_address)
+        overrides = {
+            "imap_host": imap_host,
+            "imap_port": imap_port,
+            "smtp_host": smtp_host,
+            "smtp_port": smtp_port,
+        }
+    elif withdrawn_password_provider(imap_host):
+        withdrawn_by = withdrawn_password_provider(imap_host)
+        raise ConnectRefused(
+            400,
+            f"{withdrawn_by} no longer accepts an account password for mail "
+            f"access. Connect {provider.display_name} with its sign-in button "
+            "instead — the same address and password, typed on their own page.",
+        )
 
     credentials = MailboxCredentials(
-        account_address=email_address,
-        password=app_password,
-        imap_host=provider.imap_host,
-        imap_port=provider.imap_port,
-        smtp_host=provider.smtp_host,
-        smtp_port=provider.smtp_port,
-        drafts_mailbox=provider.drafts_mailbox,
+        account_address=username,
+        password=password,
+        imap_host=imap_host,
+        imap_port=imap_port,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        drafts_mailbox=drafts_mailbox,
         timeout_seconds=float(
             getattr(request.context, "mailbox_request_timeout_seconds", None) or 30.0
         ),
@@ -191,20 +266,17 @@ async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any
     except MailboxAuthenticationError:
         raise ConnectRefused(
             400,
-            f"{provider.display_name} rejected that address and password. "
-            "Use a 16-character app password, not your account password — "
-            "Google stopped accepting account passwords for mail access on "
-            "14 March 2025. Creating one requires 2-Step Verification: "
-            f"{provider.credential_help_url}",
+            f"{imap_host} rejected that password for {email_address}. Check the "
+            "password you use to sign in to this email account and try again.",
         )
     except MailboxUnreachableError as unreachable_error:
         raise ConnectRefused(
             503,
-            f"Could not reach {provider.display_name} to check the credential: "
+            f"Could not reach {imap_host} to check the credential: "
             f"{unreachable_error}",
         )
 
-    encrypted_secret = _encrypt(app_password, request.context)
+    encrypted_secret = _encrypt(password, request.context)
     key = account_key(provider.name, email_address)
     label = deduplicate_label(
         derive_display_label(email_address), request.existing_records, key
@@ -215,7 +287,13 @@ async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any
         display_label=label,
         encrypted_secret=encrypted_secret,
         assistant_id=request.assistant_id,
+        connection_overrides=overrides or None,
     )
+
+
+# The name this handler carried when the mechanism was misnamed. Kept so an
+# existing import resolves; new code calls ``connect_password_account``.
+connect_app_password_account = connect_password_account
 
 
 async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:
@@ -446,7 +524,7 @@ async def _refuse_device_pairing(request: ConnectRequest) -> dict[str, Any]:
 
 
 CONNECT_HANDLERS: dict[str, ConnectHandler] = {
-    MECHANISM_APP_PASSWORD: connect_app_password_account,
+    MECHANISM_PASSWORD: connect_password_account,
     MECHANISM_MCP_URL: connect_mcp_server_account,
     MECHANISM_URL_ONLY: connect_website,
     MECHANISM_OAUTH: _needs_popup_login,

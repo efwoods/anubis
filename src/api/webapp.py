@@ -3763,8 +3763,8 @@ async def _connect_account_from_fields(
     stored; the plaintext credential is encrypted by the handler and never
     persisted or logged in the clear. The cap is enforced here, once, for every
     mechanism, and reconnecting an account the owner already has refreshes that
-    record rather than counting against the cap — otherwise rotating an app
-    password would eventually lock the owner out of their own mailbox.
+    record rather than counting against the cap — otherwise changing a password
+    would eventually lock the owner out of their own mailbox.
     """
     from src.anubis.utils.connected_accounts import get_provider, public_account_view
     from src.anubis.utils.connected_accounts.connect_handlers import (
@@ -4524,16 +4524,21 @@ async def connect_mailbox(
 ):
     """Connect one of the owner's email accounts to their personal avatar.
 
-    Body: ``provider`` (default "gmail"), ``email_address``, ``app_password``.
-    Kept as an alias of ``POST /connect_account`` for clients that predate the
-    generic route; the behaviour — prove by real login, encrypt, store, never
-    log the plaintext — is identical because both routes share one body.
+    Body: ``provider`` (default "email_account"), ``email_address``,
+    ``password``, and optionally ``imap_host`` / ``smtp_host`` for a domain that
+    publishes no settings. Kept as an alias of ``POST /connect_account`` for
+    clients that predate the generic route; the behaviour — prove by real login,
+    encrypt, store, never log the plaintext — is identical because both routes
+    share one body. ``app_password`` is still read so a browser tab opened
+    before the field was renamed still connects; it is never offered.
     """
     body = await request.json()
-    provider_name = str(body.get("provider") or "gmail").strip().lower()
+    provider_name = str(body.get("provider") or "email_account").strip().lower()
     fields = {
         "email_address": body.get("email_address"),
-        "app_password": body.get("app_password"),
+        "password": body.get("password") or body.get("app_password"),
+        "imap_host": body.get("imap_host"),
+        "smtp_host": body.get("smtp_host"),
     }
     return await _connect_account_from_fields(
         request, current_user, provider_name, fields

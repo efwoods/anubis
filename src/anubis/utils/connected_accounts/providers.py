@@ -20,8 +20,9 @@ Fields that carry design decisions:
     that actually evidence a public identity may be ``"social"``.
 
 ``credential_mechanism`` decides how a connection is established
-    ``"app_password"`` collects a credential in a form and verifies it by
-    logging in. ``"mcp_url"`` collects a server address (and an optional bearer
+    ``"app_password"`` (the constant is :data:`MECHANISM_PASSWORD`; the string
+    is historical) collects an address and the owner's own account password in
+    a form and verifies both by logging in. ``"mcp_url"`` collects a server address (and an optional bearer
     token) and verifies it by listing the server's tools. ``"auth0_identity"``
     links a secondary identity onto the account. ``"oauth"`` runs an
     authorization-code redirect and stores a refresh token.
@@ -37,25 +38,35 @@ Fields that carry design decisions:
     connect attempt is refused with a plain message rather than a broken form.
 
 How an owner signs in (``login_mode``)
-    The owner never types a credential into Neural Nexus. The connect card's
-    button opens the vendor's OWN sign-in page in a popup: Google's consent
-    screen for Gmail, Calendar, Analytics, and YouTube; GitHub's, X's, and
-    Vercel's authorization pages; Plaid Link for a bank; and, for any site
-    with no OAuth at all, a live browser the API hosts, where the owner signs
-    in on the site's real login page and the signed-in session is kept. The
-    ``login_mode`` property derives the popup kind from the mechanism so the
-    card, the routes, and the tools agree.
+    Two shapes, and only two. Either the owner gives an address and their own
+    account password on the card, and the handler proves them by logging in to
+    the account's own protocol; or the card opens the vendor's OWN sign-in page
+    in a popup — a consent screen, Plaid Link for a bank, or a live browser on
+    the site's real login page for a site with no OAuth at all. The
+    ``login_mode`` property derives which from the mechanism so the card, the
+    routes, and the tools agree.
 
-Gmail through Google sign-in (an accepted trade-off)
-    Reading a mailbox needs the restricted scope ``https://mail.google.com/``.
-    Until the OAuth client passes Google verification and the CASA assessment,
-    the consent screen stays in Testing status: only listed test users may sign
-    in and refresh tokens expire after seven days. An expired token is surfaced
-    as a ``needs_reconnect`` status and the card is raised again; nothing
-    silently breaks. App passwords are deliberately NOT offered: the owner asked
-    for the official Google login and nothing else, and since 2025-03-14 Google
-    accepts only OAuth 2.0 or an app password over IMAP anyway. Existing
-    app-password records keep working through ``mailbox_credentials_for``.
+An address and a password comes first
+    A desktop mail client adds an account from an address and a password and
+    finds the servers itself. :data:`EMAIL_ACCOUNT_PROVIDER` is that row, and
+    ``mail_autoconfig.discover_mail_settings`` is that discovery, so one row
+    covers every IMAP provider in the world instead of one row per company.
+    A provider row is only needed when a company wants something a password
+    cannot express.
+
+**No app passwords, anywhere.** Nothing here asks an owner to generate a
+    sixteen-character secret, offers one as an alternative, or names one in a
+    label, a placeholder, or a help link. A generated secret is a chore handed
+    to every person individually, which is precisely what the address-and-
+    password row exists to avoid. Google, Microsoft, and Yahoo have each
+    withdrawn password authentication for mail access; those three connect
+    through a certified OAuth client instead, where the owner signs in with the
+    *same* address and account password on the provider's own page.
+    ``mail_autoconfig.withdrawn_password_provider`` recognises their hosts, so
+    an owner who types such an address is told which sign-in that provider
+    wants rather than being handed a rejection for a password that was never
+    going to work. Records connected before this rule keep working unchanged
+    through ``mailbox_credentials_for``.
 """
 
 from __future__ import annotations
@@ -95,7 +106,15 @@ ALL_KINDS = frozenset(
 )
 
 # Credential mechanisms.
-MECHANISM_APP_PASSWORD = "app_password"
+# The owner supplies an address and their own account password, and the
+# handler proves both by logging in. The stored value is still the historical
+# ``"app_password"`` string so records written before this rename keep working
+# with no migration; the NAME changed because the mechanism never required an
+# app password and calling it one taught every reader the wrong thing. Nothing
+# in the product asks an owner for a generated secret.
+MECHANISM_PASSWORD = "app_password"
+# Deprecated spelling, kept so an import of the old name still resolves.
+MECHANISM_APP_PASSWORD = MECHANISM_PASSWORD
 MECHANISM_AUTH0_IDENTITY = "auth0_identity"
 MECHANISM_OAUTH = "oauth"
 MECHANISM_MCP_URL = "mcp_url"
@@ -105,7 +124,7 @@ MECHANISM_BROWSER_SESSION = "browser_session"
 MECHANISM_URL_ONLY = "url_only"
 ALL_MECHANISMS = frozenset(
     {
-        MECHANISM_APP_PASSWORD,
+        MECHANISM_PASSWORD,
         MECHANISM_AUTH0_IDENTITY,
         MECHANISM_OAUTH,
         MECHANISM_MCP_URL,
@@ -119,7 +138,7 @@ ALL_MECHANISMS = frozenset(
 # Mechanisms whose connect flow is a form the owner completes on the card.
 # ``url_only`` is a form too (a website address, no credential).
 FORM_MECHANISMS = frozenset(
-    {MECHANISM_APP_PASSWORD, MECHANISM_MCP_URL, MECHANISM_URL_ONLY}
+    {MECHANISM_PASSWORD, MECHANISM_MCP_URL, MECHANISM_URL_ONLY}
 )
 
 # How the card signs the owner in. Derived from the mechanism so every surface
@@ -130,7 +149,7 @@ LOGIN_MODE_PLAID_LINK = "plaid_link"
 LOGIN_MODE_BROWSER_SESSION = "browser_session"
 LOGIN_MODE_NONE = "none"
 LOGIN_MODES_BY_MECHANISM: dict[str, str] = {
-    MECHANISM_APP_PASSWORD: LOGIN_MODE_FORM,
+    MECHANISM_PASSWORD: LOGIN_MODE_FORM,
     MECHANISM_MCP_URL: LOGIN_MODE_FORM,
     MECHANISM_URL_ONLY: LOGIN_MODE_FORM,
     MECHANISM_OAUTH: LOGIN_MODE_OAUTH_POPUP,
@@ -247,10 +266,12 @@ class ConnectedAccountProvider:
         featured: Whether the row appears in the Featured section.
         availability: One of :data:`ALL_AVAILABILITIES`.
         connect_endpoint: The route a form-mechanism card posts its fields to.
-        imap_host: IMAP server, for ``app_password`` providers only.
-        imap_port: IMAP TLS port, for ``app_password`` providers only.
-        smtp_host: SMTP submission server, for ``app_password`` providers only.
-        smtp_port: SMTP submission port, for ``app_password`` providers only.
+        imap_host: IMAP server, for password providers only. Left empty on
+            the generic email row, where the servers are discovered from the
+            address instead of being written down per provider.
+        imap_port: IMAP TLS port, for password providers only.
+        smtp_host: SMTP submission server, for password providers only.
+        smtp_port: SMTP submission port, for password providers only.
         drafts_mailbox: IMAP folder that holds drafts. Gmail exposes this as
             ``"[Gmail]/Drafts"`` rather than the ``"Drafts"`` most other servers
             use, which is exactly the sort of per-provider detail this table
@@ -297,6 +318,11 @@ class ConnectedAccountProvider:
     connect_fields: tuple[ConnectFieldSpec, ...] = ()
     pairing_instructions: str = ""
     install_url: str | None = None
+    # True for a row that names no company and finds the servers from the
+    # address instead (see ``mail_autoconfig``). Such a row legitimately has no
+    # ``imap_host``; every row that DOES name a company still must declare one,
+    # which is why this is an explicit opt-out rather than a relaxed check.
+    discovers_servers: bool = False
     # Suggested questions shown once the account is connected, so the owner
     # can start using the connection without wording a query from scratch.
     # Each is {"label": short chip text, "prompt": the message sent to chat}.
@@ -350,6 +376,77 @@ class ConnectedAccountProvider:
         """Return the refusal an unavailable provider's connect attempt gets."""
         return COMING_SOON_MESSAGE.format(display_name=self.display_name)
 
+
+# The row a mail client would be. One provider for every IMAP host on earth:
+# the owner types the address and their own account password, and
+# ``mail_autoconfig.discover_mail_settings`` finds the servers, so there is no
+# per-company row to write and nothing for the owner to look up. The host and
+# port fields are deliberately empty — they are filled in per record from what
+# discovery returned, which is also why ``build_account_record`` accepts
+# overrides.
+EMAIL_ACCOUNT_PROVIDER = ConnectedAccountProvider(
+    name="email_account",
+    kind=KIND_MAILBOX,
+    credential_mechanism=MECHANISM_PASSWORD,
+    display_name="Email account",
+    category=CATEGORY_MAIL,
+    summary="Search, read, draft, and send email",
+    send_supported=True,
+    sent_mailbox="Sent",
+    card_description=(
+        "Connect any email account with your address and password, the way a "
+        "mail application does. The servers are found for you."
+    ),
+    icon_key="email",
+    discovers_servers=True,
+    starter_prompts=(
+        {
+            "label": "What needs a reply?",
+            "prompt": "What emails need a reply, and can you draft responses in my voice?",
+        },
+        {
+            "label": "Summarize my inbox",
+            "prompt": "Summarize the important emails from the last three days.",
+        },
+        {
+            "label": "Unsubscribe candidates",
+            "prompt": "Which newsletters or senders could I unsubscribe from?",
+        },
+    ),
+    connect_fields=(
+        ConnectFieldSpec(
+            name="email_address",
+            label="Email address",
+            input_type="email",
+            placeholder="you@example.com",
+            help_text="The address of the mailbox to connect.",
+        ),
+        ConnectFieldSpec(
+            name="password",
+            label="Password",
+            input_type="password",
+            placeholder="Your email password",
+            help_text="The password you use to sign in to this email account.",
+        ),
+        ConnectFieldSpec(
+            name="imap_host",
+            label="IMAP server",
+            placeholder="Found automatically",
+            help_text=(
+                "Only needed if your provider publishes no settings — leave "
+                "empty and they will be discovered."
+            ),
+            required=False,
+        ),
+        ConnectFieldSpec(
+            name="smtp_host",
+            label="Outgoing server",
+            placeholder="Found automatically",
+            help_text="Only needed alongside the IMAP server above.",
+            required=False,
+        ),
+    ),
+)
 
 GMAIL_PROVIDER = ConnectedAccountProvider(
     name="gmail",
@@ -857,6 +954,7 @@ GMAIL_APP_PASSWORD_PROVIDER = ConnectedAccountProvider(
 PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     provider.name: provider
     for provider in (
+        EMAIL_ACCOUNT_PROVIDER,
         GMAIL_PROVIDER,
         PLAID_PROVIDER,
         COINBASE_PROVIDER,
@@ -983,14 +1081,22 @@ def validate_registry() -> None:
                 f"availability {provider.availability!r}; expected one of "
                 f"{sorted(ALL_AVAILABILITIES)}."
             )
-        if provider.kind == KIND_MAILBOX and not provider.imap_host:
+        if (
+            provider.kind == KIND_MAILBOX
+            and not provider.imap_host
+            and not provider.discovers_servers
+            and provider.credential_mechanism == MECHANISM_PASSWORD
+        ):
             raise ValueError(
-                f"Mailbox provider {provider.name!r} must declare an imap_host."
+                f"Mailbox provider {provider.name!r} must declare an imap_host "
+                "or set discovers_servers."
             )
         if (
             provider.kind == KIND_MAILBOX
             and provider.send_supported
             and not provider.smtp_host
+            and not provider.discovers_servers
+            and provider.credential_mechanism == MECHANISM_PASSWORD
         ):
             raise ValueError(
                 f"Provider {provider.name!r} supports sending but declares no "

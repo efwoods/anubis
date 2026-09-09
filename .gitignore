@@ -1,4 +1,6 @@
 adapters
+# The adapter-service client is source, not a trained adapter: keep it tracked.
+!src/anubis/utils/adapters/
 test_q_a_dataset.pkl
 !training_lora_adapters.ipynb
 _.json

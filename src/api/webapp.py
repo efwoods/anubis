@@ -140,6 +140,11 @@ from src.anubis.utils.store_cache import (
     invalidate_store_cache_entry,
     invalidate_store_cache_for_assistant,
 )
+from src.anubis.utils.conversation_titles import (
+    CONVERSATION_TITLE_SOURCE_KEY,
+    MANUAL_TITLE_SOURCE,
+    name_conversation_thread,
+)
 from src.api.message_stops import (
     AMBIENT_BUSY_RETRY_AFTER_SECONDS,
     STOP_REQUESTED,
@@ -1152,6 +1157,101 @@ async def _meter_stopped_turn(
     )
 
 
+def _thread_metadata_updates(
+    *,
+    user_id: str,
+    assistant_id: str,
+    thread_id: str,
+    conversation_title_value: str | None,
+) -> dict:
+    """Build the thread_metadata keys one ``/message`` turn owns.
+
+    ``conversation_title`` is written only when the caller actually sent a name.
+    A caller that sends none leaves the key out entirely rather than writing
+    ``None`` over whatever name the thread carries — writing ``None`` is how the
+    name the conversation namer stored used to disappear on the reader's next
+    message. A name the caller did send is the caller's own choice and is
+    stamped as such, so the namer leaves that name alone.
+    """
+    updates: dict = {
+        "user_id": user_id,
+        "assistant_id": assistant_id,
+        "most_recent_message": datetime.now(UTC).isoformat(),
+    }
+    caller_title = (conversation_title_value or "").strip()
+    if caller_title and caller_title != thread_id:
+        updates["conversation_title"] = caller_title
+        updates[CONVERSATION_TITLE_SOURCE_KEY] = MANUAL_TITLE_SOURCE
+    return updates
+
+
+async def _write_thread_metadata(
+    langgraph_client: Any, thread_id: str, updates: dict
+) -> None:
+    """Merge ``updates`` into a thread's nested ``thread_metadata`` and store it.
+
+    The platform patches thread metadata one top-level key at a time, and
+    ``thread_metadata`` is a single top-level key holding an object. Writing a
+    freshly built object therefore replaces every key inside it, not just the
+    keys being written. Each ``/message`` turn writes that object, so a name the
+    conversation namer stored after the previous turn — and the ``shared`` flag
+    a reader set on the conversation — were erased by the next message the
+    reader sent. Reading the thread first and merging is what makes those keys
+    outlive a turn.
+    """
+    existing_metadata: dict = {}
+    existing_thread_metadata: dict = {}
+    try:
+        thread = await langgraph_client.threads.get(thread_id=thread_id)
+        if isinstance(thread, dict) and isinstance(thread.get("metadata"), dict):
+            existing_metadata = thread["metadata"]
+            nested = existing_metadata.get("thread_metadata")
+            if isinstance(nested, dict):
+                existing_thread_metadata = nested
+    except Exception:  # noqa: BLE001 - the write still goes out
+        # A thread that cannot be read is usually a thread that does not exist
+        # yet. Writing the update alone is right in that case; losing the keys
+        # of a thread that does exist is the only cost of a read that failed.
+        logger.debug(
+            "Could not read thread %s before writing its metadata", thread_id, exc_info=True
+        )
+    await langgraph_client.threads.update(
+        thread_id=thread_id,
+        metadata={
+            "thread_metadata": {**existing_thread_metadata, **updates},
+            "graph_id": "Anubis",
+        },
+    )
+
+
+async def _name_new_conversation(
+    thread_id: str,
+    *,
+    langgraph_client_headers: dict,
+    user_id: str,
+    assistant_id: str,
+) -> str:
+    """Name a conversation that has no name yet, swallowing every failure.
+
+    Run after the reply has been delivered, never before: the reader is waiting
+    on the avatar's words, and a classification call made for the sidebar's
+    benefit must not sit in front of them. A conversation that already carries a
+    name is left alone, so this costs one call per conversation rather than one
+    per turn, and it returns the name it wrote or an empty string.
+    """
+    try:
+        return await name_conversation_thread(
+            thread_id,
+            langgraph_client_headers=langgraph_client_headers,
+            only_when_unnamed=True,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - a name is a convenience, the reply is not
+        logger.warning("Could not name conversation %s", thread_id, exc_info=True)
+        return ""
+
+
 async def _finalize_stopped_turn(
     partial_text: str,
     *,
@@ -1198,19 +1298,17 @@ async def _finalize_stopped_turn(
         request_id=request_id,
         response_metadata=response_metadata,
     )
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title_value,
-        },
-        "graph_id": "Anubis",
-    }
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
-        await langgraph_client.threads.update(
-            thread_id=thread_id, metadata=thread_metadata
+        await _write_thread_metadata(
+            langgraph_client,
+            thread_id,
+            _thread_metadata_updates(
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                conversation_title_value=conversation_title_value,
+            ),
         )
     except Exception:  # noqa: BLE001 - metadata is a convenience, the stop is not
         logger.warning(
@@ -1642,17 +1740,17 @@ async def message_graph_sse(
         )
         return
 
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title_value,
-        },
-        "graph_id": "Anubis",
-    }
     langgraph_client = get_client(headers=langgraph_client_headers)
-    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+    await _write_thread_metadata(
+        langgraph_client,
+        thread_id,
+        _thread_metadata_updates(
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            conversation_title_value=conversation_title_value,
+        ),
+    )
 
     # If the graph paused for human approval, surface the preview instead of ``done``.
     # The client resumes via ``POST /message/{assistant_id}/resume`` on this thread_id.
@@ -1717,6 +1815,31 @@ async def message_graph_sse(
         if include_usage_metrics and turn_usage:
             done["usage"] = turn_usage
     yield f"data: {json.dumps(done, default=str)}\n\n"
+
+    # The conversation is named after the reply has been delivered, never
+    # before: the reader has the avatar's words in full by this frame, and the
+    # naming call costs the reader nothing but a still-open connection. A
+    # conversation that already carries a name is left alone, so this is one
+    # call per conversation rather than one per turn.
+    #
+    # The name is sent as its own frame instead of being left for the next
+    # listing of conversations, because a conversation is named on the turn
+    # that starts it — exactly the turn on which the browser is putting a new
+    # row in the sidebar. Handing the name over now is what stops that row
+    # from reading "Conversation Sep 9, 10:14" until something else refreshes.
+    conversation_name = await _name_new_conversation(
+        thread_id,
+        langgraph_client_headers=langgraph_client_headers,
+        user_id=user_id,
+        assistant_id=assistant_id,
+    )
+    if conversation_name:
+        conversation_name_frame = {
+            "type": "conversation_title",
+            "thread_id": thread_id,
+            "conversation_title": conversation_name,
+        }
+        yield f"data: {json.dumps(conversation_name_frame, default=str)}\n\n"
 
 
 class MessagePayload(BaseModel):
@@ -7292,16 +7415,29 @@ async def message_avatar(
 
     # Update most_recent_message
     langgraph_client = get_client(headers=langgraph_client_headers)
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title_data,
-        },
-        "graph_id": "Anubis",
-    }
-    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+    await _write_thread_metadata(
+        langgraph_client,
+        thread_id,
+        _thread_metadata_updates(
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            conversation_title_value=conversation_title_data,
+        ),
+    )
+
+    # A conversation this turn just started has no name. Naming it is a
+    # classification call the caller is not waiting on, so it runs after the
+    # reply has been assembled and its result reaches the browser on the next
+    # listing of conversations rather than in this response.
+    schedule_background(
+        _name_new_conversation(
+            thread_id,
+            langgraph_client_headers=langgraph_client_headers,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    )
 
     response_data = {}
     response_data["content"] = result["messages"][-1].content
@@ -7929,6 +8065,49 @@ async def get_thread_messages(
         # failure raised inside the platform's own state read is invisible here.
         logger.exception("Could not load the messages of thread %s", thread_id)
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
+
+
+@app.post("/conversations/{thread_id}/title")
+async def name_conversation_route(
+    request: Request,
+    thread_id: str,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Name a conversation from its whole transcript.
+
+    Called by the browser when the reader leaves a conversation — switching to
+    another conversation, starting a new one, or closing the page. A
+    conversation is named once when it starts, from an opening exchange that is
+    all there is to read at that point; by the time the reader leaves, the
+    conversation has usually moved on to the subject it was actually about, and
+    this is where that subject becomes the name.
+
+    A name the reader typed in the sidebar is never replaced. The response
+    carries the name the conversation now has, and ``"renamed"`` says whether
+    this request is what wrote it, so a browser that fired this request while
+    navigating away can ignore the answer without wondering what it missed.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    try:
+        conversation_name = await name_conversation_thread(
+            thread_id,
+            langgraph_client_headers=langgraph_client_headers,
+            only_when_unnamed=False,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - a name is a convenience
+        logger.warning("Could not name conversation %s", thread_id, exc_info=True)
+        conversation_name = ""
+    return JSONResponse(
+        {
+            "thread_id": thread_id,
+            "conversation_title": conversation_name,
+            "renamed": bool(conversation_name),
+        }
+    )
 
 
 @app.post("/ambient_preferences/{assistant_id}")

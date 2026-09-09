@@ -1282,6 +1282,36 @@ class GlobalContext:
         },
     )
 
+    """ <Automatic conversation naming (sidebar titles written by the messaging service)> """
+
+    conversation_title_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to let the messaging service name a conversation from its transcript: once when the conversation is started, and again when the reader leaves the conversation. FALSE leaves every thread unnamed unless the reader types a name. Env CONVERSATION_TITLE_ENABLED."
+        },
+    )
+
+    conversation_title_max_characters: int = field(
+        default=60,
+        metadata={
+            "description": "Longest automatic conversation name, in characters; a longer name is cut on a word boundary and ends with an ellipsis so the sidebar row cannot be overrun. Env CONVERSATION_TITLE_MAX_CHARACTERS."
+        },
+    )
+
+    conversation_title_transcript_tail_messages: int = field(
+        default=20,
+        metadata={
+            "description": "How many of the most recent visible messages the conversation namer reads. A conversation is named after what it is about, which the recent turns carry; reading the whole transcript would spend classification tokens on turns that cannot change the name. Env CONVERSATION_TITLE_TRANSCRIPT_TAIL_MESSAGES."
+        },
+    )
+
+    conversation_title_timeout_seconds: float = field(
+        default=20.0,
+        metadata={
+            "description": "How long the conversation namer waits on the classification model before giving up and leaving the conversation unnamed. Env CONVERSATION_TITLE_TIMEOUT_SECONDS."
+        },
+    )
+
     """ <Usage analytics (opt-in action log and described page captures)> """
 
     usage_analytics_enabled: str = field(

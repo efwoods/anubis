@@ -7919,6 +7919,10 @@ async def get_thread_messages(
         pending_interrupt = await _pending_interrupt_for_thread(thread_id)
         return JSONResponse({"messages": messages, "pending_interrupt": pending_interrupt})
     except Exception as exc:
+        # With the traceback the reader learns which frame failed; without it the
+        # browser's "Error loading messages" is the only evidence there is, and a
+        # failure raised inside the platform's own state read is invisible here.
+        logger.exception("Could not load the messages of thread %s", thread_id)
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
 
 

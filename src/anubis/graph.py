@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 
+# The fan-in edge below compiles to a ``NamedBarrierValue`` channel whose
+# checkpoint the LangGraph platform reads back as a list, which breaks
+# reading any thread that was cancelled between the fan-out and the fan-in.
+# Applied here because this module is imported before any graph is compiled
+# or any thread state is read.
+from src.anubis.utils.barrier_channel_checkpoint_compatibility import (
+    apply_barrier_channel_checkpoint_compatibility_patch,
+)
+
+apply_barrier_channel_checkpoint_compatibility_patch()
+
 load_dotenv()
 
 import logging

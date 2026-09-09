@@ -448,6 +448,60 @@ EMAIL_ACCOUNT_PROVIDER = ConnectedAccountProvider(
     ),
 )
 
+# The calendar half of the same idea, over CalDAV. Fastmail, Nextcloud, iCloud,
+# Zimbra, Zoho, and every self-hosted or corporate calendar server speak it, so
+# one row covers them all from an address and a password.
+CALENDAR_ACCOUNT_PROVIDER = ConnectedAccountProvider(
+    name="calendar_account",
+    kind=KIND_CALENDAR,
+    credential_mechanism=MECHANISM_PASSWORD,
+    display_name="Calendar account",
+    category=CATEGORY_CALENDAR,
+    summary="Read the schedule and book appointments",
+    card_description=(
+        "Connect any calendar with your address and password. The avatar can "
+        "read your schedule, find free time, and book appointments you ask for."
+    ),
+    icon_key="calendar",
+    discovers_servers=True,
+    starter_prompts=(
+        {
+            "label": "What is on this week?",
+            "prompt": "What is on my calendar this week?",
+        },
+        {
+            "label": "Find me an hour",
+            "prompt": "Find me a free hour on Thursday afternoon.",
+        },
+    ),
+    connect_fields=(
+        ConnectFieldSpec(
+            name="email_address",
+            label="Email address",
+            input_type="email",
+            placeholder="you@example.com",
+            help_text="The address you sign in to this calendar with.",
+        ),
+        ConnectFieldSpec(
+            name="password",
+            label="Password",
+            input_type="password",
+            placeholder="Your calendar password",
+            help_text="The password you use to sign in to this account.",
+        ),
+        ConnectFieldSpec(
+            name="server_url",
+            label="Calendar server",
+            placeholder="Found automatically",
+            help_text=(
+                "Only needed if your provider publishes no settings — leave "
+                "empty and it will be discovered."
+            ),
+            required=False,
+        ),
+    ),
+)
+
 GMAIL_PROVIDER = ConnectedAccountProvider(
     name="gmail",
     kind=KIND_MAILBOX,
@@ -955,6 +1009,7 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     provider.name: provider
     for provider in (
         EMAIL_ACCOUNT_PROVIDER,
+        CALENDAR_ACCOUNT_PROVIDER,
         GMAIL_PROVIDER,
         PLAID_PROVIDER,
         COINBASE_PROVIDER,

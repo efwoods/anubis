@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from src.anubis.utils.connected_accounts.providers import (
+    KIND_CALENDAR,
     LOGIN_MODE_FORM,
     MECHANISM_AUTH0_IDENTITY,
     MECHANISM_BROWSER_SESSION,
@@ -185,6 +186,8 @@ async def connect_password_account(request: ConnectRequest) -> dict[str, Any]:
     password = str(
         request.fields.get("password") or request.fields.get("app_password") or ""
     )
+    if provider.kind == KIND_CALENDAR:
+        return await _connect_calendar_account(request, email_address, password)
     if not provider.is_mailbox:
         raise ConnectRefused(
             400,
@@ -294,6 +297,72 @@ async def connect_password_account(request: ConnectRequest) -> dict[str, Any]:
 # The name this handler carried when the mechanism was misnamed. Kept so an
 # existing import resolves; new code calls ``connect_password_account``.
 connect_app_password_account = connect_password_account
+
+
+async def _connect_calendar_account(
+    request: ConnectRequest, email_address: str, password: str
+) -> dict[str, Any]:
+    """Prove a calendar account over CalDAV, then describe it.
+
+    The same two things the owner typed for mail, against the calendar's own
+    protocol. The proven principal and calendar-home addresses are kept on the
+    record so no later turn repeats discovery.
+    """
+    from src.anubis.utils.connected_accounts.caldav_client import (
+        CalDavAuthenticationError,
+        CalDavUnreachableError,
+        connect_caldav_account,
+        list_calendars,
+    )
+
+    provider = request.provider
+    if not email_address or not password:
+        raise ConnectRefused(400, "Both email_address and password are required.")
+
+    try:
+        account = await connect_caldav_account(
+            email_address=email_address,
+            password=password,
+            server_url=request.text("server_url"),
+        )
+        calendars = await list_calendars(account)
+    except CalDavAuthenticationError:
+        raise ConnectRefused(
+            400,
+            f"The calendar server rejected that password for {email_address}. "
+            "Check the password you use to sign in to this account and try again.",
+        )
+    except CalDavUnreachableError as unreachable_error:
+        raise ConnectRefused(
+            400,
+            f"No calendar server could be found for {email_address}: "
+            f"{unreachable_error} Enter the calendar server address and try again.",
+        )
+
+    encrypted_secret = _encrypt(password, request.context)
+    key = account_key(provider.name, email_address)
+    label = deduplicate_label(
+        derive_display_label(email_address), request.existing_records, key
+    )
+    return build_account_record(
+        provider=provider,
+        account_address=email_address,
+        display_label=label,
+        encrypted_secret=encrypted_secret,
+        assistant_id=request.assistant_id,
+        transport={
+            "caldav": {
+                "base_url": account.base_url,
+                "principal_url": account.principal_url,
+                "calendar_home_url": account.calendar_home_url,
+                "username": account.username,
+                "calendars": [
+                    {"name": calendar.display_name, "read_only": calendar.read_only}
+                    for calendar in calendars
+                ],
+            }
+        },
+    )
 
 
 async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:

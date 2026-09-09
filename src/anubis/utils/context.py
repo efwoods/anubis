@@ -698,6 +698,34 @@ class GlobalContext:
         },
     )
 
+    managed_auth_provider: str = field(
+        default=None,
+        metadata={
+            "description": "Which managed-auth vendor connects accounts whose company refuses an account password (Gmail, Outlook, Yahoo). Their OAuth client is already certified, so those accounts connect with no security assessment of ours; the consent screen carries the vendor's name. 'composio' is the only value implemented. Empty means such accounts cannot be connected and the card says so. Env MANAGED_AUTH_PROVIDER."
+        },
+    )
+
+    composio_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "API key for the Composio managed-auth provider, from composio.dev. Sent only to Composio; never logged or returned. No provider token is stored in this database — Composio holds and refreshes it. Env COMPOSIO_API_KEY."
+        },
+    )
+
+    composio_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "Base address of the Composio API. Empty uses the module default. Set this when Composio publishes a new API version. Env COMPOSIO_BASE_URL."
+        },
+    )
+
+    composio_http_timeout_seconds: float = field(
+        default=None,
+        metadata={
+            "description": "How long one call to the managed-auth provider may take before it is reported as unreachable. Env COMPOSIO_HTTP_TIMEOUT_SECONDS."
+        },
+    )
+
     github_oauth_client_id: str = field(
         default=None,
         metadata={

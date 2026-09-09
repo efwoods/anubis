@@ -1345,3 +1345,101 @@ def test_non_human_prompts_keep_the_subjects_own_color():
         loop = idle_loop_prompt_for(emotion, SUBJECT_NON_HUMAN)
         assert "keeps its own colors" in loop
         assert "The light itself pulses" in loop
+
+
+@pytest.mark.asyncio
+async def test_a_reference_image_upload_does_not_generate_stills(
+    monkeypatch,
+):
+    """Portrait upload stores the reference only. Generated stills and loops
+    from the previous face are dropped; new ones wait for an explicit regenerate."""
+    from src.subgraphs.process_media_graph.utils.nodes import (
+        _generate_emotion_media_after_reference_image,
+    )
+
+    calls = _fake_vendor(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_emotion_asset(
+        {
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "emotion": "joy",
+            "asset_kind": ASSET_KIND_STILL,
+            "mime_type": "image/jpeg",
+            "bytes": b"old-still",
+        }
+    )
+    await repository.upsert_emotion_asset(
+        {
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "emotion": "joy",
+            "asset_kind": ASSET_KIND_IDLE_LOOP,
+            "mime_type": "video/mp4",
+            "bytes": b"old-loop",
+        }
+    )
+    media_repository.set_media_asset_repository(repository)
+    try:
+        await _generate_emotion_media_after_reference_image(
+            _context(),
+            USER_ID,
+            ASSISTANT_ID,
+            REFERENCE,
+            subject=SUBJECT_PERSON,
+            subscription_tier="premium",
+            minimum_tier="premium",
+        )
+    finally:
+        media_repository.set_media_asset_repository(None)
+
+    kinds = {
+        (asset["emotion"], asset["asset_kind"])
+        for asset in await repository.list_emotion_assets(ASSISTANT_ID)
+    }
+    assert calls["edits"] == []
+    assert calls["videos"] == []
+    assert kinds == set()
+
+
+@pytest.mark.asyncio
+async def test_a_lower_tier_upload_drops_stale_loops_and_generates_nothing(
+    monkeypatch,
+):
+    """A portrait upload must not spend on stills or videos, and must not
+    keep generated media from a previous face."""
+    from src.subgraphs.process_media_graph.utils.nodes import (
+        _generate_emotion_media_after_reference_image,
+    )
+
+    calls = _fake_vendor(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_emotion_asset(
+        {
+            "user_id": USER_ID,
+            "assistant_id": ASSISTANT_ID,
+            "emotion": "joy",
+            "asset_kind": ASSET_KIND_IDLE_LOOP,
+            "mime_type": "video/mp4",
+            "bytes": b"old-loop",
+        }
+    )
+    media_repository.set_media_asset_repository(repository)
+    try:
+        await _generate_emotion_media_after_reference_image(
+            _context(),
+            USER_ID,
+            ASSISTANT_ID,
+            REFERENCE,
+            subject=SUBJECT_PERSON,
+            subscription_tier="pro",
+            minimum_tier="premium",
+        )
+    finally:
+        media_repository.set_media_asset_repository(None)
+
+    assets = await repository.list_emotion_assets(ASSISTANT_ID)
+    assert calls["edits"] == []
+    assert calls["videos"] == []
+    assert assets == []
+

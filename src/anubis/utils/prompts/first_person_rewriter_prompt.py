@@ -15,10 +15,18 @@ model returns a single :class:`FirstPersonStatement` with one
 is attached in code AFTER the call (see
 :class:`FirstPersonStatementsWithProvenance`).
 
-The prompt is a ``str.format`` template — it carries a single
-``{concise_context_summary}`` placeholder that the class fills in per
-call. Do NOT use f-string interpolation when authoring; keep this as a
-plain string with literal braces only around the placeholder.
+The prompt is a ``str.format`` template — it carries two placeholders,
+``{concise_context_summary}`` and ``{target_name}``, that the class fills
+in per call. Do NOT use f-string interpolation when authoring; keep this
+as a plain string with literal braces only around the placeholders.
+
+``{target_name}`` is what lets the rewriter tell a statement the target
+made from a statement another speaker made ABOUT the target. The upstream
+:class:`FactRewriterClass` deliberately harvests both (see its module
+docstring), so without the target's name this rewriter cannot see that
+"the speaker has worked with <target> for years" was said by somebody
+else, and would store it as the target's own first-person fact — making
+the avatar its own colleague. See Case D in ``<subject_triage>``.
 
 Follows the GPT-5 prompting guide structure per workspace ``.cursorrules``.
 """
@@ -44,6 +52,29 @@ treat the source as literal modality.
 CONCISE_CONTEXT_SUMMARY:
 {concise_context_summary}
 </source_context>
+
+<target_identity>
+The TARGET — the individual whose first-person identity you are
+reconstructing, and therefore the person "I" refers to in every
+statement you produce — is:
+
+TARGET_NAME:
+{target_name}
+
+Read this name before you triage anything. The source text was harvested
+from media in which OTHER people also speak about the target, so an input
+statement may be something a colleague, interviewer, host, friend, or
+relative said ABOUT the target rather than something the target said.
+The target's name is how you tell those two apart: a statement that names
+the target as a participant distinct from that statement's own speaker did
+NOT come from the target, and rewriting it with "I" standing for the
+speaker would hand the target another person's life. See Case D in
+`<subject_triage>`.
+
+If TARGET_NAME is empty or unknown, fall back to the pronoun convention in
+`<pronoun_referents>` alone, and treat any statement whose subject is a
+specific named person as Case C.
+</target_identity>
 
 <task>
 The human message contains exactly one source statement. Output exactly
@@ -73,6 +104,12 @@ convention before doing anything else:
   individual whose first-person identity you are reconstructing).
   These are the lawsuit-safe paraphrase tokens the upstream pipeline
   emits for the target. They are NOT generic third-party pronouns.
+  ONE EXCEPTION, and only one: when the same sentence ALSO names the
+  target (TARGET_NAME, see `<target_identity>`) as a participant
+  distinct from its own subject, then that subject — "the speaker",
+  "they" — is somebody else, because no speaker refers to themself by
+  name in the third person while speaking. That sentence is Case D,
+  not Case A.
 - "she" / "he" / "her" / "him" / "his" / "hers", any named person,
   any noun phrase like "her partner", "his mother", "the child" —
   refer to people OTHER than the target.
@@ -100,7 +137,7 @@ Consequences:
 1. Fidelity first. Every fact in the input must appear in the output.
    No new facts. No omissions.
 2. Subject triage second. Identify the grammatical subject of the
-   source sentence (Case A / B / C in `<subject_triage>`), using the
+   source sentence (Case A / B / C / D in `<subject_triage>`), using the
    pronoun convention in `<pronoun_referents>` to resolve who each
    pronoun refers to. The wrong subject choice produces ungrammatical
    or untrue output ("I trust each other", "I am extroverted" when
@@ -157,6 +194,50 @@ an abstraction).
   fact in the target's experience instead of misattributing it to
   the target.
 
+Case D — Subject is ANOTHER SPEAKER talking ABOUT the target, with the
+target appearing in the sentence as an object, an oblique, or a
+possessor rather than as the subject.
+  This is the case the upstream pipeline produces most often out of
+  interviews, panels, podcasts, and multi-speaker footage: the fact
+  extractor is asked for every fact stated about the target, so it
+  harvests what the people AROUND the target said about the target.
+  The sentence is genuinely about the target while its grammatical
+  subject is someone else entirely.
+
+  You detect Case D with TARGET_NAME (see `<target_identity>`): the
+  target is named — or referred to by an unambiguous third-person
+  pronoun pointing at that name — in a NON-subject position, while
+  the subject is a different person. That subject is often "the
+  speaker" or "they", which in this one situation is that other
+  person and NOT the target.
+  Case D sources look like: "The speaker has worked with TARGET_NAME
+  for years", "The speaker consults TARGET_NAME about electronics",
+  "Her mentor taught TARGET_NAME to weld", "They say TARGET_NAME is
+  the best builder on the team".
+
+  The literal-modality rewrite FLIPS THE PERSPECTIVE onto the target:
+  every reference to the target becomes "I" / "me" / "my", and the
+  original subject stays in the third person. Keep that other person
+  named when the source named them. When the source left them
+  unnamed, refer to them with a neutral third-person noun phrase that
+  adds no facts — "a colleague", "a person I work with", "someone I
+  worked with" — rather than inventing a name, a role, or a
+  relationship the source never stated.
+    Source: "The speaker has worked with TARGET_NAME for years."
+    Output: "A colleague has worked with me for years."
+    Source: "Her mentor taught TARGET_NAME to weld."
+    Output: "Her mentor taught me to weld."
+
+  The non-literal modality rewrite wraps the flipped sentence exactly
+  as the other cases do: "I dreamed that a colleague consults me
+  about electronics."
+
+  Case D OUTRANKS Case A. When a sentence has "the speaker" or "they"
+  as its subject AND names the target elsewhere in that same
+  sentence, it is Case D and never Case A — one person cannot be
+  speaking about the target in the third person and BE the target at
+  the same time.
+
 Coordinate-subject order. When you use a coordinate noun phrase that
 includes the target, the first-person pronoun comes LAST and is "I",
 not "me" or "her/him". Write "she and I", "he and I", "my partner
@@ -175,6 +256,8 @@ Literal modality.
     Case A → "I [verb]"
     Case B → "We [verb]"
     Case C → source sentence verbatim
+    Case D → perspective flipped onto the target: the other speaker
+             stays third person, the target becomes "I" / "me" / "my"
 
 Non-literal modality.
   The summary contains an explicit non-literal modality verb or
@@ -216,6 +299,12 @@ Non-literal modality.
       Output: "I dreamed that she is extroverted."
       (NOT: "I am extroverted." NOT: "She is extroverted." in dream
       modality.)
+    Case D non-literal: "I dreamed that [perspective-flipped source]"
+      Source: "The speaker has worked with TARGET_NAME for years."
+      Output: "I dreamed that a colleague has worked with me for
+      years."
+      (NOT: "I dreamed that I have worked with TARGET_NAME for
+      years.")
 
 Mixed-modality safety.
   If the source sentence ALREADY begins with a first-person modality
@@ -264,6 +353,18 @@ Mixed-modality safety.
   (literal) or wrap with a first-person modality verb (non-literal).
   Do NOT pronoun-substitute "she" → "I" on Case C — that is the
   single most damaging failure of this rewriter.
+- NEVER produce a statement in which TARGET_NAME refers to somebody
+  other than the "I" of that same statement. The one place the
+  target's own name may appear in your output is a copular
+  self-identification — "I am TARGET_NAME", "My name is TARGET_NAME",
+  "People call me TARGET_NAME". Anywhere else the output asserts that
+  the target is a separate person from themself: as the object of a
+  verb or preposition ("I have worked with TARGET_NAME"), as a
+  coordinate subject beside "I" ("TARGET_NAME and I built it"), or as
+  a possessor of something that is in fact the target's own
+  ("TARGET_NAME's workshop"). If your draft has any of those shapes,
+  you triaged a Case D sentence as Case A. Go back, apply Case D, and
+  flip the perspective so the target is "I" / "me" / "my".
 </rules>
 
 <escape_hatches>
@@ -337,6 +438,16 @@ Mixed-modality safety.
   must be exactly one `FirstPersonStatement`.
 - Numbering or labelling the output ("1. ...", "Statement: ...").
   The output is just the rewritten sentence inside the single field.
+- Rewriting a Case D sentence as Case A, which hands the target
+  somebody else's life. Taking "The speaker has worked with
+  TARGET_NAME for years and consults TARGET_NAME about electronics"
+  and outputting "I have worked with TARGET_NAME for years and I
+  consult TARGET_NAME about electronics" makes the target its own
+  colleague. The avatar then introduces itself by saying it has
+  worked with itself for years, and the stored fact directly
+  contradicts the target's own name. This is the most damaging
+  failure this rewriter can produce, because the output is kept as
+  primary self-knowledge and is read back on every single turn.
 </anti_patterns>
 
 <examples>
@@ -431,4 +542,35 @@ said "The speaker describes their professional career"):
   together." → "My co-founder and I built the company together."
   Case C literal: "Her co-founder is a robotics engineer." → "Her
   co-founder is a robotics engineer." (verbatim)
+  Case D literal: "The speaker has worked with her for years." → "A
+  colleague has worked with me for years."
+
+Case D literal in detail (subject is another speaker talking about the
+target). Assume TARGET_NAME is "Grant Imahara" and the summary says a
+colleague is describing their working relationship with him:
+  Source: "The speaker has worked with Grant Imahara for years."
+  Output: "A colleague has worked with me for years."
+  (NOT: "I have worked with Grant Imahara for years." — that makes
+  the target its own colleague.)
+
+  Source: "The speaker typically consults Grant Imahara about
+  electronics matters that are more advanced than they feel capable
+  of handling."
+  Output: "A colleague typically consults me about electronics
+  matters that are more advanced than they feel capable of
+  handling."
+  (NOT: "I typically consult Grant Imahara about electronics matters
+  that are more advanced than I feel capable of handling.")
+
+  Source: "Jamie Hyneman built the frame while Grant Imahara wired
+  the electronics."
+  Output: "Jamie Hyneman built the frame while I wired the
+  electronics."
+  (The named other person keeps their name and stays third person;
+  the target becomes "I".)
+
+Copular self-identification — the one place the target's own name is
+allowed to appear in your output:
+  Source: "The speaker is named Grant Imahara."
+  Output: "I am Grant Imahara."
 </examples>"""

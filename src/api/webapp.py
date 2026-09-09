@@ -1270,6 +1270,74 @@ async def _finalize_disconnected_turn(
             active_turn.mark_finished()
 
 
+# What the model vendors say when the operator's own account is out of credit.
+# None of these are the reader's doing, so they are never reported as a 402 —
+# that status sends the reader to billing, and the reader's allotment is fine.
+_VENDOR_CREDIT_EXHAUSTED_MARKERS = (
+    "insufficient_quota",
+    "exceeded your current quota",
+    "credit balance is too low",
+    "billing_hard_limit_reached",
+    "insufficient credits",
+    "insufficient_credits",
+    "out of credits",
+)
+
+
+def _stream_error_frame(
+    run_error: BaseException, *, request_id: str, thread_id: str | None
+) -> dict:
+    """The last frame of a message stream whose run failed after it began.
+
+    The frame carries a ``status`` the client can act on the way it acts on an
+    HTTP status — a 402 is a spent allotment and opens billing — and a
+    ``message`` fit to show. A refusal the run itself raised as an
+    ``HTTPException`` (a metering call inside the loop) keeps its status and
+    sentence. The operator's model account being out of credit is said plainly
+    and marked as the service's fault (503), never as the reader's. Anything
+    else is a plain failure; its internals stay in the server log.
+    """
+    if isinstance(run_error, HTTPException):
+        detail = run_error.detail
+        code = None
+        message = None
+        if isinstance(detail, dict):
+            code = detail.get("error")
+            message = detail.get("detail") or detail.get("message")
+        elif isinstance(detail, str):
+            message = detail
+        return {
+            "type": "error",
+            "status": int(run_error.status_code),
+            "code": code,
+            "message": message or "The avatar could not finish that reply.",
+            "request_id": request_id,
+            "thread_id": thread_id,
+        }
+    error_text = f"{type(run_error).__name__}: {run_error}".lower()
+    if any(marker in error_text for marker in _VENDOR_CREDIT_EXHAUSTED_MARKERS):
+        return {
+            "type": "error",
+            "status": 503,
+            "code": "model_provider_credit_exhausted",
+            "message": (
+                "The avatar's model provider refused this reply because the "
+                "service's credit with it is used up. This is on our side, not "
+                "yours; please try again later."
+            ),
+            "request_id": request_id,
+            "thread_id": thread_id,
+        }
+    return {
+        "type": "error",
+        "status": 500,
+        "code": "turn_failed",
+        "message": "The avatar could not finish that reply. Please try again.",
+        "request_id": request_id,
+        "thread_id": thread_id,
+    }
+
+
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -1514,6 +1582,21 @@ async def message_graph_sse(
             )
         )
         raise
+    except Exception as run_error:  # noqa: BLE001 - reported to the client below
+        # The run failed after the response had begun: the model vendor
+        # refusing for want of credit, a metering call inside the loop refused
+        # with 402, the graph raising. A 200 and some frames are already on the
+        # wire, so there is no status code left to say why. Raising here would
+        # cut the connection with no terminating chunk, and the browser reports
+        # that as a network error with no reason attached — the client showed
+        # "the response stream ended unexpectedly" for a spent credit balance.
+        # Say why in a last ``error`` frame and end the stream cleanly instead.
+        logger.exception(
+            "Message turn %s on thread %s failed mid-stream", request_id, thread_id
+        )
+        pump.cancel()
+        yield f"data: {json.dumps(_stream_error_frame(run_error, request_id=request_id, thread_id=thread_id), default=str)}\n\n"
+        return
     finally:
         if turn_registry is not None:
             turn_registry.unregister(request_id)
@@ -6582,9 +6665,32 @@ async def process_files_for_message(
         try:
             content = await file.read()
             filename = file.filename or "unknown_file"
-            content_type = file.content_type or ""
+            # The bytes decide what the attachment is, not the client's
+            # declaration: a WebP picture arrives declared
+            # ``application/octet-stream`` from any client whose extension
+            # table lacks ``.webp``, and routing that by the declaration would
+            # drop the picture into the "other file types" line below, leaving
+            # the avatar to answer from the filename alone.
+            content_type = effective_upload_mime_type(file.content_type or "", content)
 
             if content_type.startswith("image/"):
+                # The picture is prepared the same way an identity upload is:
+                # the bytes are checked against the still-image types, and a
+                # HEIC photo, an AVIF export, a TIFF scan or a BMP is
+                # transcoded here so the model receives a format it reads. A
+                # picture that cannot be prepared is described in words rather
+                # than failing the whole turn, so the avatar can say what
+                # happened instead of the person's message disappearing.
+                try:
+                    content_type, content = prepare_still_image_upload(
+                        content_type, content
+                    )
+                except HTTPException as unreadable_image:
+                    text_contents.append(
+                        f"[Image: {filename} - could not be read: "
+                        f"{unreadable_image.detail}]"
+                    )
+                    continue
                 base64_image = base64.b64encode(content).decode("utf-8")
                 image_url = f"data:{content_type};base64,{base64_image}"
 
@@ -6692,10 +6798,15 @@ async def _remember_turn_attachments_for_identity_tool(
         attachments.append(
             TurnAttachment(
                 filename=upload.filename,
-                mime_type=(upload.content_type or "application/octet-stream")
-                .split(";")[0]
-                .strip()
-                .lower(),
+                # Resolved against the bytes for the same reason the message
+                # content is: the identity tool tells the model what it may
+                # learn from, and a WebP picture declared
+                # ``application/octet-stream`` must be offered as the image
+                # it is.
+                mime_type=effective_upload_mime_type(
+                    upload.content_type or "application/octet-stream", content
+                )
+                or "application/octet-stream",
                 content=content,
             )
         )
@@ -7931,13 +8042,33 @@ class MessageFeedbackRequest(BaseModel):
 MESSAGE_FEEDBACK_TYPES = ("like", "dislike", "rating", "comment", "feels_real", "feels_fake")
 
 
+def _feedback_langgraph_headers(request: Request, current_user: dict) -> dict:
+    """The LangGraph credential for reading the rated thread back.
+
+    A signed-in caller reads with the caller's own key; an anonymous visitor
+    (a shared avatar chat) reads with the anonymous key, the same key the
+    visitor's turns were run under.
+    """
+    api_key = current_user.get("API_KEY") if isinstance(current_user, dict) else None
+    if not api_key:
+        api_key = getattr(
+            getattr(request.app.state, "context", None), "anonymous_api_key", None
+        )
+    return {"API-KEY": api_key} if api_key else {}
+
+
 @app.post("/message_feedback")
 async def record_message_feedback_route(
     request: Request,
     feedback: MessageFeedbackRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Record the conversation partner's reaction to one avatar reply.
+
+    Open to anonymous visitors as well as signed-in users: a visitor chatting
+    with a shared avatar is identified by the same hashed address the
+    visitor's turns run under, so the visitor's ratings, notes, and learned
+    preferences follow the visitor across conversations with that avatar.
 
     ``feedback_type`` is ``like`` or ``dislike`` (a thumb), ``rating`` (with
     ``rating`` on a 1-5 scale; 3 and above counts as positive), ``comment``
@@ -7994,7 +8125,7 @@ async def record_message_feedback_route(
     # request id, or only the quoted text) is still filed under the stored
     # id when the thread can name the reply, so the rating comes back on the
     # reply after a reload; stored replies carry no request id to match on.
-    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    langgraph_client_headers = _feedback_langgraph_headers(request, current_user)
     resolved_reply: tuple[dict | None, dict | None] | None = None
     if message_id is None and thread_id:
         resolved_reply = await _resolve_rated_reply(
@@ -8092,9 +8223,12 @@ async def record_message_feedback_route(
 async def get_avatar_preferences_route(
     assistant_id: str,
     thread_id: str | None = None,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     """Everything this caller has told one avatar through ratings and notes.
+
+    Open to anonymous visitors as well as signed-in users (see
+    ``record_message_feedback_route``).
 
     ``message_feedback`` lists the thumbs and notes on replies (narrowed to
     one thread when ``thread_id`` is given); ``ambient_decisions`` lists the
@@ -8413,14 +8547,64 @@ async def _apply_inline_message_feedback(
     )
 
 
-ALLOWED_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+# Still images the platform accepts from a person. The first four are the ones
+# every model vendor reads directly; the rest are what phones and design tools
+# actually produce (an iPhone photo is HEIC, a modern export is AVIF, a scan is
+# TIFF), and they are transcoded on the way in by
+# ``transcode_still_image_to_model_readable`` so no reader downstream has to
+# know about them.
+MODEL_READABLE_IMAGE_MIMES = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
+TRANSCODED_IMAGE_MIMES = frozenset(
+    {"image/heic", "image/heif", "image/avif", "image/bmp", "image/tiff"}
+)
+ALLOWED_IMAGE_MIMES = MODEL_READABLE_IMAGE_MIMES | TRANSCODED_IMAGE_MIMES
+
+# Spellings of the same still image formats that clients and web servers send.
+# Each name on the left is the same bytes as the name on the right, so they are
+# folded together before anything is decided from the declaration.
+_IMAGE_MIME_ALIASES = {
+    "image/jpg": "image/jpeg",
+    "image/pjpeg": "image/jpeg",
+    "image/x-png": "image/png",
+    "image/x-bmp": "image/bmp",
+    "image/x-ms-bmp": "image/bmp",
+    "image/tif": "image/tiff",
+    "image/x-tiff": "image/tiff",
+    "image/x-heic": "image/heic",
+    "image/heic-sequence": "image/heic",
+    "image/x-heif": "image/heif",
+    "image/heif-sequence": "image/heif",
+    "image/avif-sequence": "image/avif",
+    "image/x-avif": "image/avif",
+}
 
 
 def normalize_declared_image_mime(ct: str) -> str:
     ct = (ct or "").split(";")[0].strip().lower()
-    if ct == "image/jpg":
-        return "image/jpeg"
-    return ct
+    return _IMAGE_MIME_ALIASES.get(ct, ct)
+
+
+# The ``ftyp`` brands that make an ISO base media file a still picture rather
+# than a movie. ``heic``/``heix``/``hevc``/``hevx`` are HEVC-coded photos,
+# ``mif1``/``msf1`` are the generic HEIF forms an iPhone also writes, and
+# ``avif``/``avis`` are the AV1-coded ones; every other brand (``isom``,
+# ``mp42``, ``qt  ``...) stays video.
+_ISO_BASE_MEDIA_BRAND_MIMES = {
+    b"heic": "image/heic",
+    b"heix": "image/heic",
+    b"heim": "image/heic",
+    b"heis": "image/heic",
+    b"hevc": "image/heic",
+    b"hevx": "image/heic",
+    b"hevm": "image/heic",
+    b"hevs": "image/heic",
+    b"mif1": "image/heif",
+    b"msf1": "image/heif",
+    b"avif": "image/avif",
+    b"avis": "image/avif",
+}
 
 
 def _sniff_media_category_from_bytes(chunk: bytes) -> Optional[str]:
@@ -8435,6 +8619,10 @@ def _sniff_media_category_from_bytes(chunk: bytes) -> Optional[str]:
         return "image/gif"
     if chunk[:4] == b"RIFF" and len(chunk) >= 12 and chunk[8:12] == b"WEBP":
         return "image/webp"
+    if chunk[:2] == b"BM":
+        return "image/bmp"
+    if chunk[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
+        return "image/tiff"
     if chunk[:4] == b"%PDF":
         return "application/pdf"
     if chunk[:3] == b"ID3" or chunk[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
@@ -8446,8 +8634,53 @@ def _sniff_media_category_from_bytes(chunk: bytes) -> Optional[str]:
     if chunk[:4] == b"\x1a\x45\xdf\xa3":
         return "video/webm"
     if len(chunk) >= 12 and chunk[4:8] == b"ftyp":
-        return "video/mp4"
+        # An iPhone photo and an iPhone movie are both ISO base media files;
+        # only the brand in the ``ftyp`` box says which one this is.
+        return _ISO_BASE_MEDIA_BRAND_MIMES.get(chunk[8:12], "video/mp4")
     return None
+
+
+# Content-Type values that name no media type at all. A client that cannot map
+# the filename extension sends one of these instead of admitting it does not
+# know, so a declaration in this set carries no information about the bytes.
+UNINFORMATIVE_UPLOAD_MIMES = frozenset(
+    {
+        "",
+        "application/octet-stream",
+        "binary/octet-stream",
+        "application/x-binary",
+        "application/download",
+        "application/unknown",
+    }
+)
+
+
+def effective_upload_mime_type(declared_mime: str, body: bytes) -> str:
+    """Return the media type an upload should be routed by: contents over declaration.
+
+    A multipart client derives the part's Content-Type from the filename
+    extension, and no client's extension table is complete: curl, several
+    mobile file pickers, and every library that does not guess send a
+    ``.webp`` upload as ``application/octet-stream`` while sending the same
+    picture as ``.png`` correctly. Routing by the declaration alone therefore
+    drops WebP images that are perfectly readable, so the magic bytes decide
+    whenever the declaration is uninformative or names a different category
+    than the bytes (``text/plain`` for a WebP). A declaration that agrees with
+    the bytes on the category is kept as sent, so a QuickTime recording stays
+    ``video/quicktime`` instead of being flattened to the sniffer's coarser
+    ``video/mp4``.
+    """
+    declared_upload_mime = normalize_declared_image_mime(declared_mime)
+    sniffed_upload_mime = normalize_declared_image_mime(
+        _sniff_media_category_from_bytes(body[:512]) or ""
+    )
+    if not sniffed_upload_mime:
+        return declared_upload_mime
+    if declared_upload_mime in UNINFORMATIVE_UPLOAD_MIMES:
+        return sniffed_upload_mime
+    if declared_upload_mime.split("/")[0] != sniffed_upload_mime.split("/")[0]:
+        return sniffed_upload_mime
+    return declared_upload_mime
 
 
 def _gif_image_descriptor_count(data: bytes) -> int:
@@ -8530,8 +8763,7 @@ def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
                 status_code=400,
                 detail=(
                     f"File contents are {sniffed_image_mime!r}, which is not an "
-                    "allowed still image; allowed: image/jpeg, image/png, "
-                    "image/gif (non-animated), image/webp."
+                    "allowed still image; allowed: image/jpeg, image/png, image/gif (non-animated), image/webp (non-animated), image/heic, image/heif, image/avif, image/bmp, image/tiff."
                 ),
             )
         if declared_image_mime not in ("", "application/octet-stream") and (
@@ -8557,7 +8789,7 @@ def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
                 status_code=400,
                 detail=(
                     f"Image type not allowed (got {declared_image_mime!r}); "
-                    "allowed: image/jpeg, image/png, image/gif (non-animated), image/webp."
+                    "allowed: image/jpeg, image/png, image/gif (non-animated), image/webp (non-animated), image/heic, image/heif, image/avif, image/bmp, image/tiff."
                 ),
             )
         mime = declared_image_mime
@@ -8571,6 +8803,86 @@ def validate_upload_image_bytes(declared_mime: str, body: bytes) -> str:
             status_code=400, detail="Animated WebP is not allowed; use a still image."
         )
     return mime
+
+
+def transcode_still_image_to_model_readable(
+    mime: str, body: bytes
+) -> tuple[str, bytes]:
+    """Return ``(mime, bytes)`` in a format every model vendor can read.
+
+    The image formats a person actually has are wider than the four formats the
+    vision models accept: an iPhone photo is HEIC, a modern web export is AVIF,
+    a scan is TIFF, a screenshot pasted out of an old tool is BMP. Rejecting
+    those asks the person to go and convert their own picture, so they are
+    decoded here once, at the edge, and everything downstream — the description
+    model, the reference-portrait store, the emotion-media vendor — only ever
+    sees JPEG, PNG, GIF or WebP.
+
+    Transparency decides the target: an image carrying an alpha channel becomes
+    PNG so the transparent parts do not turn black, and everything else becomes
+    JPEG, which is far smaller than PNG for a photograph. A frame is taken from
+    a sequence (a Live Photo, an animated AVIF) because a still is what the
+    identity pipeline reads.
+    """
+    import io
+
+    if mime in MODEL_READABLE_IMAGE_MIMES:
+        return mime, body
+
+    from PIL import Image
+
+    if mime in ("image/heic", "image/heif"):
+        try:
+            import pillow_heif
+        except ImportError as heif_support_missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "HEIC/HEIF images cannot be read by this deployment "
+                    "(pillow-heif is not installed). Please upload the photo as "
+                    "JPEG, PNG or WebP."
+                ),
+            ) from heif_support_missing
+        pillow_heif.register_heif_opener()
+
+    try:
+        with Image.open(io.BytesIO(body)) as opened_image:
+            opened_image.load()
+            keeps_transparency = opened_image.mode in ("RGBA", "LA", "PA") or (
+                "transparency" in opened_image.info
+            )
+            converted_image = opened_image.convert(
+                "RGBA" if keeps_transparency else "RGB"
+            )
+    except Exception as undecodable_image:  # noqa: BLE001 - a client error
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"The {mime} image could not be read. Please upload the picture "
+                "as JPEG, PNG or WebP."
+            ),
+        ) from undecodable_image
+
+    rewritten = io.BytesIO()
+    if keeps_transparency:
+        converted_image.save(rewritten, format="PNG", optimize=True)
+        return "image/png", rewritten.getvalue()
+    converted_image.save(rewritten, format="JPEG", quality=90, optimize=True)
+    return "image/jpeg", rewritten.getvalue()
+
+
+def prepare_still_image_upload(declared_mime: str, body: bytes) -> tuple[str, bytes]:
+    """Validate one uploaded still image and return bytes a model can read.
+
+    The single entry point every image upload goes through: the magic bytes
+    decide the type, an animated GIF or WebP is refused, and a format no model
+    vendor reads is transcoded. Callers store and forward the returned bytes,
+    not the ones the person sent, so the declared type, the stored type and the
+    bytes always agree.
+    """
+    return transcode_still_image_to_model_readable(
+        validate_upload_image_bytes(declared_mime, body), body
+    )
 
 
 async def probe_remote_url_content_type(url: str) -> str:
@@ -9865,9 +10177,10 @@ async def add_avatar_voice_sample(
     from src.anubis.utils.utility import isolate_dominant_speaker_audio_b64
     from src.anubis.utils.voice.corpus import add_voice_clip, voice_status_for
     from src.anubis.utils.voice.reference_audio import (
-        read_reference_audio,
+        read_usable_reference_audio,
         store_reference_audio,
     )
+    from src.anubis.utils.voice.reference_eligibility import reference_clip_rejection
 
     repository = _voice_repository_or_503()
     enforce_tier_capability(current_user, TierCapability.UPLOAD)
@@ -9922,7 +10235,10 @@ async def add_avatar_voice_sample(
     # first take supplies it when nothing has been stored yet. The helper
     # stores a listable Document under the same filename as the clip above so
     # the document list can show which recording is the reference.
-    if await read_reference_audio(app.state.store, user_id, assistant_id) is None:
+    stored_anchor, _anchor_problem = await read_usable_reference_audio(
+        app.state.store, user_id, assistant_id, context=app.state.context
+    )
+    if stored_anchor is None:
         try:
             anchor = await isolate_dominant_speaker_audio_b64(
                 data_uri,
@@ -9931,18 +10247,42 @@ async def add_avatar_voice_sample(
                 content_type=mime_type,
                 reference_audio=True,
             )
-            await store_reference_audio(
-                app.state.store,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                audio_data_uri=anchor.get("audio_base64_preprocessed") or "",
-                transcript_text=anchor.get("text") or "",
-                filename=sample_filename,
-                namespace_filename=_namespace_safe_formatted_filename(sample_filename),
+            # A take the isolation could not cut a single-speaker clip from is
+            # not stored: an anchor the diarizer rejects is worse than no anchor,
+            # because every later upload then fails to label anyone.
+            anchor_rejection = reference_clip_rejection(
+                audio_data_uri=anchor.get("audio_base64_preprocessed"),
+                transcript_text=anchor.get("text"),
                 duration_seconds=anchor.get("duration"),
-                source="recorder",
-                replace=False,
+                maximum_seconds=getattr(
+                    app.state.context, "reference_audio_clip_max_seconds", None
+                ),
+                minimum_seconds=getattr(
+                    app.state.context, "reference_audio_minimum_seconds", None
+                ),
             )
+            if anchor_rejection is not None:
+                logger.info(
+                    "No diarizer reference stored from %s for %s: %s",
+                    sample_filename,
+                    assistant_id,
+                    anchor_rejection,
+                )
+            else:
+                await store_reference_audio(
+                    app.state.store,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    audio_data_uri=anchor.get("audio_base64_preprocessed") or "",
+                    transcript_text=anchor.get("text") or "",
+                    filename=sample_filename,
+                    namespace_filename=_namespace_safe_formatted_filename(
+                        sample_filename
+                    ),
+                    duration_seconds=anchor.get("duration"),
+                    source="recorder",
+                    replace=False,
+                )
         except Exception:  # noqa: BLE001
             logger.debug(
                 "Could not store a diarizer reference from the recording", exc_info=True
@@ -9979,6 +10319,7 @@ async def set_avatar_voice_reference(
         voice_status_for,
     )
     from src.anubis.utils.voice.reference_audio import store_reference_audio
+    from src.anubis.utils.voice.reference_eligibility import reference_clip_rejection
 
     repository = _voice_repository_or_503()
     body = await request.json()
@@ -10021,10 +10362,19 @@ async def set_avatar_voice_reference(
             detail=f"The clip could not be prepared as a reference: {isolation_error}",
         )
     anchor_uri = anchor.get("audio_base64_preprocessed") or ""
-    if not anchor_uri or not anchor.get("duration"):
-        raise HTTPException(
-            status_code=400, detail="No usable speech was found in that upload."
-        )
+    anchor_rejection = reference_clip_rejection(
+        audio_data_uri=anchor_uri,
+        transcript_text=anchor.get("text"),
+        duration_seconds=anchor.get("duration"),
+        maximum_seconds=getattr(
+            app.state.context, "reference_audio_clip_max_seconds", None
+        ),
+        minimum_seconds=getattr(
+            app.state.context, "reference_audio_minimum_seconds", None
+        ),
+    )
+    if anchor_rejection is not None:
+        raise HTTPException(status_code=400, detail=anchor_rejection)
     await store_reference_audio(
         app.state.store,
         user_id=user_id,
@@ -10179,6 +10529,51 @@ async def retry_avatar_professional_voice(
             },
         }
     )
+
+
+@app.post("/avatar_voice/rebuild")
+async def rebuild_avatar_voice(
+    assistant_id: str = Form(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete the avatar's cloned voice and train a new one from the speech held now.
+
+    The first instant clone is otherwise final, so a voice trained from the
+    wrong speech — a clip cut from an arbitrary video, a recording of somebody
+    else, or a clone the vendor has since banned — stays the avatar's voice for
+    good. This deletes the vendor's copy and trains a replacement from the
+    clips the avatar holds at this moment, which is why deleting the uploads
+    that fed the bad voice first is how the owner chooses what the new voice is
+    trained from.
+
+    The response is the ordinary voice status. When the remaining speech is
+    below the minimum the reply simply carries no voice model: the clone is
+    then built by itself as soon as enough speech is collected again.
+    """
+    from src.anubis.utils.voice.corpus import rebuild_instant_voice, voice_status_for
+
+    repository = _voice_repository_or_503()
+    enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "rebuild that avatar's voice"
+    )
+    user_id = current_user["identities"][0]["user_id"]
+    await rebuild_instant_voice(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        avatar_name=assistant.get("name") or "",
+    )
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+        store=app.state.store,
+    )
+    return JSONResponse(status.as_dict())
 
 
 @app.post("/transcribe")
@@ -10849,8 +11244,14 @@ async def _build_media_entries_for_file(
 
     Extracted verbatim from the original single-file branch so it can run per
     file in a multi-file request. Raises ``HTTPException`` on unsupported types.
+
+    The declared type is resolved against the file's magic bytes first, so an
+    upload whose client could not name the extension (a ``.webp`` picture sent
+    as ``application/octet-stream``) is routed as the image it is rather than
+    rejected as an unsupported Content-Type.
     """
     entries: list = []
+    mime_type = effective_upload_mime_type(mime_type, content)
     if (
         not reference_image
         and not reference_audio
@@ -10911,7 +11312,7 @@ async def _build_media_entries_for_file(
                 status_code=400,
                 detail="reference_image requires an image file, not audio.",
             )
-        mime = validate_upload_image_bytes(mime_type, content)
+        mime, content = prepare_still_image_upload(mime_type, content)
         entries.append(
             {
                 "filename": raw_name,
@@ -10933,16 +11334,8 @@ async def _build_media_entries_for_file(
                 status_code=400,
                 detail="reference_audio requires an audio file, not an image.",
             )
-        sniff = _sniff_media_category_from_bytes(content[:512])
         effective = mime_type
-        if mime_type == "application/octet-stream":
-            if not sniff or not sniff.startswith("audio/"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Could not determine an audio type from the upload.",
-                )
-            effective = sniff
-        elif not mime_type.startswith("audio/") and not mime_type.startswith("video/"):
+        if not effective.startswith("audio/") and not effective.startswith("video/"):
             raise HTTPException(
                 status_code=400,
                 detail="reference_audio requires an audio or video Content-Type.",
@@ -10963,11 +11356,8 @@ async def _build_media_entries_for_file(
             }
         )
     else:
-        sniff = _sniff_media_category_from_bytes(content[:512])
-        if mime_type.startswith("image/") or (
-            mime_type == "application/octet-stream" and sniff in ALLOWED_IMAGE_MIMES
-        ):
-            mime = validate_upload_image_bytes(mime_type, content)
+        if mime_type.startswith("image/"):
+            mime, content = prepare_still_image_upload(mime_type, content)
             entries.append(
                 {
                     "filename": raw_name,
@@ -10983,19 +11373,8 @@ async def _build_media_entries_for_file(
                     else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type.startswith("audio/") or (
-            mime_type == "application/octet-stream"
-            and sniff
-            and sniff.startswith("audio/")
-        ):
-            effective = (
-                mime_type if mime_type.startswith("audio/") else (sniff or mime_type)
-            )
-            if not effective.startswith("audio/"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Expected an audio upload.",
-                )
+        elif mime_type.startswith("audio/"):
+            effective = mime_type
             entries.append(
                 {
                     "filename": raw_name,
@@ -11011,14 +11390,8 @@ async def _build_media_entries_for_file(
                     else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type.startswith("video/") or (
-            mime_type == "application/octet-stream"
-            and sniff
-            and sniff.startswith("video/")
-        ):
-            effective = (
-                mime_type if mime_type.startswith("video/") else (sniff or mime_type)
-            )
+        elif mime_type.startswith("video/"):
+            effective = mime_type
             entries.append(
                 {
                     "filename": raw_name,
@@ -11034,13 +11407,11 @@ async def _build_media_entries_for_file(
                     else _namespace_safe_formatted_filename(raw_name),
                 }
             )
-        elif mime_type == "application/pdf" or (
-            # A PDF uploaded without a usable declaration (extension-less file,
-            # or a client that sends application/octet-stream) would otherwise
-            # fall through to the plain-text branch below and be ingested as
-            # binary text. The %PDF magic is decisive, so honor it.
-            mime_type == "application/octet-stream" and sniff == "application/pdf"
-        ):
+        # A PDF uploaded without a usable declaration (extension-less file, or
+        # a client that sends application/octet-stream) resolves to
+        # application/pdf on the %PDF magic above, so it is ingested as a PDF
+        # instead of falling through to the plain-text branch as binary text.
+        elif mime_type == "application/pdf":
             effective = "application/pdf"
             entries.append(
                 {
@@ -11244,7 +11615,7 @@ async def _build_media_entries_for_url(
 
     if reference_image:
         body, header_ct = await fetch_remote_url_bytes(url_clean)
-        img_mime = validate_upload_image_bytes(header_ct, body)
+        img_mime, body = prepare_still_image_upload(header_ct, body)
         entries.append(
             {
                 "filename": url_clean,
@@ -11370,7 +11741,7 @@ async def _build_media_entries_for_url(
             )
         elif ct.startswith("image/"):
             body, header_ct = await fetch_remote_url_bytes(url_clean)
-            img_mime = validate_upload_image_bytes(header_ct, body)
+            img_mime, body = prepare_still_image_upload(header_ct, body)
             entries.append(
                 {
                     "filename": url_clean,
@@ -11832,10 +12203,10 @@ async def _start_media_batch(
     so both paths bill and run media identically. Raises ``HTTPException`` when
     the allotment or rate limit refuses the batch.
     """
-    # A reference image in this batch generates the avatar's emotion stills and
-    # idle loops, which is gated by EMOTION_MEDIA_MINIMUM_TIER. The media graph
-    # runs outside the request, so the submitter's tier travels with the run
-    # and the graph reads the tier back before spending anything at the vendor.
+    # A reference image in this batch stores the portrait only. Emotion
+    # stills and idle loops wait for POST /avatar_emotion_media/regenerate.
+    # The submitter's tier still travels with the run so an explicit
+    # generate later can read it.
     config.setdefault("configurable", {})["subscription_tier"] = resolve_tier(
         current_user
     ).value
@@ -12256,9 +12627,16 @@ async def update_avatar_identity_with_media(
     ``job_id`` immediately; progress streams from
     ``GET /media_job/{job_id}/progress``.
 
-    Images must use real MIME types: ``image/jpeg``, ``image/png``, ``image/gif`` (non-animated),
-    or ``image/webp`` (non-animated). Proprietary vs biographical classification is done inside
-    the processing pipeline via structured model output (no ``proprietary_content`` flag).
+    Images are identified by their own bytes, not by the Content-Type the client
+    declares (a client with no ``.webp`` or ``.heic`` row in its extension table
+    sends ``application/octet-stream``). Accepted still images are ``image/jpeg``,
+    ``image/png``, ``image/gif`` (non-animated), ``image/webp`` (non-animated),
+    ``image/heic``, ``image/heif``, ``image/avif``, ``image/bmp`` and
+    ``image/tiff``; the last five are transcoded to JPEG (or PNG when they carry
+    transparency) on the way in, so what is stored and what the models read is
+    always one of the first four. Proprietary vs biographical classification is
+    done inside the processing pipeline via structured model output (no
+    ``proprietary_content`` flag).
 
     With **reference_image=true** or **reference_audio=true** the request must carry
     **exactly one** file or URL (a reference clip/image is a single item): the file

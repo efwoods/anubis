@@ -6,7 +6,7 @@ import re
 import uuid
 from dataclasses import dataclass
 
-from langchain.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langchain_core.documents import Document
 from langchain_core.messages import ToolMessage
@@ -205,12 +205,26 @@ async def create_episodic_memory(  # EPISODIC MEMORY CREATION IN NAMESPACE (USER
         assistant_identity_memory_document.to_json()
     )
 
-    await runtime.store.aput(
-        assistant_memory_namespace,
-        key=identity_id,
-        value={"document": assistant_identity_memory_document_json},
-    )
     tool_call_id = runtime.tool_call_id
+    if not await _put_fact_document_and_confirm(
+        runtime.store,
+        assistant_memory_namespace,
+        identity_id,
+        {"document": assistant_identity_memory_document_json},
+    ):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{document_metadata["fact"]}" could not be saved '
+                            "to the memory store. Tell the user it was not saved."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
     update = {
         "recalled_memory_documents": [assistant_identity_memory_document],
         "messages": [
@@ -336,55 +350,252 @@ def _latest_user_message_text(messages: object) -> str:
     return ""
 
 
+def _assistant_message_before_latest_user_message(messages: object) -> str:
+    """Return what the assistant last SAID before the user's most recent message (else "").
+
+    ``_user_message_grounds_fact`` needs the assistant's own previous reply to tell a user
+    ASSERTING a fact apart from a user merely repeating back something the avatar already
+    said. The scan starts at the latest ``HumanMessage`` and walks backwards to the nearest
+    ``AIMessage`` carrying text, so the tool-calling ``AIMessage`` that triggered this very
+    turn (empty content, only tool calls) is never mistaken for the assistant's reply.
+    """
+    message_list = list(messages or [])
+    latest_user_message_index = None
+    for index in range(len(message_list) - 1, -1, -1):
+        if isinstance(message_list[index], HumanMessage):
+            latest_user_message_index = index
+            break
+    if latest_user_message_index is None:
+        return ""
+    for index in range(latest_user_message_index - 1, -1, -1):
+        message = message_list[index]
+        if isinstance(message, AIMessage):
+            assistant_message_text = _extract_message_text(message.content).strip()
+            if assistant_message_text:
+                return assistant_message_text
+    return ""
+
+
+def _assistant_name_from_config(config: object) -> str:
+    """Return the name of the person the avatar reconstructs (else "").
+
+    The user routinely refers to the avatar in the THIRD person by that person's own name
+    ("Dr. Jane Goodall died at the age of 91"), while the proposed fact is stored in the
+    first person ("I died at the age of 91"). Without the name, the grounding check below
+    reads that as a fact about somebody else and refuses a fact the user plainly shared.
+    """
+    configurable = {}
+    if isinstance(config, dict):
+        configurable = config.get("configurable") or {}
+    assistant_ctx = configurable.get("assistant_ctx") or {}
+    if isinstance(assistant_ctx, dict):
+        assistant_name = assistant_ctx.get("name")
+    else:
+        assistant_name = getattr(assistant_ctx, "name", None)
+    return str(assistant_name or "").strip()
+
+
+_QUOTE_MATCH_NON_WORD_CHARACTERS = re.compile(r"[^a-z0-9]+")
+
+
+def _quote_is_present_in_user_message(quote: str, user_message_text: str) -> bool:
+    """Return whether ``quote`` really is a span of ``user_message_text``.
+
+    The verifying model is asked for the verbatim span of the user's message that carries the
+    proposed fact, and this checks that claim rather than trusting it. Casing, punctuation, and
+    whitespace are normalized away so an ordinary transcription difference ("October 1, 2025"
+    quoted as "october 1 2025") still matches, while a span the message does not contain — the
+    signature of a fact carried over from an earlier turn — does not.
+    """
+    normalized_quote = _QUOTE_MATCH_NON_WORD_CHARACTERS.sub(
+        " ", (quote or "").lower()
+    ).strip()
+    if not normalized_quote:
+        return False
+    normalized_user_message = _QUOTE_MATCH_NON_WORD_CHARACTERS.sub(
+        " ", (user_message_text or "").lower()
+    ).strip()
+    return normalized_quote in normalized_user_message
+
+
 class _UserMessageGroundsFact(BaseModel):
-    """Whether the user's most recent message is the actual source of a proposed identity fact.
+    """Where a proposed identity fact came from: the user's most recent message, or elsewhere.
 
     Guards ``update_self_identity_mem_from_user_txt`` against learning facts the avatar surfaced
     from its own retrieved consciousness (identity/quote transcripts injected into the system
-    prompt) or from earlier in the conversation, rather than from something the user just shared.
+    prompt), from its own previous reply, or from earlier in the conversation, rather than from
+    something the user just shared.
+
+    The verdict is DECOMPOSED into separate judgements the caller combines, rather than asked as
+    a single boolean. The classification model is a small one, and a single "did the user assert
+    this?" boolean made it collapse distinct failures together — refusing a fact the user stated
+    in the third person by the avatar's own name, and accepting the avatar's own words quoted
+    back by the user. Naming each decision separately keeps them stable.
+
+    ``supporting_quote_from_user_message`` is the load-bearing one, because a classification
+    alone cannot be trusted: when the user's most recent message asserts ANY fact, the model
+    reads the message as "the user is telling me things" and waves through a DIFFERENT fact it
+    surfaced from earlier in the conversation, which is the exact leak this guard exists to
+    stop. Demanding the verbatim span that carries the information turns the verdict into a
+    claim the caller can CHECK against the message itself — a fact from an earlier turn has no
+    span to quote, so it cannot be smuggled in behind a fact that does.
     """
 
-    user_asserted_the_fact: bool = Field(
+    proposed_fact_kind: Literal[
+        "identity_fact", "request_about_building_the_avatar"
+    ] = Field(
         description=(
-            "True ONLY if the user's most recent message itself states/shares this fact about "
-            "the assistant — i.e. the information the fact was derived from is present in that "
-            "message. False if the message merely ASKS about, requests, or mentions the topic "
-            "without asserting it, or if the fact could only have come from retrieved documents, "
-            "a transcript, the assistant's own words, or an earlier message."
+            "Classify the proposed fact using the `proposed_fact_kind` rules in the "
+            "system prompt."
+        )
+    )
+    supporting_quote_from_user_message: str = Field(
+        default="",
+        description=(
+            "The span of USER_MESSAGE that carries the information in PROPOSED_FACT, copied "
+            "VERBATIM from USER_MESSAGE — the caller verifies this really is part of that "
+            "message. Empty when no span of USER_MESSAGE carries that information."
+        ),
+    )
+    user_message_role: Literal[
+        "states_the_information",
+        "asks_or_requests_only",
+        "repeats_what_the_assistant_already_said",
+        "social_remark_only",
+    ] = Field(
+        description=(
+            "Classify the user's most recent message using the `user_message_role` rules in "
+            "the system prompt, checking those four values in the order they are listed there "
+            "and choosing the first that applies."
         )
     )
     reason: str = Field(description="One short sentence explaining the decision.")
 
 
-_FACT_GROUNDING_SYSTEM_PROMPT = """You are a strict gatekeeper deciding whether a proposed \
-fact about the ASSISTANT was actually shared by the user in their MOST RECENT message.
+_FACT_GROUNDING_SYSTEM_PROMPT = """You classify where a proposed fact about an AI avatar came \
+from. The avatar is an AI reconstruction of a real person, and it may only learn facts the user \
+states in the user's own most recent message.
 
 You are given:
+- ASSISTANT_NAME: the name of the person the assistant is an avatar of.
+- ASSISTANT_PREVIOUS_MESSAGE: the assistant's own message immediately before USER_MESSAGE.
 - USER_MESSAGE: the user's most recent message, verbatim.
 - PROPOSED_FACT: a first-person fact about the assistant that another component wants to store.
 
-Set `user_asserted_the_fact` true ONLY when USER_MESSAGE itself contains the information the \
-PROPOSED_FACT was derived from — the user is telling the assistant this is true about it.
+HOW THE USER REFERS TO THE ASSISTANT
+The user may refer to the assistant in the second person ("you", "your"), or by ASSISTANT_NAME \
+in the third person (a full name, surname, first name, nickname, or title, with or without an \
+honorific). A statement about ASSISTANT_NAME is a statement about the assistant. Example: when \
+ASSISTANT_NAME is "Dr. Jane Goodall", the message "Jane Goodall was born in London" states a \
+fact about the assistant.
 
-Set it false when:
-- USER_MESSAGE only ASKS about, requests, or mentions the topic (e.g. "tell me about X", \
-"spell your name", "how does Y affect you?") without asserting the fact.
-- The fact could only have come from retrieved documents, a transcript, the assistant's own \
-prior statements, or an earlier message — not from THIS message.
-- USER_MESSAGE does not contain the specific information in the fact at all.
+COMPARE INFORMATION, NOT GRAMMAR
+PROPOSED_FACT has already been rewritten into the first person on purpose. A difference in \
+grammatical person, pronouns, or naming between USER_MESSAGE and PROPOSED_FACT never matters. \
+Judge only where the INFORMATION came from.
 
-A question or request is never an assertion. When in doubt, answer false.
+Set `proposed_fact_kind`:
+- "request_about_building_the_avatar" when PROPOSED_FACT is not a claim about the person at \
+all, but a request, instruction, goal, or preference about how the AI avatar product should \
+behave, sound, be integrated, or be built — for example "I want you to sound authentic like \
+Shivon Zilis", "I should be integrated with social media applications", "I should analyze the \
+user's personal data". These sentences are about the software the user wants, and they are \
+always addressed to the avatar as work to do.
+- "identity_fact" when PROPOSED_FACT is a claim about the person — anything they are, were, \
+did, own, feel, believe, value, fear, or anyone they are related to. Every statement about the \
+person's life, past actions, body, work, or death is this kind, no matter how ordinary the \
+action is: "I have twins", "I died at the age of 91", "My favorite color is blue", "I picked up \
+my glasses before seeing a movie", "I began studying chimpanzees in 1960".
+
+When PROPOSED_FACT describes something the person did or something that is true of them, choose \
+"identity_fact". Choose "request_about_building_the_avatar" only for instructions about the \
+avatar product itself.
+
+Set `user_message_role` to the ONE value that describes USER_MESSAGE with respect to \
+PROPOSED_FACT. Check the four values in the order listed below and choose the FIRST one that \
+applies:
+- "repeats_what_the_assistant_already_said": the information in PROPOSED_FACT is already \
+present in ASSISTANT_PREVIOUS_MESSAGE, and USER_MESSAGE only quotes it, questions it, agrees \
+with it, or repeats it back. The assistant is the source, not the user. Example: \
+ASSISTANT_PREVIOUS_MESSAGE says "I believe consciousness survives beyond death" and \
+USER_MESSAGE is "why do you say that? believe consciousness survives beyond death".
+- "asks_or_requests_only": USER_MESSAGE asks about, requests, or merely mentions the topic \
+without stating the information — "tell me about X", "spell your name", "what do you remember \
+about Gombe?", "how does Y affect you?". A request that CARRIES the information is NOT this \
+value. When USER_MESSAGE is an imperative such as "remember that ...", "learn that ...", "know \
+that ...", "note that ...", or "I want you to learn the following about yourself: ...", strip \
+the imperative wrapper and read what follows it: that remainder is the user stating the \
+information, so the message belongs under "states_the_information". "remember that you have \
+twins" states that the person has twins; "note that your favorite color is blue" states the \
+favorite color. Choose "asks_or_requests_only" only when nothing is left after the wrapper is \
+stripped — when the message asks for information instead of supplying it.
+- "social_remark_only": USER_MESSAGE is a greeting, thanks, or other conversational remark, or \
+describes only what is happening in the conversation itself — "Thank you, Dr. Goodall.", "that \
+is beautiful". Addressing the assistant by name is not stating a fact about the person.
+- "states_the_information": USER_MESSAGE itself states the information PROPOSED_FACT was \
+derived from, and it is not one of the three cases above. This includes a message that wraps \
+the information in an instruction — "I want you to learn the following about yourself: ...", \
+"remember that ...", "note that ...". Extra material USER_MESSAGE carries that PROPOSED_FACT \
+leaves out — source links, citations, other facts — does not change this.
+
+Choose "states_the_information" only when the user is genuinely the source of the information \
+in this message. When the information is absent from USER_MESSAGE, or came from the assistant, \
+retrieved documents, a transcript, or an earlier turn, choose the matching other value.
+
+QUOTE THE EVIDENCE
+Set `supporting_quote_from_user_message` to the span of USER_MESSAGE that carries the \
+information in PROPOSED_FACT, copied VERBATIM — the same characters, in the same order, as they \
+appear in USER_MESSAGE. Do not paraphrase it, do not rewrite it into the first person, and do \
+not assemble it from words that are not next to each other in USER_MESSAGE. When no span of \
+USER_MESSAGE carries that information, leave it empty and do NOT choose \
+"states_the_information".
+
+JUDGE THIS FACT, NOT THE MESSAGE
+A message that states one fact does not state every fact. USER_MESSAGE often shares something \
+real while PROPOSED_FACT is a DIFFERENT fact the avatar surfaced from earlier in the \
+conversation, and that older fact must still be refused. Example: USER_MESSAGE is "you went to \
+the University of Toronto" and PROPOSED_FACT is "I have twins" — the user is plainly telling \
+the assistant something, but nothing in that message says anything about twins, so there is no \
+span to quote and the answer is "asks_or_requests_only" or "social_remark_only", never \
+"states_the_information". Ask only whether THIS PROPOSED_FACT has a span of its own.
+
+A QUOTE IS NECESSARY BUT NOT SUFFICIENT
+Finding a span to quote does not by itself make the role "states_the_information" — it only \
+rules the role OUT when there is no span. Apply the four `user_message_role` values in their \
+listed order even when you have a quote. In particular, when the information you quoted is \
+ALREADY in ASSISTANT_PREVIOUS_MESSAGE, the user is repeating the assistant back and the role \
+stays "repeats_what_the_assistant_already_said", however exactly the words match. The user \
+saying "that is beautiful, your mother Vanne supported your love of animals" right after the \
+assistant said "I grew up in Bournemouth with my mother Vanne, who supported my love of \
+animals" is a quotable span AND an echo — it is an echo.
 """
 
 
-async def _user_message_grounds_fact(fact: str, user_message_text: str) -> bool:
+async def _user_message_grounds_fact(
+    fact: str,
+    user_message_text: str,
+    assistant_name: str = "",
+    assistant_previous_message_text: str = "",
+) -> bool:
     """Verify the user's most recent message is the source the ``fact`` was derived from.
 
     Safeguard for ``update_self_identity_mem_from_user_txt``: the model frequently "learns"
     facts it actually surfaced from its own retrieved consciousness (identity/quote documents)
     when the user merely ASKS about those topics. We re-check the proposed fact against the
     latest user message only — not retrieved context, the assistant's own messages, or earlier
-    turns. Returns True when that message asserts the fact, False otherwise.
+    turns. Returns True when that message states the fact, False otherwise.
+
+    The verifier must also QUOTE the span of the user's message that carries the fact, and that
+    quote is checked against the message here. Without it, a message that shares any real fact
+    ("you went to the University of Toronto") let the model wave through an unrelated fact from
+    earlier in the conversation ("I have twins") — the leak this guard exists to stop.
+
+    ``assistant_name`` and ``assistant_previous_message_text`` are what make the two hard cases
+    separable. Without the name, a user writing about the avatar in the third person ("Dr. Jane
+    Goodall died at the age of 91") reads as a fact about a stranger and a real fact is dropped;
+    without the previous reply, a user quoting the avatar's own words back reads as the user
+    asserting them and the avatar learns from itself. Both are optional — the check still runs,
+    just with less to go on, when either is unavailable.
 
     Fails OPEN (returns True) on an empty message or model error so transient failures never
     silently drop a genuine fact — mirrors ``_suggest_correction``'s graceful fallback.
@@ -397,11 +608,34 @@ async def _user_message_grounds_fact(fact: str, user_message_text: str) -> bool:
             [
                 SystemMessage(content=_FACT_GROUNDING_SYSTEM_PROMPT),
                 HumanMessage(
-                    content=f"USER_MESSAGE: {user_message_text}\n\nPROPOSED_FACT: {fact}"
+                    content=(
+                        f"ASSISTANT_NAME: {assistant_name or '(not provided)'}\n\n"
+                        f"ASSISTANT_PREVIOUS_MESSAGE: {assistant_previous_message_text or '(none)'}\n\n"
+                        f"USER_MESSAGE: {user_message_text}\n\n"
+                        f"PROPOSED_FACT: {fact}"
+                    )
                 ),
             ]
         )
-        return bool(result.user_asserted_the_fact)
+        if (
+            result.proposed_fact_kind != "identity_fact"
+            or result.user_message_role != "states_the_information"
+        ):
+            return False
+        # The classification alone is not enough: a message that shares one real fact makes
+        # the model read every proposed fact as shared, including one it surfaced from an
+        # earlier turn. The quoted span has to actually be in the message.
+        if not _quote_is_present_in_user_message(
+            result.supporting_quote_from_user_message, user_message_text
+        ):
+            logger.info(
+                "update_self_identity_mem_from_user_txt: refusing %r — the verifier quoted "
+                "%r, which is not in the user's most recent message",
+                fact,
+                result.supporting_quote_from_user_message,
+            )
+            return False
+        return True
     except Exception:
         logger.exception(
             "update_self_identity_mem_from_user_txt: fact-grounding check failed; allowing the fact"
@@ -759,7 +993,12 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
         """
 
         if not await _user_message_grounds_fact(
-            fact_shared_about_the_assistant_from_the_user, latest_user_message_text
+            fact_shared_about_the_assistant_from_the_user,
+            latest_user_message_text,
+            assistant_name=_assistant_name_from_config(runtime.config),
+            assistant_previous_message_text=_assistant_message_before_latest_user_message(
+                runtime.state.get("messages")
+            ),
         ):
             tool_call_id = runtime.tool_call_id
             update = {
@@ -963,13 +1202,31 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
             }
         )
 
-    await runtime.store.aput(
-        assistant_memory_namespace,
-        key=identity_id,
-        value={"document": assistant_identity_memory_document_json},
-    )
-
     tool_call_id = runtime.tool_call_id
+    if not await _put_fact_document_and_confirm(
+        runtime.store,
+        assistant_memory_namespace,
+        identity_id,
+        {"document": assistant_identity_memory_document_json},
+    ):
+        # Do NOT put the document into ``assistant_identity_documents``: state that holds a
+        # fact the store does not is exactly what makes the avatar recite something its owner
+        # cannot see or delete in avatar settings.
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{fact_shared_about_the_assistant_from_the_user}" '
+                            "could not be saved to the identity store. Tell the user the fact "
+                            "was not saved and ask them to share it again."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
+
     update = {
         "assistant_identity_documents": [assistant_identity_memory_document],
         "messages": [
@@ -1224,12 +1481,26 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
             }
         )
 
-    await runtime.store.aput(
-        user_identity_namespace,
-        key=identity_id,
-        value={"document": user_identity_document_json},
-    )
     tool_call_id = runtime.tool_call_id
+    if not await _put_fact_document_and_confirm(
+        runtime.store,
+        user_identity_namespace,
+        identity_id,
+        {"document": user_identity_document_json},
+    ):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{user_fact}" could not be saved to the store. '
+                            "Tell the user it was not saved."
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
     update = {
         "user_identity_documents": [user_identity_document],
         "messages": [
@@ -1363,6 +1634,42 @@ def _store_items_contain_fact(items, proposed_fact: str) -> bool:
     for item in items or []:
         if _normalize_fact_text(_extract_clean_fact(item)) == proposed:
             return True
+    return False
+
+
+async def _put_fact_document_and_confirm(store, namespace: tuple, key: str, value: dict) -> bool:
+    """Write one fact document and confirm it is actually readable back. True when stored.
+
+    ``store.aput`` returning cleanly is NOT proof the row landed. The store a graph node is
+    handed by ``langgraph-api`` queues writes and flushes them on a background task, so a put
+    that never flushes leaves no row while the tool goes on to report "Learned" — the avatar
+    then keeps the fact in ``assistant_identity_documents`` graph state (so it answers from it
+    for the rest of the thread and renders it into the identity block of the system prompt)
+    while the owner's settings screen, which reads the store, never shows it.
+
+    Observed on 2026-09-08: four facts taught in one turn, four ``update_self_identity_mem_from_user_txt``
+    calls that all replied "Learned", and only the last three rows in the store — nothing at all
+    was written store-wide during the first call's second.
+
+    Reading the key back turns that silent loss into something the caller can act on: one retry,
+    then an honest refusal instead of a false "Learned".
+    """
+    for attempt in (1, 2):
+        try:
+            await store.aput(namespace, key=key, value=value)
+            if await store.aget(namespace, key) is not None:
+                return True
+        except Exception:
+            logger.exception(
+                "Storing identity fact %s in %s failed on attempt %s", key, namespace, attempt
+            )
+            continue
+        logger.warning(
+            "Identity fact %s was written to %s but could not be read back (attempt %s)",
+            key,
+            namespace,
+            attempt,
+        )
     return False
 
 
@@ -2761,6 +3068,11 @@ def _research_proposal_preview(index: int, proposal: dict) -> dict:
         # What the avatar holds today, which the research disputes.
         "current_fact_content": proposal.get("existing_fact")
         or "(nothing stored yet on this point)",
+        # Whether the avatar holds anything on this point at all. A
+        # contradiction between the sources and a stored fact and a
+        # contradiction among the sources alone are different decisions, and
+        # the panel words them differently.
+        "has_stored_fact": bool(proposal.get("existing_fact")),
         "current_fact_context": proposal.get("fact_context") or "",
         "document_excerpt": "\n\n".join(excerpt_parts)[:1000],
         # The researched version, pre-filled so the owner can accept or edit it.

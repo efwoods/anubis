@@ -131,6 +131,11 @@ class VoiceStatus:
     training_started_at: str | None = None
     clips: list[dict[str, Any]] = field(default_factory=list)
     reference_audio_document: str | None = None
+    # Whether the stored reference clip can actually anchor the diarizer, and
+    # the sentence naming what is wrong when the clip cannot. The Voice panel
+    # asks the owner for a better recording on the strength of these two.
+    reference_audio_usable: bool = False
+    reference_audio_problem: str | None = None
     detail: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -364,6 +369,92 @@ async def ensure_instant_voice(
     # every status read (see _refresh_voice_safety) is what catches the rest.
     return await _refresh_voice_safety(
         repository, context, record, assistant_id=assistant_id
+    )
+
+
+async def rebuild_instant_voice(
+    repository: Any,
+    context: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    avatar_name: str = "",
+) -> dict[str, Any]:
+    """Delete the avatar's instant clone and train a new one from the corpus as it stands.
+
+    ``ensure_instant_voice`` builds the first clone and then never rebuilds, so
+    a clone trained from the wrong speech — a recording of somebody else, a clip
+    cut from an arbitrary video, speech the vendor went on to ban — is otherwise
+    the avatar's voice forever. This is the way out: the vendor's copy is
+    deleted, the stored clone is cleared along with the errors and the ban mark
+    that belonged to it, and a fresh clone is trained from the clips the avatar
+    holds now. Deleting an upload first (which removes that upload's clips) is
+    therefore how the owner chooses what the new voice is trained from.
+
+    The vendor copy is deleted before the new clone is requested, because a
+    vendor plan allows only so many voices and the old one is being replaced.
+    Should the new clone then fail, the avatar is left with no instant voice and
+    the ordinary retry on the next status read builds one.
+
+    The professional clone, its verification, and the collected clips are all
+    left exactly as they are.
+
+    Returns:
+        The stored voice record after the rebuild attempt.
+    """
+    record = await _voice_record(repository, user_id, assistant_id)
+    previous_voice_id = record.get("instant_voice_id")
+    if previous_voice_id and voice_configured(context):
+        try:
+            await elevenlabs_client.delete_voice(context, previous_voice_id)
+            logger.info(
+                "Deleted instant voice %s for %s before rebuilding",
+                previous_voice_id,
+                assistant_id,
+            )
+        except elevenlabs_client.ElevenLabsError as delete_error:
+            # A voice already gone at the vendor, or a vendor outage, must not
+            # strand the avatar with a stored id that no longer speaks. The
+            # stored clone is cleared either way and a new one is trained.
+            logger.warning(
+                "Could not delete instant voice %s for %s: %s",
+                previous_voice_id,
+                assistant_id,
+                delete_error,
+            )
+
+    record["instant_voice_id"] = None
+    record["instant_voice_seconds"] = 0.0
+    record["detail"] = {
+        key: value
+        for key, value in (record.get("detail") or {}).items()
+        # Every one of these described the clone being deleted: a transient
+        # failure to build it, and the vendor's ban on the voice it produced.
+        # Carrying them onto the next clone would either suppress the rebuild
+        # or report the new voice as banned before the vendor has judged it.
+        if key
+        not in (
+            "instant_error",
+            "instant_error_at",
+            "instant_blocked",
+            "instant_blocked_reason",
+            "instant_blocked_at",
+            "instant_safety_checked_at",
+        )
+    }
+    if previous_voice_id:
+        record["detail"]["instant_replaced_voice_id"] = previous_voice_id
+    record["detail"]["instant_rebuilt_at"] = datetime.now(tz=UTC).timestamp()
+    await repository.upsert_voice(record)
+
+    # ``ensure_instant_voice`` re-reads the record, so the cleared row above is
+    # what it sees: no clone, and the corpus as the owner has left it.
+    return await ensure_instant_voice(
+        repository,
+        context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        avatar_name=avatar_name,
     )
 
 
@@ -751,12 +842,26 @@ async def voice_status_for(
     clips = await repository.list_voice_clips(assistant_id)
     active, active_id = await resolve_active_voice_id(repository, assistant_id)
     reference_audio_document: str | None = None
+    reference_audio_usable = False
+    reference_audio_problem: str | None = None
     if store is not None:
         from src.anubis.utils.voice.reference_audio import read_reference_audio
+        from src.anubis.utils.voice.reference_eligibility import (
+            stored_reference_rejection,
+        )
 
         stored_reference = await read_reference_audio(store, user_id, assistant_id)
         if stored_reference is not None:
             reference_audio_document = stored_reference.get("filename")
+        # A row can exist and still be unable to anchor the diarizer — rows
+        # written before that was checked hold the isolation's passthrough
+        # fallback. The owner is told which of the two situations this is.
+        reference_audio_problem = stored_reference_rejection(
+            stored_reference,
+            maximum_seconds=getattr(context, "reference_audio_clip_max_seconds", None),
+            minimum_seconds=getattr(context, "reference_audio_minimum_seconds", None),
+        )
+        reference_audio_usable = reference_audio_problem is None
     return VoiceStatus(
         assistant_id=assistant_id,
         collected_seconds=collected,
@@ -789,6 +894,8 @@ async def voice_status_for(
             for clip in clips
         ],
         reference_audio_document=reference_audio_document,
+        reference_audio_usable=reference_audio_usable,
+        reference_audio_problem=reference_audio_problem,
         detail={
             k: v
             for k, v in (record.get("detail") or {}).items()

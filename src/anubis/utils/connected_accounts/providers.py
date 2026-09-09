@@ -122,6 +122,11 @@ MECHANISM_DEVICE_PAIRING = "device_pairing"
 MECHANISM_PLAID_LINK = "plaid_link"
 MECHANISM_BROWSER_SESSION = "browser_session"
 MECHANISM_URL_ONLY = "url_only"
+# The owner names a site and the connection is worked out from the site itself:
+# if it offers a Model Context Protocol server, that is the way in, and the
+# server's own dynamic client registration means no application to create and
+# no credential to paste. See ``mcp_discovery``.
+MECHANISM_SITE_DISCOVERY = "site_discovery"
 ALL_MECHANISMS = frozenset(
     {
         MECHANISM_PASSWORD,
@@ -132,13 +137,19 @@ ALL_MECHANISMS = frozenset(
         MECHANISM_PLAID_LINK,
         MECHANISM_BROWSER_SESSION,
         MECHANISM_URL_ONLY,
+        MECHANISM_SITE_DISCOVERY,
     }
 )
 
 # Mechanisms whose connect flow is a form the owner completes on the card.
 # ``url_only`` is a form too (a website address, no credential).
 FORM_MECHANISMS = frozenset(
-    {MECHANISM_PASSWORD, MECHANISM_MCP_URL, MECHANISM_URL_ONLY}
+    {
+        MECHANISM_PASSWORD,
+        MECHANISM_MCP_URL,
+        MECHANISM_URL_ONLY,
+        MECHANISM_SITE_DISCOVERY,
+    }
 )
 
 # How the card signs the owner in. Derived from the mechanism so every surface
@@ -152,6 +163,7 @@ LOGIN_MODES_BY_MECHANISM: dict[str, str] = {
     MECHANISM_PASSWORD: LOGIN_MODE_FORM,
     MECHANISM_MCP_URL: LOGIN_MODE_FORM,
     MECHANISM_URL_ONLY: LOGIN_MODE_FORM,
+    MECHANISM_SITE_DISCOVERY: LOGIN_MODE_FORM,
     MECHANISM_OAUTH: LOGIN_MODE_OAUTH_POPUP,
     MECHANISM_PLAID_LINK: LOGIN_MODE_PLAID_LINK,
     MECHANISM_BROWSER_SESSION: LOGIN_MODE_BROWSER_SESSION,
@@ -829,30 +841,32 @@ WEBSITE_PROVIDER = ConnectedAccountProvider(
 
 CUSTOM_SITE_PROVIDER = ConnectedAccountProvider(
     name="custom_site",
-    kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
-    display_name="Custom site",
+    kind=KIND_MCP_SERVER,
+    credential_mechanism=MECHANISM_SITE_DISCOVERY,
+    display_name="Any site",
     category=CATEGORY_CUSTOM,
-    summary="Sign in to any website and let the avatar use your account",
+    summary="Connect a site the way the site itself offers",
     featured=False,
     card_description=(
-        "Sign in to any website on its own login page. The avatar keeps the "
-        "signed-in session and can read and act on your account there."
+        "Name a site and the avatar works out how to reach it. A site that "
+        "runs a Model Context Protocol server needs nothing else — no "
+        "application to create, no key to paste."
     ),
     icon_key="url",
     connect_fields=(
         ConnectFieldSpec(
-            name="name",
-            label="Name",
-            placeholder="My dashboard",
-            help_text="How the avatar refers to this site in conversation.",
+            name="site_url",
+            label="Site address",
+            input_type="url",
+            placeholder="example.com",
+            help_text="The site's address. The rest is worked out from there.",
         ),
         ConnectFieldSpec(
-            name="site_url",
-            label="Sign-in page address",
-            input_type="url",
-            placeholder="https://example.com/login",
-            help_text="The page where you sign in. Opens in a window for you to sign in on.",
+            name="name",
+            label="Name",
+            placeholder="Taken from the site",
+            help_text="How the avatar refers to this site in conversation.",
+            required=False,
         ),
     ),
 )

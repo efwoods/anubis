@@ -32,6 +32,7 @@ from src.anubis.utils.connected_accounts.providers import (
     MECHANISM_OAUTH,
     MECHANISM_PASSWORD,
     MECHANISM_PLAID_LINK,
+    MECHANISM_SITE_DISCOVERY,
     MECHANISM_URL_ONLY,
     ConnectedAccountProvider,
 )
@@ -475,6 +476,57 @@ async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:
     )
 
 
+async def connect_site_by_discovery(request: ConnectRequest) -> dict[str, Any]:
+    """Connect a site the way the site itself offers, or say that it offers none.
+
+    The owner names a site; this asks the site how it wants to be reached. A
+    Model Context Protocol server is the answer whenever there is one, because
+    it needs no application registered anywhere and no credential typed into
+    Neural Nexus — the server states how to sign in and registers this client
+    itself.
+
+    Once found, the address is handed to the Model Context Protocol handler,
+    which already knows how to prove a server, ask for a sign-in, and describe
+    the tools. Discovery adds no second copy of any of that.
+    """
+    from src.anubis.utils.connected_accounts.mcp_discovery import (
+        discover_mcp_server,
+        normalize_site,
+    )
+    from src.anubis.utils.connected_accounts.providers import get_provider
+
+    site = request.text("site_url")
+    if not site:
+        raise ConnectRefused(400, "A site address is required.")
+    origin, host = normalize_site(site)
+    if not origin:
+        raise ConnectRefused(400, f"{site!r} is not a web address.")
+
+    found = await discover_mcp_server(origin, request.context)
+    if found is None:
+        raise ConnectRefused(
+            400,
+            f"{host} does not offer a Model Context Protocol server, so there "
+            "is no supported way for the avatar to use an account there. If "
+            f"{host} publishes an API key or a connector address, connect it "
+            "as a custom connector instead.",
+        )
+
+    mcp_provider = get_provider("custom_mcp") or request.provider
+    return await connect_mcp_server_account(
+        ConnectRequest(
+            provider=mcp_provider,
+            fields={
+                "server_url": found.server_url,
+                "name": request.text("name") or found.name or host,
+            },
+            assistant_id=request.assistant_id,
+            context=request.context,
+            existing_records=request.existing_records,
+        )
+    )
+
+
 async def _needs_popup_login(request: ConnectRequest) -> dict[str, Any]:
     """OAuth, Plaid Link, and browser sign-ins happen in a popup, not a form.
 
@@ -596,6 +648,7 @@ CONNECT_HANDLERS: dict[str, ConnectHandler] = {
     MECHANISM_PASSWORD: connect_password_account,
     MECHANISM_MCP_URL: connect_mcp_server_account,
     MECHANISM_URL_ONLY: connect_website,
+    MECHANISM_SITE_DISCOVERY: connect_site_by_discovery,
     MECHANISM_OAUTH: _needs_popup_login,
     MECHANISM_PLAID_LINK: _needs_popup_login,
     MECHANISM_BROWSER_SESSION: _needs_popup_login,

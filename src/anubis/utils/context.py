@@ -1959,13 +1959,24 @@ class GlobalContext:
             scalar_type = _unwrap_type_hint(field_type)
 
             if getattr(self, f.name) == f.default:
-                env_val = os.environ.get(f.name.upper(), f.default)
+                # Prefer the field's own name (ELEVENLABS_API_KEY). Fall back to
+                # the NN_ prefix some deployments use (NN_ELEVENLABS_API_KEY) so
+                # a key that is only set under NN_ still configures the field —
+                # otherwise voice speaks refuse with "Voice features are not
+                # configured" even when the avatar already has a clone.
+                env_val = os.environ.get(f.name.upper())
+                if env_val is None or (
+                    isinstance(env_val, str) and env_val.strip() == ""
+                ):
+                    env_val = os.environ.get(f"NN_{f.name.upper()}")
 
                 # An env var that is declared but left empty (e.g. `MODEL_TOKEN_LIMIT=`
                 # in .env) reads back as "" rather than being absent. Treat an
                 # empty/whitespace-only string as "unset" and keep the field default,
                 # so int("")/float("") coercion below cannot crash startup.
-                if isinstance(env_val, str) and env_val.strip() == "":
+                if env_val is None or (
+                    isinstance(env_val, str) and env_val.strip() == ""
+                ):
                     env_val = f.default
 
                 if env_val is not None:

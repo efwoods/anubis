@@ -254,6 +254,13 @@ class GlobalContext:
         },
     )
 
+    reference_audio_minimum_seconds: float = field(
+        default=1.3,
+        metadata={
+            "description": "Least seconds of the avatar speaking a reference clip must hold before the clip may anchor the diarizer. Env REFERENCE_AUDIO_MINIMUM_SECONDS."
+        },
+    )
+
     media_preprocessing_seconds_per_media_second: float = field(
         default=1.0,
         metadata={
@@ -915,14 +922,14 @@ class GlobalContext:
     emotion_media_generation_enabled: str = field(
         default="true",
         metadata={
-            "description": "Whether uploading a reference image also generates the avatar's emotion stills and idle loops. Set to false to skip generation (for example in a test environment) while keeping the rest of the media pipeline. Env EMOTION_MEDIA_GENERATION_ENABLED."
+            "description": "Whether emotion stills and idle-loop videos may be generated from the reference image. Idle-loop videos (and the stills they need) wait for POST /avatar_emotion_media/regenerate. Uploading a reference image does not generate stills. Set to false to skip generation (for example in a test environment) while keeping the rest of the media pipeline. Env EMOTION_MEDIA_GENERATION_ENABLED."
         },
     )
 
     emotion_media_minimum_tier: str = field(
         default="premium",
         metadata={
-            "description": "Lowest subscription tier whose owner may generate an avatar's emotion stills and idle loops from the reference image — free, pro, or premium (premium is the enterprise-grade tier today). A tier below this value never triggers generation on a reference-image upload and is refused by POST /avatar_emotion_media/regenerate. Env EMOTION_MEDIA_MINIMUM_TIER."
+            "description": "Lowest subscription tier whose owner may generate an avatar's emotion stills and idle loops from the explicit regenerate control — free, pro, or premium (premium is the enterprise-grade tier today). A tier below this value is refused by POST /avatar_emotion_media/regenerate. Env EMOTION_MEDIA_MINIMUM_TIER."
         },
     )
 

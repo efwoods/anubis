@@ -82,7 +82,9 @@ def test_unrecognized_bytes_fall_back_to_the_declaration():
     with pytest.raises(HTTPException):
         validate_upload_image_bytes("application/octet-stream", unknown)
     with pytest.raises(HTTPException):
-        validate_upload_image_bytes("image/tiff", unknown)
+        # SVG is a drawing the models are not given, so it stays out of the
+        # accepted still-image types even when the caller names it.
+        validate_upload_image_bytes("image/svg+xml", unknown)
 
 
 # --------------------------------------------------------------------------- #
@@ -278,3 +280,289 @@ async def test_fandom_wiki_url_is_accepted_instead_of_400(
     payload = json.loads(response.body)
     assert payload["items_accepted"] >= 1
     assert payload.get("items_rejected", 0) == 0
+
+
+# --------------------------------------------------------------------------- #
+# WebP: a client that cannot name the extension must not lose the picture
+# --------------------------------------------------------------------------- #
+
+# A still WebP: the RIFF container, the WEBP form type, and a lossy chunk tag.
+WEBP_BYTES = b"RIFF" + (512).to_bytes(4, "little") + b"WEBPVP8 " + b"\x00" * 512
+
+
+def test_webp_declared_as_octet_stream_resolves_to_webp():
+    """curl and several mobile pickers have no ``.webp`` row in their extension
+    table and send ``application/octet-stream``; the magic bytes name the type."""
+    from src.api.webapp import effective_upload_mime_type
+
+    assert effective_upload_mime_type("application/octet-stream", WEBP_BYTES) == (
+        "image/webp"
+    )
+    assert effective_upload_mime_type("", WEBP_BYTES) == "image/webp"
+    assert effective_upload_mime_type("text/plain", WEBP_BYTES) == "image/webp"
+
+
+def test_a_declaration_agreeing_with_the_bytes_is_kept_as_sent():
+    """The sniffer's category is coarser than a client's declaration, so a
+    QuickTime recording keeps ``video/quicktime`` rather than becoming mp4, and
+    a type the sniffer cannot recognize at all is left exactly as declared."""
+    from src.api.webapp import effective_upload_mime_type
+
+    quicktime = b"\x00\x00\x00\x14ftypqt  " + b"\x00" * 64
+    assert effective_upload_mime_type("video/quicktime", quicktime) == "video/quicktime"
+    assert effective_upload_mime_type("text/csv", b"a,b\n1,2\n") == "text/csv"
+
+
+@pytest.mark.asyncio
+async def test_webp_declared_as_octet_stream_builds_an_image_entry():
+    from src.api.webapp import _build_media_entries_for_file
+
+    entries = await _build_media_entries_for_file(
+        "portrait.webp",
+        WEBP_BYTES,
+        "application/octet-stream",
+        reference_image=False,
+        reference_audio=False,
+        user_id="u1",
+        assistant_id="a1",
+    )
+    assert len(entries) == 1
+    assert entries[0]["content_type"] == "image/webp"
+    assert entries[0]["base64_encoded_str"].startswith("data:image/webp;base64,")
+
+
+@pytest.mark.asyncio
+async def test_webp_reference_portrait_declared_as_octet_stream_is_accepted():
+    """The reference portrait is a single still image; a WebP the client could
+    not name is still that still image."""
+    from src.api.webapp import _build_media_entries_for_file
+
+    entries = await _build_media_entries_for_file(
+        "portrait.webp",
+        WEBP_BYTES,
+        "application/octet-stream",
+        reference_image=True,
+        reference_audio=False,
+        user_id="u1",
+        assistant_id="a1",
+    )
+    assert len(entries) == 1
+    assert entries[0]["reference_image"] is True
+    assert entries[0]["content_type"] == "image/webp"
+
+
+@pytest.mark.asyncio
+async def test_message_attachment_webp_declared_as_octet_stream_is_an_image_block():
+    """On ``POST /message/{assistant_id}`` the same WebP must reach the model as
+    an image block; routing it by the declaration alone left the avatar
+    answering from the filename."""
+    from src.api.webapp import process_files_for_message
+
+    _text, multimodal_content, image_filenames = await process_files_for_message(
+        files=[
+            _upload_file("portrait.webp", WEBP_BYTES, "application/octet-stream")
+        ],
+        message="What is in this picture?",
+    )
+    assert image_filenames == ["portrait.webp"]
+    assert multimodal_content is not None
+    image_blocks = [
+        block for block in multimodal_content if block.get("type") == "image_url"
+    ]
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["image_url"]["url"].startswith("data:image/webp;base64,")
+
+
+@pytest.mark.asyncio
+async def test_message_attachment_text_file_stays_text():
+    """Resolving the type from the bytes must not turn a document into an image:
+    the sniffer recognizes no text format, so the declaration still decides."""
+    from src.api.webapp import process_files_for_message
+
+    text_content, multimodal_content, image_filenames = (
+        await process_files_for_message(
+            files=[_upload_file("notes.txt", b"a line of notes", "text/plain")],
+            message="",
+        )
+    )
+    assert multimodal_content is None
+    assert image_filenames == []
+    assert "a line of notes" in text_content
+
+
+# --------------------------------------------------------------------------- #
+# Phone and design-tool formats: accepted, and transcoded for the model vendors
+# --------------------------------------------------------------------------- #
+
+
+def _still_image_bytes(image_format: str, *, transparent: bool = False) -> bytes:
+    """Encode a small picture in one of the formats a person actually uploads."""
+    from PIL import Image
+
+    if image_format in ("HEIF", "AVIF"):
+        pytest.importorskip("pillow_heif") if image_format == "HEIF" else None
+        if image_format == "HEIF":
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+    picture = Image.new(
+        "RGBA" if transparent else "RGB",
+        (48, 48),
+        (12, 180, 96, 128) if transparent else (12, 180, 96),
+    )
+    encoded = io.BytesIO()
+    picture.save(encoded, format=image_format)
+    return encoded.getvalue()
+
+
+def test_iso_base_media_brands_separate_photos_from_movies():
+    """HEIC, AVIF and MP4 share one container; the ``ftyp`` brand is what says
+    whether the bytes are a photograph or a movie."""
+    from src.api.webapp import _sniff_media_category_from_bytes
+
+    padding = b"\x00" * 32
+    assert (
+        _sniff_media_category_from_bytes(b"\x00\x00\x00\x1cftypheic" + padding)
+        == "image/heic"
+    )
+    assert (
+        _sniff_media_category_from_bytes(b"\x00\x00\x00\x1cftypmif1" + padding)
+        == "image/heif"
+    )
+    assert (
+        _sniff_media_category_from_bytes(b"\x00\x00\x00\x20ftypavif" + padding)
+        == "image/avif"
+    )
+    assert (
+        _sniff_media_category_from_bytes(b"\x00\x00\x00\x18ftypmp42" + padding)
+        == "video/mp4"
+    )
+    assert (
+        _sniff_media_category_from_bytes(b"\x00\x00\x00\x14ftypqt  " + padding)
+        == "video/mp4"
+    )
+
+
+def test_bmp_and_tiff_are_recognized_from_their_magic_bytes():
+    from src.api.webapp import _sniff_media_category_from_bytes
+
+    assert _sniff_media_category_from_bytes(b"BM" + b"\x00" * 64) == "image/bmp"
+    assert _sniff_media_category_from_bytes(b"II\x2a\x00" + b"\x00" * 64) == "image/tiff"
+    assert _sniff_media_category_from_bytes(b"MM\x00\x2a" + b"\x00" * 64) == "image/tiff"
+
+
+@pytest.mark.parametrize(
+    "image_format",
+    ["AVIF", "BMP", "TIFF", pytest.param("HEIF", id="HEIC")],
+)
+def test_phone_and_scanner_formats_are_transcoded_to_jpeg(image_format):
+    """A HEIC photo, an AVIF export, a BMP screenshot and a TIFF scan are all
+    accepted, and what comes back is a format every vision model reads."""
+    if image_format == "HEIF":
+        pytest.importorskip("pillow_heif")
+    from src.api.webapp import MODEL_READABLE_IMAGE_MIMES, prepare_still_image_upload
+
+    prepared_mime, prepared_bytes = prepare_still_image_upload(
+        "application/octet-stream", _still_image_bytes(image_format)
+    )
+    assert prepared_mime == "image/jpeg"
+    assert prepared_mime in MODEL_READABLE_IMAGE_MIMES
+    assert prepared_bytes.startswith(b"\xff\xd8\xff")
+
+
+def test_a_transparent_image_becomes_png_so_it_does_not_go_black():
+    """JPEG has no alpha channel, so an image that carries transparency is
+    re-encoded as PNG instead."""
+    from src.api.webapp import prepare_still_image_upload
+
+    prepared_mime, prepared_bytes = prepare_still_image_upload(
+        "image/tiff", _still_image_bytes("TIFF", transparent=True)
+    )
+    assert prepared_mime == "image/png"
+    assert prepared_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_an_already_readable_image_is_passed_through_untouched():
+    """Transcoding is only for the formats the vendors cannot read: a JPEG is
+    handed on as the very bytes the person uploaded."""
+    from src.api.webapp import prepare_still_image_upload
+
+    prepared_mime, prepared_bytes = prepare_still_image_upload("image/jpeg", JPEG_BYTES)
+    assert prepared_mime == "image/jpeg"
+    assert prepared_bytes is JPEG_BYTES
+
+
+def test_declared_image_aliases_are_folded_to_one_spelling():
+    """Clients and web servers spell these formats several ways; the bytes are
+    the same picture, so the names are folded before anything is decided."""
+    from src.api.webapp import normalize_declared_image_mime
+
+    assert normalize_declared_image_mime("image/x-ms-bmp") == "image/bmp"
+    assert normalize_declared_image_mime("IMAGE/TIF") == "image/tiff"
+    assert normalize_declared_image_mime("image/heic-sequence") == "image/heic"
+    assert normalize_declared_image_mime("image/jpg") == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_heic_photo_builds_an_image_entry_the_pipeline_can_read():
+    """An iPhone photo declared ``application/octet-stream`` becomes an entry
+    whose stored type and stored bytes are both JPEG."""
+    pytest.importorskip("pillow_heif")
+    from src.api.webapp import _build_media_entries_for_file
+
+    entries = await _build_media_entries_for_file(
+        "IMG_4821.HEIC",
+        _still_image_bytes("HEIF"),
+        "application/octet-stream",
+        reference_image=True,
+        reference_audio=False,
+        user_id="u1",
+        assistant_id="a1",
+    )
+    assert len(entries) == 1
+    assert entries[0]["content_type"] == "image/jpeg"
+    assert entries[0]["base64_encoded_str"].startswith("data:image/jpeg;base64,")
+    assert entries[0]["content"].startswith(b"\xff\xd8\xff")
+
+
+@pytest.mark.asyncio
+async def test_message_attachment_heic_photo_becomes_a_jpeg_image_block():
+    pytest.importorskip("pillow_heif")
+    from src.api.webapp import process_files_for_message
+
+    _text, multimodal_content, image_filenames = await process_files_for_message(
+        files=[
+            _upload_file(
+                "IMG_4821.HEIC",
+                _still_image_bytes("HEIF"),
+                "application/octet-stream",
+            )
+        ],
+        message="What is in this photo?",
+    )
+    assert image_filenames == ["IMG_4821.HEIC"]
+    image_blocks = [
+        block for block in multimodal_content if block.get("type") == "image_url"
+    ]
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_attached_image_is_described_not_fatal():
+    """A picture that cannot be prepared must not take the whole message down:
+    the turn still reaches the avatar, carrying a line saying what happened."""
+    from src.api.webapp import process_files_for_message
+
+    truncated_heic = b"\x00\x00\x00\x1cftypheic" + b"\x00" * 32
+    text_content, multimodal_content, image_filenames = (
+        await process_files_for_message(
+            files=[
+                _upload_file("broken.heic", truncated_heic, "application/octet-stream")
+            ],
+            message="What is in this photo?",
+        )
+    )
+    assert multimodal_content is None
+    assert image_filenames == []
+    assert "could not be read" in text_content

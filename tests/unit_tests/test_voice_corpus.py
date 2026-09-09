@@ -221,9 +221,60 @@ async def test_voice_status_lists_clips_and_the_reference_document(monkeypatch):
         store=store,
     )
     assert status.reference_audio_document == "Mom.m4a"
+    # The clip can anchor the diarizer, so the panel has nothing to warn about.
+    assert status.reference_audio_usable is True
+    assert status.reference_audio_problem is None
     assert [clip["source_document_name"] for clip in status.clips] == ["Mom.m4a"]
     assert status.clips[0]["duration_seconds"] == 12
     assert corpus.voice_seconds_by_document(status.clips) == {"Mom.m4a": 12}
+
+
+@pytest.mark.asyncio
+async def test_voice_status_reports_a_reference_that_cannot_anchor_the_diarizer(
+    monkeypatch,
+):
+    """A row can exist and still be useless to the diarizer.
+
+    Rows written before the clip was checked hold the isolation's passthrough:
+    the whole original recording, with no duration and no transcript. The Voice
+    panel asks the owner for a better upload on the strength of these fields, so
+    the presence of a row must not read as a working reference.
+    """
+    from src.anubis.utils.voice import reference_audio as reference_audio_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    store = _ReferenceStore()
+    unusable_document = reference_audio_module.build_reference_audio_document(
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        transcript_text="",
+        filename="https://www.youtube.com/@imahara",
+        namespace_filename="channel-key",
+        duration_seconds=None,
+        source="upload",
+    )
+    store.rows[
+        (
+            reference_audio_module.reference_audio_namespace(USER_ID, ASSISTANT_ID),
+            ASSISTANT_ID,
+        )
+    ] = {
+        "reference_audio_data": CLIP,
+        "document": unusable_document.to_json(),
+    }
+
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+        store=store,
+    )
+    assert status.reference_audio_document == "https://www.youtube.com/@imahara"
+    assert status.reference_audio_usable is False
+    assert status.reference_audio_problem
 
 
 @pytest.mark.asyncio
@@ -833,3 +884,185 @@ async def test_a_failed_note_does_not_break_the_refusal(monkeypatch):
     assert "voice_blocked" in response.body.decode("utf-8")
     stored = await repository.get_voice(ASSISTANT_ID)
     assert stored["detail"]["instant_blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_bad_voice_model_can_be_deleted_and_trained_again(monkeypatch):
+    """The first clone is final until the owner asks for another one.
+
+    A voice trained from the wrong speech is otherwise permanent, so the rebuild
+    deletes the vendor's copy and trains a replacement from the clips the avatar
+    holds at that moment.
+    """
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await _add(repository, _context(), 45)
+    record = await _add(repository, _context(), 30)
+    assert record["instant_voice_id"] == "ivc-1"
+
+    record = await corpus.rebuild_instant_voice(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        avatar_name="Evan",
+    )
+
+    assert vendor.deleted == ["ivc-1"]
+    assert record["instant_voice_id"] == "ivc-2"
+    # The replaced voice is remembered, so a vendor-side leftover can be traced.
+    assert record["detail"]["instant_replaced_voice_id"] == "ivc-1"
+    # The clips are the owner's to curate; the rebuild never discards them.
+    assert await repository.total_voice_seconds(ASSISTANT_ID) == 75
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_trains_only_from_the_speech_that_is_left(monkeypatch):
+    """Deleting the upload that fed a bad voice is how the new one is chosen."""
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    for name, seconds in (("Channel.m4a", 40), ("Interview.mp4", 70)):
+        await corpus.add_voice_clip(
+            repository,
+            _context(),
+            user_id=USER_ID,
+            assistant_id=ASSISTANT_ID,
+            audio_data_uri=CLIP,
+            duration_seconds=seconds,
+            source="media_upload",
+            source_document_name=name,
+            avatar_name="Evan",
+        )
+    await corpus.forget_document_clips(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        source_document_name="Channel.m4a",
+    )
+
+    record = await corpus.rebuild_instant_voice(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        avatar_name="Evan",
+    )
+
+    assert vendor.deleted == ["ivc-1"]
+    # Only the remaining upload trained the new voice.
+    assert record["instant_voice_seconds"] == 70
+    assert vendor.instant[-1] == ("Evan (instant)", 1)
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_below_the_minimum_leaves_the_avatar_with_no_voice(monkeypatch):
+    """Deleting is allowed even when too little speech is left to train again.
+
+    The ordinary collection path builds the next clone as soon as enough speech
+    is gathered, so the owner is never stuck with a voice they cannot remove.
+    """
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await _add(repository, _context(), 75)
+    await repository.delete_voice_clips_for_avatar(ASSISTANT_ID)
+
+    record = await corpus.rebuild_instant_voice(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        avatar_name="Evan",
+    )
+
+    assert vendor.deleted == ["ivc-1"]
+    assert record["instant_voice_id"] is None
+    assert record["instant_voice_seconds"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_clears_a_vendor_ban_so_a_new_voice_can_be_judged(monkeypatch):
+    """A ban belongs to the deleted voice, not to the avatar.
+
+    The ban mark suppresses speech and is never re-checked, so carrying it onto
+    the replacement would report a brand-new voice as blocked before ElevenLabs
+    has looked at it.
+    """
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await _add(repository, _context(), 75)
+    await corpus.mark_voice_blocked(repository, USER_ID, ASSISTANT_ID)
+    blocked_record = await repository.get_voice(ASSISTANT_ID)
+    assert corpus.voice_record_blocked(blocked_record)
+
+    record = await corpus.rebuild_instant_voice(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        avatar_name="Evan",
+    )
+
+    assert vendor.deleted == ["ivc-1"]
+    assert record["instant_voice_id"] == "ivc-2"
+    assert corpus.voice_record_blocked(record) is False
+
+
+@pytest.mark.asyncio
+async def test_a_vendor_that_cannot_delete_still_lets_the_owner_move_on(monkeypatch):
+    """A voice already gone at the vendor must not strand the stored clone."""
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    await _add(repository, _context(), 75)
+
+    async def failing_delete(context, voice_id):
+        raise elevenlabs_client.ElevenLabsError("voice not found")
+
+    monkeypatch.setattr(elevenlabs_client, "delete_voice", failing_delete)
+
+    record = await corpus.rebuild_instant_voice(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        avatar_name="Evan",
+    )
+
+    assert record["instant_voice_id"] == "ivc-2"
+    assert vendor.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_the_rebuild_route_returns_the_status_of_the_new_voice(monkeypatch):
+    """The owner's way out of a bad voice, end to end through the route."""
+    from src.api import webapp as webapp_module
+
+    vendor = _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(
+            context=_context(), pool=None, stripe=None, store=_ReferenceStore()
+        ),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def owned_assistant(assistant_id, current_user, action_description=""):
+        return {"name": "Evan", "metadata": {}}, {"user_id": USER_ID}
+
+    monkeypatch.setattr(
+        webapp_module, "resolve_assistant_for_creator", owned_assistant
+    )
+    await _add(repository, _context(), 75)
+    assert (await repository.get_voice(ASSISTANT_ID))["instant_voice_id"] == "ivc-1"
+
+    response = await webapp_module.rebuild_avatar_voice(
+        assistant_id=ASSISTANT_ID,
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+
+    assert vendor.deleted == ["ivc-1"]
+    body = response.body.decode("utf-8").replace(" ", "")
+    assert '"instant_voice_id":"ivc-2"' in body
+    media_repository.set_media_asset_repository(None)

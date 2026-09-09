@@ -27,7 +27,7 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.store_cache import invalidate_store_cache_entry
 from src.anubis.utils.voice.reference_audio import (
-    read_reference_audio,
+    read_usable_reference_audio,
     reference_audio_lock,
     store_reference_audio,
 )
@@ -79,151 +79,52 @@ async def _generate_emotion_media_after_reference_image(
     subscription_tier: str | None = None,
     minimum_tier: str | None = None,
 ) -> None:
-    """Build the avatar's emotion stills and idle loops from a new reference image.
+    """Drop generated stills and idle loops from a previous face.
 
-    Skipped when generation is disabled, no xAI key is configured, or no media
-    repository has been published (the dev server without the FastAPI lifespan).
-    Every failure is logged and reported through progress rather than raised:
-    the reference image itself is already stored, and an upload must not fail
-    because a vendor refused one of thirteen generations.
+    Stills and idle loops wait for an explicit regenerate from settings
+    ("Create generative reference videos"). A portrait upload stores the
+    reference image only — generating the other six stills without that
+    trigger spent at the vendor and left faces voice mode would not use.
 
-    The run is also recorded as an ``emotion_media`` job row in the media
-    repository, with each failure's ``error_code`` and ``message`` in its
-    detail, so the manifest can tell the settings screen why a loop is missing
-    long after the upload toast is gone. ``subject`` is the classified
-    reference subject and picks the prompt family; ``assessment`` is the full
-    reference assessment, and a high moderation risk in it withholds every
-    vendor call so the owner is warned instead of charged for a refusal.
+    Generated media from the previous portrait belongs to a different face.
+    Drop it even when this upload generates nothing so the old stills and
+    videos cannot keep showing against the new reference.
     """
     from src.anubis.utils.media_assets import get_media_asset_repository
     from src.anubis.utils.media_assets.repository import (
-        JOB_STATE_COMPLETED,
-        JOB_STATE_FAILED,
-        JOB_STATE_RUNNING,
+        ASSET_KIND_IDLE_LOOP,
+        ASSET_KIND_STILL,
     )
-    from src.anubis.utils.media_generation.emotion_media import (
-        emotion_media_enabled,
-        generate_emotion_media_for_avatar,
-        summarize_failures,
+
+    del (
+        context,
+        user_id,
+        reference_image_data_uri,
+        subject,
+        assessment,
+        subscription_tier,
+        minimum_tier,
     )
 
     repository = get_media_asset_repository()
-    if repository is None or not emotion_media_enabled(context):
+    if repository is None:
         logger.info(
-            "Emotion media generation skipped for %s (repository=%s, enabled=%s)",
+            "Emotion media cleanup skipped for %s (no repository)",
             assistant_id,
-            repository is not None,
-            emotion_media_enabled(context),
         )
         return
 
-    # Generating the stills and loops is billed per image and per video second
-    # at the vendor, so a tier below EMOTION_MEDIA_MINIMUM_TIER stores the
-    # reference image and generates nothing; the owner's settings screen offers
-    # the generation button once the tier permits the spend.
-    if not emotion_media_tier_allows_generation(subscription_tier, minimum_tier):
-        logger.info(
-            "Emotion media generation skipped for %s: tier %s is below the minimum %s",
+    try:
+        await repository.delete_emotion_assets_for_avatar(
             assistant_id,
-            subscription_tier,
-            minimum_tier,
+            asset_kinds=(ASSET_KIND_STILL, ASSET_KIND_IDLE_LOOP),
         )
-        _emit_media_progress(
-            "emotion_media_skipped",
-            reason="tier",
-            subscription_tier=subscription_tier,
-            required_tier=minimum_tier,
+    except Exception:  # noqa: BLE001 - stale media must not fail the upload
+        logger.debug(
+            "Could not drop stale emotion media for %s",
+            assistant_id,
+            exc_info=True,
         )
-        return
-
-    pool = getattr(repository, "pool", None)
-    job_id: str | None = None
-    try:
-        job_id = await repository.create_job(
-            user_id=user_id,
-            assistant_id=assistant_id,
-            job_kind="emotion_media",
-            state=JOB_STATE_RUNNING,
-            detail={
-                "source": "upload",
-                "only_missing": False,
-                "subject": subject,
-                "moderation_risk": (assessment or {}).get("moderation_risk"),
-                "moderation_reasons": (assessment or {}).get("moderation_reasons"),
-            },
-        )
-    except Exception:  # noqa: BLE001 - the record is a convenience, not the work
-        logger.debug("Could not record the emotion media job", exc_info=True)
-
-    async def _record_metric(
-        inference_type: str, cost_usd: float, model_name: str, request_id: str | None
-    ) -> None:
-        if pool is None:
-            return
-        from src.anubis.utils.billing.metering import persist_api_metrics_row
-
-        try:
-            await persist_api_metrics_row(
-                pool,
-                inference_type=inference_type,
-                cost_usd=cost_usd,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                model_name=model_name,
-            )
-        except Exception:  # noqa: BLE001 - metering must not fail generation
-            logger.debug("Could not record %s cost", inference_type, exc_info=True)
-
-    try:
-        manifest = await generate_emotion_media_for_avatar(
-            context,
-            repository,
-            user_id=user_id,
-            assistant_id=assistant_id,
-            reference_image_data_uri=reference_image_data_uri,
-            subject=subject,
-            assessment=assessment,
-            progress=lambda stage, fields: _emit_media_progress(stage, **fields),
-            metrics=_record_metric,
-        )
-        failures = manifest.get("failures") or []
-        if failures:
-            logger.warning(
-                "Emotion media for %s finished with %d failure(s): %s",
-                assistant_id,
-                len(failures),
-                failures,
-            )
-        if job_id is not None:
-            await repository.update_job(
-                job_id,
-                state=JOB_STATE_FAILED if failures else JOB_STATE_COMPLETED,
-                detail={
-                    "complete": manifest.get("complete"),
-                    "failures": failures,
-                    "summary": summarize_failures(failures),
-                    "subject": manifest.get("subject"),
-                    "withheld": manifest.get("withheld", False),
-                    "moderation_risk": manifest.get("moderation_risk"),
-                    "moderation_reasons": manifest.get("moderation_reasons"),
-                },
-            )
-    except Exception as generation_error:  # noqa: BLE001
-        logger.exception(
-            "Emotion media generation failed for %s: %s", assistant_id, generation_error
-        )
-        _emit_media_progress(
-            "emotion_media_complete", complete=False, error=str(generation_error)
-        )
-        if job_id is not None:
-            try:
-                await repository.update_job(
-                    job_id,
-                    state=JOB_STATE_FAILED,
-                    detail={"error": str(generation_error)},
-                )
-            except Exception:  # noqa: BLE001
-                logger.debug("Could not record the emotion media failure", exc_info=True)
 
 
 def _assistant_is_personal_avatar(config: Any) -> bool:
@@ -1496,12 +1397,10 @@ async def process_media_item_task(
                 # picked up on the next message.
                 invalidate_store_cache_entry(namespace, assistant_id)
 
-                # The reference image is the neutral emotion. Derive the other
-                # six stills and animate all seven into idle loops, persisting
-                # each as it completes so runtime is a lookup. Progress rides
-                # the same media_progress stream as the upload, and a vendor
-                # failure never fails the upload — the missing assets are
-                # reported and can be regenerated from settings.
+                # A new portrait drops stills and idle loops from the previous
+                # face. New stills and loops wait for Create generative
+                # reference videos — uploading the reference must not spend
+                # at the vendor.
                 configurable = (config or {}).get("configurable") or {}
                 await _generate_emotion_media_after_reference_image(
                     runtime.context,
@@ -1880,6 +1779,11 @@ async def process_media_item_task(
             We persist the reference audio URI under ``(user_id, assistant_id,
             "reference_audio")`` so the next non-reference upload can use it.
             """
+            from src.anubis.utils.voice.reference_eligibility import (
+                reference_clip_rejection,
+                reference_source_rejection,
+            )
+
             reference_audio = metadata.get("reference_audio", False)
             # Batch-wide "no single target": every detected speaker is the avatar.
             # Diarization still runs, but no stored reference clip is required and
@@ -1888,21 +1792,45 @@ async def process_media_item_task(
                 metadata.get("create_reference_media_from_playlist", False)
             )
             # The server decides the reference: the first audio or video upload
-            # for an avatar becomes the diarizer's reference clip. Later uploads
-            # keep the stored reference and are processed as ordinary speech.
+            # that is a single recording, and that yields a clip the diarizer can
+            # use, becomes the reference clip. Later uploads keep a usable stored
+            # reference and are processed as ordinary speech. A stored clip that
+            # cannot anchor the diarizer counts as no reference at all, so the
+            # next upload that does yield a usable clip takes the stored clip's
+            # place rather than leaving the avatar anchored to nothing.
             promoted_to_reference = False
             if not reference_audio and not create_reference_media_from_playlist:
-                stored_reference = await read_reference_audio(
-                    store, user_id, assistant_id
+                stored_reference, _stored_reference_problem = (
+                    await read_usable_reference_audio(
+                        store, user_id, assistant_id, context=runtime.context
+                    )
                 )
                 if stored_reference is None:
-                    reference_audio = True
-                    promoted_to_reference = True
-                    logger.info(
-                        "No stored reference audio for %s; promoting %s to the reference clip",
-                        assistant_id,
-                        filename,
+                    promotion_rejection = reference_source_rejection(
+                        filename=filename,
+                        url_kind=metadata.get("url_kind"),
+                        media_type=media_type,
                     )
+                    if promotion_rejection is not None:
+                        logger.info(
+                            "Not promoting %s to the reference clip for %s: %s",
+                            filename,
+                            assistant_id,
+                            promotion_rejection,
+                        )
+                        _emit_media_progress(
+                            "reference_audio_skipped",
+                            filename=filename,
+                            reason=promotion_rejection,
+                        )
+                    else:
+                        reference_audio = True
+                        promoted_to_reference = True
+                        logger.info(
+                            "No usable reference audio for %s; promoting %s to the reference clip",
+                            assistant_id,
+                            filename,
+                        )
 
             payload_uri = _full_data_uri_from_media_dict(media_item)
             audio_url = ""
@@ -1978,9 +1906,18 @@ async def process_media_item_task(
                 # Concurrent items of one batch take the avatar's lock so exactly
                 # one of them writes the reference; the others see the stored
                 # clip and continue as ordinary speech.
+                # A source that names a body of work rather than one recording
+                # can never anchor the diarizer, however the item was flagged.
+                source_rejection = reference_source_rejection(
+                    filename=filename,
+                    url_kind=metadata.get("url_kind"),
+                    media_type=media_type,
+                )
                 async with reference_audio_lock(user_id, assistant_id):
-                    existing_reference = await read_reference_audio(
-                        store, user_id, assistant_id
+                    existing_reference, _existing_problem = (
+                        await read_usable_reference_audio(
+                            store, user_id, assistant_id, context=runtime.context
+                        )
                     )
                     if existing_reference is not None:
                         logger.info(
@@ -1988,6 +1925,18 @@ async def process_media_item_task(
                             assistant_id,
                             existing_reference.get("filename"),
                             filename,
+                        )
+                    elif source_rejection is not None:
+                        logger.info(
+                            "Not storing a reference clip from %s for %s: %s",
+                            filename,
+                            assistant_id,
+                            source_rejection,
+                        )
+                        _emit_media_progress(
+                            "reference_audio_skipped",
+                            filename=filename,
+                            reason=source_rejection,
                         )
                     else:
                         transcription_dict = await isolate_dominant_speaker_audio_b64(
@@ -2005,22 +1954,53 @@ async def process_media_item_task(
                         )
                         transcription_text = transcription_dict.get("text") or ""
                         ref_duration = transcription_dict.get("duration")
-                        reference_document = await store_reference_audio(
-                            store,
-                            user_id=user_id,
-                            assistant_id=assistant_id,
+                        # When no single speaker stood out, the helper hands back
+                        # the whole original audio with no duration and no
+                        # transcript. Storing that fallback would anchor the
+                        # avatar to a clip the diarizer rejects outright, and
+                        # nothing but an explicit owner action could undo the
+                        # write, so the upload is processed as ordinary speech
+                        # and the next upload gets the chance instead.
+                        clip_rejection = reference_clip_rejection(
                             audio_data_uri=ref_payload_uri,
                             transcript_text=transcription_text,
-                            filename=filename,
-                            namespace_filename=namespace_filename,
                             duration_seconds=ref_duration,
-                            source="upload",
-                            replace=False,
-                            lock_already_held=True,
+                            maximum_seconds=getattr(
+                                runtime.context, "reference_audio_clip_max_seconds", None
+                            ),
+                            minimum_seconds=getattr(
+                                runtime.context, "reference_audio_minimum_seconds", None
+                            ),
                         )
-                        if reference_document is not None:
-                            all_documents.append(reference_document)
-                            reference_written = True
+                        if clip_rejection is not None:
+                            logger.info(
+                                "No reference clip stored from %s for %s: %s",
+                                filename,
+                                assistant_id,
+                                clip_rejection,
+                            )
+                            _emit_media_progress(
+                                "reference_audio_skipped",
+                                filename=filename,
+                                reason=clip_rejection,
+                            )
+                        else:
+                            reference_document = await store_reference_audio(
+                                store,
+                                user_id=user_id,
+                                assistant_id=assistant_id,
+                                audio_data_uri=ref_payload_uri,
+                                transcript_text=transcription_text,
+                                filename=filename,
+                                namespace_filename=namespace_filename,
+                                duration_seconds=ref_duration,
+                                source="upload",
+                                replace=False,
+                                lock_already_held=True,
+                            )
+                            if reference_document is not None:
+                                all_documents.append(reference_document)
+                                reference_written = True
 
                 if reference_written:
                     # The reference recording is also voice-clone material. The
@@ -2097,8 +2077,13 @@ async def process_media_item_task(
             if (
                 not create_reference_media_from_playlist
             ):  # Every entity is the target during create_reference_media_from_playlist
-                stored_reference = await read_reference_audio(
-                    store, user_id, assistant_id
+                # Only a usable clip is handed to the diarizer. Sending a clip
+                # outside the duration the diarizer accepts makes the whole call
+                # fail, and the failure path treats every speaker in the
+                # recording as the avatar; running unlabelled is the safer of
+                # the two outcomes.
+                stored_reference, _anchor_problem = await read_usable_reference_audio(
+                    store, user_id, assistant_id, context=runtime.context
                 )
                 if stored_reference is not None:
                     encoded_reference_audio = (
@@ -2134,6 +2119,10 @@ async def process_media_item_task(
                     )
                 )
                 return all_documents
+            # Whether the diarizer call itself failed, as opposed to running
+            # and finding one speaker. The fallback path below reads this to
+            # decide whether "this is the avatar" may be presumed at all.
+            diarization_failed = False
             try:
                 diar_response = await transcribe_audio_diarize(
                     media_base64=payload_uri,
@@ -2149,6 +2138,9 @@ async def process_media_item_task(
                     e,
                 )
                 diar_response = None
+                # A failed call resolved nobody. The fallback below must not
+                # then claim every speaker in the recording as the avatar.
+                diarization_failed = True
 
             if diar_response:
                 # DEV-only: persist the full diarized transcript (labeled speakers)
@@ -2606,7 +2598,9 @@ async def process_media_item_task(
             # No usable diarized segments: transcribe once and apply the same
             # is_target gate. Only a reference-audio upload (this upload IS the
             # target sample) is treated as the target; otherwise the speaker is
-            # unidentified and yields biographical facts only.
+            # unidentified and yields biographical facts only. When the diarizer
+            # call FAILED, nobody was resolved at all, so nothing here may be
+            # presumed to be the avatar speaking.
             # ---------------------------------------------------------------
             try:
                 fallback = await transcribe_audio(
@@ -2684,10 +2678,16 @@ async def process_media_item_task(
             # when the user has previously registered a reference audio
             # (single-speaker uploads after registration are presumed to be
             # the target — same rationale as the lone-speaker promotion in
-            # the diarized-segments branch above). The non-target identity-
-            # facts path only kicks in for unidentified-speaker uploads with
-            # no stored reference audio.
-            if reference_audio or encoded_reference_audio is not None:
+            # the diarized-segments branch above), and only when the diarizer
+            # actually ran: a call that failed resolved nobody, so presuming
+            # the target there would write every speaker in a multi-speaker
+            # recording into the avatar's own words. The non-target identity-
+            # facts path takes unidentified-speaker uploads, uploads with no
+            # stored reference audio, and any recording the diarizer could not
+            # read at all.
+            if not diarization_failed and (
+                reference_audio or encoded_reference_audio is not None
+            ):
                 documents = await process_text_to_document(
                     metadata=transcript_media_item["metadata"],
                     user_id=user_id,

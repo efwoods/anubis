@@ -105,6 +105,7 @@ def test_a_contradiction_renders_in_the_correction_panel_shape():
     ):
         assert field in preview, field
     assert preview["current_fact_content"] == "I was born in Toronto."
+    assert preview["has_stored_fact"] is True
     assert preview["suggested_edit_fact_content"] == "I was born in Ottawa."
     # Nobody but the owner can say which version is true, so nothing is
     # pre-selected and a dismissed panel changes nothing.
@@ -118,3 +119,6 @@ def test_a_proposal_with_nothing_stored_still_reads_sensibly():
     preview = _research_proposal_preview(1, {"fact_id": "f", "fact": "I sail."})
     assert preview["current_fact_content"] == "(nothing stored yet on this point)"
     assert preview["suggested_edit_fact_content"] == "I sail."
+    # The panel words a contradiction against a stored fact differently from a
+    # contradiction among the sources alone, so it is told which this is.
+    assert preview["has_stored_fact"] is False

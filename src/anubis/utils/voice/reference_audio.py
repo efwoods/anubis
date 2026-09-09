@@ -11,10 +11,16 @@ the clip shows up in ``/list_avatar_documents`` and can be deleted there.
 
 Rules enforced here:
 
-- The first audio or video upload for an avatar becomes the reference; later
-  uploads never replace the clip (``store_reference_audio`` with
-  ``replace=False``). A per-avatar lock serializes concurrent items of one
+- The first audio or video upload that yields a USABLE clip becomes the
+  reference; later uploads never replace a usable clip (``store_reference_audio``
+  with ``replace=False``). A per-avatar lock serializes concurrent items of one
   batch so exactly one of them writes.
+- A stored row whose clip cannot anchor the diarizer — the passthrough fallback
+  with no duration and no transcript, or a clip outside the duration the
+  diarizer accepts — counts as no reference at all. Such a row is overwritten by
+  the next upload that does yield a usable clip, and is never handed to the
+  diarizer in the meantime. ``src/anubis/utils/voice/reference_eligibility.py``
+  is where usable is defined.
 - The owner can point the reference at a different upload explicitly
   (``replace=True``), which only rewrites this store row.
 """
@@ -86,6 +92,50 @@ async def read_reference_audio(
         "namespace_filename": metadata.get("namespace_filename"),
         "duration_seconds": metadata.get("duration"),
     }
+
+
+async def read_usable_reference_audio(
+    store: Any,
+    user_id: str,
+    assistant_id: str,
+    *,
+    context: Any = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the stored reference clip only when the clip can anchor the diarizer.
+
+    Returns ``(clip, None)`` for a usable clip and ``(None, reason)`` otherwise —
+    for an avatar with no reference at all, and equally for an avatar holding a
+    row that was written before these checks existed. Callers that need to know
+    a row is merely present (the store writer, the document list) keep using
+    ``read_reference_audio``.
+
+    Args:
+        store: The LangGraph store.
+        user_id: The avatar's creator.
+        assistant_id: The avatar.
+        context: A ``GlobalContext`` supplying the duration bounds; the
+            diarizer's own bounds are used when no context is given.
+    """
+    from src.anubis.utils.voice.reference_eligibility import (
+        stored_reference_rejection,
+    )
+
+    stored_reference = await read_reference_audio(store, user_id, assistant_id)
+    rejection = stored_reference_rejection(
+        stored_reference,
+        maximum_seconds=getattr(context, "reference_audio_clip_max_seconds", None),
+        minimum_seconds=getattr(context, "reference_audio_minimum_seconds", None),
+    )
+    if rejection is not None:
+        if stored_reference is not None:
+            logger.info(
+                "Stored reference audio for %s is unusable (%s): %s",
+                assistant_id,
+                stored_reference.get("filename"),
+                rejection,
+            )
+        return None, rejection
+    return stored_reference, None
 
 
 def build_reference_audio_document(
@@ -187,7 +237,13 @@ async def _write_reference_audio(
     """Check-and-write without locking; callers hold ``reference_audio_lock``."""
     namespace = reference_audio_namespace(user_id, assistant_id)
     if not replace:
-        existing = await read_reference_audio(store, user_id, assistant_id)
+        # Only a USABLE clip is protected from being overwritten. A row holding
+        # the passthrough fallback would otherwise make the avatar's first bad
+        # upload permanent, because nothing but an explicit owner action can
+        # replace a stored row.
+        existing, _existing_problem = await read_usable_reference_audio(
+            store, user_id, assistant_id
+        )
         if existing is not None:
             return None
     document = build_reference_audio_document(

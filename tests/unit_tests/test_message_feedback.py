@@ -421,3 +421,52 @@ async def test_the_routes_record_and_return_what_the_browser_shows(monkeypatch):
     ]
     assert preferences_payload["what_feels_real"][0]["polarity"] == "feels_fake"
     assert preferences_payload["learned_preferences"] == []
+
+
+
+@pytest.mark.asyncio
+async def test_an_anonymous_visitor_can_rate_and_read_back(monkeypatch):
+    """A visitor with no API key rates with the anonymous key and gets the row back."""
+    store = _FakeStore()
+    monkeypatch.setattr(webapp_module.app.state, "store", store, raising=False)
+    monkeypatch.setattr(
+        webapp_module.app.state,
+        "context",
+        SimpleNamespace(anonymous_api_key="anon-key"),
+        raising=False,
+    )
+    visitor = {"identities": [{"user_id": "hashed-ip-1"}]}
+    request = SimpleNamespace(app=SimpleNamespace(state=webapp_module.app.state))
+    seen_headers = {}
+
+    async def fake_thread(client, _thread_id):
+        seen_headers.update(getattr(client, "headers", {}) or {})
+        return [{"type": "ai", "id": "lc_run--7", "content": "Welcome, stranger."}]
+
+    monkeypatch.setattr(webapp_module, "_load_thread_message_dicts", fake_thread)
+    monkeypatch.setattr(
+        webapp_module, "get_client", lambda headers=None: SimpleNamespace(headers=headers)
+    )
+    recorded = await webapp_module.record_message_feedback_route(
+        request=request,
+        feedback=webapp_module.MessageFeedbackRequest(
+            assistant_id="a1",
+            thread_id="t1",
+            request_id="req-7",
+            feedback_type="like",
+            content="Welcome, stranger.",
+        ),
+        current_user=visitor,
+    )
+    payload = json.loads(recorded.body)
+    assert payload["recorded"] is True
+    assert payload["message_id"] == "lc_run--7"
+    assert seen_headers == {"API-KEY": "anon-key"}
+    assert (message_feedback_namespace("hashed-ip-1", "a1"), "lc_run--7") in store.items
+
+    preferences = await webapp_module.get_avatar_preferences_route(
+        assistant_id="a1", thread_id="t1", current_user=visitor
+    )
+    rows = json.loads(preferences.body)["message_feedback"]
+    assert [row["message_id"] for row in rows] == ["lc_run--7"]
+    assert rows[0]["feedback"]["type"] == "like"

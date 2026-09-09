@@ -598,8 +598,11 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
     credential_mechanism=MECHANISM_OAUTH,
     display_name="Google Calendar",
     category=CATEGORY_CALENDAR,
-    summary="Check your schedule",
-    card_description="Read your calendar so the avatar knows your schedule.",
+    summary="Read the schedule and book appointments",
+    card_description=(
+        "Read your calendar and book, change, or cancel the appointments you "
+        "ask for."
+    ),
     icon_key="google_calendar",
     login_url="https://accounts.google.com/ServiceLogin?continue=https://calendar.google.com/",
     home_url="https://calendar.google.com/",
@@ -608,6 +611,7 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
         "openid",
         "email",
         "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar.events",
     ),
 )
 

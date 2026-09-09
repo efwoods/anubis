@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 from langchain.tools import tool
 
@@ -94,6 +95,43 @@ async def _post_json(url: str, token: str, body: dict[str, Any], *, headers: dic
         return response.status_code, response.json()
     except Exception:
         return response.status_code, {"text": response.text[:2000]}
+
+
+async def _request_json(method: str, url: str, token: str, *, body: dict[str, Any] | None = None, params: dict[str, Any] | None = None, timeout: float = 20.0) -> tuple[int, Any]:
+    """Any verb against a vendor API. PUT and DELETE have no helper above."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.request(
+            method,
+            url,
+            json=body,
+            params=params,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+    if not response.content:
+        return response.status_code, {}
+    try:
+        return response.status_code, response.json()
+    except Exception:
+        return response.status_code, {"text": response.text[:2000]}
+
+
+def _calendar_event_view(entry: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the shape a calendar tool hands back, whichever verb produced it."""
+    entry = entry or {}
+    start = entry.get("start") or {}
+    end = entry.get("end") or {}
+    return {
+        "id": entry.get("id"),
+        "summary": entry.get("summary"),
+        "start": start.get("dateTime") or start.get("date"),
+        "end": end.get("dateTime") or end.get("date"),
+        "location": entry.get("location"),
+        "description": entry.get("description"),
+        "attendees": [person.get("email") for person in entry.get("attendees") or []],
+        "url": entry.get("htmlLink"),
+    }
 
 
 def _selector(records: list[dict[str, Any]], provider_name: str):
@@ -340,7 +378,217 @@ def build_vendor_api_tools(context: Any, accounts: list[dict[str, Any]], *, stor
             ]
             return {"status": "ok", "events": events}
 
-        tools.append(calendar_events)
+        CALENDAR_ROOT = "https://www.googleapis.com/calendar/v3"
+
+        def _moment(value: str | None) -> dict[str, str] | None:
+            """Render one ISO 8601 value the way the calendar API expects it.
+
+            A bare date is an all-day appointment, which is what a person means
+            by "Thursday" rather than "Thursday at three".
+            """
+            text = str(value or "").strip()
+            if not text:
+                return None
+            if len(text) == 10 and text.count("-") == 2:
+                return {"date": text}
+            moment = _parse(text)
+            if moment is None:
+                return None
+            return {"dateTime": moment.isoformat()}
+
+        async def _calendar_token(connection: str | None):
+            record, error = select_calendar(connection)
+            if error:
+                return None, error
+            token, failure = await _bearer(context, store, record)
+            if failure:
+                return None, failure
+            return token, None
+
+        @tool
+        async def list_calendars(connection: str | None = None) -> dict[str, Any]:
+            """List the owner's calendars, and say which ones can be written to."""
+            token, failure = await _calendar_token(connection)
+            if failure:
+                return failure
+            status_code, document = await _get_json(
+                f"{CALENDAR_ROOT}/users/me/calendarList", token, params={"maxResults": 250}
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            calendars = [
+                {
+                    "id": entry.get("id"),
+                    "name": entry.get("summary"),
+                    "primary": bool(entry.get("primary")),
+                    # "reader" and "freeBusyReader" cannot hold an appointment.
+                    "read_only": str(entry.get("accessRole") or "") in ("reader", "freeBusyReader"),
+                }
+                for entry in (document or {}).get("items") or []
+            ]
+            return {"status": "ok", "calendars": calendars}
+
+        @tool
+        async def create_calendar_event(
+            summary: str,
+            start: str,
+            end: str | None = None,
+            description: str = "",
+            location: str = "",
+            attendees: list[str] | None = None,
+            calendar: str = "primary",
+            connection: str | None = None,
+        ) -> dict[str, Any]:
+            """Book one appointment on the owner's calendar.
+
+            Call this only when the conversation partner has asked for the
+            appointment and has seen the day, the time, and the title. ``start``
+            and ``end`` are ISO 8601; a bare date books a whole day, and with no
+            ``end`` the appointment lasts one hour.
+            """
+            token, failure = await _calendar_token(connection)
+            if failure:
+                return failure
+            starts_at = _moment(start)
+            if starts_at is None:
+                return {"status": "error", "error": f"{start!r} is not a date or time this can read."}
+            ends_at = _moment(end)
+            if ends_at is None:
+                if "date" in starts_at:
+                    ends_at = {"date": (datetime.fromisoformat(starts_at["date"]) + timedelta(days=1)).date().isoformat()}
+                else:
+                    ends_at = {"dateTime": (datetime.fromisoformat(starts_at["dateTime"]) + timedelta(hours=1)).isoformat()}
+            body: dict[str, Any] = {"summary": summary, "start": starts_at, "end": ends_at}
+            if description:
+                body["description"] = description
+            if location:
+                body["location"] = location
+            if attendees:
+                body["attendees"] = [{"email": address} for address in attendees]
+            status_code, document = await _post_json(
+                f"{CALENDAR_ROOT}/calendars/{quote(calendar, safe='')}/events", token, body
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            return {"status": "created", "event": _calendar_event_view(document)}
+
+        @tool
+        async def update_calendar_event(
+            event_id: str,
+            summary: str | None = None,
+            start: str | None = None,
+            end: str | None = None,
+            description: str | None = None,
+            location: str | None = None,
+            calendar: str = "primary",
+            connection: str | None = None,
+        ) -> dict[str, Any]:
+            """Change one existing appointment. Only the fields given are changed.
+
+            Call this only when the conversation partner has asked for the change.
+            """
+            token, failure = await _calendar_token(connection)
+            if failure:
+                return failure
+            body: dict[str, Any] = {}
+            if summary is not None:
+                body["summary"] = summary
+            if description is not None:
+                body["description"] = description
+            if location is not None:
+                body["location"] = location
+            for name, value in (("start", start), ("end", end)):
+                if value:
+                    moment = _moment(value)
+                    if moment is None:
+                        return {"status": "error", "error": f"{value!r} is not a date or time this can read."}
+                    body[name] = moment
+            if not body:
+                return {"status": "error", "error": "Name at least one thing to change."}
+            status_code, document = await _request_json(
+                "PATCH",
+                f"{CALENDAR_ROOT}/calendars/{quote(calendar, safe='')}/events/{quote(event_id, safe='')}",
+                token,
+                body=body,
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            return {"status": "updated", "event": _calendar_event_view(document)}
+
+        @tool
+        async def delete_calendar_event(event_id: str, calendar: str = "primary", connection: str | None = None) -> dict[str, Any]:
+            """Remove one appointment from the owner's calendar.
+
+            Call this only when the conversation partner has asked for the
+            appointment to be removed and knows which one.
+            """
+            token, failure = await _calendar_token(connection)
+            if failure:
+                return failure
+            status_code, document = await _request_json(
+                "DELETE",
+                f"{CALENDAR_ROOT}/calendars/{quote(calendar, safe='')}/events/{quote(event_id, safe='')}",
+                token,
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            return {"status": "deleted", "event_id": event_id}
+
+        @tool
+        async def find_free_time(
+            since: str | None = None,
+            until: str | None = None,
+            duration_minutes: int = 30,
+            calendar: str = "primary",
+            connection: str | None = None,
+        ) -> dict[str, Any]:
+            """Find openings of at least ``duration_minutes`` in the owner's schedule."""
+            token, failure = await _calendar_token(connection)
+            if failure:
+                return failure
+            now = datetime.now(UTC)
+            start = _parse(since) or now
+            end = _parse(until) or (start + timedelta(days=7))
+            status_code, document = await _post_json(
+                f"{CALENDAR_ROOT}/freeBusy",
+                token,
+                {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "items": [{"id": calendar}]},
+            )
+            if status_code >= 400:
+                return {"status": "error", "status_code": status_code, "error": str(document)[:500]}
+            busy_periods = ((document or {}).get("calendars") or {}).get(calendar, {}).get("busy") or []
+            busy: list[tuple[datetime, datetime]] = []
+            for period in busy_periods:
+                busy_start = _parse(period.get("start"))
+                busy_end = _parse(period.get("end"))
+                if busy_start and busy_end:
+                    busy.append((busy_start, busy_end))
+            busy.sort()
+            merged: list[list[datetime]] = []
+            for busy_start, busy_end in busy:
+                if merged and busy_start <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], busy_end)
+                    continue
+                merged.append([busy_start, busy_end])
+            minimum = timedelta(minutes=max(1, int(duration_minutes)))
+            openings: list[dict[str, str]] = []
+            cursor = start
+            for busy_start, busy_end in merged:
+                if busy_start - cursor >= minimum:
+                    openings.append({"start": cursor.isoformat(), "end": busy_start.isoformat()})
+                cursor = max(cursor, busy_end)
+            if end - cursor >= minimum:
+                openings.append({"start": cursor.isoformat(), "end": end.isoformat()})
+            return {"status": "ok", "duration_minutes": duration_minutes, "openings": openings}
+
+        tools.extend([
+            list_calendars,
+            calendar_events,
+            create_calendar_event,
+            update_calendar_event,
+            delete_calendar_event,
+            find_free_time,
+        ])
 
     if "google_analytics" in providers_present:
         select_analytics = _selector(accounts, "google_analytics")

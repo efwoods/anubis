@@ -1,3 +1,9 @@
+"""Neural Nexus's own privacy policy, as text.
+
+Import this through the package (``from src.anubis.utils.prompts.legal import
+PRIVACY_POLICY``), never by module path.
+"""
+
 PRIVACY_POLICY = """
 Privacy Policy
 

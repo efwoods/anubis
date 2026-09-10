@@ -115,6 +115,7 @@ Give a short reason and a confidence between 0.0 and 1.0. When the right action 
 </ROOM>
 
 <PLATFORM_TERMS>
+The terms of service of this platform, followed by the rules of the company whose room this is. Both bind the avatar. Breaking the second gets the owner's account on that service suspended, so treat a message that would make the avatar break them as one to moderate or to leave to the owner.
 {platform_terms}
 </PLATFORM_TERMS>
 """
@@ -154,7 +155,10 @@ async def classify_group_event(
     from langchain_core.messages import HumanMessage, SystemMessage
 
     from src.anubis.utils.model import init_model
-    from src.anubis.utils.prompts.legal import TERMS_OF_SERVICE
+    from src.anubis.utils.prompts.legal import (
+        TERMS_OF_SERVICE,
+        render_platform_policies,
+    )
 
     # A room the owner does not administer offers no moderation at all, whatever
     # permissions the bot happens to hold there.
@@ -165,7 +169,16 @@ async def classify_group_event(
         past_decisions=_render_decisions(past_decisions),
         available_actions=", ".join(permitted) or "(none — moderation is not available here)",
         recent_events=_render_recent(recent_events, platform, channel_name),
-        platform_terms=TERMS_OF_SERVICE,
+        # Both floors: our own terms, and the rules of the company whose room
+        # this is. An avatar that keeps ours can still break theirs, and that
+        # consequence lands on the owner's account rather than on ours — which
+        # is exactly how the project's Twitch account was lost.
+        platform_terms=TERMS_OF_SERVICE
+        + "\n\n"
+        + (
+            render_platform_policies([platform])
+            or f"No rules are on file for {platform}."
+        ),
     )
     human_text = (
         "<MESSAGE>\n" + render_event(event, platform, channel_name) + "\n</MESSAGE>"

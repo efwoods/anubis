@@ -74,6 +74,7 @@ def test_the_room_triage_is_shown_the_real_documents():
         owner_rules="(none)",
         past_decisions="(none)",
         available_actions="warn",
+        available_decision_actions="ignore, notify, respond",
         recent_events="(nothing)",
         platform_terms=TERMS_OF_SERVICE
         + "\n\n"

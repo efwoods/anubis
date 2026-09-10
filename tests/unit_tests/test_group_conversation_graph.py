@@ -161,12 +161,22 @@ async def _decide(event, *, available_actions=None, owns_channel=True, recent=No
 
 
 @pytest.mark.asyncio
-async def test_a_direct_mention_is_answered_without_triage(harness, monkeypatch):
-    reasoning = _FakeReasoning().install(monkeypatch)
+async def test_a_direct_mention_is_always_answered(harness, monkeypatch):
+    """Speaking to the avatar always gets an answer — the classifier picks where.
+
+    A mention used to skip classification entirely, which meant the avatar
+    answered a private question in the channel because nothing ever considered
+    doing otherwise. It is classified now; what is guaranteed is that a mention
+    can never come back as silence.
+    """
+    reasoning = _FakeReasoning(
+        GroupTriageClassification(decision="ignore", reason="chatter", confidence=0.9)
+    ).install(monkeypatch)
     decision = await _decide(_event(mentioned=True))
+    assert reasoning.classified == ["is the stream up tomorrow?"]
+    # The classifier said ignore; a mention is answered anyway.
     assert decision.action == "respond"
     assert decision.reply == DRAFTED
-    assert reasoning.classified == [], "somebody spoke to the avatar; no triage is needed"
 
 
 @pytest.mark.asyncio

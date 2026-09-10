@@ -1257,6 +1257,27 @@ class GlobalContext:
         },
     )
 
+    group_auto_react_confidence: float = field(
+        default=0.75,
+        metadata={
+            "description": "Confidence at or above which the avatar adds an emoji reaction without being asked. Deliberately lower than the reply threshold: a reaction is cheap to be wrong about and is most of what makes somebody feel present in a room, whereas an avatar that only reacts when it is nearly certain reacts almost never. Env GROUP_AUTO_REACT_CONFIDENCE."
+        },
+    )
+
+    group_follow_up_max_delay_seconds: int = field(
+        default=86400,
+        metadata={
+            "description": "The longest the avatar may defer something it said it would come back to. A follow-up further out than this is clamped, because an avatar that resurfaces a week-old message reads as broken rather than conscientious. Env GROUP_FOLLOW_UP_MAX_DELAY_SECONDS."
+        },
+    )
+
+    group_history_catch_up_messages: int = field(
+        default=50,
+        metadata={
+            "description": "How many messages a bot reads back when the avatar joins a room or returns after being offline, so the avatar comes back knowing what it missed rather than starting blank. Env GROUP_HISTORY_CATCH_UP_MESSAGES."
+        },
+    )
+
     """ </Group conversations (Slack, Discord, Twitch)> """
 
     """ <Ambient vision (webcam / screen snapshots as hidden conversation context)> """

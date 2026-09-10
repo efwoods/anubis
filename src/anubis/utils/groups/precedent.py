@@ -61,6 +61,11 @@ def group_channel_namespace(creator_id: str, assistant_id: str) -> tuple[str, st
     return (creator_id, assistant_id, "group_channel")
 
 
+def group_follow_up_namespace(creator_id: str, assistant_id: str) -> tuple[str, str, str]:
+    """Return where the avatar keeps what it will come back to."""
+    return (creator_id, assistant_id, "group_follow_up")
+
+
 def _utc_now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
 
@@ -184,6 +189,7 @@ async def store_decision_record(
     applied_rule: str = "",
     reply_text: str | None = None,
     owner_approved: bool = False,
+    cold_direct_message: bool = False,
 ) -> Document:
     """Record one decision, so the next similar message is decided the same way."""
     key = stable_event_key(platform, channel_id, event.event_id)
@@ -216,6 +222,10 @@ async def store_decision_record(
             "reply_text": reply_text,
             "decided_at": _utc_now_iso(),
             "owner_approved": owner_approved,
+            # Whether this direct message went to somebody who had never spoken
+            # to the avatar. Only such a decision, once the owner has allowed
+            # it, is precedent for the next one.
+            "cold_direct_message": cold_direct_message,
             "corrected_action": None,
             "corrected_moderation_action": None,
             "fact": event.text,
@@ -281,6 +291,170 @@ async def has_moderation_precedent(
         if metadata.get("owner_approved"):
             return True
     return False
+
+
+async def has_direct_message_precedent(
+    store: Any,
+    creator_id: str,
+    assistant_id: str,
+    *,
+    platform: str,
+    channel_id: str,
+    limit: int = 200,
+) -> bool:
+    """Has the owner ever allowed a direct message to a stranger from this room?
+
+    The twin of ``has_moderation_precedent``, and for the same reason. A direct
+    message to somebody who has never spoken to the avatar is not reversible in
+    the way a public message is: it arrives in a private conversation, wearing
+    the owner's name, unasked for. Platforms read it as spam and a person reads
+    it as the owner having messaged them.
+
+    So the avatar cannot decide on its own that a cold direct message is
+    acceptable here. The owner has to have allowed one — and, exactly as with a
+    ban, only a decision the owner themselves accepted or corrected the avatar
+    into counts, so the avatar can never bootstrap its own permission from
+    something it did unilaterally.
+    """
+    documents = await _search(
+        store,
+        group_decision_namespace(creator_id, assistant_id),
+        query=None,
+        limit=limit,
+    )
+    for document in documents:
+        metadata = document.metadata
+        if str(metadata.get("platform") or "") != platform:
+            continue
+        if str(metadata.get("channel_id") or "") != channel_id:
+            continue
+        if not metadata.get("owner_approved"):
+            continue
+        corrected = str(metadata.get("corrected_action") or "")
+        action = corrected or str(metadata.get("action") or "")
+        if action == "direct_message" and metadata.get("cold_direct_message"):
+            return True
+    return False
+
+
+async def has_exchanged_with(
+    store: Any,
+    creator_id: str,
+    assistant_id: str,
+    *,
+    platform: str,
+    channel_id: str,
+    author_id: str,
+    limit: int = 200,
+) -> bool:
+    """Has this person ever actually spoken TO the avatar, or it to them?
+
+    Talking in a room the avatar happens to be in is not the same as addressing
+    it. Somebody who has never once spoken to the avatar receiving a private
+    message from it is a cold approach however long they have been in the
+    channel, so the looser reading — anybody who has ever typed here — is the
+    wrong one and is not used.
+
+    Counts as having exchanged: a message that mentioned the avatar, or any
+    message the avatar itself answered, privately or in the room.
+    """
+    documents = await _search(
+        store,
+        group_decision_namespace(creator_id, assistant_id),
+        query=None,
+        limit=limit,
+    )
+    for document in documents:
+        metadata = document.metadata
+        if str(metadata.get("platform") or "") != platform:
+            continue
+        if str(metadata.get("channel_id") or "") != channel_id:
+            continue
+        if str(metadata.get("author_id") or "") != author_id:
+            continue
+        if metadata.get("mentioned"):
+            return True
+        if str(metadata.get("action") or "") in (
+            "respond",
+            "reply_in_thread",
+            "direct_message",
+        ):
+            return True
+    return False
+
+
+async def record_follow_up(
+    store: Any,
+    creator_id: str,
+    assistant_id: str,
+    *,
+    platform: str,
+    channel_id: str,
+    channel_name: str,
+    event: GroupEvent,
+    due_at: str,
+    what: str,
+) -> dict[str, Any]:
+    """Remember something the avatar said it would come back to.
+
+    Keyed by the event, so the same message cannot queue two follow-ups however
+    many times a bot resends it.
+    """
+    key = stable_event_key(platform, channel_id, event.event_id)
+    payload = {
+        "follow_up_id": key,
+        "platform": platform,
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "event": event.model_dump(),
+        "due_at": due_at,
+        "what": what,
+        "recorded_at": _utc_now_iso(),
+        "resolved": False,
+    }
+    await store.aput(
+        group_follow_up_namespace(creator_id, assistant_id), key=key, value={"value": payload}
+    )
+    return payload
+
+
+async def due_follow_ups(
+    store: Any, creator_id: str, assistant_id: str, *, now: str | None = None
+) -> list[dict[str, Any]]:
+    """Everything the avatar meant to come back to whose time has arrived."""
+    moment = now or _utc_now_iso()
+    try:
+        items = await store.asearch(
+            group_follow_up_namespace(creator_id, assistant_id), limit=500
+        )
+    except Exception:  # noqa: BLE001 - nothing due is the right answer here
+        return []
+    due = []
+    for item in items or []:
+        value = getattr(item, "value", None) or {}
+        payload = value.get("value") if isinstance(value, dict) else None
+        if not isinstance(payload, dict) or payload.get("resolved"):
+            continue
+        if str(payload.get("due_at") or "") <= moment:
+            due.append(payload)
+    due.sort(key=lambda payload: payload.get("due_at") or "")
+    return due
+
+
+async def resolve_follow_up(
+    store: Any, creator_id: str, assistant_id: str, follow_up_id: str
+) -> bool:
+    """Mark one as dealt with, so it fires once rather than every poll."""
+    namespace = group_follow_up_namespace(creator_id, assistant_id)
+    item = await store.aget(namespace, key=follow_up_id)
+    value = getattr(item, "value", None) or {}
+    payload = value.get("value") if isinstance(value, dict) else None
+    if not isinstance(payload, dict):
+        return False
+    payload["resolved"] = True
+    payload["resolved_at"] = _utc_now_iso()
+    await store.aput(namespace, key=follow_up_id, value={"value": payload})
+    return True
 
 
 async def mark_decision_owner_approved(
@@ -365,6 +539,14 @@ async def apply_decision_correction(
     return {
         "event_id": correction.event_id,
         "decision_found": document is not None,
+        # What the avatar actually did, so a caller can tell whether there are
+        # words of its own still standing that the correction should fix.
+        "previous_action": (
+            str(document.metadata.get("action") or "") if document is not None else ""
+        ),
+        "previous_reply": (
+            str(document.metadata.get("reply_text") or "") if document is not None else ""
+        ),
         "learned_rule": rule_document.metadata["rule"] if rule_document else None,
         "rule_already_known": rule_document is None,
     }
@@ -520,6 +702,12 @@ async def forget_channel(
 
 __all__ = [
     "acknowledge_notifications",
+    "due_follow_ups",
+    "group_follow_up_namespace",
+    "has_direct_message_precedent",
+    "has_exchanged_with",
+    "record_follow_up",
+    "resolve_follow_up",
     "apply_decision_correction",
     "delete_policy_rule",
     "forget_channel",

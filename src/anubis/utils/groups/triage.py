@@ -34,14 +34,47 @@ logger = logging.getLogger(__name__)
 class GroupTriageClassification(BaseModel):
     """Decide what the avatar does about one message in a room."""
 
-    decision: Literal["ignore", "respond", "notify", "moderate"] = Field(
+    decision: Literal[
+        "ignore",
+        "react",
+        "respond",
+        "reply_in_thread",
+        "direct_message",
+        "follow_up",
+        "notify",
+        "moderate",
+    ] = Field(
         description=(
-            "ignore: ordinary chatter that needs nothing. respond: the avatar has "
-            "something to say — a question the owner would answer, or a topic the "
-            "owner speaks about. notify: only the owner can decide this, or the "
-            "rules leave the right action unclear. moderate: the message breaks a "
-            "rule of the room or the platform terms."
+            "What a member of this room would do about this message. "
+            "ignore: ordinary chatter that needs nothing. "
+            "react: worth acknowledging but not worth saying anything — agreement, "
+            "thanks, congratulations, sympathy, a joke that landed. "
+            "respond: say something to the room. "
+            "reply_in_thread: this belongs in a thread — a tangent, a long answer, or "
+            "a reply to something already in a thread. "
+            "direct_message: the answer is private or about one person only, and "
+            "saying it in the room would expose them. "
+            "follow_up: the right answer needs something that is not available yet, "
+            "so come back to this later. "
+            "notify: only the owner can decide this. "
+            "moderate: the message breaks a rule of the room or the platform terms."
         )
+    )
+    reaction: str = Field(
+        default="",
+        description=(
+            "For a react decision only: one emoji, as a name without colons "
+            "('tada', 'heart', 'eyes', 'raised_hands', 'thumbsup') or the character "
+            "itself. Empty for every other decision."
+        ),
+    )
+    follow_up_after_seconds: int = Field(
+        default=0,
+        description=(
+            "For a follow_up decision only: how long to wait before coming back, in "
+            "seconds. Minutes for something imminent, hours for something that needs "
+            "the owner or the world to move first. 0 for every other decision."
+        ),
     )
     moderation_action: Literal["none", "warn", "delete", "timeout", "ban"] = Field(
         default="none",
@@ -82,16 +115,21 @@ class GroupTriageClassification(BaseModel):
 
 GROUP_TRIAGE_SYSTEM_PROMPT = """
 <ROLE>
-You take part in a group conversation on behalf of {owner_name}, exactly the way {owner_name} takes part. You decide, for one message at a time, whether to ignore the message, respond to the message in {owner_name}'s voice, notify {owner_name}, or moderate the author of the message.
+You are a member of this room, taking part on behalf of {owner_name} exactly the way {owner_name} takes part. You decide, for one message at a time, what a person in this room would actually do about it.
 </ROLE>
 
 <INSTRUCTIONS>
-Decide the action for the MESSAGE.
-- ignore: ordinary chatter, reactions, conversation between other people, and anything that needs nothing from {owner_name}.
-- respond: a direct question to {owner_name}, or a topic {owner_name} has something to say about. The reply is written separately, in {owner_name}'s voice.
-- notify: something only {owner_name} can decide, a business opportunity, a personal matter, an emergency, or a case the rules leave uncertain.
+Decide the action for the MESSAGE. A member of a room has a whole repertoire, and using only one of them is what makes somebody read as a machine. Most messages deserve nothing; of the rest, far more deserve a reaction than a reply.
+- ignore: ordinary chatter, conversation between other people, and anything that needs nothing from {owner_name}. This is the commonest answer and there is nothing wrong with it.
+- react: worth acknowledging, not worth saying anything about. Agreement, thanks, congratulations, sympathy, a joke that landed, somebody sharing something finished. Put ONE emoji in reaction, as a name without colons: tada, heart, eyes, raised_hands, thumbsup, pray, fire, sob. A person reacts many times for every time they speak.
+- respond: say something to the room. A direct question to {owner_name}, or a topic {owner_name} has something to say about.
+- reply_in_thread: the same, but it belongs in a thread rather than the main channel — a tangent, a long or technical answer, or a reply to something already being discussed in a thread. Prefer this over respond whenever answering in the channel would interrupt a conversation already going on.
+- direct_message: the answer is private, personal, or about one person only, and saying it in the room would expose them. Somebody's health, money, employment, a mistake they made, anything they told {owner_name} in confidence. When in doubt about whether something is private, this is the safe choice and the room is not.
+- follow_up: the right answer needs something that is not available yet — a person who is away, a result that has not come in, an event that has not happened. Say so in the reason and set follow_up_after_seconds to how long to wait. Only choose this when there is a real, concrete thing being waited for.
+- notify: only {owner_name} can decide this, or the rules leave the right action unclear.
 - moderate: the message breaks one of the OWNER_RULES or the PLATFORM_TERMS. Choose the action the OWNER_RULES prescribe; when the rules are silent, choose warn for a first mild offense, delete for spam or links, timeout for harassment, and ban only for hate, threats, or repeated abuse.
 Choose the moderation action ONLY from AVAILABLE_MODERATION_ACTIONS. When that list is empty, never choose moderate: choose notify instead and say in the reason what {owner_name} might want to do.
+Choose an action ONLY from AVAILABLE_ACTIONS. That list is what this room and this connection can actually carry out; anything else would be a decision nobody performs.
 The OWNER_RULES are what {owner_name} dictated, or what was learned from {owner_name}'s past corrections. Follow the OWNER_RULES over the defaults above, and quote the rule that was applied in applied_rule.
 The PAST_DECISIONS show how similar messages were decided before, including {owner_name}'s own corrections. Be consistent with those corrections.
 The ROOM shows the last few messages, for context only. Decide about the MESSAGE alone.
@@ -105,6 +143,10 @@ Give a short reason and a confidence between 0.0 and 1.0. When the right action 
 <PAST_DECISIONS>
 {past_decisions}
 </PAST_DECISIONS>
+
+<AVAILABLE_ACTIONS>
+{available_decision_actions}
+</AVAILABLE_ACTIONS>
 
 <AVAILABLE_MODERATION_ACTIONS>
 {available_actions}
@@ -150,6 +192,7 @@ async def classify_group_event(
     past_decisions: list[dict[str, Any]],
     available_actions: list[str],
     owns_channel: bool,
+    capabilities: list[str] | None = None,
 ) -> GroupTriageClassification:
     """Decide one message with the owner's rules and past decisions as precedent."""
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -163,7 +206,12 @@ async def classify_group_event(
     # A room the owner does not administer offers no moderation at all, whatever
     # permissions the bot happens to hold there.
     permitted = [str(action) for action in available_actions or []] if owns_channel else []
+    # A bot that has not been taught to report its capabilities can still always
+    # reply, which is what every version of every bot could do.
+    reported = [str(name) for name in capabilities or []] or ["reply"]
+    decision_actions = decision_actions_for(reported, moderation_available=bool(permitted))
     system_prompt = GROUP_TRIAGE_SYSTEM_PROMPT.format(
+        available_decision_actions=", ".join(decision_actions),
         owner_name=owner_name or "the owner",
         owner_rules=_render_rules(policy_rules),
         past_decisions=_render_decisions(past_decisions),
@@ -213,40 +261,121 @@ async def classify_group_event(
         applied_rule=str(getattr(response, "applied_rule", "") or "").strip(),
         reason=str(getattr(response, "reason", "") or "").strip(),
     )
-    return enforce_available_actions(classification, permitted)
+    return enforce_capabilities(classification, permitted, reported)
 
 
-def enforce_available_actions(
-    classification: GroupTriageClassification, permitted: list[str]
+# What a decision needs the bot to be able to do. ``ignore``, ``notify`` and
+# ``follow_up`` need nothing: the first two happen without touching the room and
+# the third is held by the API itself.
+CAPABILITY_FOR_DECISION = {
+    "react": "react",
+    "respond": "reply",
+    "reply_in_thread": "thread",
+    "direct_message": "direct_message",
+}
+
+# Where a decision goes when the bot cannot carry it out.
+#
+# The one that matters is ``direct_message``. The avatar chose privacy, so the
+# fallback must never be the room: saying a private thing in public is the only
+# outcome worse than saying nothing. A missed reaction, by contrast, is nothing
+# at all, and must never be escalated into speech.
+DEGRADED_DECISION = {
+    "react": "ignore",
+    "respond": "notify",
+    "reply_in_thread": "respond",
+    "direct_message": "notify",
+}
+
+
+def decision_actions_for(
+    capabilities: list[str], *, moderation_available: bool
+) -> list[str]:
+    """Return the actions worth offering the classifier for this room."""
+    actions = ["ignore", "notify", "follow_up"]
+    for decision, capability in CAPABILITY_FOR_DECISION.items():
+        if capability in capabilities:
+            actions.append(decision)
+    if moderation_available:
+        actions.append("moderate")
+    return actions
+
+
+def enforce_capabilities(
+    classification: GroupTriageClassification,
+    permitted: list[str],
+    capabilities: list[str] | None = None,
 ) -> GroupTriageClassification:
-    """Never return a moderation action the platform did not offer.
+    """Never return something the bot cannot carry out; degrade it instead.
 
-    The classifier is told what is available, but being told is not a
-    guarantee. A moderation decision the bot cannot carry out would otherwise
-    come back as an action the bot silently drops, which reads to the owner as
-    the avatar having done something about a message when nothing was done.
+    The classifier is told what is available, but being told is not a guarantee.
+    An action the bot cannot perform would otherwise come back as one the bot
+    silently drops, which reads to the owner as the avatar having dealt with a
+    message when nothing was done at all.
+
+    Degrading rather than dropping keeps the avatar's *intent*: a reply it
+    cannot post still reaches the owner, and a private answer it cannot send
+    privately reaches the owner rather than the room.
     """
+    reported = [str(name) for name in capabilities or []] or ["reply"]
+
     if classification.decision != "moderate":
         classification.moderation_action = "none"
+    else:
+        if classification.moderation_action == "none":
+            classification.moderation_action = "warn"
+        if classification.moderation_action not in permitted:
+            classification.decision = "notify"
+            offered = ", ".join(permitted) or "nothing"
+            classification.reason = (
+                f"{classification.reason} "
+                f"The avatar judged this to need {classification.moderation_action}, which is "
+                f"not available here (available: {offered}), so the owner decides."
+            ).strip()
+            classification.moderation_action = "none"
+            classification.needs_owner_action = True
         return classification
-    if classification.moderation_action == "none":
-        classification.moderation_action = "warn"
-    if classification.moderation_action not in permitted:
-        classification.decision = "notify"
-        offered = ", ".join(permitted) or "nothing"
+
+    # Follow the degradation chain until the decision is one this bot can do:
+    # a thread reply with no threads becomes a channel reply, and if the bot
+    # cannot even post, that in turn reaches the owner.
+    seen: set[str] = set()
+    while True:
+        needed = CAPABILITY_FOR_DECISION.get(classification.decision)
+        if needed is None or needed in reported or classification.decision in seen:
+            break
+        seen.add(classification.decision)
+        fallen_back_to = DEGRADED_DECISION.get(classification.decision, "notify")
         classification.reason = (
             f"{classification.reason} "
-            f"The avatar judged this to need {classification.moderation_action}, which is "
-            f"not available here (available: {offered}), so the owner decides."
+            f"The avatar judged this to be {classification.decision}, which this "
+            f"connection cannot do here, so it is {fallen_back_to} instead."
         ).strip()
-        classification.moderation_action = "none"
-        classification.needs_owner_action = True
+        if fallen_back_to == "notify":
+            classification.needs_owner_action = True
+        classification.decision = fallen_back_to
+
+    if classification.decision != "react":
+        classification.reaction = ""
+    elif not classification.reaction.strip():
+        # A reaction with no emoji is not a reaction.
+        classification.decision = "ignore"
+    if classification.decision != "follow_up":
+        classification.follow_up_after_seconds = 0
     return classification
 
 
+# Kept under the old name: the group graph and its tests were written against it.
+enforce_available_actions = enforce_capabilities
+
+
 __all__ = [
+    "CAPABILITY_FOR_DECISION",
+    "DEGRADED_DECISION",
     "GROUP_TRIAGE_SYSTEM_PROMPT",
     "GroupTriageClassification",
     "classify_group_event",
+    "decision_actions_for",
     "enforce_available_actions",
+    "enforce_capabilities",
 ]

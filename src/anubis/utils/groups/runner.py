@@ -21,6 +21,7 @@ from typing import Any
 from langgraph.types import Command
 
 from src.anubis.utils.groups.events import (
+    GROUP_ACTIONS,
     GroupDecision,
     GroupEvent,
     GroupEventsRequest,
@@ -114,6 +115,7 @@ async def run_group_conversation_for_event(
     available_actions: list[str],
     event: GroupEvent,
     recent_events: list[GroupEvent],
+    capabilities: list[str] | None = None,
 ) -> GroupDecision:
     """Record one message as an inbox item and run its triage to a decision."""
     repository = get_inbox_repository()
@@ -162,6 +164,7 @@ async def run_group_conversation_for_event(
         "channel_name": channel_name,
         "owns_channel": owns_channel,
         "available_actions": list(available_actions or []),
+        "capabilities": list(capabilities or []),
         "event": event.model_dump(),
         "recent_events": [entry.model_dump() for entry in recent_events],
     }
@@ -218,6 +221,10 @@ def _decision_from_state(
     if waiting:
         action = "notify"
 
+    # A reply that is going out privately is still the reply: the bot needs the
+    # words and the recipient, and the action tells it where to put them.
+    speaks = action in ("respond", "reply_in_thread", "direct_message")
+
     reply = str((state.get("draft") or {}).get("body") or "") or None
     moderation_action = str(state.get("moderation_action") or "none")
     if action != "moderate":
@@ -225,10 +232,21 @@ def _decision_from_state(
     return GroupDecision(
         event_id=event.event_id,
         author_id=event.author_id,
-        action=action if action in ("ignore", "respond", "notify", "moderate") else "notify",
+        action=action if action in GROUP_ACTIONS else "notify",
         moderation_action=moderation_action,
-        # Nothing is posted in the room while the owner still has to answer.
-        reply=None if waiting or action != "respond" else reply,
+        # Nothing reaches anybody while the owner still has to answer.
+        reply=None if waiting or not speaks else reply,
+        reaction=(
+            None if waiting or action != "react" else (str(state.get("reaction") or "") or None)
+        ),
+        direct_message_to=(
+            None if waiting or action != "direct_message" else event.author_id
+        ),
+        follow_up_after_seconds=(
+            int(state.get("follow_up_after_seconds") or 0) or None
+            if action == "follow_up"
+            else None
+        ),
         reasoning=str(classification.get("reason") or row.get("reason") or ""),
         confidence=float(state.get("confidence") or row.get("confidence") or 0.0),
         applied_rule=str(classification.get("applied_rule") or "") or None,
@@ -253,12 +271,17 @@ def _decision_from_item(item: dict[str, Any] | None, event: GroupEvent) -> Group
     moderation_action = str(detail.get("moderation_action") or "none")
     if action != "moderate":
         moderation_action = "none"
+    speaks = action in ("respond", "reply_in_thread", "direct_message")
     return GroupDecision(
         event_id=str(item.get("external_id") or event.event_id),
         author_id=event.author_id,
-        action=action if action in ("ignore", "respond", "notify", "moderate") else "notify",
+        action=action if action in GROUP_ACTIONS else "notify",
         moderation_action=moderation_action,
-        reply=None if waiting or action != "respond" else (item.get("draft") or None),
+        reaction=None if waiting or action != "react" else (detail.get("reaction") or None),
+        direct_message_to=(
+            None if waiting or action != "direct_message" else event.author_id
+        ),
+        reply=None if waiting or not speaks else (item.get("draft") or None),
         reasoning=str(item.get("reason") or ""),
         confidence=float(item.get("confidence") or 0.0),
         item_id=str(item.get("item_id") or ""),
@@ -295,6 +318,7 @@ async def triage_group_events(
                     channel_name=request.channel_name,
                     owns_channel=request.owns_channel,
                     available_actions=request.available_actions,
+                    capabilities=request.capabilities,
                     event=event,
                     recent_events=events[window_start:index],
                 )
@@ -317,6 +341,77 @@ async def triage_group_events(
             *(_one(index, event) for index, event in enumerate(events))
         )
     )
+
+
+async def run_due_follow_ups(
+    context: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    assistant: dict[str, Any] | None = None,
+    store: Any = None,
+    limit: int = 20,
+) -> list[GroupDecision]:
+    """Act on everything the avatar said it would come back to, now that it is due.
+
+    This is what makes "I will get back to you on that" true rather than a
+    phrase, which is most of what separates somebody who is present from a bot
+    that answers when poked. Each one is decided again from scratch — the room
+    has moved on, and the answer that was unavailable an hour ago may be
+    available now, or may still not be — so it takes whatever gate the action
+    it resolves to carries.
+    """
+    from src.anubis.utils.groups.precedent import due_follow_ups, resolve_follow_up
+
+    working_store = store if store is not None else _store
+    if working_store is None:
+        return []
+    pending = await due_follow_ups(working_store, user_id, assistant_id)
+    decisions: list[GroupDecision] = []
+    for payload in pending[: max(1, limit)]:
+        event = GroupEvent(**(payload.get("event") or {}))
+        try:
+            decision = await run_group_conversation_for_event(
+                context,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                assistant=assistant,
+                platform=str(payload.get("platform") or ""),
+                channel_id=str(payload.get("channel_id") or ""),
+                channel_name=str(payload.get("channel_name") or ""),
+                owns_channel=False,
+                available_actions=[],
+                capabilities=["reply", "thread"],
+                # The follow-up itself is the context: what the avatar meant to
+                # come back about, so it does not simply decide the same way and
+                # queue another one.
+                event=GroupEvent(
+                    **{
+                        **event.model_dump(),
+                        "event_id": f"{event.event_id}:follow-up",
+                        "text": (
+                            f"{event.text}\n\n"
+                            f"[The avatar said it would come back to this: "
+                            f"{payload.get('what') or 'no reason recorded'}. "
+                            f"That time has arrived.]"
+                        ),
+                    }
+                ),
+                recent_events=[],
+            )
+        except Exception as follow_up_error:  # noqa: BLE001 - one never blocks the rest
+            logger.exception(
+                "A follow-up could not be acted on: %s", follow_up_error
+            )
+            continue
+        # Resolved either way: a follow-up that fires once and is dropped is far
+        # better than one that fires on every poll forever.
+        await resolve_follow_up(
+            working_store, user_id, assistant_id, str(payload.get("follow_up_id") or "")
+        )
+        if decision.action != "follow_up":
+            decisions.append(decision)
+    return decisions
 
 
 async def resume_group_item(
@@ -350,6 +445,7 @@ async def resume_group_item(
 
 __all__ = [
     "resume_group_item",
+    "run_due_follow_ups",
     "run_group_conversation_for_event",
     "set_group_runtime",
     "triage_group_events",

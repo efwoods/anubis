@@ -158,12 +158,31 @@ async def receive_group_events(
         concurrency=int(getattr(context, "group_conversation_concurrency", None) or 4),
         recent_window=int(getattr(context, "group_recent_events_for_triage", None) or 12),
     )
+    # Anything the avatar said it would come back to, whose time has arrived.
+    # Folded in here so a bot that is already talking to us acts on it without a
+    # second call — which is what makes a follow-up feel like the avatar
+    # remembering rather than a scheduled job.
+    from src.anubis.utils.groups.runner import run_due_follow_ups
+
+    try:
+        due = await run_due_follow_ups(
+            context,
+            user_id=creator_user_id,
+            assistant_id=assistant_id,
+            assistant=assistant,
+            store=store,
+        )
+    except Exception as follow_up_error:  # noqa: BLE001 - never fail a batch over these
+        logger.warning("Due follow-ups could not be acted on: %s", follow_up_error)
+        due = []
+
     return JSONResponse(
         {
             "assistant_id": assistant_id,
             "platform": events_request.platform,
             "channel_id": events_request.channel_id,
             "decisions": [decision.model_dump() for decision in decisions],
+            "follow_ups": [decision.model_dump() for decision in due],
         }
     )
 
@@ -186,10 +205,30 @@ async def correct_group_decision(
     _, creator_user_id = await resolve_avatar_for_group(
         assistant_id, current_user, correction.platform
     )
+    store = _store_or_503()
     result = await apply_decision_correction(
-        _store_or_503(), creator_user_id, assistant_id, correction
+        store, creator_user_id, assistant_id, correction
     )
+    # When the decision being corrected was something the avatar itself said,
+    # the correction is not only a rule for next time: the words are still up
+    # there. Tell the bot to fix them, which is what a person does on being
+    # told they were wrong.
+    result["own_message_action"] = _own_message_action(correction, result)
     return JSONResponse(result)
+
+
+def _own_message_action(correction: Any, result: dict[str, Any]) -> dict[str, Any] | None:
+    """Return what the bot should do about the avatar's own message, if anything."""
+    if not result.get("decision_found"):
+        return None
+    previous = str(result.get("previous_action") or "")
+    if previous not in ("respond", "reply_in_thread", "direct_message", "post_reply"):
+        return None
+    corrected = str(correction.corrected_action or "")
+    if corrected in ("ignore", "notify"):
+        # The avatar should not have said it at all.
+        return {"action": "delete", "reason": correction.note or ""}
+    return {"action": "edit", "reason": correction.note or ""}
 
 
 @group_conversations_route.get("/groups/{assistant_id}/policy")
@@ -256,6 +295,27 @@ async def delete_group_policy_rule(
     if not deleted:
         raise HTTPException(status_code=404, detail="No such rule.")
     return JSONResponse({"status": "deleted", "rule_id": rule_id})
+
+
+@group_conversations_route.get("/groups/{assistant_id}/follow_ups")
+async def read_group_follow_ups(
+    assistant_id: str,
+    due_only: bool = True,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return what the avatar said it would come back to."""
+    from src.anubis.utils.groups.precedent import due_follow_ups
+
+    _require_enabled()
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    pending = await due_follow_ups(
+        _store_or_503(),
+        creator_user_id,
+        assistant_id,
+        # A far-future timestamp reads everything, due or not.
+        now=None if due_only else "9999-12-31T23:59:59+00:00",
+    )
+    return JSONResponse({"follow_ups": pending, "count": len(pending)})
 
 
 @group_conversations_route.get("/groups/{assistant_id}/notifications")

@@ -54,9 +54,12 @@ from langgraph.types import interrupt
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.groups.events import GroupEvent, render_event
 from src.anubis.utils.groups.precedent import (
+    has_direct_message_precedent,
+    has_exchanged_with,
     has_moderation_precedent,
     queue_notification,
     recall_decisions,
+    record_follow_up,
     store_decision_record,
     store_policy_rule,
 )
@@ -75,9 +78,20 @@ from src.anubis.utils.inbox.repository import (
 logger = logging.getLogger(__name__)
 
 DECISION_IGNORE = "ignore"
+DECISION_REACT = "react"
 DECISION_RESPOND = "respond"
+DECISION_REPLY_IN_THREAD = "reply_in_thread"
+DECISION_DIRECT_MESSAGE = "direct_message"
+DECISION_FOLLOW_UP = "follow_up"
 DECISION_NOTIFY = "notify"
 DECISION_MODERATE = "moderate"
+
+# The decisions that put words in front of somebody and therefore need a draft.
+SPEAKING_DECISIONS = (
+    DECISION_RESPOND,
+    DECISION_REPLY_IN_THREAD,
+    DECISION_DIRECT_MESSAGE,
+)
 
 # The two actions that cannot be undone by the owner afterwards, and so require
 # the owner to have allowed that same action in that same room before.
@@ -97,6 +111,10 @@ class GroupConversationState(TypedDict, total=False):
     channel_name: str
     owns_channel: bool
     available_actions: list[str]
+    capabilities: list[str]
+    reaction: str
+    follow_up_after_seconds: int
+    recipient_has_engaged: bool
     event: dict[str, Any]
     recent_events: list[dict[str, Any]]
     speaker_id: str
@@ -154,7 +172,12 @@ def _speaker_key(state: GroupConversationState) -> str:
 async def accept_event(
     state: GroupConversationState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, Any]:
-    """Normalize the message and note who spoke."""
+    """Normalize the message and note who spoke.
+
+    Whether this person has ever spoken TO the avatar is decided in
+    ``recall_precedent``, which has the store; it is what the whole
+    direct-message gate turns on.
+    """
     event = _event_of(state)
     return {
         "event": event.model_dump(),
@@ -194,16 +217,39 @@ async def recall_precedent(
         sender_domain=_room_key(state),
         message_kind=None,
     )
+    # A message that addresses the avatar is somebody speaking to it. Anything
+    # else has to be looked up: talking in a room the avatar is in is not the
+    # same as having ever addressed it, and a private message to somebody in
+    # the second group is a cold approach wearing the owner's name.
+    engaged = bool(event.mentioned)
+    if not engaged and store is not None:
+        engaged = await has_exchanged_with(
+            store,
+            state["user_id"],
+            state["assistant_id"],
+            platform=str(state.get("platform") or ""),
+            channel_id=str(state.get("channel_id") or ""),
+            author_id=str(event.author_id or ""),
+        )
     return {
         "policy_rules": policy_rules,
         "past_decisions": past_decisions,
         "preferences": preferences,
+        "recipient_has_engaged": engaged,
     }
 
 
 def route_by_mention(state: GroupConversationState) -> str:
-    """Somebody spoke to the avatar: answer. Otherwise decide whether to take part."""
-    return "draft_in_voice" if state.get("mentioned") else "classify"
+    """Every message is classified, including one addressed to the avatar.
+
+    A mention used to skip straight to drafting, on the reasoning that somebody
+    who speaks to you gets an answer. They do — that guarantee is kept in
+    ``classify``, which can never turn a mention into silence. But *where* to
+    answer is a separate question, and it was being decided by default: asked
+    something private in a public channel, the avatar answered in the channel.
+    A person would reply privately, so the avatar has to be allowed to choose.
+    """
+    return "classify"
 
 
 async def classify(
@@ -223,7 +269,17 @@ async def classify(
         past_decisions=state.get("past_decisions") or [],
         available_actions=list(state.get("available_actions") or []),
         owns_channel=bool(state.get("owns_channel")),
+        capabilities=list(state.get("capabilities") or []),
     )
+    # Somebody who speaks to the avatar always gets an answer. The classifier
+    # chooses where — the room, a thread, or privately — but never nothing.
+    if state.get("mentioned") and classification.decision in (
+        DECISION_IGNORE,
+        DECISION_REACT,
+    ):
+        classification.decision = DECISION_RESPOND
+        classification.reaction = ""
+
     await _repository().update_item(
         state["item_id"],
         message_kind=classification.message_kind,
@@ -234,18 +290,27 @@ async def classify(
     return {
         "classification": classification.model_dump(),
         "moderation_action": classification.moderation_action,
+        "reaction": classification.reaction,
+        "follow_up_after_seconds": int(classification.follow_up_after_seconds or 0),
     }
 
 
 def route_after_classify(state: GroupConversationState) -> str:
-    """Route an ignore to the outcome, a reply to drafting, the rest to scoring or the owner."""
+    """Send each decision where it has to go next.
+
+    Anything that puts words in front of somebody is drafted first; a reaction
+    and a moderation action have nothing to write, so they go straight to the
+    confidence gate; a follow-up is only an intention, and is recorded.
+    """
     decision = (state.get("classification") or {}).get("decision")
     if decision == DECISION_IGNORE:
         return "record_outcome"
-    if decision == DECISION_RESPOND:
+    if decision in SPEAKING_DECISIONS:
         return "draft_in_voice"
-    if decision == DECISION_MODERATE:
+    if decision in (DECISION_REACT, DECISION_MODERATE):
         return "score_confidence"
+    if decision == DECISION_FOLLOW_UP:
+        return "record_follow_up_node"
     return "await_owner"
 
 
@@ -358,9 +423,19 @@ async def draft_in_voice(
 
 
 def route_after_draft(state: GroupConversationState) -> str:
-    """Post a mention straight back; score a passive reply first."""
+    """Post a mention straight back; score anything the avatar chose to say itself.
+
+    A direct message is scored even when the avatar was mentioned: the reply is
+    owed, but taking it into a private conversation is a separate judgement
+    with its own gate.
+    """
     if not (state.get("draft") or {}).get("body"):
         return "await_owner"
+    decision = (state.get("classification") or {}).get("decision")
+    if decision == DECISION_DIRECT_MESSAGE:
+        # The reply may be owed, but taking it into a private conversation is a
+        # separate judgement with its own gate.
+        return "score_confidence"
     return "post_reply" if state.get("mentioned") else "score_confidence"
 
 
@@ -376,12 +451,24 @@ async def score_confidence(
     )
 
     classification = state.get("classification") or {}
-    is_moderation = classification.get("decision") == DECISION_MODERATE
-    threshold = float(
-        getattr(runtime.context, "group_auto_moderate_confidence", None) or 0.97
-        if is_moderation
-        else getattr(runtime.context, "group_auto_respond_confidence", None) or 0.9
-    )
+    decision = classification.get("decision")
+    is_moderation = decision == DECISION_MODERATE
+    if is_moderation:
+        threshold = float(
+            getattr(runtime.context, "group_auto_moderate_confidence", None) or 0.97
+        )
+    elif decision == DECISION_REACT:
+        # Deliberately lower than speech. A reaction is cheap to be wrong about
+        # and is most of what makes somebody feel present in a room; an avatar
+        # that reacts only when it is nearly certain reacts almost never, which
+        # is exactly how a bot behaves.
+        threshold = float(
+            getattr(runtime.context, "group_auto_react_confidence", None) or 0.75
+        )
+    else:
+        threshold = float(
+            getattr(runtime.context, "group_auto_respond_confidence", None) or 0.9
+        )
     preferences = state.get("preferences") or []
     prior, prior_reason = preference_prior(
         preferences,
@@ -390,9 +477,9 @@ async def score_confidence(
         sender_domain=_room_key(state),
     )
     event = _event_of(state)
-    if is_moderation:
-        # There is no draft to judge for a moderation action, so the classifier's
-        # own confidence stands in for the alignment half of the score.
+    if is_moderation or decision == DECISION_REACT:
+        # There is no draft to judge for a moderation action or a reaction, so
+        # the classifier's own confidence stands in for the alignment half.
         alignment_score = float(classification.get("confidence") or 0.0)
         alignment_reason = classification.get("reason") or ""
     else:
@@ -455,6 +542,32 @@ async def route_after_confidence(
             if not allowed_before:
                 return "await_owner"
         return "apply_moderation" if confident else "await_owner"
+
+    if classification.get("decision") == DECISION_DIRECT_MESSAGE:
+        # A direct message to somebody who has spoken to the avatar is a reply
+        # in private. A direct message to somebody who has NOT is a cold
+        # approach wearing the owner's name, which is how this feature would
+        # damage the owner and how a platform would read it as spam — so it
+        # never happens on the avatar's own judgement, however confident,
+        # until the owner has allowed one in this room.
+        if not state.get("recipient_has_engaged"):
+            store = getattr(runtime, "store", None) if runtime is not None else None
+            if store is None:
+                return "await_owner"
+            allowed_before = await has_direct_message_precedent(
+                store,
+                state["user_id"],
+                state["assistant_id"],
+                platform=str(state.get("platform") or ""),
+                channel_id=str(state.get("channel_id") or ""),
+            )
+            if not allowed_before:
+                return "await_owner"
+        return "open_direct_message" if confident else "await_owner"
+
+    if classification.get("decision") == DECISION_REACT:
+        return "react" if confident else "await_owner"
+
     return "post_reply" if confident else "await_owner"
 
 
@@ -653,6 +766,16 @@ def route_by_action(state: GroupConversationState) -> str:
         return "post_reply" if (state.get("draft") or {}).get("body") else "record_outcome"
     if action == ACTION_MODERATE:
         return "apply_moderation"
+    if action == DECISION_REACT:
+        return "react" if str(state.get("reaction") or "").strip() else "record_outcome"
+    if action == DECISION_DIRECT_MESSAGE:
+        return (
+            "open_direct_message"
+            if (state.get("draft") or {}).get("body")
+            else "record_outcome"
+        )
+    if action == DECISION_FOLLOW_UP:
+        return "record_follow_up_node"
     return "record_outcome"
 
 
@@ -667,6 +790,69 @@ async def post_reply(
     """
     automatic = not state.get("owner_decision")
     return {"outcome": STATE_AUTO_SENT if automatic else STATE_SENT}
+
+
+async def react(
+    state: GroupConversationState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+) -> dict[str, Any]:
+    """Hand the reaction back for the bot to add.
+
+    Nothing is transmitted here, as with every other action: the bot that sent
+    the batch adds the emoji itself.
+    """
+    automatic = not state.get("owner_decision")
+    return {"outcome": STATE_AUTO_SENT if automatic else STATE_SENT}
+
+
+async def open_direct_message(
+    state: GroupConversationState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+) -> dict[str, Any]:
+    """Hand the private reply back for the bot to send as a direct message."""
+    logger.info(
+        "Group decision: a private reply to %s in %s",
+        state.get("speaker_name"),
+        _room_key(state),
+    )
+    automatic = not state.get("owner_decision")
+    return {"outcome": STATE_AUTO_SENT if automatic else STATE_SENT}
+
+
+async def record_follow_up_node(
+    state: GroupConversationState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+) -> dict[str, Any]:
+    """Remember something the avatar said it would come back to.
+
+    A follow-up is an intention rather than an act, so it needs no confidence
+    gate and no capability from the bot: the API holds it, and when the time
+    comes it is decided again from scratch, under whatever gate the action it
+    resolves to carries.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return {"outcome": STATE_RESOLVED}
+    classification = state.get("classification") or {}
+    ceiling = int(
+        getattr(runtime.context, "group_follow_up_max_delay_seconds", None) or 86_400
+    )
+    delay = max(60, min(int(state.get("follow_up_after_seconds") or 0) or 3_600, ceiling))
+    due_at = (datetime.now(tz=UTC) + timedelta(seconds=delay)).isoformat()
+    await record_follow_up(
+        store,
+        state["user_id"],
+        state["assistant_id"],
+        platform=str(state.get("platform") or ""),
+        channel_id=str(state.get("channel_id") or ""),
+        channel_name=str(state.get("channel_name") or ""),
+        event=_event_of(state),
+        due_at=due_at,
+        what=str(classification.get("reason") or ""),
+    )
+    logger.info(
+        "The avatar will come back to a message in %s at %s", _room_key(state), due_at
+    )
+    return {"outcome": STATE_RESOLVED}
 
 
 async def apply_moderation(
@@ -715,6 +901,7 @@ async def record_outcome(
                 state.get("chosen_action") or classification.get("decision") or ""
             ),
             "moderation_action": str(state.get("moderation_action") or "none"),
+            "reaction": str(state.get("reaction") or ""),
             "mentioned": bool(state.get("mentioned")),
         },
     )
@@ -738,6 +925,18 @@ async def record_outcome(
             confidence=float(state.get("confidence") or 0.0),
             applied_rule=str(classification.get("applied_rule") or ""),
             reply_text=(state.get("draft") or {}).get("body"),
+            # A cold direct message the owner allowed is the precedent the next
+            # one needs; one the avatar sent to somebody who had spoken to it
+            # is not, because that was never the gated case.
+            cold_direct_message=(
+                str(
+                    state.get("chosen_action")
+                    or classification.get("decision")
+                    or ""
+                )
+                == DECISION_DIRECT_MESSAGE
+                and not state.get("recipient_has_engaged")
+            ),
             # An action the owner accepted or chose is the owner allowing that
             # action in this room, which is the precedent an irreversible
             # action needs the next time one is proposed here.
@@ -761,6 +960,9 @@ def build_group_workflow() -> StateGraph:
     workflow.add_node("apply_owner_decision", apply_owner_decision)
     workflow.add_node("update_preferences", update_preferences)
     workflow.add_node("post_reply", post_reply)
+    workflow.add_node("react", react)
+    workflow.add_node("open_direct_message", open_direct_message)
+    workflow.add_node("record_follow_up_node", record_follow_up_node)
     workflow.add_node("apply_moderation", apply_moderation)
     workflow.add_node("record_outcome", record_outcome)
 
@@ -778,6 +980,7 @@ def build_group_workflow() -> StateGraph:
             "record_outcome": "record_outcome",
             "draft_in_voice": "draft_in_voice",
             "score_confidence": "score_confidence",
+            "record_follow_up_node": "record_follow_up_node",
             "await_owner": "await_owner",
         },
     )
@@ -795,6 +998,8 @@ def build_group_workflow() -> StateGraph:
         route_after_confidence,
         {
             "post_reply": "post_reply",
+            "react": "react",
+            "open_direct_message": "open_direct_message",
             "apply_moderation": "apply_moderation",
             "await_owner": "await_owner",
         },
@@ -811,6 +1016,9 @@ def build_group_workflow() -> StateGraph:
         },
     )
     workflow.add_edge("post_reply", "record_outcome")
+    workflow.add_edge("react", "record_outcome")
+    workflow.add_edge("open_direct_message", "record_outcome")
+    workflow.add_edge("record_follow_up_node", "record_outcome")
     workflow.add_edge("apply_moderation", "record_outcome")
     workflow.add_edge("record_outcome", END)
     return workflow

@@ -23,7 +23,40 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 # What the avatar can decide to do about one message in a room.
-GROUP_ACTIONS = ("ignore", "respond", "notify", "moderate")
+#
+# This is the whole repertoire of a member of that room, not a moderation menu.
+# A person in a channel reacts far more often than they reply, takes a private
+# matter to a direct message rather than answering it in front of everybody,
+# answers in the thread a question was asked in, and says "I will come back to
+# you on that" and then does. An avatar with only reply-or-silence available
+# reads as a bot no matter how well it writes, because the shape of its
+# participation is wrong.
+GROUP_ACTIONS = (
+    "ignore",
+    "react",
+    "respond",
+    "reply_in_thread",
+    "direct_message",
+    "follow_up",
+    "notify",
+    "moderate",
+)
+
+# What a bot reports it can actually do in one room. The avatar is never
+# offered a capability the platform or the bot's permissions do not have, and a
+# decision that needs a missing one degrades rather than being dropped.
+GROUP_CAPABILITIES = (
+    "react",
+    "reply",
+    "thread",
+    "direct_message",
+    "upload_file",
+    "edit_own",
+    "delete_own",
+    "read_history",
+    "typing",
+    "presence",
+)
 
 # What "moderate" can mean. Which of these a platform actually offers is
 # reported per request by the bot: Slack, for example, offers no timeout and no
@@ -93,6 +126,15 @@ class GroupEventsRequest(BaseModel):
             "An empty list means the avatar may take part but never moderate."
         ),
     )
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Everything else this bot can do in this room — react, reply, thread, "
+            "direct_message, upload_file, edit_own, delete_own, read_history, typing, "
+            "presence. An empty list is read as reply only, which is what a bot that "
+            "has not been taught to report its capabilities can always do."
+        ),
+    )
     events: list[GroupEvent] = Field(default_factory=list)
 
 
@@ -101,9 +143,30 @@ class GroupDecision(BaseModel):
 
     event_id: str
     author_id: str = ""
-    action: Literal["ignore", "respond", "notify", "moderate"]
+    action: Literal[
+        "ignore",
+        "react",
+        "respond",
+        "reply_in_thread",
+        "direct_message",
+        "follow_up",
+        "notify",
+        "moderate",
+    ]
     moderation_action: Literal["none", "warn", "delete", "timeout", "ban"] = "none"
     reply: str | None = None
+    reaction: str | None = Field(
+        default=None,
+        description="The emoji to react with, when the action is react: a name like 'tada' or the character itself.",
+    )
+    direct_message_to: str | None = Field(
+        default=None,
+        description="Whose direct message to open, when the action is direct_message.",
+    )
+    follow_up_after_seconds: int | None = Field(
+        default=None,
+        description="How long to wait before coming back to this, when the action is follow_up.",
+    )
     reasoning: str = ""
     confidence: float = 0.0
     applied_rule: str | None = None
@@ -148,6 +211,7 @@ def render_event(event: GroupEvent, platform: str, channel_name: str) -> str:
 
 __all__ = [
     "GROUP_ACTIONS",
+    "GROUP_CAPABILITIES",
     "GROUP_PLATFORMS",
     "MODERATION_ACTIONS",
     "DecisionCorrection",

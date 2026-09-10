@@ -4216,15 +4216,21 @@ async def connect_account_browser_start(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Open a live browser at a site's sign-in page for the owner to sign in on.
+    """Open a site's sign-in page for the owner — in their own browser when it can be.
 
-    Body: ``provider`` (langsmith, openai, anthropic, a social
-    site, custom_site, or website) plus ``site_url`` and ``name`` for a custom
-    site. Returns ``{login_id, view_url, nonce, expires_in}``; the card opens
-    ``view_url`` (a path on this API) in the window it opened on the click.
+    Body: ``provider`` (langsmith, openai, anthropic, a social site,
+    custom_site, or website) plus ``site_url`` and ``name`` for a custom site.
+    ``device_id`` names which of the owner's machines to open the page on, and
+    ``use_hosted_browser`` asks for the window this API hosts instead.
+
+    Two shapes come back. When a machine of the owner's is online the page
+    opens as a tab in THEIR browser and the answer carries ``login_mode:
+    "desktop_browser"`` with a ``login_token`` the card presents when the owner
+    says they are done. Otherwise the hosted browser opens and the answer
+    carries ``login_mode: "browser_session"`` with the ``view_url`` the card
+    shows in the window it opened on the click.
     """
     from src.anubis.utils.connected_accounts import get_provider
-    from src.anubis.utils.connected_accounts.browser_login import start_login
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
     from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
 
@@ -4254,18 +4260,17 @@ async def connect_account_browser_start(
     personal_avatar = await _resolve_personal_avatar_for_connection(
         client, request, current_user, token
     )
-    reconnect_key = str(body.get("reconnect_account_key") or "").strip() or None
-    if reconnect_key and reconnect_key.startswith("account:"):
-        reconnect_key = reconnect_key[len("account:"):]
+    reconnect_key = _normalized_reconnect_key(body.get("reconnect_account_key"))
     try:
-        started = await start_login(
-            app.state.context,
+        started = await _start_sign_in_browser(
             user_id=user_id,
             assistant_id=str(personal_avatar.get("assistant_id")),
             provider=provider,
             site_url=site_url or provider.login_url,
             name=body.get("name"),
             reconnect_account_key=reconnect_key,
+            device_id=str(body.get("device_id") or "").strip() or None,
+            prefer_hosted_browser=bool(body.get("use_hosted_browser")),
         )
     except BrowserSessionError as session_error:
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
@@ -4347,13 +4352,22 @@ async def connect_account_browser_stream(websocket: WebSocket, login_id: str):
 
 @app.post("/connect_account/browser/{login_id}/finish")
 async def connect_account_browser_finish(request: Request, login_id: str):
-    """Save the signed-in session as a connected account."""
+    """Save the signed-in session as a connected account.
+
+    Serves both browsers: a login id belonging to a sign-in the owner did in
+    their OWN browser brings the session back from their machine, and any
+    other id captures it from the window this API hosts.
+    """
     from src.anubis.utils.connected_accounts import get_provider, public_account_view
     from src.anubis.utils.connected_accounts.browser_login import (
         finish_login,
         verify_login_token,
     )
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.desktop_login import (
+        finish_desktop_login,
+        get_desktop_login,
+    )
     from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
 
     token = _login_token_from_request(request)
@@ -4364,10 +4378,22 @@ async def connect_account_browser_finish(request: Request, login_id: str):
     user_id = str(payload.get("user_id") or "")
     nonce = payload.get("nonce")
     existing_records = await _connected_account_records_without_session(user_id)
+    signed_in_on_own_browser = get_desktop_login(login_id) is not None
     try:
-        finished = await finish_login(
-            app.state.context, login_id=login_id, user_id=user_id, existing_records=existing_records
-        )
+        if signed_in_on_own_browser:
+            finished = await finish_desktop_login(
+                app.state.context,
+                login_id=login_id,
+                user_id=user_id,
+                existing_records=existing_records,
+            )
+        else:
+            finished = await finish_login(
+                app.state.context,
+                login_id=login_id,
+                user_id=user_id,
+                existing_records=existing_records,
+            )
         record = finished["record"]
         provider = get_provider(str(record.get("provider") or ""))
         _enforce_connection_caps(existing_records, provider, record)
@@ -4388,6 +4414,9 @@ async def connect_account_browser_finish(request: Request, login_id: str):
             "account_address": view.get("account_address"),
             "tool_count": len(tool_names_for(provider, record)),
             "heuristic_signed_in": finished.get("heuristic_signed_in"),
+            "signed_in_on": "your own browser" if signed_in_on_own_browser else "a hosted window",
+            "device_label": finished.get("device_label"),
+            "cookie_count": finished.get("cookie_count"),
         },
         status_code=200,
     )
@@ -4395,19 +4424,25 @@ async def connect_account_browser_finish(request: Request, login_id: str):
 
 @app.post("/connect_account/browser/{login_id}/cancel")
 async def connect_account_browser_cancel(request: Request, login_id: str):
-    """Close a sign-in window without saving anything."""
+    """Close a sign-in without saving anything.
+
+    A sign-in the owner started in their own browser leaves the tab alone —
+    it is their window, on their machine, and closing it is theirs to do.
+    """
     from src.anubis.utils.connected_accounts.browser_login import (
         cancel_login,
         verify_login_token,
     )
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.desktop_login import cancel_desktop_login
 
     token = _login_token_from_request(request)
     try:
         payload = verify_login_token(app.state.context, token, login_id)
     except BrowserSessionError as session_error:
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
-    cancelled = await cancel_login(login_id, str(payload.get("user_id") or ""))
+    user_id = str(payload.get("user_id") or "")
+    cancelled = cancel_desktop_login(login_id, user_id) or await cancel_login(login_id, user_id)
     return JSONResponse(content={"ok": False, "cancelled": cancelled}, status_code=200)
 
 
@@ -4484,6 +4519,76 @@ async def connect_account_oauth_start(
     return JSONResponse(content=started, status_code=200)
 
 
+def _normalized_reconnect_key(reconnect_account_key: str | None) -> str | None:
+    """The bare account key a "sign in again" names, without its card prefix."""
+    reconnect_key = str(reconnect_account_key or "").strip() or None
+    if reconnect_key and reconnect_key.startswith("account:"):
+        reconnect_key = reconnect_key[len("account:"):]
+    return reconnect_key
+
+
+async def _start_sign_in_browser(
+    *,
+    user_id: str,
+    assistant_id: str,
+    provider: Any,
+    site_url: str | None,
+    name: str | None,
+    reconnect_account_key: str | None,
+    device_id: str | None = None,
+    prefer_hosted_browser: bool = False,
+) -> dict:
+    """Open a sign-in page for the owner — in THEIR browser when one is reachable.
+
+    The owner's own browser is the first choice for every site: the vendors
+    that refuse an automated browser (Google above all) accept it, and the
+    owner is frequently signed in there already. It needs the connector
+    running on a machine of theirs, so when no machine is online — or the card
+    explicitly asked for the hosted window — the sign-in falls back to the
+    browser this API hosts rather than refusing to connect at all.
+    """
+    from src.anubis.utils.connected_accounts.browser_login import start_login
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.desktop_login import (
+        desktop_sign_in_available,
+        start_desktop_login,
+    )
+
+    if not prefer_hosted_browser and desktop_sign_in_available(user_id, device_id):
+        try:
+            return await start_desktop_login(
+                app.state.context,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                provider=provider,
+                site_url=site_url,
+                name=name,
+                reconnect_account_key=reconnect_account_key,
+                device_id=device_id,
+            )
+        except BrowserSessionError as desktop_error:
+            # A machine that went offline between the check and the call, or a
+            # connector too old for the sign-in tools, is a reason to use the
+            # hosted window — not a reason to fail the connection.
+            logger.info(
+                "Falling back to the hosted sign-in browser: %s", desktop_error.detail
+            )
+    try:
+        started = await start_login(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            provider=provider,
+            site_url=site_url,
+            name=name,
+            reconnect_account_key=reconnect_account_key,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    started["login_mode"] = "browser_session"
+    return started
+
+
 async def _start_browser_fallback(
     request: Request,
     current_user: dict,
@@ -4493,28 +4598,17 @@ async def _start_browser_fallback(
     name: str | None = None,
     reconnect_account_key: str | None = None,
 ) -> dict:
-    """Open the live sign-in browser for a vendor whose OAuth app is not configured."""
-    from src.anubis.utils.connected_accounts.browser_login import start_login
-    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
-
+    """Open a sign-in page for a vendor whose OAuth application is not configured."""
     user_id = current_user["identities"][0]["user_id"]
-    reconnect_key = str(reconnect_account_key or "").strip() or None
-    if reconnect_key and reconnect_key.startswith("account:"):
-        reconnect_key = reconnect_key[len("account:"):]
-    try:
-        started = await start_login(
-            app.state.context,
-            user_id=user_id,
-            assistant_id=str(personal_avatar.get("assistant_id")),
-            provider=provider,
-            site_url=provider.login_url,
-            name=str(name or "").strip() or provider.display_name,
-            reconnect_account_key=reconnect_key,
-        )
-    except BrowserSessionError as session_error:
-        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
-    started["login_mode"] = "browser_session"
-    started["fallback"] = "browser_session"
+    started = await _start_sign_in_browser(
+        user_id=user_id,
+        assistant_id=str(personal_avatar.get("assistant_id")),
+        provider=provider,
+        site_url=provider.login_url,
+        name=str(name or "").strip() or provider.display_name,
+        reconnect_account_key=_normalized_reconnect_key(reconnect_account_key),
+    )
+    started["fallback"] = started.get("login_mode") or "browser_session"
     return started
 
 
@@ -4693,17 +4787,25 @@ async def connectable_providers(
     from src.anubis.utils.connected_accounts.connection_tools import (
         build_connect_card,
     )
+    from src.anubis.utils.connected_accounts.desktop_login import choose_device
     from src.anubis.utils.connected_accounts.providers import (
         CATEGORY_ORDER,
         catalog_providers,
     )
 
+    # Whether a sign-in would open in the owner's OWN browser right now. The
+    # picker says which machine the tab will appear on, so nobody is left
+    # watching for a window that opened on a different desk.
+    sign_in_device = choose_device(str(current_user["identities"][0]["user_id"]))
     return JSONResponse(
         content={
             "categories": list(CATEGORY_ORDER),
             "providers": [
                 build_connect_card(provider) for provider in catalog_providers()
             ],
+            "sign_in_in_your_own_browser": sign_in_device is not None,
+            "sign_in_device_label": getattr(sign_in_device, "device_label", None),
+            "sign_in_device_id": getattr(sign_in_device, "device_id", None),
         },
         status_code=200,
     )

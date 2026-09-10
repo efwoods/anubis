@@ -1312,6 +1312,66 @@ class GlobalContext:
 
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
+    """ Browsing Insights (what the owner's own web browsing says about the owner) """
+
+    browsing_insights_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to read the owner's browsing history from their connected machines and learn facts and traits from it. Env BROWSING_INSIGHTS_ENABLED."
+        },
+    )
+
+    browsing_insights_poll_seconds: int = field(
+        default=300,
+        metadata={
+            "description": "How often, in seconds, the background browsing sweep asks each connected machine whether any new browsing has happened. The question costs one indexed count per browser profile and no model call. Env BROWSING_INSIGHTS_POLL_SECONDS."
+        },
+    )
+
+    browsing_insights_minimum_new_visits: int = field(
+        default=25,
+        metadata={
+            "description": "How many new page visits a machine must have recorded before a background pass spends a model call on them. A first pass over a machine ignores this. Env BROWSING_INSIGHTS_MINIMUM_NEW_VISITS."
+        },
+    )
+
+    browsing_insights_minimum_seconds_between_analyses: int = field(
+        default=900,
+        metadata={
+            "description": "The shortest gap, in seconds, between two background analyses of one machine's browsing, whatever the visit count. Env BROWSING_INSIGHTS_MINIMUM_SECONDS_BETWEEN_ANALYSES."
+        },
+    )
+
+    browsing_insights_backfill_days: int = field(
+        default=30,
+        metadata={
+            "description": "How many days of existing browsing history are read the first time a machine is analysed, so a newly connected machine teaches the avatar immediately. Env BROWSING_INSIGHTS_BACKFILL_DAYS."
+        },
+    )
+
+    browsing_insights_max_visits_per_pass: int = field(
+        default=2000,
+        metadata={
+            "description": "The most page visits one pass reads from one machine; the rest are left for the next pass rather than skipped. Env BROWSING_INSIGHTS_MAX_VISITS_PER_PASS."
+        },
+    )
+
+    browsing_insights_max_digest_characters: int = field(
+        default=24000,
+        metadata={
+            "description": "The size cap, in characters, of the browsing digest one analysis reads. The digest is trimmed from the end, so the counts and the searches survive a trim. Env BROWSING_INSIGHTS_MAX_DIGEST_CHARACTERS."
+        },
+    )
+
+    browsing_insights_report_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to save a readable report to the reports list for every browsing pass that found something. Env BROWSING_INSIGHTS_REPORT_ENABLED."
+        },
+    )
+
+    """ </Browsing Insights> """
+
     """ Continuous Learning & Personalization """
 
     learning_sweep_enabled: str = field(

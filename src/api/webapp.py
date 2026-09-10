@@ -2434,6 +2434,18 @@ async def lifespan(app: FastAPI):
             app.state.learning_sweeper_task = asyncio.create_task(
                 run_learning_sweeper(app)
             )
+        # Browsing insights: while the owner browses, the avatar keeps up. Each
+        # turn of this loop asks every connected machine how much is new — one
+        # indexed count per browser profile, no rows and no model call — and
+        # analyses only when enough new browsing has accumulated to be worth a
+        # model call (see browsing/sweeper.py).
+        app.state.browsing_sweeper_task = None
+        if str(app.state.context.browsing_insights_enabled or "").upper() == "TRUE":
+            from src.anubis.utils.browsing.sweeper import run_browsing_sweeper
+
+            app.state.browsing_sweeper_task = asyncio.create_task(
+                run_browsing_sweeper(app)
+            )
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
@@ -2442,6 +2454,13 @@ async def lifespan(app: FastAPI):
             sweeper_task.cancel()
             try:
                 await sweeper_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
+        browsing_task = getattr(app.state, "browsing_sweeper_task", None)
+        if browsing_task is not None:
+            browsing_task.cancel()
+            try:
+                await browsing_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
                 pass
         purge_task = getattr(app.state, "usage_analytics_purge_task", None)

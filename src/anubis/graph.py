@@ -1148,6 +1148,31 @@ async def think(
             *build_development_tools(deep_agent_run_context, live_connections),
         ]
 
+        # What the owner's own web browsing says about the owner. The
+        # background sweep keeps this current on its own; the tool is for the
+        # owner asking directly, and it waives the sweep's thresholds because
+        # a person who asked has already decided the pass is worth running.
+        if (
+            str(getattr(deep_agent_run_context, "browsing_insights_enabled", "TRUE") or "")
+            .strip()
+            .upper()
+            == "TRUE"
+        ):
+            from src.anubis.utils.browsing.tools import build_browsing_insight_tools
+
+            analysis_extra_tools = [
+                *analysis_extra_tools,
+                *build_browsing_insight_tools(
+                    deep_agent_run_context,
+                    store=runtime.store,
+                    user_id=state["user_state"]["user_id"],
+                    assistant_id=state["assistant_state"]["assistant_id"],
+                    target_name=str(
+                        (state.get("assistant_state") or {}).get("assistant_name") or ""
+                    ),
+                ),
+            ]
+
     # Browser capability gate: the process-wide environment switch
     # (BROWSER_TOOLS_ENABLED) AND the personal avatar. The browser follows
     # links out of the owner's own mail and will carry the owner's signed-in

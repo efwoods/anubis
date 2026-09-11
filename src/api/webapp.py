@@ -36,7 +36,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.store.base import IndexConfig
 from langgraph.store.postgres import AsyncPostgresStore
@@ -2333,6 +2333,20 @@ async def lifespan(app: FastAPI):
         inbox_package.PostgresInboxRepository(app.state.pool)
     )
 
+    # Content subscriptions: what the owner's own accounts publish, and every
+    # announcement received. Published process-wide the same way, because the
+    # webhook route and the mailbox watcher both reach it without importing
+    # this module.
+    from src.anubis.utils import subscriptions as subscriptions_package
+    from src.anubis.utils.subscriptions import (
+        repository as subscriptions_repository,
+    )
+
+    await subscriptions_package.ensure_subscription_tables(app.state.pool)
+    subscriptions_package.set_subscription_repository(
+        subscriptions_repository.PostgresSubscriptionRepository(app.state.pool)
+    )
+
     # Geo-located avatars. Two throttles keep a moving phone from flooding the
     # visit records and from notifying the same visitor about the same avatar on
     # every position update. Both live in this process, so a deployment with
@@ -2390,6 +2404,13 @@ async def lifespan(app: FastAPI):
         app.state.inbox_poller = asyncio.create_task(
             inbox_poller.poll_forever(app.state.context)
         )
+        # IDLE makes mail event-driven: the server speaks first, so a message
+        # that arrives now is triaged now. The interval poll above stays as the
+        # catch-up pass — IDLE keeps up, the poll catches up.
+        from src.anubis.utils.inbox.idle_watchers import MailboxIdleWatchers
+
+        app.state.mailbox_idle_watchers = MailboxIdleWatchers(app.state.context)
+        app.state.mailbox_idle_watchers.start()
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
@@ -2406,6 +2427,20 @@ async def lifespan(app: FastAPI):
             )
         except ImportError:
             app.state.report_scheduler = None
+
+        # Subscription leases expire, and a lapsed lease is silent: nothing
+        # fails, content simply stops arriving. This is a timer over stored
+        # expiry times, not a poll of any platform.
+        try:
+            from src.anubis.utils.subscriptions.transports import (
+                renew_subscriptions_forever,
+            )
+
+            app.state.subscription_renewer = asyncio.create_task(
+                renew_subscriptions_forever(app.state.context)
+            )
+        except Exception:  # noqa: BLE001 - renewal is not worth failing boot
+            app.state.subscription_renewer = None
         except Exception as scheduler_error:  # noqa: BLE001 - startup must not fail
             logger.error("Report scheduler could not start: %s", scheduler_error)
             app.state.report_scheduler = None
@@ -2466,6 +2501,12 @@ async def lifespan(app: FastAPI):
         purge_task = getattr(app.state, "usage_analytics_purge_task", None)
         if purge_task is not None:
             purge_task.cancel()
+        renewer_task = getattr(app.state, "subscription_renewer", None)
+        if renewer_task is not None:
+            renewer_task.cancel()
+        mailbox_watchers = getattr(app.state, "mailbox_idle_watchers", None)
+        if mailbox_watchers is not None:
+            await mailbox_watchers.stop()
         try:
             from src.anubis.utils.connected_accounts.browser_sessions import (
                 shutdown_browser_sessions,
@@ -3417,6 +3458,259 @@ def _resolve_stripe_webhook_secret(context) -> Optional[str]:
         return None
 
 
+@app.get("/social_webhook/{provider_name}")
+async def social_webhook_verify(provider_name: str, request: Request):
+    """Answer a platform's verification handshake for a content subscription.
+
+    Unauthenticated of necessity — the caller is YouTube or Meta, not the owner
+    — and therefore narrow by construction: the only thing this route can do is
+    echo a challenge for a subscription this server already asked for, and it
+    refuses a challenge naming any topic it did not ask about. That refusal is
+    what stops a stranger from pointing our callback at their own feed.
+    """
+    from src.anubis.utils.subscriptions.repository import (
+        SUBSCRIPTION_ACTIVE,
+        get_subscription_repository,
+    )
+    from src.anubis.utils.subscriptions.transports import lease_expiry
+
+    parameters = request.query_params
+
+    # Meta verifies with its own token rather than with a per-subscription
+    # challenge, because its webhook is configured against the application.
+    if parameters.get("hub.verify_token"):
+        expected = str(
+            getattr(app.state.context, "meta_webhook_verify_token", "") or ""
+        )
+        if not expected or parameters.get("hub.verify_token") != expected:
+            raise HTTPException(status_code=403, detail="Verification refused.")
+        return PlainTextResponse(parameters.get("hub.challenge") or "")
+
+    mode = parameters.get("hub.mode") or ""
+    topic = parameters.get("hub.topic") or ""
+    challenge = parameters.get("hub.challenge") or ""
+    if not challenge:
+        raise HTTPException(status_code=400, detail="No challenge was presented.")
+
+    repository = get_subscription_repository()
+    matches = await repository.find_by_callback(
+        provider=provider_name, topic=topic
+    )
+    if not matches:
+        # A hub may spell the topic as the feed address while the row keys on
+        # the channel id; try the stored topic address before refusing.
+        everything = await repository.find_by_callback(
+            provider=provider_name, topic=topic.strip()
+        )
+        matches = [
+            subscription
+            for subscription in (everything or [])
+            if subscription.get("topic_url") == topic
+        ]
+    if not matches:
+        logger.warning(
+            "Refused a %s verification for an unrequested topic: %s",
+            provider_name,
+            topic,
+        )
+        raise HTTPException(status_code=404, detail="No such subscription.")
+
+    subscription = matches[0]
+    if mode == "unsubscribe":
+        await repository.set_subscription_status(
+            subscription["subscription_id"],
+            status="disabled",
+            detail="The hub confirmed the subscription was removed.",
+        )
+        return PlainTextResponse(challenge)
+
+    await repository.set_subscription_status(
+        subscription["subscription_id"],
+        status=SUBSCRIPTION_ACTIVE,
+        detail="The platform confirmed the subscription.",
+        expires_at=lease_expiry(
+            app.state.context, parameters.get("hub.lease_seconds")
+        ),
+    )
+    return PlainTextResponse(challenge)
+
+
+@app.post("/social_webhook/{provider_name}")
+async def social_webhook_deliver(provider_name: str, request: Request):
+    """Receive a platform's announcement that the owner published something.
+
+    Three things happen before the payload is believed, and the order is the
+    whole security of this route: the raw body is read, the signature is
+    checked against it, and only then is it parsed. A payload parsed first and
+    verified afterwards is verified against bytes nobody signed.
+
+    Answers 2xx quickly whatever happens downstream. Every platform here
+    retries a failing callback and then drops the subscription, so an ingest
+    problem must not be reported as a delivery problem — the work is recorded
+    and handed to a background task instead.
+    """
+    from src.anubis.utils.connected_accounts.providers import (
+        CONTENT_TRANSPORT_EVENTSUB,
+        CONTENT_TRANSPORT_META_GRAPH,
+        CONTENT_TRANSPORT_WEBSUB,
+        get_provider,
+    )
+    from src.anubis.utils.subscriptions.payloads import (
+        parse_eventsub,
+        parse_meta_change,
+        parse_websub_atom,
+        websub_topic_of,
+    )
+    from src.anubis.utils.subscriptions.repository import (
+        SUBSCRIPTION_ACTIVE,
+        get_subscription_repository,
+    )
+    from src.anubis.utils.subscriptions.transports import (
+        is_replay,
+        verify_eventsub_signature,
+        verify_meta_signature,
+        verify_websub_signature,
+    )
+
+    provider = get_provider(provider_name)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Unknown provider.")
+
+    raw_body = await request.body()
+    repository = get_subscription_repository()
+    transport = provider.content_transport
+    items: list[dict[str, Any]] = []
+    subscription: dict[str, Any] | None = None
+
+    if transport == CONTENT_TRANSPORT_WEBSUB:
+        topic = websub_topic_of(raw_body)
+        if not topic:
+            raise HTTPException(status_code=400, detail="No topic in the payload.")
+        candidates = await repository.find_by_callback(
+            provider=provider_name, topic=topic
+        )
+        subscription = candidates[0] if candidates else None
+        if subscription is None:
+            logger.warning("Dropped a %s push for an unknown topic.", provider_name)
+            raise HTTPException(status_code=404, detail="No such subscription.")
+        if not verify_websub_signature(
+            raw_body=raw_body,
+            header_value=request.headers.get("X-Hub-Signature-256")
+            or request.headers.get("X-Hub-Signature"),
+            secret=str(subscription.get("secret") or ""),
+        ):
+            logger.warning("Refused a %s push with a bad signature.", provider_name)
+            raise HTTPException(status_code=403, detail="Signature mismatch.")
+        items = parse_websub_atom(raw_body)
+
+    elif transport == CONTENT_TRANSPORT_EVENTSUB:
+        message_type = request.headers.get("Twitch-Eventsub-Message-Type") or ""
+        timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp")
+        if is_replay(timestamp):
+            raise HTTPException(status_code=403, detail="Stale delivery.")
+        payload = json.loads(raw_body or b"{}")
+        candidates = await repository.find_by_callback(
+            provider=provider_name,
+            topic=str(
+                ((payload.get("subscription") or {}).get("condition") or {}).get(
+                    "broadcaster_user_id"
+                )
+                or ""
+            ),
+        )
+        subscription = candidates[0] if candidates else None
+        secret = str(
+            (subscription or {}).get("secret")
+            or getattr(app.state.context, "twitch_eventsub_secret", "")
+            or ""
+        )
+        if not verify_eventsub_signature(
+            raw_body=raw_body,
+            message_id=request.headers.get("Twitch-Eventsub-Message-Id"),
+            timestamp=timestamp,
+            signature=request.headers.get("Twitch-Eventsub-Message-Signature"),
+            secret=secret,
+        ):
+            raise HTTPException(status_code=403, detail="Signature mismatch.")
+        # Twitch's own handshake asks us to echo a challenge on this route.
+        if message_type == "webhook_callback_verification":
+            if subscription is not None:
+                await repository.set_subscription_status(
+                    subscription["subscription_id"],
+                    status=SUBSCRIPTION_ACTIVE,
+                    detail="Twitch confirmed the subscription.",
+                )
+            return PlainTextResponse(str(payload.get("challenge") or ""))
+        if message_type == "revocation":
+            if subscription is not None:
+                await repository.set_subscription_status(
+                    subscription["subscription_id"],
+                    status="disabled",
+                    detail="Twitch revoked the subscription.",
+                )
+            return JSONResponse({"status": "ok"})
+        items = parse_eventsub(payload)
+
+    elif transport == CONTENT_TRANSPORT_META_GRAPH:
+        if not verify_meta_signature(
+            raw_body=raw_body,
+            header_value=request.headers.get("X-Hub-Signature-256"),
+            app_secret=str(getattr(app.state.context, "meta_app_secret", "") or ""),
+        ):
+            raise HTTPException(status_code=403, detail="Signature mismatch.")
+        payload = json.loads(raw_body or b"{}")
+        items = parse_meta_change(payload)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.display_name} does not deliver to this callback.",
+        )
+
+    if not items:
+        return JSONResponse({"status": "ok", "accepted": 0})
+
+    accepted = 0
+    for item in items:
+        match = subscription
+        if match is None and item.get("object_id"):
+            candidates = await repository.find_by_callback(
+                provider=provider_name, topic=str(item["object_id"])
+            )
+            match = candidates[0] if candidates else None
+        if match is None:
+            continue
+        accepted += 1
+        schedule_background(_ingest_subscription_event(match, item, provider_name))
+
+    return JSONResponse({"status": "ok", "accepted": accepted})
+
+
+async def _ingest_subscription_event(
+    subscription: dict[str, Any], item: dict[str, Any], provider_name: str
+) -> None:
+    """Hand one verified announcement to the intake, off the callback's reply."""
+    from src.anubis.utils.subscriptions.intake import record_content_event
+
+    try:
+        await record_content_event(
+            provider=provider_name,
+            connection_key=str(subscription.get("connection_key") or "") or None,
+            personal_avatar_id=str(subscription.get("personal_avatar_id") or ""),
+            user_id=str(subscription.get("user_id") or ""),
+            external_item_id=str(item.get("external_item_id") or ""),
+            url=item.get("url"),
+            title=item.get("title"),
+            published_at=item.get("published_at"),
+            transport=str(subscription.get("transport") or ""),
+            subscription_id=str(subscription.get("subscription_id") or ""),
+            avatar_name=subscription.get("avatar_name"),
+            avatar_description=subscription.get("avatar_description"),
+            store=getattr(app.state, "store", None),
+        )
+    except Exception:  # noqa: BLE001 - a delivery must never crash the task
+        logger.exception("Could not ingest a %s announcement.", provider_name)
+
+
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     """Verify and process Stripe subscription-lifecycle webhooks.
@@ -4002,9 +4296,191 @@ def _enforce_connection_caps(
         )
 
 
+async def _onboard_social_account(record: dict[str, Any]) -> None:
+    """Prove a newly connected social account, subscribe to it, and crawl it.
+
+    Runs off the request path because the crawl can take minutes. Everything
+    here is ordered around one rule: nothing this account published reaches the
+    avatar's identity until the account is proven to belong to the avatar's own
+    person. So the proof comes first, and a failed proof ends the sequence with
+    the account connected and usable in conversation but contributing nothing
+    to identity — a state the owner can see and fix.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        OWNERSHIP_PROVEN,
+        prove_ownership,
+    )
+    from src.anubis.utils.connected_accounts.store import save_connected_account
+
+    context = app.state.context
+    store = getattr(app.state, "store", None)
+    user_id = str(record.get("user_id") or "")
+    assistant_id = str(record.get("assistant_id") or "")
+    account_key = str(record.get("account_key") or "")
+    if not (user_id and assistant_id and account_key):
+        return
+
+    try:
+        ownership = await prove_ownership(context, store, record)
+    except Exception:  # noqa: BLE001 - a failed proof is a state, not a crash
+        logger.exception("Ownership proof crashed for %s", account_key)
+        return
+
+    record["ownership"] = ownership
+    # Capture what the crawl seed needs while a fresh credential is guaranteed
+    # to exist: after this, the channel is known without another vendor call.
+    if ownership.get("state") == OWNERSHIP_PROVEN:
+        await _capture_social_crawl_seed(record, ownership)
+    try:
+        await save_connected_account(store, user_id, record)
+    except Exception:  # noqa: BLE001 - the proof is re-derivable on reconnect
+        logger.exception("Could not store the ownership proof for %s", account_key)
+        return
+
+    if ownership.get("state") != OWNERSHIP_PROVEN:
+        logger.info(
+            "%s connected but unproven; it will not feed identity. %s",
+            account_key,
+            ownership.get("detail"),
+        )
+        return
+
+    avatar_name, avatar_description, tier_name = await _avatar_context_for_crawl(
+        user_id, assistant_id
+    )
+
+    try:
+        from src.anubis.utils.subscriptions.transports import subscribe_to_content
+
+        outcome = await subscribe_to_content(
+            context,
+            record=record,
+            personal_avatar_id=assistant_id,
+            user_id=user_id,
+            avatar_name=avatar_name,
+            avatar_description=avatar_description,
+        )
+        logger.info("Subscription for %s: %s", account_key, outcome.get("status"))
+    except Exception:  # noqa: BLE001 - the crawl is still worth running
+        logger.exception("Could not subscribe to %s", account_key)
+
+    try:
+        from src.anubis.utils.subscriptions.crawl import crawl_connected_account
+
+        report = await crawl_connected_account(
+            context,
+            record=record,
+            personal_avatar_id=assistant_id,
+            user_id=user_id,
+            avatar_name=avatar_name,
+            avatar_description=avatar_description,
+            tier_name=tier_name,
+            store=store,
+        )
+        logger.info(
+            "Initial crawl of %s: %s, %s ingested",
+            account_key,
+            report.get("status"),
+            report.get("ingested"),
+        )
+    except Exception:  # noqa: BLE001 - never surfaces to the owner's request
+        logger.exception("The initial crawl of %s failed", account_key)
+
+
+async def _capture_social_crawl_seed(
+    record: dict[str, Any], ownership: dict[str, Any]
+) -> None:
+    """Record where this account's published work lives, onto the record.
+
+    For YouTube that is the uploads playlist and the channel id — the first is
+    the crawl seed, the second is the WebSub topic — and both are read from the
+    vendor rather than guessed from a handle, because a channel address can be
+    a custom name, a legacy user name, or an id, and only one of those is
+    stable enough to subscribe against.
+    """
+    from src.anubis.utils.connected_accounts.ownership import _read_youtube_channel
+
+    if str(record.get("provider") or "") != "youtube":
+        return
+    transport = dict(record.get("transport") or {})
+    if transport.get("youtube_channel_id"):
+        return
+    channel = await _read_youtube_channel(
+        app.state.context, getattr(app.state, "store", None), record
+    )
+    if not channel:
+        return
+    transport["youtube_channel_id"] = channel.get("channel_id")
+    transport["youtube_uploads_playlist_id"] = channel.get("uploads_playlist_id")
+    record["transport"] = transport
+
+
+async def _avatar_context_for_crawl(
+    user_id: str, assistant_id: str
+) -> tuple[str | None, str | None, str]:
+    """Return the avatar's name and description, and the owner's tier name.
+
+    The name is what the media pipeline matches speakers against, so a crawl
+    that ran without it would index recordings while attributing none of them
+    to the person. The tier decides how much the crawl may spend.
+    """
+    from src.anubis.utils.billing.gating import resolve_tier
+    from src.security.auth import get_user_by_identity_user_id
+
+    owner = await get_user_by_identity_user_id(user_id)
+    tier_name = "free"
+    if owner is not None:
+        tier = resolve_tier(owner)
+        tier_name = str(getattr(tier, "value", tier) or "free")
+
+    name, description = await _read_avatar_name_and_description(assistant_id)
+    return name, description, tier_name
+
+
+async def _read_avatar_name_and_description(
+    assistant_id: str,
+) -> tuple[str | None, str | None]:
+    """Read one avatar's name and description straight from the database.
+
+    The LangGraph SDK client authenticates with a caller's own plaintext API
+    key, which background work does not hold and must not store. The assistants
+    live in this application's own database, so the read goes there instead:
+    the same data, without inventing a credential to ask for it.
+    """
+    pool = getattr(app.state, "pool", None)
+    if pool is None:
+        return None, None
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT name, description FROM assistant WHERE assistant_id = %s",
+                    (assistant_id,),
+                )
+                row = await cursor.fetchone()
+    except Exception:  # noqa: BLE001 - the crawl can run with a bare name
+        logger.info("Could not read avatar %s for the crawl context.", assistant_id)
+        return None, None
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
 def _after_record_stored(provider: Any, record: dict[str, Any]) -> None:
     """Housekeeping once a record is written (cache resets, schedule seeds)."""
-    from src.anubis.utils.connected_accounts.providers import KIND_MCP_SERVER
+    from src.anubis.utils.connected_accounts.providers import (
+        KIND_MCP_SERVER,
+        KIND_SOCIAL,
+    )
+
+
+    # A social account is the one kind whose connection is also a claim about a
+    # real person. Proving that claim, crawling what they have already
+    # published, and subscribing so the next thing arrives on its own all
+    # happen off the request: the owner's connect card should return the moment
+    # the account is linked, not after a channel has been walked.
+    if provider.kind == KIND_SOCIAL:
+        schedule_background(_onboard_social_account(record))
 
     if provider.kind == KIND_MCP_SERVER:
         from src.anubis.utils.connected_accounts.mcp_server_tools import (
@@ -4856,6 +5332,228 @@ async def list_connected_accounts(
     )
 
 
+@app.get("/social_subscriptions")
+async def list_social_subscriptions(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Report what the personal avatar is subscribed to, and what it has learned.
+
+    This is what the owner sees to know the feature is alive: which accounts are
+    proven theirs, which are subscribed, how each one is notified, and what has
+    arrived recently. An account connected but unproven is reported plainly
+    rather than hidden, because "nothing is arriving" needs a reason attached.
+    """
+    from src.anubis.utils.connected_accounts.ownership import ownership_of
+    from src.anubis.utils.connected_accounts.providers import (
+        KIND_SOCIAL,
+        get_provider,
+    )
+    from src.anubis.utils.subscriptions.repository import (
+        get_subscription_repository,
+    )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+
+    records = [
+        record
+        for record in await _connected_account_records(client, user_id)
+        if record.get("kind") == KIND_SOCIAL
+    ]
+    repository = get_subscription_repository()
+    subscriptions = await repository.list_for_avatar(assistant_id)
+    by_connection = {
+        str(subscription.get("connection_key") or ""): subscription
+        for subscription in subscriptions
+    }
+
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        account_key = str(record.get("account_key") or "")
+        provider = get_provider(str(record.get("provider") or ""))
+        ownership = ownership_of(record)
+        subscription = by_connection.get(account_key)
+        rows.append(
+            {
+                "account_key": account_key,
+                "provider": record.get("provider"),
+                "display_label": record.get("display_label"),
+                "handle": ownership.get("handle"),
+                "profile_url": ownership.get("profile_url"),
+                "ownership_state": ownership.get("state"),
+                "ownership_method": ownership.get("method"),
+                "ownership_detail": ownership.get("detail"),
+                "subscribable": bool(provider and provider.is_subscribable),
+                "content_transport": (
+                    provider.content_transport if provider else None
+                ),
+                "pushes_content": bool(provider and provider.pushes_content),
+                "subscription_status": (subscription or {}).get("status"),
+                "subscription_detail": (subscription or {}).get("detail"),
+                "last_event_at": (subscription or {}).get("last_event_at"),
+                "expires_at": (subscription or {}).get("expires_at"),
+            }
+        )
+
+    events = await repository.list_events_for_avatar(assistant_id, limit=25)
+    return JSONResponse(
+        content={
+            "assistant_id": assistant_id,
+            "accounts": rows,
+            "recent_events": [
+                {
+                    "provider": event.get("provider"),
+                    "url": event.get("url"),
+                    "title": event.get("title"),
+                    "state": event.get("state"),
+                    "detail": event.get("detail"),
+                    "received_at": event.get("received_at"),
+                }
+                for event in events
+            ],
+        },
+        status_code=200,
+    )
+
+
+@app.post("/social_subscriptions/{account_key:path}/verify")
+async def verify_social_account_ownership(
+    account_key: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check again whether this account belongs to the avatar's person.
+
+    The action behind "Not verified" in the interface. It exists because the
+    one proof an owner can act on — placing a token in a feed they control —
+    happens after the connection, so there has to be a way to ask again.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        OWNERSHIP_PROVEN,
+        prove_ownership,
+    )
+    from src.anubis.utils.connected_accounts.store import (
+        get_connected_account,
+        save_connected_account,
+    )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+
+    store = getattr(app.state, "store", None)
+    record = await get_connected_account(store, user_id, account_key)
+    if record is None or str(record.get("assistant_id") or "") != assistant_id:
+        raise HTTPException(status_code=404, detail="No such connected account.")
+
+    ownership = await prove_ownership(app.state.context, store, record)
+    record["ownership"] = ownership
+    if ownership.get("state") == OWNERSHIP_PROVEN:
+        await _capture_social_crawl_seed(record, ownership)
+    await save_connected_account(store, user_id, record)
+
+    if ownership.get("state") == OWNERSHIP_PROVEN:
+        # Proving it is what unlocks everything else, so the crawl and the
+        # subscription follow immediately rather than waiting for a reconnect.
+        schedule_background(_onboard_social_account(record))
+
+    return JSONResponse(content={"ownership": ownership}, status_code=200)
+
+
+@app.post("/social_subscriptions/{account_key:path}/pull_more")
+async def pull_more_social_content(
+    account_key: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Walk further into what this account has already published.
+
+    The initial crawl stops at the tier's item cap, which is a spending limit
+    rather than a judgement about how much of the person's work matters. This
+    is the owner saying to spend more, and it resumes from what the last pass
+    already visited instead of paying for the same pages twice.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        is_owned_by_personal_avatar,
+        refusal_reason,
+    )
+    from src.anubis.utils.connected_accounts.store import get_connected_account
+    from src.anubis.utils.subscriptions.crawl import crawl_connected_account
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+
+    store = getattr(app.state, "store", None)
+    record = await get_connected_account(store, user_id, account_key)
+    if record is None or str(record.get("assistant_id") or "") != assistant_id:
+        raise HTTPException(status_code=404, detail="No such connected account.")
+    if not is_owned_by_personal_avatar(record, personal_avatar_id=assistant_id):
+        raise HTTPException(
+            status_code=403,
+            detail=refusal_reason(record, personal_avatar_id=assistant_id)
+            or "This account is not proven to be yours.",
+        )
+
+    avatar_name, avatar_description, tier_name = await _avatar_context_for_crawl(
+        user_id, assistant_id
+    )
+    already_seen = await _already_crawled_urls(assistant_id)
+
+    async def _run_pull() -> None:
+        report = await crawl_connected_account(
+            app.state.context,
+            record=record,
+            personal_avatar_id=assistant_id,
+            user_id=user_id,
+            avatar_name=avatar_name,
+            avatar_description=avatar_description,
+            tier_name=tier_name,
+            already_seen=already_seen,
+            store=store,
+        )
+        logger.info(
+            "Pull-more on %s: %s, %s ingested",
+            account_key,
+            report.get("status"),
+            report.get("ingested"),
+        )
+
+    schedule_background(_run_pull())
+    return JSONResponse(
+        content={
+            "status": "started",
+            "detail": "Walking further into what this account has published.",
+        },
+        status_code=202,
+    )
+
+
+async def _already_crawled_urls(assistant_id: str) -> set[str]:
+    """Addresses this avatar has already taken in, so a second pass skips them."""
+    from src.anubis.utils.subscriptions.repository import (
+        get_subscription_repository,
+    )
+
+    repository = get_subscription_repository()
+    events = await repository.list_events_for_avatar(assistant_id, limit=1000)
+    return {str(event.get("url") or "") for event in events if event.get("url")}
+
+
 async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any]]:
     """The device rows ``GET /list_mcp_connections`` returns, as a reusable helper."""
     from src.anubis.utils.tools.data_analysis import relay as relay_registry
@@ -5459,6 +6157,39 @@ async def create_avatar(
         )
 
 
+def _social_proof_required() -> bool:
+    """Whether sharing demands a proven social account (env-gated)."""
+    return str(
+        getattr(app.state.context, "require_social_proof_for_sharing", "false") or ""
+    ).strip().lower() in {"true", "1", "yes"}
+
+
+async def _proven_social_accounts_for(
+    user_id: str, assistant_id: str
+) -> list[dict[str, Any]]:
+    """Return this avatar's social accounts whose ownership has been proven.
+
+    Filtered through ``social_providers()`` rather than through "the user has
+    any connected account": a mailbox or a machine proves nothing about whose
+    face an avatar wears, and treating one as proof would open exactly the hole
+    that registry function was written to close.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        is_owned_by_personal_avatar,
+    )
+    from src.anubis.utils.connected_accounts.providers import social_providers
+    from src.anubis.utils.connected_accounts.store import read_connected_accounts
+
+    allowed = {provider.name for provider in social_providers()}
+    records = await read_connected_accounts(getattr(app.state, "store", None), user_id)
+    return [
+        record
+        for record in records
+        if str(record.get("provider") or "") in allowed
+        and is_owned_by_personal_avatar(record, personal_avatar_id=assistant_id)
+    ]
+
+
 @app.post("/share_avatar")
 async def share_avatar(
     assistant_id: str,
@@ -5509,6 +6240,25 @@ async def share_avatar(
                 "shared publicly."
             ),
         )
+
+    # The personal-avatar flag says the owner CLAIMS this is their likeness.
+    # A connected social account they proved they control is the only thing in
+    # the product that BACKS that claim, which is what ``social_providers()``
+    # has always documented itself as the allow-list for. Behind a setting
+    # because turning it on refuses sharing for an avatar that has no connected
+    # account yet, and that has to be a deliberate change rather than a
+    # surprise.
+    if is_public and not is_admin and _social_proof_required():
+        proven = await _proven_social_accounts_for(user_id, assistant_id)
+        if not proven:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Sharing your avatar publishes your likeness, so first "
+                    "connect a social account you own and let it be verified. "
+                    "That connection is what shows the likeness is yours."
+                ),
+            )
 
     try:
         # LangGraph merges metadata by key, so this leaves user_id and the

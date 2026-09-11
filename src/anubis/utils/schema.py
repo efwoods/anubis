@@ -393,6 +393,104 @@ class ContentSituationClassification(BaseModel):
     )
 
 
+class PersonalAvatarRelevance(BaseModel):
+    """Whether one crawled page is the avatar's own person, and worth descending from.
+
+    Two separate judgements, because they are genuinely different questions and
+    conflating them is what lets a crawl wander off into the open internet.
+
+    ``is_about_target`` asks whether this content is OF or BY the person — their
+    own words, their own picture, their own recording, or a page genuinely about
+    them. A page that merely mentions them in a list, or that shares a topic
+    they care about, is not.
+
+    ``worth_following`` asks whether the links on this page are likely to lead to
+    more of the person's own material. A profile or index page can be worth
+    following while containing almost no content of its own; a single post can
+    be full of the person's words while linking nowhere useful.
+    """
+
+    is_about_target: bool = Field(
+        description=(
+            "True only when this content is of or by the named person: their "
+            "own words, their own likeness, their own recording, or a page "
+            "substantially about them. A passing mention is false."
+        )
+    )
+    is_targets_own_words: bool = Field(
+        description=(
+            "True when the person themselves is speaking or writing here, as "
+            "opposed to somebody else writing about them."
+        )
+    )
+    relevance: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How strongly this content belongs to the named person, from 0 "
+            "(unrelated) to 1 (unmistakably theirs)."
+        ),
+    )
+    worth_following: bool = Field(
+        description=(
+            "True when links on this page are likely to lead to more content "
+            "by or about the same person."
+        )
+    )
+    reasoning: str = Field(
+        description=(
+            "Cite the specific evidence in the content that decided this, "
+            "naming what was seen rather than describing the page in general."
+        )
+    )
+
+
+PERSONAL_AVATAR_RELEVANCE_SYSTEM_PROMPT = """
+# Role and Objective
+
+You decide whether one piece of content belongs to a specific named person, so
+that a crawl building that person's avatar collects only what is genuinely
+theirs and stops descending branches that are not.
+
+# Why this matters
+
+The content you approve becomes the person's avatar: their remembered facts,
+their quoted words, the voice the avatar speaks in. Content that is not theirs
+does not merely add noise — it teaches the avatar to speak as somebody else.
+Be strict. When the evidence is weak, answer false.
+
+# What counts as the person's own content
+
+- Words they wrote or spoke: posts, captions, articles, transcripts of them
+  talking, their side of an interview.
+- Recordings and photographs OF them: a video they appear in, a picture of
+  them, audio of their voice.
+- A page substantially about them: a profile, a biography, an article whose
+  subject is this person.
+
+# What does not count
+
+- A passing mention, a name in a credits list, a comment thread they are not in.
+- Content about a subject they are known for, written by somebody else.
+- Navigation, advertising, recommended and related content, other people's
+  posts that merely appear on the same page.
+- A different person who shares the name. Check corroborating detail before
+  accepting a name match.
+
+# Following links
+
+Answer `worth_following` true only when this page is a place more of THIS
+person's material is reachable from — their own profile, their own index or
+archive, their own channel. A page that is not about them is never worth
+following, however many links it holds.
+
+# Output
+
+Give `reasoning` that names the specific evidence you saw. Do not restate the
+page's topic; say what made it theirs or not.
+"""
+
+
 CONTENT_SITUATION_CLASSIFICATION_SYSTEM_PROMPT = """
 # Role and Objective
 

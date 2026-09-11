@@ -209,8 +209,14 @@ _mgmt_token_cache: dict = {"token": None, "expires": 0}
 import time
 
 
-async def _get_mgmt_token(request: Request) -> str:
-    """Get a Management API token using client credentials."""
+async def _get_mgmt_token(request: Request | None = None) -> str:
+    """Get a Management API token using client credentials.
+
+    ``request`` is accepted for call-site symmetry with the rest of this module
+    and is deliberately unused: the token comes from a client-credentials grant
+    against the tenant, not from anything about the caller. Background work
+    (a platform webhook, a mailbox watcher) therefore passes nothing.
+    """
     now = time.monotonic()
     if _mgmt_token_cache["token"] and now < _mgmt_token_cache["expires"]:
         return _mgmt_token_cache["token"]
@@ -1056,6 +1062,66 @@ class UserDataReturn(UserDataCache):
 
 
 # ── Dependency: require valid token ────────────────────────────────────────
+
+
+# Owner records resolved for unattended work, cached exactly like the API-key
+# cache above: same short TTL, for the same reason. A subscription-driven
+# ingest must read a CURRENT tier — an owner who downgrades should stop being
+# billed at the old rate — so the record is re-read rather than stored.
+_background_user_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
+
+
+async def get_user_by_identity_user_id(bare_user_id: str) -> dict | None:
+    """Resolve an Auth0 account from the bare identity id, with no HTTP request.
+
+    Everything the product stores about ownership — avatar metadata, connected
+    accounts, subscriptions — keys on ``identities[0].user_id``, the identifier
+    WITHOUT the provider prefix (see ``personal_avatar.bare_user_identifier``).
+    The Management API's by-id route wants the prefixed form, so this looks the
+    account up by identity instead.
+
+    Unlike :func:`get_user`, this takes no ``Request``: it exists for work that
+    runs on a background task, where a platform webhook or a mailbox watcher —
+    not a caller — started the turn. Returning the real record is what lets such
+    a path go through the same tier gate, allotment check and Stripe metering as
+    an interactive upload, instead of quietly ingesting for free.
+
+    Returns ``None`` when the account cannot be resolved; the caller must treat
+    that as "do not ingest" rather than as an unmetered success.
+    """
+    identifier = (bare_user_id or "").strip()
+    if not identifier:
+        return None
+    async with _cache_lock:
+        cached = _background_user_cache.get(identifier)
+    if cached is not None:
+        return cached
+    try:
+        access_token = await _get_mgmt_token(None)
+        result = await retry_async_httpx_request(
+            "GET",
+            url=f"{BASE_AUTH_URL}/api/v2/users",
+            params={
+                "q": f'identities.user_id:"{identifier}"',
+                "search_engine": "v3",
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        result.raise_for_status()
+        users = result.json()
+    except Exception as lookup_error:  # noqa: BLE001 - a failed lookup is a refusal
+        logger.warning(
+            "Could not resolve the owner %s for unattended work: %s",
+            identifier,
+            lookup_error,
+        )
+        return None
+    if not users:
+        return None
+    user = users[0]
+    async with _cache_lock:
+        _background_user_cache[identifier] = user
+    return user
 
 
 async def get_user_with_api_key(

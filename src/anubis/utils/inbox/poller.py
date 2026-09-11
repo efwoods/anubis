@@ -73,6 +73,53 @@ def _run_config(
     }
 
 
+async def _learn_from_publication_notice(
+    context: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    message: dict[str, Any],
+    external_id: str,
+) -> None:
+    """Treat a message as a possible "you published something" notice.
+
+    Cheap to skip and never fatal: the sender's domain is checked against the
+    provider registry first, so the great majority of mail costs one dictionary
+    lookup and nothing else. Only mail from a platform the owner connected
+    reaches a model.
+    """
+    sender = str(message.get("sender") or "")
+    if not sender:
+        return
+    try:
+        from src.anubis.utils.subscriptions.email_notifications import (
+            handle_mail_as_publication,
+            provider_for_sender,
+        )
+
+        if provider_for_sender(sender) is None:
+            return
+        outcome = await handle_mail_as_publication(
+            context,
+            store=_store,
+            user_id=user_id,
+            personal_avatar_id=assistant_id,
+            sender=sender,
+            subject=str(message.get("subject") or ""),
+            body_text=str(message.get("body_text") or ""),
+            message_id=external_id,
+        )
+    except Exception:  # noqa: BLE001 - triage must run whatever happens here
+        logger.exception("Could not read a message as a publication notice.")
+        return
+    if outcome:
+        logger.info(
+            "A publication notice from %s resolved as %s.",
+            sender,
+            outcome.get("status"),
+        )
+
+
 async def run_inbox_for_message(
     context: Any,
     *,
@@ -123,6 +170,19 @@ async def run_inbox_for_message(
             "state": STATE_PENDING_OWNER,
         }
     )
+    # A platform's "your video is live" notice is both something the owner may
+    # want to see and an announcement that the avatar's person published
+    # something. Both readings are honoured: this runs alongside triage rather
+    # than instead of it, so the inbox behaves exactly as it did while the
+    # avatar also learns from what the notice points at.
+    await _learn_from_publication_notice(
+        context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        message=message,
+        external_id=external_id,
+    )
+
     initial_state = {
         "item_id": item["item_id"],
         "user_id": user_id,
@@ -395,3 +455,23 @@ async def poll_forever(context: Any) -> None:
             return
         except Exception:  # noqa: BLE001
             logger.debug("Inbox poll iteration failed", exc_info=True)
+
+
+def inbox_store() -> Any:
+    """Return the store the inbox runtime was published with.
+
+    The IDLE watchers need it to decrypt a mailbox credential, and they must not
+    reach into this module's private name to get it.
+    """
+    return _store
+
+
+async def poll_now_for_user(context: Any, user_id: str) -> dict[str, Any]:
+    """Fetch and triage one owner's mail immediately, skipping interval spacing.
+
+    Called by an IDLE watcher the moment its server reports an arrival, so the
+    fetch, the triage, and the publication-notice check all stay on the single
+    path that reads a mailbox — IDLE decides only *when* that path runs, never
+    what it does.
+    """
+    return await _poll_mailboxes(context, only_user_id=user_id)

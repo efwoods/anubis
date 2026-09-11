@@ -138,6 +138,42 @@ ALL_MECHANISMS = frozenset(
         MECHANISM_BROWSER_SESSION,
         MECHANISM_URL_ONLY,
         MECHANISM_SITE_DISCOVERY,
+        MECHANISM_API_KEY,
+    }
+)
+
+# How a provider announces that the owner has published something new. This is
+# the transport a content subscription uses, and it is deliberately separate
+# from ``credential_mechanism``: how an account is CONNECTED says nothing about
+# how it ANNOUNCES. YouTube connects by OAuth and announces by WebSub; Instagram
+# connects by browser session and announces by emailing the owner.
+#
+# There is no polling value on purpose. A subscription either receives a push
+# from the platform or recognises the platform's own notification to the owner;
+# a provider that can do neither is reported as not subscribable rather than
+# being swept on a timer.
+CONTENT_TRANSPORT_WEBSUB = "websub"
+CONTENT_TRANSPORT_EVENTSUB = "eventsub"
+CONTENT_TRANSPORT_META_GRAPH = "meta_graph"
+CONTENT_TRANSPORT_EMAIL_NOTIFICATION = "email_notification"
+CONTENT_TRANSPORT_NONE = "none"
+ALL_CONTENT_TRANSPORTS = frozenset(
+    {
+        CONTENT_TRANSPORT_WEBSUB,
+        CONTENT_TRANSPORT_EVENTSUB,
+        CONTENT_TRANSPORT_META_GRAPH,
+        CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+        CONTENT_TRANSPORT_NONE,
+    }
+)
+
+# The transports the platform itself pushes to our callback. Everything else
+# reaches us because the owner's mailbox received the platform's notification.
+PUSH_CONTENT_TRANSPORTS = frozenset(
+    {
+        CONTENT_TRANSPORT_WEBSUB,
+        CONTENT_TRANSPORT_EVENTSUB,
+        CONTENT_TRANSPORT_META_GRAPH,
     }
 )
 
@@ -353,6 +389,41 @@ class ConnectedAccountProvider:
     # A device-bound provider is connected through a machine running the
     # daemon rather than through a credential of its own.
     device_bound: bool = False
+    # True for the few vendors whose terms forbid keeping a signed-in session
+    # and reading their pages, so the key they issue is the ONLY route allowed.
+    # Everywhere else the owner's own login comes first; this flag is the narrow
+    # exception, and it exists so that exception is stated per vendor rather
+    # than hidden in the ordering. See ``vendor_key_tools`` for the finding.
+    terms_require_api_key: bool = False
+    # How this provider announces newly published content, and what the owner's
+    # mailbox should watch for when the answer is an email notification.
+    # ``notification_sender_domains`` is matched against the sending domain of a
+    # message, which is what keeps the notification reader from treating every
+    # message from a social network as a publication event.
+    content_transport: str = CONTENT_TRANSPORT_NONE
+    notification_sender_domains: tuple[str, ...] = ()
+    # Template that turns the owner's handle into the public profile the crawl
+    # starts from, e.g. ``"https://www.instagram.com/{handle}/"``. A provider
+    # whose crawl seed is discovered another way (YouTube's uploads playlist,
+    # read from the API at connect time) leaves this unset.
+    profile_url_template: str | None = None
+
+    @property
+    def pushes_content(self) -> bool:
+        """Whether the platform itself calls our webhook when content appears."""
+        return self.content_transport in PUSH_CONTENT_TRANSPORTS
+
+    @property
+    def is_subscribable(self) -> bool:
+        """Whether new content from this provider can reach the avatar at all."""
+        return self.content_transport != CONTENT_TRANSPORT_NONE
+
+    def profile_url_for(self, handle: str) -> str | None:
+        """Return the owner's public profile URL, or ``None`` without a template."""
+        cleaned = (handle or "").strip().lstrip("@")
+        if not cleaned or not self.profile_url_template:
+            return None
+        return self.profile_url_template.format(handle=cleaned)
 
     @property
     def login_mode(self) -> str:
@@ -655,6 +726,8 @@ YOUTUBE_PROVIDER = ConnectedAccountProvider(
     summary="Your channel's videos, statistics, and comments",
     card_description="Read your channel's videos, statistics, and comments.",
     icon_key="youtube",
+    content_transport=CONTENT_TRANSPORT_WEBSUB,
+    notification_sender_domains=("youtube.com", "google.com"),
     login_url="https://accounts.google.com/ServiceLogin?continue=https://studio.youtube.com/",
     home_url="https://studio.youtube.com/",
     oauth_config_key="google",
@@ -697,6 +770,11 @@ X_PROVIDER = ConnectedAccountProvider(
     send_supported=True,
     card_description="Read your posts and post replies as you.",
     icon_key="twitter",
+    # X offers no webhook on the free tier, but it emails the owner when the
+    # owner posts, so the notification transport carries it.
+    content_transport=CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+    notification_sender_domains=("x.com", "twitter.com"),
+    profile_url_template="https://x.com/{handle}",
     oauth_config_key="x",
     login_url="https://x.com/i/flow/login",
     home_url="https://x.com/notifications",
@@ -904,6 +982,9 @@ INSTAGRAM_PROVIDER = ConnectedAccountProvider(
     summary="Your posts, captions, and comments",
     card_description="Sign in to Instagram so the avatar can read your posts.",
     icon_key="instagram",
+    content_transport=CONTENT_TRANSPORT_META_GRAPH,
+    notification_sender_domains=("instagram.com", "mail.instagram.com"),
+    profile_url_template="https://www.instagram.com/{handle}/",
     login_url="https://www.instagram.com/accounts/login/",
     home_url="https://www.instagram.com/",
     recipe_key="instagram",
@@ -918,6 +999,9 @@ TWITCH_PROVIDER = ConnectedAccountProvider(
     summary="Your channel, streams, and chat history",
     card_description="Sign in to Twitch so the avatar can read your channel.",
     icon_key="twitch",
+    content_transport=CONTENT_TRANSPORT_EVENTSUB,
+    notification_sender_domains=("twitch.tv",),
+    profile_url_template="https://www.twitch.tv/{handle}",
     login_url="https://www.twitch.tv/login",
     home_url="https://www.twitch.tv/",
     recipe_key="twitch",
@@ -932,6 +1016,9 @@ FACEBOOK_PROVIDER = ConnectedAccountProvider(
     summary="Your posts and pages",
     card_description="Sign in to Facebook so the avatar can read your posts and pages.",
     icon_key="facebook",
+    content_transport=CONTENT_TRANSPORT_META_GRAPH,
+    notification_sender_domains=("facebookmail.com", "facebook.com"),
+    profile_url_template="https://www.facebook.com/{handle}",
     login_url="https://www.facebook.com/login/",
     home_url="https://www.facebook.com/",
     recipe_key="facebook",
@@ -946,9 +1033,94 @@ LINKEDIN_PROVIDER = ConnectedAccountProvider(
     summary="Your profile, posts, and messages",
     card_description="Sign in to LinkedIn so the avatar can read your profile and posts.",
     icon_key="linkedin",
+    content_transport=CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+    notification_sender_domains=("linkedin.com", "e.linkedin.com"),
+    profile_url_template="https://www.linkedin.com/in/{handle}/",
     login_url="https://www.linkedin.com/login",
     home_url="https://www.linkedin.com/feed/",
     recipe_key="linkedin",
+)
+
+TIKTOK_PROVIDER = ConnectedAccountProvider(
+    name="tiktok",
+    kind=KIND_SOCIAL,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="TikTok",
+    category=CATEGORY_SOCIAL,
+    summary="Your videos and captions",
+    card_description="Sign in to TikTok so the avatar can read your videos.",
+    icon_key="tiktok",
+    content_transport=CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+    notification_sender_domains=("tiktok.com", "account.tiktok.com"),
+    profile_url_template="https://www.tiktok.com/@{handle}",
+    login_url="https://www.tiktok.com/login",
+    home_url="https://www.tiktok.com/",
+    recipe_key="tiktok",
+)
+
+# A podcast or any other feed. The only row here that needs no sign-in at all:
+# the owner names a feed, and the feed itself is public. Because nothing is
+# signed in, nothing about this row proves the owner owns it — see
+# ``ownership.py``, which is what stops an unproven feed from reaching identity.
+PODCAST_FEED_PROVIDER = ConnectedAccountProvider(
+    name="podcast_feed",
+    kind=KIND_SOCIAL,
+    credential_mechanism=MECHANISM_URL_ONLY,
+    display_name="Podcast or feed",
+    category=CATEGORY_SOCIAL,
+    summary="Your podcast episodes as they publish",
+    card_description=(
+        "Name your podcast's feed so every new episode reaches your avatar."
+    ),
+    icon_key="podcast",
+    content_transport=CONTENT_TRANSPORT_WEBSUB,
+    connect_fields=(
+        ConnectFieldSpec(
+            name="site_url",
+            label="Feed address",
+            placeholder="https://example.com/podcast.xml",
+            help_text=(
+                "The RSS or Atom address of your show. A page address works "
+                "too — the feed is found from it."
+            ),
+        ),
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            required=False,
+            placeholder="My podcast",
+        ),
+    ),
+)
+
+# Any public profile the owner publishes from that is not one of the named
+# platforms: a Substack, a personal blog, a Medium page.
+PROFILE_URL_PROVIDER = ConnectedAccountProvider(
+    name="profile_url",
+    kind=KIND_SOCIAL,
+    credential_mechanism=MECHANISM_URL_ONLY,
+    display_name="Any profile you publish from",
+    category=CATEGORY_SOCIAL,
+    summary="A blog, newsletter, or profile page",
+    card_description=(
+        "Name a page you publish from so new writing reaches your avatar."
+    ),
+    icon_key="profile",
+    content_transport=CONTENT_TRANSPORT_WEBSUB,
+    connect_fields=(
+        ConnectFieldSpec(
+            name="site_url",
+            label="Address",
+            placeholder="https://example.substack.com",
+            help_text="The feed is discovered from the page.",
+        ),
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            required=False,
+            placeholder="My newsletter",
+        ),
+    ),
 )
 
 DISCORD_PROVIDER = ConnectedAccountProvider(
@@ -1046,17 +1218,134 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
         TWITCH_PROVIDER,
         FACEBOOK_PROVIDER,
         LINKEDIN_PROVIDER,
+        TIKTOK_PROVIDER,
+        PODCAST_FEED_PROVIDER,
+        PROFILE_URL_PROVIDER,
         DISCORD_PROVIDER,
         SLACK_PROVIDER,
         DESKTOP_MCP_PROVIDER,
         CUSTOM_MCP_PROVIDER,
         CUSTOM_SITE_PROVIDER,
+        SIGNED_IN_SITE_PROVIDER,
     )
 }
 
 
 # Names a person (or the model) may use for a provider that is registered
 # under another name.
+def provider_for_host(hostname: str) -> ConnectedAccountProvider | None:
+    """Return the registered provider that already covers ``hostname``, if any.
+
+    A person naming "github.com" should be sent down GitHub's OAuth route rather
+    than asked to sign in through a browser and have a session kept: the
+    supported route is better in every way, and for some vendors keeping a
+    session instead is against their terms. Matching is on the registrable
+    domain of a provider's own ``home_url`` / ``login_url``, so a provider is
+    only claimed when it says itself which site it is for.
+
+    A provider whose own address carries a subdomain claims only that exact host.
+    ``smith.langchain.com`` is LangSmith; ``academy.langchain.com`` is a
+    different service that happens to share a domain, and offering the LangSmith
+    connector for it would be wrong. A provider whose address is the bare domain
+    (``github.com``) claims its subdomains too, because there the vendor and the
+    domain are the same thing.
+
+    Google's providers are deliberately excluded from the match: several of them
+    share ``accounts.google.com`` as a login address, so a host match there would
+    pick an arbitrary one of Gmail, Calendar, Analytics and YouTube.
+    """
+    from urllib.parse import urlparse
+
+    wanted = (hostname or "").strip().lower().rstrip(".")
+    if not wanted:
+        return None
+    for provider in PROVIDER_REGISTRY.values():
+        for address in (provider.home_url, provider.login_url):
+            if not address:
+                continue
+            try:
+                candidate_host = (urlparse(address).hostname or "").lower()
+            except Exception:  # noqa: BLE001 - a malformed entry claims nothing
+                continue
+            if not candidate_host or candidate_host.endswith("google.com"):
+                continue
+            if candidate_host == wanted:
+                return provider
+            # Only a provider named by its bare domain speaks for subdomains.
+            if candidate_host == _registrable_domain(
+                candidate_host
+            ) and wanted.endswith("." + candidate_host):
+                return provider
+    return None
+
+
+def _registrable_domain(hostname: str) -> str:
+    """Return the last two labels of a hostname, lowercased.
+
+    Good enough to tell "console.x.ai" from "github.com" without carrying a
+    public-suffix list. It over-matches on multi-part suffixes such as
+    ``co.uk``; the cost of that is offering a slightly wrong provider, which the
+    owner sees and can decline, never a wrong credential being used.
+    """
+    cleaned = (hostname or "").strip().lower().rstrip(".")
+    if not cleaned:
+        return ""
+    labels = [label for label in cleaned.split(".") if label]
+    if len(labels) < 2:
+        return cleaned
+    return ".".join(labels[-2:])
+
+
+# The address a person's PUBLIC profile lives at is often not the address the
+# connector signs in to. A channel is read at ``studio.youtube.com`` but linked
+# from ``youtube.com``; a profile is read at ``www.instagram.com`` but written
+# ``instagram.com`` as often as not. ``provider_for_host`` deliberately refuses
+# both of those, because it decides where a SIGN-IN is routed and a provider
+# there may only claim a host it names itself.
+#
+# This table is the discovery-time counterpart: it answers "a page at this host
+# suggests an account of this kind", which is a question whose wrong answer costs
+# only a question put to the owner, never a credential sent to the wrong vendor.
+# Keep the two apart; do not fold this into ``provider_for_host``.
+PUBLIC_PROFILE_HOSTS: dict[str, str] = {
+    "facebook.com": "facebook",
+    "github.com": "github",
+    "instagram.com": "instagram",
+    "linkedin.com": "linkedin",
+    "twitch.tv": "twitch",
+    "twitter.com": "twitter",
+    "x.com": "twitter",
+    "youtube.com": "youtube",
+}
+
+
+def provider_for_public_profile_host(
+    hostname: str,
+) -> ConnectedAccountProvider | None:
+    """Return the provider whose accounts live at ``hostname``, for discovery only.
+
+    Used when deep research has read a page and the question is whether that page
+    looks like an account the subject owns. Tries the strict sign-in matcher
+    first, then the public-profile table above, matching on the registrable
+    domain so ``www.youtube.com`` and ``m.youtube.com`` both answer YouTube.
+
+    Never use this to decide where a sign-in goes — ``provider_for_host`` is that
+    function, and its stricter rule is deliberate.
+    """
+    strict_match = provider_for_host(hostname)
+    if strict_match is not None:
+        return strict_match
+    cleaned = (hostname or "").strip().lower().rstrip(".")
+    if not cleaned:
+        return None
+    provider_name = PUBLIC_PROFILE_HOSTS.get(cleaned) or PUBLIC_PROFILE_HOSTS.get(
+        _registrable_domain(cleaned)
+    )
+    if not provider_name:
+        return None
+    return PROVIDER_REGISTRY.get(provider_name)
+
+
 PROVIDER_NAME_ALIASES: dict[str, str] = {
     "x": "twitter",
     "x.com": "twitter",

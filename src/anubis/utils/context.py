@@ -908,6 +908,136 @@ class GlobalContext:
         },
     )
 
+    """ <Content subscriptions: the personal avatar's own accounts, crawled and subscribed> """
+
+    social_webhook_callback_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "Public https base address platforms call when the owner publishes, e.g. https://api.example.com. The callback becomes <base>/social_webhook/<provider>. Must be reachable from the public internet: in development this is a tunnel address, and leaving it empty disables every push transport (notification transports still work). Env SOCIAL_WEBHOOK_CALLBACK_BASE_URL."
+        },
+    )
+
+    social_webhook_lease_seconds: int = field(
+        default=432000,
+        metadata={
+            "description": "Lease length requested from a WebSub hub, in seconds. A lease that lapses stops delivering silently, so the renewal task refreshes each one before this elapses. Env SOCIAL_WEBHOOK_LEASE_SECONDS."
+        },
+    )
+
+    social_subscription_renewal_interval_seconds: float = field(
+        default=3600.0,
+        metadata={
+            "description": "How often the renewal task looks for leases about to expire. This is a timer over stored expiry times, not a poll of any platform. Env SOCIAL_SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS."
+        },
+    )
+
+    social_subscription_renewal_margin_seconds: float = field(
+        default=86400.0,
+        metadata={
+            "description": "How long before a lease expires it is renewed. Generous on purpose: a missed renewal is invisible until the owner notices content has stopped arriving. Env SOCIAL_SUBSCRIPTION_RENEWAL_MARGIN_SECONDS."
+        },
+    )
+
+    social_crawl_max_items_free: int = field(
+        default=5,
+        metadata={
+            "description": "Most items the initial crawl may ingest for a free-tier owner. Every item costs a transcription or description call, so this is a spending limit rather than a quality setting. Env SOCIAL_CRAWL_MAX_ITEMS_FREE."
+        },
+    )
+
+    social_crawl_max_items_pro: int = field(
+        default=50,
+        metadata={
+            "description": "Most items the initial crawl may ingest for a pro-tier owner. Env SOCIAL_CRAWL_MAX_ITEMS_PRO."
+        },
+    )
+
+    social_crawl_max_items_premium: int = field(
+        default=300,
+        metadata={
+            "description": "Most items the initial crawl may ingest for a premium-tier owner. Env SOCIAL_CRAWL_MAX_ITEMS_PREMIUM."
+        },
+    )
+
+    social_crawl_max_depth: int = field(
+        default=3,
+        metadata={
+            "description": "How many levels out from the account's own profile the breadth-first crawl may walk. Each level multiplies, and the material actually belonging to the person is concentrated in the first two. Env SOCIAL_CRAWL_MAX_DEPTH."
+        },
+    )
+
+    social_crawl_max_nodes: int = field(
+        default=200,
+        metadata={
+            "description": "Ceiling on addresses one crawl may visit, counting pages that are judged and then pruned. Bounds the relevance calls, which are paid for whether or not the page is kept. Env SOCIAL_CRAWL_MAX_NODES."
+        },
+    )
+
+    social_crawl_relevance_minimum_score: float = field(
+        default=0.5,
+        metadata={
+            "description": "How strongly a page must belong to the avatar's person before it is ingested and its links followed, from 0 to 1. Raising it makes the crawl stricter about what counts as the person's own content. Env SOCIAL_CRAWL_RELEVANCE_MINIMUM_SCORE."
+        },
+    )
+
+    require_social_proof_for_sharing: str = field(
+        default="false",
+        metadata={
+            "description": "Whether sharing a personal avatar requires at least one social account proven to belong to the owner. Sharing a likeness is a claim about a real person, and a proven account is what backs that claim. Turning this on refuses sharing for an already-shared avatar that has no connected social account, so enable it deliberately. Env REQUIRE_SOCIAL_PROOF_FOR_SHARING."
+        },
+    )
+
+    imap_idle_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether connected mailboxes are watched with IMAP IDLE, so a new message wakes triage in seconds instead of at the next poll. Servers that refuse IDLE fall back to the interval poll on their own. Env IMAP_IDLE_ENABLED."
+        },
+    )
+
+    imap_idle_refresh_seconds: float = field(
+        default=1500.0,
+        metadata={
+            "description": "How often an IDLE connection is renewed. The IMAP specification requires a client to re-issue IDLE at least every 29 minutes, so this stays below that. Env IMAP_IDLE_REFRESH_SECONDS."
+        },
+    )
+
+    twitch_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Twitch application client id, used to register EventSub subscriptions for the owner's own channel. Empty means Twitch notices are read from the owner's mailbox instead. Env TWITCH_CLIENT_ID."
+        },
+    )
+
+    twitch_app_access_token: str = field(
+        default=None,
+        metadata={
+            "description": "Twitch application access token for EventSub registration. Env TWITCH_APP_ACCESS_TOKEN."
+        },
+    )
+
+    twitch_eventsub_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Fallback secret for verifying Twitch EventSub deliveries when a subscription carries none of its own. Env TWITCH_EVENTSUB_SECRET."
+        },
+    )
+
+    meta_webhook_verify_token: str = field(
+        default=None,
+        metadata={
+            "description": "Token Meta echoes when verifying the Instagram and Facebook webhook callback. Env META_WEBHOOK_VERIFY_TOKEN."
+        },
+    )
+
+    meta_app_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Meta application secret, used to verify the signature on Instagram and Facebook deliveries. Env META_APP_SECRET."
+        },
+    )
+
+    """ </Content subscriptions: the personal avatar's own accounts, crawled and subscribed> """
+
     """ </Connected accounts (mailbox and social) for the personal avatar> """
 
     """ <Emotion media generation (xAI images and idle-loop videos)> """

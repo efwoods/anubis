@@ -1,3 +1,9 @@
+"""Neural Nexus's own terms of service, as text.
+
+Import this through the package (``from src.anubis.utils.prompts.legal import
+TERMS_OF_SERVICE``), never by module path.
+"""
+
 TERMS_OF_SERVICE = """
 1. Acceptance of Terms
 

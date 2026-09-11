@@ -172,3 +172,104 @@ def test_phrase_is_well_formed():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Stored profile payload
+#
+# The profile key has held three shapes over its life, and the two hot read
+# paths (system-prompt build, per-reply style scoring) must handle all of them
+# without a migration step.
+# ---------------------------------------------------------------------------
+
+
+def test_phrase_list_loads_from_every_stored_shape():
+    import json
+
+    from src.anubis.utils.dataset.key_phrases import (
+        load_key_phrase_profile_phrase_list,
+    )
+
+    expected = ["tricky", "you know"]
+    assert load_key_phrase_profile_phrase_list(json.dumps(expected)) == expected
+    assert load_key_phrase_profile_phrase_list(expected) == expected
+    assert (
+        load_key_phrase_profile_phrase_list(
+            json.dumps({"envelope_version": 1, "phrases": expected})
+        )
+        == expected
+    )
+    assert (
+        load_key_phrase_profile_phrase_list({"envelope_version": 1, "phrases": expected})
+        == expected
+    )
+
+
+def test_phrase_list_preserves_rank_order():
+    """The prompt renders a PREFIX, so re-sorting would show the wrong phrases."""
+    from src.anubis.utils.dataset.key_phrases import (
+        load_key_phrase_profile_phrase_list,
+    )
+
+    ranked = ["zebra", "apple", "middle"]
+    assert load_key_phrase_profile_phrase_list(ranked) == ranked
+
+
+def test_phrase_list_filters_debris_in_every_shape():
+    import json
+
+    from src.anubis.utils.dataset.key_phrases import (
+        load_key_phrase_profile_phrase_list,
+    )
+
+    polluted = ["https t co abcd", "you know", "x marks the spot"]
+    assert load_key_phrase_profile_phrase_list(polluted) == ["you know"]
+    assert load_key_phrase_profile_phrase_list(
+        json.dumps({"phrases": polluted})
+    ) == ["you know"]
+
+
+@pytest.mark.parametrize("stored", ["", None, "{{", 17, [1, 2, 3]])
+def test_phrase_list_returns_empty_for_unusable_values(stored):
+    from src.anubis.utils.dataset.key_phrases import (
+        load_key_phrase_profile_phrase_list,
+    )
+
+    assert load_key_phrase_profile_phrase_list(stored) == []
+
+
+def test_detail_envelope_round_trips():
+    import json
+
+    from src.anubis.utils.dataset.key_phrases import (
+        build_key_phrase_profile_detail_envelope,
+        load_key_phrase_profile_detail,
+    )
+
+    envelope = build_key_phrase_profile_detail_envelope(
+        ["tricky"],
+        [{"phrase": "tricky", "classification": "signature_style"}],
+        {"tricky": {"classification": "signature_style"}},
+        classification_histogram={"signature_style": 1},
+    )
+    restored = load_key_phrase_profile_detail(json.dumps(envelope))
+    assert restored["phrases"] == ["tricky"]
+    assert restored["judgement_cache"]["tricky"]["classification"] == "signature_style"
+    assert restored["classification_histogram"] == {"signature_style": 1}
+
+
+def test_occurrence_rate_counts_single_word_phrases():
+    """Single-word phrases are new to this function's inputs and must count."""
+    text = "lol that is lol funny and nothing else at all here"
+    assert key_phrase_occurrence_rate(text, ["lol"]) == pytest.approx(2 / 11)
+
+
+def test_attestation_now_includes_single_words():
+    """A single-word signature phrase must survive the corpus-attestation filter."""
+    from src.anubis.utils.dataset.key_phrases import (
+        build_corpus_phrase_attestation_set,
+    )
+
+    attested = build_corpus_phrase_attestation_set(["That was tricky, honestly."])
+    assert "tricky" in attested
+    assert "was tricky" in attested

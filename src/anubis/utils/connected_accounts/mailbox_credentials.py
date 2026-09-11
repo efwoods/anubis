@@ -1,7 +1,7 @@
 """Live mailbox credentials from a stored record, whatever its mechanism.
 
-A mailbox record connected before Google sign-in landed holds an encrypted
-app password; one connected through the popup holds an encrypted OAuth token
+A mailbox record connected with an address and a password holds that password
+encrypted; one connected through a sign-in popup holds an encrypted OAuth token
 bundle. Every mail operation — the tools, the inbox poller, the reply sender,
 the writing-sample import — asks this one function for credentials so none of
 them has to know which kind of record it holds. OAuth records present a fresh
@@ -24,7 +24,7 @@ async def mailbox_credentials_for(
     """Build ``MailboxCredentials`` for one connected mailbox record.
 
     Raises ``SecretDecryptionError`` / ``SecretEncryptionNotConfiguredError``
-    for an unreadable app password and ``OAuthReconnectRequired`` for a token
+    for an unreadable password and ``OAuthReconnectRequired`` for a token
     the vendor no longer honours.
     """
     from src.anubis.utils.tools.email.imap_client import (

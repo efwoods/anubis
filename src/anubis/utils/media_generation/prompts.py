@@ -132,7 +132,16 @@ _PERSON_STILL_PROMPT_TEMPLATE = (
     "same camera angle. Change only the facial expression to {expression}. Do "
     "not change the pose, the hair, the clothing, the camera angle, or the "
     "composition. Photorealistic, matching the source image exactly in every "
-    "respect other than the expression."
+    "respect other than the expression.{motion}"
+)
+
+# When the person's own movement has been measured, the still already holds
+# that person's characteristic carriage — head tilt, lean, where the hands
+# rest — so anything animating the still inherits it. Only the carriage is
+# taken from the block; the still is a single frame and cannot show a rate.
+_PERSON_STILL_MOTION_TEMPLATE = (
+    " The person's posture and carriage in this still match how this person "
+    "really holds themself, measured from this person: {motion_prompt}"
 )
 
 _CHARACTER_STILL_PROMPT_TEMPLATE = (
@@ -142,7 +151,7 @@ _CHARACTER_STILL_PROMPT_TEMPLATE = (
     "clothing, the camera angle, or the composition. Keep the exact rendering "
     "style of the source image — do not make the image photorealistic and do "
     "not redraw the character — matching the source image exactly in every "
-    "respect other than the expression."
+    "respect other than the expression.{motion}"
 )
 
 _NON_HUMAN_STILL_PROMPT_TEMPLATE = (
@@ -157,21 +166,42 @@ _NON_HUMAN_STILL_PROMPT_TEMPLATE = (
     "it in every respect other than that emotional lighting."
 )
 
+# The generic idle motion, used only until the person's own movement has been
+# measured. Once a motion block exists, it replaces this clause entirely: the
+# clip breathes, blinks, shifts and fidgets the way *this* person does.
+_GENERIC_PERSON_IDLE_MOTION = (
+    "The person breathes naturally, blinks, and shifts weight slightly, with an "
+    "occasional subtle fidget."
+)
+_MEASURED_PERSON_IDLE_MOTION_TEMPLATE = (
+    "The person breathes naturally and moves the way this person really moves "
+    "when idle, described from measurements of this person — keep every rate, "
+    "range and habit below, and add nothing else:\n{motion_prompt}"
+)
+
 _PERSON_IDLE_LOOP_PROMPT_TEMPLATE = (
     "Base idle animation of the person in the image, holding a {emotion} "
-    "expression throughout. The person breathes naturally, blinks, and shifts "
-    "weight slightly, with an occasional subtle fidget. No speech and no mouth "
+    "expression throughout. {motion} No speech and no mouth "
     "movement other than breathing. No camera movement, no zoom, no background "
     "change, no new objects. The very first frame and the very last frame MUST "
     "match the supplied image exactly — the same pose, framing, and expression — "
     "so the clip loops seamlessly when played end to end."
 )
 
+_GENERIC_CHARACTER_IDLE_MOTION = (
+    "The character breathes naturally, blinks, and shifts weight slightly, with "
+    "an occasional subtle fidget."
+)
+_MEASURED_CHARACTER_IDLE_MOTION_TEMPLATE = (
+    "The character breathes naturally and moves the way the real person behind "
+    "this character moves when idle, described from measurements of that person "
+    "— keep every rate, range and habit below, and add nothing else:\n{motion_prompt}"
+)
+
 _CHARACTER_IDLE_LOOP_PROMPT_TEMPLATE = (
     "Base idle animation of the character in the image, in the exact art "
-    "style of the image, holding a {emotion} expression throughout. The "
-    "character breathes naturally, blinks, and shifts weight slightly, with an "
-    "occasional subtle fidget. No speech and no mouth movement other than "
+    "style of the image, holding a {emotion} expression throughout. {motion} "
+    "No speech and no mouth movement other than "
     "breathing. No camera movement, no zoom, no background change, no new "
     "objects, no change of rendering style. The very first frame and the very "
     "last frame MUST match the supplied image exactly — the same pose, framing, "
@@ -198,8 +228,27 @@ def normalize_reference_subject(subject: str | None) -> str:
     return candidate if candidate in REFERENCE_SUBJECTS else SUBJECT_PERSON
 
 
-def still_prompt_for(emotion: str, subject: str | None = SUBJECT_PERSON) -> str:
-    """Return the image-edit prompt that turns the reference into ``emotion``."""
+def _posture_only(motion_prompt: str | None) -> str:
+    """Keep the lines of a motion block a single frame can show (posture, hands)."""
+    lines = [
+        line.strip()
+        for line in str(motion_prompt or "").splitlines()
+        if line.strip().startswith(("HEAD:", "POSTURE:", "HANDS:", "FACE:"))
+    ]
+    return " ".join(lines)
+
+
+def still_prompt_for(
+    emotion: str,
+    subject: str | None = SUBJECT_PERSON,
+    motion_prompt: str | None = None,
+) -> str:
+    """Return the image-edit prompt that turns the reference into ``emotion``.
+
+    ``motion_prompt`` is the person's measured motion block (see
+    ``src/anubis/utils/motion/motion_prompt.py``); for a still only the
+    carriage lines are used, since one frame cannot show a rate.
+    """
     family = normalize_reference_subject(subject)
     if family == SUBJECT_NON_HUMAN:
         cue = _NON_HUMAN_CUE_BY_EMOTION.get(emotion)
@@ -214,11 +263,21 @@ def still_prompt_for(emotion: str, subject: str | None = SUBJECT_PERSON) -> str:
         if family == SUBJECT_STYLIZED_CHARACTER
         else _PERSON_STILL_PROMPT_TEMPLATE
     )
-    return template.format(expression=expression)
+    posture = _posture_only(motion_prompt)
+    motion = _PERSON_STILL_MOTION_TEMPLATE.format(motion_prompt=posture) if posture else ""
+    return template.format(expression=expression, motion=motion)
 
 
-def idle_loop_prompt_for(emotion: str, subject: str | None = SUBJECT_PERSON) -> str:
-    """Return the image-to-video prompt for ``emotion``'s idle loop."""
+def idle_loop_prompt_for(
+    emotion: str,
+    subject: str | None = SUBJECT_PERSON,
+    motion_prompt: str | None = None,
+) -> str:
+    """Return the image-to-video prompt for ``emotion``'s idle loop.
+
+    With a ``motion_prompt`` the generic breathe-blink-fidget clause is
+    replaced by the person's own measured habits.
+    """
     family = normalize_reference_subject(subject)
     label = "neutral, relaxed" if emotion == NEUTRAL_EMOTION else emotion
     if family == SUBJECT_NON_HUMAN:
@@ -226,9 +285,19 @@ def idle_loop_prompt_for(emotion: str, subject: str | None = SUBJECT_PERSON) -> 
         if motion is None:
             raise ValueError(f"No idle loop prompt is defined for emotion {emotion!r}.")
         return _NON_HUMAN_IDLE_LOOP_PROMPT_TEMPLATE.format(emotion=label, motion=motion)
-    template = (
-        _CHARACTER_IDLE_LOOP_PROMPT_TEMPLATE
-        if family == SUBJECT_STYLIZED_CHARACTER
-        else _PERSON_IDLE_LOOP_PROMPT_TEMPLATE
-    )
-    return template.format(emotion=label)
+    measured = str(motion_prompt or "").strip()
+    if family == SUBJECT_STYLIZED_CHARACTER:
+        template = _CHARACTER_IDLE_LOOP_PROMPT_TEMPLATE
+        motion_clause = (
+            _MEASURED_CHARACTER_IDLE_MOTION_TEMPLATE.format(motion_prompt=measured)
+            if measured
+            else _GENERIC_CHARACTER_IDLE_MOTION
+        )
+    else:
+        template = _PERSON_IDLE_LOOP_PROMPT_TEMPLATE
+        motion_clause = (
+            _MEASURED_PERSON_IDLE_MOTION_TEMPLATE.format(motion_prompt=measured)
+            if measured
+            else _GENERIC_PERSON_IDLE_MOTION
+        )
+    return template.format(emotion=label, motion=motion_clause)

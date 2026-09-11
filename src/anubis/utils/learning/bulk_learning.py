@@ -352,7 +352,12 @@ async def run_account_learning_sweep(
     pending_records: list[dict[str, Any]],
 ) -> dict[str, int]:
     """Process every pending conversation for one user. Never raises."""
-    counters = {"threads": 0, "ratings_aggregated": 0, "inferred_records": 0}
+    counters = {
+        "threads": 0,
+        "ratings_aggregated": 0,
+        "inferred_records": 0,
+        "style_recalibrated": 0,
+    }
     swept_assistants: set[str] = set()
     for record in pending_records:
         thread_id = record.get("thread_id")
@@ -390,7 +395,83 @@ async def run_account_learning_sweep(
                 assistant_id,
                 aggregation_error,
             )
+
+    # What this person has said in conversation is a direct quote of this person,
+    # no different in kind from a quote lifted out of an uploaded interview, so it
+    # belongs in the same corpus the style profile and the signature key phrases
+    # are built from. The words are read out of the threads that already hold them
+    # and handed over in memory; ``calibrate_ground_truth`` stores only what it
+    # always stored — the style blob, the key phrases, and the derived feature
+    # dictionary — so nothing is duplicated into the store.
+    #
+    # Once per user per sweep, never per thread: the corpus read covers every
+    # conversation the person has held.
+    counters["style_recalibrated"] = await recalibrate_style_from_conversations(
+        store, graph, user_id
+    )
     return counters
+
+
+async def recalibrate_style_from_conversations(
+    store: Any, graph: Any, user_id: str
+) -> int:
+    """Fold this person's own words into their avatar's style profile and key phrases.
+
+    Returns 1 when a recalibration ran, 0 otherwise. Never raises: a style
+    refresh is an improvement to a prompt section, and failing one must not cost
+    the sweep the learning records it already wrote.
+    """
+    from src.anubis.utils.context import GlobalContext
+    from src.anubis.utils.learning.speaker_turns import read_speaker_corpus
+    from src.anubis.utils.personal_avatar import read_personal_avatar_id
+
+    try:
+        context = GlobalContext()
+        enabled = str(
+            getattr(context, "conversation_training_enabled", "true") or "true"
+        )
+        if enabled.strip().lower() not in ("1", "true", "yes", "on"):
+            return 0
+        # The words belong to the speaker, so they are folded into the speaker's
+        # OWN avatar — even when the conversation was held with somebody else's.
+        personal_avatar_id = await read_personal_avatar_id(store, user_id)
+        if not personal_avatar_id:
+            # No pointer yet. The next visit to any route that resolves the
+            # personal avatar writes one, and the next sweep picks this up.
+            return 0
+        documents = await read_speaker_corpus(
+            store,
+            graph,
+            user_id,
+            minimum_characters=int(
+                getattr(context, "speaker_quote_minimum_characters", 40) or 40
+            ),
+        )
+        if not documents:
+            return 0
+        from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import (
+            calibrate_ground_truth,
+        )
+
+        await calibrate_ground_truth(
+            store=store,
+            assistant_id=personal_avatar_id,
+            documents=documents,
+            user_id=user_id,
+        )
+        logger.info(
+            "Recalibrated the style of %s from %s conversational quotes",
+            personal_avatar_id,
+            len(documents),
+        )
+        return 1
+    except Exception as recalibration_error:  # noqa: BLE001 - never fail the sweep
+        logger.warning(
+            "Could not recalibrate style from conversations for %s: %s",
+            user_id,
+            recalibration_error,
+        )
+        return 0
 
 
 async def run_learning_sweep_once(
@@ -400,13 +481,24 @@ async def run_learning_sweep_once(
     now = now or datetime.now(tz=UTC)
     pending_by_user = await list_pending_accounts(store)
     idle_users = select_idle_accounts(pending_by_user, now=now, idle_seconds=idle_seconds)
-    totals = {"accounts": 0, "threads": 0, "ratings_aggregated": 0, "inferred_records": 0}
+    totals = {
+        "accounts": 0,
+        "threads": 0,
+        "ratings_aggregated": 0,
+        "inferred_records": 0,
+        "style_recalibrated": 0,
+    }
     for user_id in idle_users:
         counters = await run_account_learning_sweep(
             store, graph, user_id, pending_by_user[user_id]
         )
         totals["accounts"] += 1
-        for key in ("threads", "ratings_aggregated", "inferred_records"):
+        for key in (
+            "threads",
+            "ratings_aggregated",
+            "inferred_records",
+            "style_recalibrated",
+        ):
             totals[key] += counters.get(key, 0)
     return totals
 

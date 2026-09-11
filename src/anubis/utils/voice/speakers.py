@@ -1,11 +1,17 @@
 """Who is speaking: label a live-voice utterance by speaker.
 
-A personal avatar in the real world hears three kinds of voice: the owner
-(the person the avatar is), other people in the room, and its own replies.
-The avatar's own replies never reach this module: the avatar knows what the
-avatar said because those turns are the assistant messages of the thread, and
-the microphone is paused while the avatar speaks. This module tells the other
-two apart.
+An avatar in the real world hears three kinds of voice: the person talking to
+it, other people in the room, and its own replies coming back off a speaker.
+This module tells them apart.
+
+Two names run through all of it and they are NOT the same name.
+``owner_label`` is the person at the microphone — whoever this conversation is
+with. ``avatar_label`` is the avatar. On a *personal* avatar, a portrait of its
+own creator, they are one person with one voice, which is what lets the stored
+reference clip identify the speaker. On anybody else's avatar they are two
+different people, and treating the avatar's name as the speaker's is how a
+person ends up reading their own question back with somebody else's name in
+front of it.
 
 One diarization call (``gpt-4o-transcribe-diarize``) receives the utterance
 together with reference clips of the voices the avatar already knows:
@@ -19,12 +25,20 @@ together with reference clips of the voices the avatar already knows:
 Voices matched to a reference come back labelled with that reference's name.
 Any other voice is given the next free ``Speaker N`` label, and a clip of that
 voice is remembered for the following utterances when the person spoke long
-enough to make a usable reference.
+enough to make a usable reference. The diarizer often ignores the owner
+reference and returns a generic letter or "Speaker 1" for a monologue; a
+spoken turn with only one living voice is therefore claimed as the owner
+rather than invented as someone else.
 
-The result is a script (``Evan: …`` / ``Speaker 2: …``) that becomes the human
-turn's text, plus a ``speakers`` record kept in the message's
-``additional_kwargs`` so the web app can paint speaker chips and the graph can
-tell whether the owner spoke at all.
+The result is a script that becomes the human turn's text, plus a ``speakers``
+record kept in the message's ``additional_kwargs`` so the web app can paint
+speaker chips and the graph can tell whether the person spoke at all. **The
+script names only what the avatar could not otherwise work out**: a third voice
+in the room (``Speaker 2: …``) and a sound that is nobody talking
+(``background: a television in the next room``). The person's own lines carry
+no name, because there is only one person the avatar is talking to, and the
+avatar's own echo is dropped altogether, because those words are already in the
+thread as the avatar's reply.
 """
 
 from __future__ import annotations
@@ -48,6 +62,14 @@ SPOKEN_TURN_KIND = "spoken_turn"
 DEFAULT_OWNER_LABEL = "Owner"
 OTHER_SPEAKER_LABEL_PREFIX = "Speaker"
 AVATAR_LABEL_SUFFIX = "(avatar)"
+#: What a stretch of sound that is not anybody talking is called. Speech models
+#: return these as bracketed markers ("[television playing]", "(laughter)") in
+#: the middle of a transcript. They are not a speaker and must not be given a
+#: speaker's name, but they are not noise either: they set the scene the words
+#: were said in, and that changes what the words mean.
+SCENE_SOUND_LABEL = "background"
+#: A segment whose whole text is one bracketed marker and nothing else.
+_SCENE_SOUND_PATTERN = re.compile(r"^\s*[\[(]\s*([^\]\)]{1,80}?)\s*[\])]\s*$")
 # An owner-attributed line this similar to a recent reply is the avatar's own
 # cloned voice coming out of a speaker, not the person talking.
 AVATAR_ECHO_MIN_CHARACTERS = 20
@@ -73,6 +95,7 @@ class LabelledSegment:
     is_owner: bool = False
     is_new_speaker: bool = False
     is_avatar: bool = False
+    is_scene: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         """Serialise for ``additional_kwargs`` and the stream frame."""
@@ -83,6 +106,7 @@ class LabelledSegment:
             "end": round(float(self.end), 3),
             "is_owner": bool(self.is_owner),
             "is_avatar": bool(self.is_avatar),
+            "is_scene": bool(self.is_scene),
         }
 
 
@@ -96,11 +120,19 @@ class SpokenTurn:
     owner_identified: bool
     other_speakers: list[str]
     duration_seconds: float
+    #: The avatar's own name. Equal to ``owner_label`` only when the avatar is
+    #: a portrait of the person at the microphone; on anybody else's avatar the
+    #: two are different people, and conflating them is how the person's own
+    #: words end up attributed to the avatar. Left empty by a caller that has
+    #: only one name to work with, which then stands for both.
+    avatar_label: str = ""
     remembered_new_speakers: list[str] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     total_cost: float = 0.0
     latency_ms: float = 0.0
     model: str = ""
+    audio_data_uri: str = ""
+    owner_matched_reference: bool = False
 
     @property
     def owner_spoke(self) -> bool:
@@ -109,9 +141,14 @@ class SpokenTurn:
 
     @property
     def others_spoke(self) -> bool:
-        """Whether anyone other than the owner and the avatar's own echo spoke."""
+        """Whether a third person spoke — not the person, not the avatar's echo.
+
+        A sound that is not a voice does not make this true: a television in
+        the room is scene, not somebody joining the conversation.
+        """
         return any(
-            not segment.is_owner and not segment.is_avatar for segment in self.segments
+            not segment.is_owner and not segment.is_avatar and not segment.is_scene
+            for segment in self.segments
         )
 
     @property
@@ -125,7 +162,7 @@ class SpokenTurn:
             "kind": SPOKEN_TURN_KIND,
             "speakers": {
                 "owner_label": self.owner_label,
-                "avatar_label": avatar_label_for(self.owner_label),
+                "avatar_label": avatar_label_for(self.avatar_label or self.owner_label),
                 "owner_identified": self.owner_identified,
                 "owner_spoke": self.owner_spoke,
                 "avatar_spoke": self.avatar_spoke,
@@ -160,20 +197,46 @@ def next_other_speaker_label(existing_labels: list[str]) -> str:
     return f"{OTHER_SPEAKER_LABEL_PREFIX} {number}"
 
 
+def scene_sound_of(text: str) -> str | None:
+    """The sound a segment is, when the segment is a sound and not speech.
+
+    Speech models mark what they hear but cannot transcribe with a bracketed
+    caption — ``[television playing]``, ``(laughter)``, ``[door closes]``. That
+    is not a person and must never be given a person's name, but it is also not
+    something to throw away: it is the scene the words were said in.
+
+    :param text: One segment's transcribed text.
+    :returns: The sound, without its brackets, or ``None`` for real speech.
+    """
+    match = _SCENE_SOUND_PATTERN.match(str(text or ""))
+    if match is None:
+        return None
+    sound = match.group(1).strip()
+    return sound or None
+
+
 def label_segments(
     raw_segments: list[Any],
     *,
     owner_label: str,
     owner_reference_given: bool,
     remembered_labels: list[str],
+    avatar_label: str | None = None,
+    avatar_reference_given: bool = False,
 ) -> tuple[list[LabelledSegment], dict[str, str]]:
-    """Map the diarizer's speaker names onto owner / remembered / new labels.
+    """Map the diarizer's speaker names onto owner / avatar / remembered / new.
 
     The diarizer returns a known speaker's given name when a voice matches a
     reference and an anonymous letter (``A``, ``B`` …) otherwise. Anonymous
     voices are given fresh ``Speaker N`` labels in order of first appearance.
     Returns the labelled segments and the mapping from each anonymous diarizer
     name to the label chosen for that voice.
+
+    ``avatar_label`` names the avatar when the reference clip handed to the
+    diarizer is the AVATAR's voice and not the person's — which is every avatar
+    that is not a portrait of the person holding the microphone. A voice
+    matched to that reference is the avatar's own playback coming back through
+    the room, never the person talking, and is marked as such.
     """
     # Without an owner reference the diarizer cannot return the owner's name;
     # a raw label that happens to equal the owner label is then just another
@@ -181,6 +244,8 @@ def label_segments(
     known = set(remembered_labels)
     if owner_reference_given:
         known.add(owner_label)
+    avatar_name = (avatar_label or "").strip()
+    avatar_is_known = bool(avatar_name) and avatar_reference_given
     new_label_by_raw_name: dict[str, str] = {}
     labelled: list[LabelledSegment] = []
     for raw in raw_segments:
@@ -190,8 +255,23 @@ def label_segments(
             continue
         start = float(_attribute(raw, "start") or 0.0)
         end = float(_attribute(raw, "end") or start)
-        if speaker == owner_label and owner_reference_given:
+        sound = scene_sound_of(text)
+        if sound is not None:
+            labelled.append(
+                LabelledSegment(
+                    SCENE_SOUND_LABEL, sound, start, end, is_scene=True
+                )
+            )
+            continue
+        if owner_reference_given and speaker == owner_label:
             labelled.append(LabelledSegment(owner_label, text, start, end, is_owner=True))
+            continue
+        if avatar_is_known and speaker == avatar_name:
+            labelled.append(
+                LabelledSegment(
+                    avatar_label_for(avatar_name), text, start, end, is_avatar=True
+                )
+            )
             continue
         if speaker in known:
             labelled.append(LabelledSegment(speaker, text, start, end))
@@ -248,10 +328,14 @@ def is_avatar_echo(text: str, recent_avatar_replies: list[str]) -> bool:
 def mark_avatar_echo(
     segments: list[LabelledSegment],
     *,
-    owner_label: str,
+    avatar_label: str,
     recent_avatar_replies: list[str],
 ) -> list[LabelledSegment]:
-    """Relabel owner-attributed lines that repeat the avatar's recent replies."""
+    """Relabel owner-attributed lines that repeat the avatar's recent replies.
+
+    ``avatar_label`` is the AVATAR's name, which is the person's name only on a
+    personal avatar; the echo is the avatar's voice either way.
+    """
     if not recent_avatar_replies:
         return segments
     relabelled: list[LabelledSegment] = []
@@ -259,7 +343,7 @@ def mark_avatar_echo(
         if segment.is_owner and is_avatar_echo(segment.text, recent_avatar_replies):
             relabelled.append(
                 LabelledSegment(
-                    avatar_label_for(owner_label),
+                    avatar_label_for(avatar_label),
                     segment.text,
                     segment.start,
                     segment.end,
@@ -272,18 +356,97 @@ def mark_avatar_echo(
     return relabelled
 
 
+def claim_lone_speaker_as_owner(
+    segments: list[LabelledSegment],
+    *,
+    owner_label: str,
+    new_label_by_raw_name: dict[str, str] | None = None,
+) -> tuple[list[LabelledSegment], dict[str, str]]:
+    """Treat a monologue as the owner, even when the diarizer disagreed.
+
+    Live voice on a personal device is the owner talking. The diarizer still
+    often returns a generic letter, "Speaker 1", or a previously remembered
+    "Speaker 2" for that one voice — especially when the owner reference clip
+    does not match the live microphone, or when an earlier false identification
+    stored the owner's own clip as someone else. Labelling that lone voice as
+    another person both misnames the turn and sends it through ambient triage
+    instead of answering it.
+
+    Avatar-echo lines do not count as a second person. Two or more living
+    voices are left alone. Returns the (possibly relabelled) segments and the
+    remaining new-speaker map so the owner's voice is not remembered as
+    Speaker N.
+    """
+    remaining_new = dict(new_label_by_raw_name or {})
+    # Neither the avatar's own echo nor a sound that is not a voice makes a
+    # second person in the room.
+    living = [
+        segment
+        for segment in segments
+        if not segment.is_avatar and not segment.is_scene
+    ]
+    if not living:
+        return segments, remaining_new
+    unique = {segment.speaker for segment in living}
+    if len(unique) != 1:
+        return segments, remaining_new
+    sole = next(iter(unique))
+    if sole == owner_label and all(segment.is_owner for segment in living):
+        return segments, remaining_new
+    claimed: list[LabelledSegment] = []
+    for segment in segments:
+        if segment.is_avatar or segment.is_scene:
+            claimed.append(segment)
+            continue
+        claimed.append(
+            LabelledSegment(
+                owner_label,
+                segment.text,
+                segment.start,
+                segment.end,
+                is_owner=True,
+            )
+        )
+    remaining_new = {
+        raw: label for raw, label in remaining_new.items() if label != sole
+    }
+    return claimed, remaining_new
+
+
 def render_speaker_script(segments: list[LabelledSegment]) -> str:
-    """Render ``Name: words`` lines, merging consecutive lines of one speaker."""
-    lines: list[str] = []
+    """Render the utterance as the avatar reads it, naming only what needs naming.
+
+    **Only a voice that is not one of the two people already in the
+    conversation is labelled.** The person at the microphone is simply whoever
+    the avatar is talking to, and the avatar is the avatar; putting a name in
+    front of either one's lines tells the avatar nothing it did not already
+    have, and got the name outright wrong on every avatar that is not a
+    portrait of the person holding the microphone — the person's own words came
+    back to them prefixed with the avatar's name. A third voice in the room has
+    to be named, because which of several people said something changes what
+    was said. So does a sound that is nobody talking: a television behind the
+    words is the scene the words were said in.
+
+    The avatar's own voice, picked up from a speaker in the room, is left out
+    of the script entirely. Those words are already in the thread as the
+    avatar's own reply, and an unlabelled echo would read as the person saying
+    them back.
+
+    Consecutive lines from the same source are merged.
+    """
+    lines: list[tuple[str | None, str]] = []
     for segment in segments:
         text = segment.text.strip()
-        if not text:
+        if not text or segment.is_avatar:
             continue
-        if lines and lines[-1][0] == segment.speaker:
-            lines[-1] = (segment.speaker, f"{lines[-1][1]} {text}")
+        label = None if segment.is_owner else segment.speaker
+        if lines and lines[-1][0] == label:
+            lines[-1] = (label, f"{lines[-1][1]} {text}")
         else:
-            lines.append((segment.speaker, text))
-    return "\n".join(f"{speaker}: {text}" for speaker, text in lines)
+            lines.append((label, text))
+    return "\n".join(
+        text if label is None else f"{label}: {text}" for label, text in lines
+    )
 
 
 def _attribute(record: Any, name: str) -> Any:
@@ -330,30 +493,70 @@ def _data_uri(mime_type: str, payload: bytes) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(payload).decode('ascii')}"
 
 
+async def _stored_reference_anchor(
+    store: Any,
+    user_id: str,
+    assistant_id: str,
+    context: Any = None,
+) -> str | None:
+    """The owner anchor taken from the avatar's stored reference audio clip.
+
+    The live diarizer's usual anchor is cut from the voice-clone corpus, which
+    is empty until the avatar has a voice. The reference audio the owner
+    supplied deliberately — on create, in settings, with a media upload, or
+    from verified research — anchors the first live utterances instead, so the
+    owner is matched against a real reference rather than assumed to be
+    whoever is talking.
+    """
+    if store is None or not user_id or not assistant_id:
+        return None
+    try:
+        from src.anubis.utils.voice.reference_audio import read_usable_reference_audio
+
+        clip, _problem = await read_usable_reference_audio(
+            store, user_id, assistant_id, context=context
+        )
+    except Exception:  # noqa: BLE001 - the anchor is an aid, not a requirement
+        logger.debug(
+            "Could not read stored reference audio for %s", assistant_id, exc_info=True
+        )
+        return None
+    if not clip:
+        return None
+    return str(clip.get("audio_data_uri") or "") or None
+
+
 async def owner_reference_clip(
     repository: Any,
     assistant_id: str,
     *,
     max_seconds: float,
+    store: Any = None,
+    user_id: str = "",
+    context: Any = None,
 ) -> str | None:
     """A data URI of the owner's voice, cut to ``max_seconds`` from the longest stored clip.
 
     The clip comes from the recordings the owner made for the voice clone. The
     cut is cached in-process for a few minutes: an utterance arrives every few
     seconds in a live conversation and the recordings rarely change.
+
+    An avatar with no voice yet has no such recordings, so the stored reference
+    audio clip is used instead when ``store`` is given. That is what lets the
+    very first live utterance be attributed to the owner by the diarizer.
     """
     if repository is None or not assistant_id:
-        return None
+        return await _stored_reference_anchor(store, user_id, assistant_id, context)
     try:
         clips = await repository.list_voice_clips(assistant_id, include_bytes=False)
     except Exception:  # noqa: BLE001 - no clips means no owner reference
         logger.debug("Could not list voice clips for %s", assistant_id, exc_info=True)
-        return None
+        return await _stored_reference_anchor(store, user_id, assistant_id, context)
     if not clips:
-        return None
+        return await _stored_reference_anchor(store, user_id, assistant_id, context)
     longest = max(clips, key=lambda clip: float(clip.get("duration_seconds") or 0.0))
     if float(longest.get("duration_seconds") or 0.0) < REFERENCE_CLIP_MIN_SECONDS:
-        return None
+        return await _stored_reference_anchor(store, user_id, assistant_id, context)
     clip_id = str(longest.get("clip_id") or "")
     cached = _owner_clip_cache.get(assistant_id)
     now = time.monotonic()
@@ -457,10 +660,24 @@ async def diarize_spoken_turn(
     assistant_id: str,
     thread_id: str | None,
     owner_label: str,
+    avatar_label: str | None = None,
+    avatar_portrays_the_speaker: bool = True,
     diarizer: Any = None,
     recent_avatar_replies: list[str] | None = None,
+    store: Any = None,
 ) -> SpokenTurn:
     """Transcribe one utterance and label every line by speaker.
+
+    ``owner_label`` is the person AT THE MICROPHONE — the one the avatar is
+    talking to. ``avatar_label`` is the avatar. On a personal avatar the two
+    are one person and one voice, which is why the stored reference clip
+    identifies the speaker at all. On anybody else's avatar they are two
+    different people: the reference clip is the avatar's voice, the person
+    talking is somebody else entirely, and
+    ``avatar_portrays_the_speaker=False`` says so. Get that wrong and the
+    clip is offered to the diarizer under the speaker's name, every lone voice
+    in the room is claimed as the avatar, and the person's own words come back
+    to them labelled with the avatar's name.
 
     ``recent_avatar_replies`` (the avatar's last spoken replies) lets the
     avatar's own voice, heard through a speaker and attributed to the person by
@@ -482,12 +699,18 @@ async def diarize_spoken_turn(
 
     started = time.perf_counter()
     owner_label = (owner_label or DEFAULT_OWNER_LABEL).strip() or DEFAULT_OWNER_LABEL
+    avatar_label = (avatar_label or "").strip() or owner_label
     max_remembered = int(context.voice_speaker_memory_max_speakers or 3)
     reference_seconds = float(context.voice_speaker_reference_max_seconds or 9.0)
     min_segment_seconds = float(context.voice_speaker_min_segment_seconds or 2.0)
 
     owner_reference = await owner_reference_clip(
-        repository, assistant_id, max_seconds=reference_seconds
+        repository,
+        assistant_id,
+        max_seconds=reference_seconds,
+        store=store,
+        user_id=user_id,
+        context=context,
     )
     remembered: list[dict[str, Any]] = []
     if repository is not None and thread_id:
@@ -501,8 +724,12 @@ async def diarize_spoken_turn(
 
     known_names: list[str] = []
     known_references: list[str] = []
+    # The stored clip is the AVATAR's reference audio. It names the speaker
+    # only when the avatar is a portrait of the speaker; otherwise it names the
+    # avatar, and a voice matching it is the avatar's own playback in the room.
+    reference_name = owner_label if avatar_portrays_the_speaker else avatar_label
     if owner_reference:
-        known_names.append(owner_label)
+        known_names.append(reference_name)
         known_references.append(owner_reference)
     for record in remembered:
         if len(known_names) >= DIARIZER_MAX_KNOWN_SPEAKERS:
@@ -512,7 +739,7 @@ async def diarize_spoken_turn(
             continue
         known_names.append(str(record["label"]))
         known_references.append(_data_uri(record.get("mime_type") or "audio/mpeg", payload))
-    remembered_labels = [name for name in known_names if name != owner_label]
+    remembered_labels = [name for name in known_names if name != reference_name]
 
     preprocessed = await preprocess_audio(
         _data_uri(mime_type or "audio/webm", audio_bytes),
@@ -542,6 +769,7 @@ async def diarize_spoken_turn(
                 script="",
                 segments=[],
                 owner_label=owner_label,
+                avatar_label=avatar_label,
                 owner_identified=bool(owner_reference),
                 other_speakers=[],
                 duration_seconds=duration_seconds,
@@ -574,13 +802,27 @@ async def diarize_spoken_turn(
         segments, new_label_by_raw_name = label_segments(
             raw_segments,
             owner_label=owner_label,
-            owner_reference_given=bool(owner_reference),
+            owner_reference_given=bool(owner_reference)
+            and avatar_portrays_the_speaker,
             remembered_labels=remembered_labels,
+            avatar_label=avatar_label,
+            avatar_reference_given=bool(owner_reference)
+            and not avatar_portrays_the_speaker,
         )
         segments = mark_avatar_echo(
             segments,
-            owner_label=owner_label,
+            avatar_label=avatar_label,
             recent_avatar_replies=list(recent_avatar_replies or []),
+        )
+        # Whether the diarizer matched the owner against a reference, read
+        # before ``claim_lone_speaker_as_owner`` relabels a lone voice. Voice
+        # accrual trusts only a real match: the lone voice in the room may be
+        # background chatter, and an instant clone built from it is permanent.
+        owner_matched_reference = any(segment.is_owner for segment in segments)
+        segments, new_label_by_raw_name = claim_lone_speaker_as_owner(
+            segments,
+            owner_label=owner_label,
+            new_label_by_raw_name=new_label_by_raw_name,
         )
         remembered_new = await _remember_new_speakers(
             repository,
@@ -611,7 +853,7 @@ async def diarize_spoken_turn(
         {
             segment.speaker
             for segment in segments
-            if not segment.is_owner and not segment.is_avatar
+            if not segment.is_owner and not segment.is_avatar and not segment.is_scene
         },
         key=lambda label: (len(label), label),
     )
@@ -619,7 +861,10 @@ async def diarize_spoken_turn(
         script=render_speaker_script(segments),
         segments=segments,
         owner_label=owner_label,
-        owner_identified=bool(owner_reference),
+        avatar_label=avatar_label,
+        # The person is identified only by a reference that is the person's own
+        # voice; the avatar's reference identifies the avatar, not them.
+        owner_identified=bool(owner_reference) and avatar_portrays_the_speaker,
         other_speakers=other_speakers,
         duration_seconds=duration_seconds,
         remembered_new_speakers=remembered_new,
@@ -627,6 +872,8 @@ async def diarize_spoken_turn(
         total_cost=float(total_cost or 0.0),
         latency_ms=(time.perf_counter() - started) * 1000.0,
         model=str(context.audio_diarization_model or "gpt-4o-transcribe-diarize"),
+        audio_data_uri=_data_uri("audio/mp3", mp3_bytes),
+        owner_matched_reference=owner_matched_reference,
     )
 
 

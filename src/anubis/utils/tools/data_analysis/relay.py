@@ -199,6 +199,17 @@ def sessions_for_user(user_id: str) -> list[RelaySession]:
     return sorted(sessions, key=lambda session: session.device_label)
 
 
+def all_sessions() -> list[RelaySession]:
+    """Every live session in this process, across every account.
+
+    Used by background work that has no caller to scope it — the browsing
+    sweeper walks the machines that are actually connected rather than every
+    account that has ever registered one, so an account whose machines are all
+    asleep costs the loop nothing.
+    """
+    return sorted(_sessions_by_device.values(), key=lambda session: session.device_id)
+
+
 def is_online(device_id: str | None, user_id: str | None = None) -> bool:
     """Whether a device currently holds a live relay socket.
 

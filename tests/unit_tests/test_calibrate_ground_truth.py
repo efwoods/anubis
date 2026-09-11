@@ -167,23 +167,42 @@ def _distinct_quote(index: int) -> str:
 def deterministic_key_phrases(monkeypatch):
     """Pin phrase discovery so the fast/slow path choice is what a test intends.
 
-    Patched on the DEFINING module, not on the calibration module: calibration
-    imports these lazily inside the function body (the module pulls in numpy and
+    Patched on the DEFINING modules, not on the calibration module: calibration
+    imports these lazily inside the function body (the modules pull in numpy and
     scikit-learn, so the imports are deferred), which means the names are resolved
     from the source module at call time and never exist as calibration-module
     attributes.
+
+    Pinning ``build_signature_key_phrase_profile`` is not merely for determinism.
+    That function runs the language-model judge, so leaving it unpatched makes
+    every test in this file attempt a live model call and then fall open — the
+    tests still pass, but they pass slowly, over the network, and for the wrong
+    reason.
     """
+    import src.anubis.utils.dataset.key_phrase_judgement as judgement_module
     import src.anubis.utils.dataset.key_phrases as key_phrases_module
 
+    async def _fake_profile(documents, **keyword_arguments):
+        return judgement_module.KeyPhraseProfile(
+            phrases=["the hospital"],
+            entries=[{"phrase": "the hospital"}],
+            judgement_cache={
+                "the hospital": {
+                    "classification": "signature_style",
+                    "confidence": "high",
+                    "reason": "pinned by the test fixture",
+                    "judgement_source": "model",
+                }
+            },
+        )
+
     monkeypatch.setattr(
-        key_phrases_module,
-        "discover_key_phrases",
-        lambda documents: [{"phrase": "the hospital"}],
+        judgement_module, "build_signature_key_phrase_profile", _fake_profile
     )
     monkeypatch.setattr(
         key_phrases_module,
         "build_corpus_phrase_attestation_set",
-        lambda documents: {"the hospital"},
+        lambda documents, **keyword_arguments: {"the hospital"},
     )
     return ["the hospital"]
 
@@ -357,3 +376,129 @@ async def test_unreadable_corpus_still_proceeds_when_documents_were_passed(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The phrase set must stop growing across uploads
+#
+# The old code stored ``set(discovered) | set(previous)``, so the list grew by
+# roughly a discovery's worth on every upload and every one of those phrases was
+# rendered into the system prompt on every turn.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_consecutive_calibrations_replace_rather_than_accumulate(monkeypatch):
+    """The second run's phrases replace the first run's, never union with them."""
+    import json
+
+    import src.anubis.utils.dataset.key_phrase_judgement as judgement_module
+    import src.anubis.utils.dataset.key_phrases as key_phrases_module
+    from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import (
+        MIN_ROWS_FOR_CALIBRATION,
+        calibrate_ground_truth_from_stored_corpus,
+    )
+
+    produced = iter([["first phrase"], ["second phrase"]])
+
+    async def _fake_profile(documents, **keyword_arguments):
+        return judgement_module.KeyPhraseProfile(phrases=list(next(produced)))
+
+    monkeypatch.setattr(
+        judgement_module, "build_signature_key_phrase_profile", _fake_profile
+    )
+    monkeypatch.setattr(
+        key_phrases_module,
+        "build_corpus_phrase_attestation_set",
+        lambda documents, **keyword_arguments: {"first phrase", "second phrase"},
+    )
+
+    store = _FakeQuoteStore(
+        [
+            _QuoteItem(f"doc-{index}", _distinct_quote(index))
+            for index in range(MIN_ROWS_FOR_CALIBRATION + 2)
+        ]
+    )
+    for _ in range(2):
+        await calibrate_ground_truth_from_stored_corpus(
+            store=store, assistant_id="a1", user_id="owner1"
+        )
+
+    stored = store.contents[(("owner1", "a1", "key_phrase_profile"), "key_phrase_profile")]
+    assert json.loads(stored.value["value"]) == ["second phrase"]
+
+
+@pytest.mark.asyncio
+async def test_the_detail_record_is_written_beside_the_phrase_list(
+    deterministic_key_phrases,
+):
+    """The judgement cache is what keeps a stable corpus producing a stable set."""
+    import json
+
+    from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import (
+        KEY_PHRASE_PROFILE_DETAIL_KEY,
+        KEY_PHRASE_PROFILE_KEY,
+        MIN_ROWS_FOR_CALIBRATION,
+        calibrate_ground_truth_from_stored_corpus,
+    )
+
+    store = _FakeQuoteStore(
+        [
+            _QuoteItem(f"doc-{index}", _distinct_quote(index))
+            for index in range(MIN_ROWS_FOR_CALIBRATION + 2)
+        ]
+    )
+    await calibrate_ground_truth_from_stored_corpus(
+        store=store, assistant_id="a1", user_id="owner1"
+    )
+
+    namespace = ("owner1", "a1", KEY_PHRASE_PROFILE_KEY)
+    assert (namespace, KEY_PHRASE_PROFILE_KEY) in store.contents
+    detail_item = store.contents[(namespace, KEY_PHRASE_PROFILE_DETAIL_KEY)]
+    detail = json.loads(detail_item.value["value"])
+    assert detail["phrases"] == ["the hospital"]
+    assert "the hospital" in detail["judgement_cache"]
+
+
+@pytest.mark.asyncio
+async def test_a_discovery_failure_keeps_the_previously_stored_phrases(monkeypatch):
+    """Losing the phrase set would strip SIGNATURE PHRASES and force a full rebuild."""
+    import json
+
+    import src.anubis.utils.dataset.key_phrase_judgement as judgement_module
+    import src.anubis.utils.dataset.key_phrases as key_phrases_module
+    from src.subgraphs.process_media_graph.utils.calibrate_ground_truth import (
+        KEY_PHRASE_PROFILE_KEY,
+        MIN_ROWS_FOR_CALIBRATION,
+        calibrate_ground_truth_from_stored_corpus,
+    )
+
+    async def _explode(documents, **keyword_arguments):
+        raise RuntimeError("discovery blew up")
+
+    monkeypatch.setattr(
+        judgement_module, "build_signature_key_phrase_profile", _explode
+    )
+    monkeypatch.setattr(
+        key_phrases_module,
+        "build_corpus_phrase_attestation_set",
+        lambda documents, **keyword_arguments: {"kept phrase"},
+    )
+
+    store = _FakeQuoteStore(
+        [
+            _QuoteItem(f"doc-{index}", _distinct_quote(index))
+            for index in range(MIN_ROWS_FOR_CALIBRATION + 2)
+        ]
+    )
+    namespace = ("owner1", "a1", KEY_PHRASE_PROFILE_KEY)
+    store.contents[(namespace, KEY_PHRASE_PROFILE_KEY)] = _StoreItem(
+        {"value": json.dumps(["kept phrase"])}
+    )
+
+    await calibrate_ground_truth_from_stored_corpus(
+        store=store, assistant_id="a1", user_id="owner1"
+    )
+
+    stored = store.contents[(namespace, KEY_PHRASE_PROFILE_KEY)]
+    assert json.loads(stored.value["value"]) == ["kept phrase"]

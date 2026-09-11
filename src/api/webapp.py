@@ -36,7 +36,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.store.base import IndexConfig
 from langgraph.store.postgres import AsyncPostgresStore
@@ -136,10 +136,27 @@ from src.anubis.utils.avatar_deletion import (
 )
 from src.anubis.utils.huggingface_prefetch import ensure_huggingface_models_cached
 from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
+from src.anubis.utils.net.url_safety import (
+    UnsafeUrlError,
+    assert_public_host,
+    get_with_public_host_guard,
+)
 from src.anubis.utils.store_cache import (
     invalidate_store_cache_entry,
     invalidate_store_cache_for_assistant,
 )
+from src.anubis.utils.conversation_titles import (
+    CONVERSATION_TITLE_SOURCE_KEY,
+    MANUAL_TITLE_SOURCE,
+    name_conversation_thread,
+)
+from src.api.group_conversations import group_conversations_route
+from src.anubis.utils.tools.vision.accessibility_tools import SCENE_NARRATION_EVENT
+from src.anubis.utils.tools.vision.look_tools import (
+    SHARE_REQUEST_EVENT,
+    SHARE_STOP_EVENT,
+)
+from src.api.look_context import LookContext, LookContextRegistry
 from src.api.message_stops import (
     AMBIENT_BUSY_RETRY_AFTER_SECONDS,
     STOP_REQUESTED,
@@ -163,6 +180,7 @@ from src.api.media_jobs import (
     request_cancel,
     run_batch_media_job,
 )
+from src.security.bans import ban_account, ban_subject_from_user
 from src.security.auth import (
     _tier_from_subscription,
     bearer_credentials_from_request,
@@ -172,6 +190,7 @@ from src.security.auth import (
     get_current_user_or_anonymous_user_id,
     get_user,
     get_user_with_api_key,
+    resolve_request_hashed_ip,
     security_route,
     update_user_app_metadata_fields,
     update_user_subscription_status,
@@ -872,6 +891,18 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+#: Custom stream frames the browser ACTS on rather than displays: switch a share
+#: off, offer the person the one button that can start a screen capture, and
+#: start or stop scene narration. They are emitted by tools deep inside the
+#: graph (``src/anubis/utils/tools/vision/``), none of them pauses the run, and
+#: none of them is answered — so the SSE loop forwards them untouched. A frame
+#: missing from this set is silently dropped, which looks to the person like a
+#: tool that ran and did nothing.
+BROWSER_DIRECTED_FRAMES = frozenset(
+    {SHARE_STOP_EVENT, SHARE_REQUEST_EVENT, SCENE_NARRATION_EVENT}
+)
+
+
 from uuid import NAMESPACE_URL, uuid5
 
 
@@ -1152,6 +1183,101 @@ async def _meter_stopped_turn(
     )
 
 
+def _thread_metadata_updates(
+    *,
+    user_id: str,
+    assistant_id: str,
+    thread_id: str,
+    conversation_title_value: str | None,
+) -> dict:
+    """Build the thread_metadata keys one ``/message`` turn owns.
+
+    ``conversation_title`` is written only when the caller actually sent a name.
+    A caller that sends none leaves the key out entirely rather than writing
+    ``None`` over whatever name the thread carries — writing ``None`` is how the
+    name the conversation namer stored used to disappear on the reader's next
+    message. A name the caller did send is the caller's own choice and is
+    stamped as such, so the namer leaves that name alone.
+    """
+    updates: dict = {
+        "user_id": user_id,
+        "assistant_id": assistant_id,
+        "most_recent_message": datetime.now(UTC).isoformat(),
+    }
+    caller_title = (conversation_title_value or "").strip()
+    if caller_title and caller_title != thread_id:
+        updates["conversation_title"] = caller_title
+        updates[CONVERSATION_TITLE_SOURCE_KEY] = MANUAL_TITLE_SOURCE
+    return updates
+
+
+async def _write_thread_metadata(
+    langgraph_client: Any, thread_id: str, updates: dict
+) -> None:
+    """Merge ``updates`` into a thread's nested ``thread_metadata`` and store it.
+
+    The platform patches thread metadata one top-level key at a time, and
+    ``thread_metadata`` is a single top-level key holding an object. Writing a
+    freshly built object therefore replaces every key inside it, not just the
+    keys being written. Each ``/message`` turn writes that object, so a name the
+    conversation namer stored after the previous turn — and the ``shared`` flag
+    a reader set on the conversation — were erased by the next message the
+    reader sent. Reading the thread first and merging is what makes those keys
+    outlive a turn.
+    """
+    existing_metadata: dict = {}
+    existing_thread_metadata: dict = {}
+    try:
+        thread = await langgraph_client.threads.get(thread_id=thread_id)
+        if isinstance(thread, dict) and isinstance(thread.get("metadata"), dict):
+            existing_metadata = thread["metadata"]
+            nested = existing_metadata.get("thread_metadata")
+            if isinstance(nested, dict):
+                existing_thread_metadata = nested
+    except Exception:  # noqa: BLE001 - the write still goes out
+        # A thread that cannot be read is usually a thread that does not exist
+        # yet. Writing the update alone is right in that case; losing the keys
+        # of a thread that does exist is the only cost of a read that failed.
+        logger.debug(
+            "Could not read thread %s before writing its metadata", thread_id, exc_info=True
+        )
+    await langgraph_client.threads.update(
+        thread_id=thread_id,
+        metadata={
+            "thread_metadata": {**existing_thread_metadata, **updates},
+            "graph_id": "Anubis",
+        },
+    )
+
+
+async def _name_new_conversation(
+    thread_id: str,
+    *,
+    langgraph_client_headers: dict,
+    user_id: str,
+    assistant_id: str,
+) -> str:
+    """Name a conversation that has no name yet, swallowing every failure.
+
+    Run after the reply has been delivered, never before: the reader is waiting
+    on the avatar's words, and a classification call made for the sidebar's
+    benefit must not sit in front of them. A conversation that already carries a
+    name is left alone, so this costs one call per conversation rather than one
+    per turn, and it returns the name it wrote or an empty string.
+    """
+    try:
+        return await name_conversation_thread(
+            thread_id,
+            langgraph_client_headers=langgraph_client_headers,
+            only_when_unnamed=True,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - a name is a convenience, the reply is not
+        logger.warning("Could not name conversation %s", thread_id, exc_info=True)
+        return ""
+
+
 async def _finalize_stopped_turn(
     partial_text: str,
     *,
@@ -1198,19 +1324,17 @@ async def _finalize_stopped_turn(
         request_id=request_id,
         response_metadata=response_metadata,
     )
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title_value,
-        },
-        "graph_id": "Anubis",
-    }
     try:
         langgraph_client = get_client(headers=langgraph_client_headers)
-        await langgraph_client.threads.update(
-            thread_id=thread_id, metadata=thread_metadata
+        await _write_thread_metadata(
+            langgraph_client,
+            thread_id,
+            _thread_metadata_updates(
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                conversation_title_value=conversation_title_value,
+            ),
         )
     except Exception:  # noqa: BLE001 - metadata is a convenience, the stop is not
         logger.warning(
@@ -1338,6 +1462,89 @@ def _stream_error_frame(
     }
 
 
+def _message_text_for_moderation(human_message: Any) -> str:
+    """The text of a human turn, whether its content is a string or content blocks."""
+    try:
+        from src.anubis.utils.learning.sentiment import message_text
+
+        return message_text(getattr(human_message, "content", "") or "")
+    except Exception:  # noqa: BLE001 - moderation must never break on an odd shape
+        return ""
+
+
+async def _judge_message_after_reply(
+    app_state: Any,
+    current_user: dict | None,
+    *,
+    message_text: str,
+    request_hashed_ip: str | None,
+    already_refused: bool = False,
+) -> None:
+    """Run the deep terms-of-service judge on a message AFTER its reply was sent.
+
+    This is the half of AI monitoring that must not touch the critical path of a
+    reply. The inline screen (``moderate_content_fast`` in the graph) is one free
+    moderation call and refuses only clear-cut abuse; the structured-output judge
+    that reads the terms of service and the privacy policy in full is far slower,
+    so it runs here, detached, once the person already has their answer.
+
+    A violation it finds bans the account, which means enforcement lands on the
+    NEXT request rather than on this one — ``refuse_if_banned`` refuses the caller
+    at authentication from that point on. That is the deliberate trade: one
+    violating turn is answered, and no reply in the product waits on a judge.
+
+    Never raises: it runs detached, so an exception here would surface only as an
+    unretrieved task exception.
+    """
+    try:
+        if app_state is None or current_user is None:
+            return
+        if already_refused:
+            # The inline screen already refused and banned; judging again would
+            # only cost a call to reach a verdict nobody reads.
+            return
+        context = getattr(app_state, "context", None)
+        from src.anubis.utils.moderation.content_moderation import (
+            moderation_flag_enabled,
+        )
+
+        if not moderation_flag_enabled(
+            getattr(context, "content_moderation_enabled", "TRUE")
+        ):
+            return
+        text = (message_text or "").strip()
+        if not text:
+            return
+
+        from src.anubis.utils.moderation.content_moderation import (
+            DEFAULT_MAX_CHARACTERS,
+            judge_text,
+        )
+
+        verdict = await judge_text(
+            text,
+            max_characters=int(
+                getattr(context, "content_moderation_max_characters", DEFAULT_MAX_CHARACTERS)
+                or DEFAULT_MAX_CHARACTERS
+            ),
+        )
+        if not verdict.get("violation"):
+            return
+        await ban_account(
+            app_state,
+            ban_subject_from_user(current_user, request_hashed_ip),
+            reason=str(verdict.get("reasoning") or "terms of service violation"),
+            violated_clauses=list(verdict.get("violated_clauses") or []),
+            source="message",
+            excerpt=str(verdict.get("excerpt") or ""),
+        )
+        logger.warning(
+            "Background content moderation banned an account after the reply was sent."
+        )
+    except Exception as judge_error:  # noqa: BLE001 - detached; must never escape
+        logger.error("Background content moderation failed: %s", judge_error)
+
+
 async def message_graph_sse(
     graph,
     human_message: HumanMessage,
@@ -1359,6 +1566,7 @@ async def message_graph_sse(
     include_usage_metrics: bool = True,
     spoken_turn_frame: dict | None = None,
     ambient: bool = False,
+    request_hashed_ip: str | None = None,
 ):
     """Stream assistant tokens (SSE) then a terminal event with full metadata.
 
@@ -1388,6 +1596,7 @@ async def message_graph_sse(
     accumulated_chunks: list[str] = []
     last_ai: AIMessage | None = None
     ambient_decision: dict | None = None
+    moderation_verdict: dict | None = None
 
     # The turn is registered before anything is sent so that
     # ``POST /message/{assistant_id}/stop`` can find it from the moment the
@@ -1545,6 +1754,36 @@ async def message_graph_sse(
                         key: value for key, value in payload.items() if key != "type"
                     }
                     yield f"data: {json.dumps(payload, default=str)}\n\n"
+                elif payload.get("type") == "moderation_violation":
+                    # AI monitoring: the graph refused this turn on the inline
+                    # screen. The ban lives here rather than in the graph because
+                    # it needs the connection pool and the Stripe client, which
+                    # the graph does not hold.
+                    moderation_verdict = {
+                        key: value for key, value in payload.items() if key != "type"
+                    }
+                    if app_state is not None and current_user is not None:
+                        await ban_account(
+                            app_state,
+                            ban_subject_from_user(current_user, request_hashed_ip),
+                            reason=str(
+                                moderation_verdict.get("reasoning")
+                                or "terms of service violation"
+                            ),
+                            violated_clauses=list(
+                                moderation_verdict.get("violated_clauses") or []
+                            ),
+                            source="message",
+                            excerpt=str(moderation_verdict.get("excerpt") or ""),
+                        )
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+                elif payload.get("type") in BROWSER_DIRECTED_FRAMES:
+                    # Frames the browser acts on rather than displays: switch a
+                    # share off, offer the person the button that starts a
+                    # screen capture, start or stop scene narration. None of
+                    # them pauses the run and none of them is answered, so they
+                    # are forwarded as they are and the stream carries on.
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
                 elif payload.get("type") == "image_description_usage":
                     # One vision call described an attached image (a typed turn's
                     # attachment or an ambient snapshot). Metered here because the
@@ -1642,17 +1881,17 @@ async def message_graph_sse(
         )
         return
 
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title_value,
-        },
-        "graph_id": "Anubis",
-    }
     langgraph_client = get_client(headers=langgraph_client_headers)
-    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+    await _write_thread_metadata(
+        langgraph_client,
+        thread_id,
+        _thread_metadata_updates(
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            conversation_title_value=conversation_title_value,
+        ),
+    )
 
     # If the graph paused for human approval, surface the preview instead of ``done``.
     # The client resumes via ``POST /message/{assistant_id}/resume`` on this thread_id.
@@ -1693,6 +1932,8 @@ async def message_graph_sse(
         done["response_metadata"] = response_metadata
     if ambient_decision is not None:
         done["ambient"] = ambient_decision
+    if moderation_verdict is not None:
+        done["moderation"] = {"banned": True, **moderation_verdict}
 
     # Always accrue actual model API usage BEFORE the terminal frame. Reporting
     # the usage block on ``done`` is optional (``include_usage_metrics``);
@@ -1717,6 +1958,45 @@ async def message_graph_sse(
         if include_usage_metrics and turn_usage:
             done["usage"] = turn_usage
     yield f"data: {json.dumps(done, default=str)}\n\n"
+
+    # AI monitoring, stage two. The reply is delivered by this point, so the deep
+    # terms-of-service judge runs detached and costs the reader nothing. A
+    # violation it finds bans the account, and the ban refuses the caller's NEXT
+    # request at authentication.
+    schedule_background(
+        _judge_message_after_reply(
+            app_state,
+            current_user,
+            message_text=_message_text_for_moderation(human_message),
+            request_hashed_ip=request_hashed_ip,
+            already_refused=moderation_verdict is not None,
+        )
+    )
+
+    # The conversation is named after the reply has been delivered, never
+    # before: the reader has the avatar's words in full by this frame, and the
+    # naming call costs the reader nothing but a still-open connection. A
+    # conversation that already carries a name is left alone, so this is one
+    # call per conversation rather than one per turn.
+    #
+    # The name is sent as its own frame instead of being left for the next
+    # listing of conversations, because a conversation is named on the turn
+    # that starts it — exactly the turn on which the browser is putting a new
+    # row in the sidebar. Handing the name over now is what stops that row
+    # from reading "Conversation Sep 9, 10:14" until something else refreshes.
+    conversation_name = await _name_new_conversation(
+        thread_id,
+        langgraph_client_headers=langgraph_client_headers,
+        user_id=user_id,
+        assistant_id=assistant_id,
+    )
+    if conversation_name:
+        conversation_name_frame = {
+            "type": "conversation_title",
+            "thread_id": thread_id,
+            "conversation_title": conversation_name,
+        }
+        yield f"data: {json.dumps(conversation_name_frame, default=str)}\n\n"
 
 
 class MessagePayload(BaseModel):
@@ -2117,6 +2397,12 @@ async def lifespan(app: FastAPI):
     # (meter + tier price ids) so metering and subscription endpoints can use them.
     await ensure_api_metrics_table(app.state.pool)
     await ensure_anonymous_billing_customers_table(app.state.pool)
+    # AI monitoring: the banned_accounts table is the only source of truth for a
+    # ban — Auth0 is never consulted or written — so it must exist before the
+    # first request can be refused.
+    from src.security.bans import ensure_banned_accounts_table
+
+    await ensure_banned_accounts_table(app.state.pool)
     # Connected accounts (mailboxes, custom connectors) live in their own table,
     # keyed by user and personal avatar rather than by an identity provider's
     # namespace. Publish the repository process-wide so graph nodes and tools —
@@ -2195,6 +2481,15 @@ async def lifespan(app: FastAPI):
     media_assets_package.set_media_asset_repository(
         media_assets_package.PostgresMediaAssetRepository(app.state.pool)
     )
+    # How each avatar's person moves (src/anubis/utils/motion/): coordinate
+    # timelines, the expression basis, primitives and the rendered profile,
+    # in their own tables beside the media assets.
+    from src.anubis.utils import motion as motion_package
+
+    await motion_package.ensure_motion_tables(app.state.pool)
+    motion_package.set_motion_repository(
+        motion_package.PostgresMotionRepository(app.state.pool)
+    )
     # A professional voice clone trains for hours; its state lives in the
     # avatar_voice table and is refreshed on a schedule that survives restarts.
     app.state.voice_training_poller = asyncio.create_task(
@@ -2207,6 +2502,20 @@ async def lifespan(app: FastAPI):
     await inbox_package.ensure_inbox_tables(app.state.pool)
     inbox_package.set_inbox_repository(
         inbox_package.PostgresInboxRepository(app.state.pool)
+    )
+
+    # Content subscriptions: what the owner's own accounts publish, and every
+    # announcement received. Published process-wide the same way, because the
+    # webhook route and the mailbox watcher both reach it without importing
+    # this module.
+    from src.anubis.utils import subscriptions as subscriptions_package
+    from src.anubis.utils.subscriptions import (
+        repository as subscriptions_repository,
+    )
+
+    await subscriptions_package.ensure_subscription_tables(app.state.pool)
+    subscriptions_package.set_subscription_repository(
+        subscriptions_repository.PostgresSubscriptionRepository(app.state.pool)
     )
 
     # Geo-located avatars. Two throttles keep a moving phone from flooding the
@@ -2251,6 +2560,13 @@ async def lifespan(app: FastAPI):
         runtime_handles.set_identity_media_job_starter(
             start_identity_media_job_from_chat
         )
+        # Connecting an account research suggested starts the next round of
+        # research through this published starter (see runtime_handles).
+        runtime_handles.set_deep_research_job_starter(
+            lambda **keyword_arguments: _start_deep_research_job(
+                app.state, **keyword_arguments
+            )
+        )
         checkpointer = AsyncPostgresSaver(app.state.pool)
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
@@ -2260,9 +2576,19 @@ async def lifespan(app: FastAPI):
         from src.anubis.utils.inbox import poller as inbox_poller
 
         inbox_poller.set_inbox_runtime(checkpointer, store)
+        from src.anubis.utils.groups.runner import set_group_runtime
+
+        set_group_runtime(checkpointer, store)
         app.state.inbox_poller = asyncio.create_task(
             inbox_poller.poll_forever(app.state.context)
         )
+        # IDLE makes mail event-driven: the server speaks first, so a message
+        # that arrives now is triaged now. The interval poll above stays as the
+        # catch-up pass — IDLE keeps up, the poll catches up.
+        from src.anubis.utils.inbox.idle_watchers import MailboxIdleWatchers
+
+        app.state.mailbox_idle_watchers = MailboxIdleWatchers(app.state.context)
+        app.state.mailbox_idle_watchers.start()
         app.state.graph = message_workflow.compile(
             store=store, checkpointer=checkpointer
         )
@@ -2279,6 +2605,20 @@ async def lifespan(app: FastAPI):
             )
         except ImportError:
             app.state.report_scheduler = None
+
+        # Subscription leases expire, and a lapsed lease is silent: nothing
+        # fails, content simply stops arriving. This is a timer over stored
+        # expiry times, not a poll of any platform.
+        try:
+            from src.anubis.utils.subscriptions.transports import (
+                renew_subscriptions_forever,
+            )
+
+            app.state.subscription_renewer = asyncio.create_task(
+                renew_subscriptions_forever(app.state.context)
+            )
+        except Exception:  # noqa: BLE001 - renewal is not worth failing boot
+            app.state.subscription_renewer = None
         except Exception as scheduler_error:  # noqa: BLE001 - startup must not fail
             logger.error("Report scheduler could not start: %s", scheduler_error)
             app.state.report_scheduler = None
@@ -2307,6 +2647,18 @@ async def lifespan(app: FastAPI):
             app.state.learning_sweeper_task = asyncio.create_task(
                 run_learning_sweeper(app)
             )
+        # Browsing insights: while the owner browses, the avatar keeps up. Each
+        # turn of this loop asks every connected machine how much is new — one
+        # indexed count per browser profile, no rows and no model call — and
+        # analyses only when enough new browsing has accumulated to be worth a
+        # model call (see browsing/sweeper.py).
+        app.state.browsing_sweeper_task = None
+        if str(app.state.context.browsing_insights_enabled or "").upper() == "TRUE":
+            from src.anubis.utils.browsing.sweeper import run_browsing_sweeper
+
+            app.state.browsing_sweeper_task = asyncio.create_task(
+                run_browsing_sweeper(app)
+            )
         logger.info("Application startup: lifecycle complete")
         yield
     finally:
@@ -2317,9 +2669,22 @@ async def lifespan(app: FastAPI):
                 await sweeper_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
                 pass
+        browsing_task = getattr(app.state, "browsing_sweeper_task", None)
+        if browsing_task is not None:
+            browsing_task.cancel()
+            try:
+                await browsing_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
         purge_task = getattr(app.state, "usage_analytics_purge_task", None)
         if purge_task is not None:
             purge_task.cancel()
+        renewer_task = getattr(app.state, "subscription_renewer", None)
+        if renewer_task is not None:
+            renewer_task.cancel()
+        mailbox_watchers = getattr(app.state, "mailbox_idle_watchers", None)
+        if mailbox_watchers is not None:
+            await mailbox_watchers.stop()
         try:
             from src.anubis.utils.connected_accounts.browser_sessions import (
                 shutdown_browser_sessions,
@@ -2340,6 +2705,10 @@ app = FastAPI(
 # Replies being generated right now, keyed by request id, so
 # ``POST /message/{assistant_id}/stop`` can end one (see ``message_stops``).
 app.state.active_message_turns = ActiveMessageTurnRegistry()
+# What each thread's last turn reported it could see, so a ``look_now`` pause
+# can be answered with the same context the paused turn had even when the
+# resuming client does not send it back (see ``src/api/look_context.py``).
+app.state.look_contexts = LookContextRegistry()
 
 
 # Middleware for request metrics
@@ -2406,6 +2775,7 @@ async def documentation():
 
 
 app.include_router(router=security_route)
+app.include_router(router=group_conversations_route)
 
 
 def _checkout_line_items_for_tier(billing_config, tier: SubscriptionTier) -> list[dict]:
@@ -2974,6 +3344,100 @@ async def manage_subscription(
     }
 
 
+def _refuse_unless_administrator(request: Request, current_user: dict) -> None:
+    """Allow only the configured administrator through an /admin/bans route."""
+    administrator_user_id = getattr(
+        request.app.state.context, "admin_user_id", None
+    )
+    identities = current_user.get("identities") or [{}]
+    caller_user_id = identities[0].get("user_id") if identities else None
+    if not administrator_user_id or caller_user_id != administrator_user_id:
+        raise HTTPException(status_code=403, detail="Not permitted.")
+
+
+@app.get("/ban_status")
+async def ban_status(
+    request: Request, current_user: dict = Depends(get_current_user_or_anonymous_user)
+):
+    """Report whether the caller is banned, and why.
+
+    Readable by the banned person themselves: a refusal elsewhere is a bare 403,
+    and someone who has been cut off is owed the reason and the appeal address.
+    Anonymous callers are identified by their hashed IP, which is what an
+    anonymous ban is recorded against.
+    """
+    from src.security.bans import (
+        ban_refusal_detail,
+        ban_subject_from_user,
+        find_active_ban,
+    )
+
+    subject = ban_subject_from_user(
+        current_user, resolve_request_hashed_ip(request)
+    )
+    ban = await find_active_ban(
+        getattr(request.app.state, "pool", None),
+        user_id=subject.user_id,
+        hashed_ip=subject.hashed_ip,
+        email=subject.email,
+    )
+    if ban is None:
+        return {"banned": False}
+    appeal_contact = getattr(
+        request.app.state.context, "ban_appeal_contact_email", None
+    )
+    return {
+        "banned": True,
+        "reason": ban.get("reason"),
+        "violated_clauses": ban.get("violated_clauses") or [],
+        "banned_at": ban.get("banned_at"),
+        "detail": ban_refusal_detail(ban, appeal_contact),
+    }
+
+
+@app.get("/admin/bans")
+async def list_banned_accounts(
+    request: Request,
+    include_lifted: bool = False,
+    limit: int = 200,
+    current_user: dict = Depends(get_current_user),
+):
+    """List bans, newest first. Administrator only."""
+    from src.security.bans import list_bans
+
+    _refuse_unless_administrator(request, current_user)
+    bans = await list_bans(
+        getattr(request.app.state, "pool", None),
+        include_lifted=include_lifted,
+        limit=limit,
+    )
+    return {"bans": bans, "count": len(bans)}
+
+
+@app.post("/admin/bans/{ban_id}/lift")
+async def lift_banned_account(
+    request: Request,
+    ban_id: str,
+    appeal_note: str | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lift one ban after an accepted appeal. Administrator only.
+
+    Lifting clears the ban cache, so the next request from that account is
+    admitted without waiting for the cache to expire. A ban that is already
+    lifted, or was never there, answers 404 rather than reporting success.
+    """
+    from src.security.bans import lift_ban
+
+    _refuse_unless_administrator(request, current_user)
+    lifted = await lift_ban(
+        getattr(request.app.state, "pool", None), ban_id, appeal_note
+    )
+    if lifted is None:
+        raise HTTPException(status_code=404, detail="No active ban with that id.")
+    return {"lifted": True, "ban": lifted}
+
+
 def _auth0_user_id_for_customer(
     stripe_client, customer_id: Optional[str]
 ) -> Optional[str]:
@@ -3268,6 +3732,259 @@ def _resolve_stripe_webhook_secret(context) -> Optional[str]:
         return value or None
     except OSError:
         return None
+
+
+@app.get("/social_webhook/{provider_name}")
+async def social_webhook_verify(provider_name: str, request: Request):
+    """Answer a platform's verification handshake for a content subscription.
+
+    Unauthenticated of necessity — the caller is YouTube or Meta, not the owner
+    — and therefore narrow by construction: the only thing this route can do is
+    echo a challenge for a subscription this server already asked for, and it
+    refuses a challenge naming any topic it did not ask about. That refusal is
+    what stops a stranger from pointing our callback at their own feed.
+    """
+    from src.anubis.utils.subscriptions.repository import (
+        SUBSCRIPTION_ACTIVE,
+        get_subscription_repository,
+    )
+    from src.anubis.utils.subscriptions.transports import lease_expiry
+
+    parameters = request.query_params
+
+    # Meta verifies with its own token rather than with a per-subscription
+    # challenge, because its webhook is configured against the application.
+    if parameters.get("hub.verify_token"):
+        expected = str(
+            getattr(app.state.context, "meta_webhook_verify_token", "") or ""
+        )
+        if not expected or parameters.get("hub.verify_token") != expected:
+            raise HTTPException(status_code=403, detail="Verification refused.")
+        return PlainTextResponse(parameters.get("hub.challenge") or "")
+
+    mode = parameters.get("hub.mode") or ""
+    topic = parameters.get("hub.topic") or ""
+    challenge = parameters.get("hub.challenge") or ""
+    if not challenge:
+        raise HTTPException(status_code=400, detail="No challenge was presented.")
+
+    repository = get_subscription_repository()
+    matches = await repository.find_by_callback(
+        provider=provider_name, topic=topic
+    )
+    if not matches:
+        # A hub may spell the topic as the feed address while the row keys on
+        # the channel id; try the stored topic address before refusing.
+        everything = await repository.find_by_callback(
+            provider=provider_name, topic=topic.strip()
+        )
+        matches = [
+            subscription
+            for subscription in (everything or [])
+            if subscription.get("topic_url") == topic
+        ]
+    if not matches:
+        logger.warning(
+            "Refused a %s verification for an unrequested topic: %s",
+            provider_name,
+            topic,
+        )
+        raise HTTPException(status_code=404, detail="No such subscription.")
+
+    subscription = matches[0]
+    if mode == "unsubscribe":
+        await repository.set_subscription_status(
+            subscription["subscription_id"],
+            status="disabled",
+            detail="The hub confirmed the subscription was removed.",
+        )
+        return PlainTextResponse(challenge)
+
+    await repository.set_subscription_status(
+        subscription["subscription_id"],
+        status=SUBSCRIPTION_ACTIVE,
+        detail="The platform confirmed the subscription.",
+        expires_at=lease_expiry(
+            app.state.context, parameters.get("hub.lease_seconds")
+        ),
+    )
+    return PlainTextResponse(challenge)
+
+
+@app.post("/social_webhook/{provider_name}")
+async def social_webhook_deliver(provider_name: str, request: Request):
+    """Receive a platform's announcement that the owner published something.
+
+    Three things happen before the payload is believed, and the order is the
+    whole security of this route: the raw body is read, the signature is
+    checked against it, and only then is it parsed. A payload parsed first and
+    verified afterwards is verified against bytes nobody signed.
+
+    Answers 2xx quickly whatever happens downstream. Every platform here
+    retries a failing callback and then drops the subscription, so an ingest
+    problem must not be reported as a delivery problem — the work is recorded
+    and handed to a background task instead.
+    """
+    from src.anubis.utils.connected_accounts.providers import (
+        CONTENT_TRANSPORT_EVENTSUB,
+        CONTENT_TRANSPORT_META_GRAPH,
+        CONTENT_TRANSPORT_WEBSUB,
+        get_provider,
+    )
+    from src.anubis.utils.subscriptions.payloads import (
+        parse_eventsub,
+        parse_meta_change,
+        parse_websub_atom,
+        websub_topic_of,
+    )
+    from src.anubis.utils.subscriptions.repository import (
+        SUBSCRIPTION_ACTIVE,
+        get_subscription_repository,
+    )
+    from src.anubis.utils.subscriptions.transports import (
+        is_replay,
+        verify_eventsub_signature,
+        verify_meta_signature,
+        verify_websub_signature,
+    )
+
+    provider = get_provider(provider_name)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Unknown provider.")
+
+    raw_body = await request.body()
+    repository = get_subscription_repository()
+    transport = provider.content_transport
+    items: list[dict[str, Any]] = []
+    subscription: dict[str, Any] | None = None
+
+    if transport == CONTENT_TRANSPORT_WEBSUB:
+        topic = websub_topic_of(raw_body)
+        if not topic:
+            raise HTTPException(status_code=400, detail="No topic in the payload.")
+        candidates = await repository.find_by_callback(
+            provider=provider_name, topic=topic
+        )
+        subscription = candidates[0] if candidates else None
+        if subscription is None:
+            logger.warning("Dropped a %s push for an unknown topic.", provider_name)
+            raise HTTPException(status_code=404, detail="No such subscription.")
+        if not verify_websub_signature(
+            raw_body=raw_body,
+            header_value=request.headers.get("X-Hub-Signature-256")
+            or request.headers.get("X-Hub-Signature"),
+            secret=str(subscription.get("secret") or ""),
+        ):
+            logger.warning("Refused a %s push with a bad signature.", provider_name)
+            raise HTTPException(status_code=403, detail="Signature mismatch.")
+        items = parse_websub_atom(raw_body)
+
+    elif transport == CONTENT_TRANSPORT_EVENTSUB:
+        message_type = request.headers.get("Twitch-Eventsub-Message-Type") or ""
+        timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp")
+        if is_replay(timestamp):
+            raise HTTPException(status_code=403, detail="Stale delivery.")
+        payload = json.loads(raw_body or b"{}")
+        candidates = await repository.find_by_callback(
+            provider=provider_name,
+            topic=str(
+                ((payload.get("subscription") or {}).get("condition") or {}).get(
+                    "broadcaster_user_id"
+                )
+                or ""
+            ),
+        )
+        subscription = candidates[0] if candidates else None
+        secret = str(
+            (subscription or {}).get("secret")
+            or getattr(app.state.context, "twitch_eventsub_secret", "")
+            or ""
+        )
+        if not verify_eventsub_signature(
+            raw_body=raw_body,
+            message_id=request.headers.get("Twitch-Eventsub-Message-Id"),
+            timestamp=timestamp,
+            signature=request.headers.get("Twitch-Eventsub-Message-Signature"),
+            secret=secret,
+        ):
+            raise HTTPException(status_code=403, detail="Signature mismatch.")
+        # Twitch's own handshake asks us to echo a challenge on this route.
+        if message_type == "webhook_callback_verification":
+            if subscription is not None:
+                await repository.set_subscription_status(
+                    subscription["subscription_id"],
+                    status=SUBSCRIPTION_ACTIVE,
+                    detail="Twitch confirmed the subscription.",
+                )
+            return PlainTextResponse(str(payload.get("challenge") or ""))
+        if message_type == "revocation":
+            if subscription is not None:
+                await repository.set_subscription_status(
+                    subscription["subscription_id"],
+                    status="disabled",
+                    detail="Twitch revoked the subscription.",
+                )
+            return JSONResponse({"status": "ok"})
+        items = parse_eventsub(payload)
+
+    elif transport == CONTENT_TRANSPORT_META_GRAPH:
+        if not verify_meta_signature(
+            raw_body=raw_body,
+            header_value=request.headers.get("X-Hub-Signature-256"),
+            app_secret=str(getattr(app.state.context, "meta_app_secret", "") or ""),
+        ):
+            raise HTTPException(status_code=403, detail="Signature mismatch.")
+        payload = json.loads(raw_body or b"{}")
+        items = parse_meta_change(payload)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.display_name} does not deliver to this callback.",
+        )
+
+    if not items:
+        return JSONResponse({"status": "ok", "accepted": 0})
+
+    accepted = 0
+    for item in items:
+        match = subscription
+        if match is None and item.get("object_id"):
+            candidates = await repository.find_by_callback(
+                provider=provider_name, topic=str(item["object_id"])
+            )
+            match = candidates[0] if candidates else None
+        if match is None:
+            continue
+        accepted += 1
+        schedule_background(_ingest_subscription_event(match, item, provider_name))
+
+    return JSONResponse({"status": "ok", "accepted": accepted})
+
+
+async def _ingest_subscription_event(
+    subscription: dict[str, Any], item: dict[str, Any], provider_name: str
+) -> None:
+    """Hand one verified announcement to the intake, off the callback's reply."""
+    from src.anubis.utils.subscriptions.intake import record_content_event
+
+    try:
+        await record_content_event(
+            provider=provider_name,
+            connection_key=str(subscription.get("connection_key") or "") or None,
+            personal_avatar_id=str(subscription.get("personal_avatar_id") or ""),
+            user_id=str(subscription.get("user_id") or ""),
+            external_item_id=str(item.get("external_item_id") or ""),
+            url=item.get("url"),
+            title=item.get("title"),
+            published_at=item.get("published_at"),
+            transport=str(subscription.get("transport") or ""),
+            subscription_id=str(subscription.get("subscription_id") or ""),
+            avatar_name=subscription.get("avatar_name"),
+            avatar_description=subscription.get("avatar_description"),
+            store=getattr(app.state, "store", None),
+        )
+    except Exception:  # noqa: BLE001 - a delivery must never crash the task
+        logger.exception("Could not ingest a %s announcement.", provider_name)
 
 
 @app.post("/stripe/webhook")
@@ -3637,18 +4354,108 @@ async def _resolve_personal_avatar_capability_statuses(
     if connected_mailboxes:
         statuses["connected_mailboxes"] = connected_mailboxes
 
-    connected_social_accounts = [
-        public_account_view(account)
+    # A social account reports whether it is PROVEN and whether it is
+    # SUBSCRIBED, not merely whether it is connected. Those are the two facts
+    # that decide whether anything this person publishes will ever reach the
+    # avatar, so an owner reading this list can tell working from decorative.
+    from src.anubis.utils.connected_accounts.ownership import ownership_of
+
+    social_records = [
+        account
         for account in accounts
-        if account.get("kind") == "social" and account.get("status") == STATUS_CONNECTED
+        if account.get("kind") == "social"
+        and account.get("status") == STATUS_CONNECTED
     ]
-    if connected_social_accounts:
+    if social_records:
+        subscriptions_by_connection: dict[str, dict] = {}
+        try:
+            from src.anubis.utils.subscriptions.repository import (
+                get_subscription_repository,
+            )
+
+            for subscription in await get_subscription_repository().list_for_avatar(
+                str(personal_avatar.get("assistant_id") or "")
+            ):
+                subscriptions_by_connection[
+                    str(subscription.get("connection_key") or "")
+                ] = subscription
+        except Exception:  # noqa: BLE001 - the accounts still list without it
+            logger.debug("Could not read content subscriptions", exc_info=True)
+
+        connected_social_accounts = []
+        for account in social_records:
+            view = public_account_view(account)
+            ownership = ownership_of(account)
+            subscription = subscriptions_by_connection.get(
+                str(account.get("account_key") or "")
+            )
+            view["ownership_state"] = ownership.get("state")
+            view["ownership_handle"] = ownership.get("handle")
+            view["subscription_status"] = (subscription or {}).get("status")
+            view["last_event_at"] = (subscription or {}).get("last_event_at")
+            connected_social_accounts.append(view)
         statuses["connected_social_accounts"] = connected_social_accounts
 
-    # The personal avatar's adapter is trained from the owner's messages across
-    # every avatar; no connection step gates that, so it is always active.
-    statuses["adapter_training"] = "active"
+    # The personal avatar's adapter is trained from what the owner has given the
+    # product AND from the owner's own messages across every avatar — the two are
+    # the same kind of thing, so they are counted together here.
+    #
+    # This used to be the literal string "active", which claimed a capability
+    # nothing implemented. Report what is actually there instead: an owner who has
+    # said nothing and uploaded nothing should be able to see that.
+    statuses["adapter_training"] = await _adapter_training_status(
+        user_id, personal_avatar.get("assistant_id")
+    )
     return statuses
+
+
+async def _adapter_training_status(user_id: str, assistant_id: Any) -> dict[str, Any]:
+    """Report how much of the owner's own material the avatar's adapter can learn from.
+
+    Two sources, counted separately because they arrive so differently: quotes the
+    owner gave the product directly (uploads), and the owner's own turns in
+    conversation, which are read from the threads that already hold them rather
+    than copied anywhere. The conversation figure comes from the engagement
+    records the platform already writes on every turn, so producing it reads no
+    message text at all.
+    """
+    from src.anubis.utils.learning.namespaces import LEARNING_KIND_ENGAGEMENT
+
+    store = getattr(app.state, "store", None)
+    assistant_id = str(assistant_id or "")
+    status: dict[str, Any] = {
+        "state": "active",
+        "uploaded_quotes": 0,
+        "conversation_turns": 0,
+    }
+    if store is None or not assistant_id:
+        return status
+
+    try:
+        from src.api.salvage.adapter_routes import count_quote_documents
+
+        status["uploaded_quotes"] = await count_quote_documents(
+            store, user_id, assistant_id, 10000
+        )
+    except Exception:  # noqa: BLE001 - a count is never worth a failed request
+        logger.debug("Could not count uploaded quotes", exc_info=True)
+
+    try:
+        namespaces = await store.alist_namespaces(prefix=(user_id,), limit=1000)
+        total_turns = 0
+        for namespace in namespaces or []:
+            namespace = tuple(namespace)
+            if len(namespace) != 3 or namespace[2] != LEARNING_KIND_ENGAGEMENT:
+                continue
+            item = await store.aget(namespace, "engagement")
+            value = getattr(item, "value", None) if item is not None else None
+            record = (value or {}).get("value") if isinstance(value, dict) else None
+            if isinstance(record, dict):
+                total_turns += int(record.get("message_count") or 0)
+        status["conversation_turns"] = total_turns
+    except Exception:  # noqa: BLE001 - likewise
+        logger.debug("Could not count conversation turns", exc_info=True)
+    return status
 
 
 async def _resolve_personal_avatar_for_connection(
@@ -3763,8 +4570,8 @@ async def _connect_account_from_fields(
     stored; the plaintext credential is encrypted by the handler and never
     persisted or logged in the clear. The cap is enforced here, once, for every
     mechanism, and reconnecting an account the owner already has refreshes that
-    record rather than counting against the cap — otherwise rotating an app
-    password would eventually lock the owner out of their own mailbox.
+    record rather than counting against the cap — otherwise changing a password
+    would eventually lock the owner out of their own mailbox.
     """
     from src.anubis.utils.connected_accounts import get_provider, public_account_view
     from src.anubis.utils.connected_accounts.connect_handlers import (
@@ -3855,9 +4662,365 @@ def _enforce_connection_caps(
         )
 
 
+async def _close_account_question(record: dict[str, Any]) -> None:
+    """Close the research question this connection answers, and its inbox item.
+
+    Connecting the GitHub account answers the GitHub question and nothing else;
+    every other account research suggested stays open until the owner answers
+    that one too. Runs from every route that stores a record, including the
+    popup callbacks that carry no owner session, which is why it takes only the
+    record and reaches nothing that needs authentication.
+    """
+    from src.anubis.utils.research.discovered_accounts import (
+        ACCOUNT_STATUS_CONNECTED,
+        mark_discovered_account_resolved,
+        read_discovered_accounts,
+    )
+
+    owner_id = str(record.get("user_id") or "")
+    assistant_id = str(record.get("assistant_id") or "")
+    provider_name = str(record.get("provider") or "")
+    if not owner_id or not assistant_id or not provider_name:
+        return
+    store = getattr(app.state, "store", None)
+    if store is None:
+        return
+    existing = await read_discovered_accounts(
+        store, creator_id=owner_id, assistant_id=assistant_id
+    )
+    if not existing:
+        return
+    matching = [
+        account
+        for account in existing.get("accounts", [])
+        if str(account.get("provider") or "") == provider_name
+    ]
+    if not matching:
+        return
+    await mark_discovered_account_resolved(
+        store,
+        creator_id=owner_id,
+        assistant_id=assistant_id,
+        provider=provider_name,
+        status=ACCOUNT_STATUS_CONNECTED,
+    )
+    inbox_item_id = str(matching[0].get("inbox_item_id") or "")
+    if not inbox_item_id:
+        return
+    try:
+        from src.anubis.utils.inbox.repository import (
+            STATE_RESOLVED,
+            get_inbox_repository,
+        )
+
+        repository = get_inbox_repository()
+        if repository is not None:
+            await repository.update_item(
+                inbox_item_id,
+                state=STATE_RESOLVED,
+                owner_decision={"action": "connected", "provider": provider_name},
+                resolved_at=datetime.now(UTC),
+            )
+    except Exception:  # noqa: BLE001 - the account IS connected; the item is cosmetic
+        logger.debug(
+            "Could not close the inbox item for %s", provider_name, exc_info=True
+        )
+
+
+async def _continue_research_after_connection(
+    current_user: dict, assistant_id: str, provider_name: str
+) -> None:
+    """Start the next round of research now that a suggested account is connected.
+
+    What the account reveals is exactly what the open web could not, so the
+    connection is the moment to look again. Concurrent by construction: research
+    jobs are asyncio tasks, so this never waits on, blocks, or restarts a run
+    still in flight.
+
+    Best effort throughout. A connection that succeeded must never be reported as
+    a failure because the follow-up research could not start.
+    """
+    from src.anubis.utils.connected_accounts import get_provider
+    from src.anubis.utils.research.discovered_accounts import read_discovered_accounts
+
+    store = getattr(app.state, "store", None)
+    if store is None or not assistant_id or not provider_name:
+        return
+    owner_id = current_user["identities"][0]["user_id"]
+
+    # A connection binds to the PERSONAL avatar even when another avatar the
+    # owner owns is the one that asked for it, because the personal avatar is the
+    # owner's standing proxy and the one place credentials live. Research and its
+    # questions are scoped the same way, so resolve that avatar here rather than
+    # using whichever avatar happened to be in the conversation — otherwise
+    # connecting an account from a conversation with another avatar would find no
+    # question to close and start no further research.
+    from src.anubis.utils.personal_avatar import (
+        personal_avatar_id_for_owner,
+        read_personal_avatar_id,
+    )
+    from src.anubis.utils.runtime_handles import get_postgres_pool
+
+    accounts_avatar_id = (
+        await read_personal_avatar_id(store, owner_id)
+        or await personal_avatar_id_for_owner(get_postgres_pool(), owner_id)
+        or assistant_id
+    )
+    record = await read_discovered_accounts(
+        store, creator_id=owner_id, assistant_id=accounts_avatar_id
+    )
+    # Only an account THIS research suggested triggers a further round. An owner
+    # connecting Gmail unprompted is connecting Gmail, not asking to be researched.
+    if not record:
+        return
+    if not any(
+        str(account.get("provider") or "") == provider_name
+        for account in record.get("accounts", [])
+    ):
+        return
+
+    client = get_client(headers={"API-KEY": current_user["API_KEY"]})
+    assistant = await client.assistants.get(accounts_avatar_id)
+    assistant_metadata = (assistant or {}).get("metadata") or {}
+    if assistant_metadata.get("is_personal_avatar_of_creator") is not True:
+        return
+    provider = get_provider(provider_name)
+    provider_label = provider.display_name if provider else provider_name
+    _start_deep_research_job(
+        app.state,
+        current_user,
+        assistant_id=accounts_avatar_id,
+        creator_id=owner_id,
+        subject_name=(assistant or {}).get("name") or record.get("subject_name") or "",
+        subject_description=(assistant or {}).get("description"),
+        research_hint=(
+            f"The subject has just connected their {provider_label} account. "
+            f"Use what that {provider_label} account shows about the subject to "
+            "look again at what earlier research could not answer."
+        ),
+        assistant_metadata=assistant_metadata,
+    )
+
+
+async def _onboard_social_account(record: dict[str, Any]) -> None:
+    """Prove a newly connected social account, subscribe to it, and crawl it.
+
+    Runs off the request path because the crawl can take minutes. Everything
+    here is ordered around one rule: nothing this account published reaches the
+    avatar's identity until the account is proven to belong to the avatar's own
+    person. So the proof comes first, and a failed proof ends the sequence with
+    the account connected and usable in conversation but contributing nothing
+    to identity — a state the owner can see and fix.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        OWNERSHIP_PROVEN,
+        prove_ownership,
+    )
+    from src.anubis.utils.connected_accounts.store import save_connected_account
+
+    context = app.state.context
+    store = getattr(app.state, "store", None)
+    user_id = str(record.get("user_id") or "")
+    assistant_id = str(record.get("assistant_id") or "")
+    account_key = str(record.get("account_key") or "")
+    if not (user_id and assistant_id and account_key):
+        return
+
+    # A source with no sign-in needs two things before it can even be judged:
+    # the feed it publishes through, and the token the owner will place in it to
+    # claim it. Both are prepared here so the ownership check has something to
+    # look for and the interface has something to show.
+    await _prepare_feed_source(record)
+
+    try:
+        ownership = await prove_ownership(context, store, record)
+    except Exception:  # noqa: BLE001 - a failed proof is a state, not a crash
+        logger.exception("Ownership proof crashed for %s", account_key)
+        return
+
+    record["ownership"] = ownership
+    # Capture what the crawl seed needs while a fresh credential is guaranteed
+    # to exist: after this, the channel is known without another vendor call.
+    if ownership.get("state") == OWNERSHIP_PROVEN:
+        await _capture_social_crawl_seed(record, ownership)
+    try:
+        await save_connected_account(store, user_id, record)
+    except Exception:  # noqa: BLE001 - the proof is re-derivable on reconnect
+        logger.exception("Could not store the ownership proof for %s", account_key)
+        return
+
+    if ownership.get("state") != OWNERSHIP_PROVEN:
+        logger.info(
+            "%s connected but unproven; it will not feed identity. %s",
+            account_key,
+            ownership.get("detail"),
+        )
+        return
+
+    avatar_name, avatar_description, tier_name = await _avatar_context_for_crawl(
+        user_id, assistant_id
+    )
+
+    try:
+        from src.anubis.utils.subscriptions.transports import subscribe_to_content
+
+        outcome = await subscribe_to_content(
+            context,
+            record=record,
+            personal_avatar_id=assistant_id,
+            user_id=user_id,
+            avatar_name=avatar_name,
+            avatar_description=avatar_description,
+        )
+        logger.info("Subscription for %s: %s", account_key, outcome.get("status"))
+    except Exception:  # noqa: BLE001 - the crawl is still worth running
+        logger.exception("Could not subscribe to %s", account_key)
+
+    try:
+        from src.anubis.utils.subscriptions.crawl import crawl_connected_account
+
+        report = await crawl_connected_account(
+            context,
+            record=record,
+            personal_avatar_id=assistant_id,
+            user_id=user_id,
+            avatar_name=avatar_name,
+            avatar_description=avatar_description,
+            tier_name=tier_name,
+            store=store,
+        )
+        logger.info(
+            "Initial crawl of %s: %s, %s ingested",
+            account_key,
+            report.get("status"),
+            report.get("ingested"),
+        )
+    except Exception:  # noqa: BLE001 - never surfaces to the owner's request
+        logger.exception("The initial crawl of %s failed", account_key)
+
+
+async def _prepare_feed_source(record: dict[str, Any]) -> None:
+    """Give a no-login source its feed address and its verification token.
+
+    Only for sources that carry no credential — a podcast feed, a blog, a
+    profile page. Everything else proves itself by having been signed in to,
+    and needs neither.
+    """
+    from src.anubis.utils.connected_accounts.ownership import new_verification_token
+    from src.anubis.utils.connected_accounts.providers import MECHANISM_URL_ONLY
+    from src.anubis.utils.subscriptions.transports import discover_feed_url
+
+    if str(record.get("credential_mechanism") or "") != MECHANISM_URL_ONLY:
+        return
+    transport = dict(record.get("transport") or {})
+    if not transport.get("verification_token"):
+        transport["verification_token"] = new_verification_token()
+    if not transport.get("feed_url"):
+        site_url = str(transport.get("site_url") or "")
+        discovered = await discover_feed_url(site_url)
+        if discovered:
+            transport["feed_url"] = discovered
+    record["transport"] = transport
+
+
+async def _capture_social_crawl_seed(
+    record: dict[str, Any], ownership: dict[str, Any]
+) -> None:
+    """Record where this account's published work lives, onto the record.
+
+    For YouTube that is the uploads playlist and the channel id — the first is
+    the crawl seed, the second is the WebSub topic — and both are read from the
+    vendor rather than guessed from a handle, because a channel address can be
+    a custom name, a legacy user name, or an id, and only one of those is
+    stable enough to subscribe against.
+    """
+    from src.anubis.utils.connected_accounts.ownership import _read_youtube_channel
+
+    if str(record.get("provider") or "") != "youtube":
+        return
+    transport = dict(record.get("transport") or {})
+    if transport.get("youtube_channel_id"):
+        return
+    channel = await _read_youtube_channel(
+        app.state.context, getattr(app.state, "store", None), record
+    )
+    if not channel:
+        return
+    transport["youtube_channel_id"] = channel.get("channel_id")
+    transport["youtube_uploads_playlist_id"] = channel.get("uploads_playlist_id")
+    record["transport"] = transport
+
+
+async def _avatar_context_for_crawl(
+    user_id: str, assistant_id: str
+) -> tuple[str | None, str | None, str]:
+    """Return the avatar's name and description, and the owner's tier name.
+
+    The name is what the media pipeline matches speakers against, so a crawl
+    that ran without it would index recordings while attributing none of them
+    to the person. The tier decides how much the crawl may spend.
+    """
+    from src.anubis.utils.billing.gating import resolve_tier
+    from src.security.auth import get_user_by_identity_user_id
+
+    owner = await get_user_by_identity_user_id(user_id)
+    tier_name = "free"
+    if owner is not None:
+        tier = resolve_tier(owner)
+        tier_name = str(getattr(tier, "value", tier) or "free")
+
+    name, description = await _read_avatar_name_and_description(assistant_id)
+    return name, description, tier_name
+
+
+async def _read_avatar_name_and_description(
+    assistant_id: str,
+) -> tuple[str | None, str | None]:
+    """Read one avatar's name and description straight from the database.
+
+    The LangGraph SDK client authenticates with a caller's own plaintext API
+    key, which background work does not hold and must not store. The assistants
+    live in this application's own database, so the read goes there instead:
+    the same data, without inventing a credential to ask for it.
+    """
+    pool = getattr(app.state, "pool", None)
+    if pool is None:
+        return None, None
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT name, description FROM assistant WHERE assistant_id = %s",
+                    (assistant_id,),
+                )
+                row = await cursor.fetchone()
+    except Exception:  # noqa: BLE001 - the crawl can run with a bare name
+        logger.info("Could not read avatar %s for the crawl context.", assistant_id)
+        return None, None
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
 def _after_record_stored(provider: Any, record: dict[str, Any]) -> None:
     """Housekeeping once a record is written (cache resets, schedule seeds)."""
-    from src.anubis.utils.connected_accounts.providers import KIND_MCP_SERVER
+    from src.anubis.utils.connected_accounts.providers import (
+        KIND_MCP_SERVER,
+        KIND_SOCIAL,
+    )
+
+    # An account deep research suggested has a question waiting on the owner;
+    # connecting the account IS the answer, so close that question here rather
+    # than leaving it to be asked again on the next turn.
+    schedule_background(_close_account_question(record))
+
+    # A social account is the one kind whose connection is also a claim about a
+    # real person. Proving that claim, crawling what they have already
+    # published, and subscribing so the next thing arrives on its own all
+    # happen off the request: the owner's connect card should return the moment
+    # the account is linked, not after a channel has been walked.
+    if provider.kind == KIND_SOCIAL:
+        schedule_background(_onboard_social_account(record))
 
     if provider.kind == KIND_MCP_SERVER:
         from src.anubis.utils.connected_accounts.mcp_server_tools import (
@@ -4088,15 +5251,21 @@ async def connect_account_browser_start(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Open a live browser at a site's sign-in page for the owner to sign in on.
+    """Open a site's sign-in page for the owner — in their own browser when it can be.
 
-    Body: ``provider`` (langsmith, openai, anthropic, a social
-    site, custom_site, or website) plus ``site_url`` and ``name`` for a custom
-    site. Returns ``{login_id, view_url, nonce, expires_in}``; the card opens
-    ``view_url`` (a path on this API) in the window it opened on the click.
+    Body: ``provider`` (langsmith, openai, anthropic, a social site,
+    custom_site, or website) plus ``site_url`` and ``name`` for a custom site.
+    ``device_id`` names which of the owner's machines to open the page on, and
+    ``use_hosted_browser`` asks for the window this API hosts instead.
+
+    Two shapes come back. When a machine of the owner's is online the page
+    opens as a tab in THEIR browser and the answer carries ``login_mode:
+    "desktop_browser"`` with a ``login_token`` the card presents when the owner
+    says they are done. Otherwise the hosted browser opens and the answer
+    carries ``login_mode: "browser_session"`` with the ``view_url`` the card
+    shows in the window it opened on the click.
     """
     from src.anubis.utils.connected_accounts import get_provider
-    from src.anubis.utils.connected_accounts.browser_login import start_login
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
     from src.anubis.utils.connected_accounts.oauth_state import OAuthStateError
 
@@ -4126,18 +5295,17 @@ async def connect_account_browser_start(
     personal_avatar = await _resolve_personal_avatar_for_connection(
         client, request, current_user, token
     )
-    reconnect_key = str(body.get("reconnect_account_key") or "").strip() or None
-    if reconnect_key and reconnect_key.startswith("account:"):
-        reconnect_key = reconnect_key[len("account:"):]
+    reconnect_key = _normalized_reconnect_key(body.get("reconnect_account_key"))
     try:
-        started = await start_login(
-            app.state.context,
+        started = await _start_sign_in_browser(
             user_id=user_id,
             assistant_id=str(personal_avatar.get("assistant_id")),
             provider=provider,
             site_url=site_url or provider.login_url,
             name=body.get("name"),
             reconnect_account_key=reconnect_key,
+            device_id=str(body.get("device_id") or "").strip() or None,
+            prefer_hosted_browser=bool(body.get("use_hosted_browser")),
         )
     except BrowserSessionError as session_error:
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
@@ -4219,13 +5387,22 @@ async def connect_account_browser_stream(websocket: WebSocket, login_id: str):
 
 @app.post("/connect_account/browser/{login_id}/finish")
 async def connect_account_browser_finish(request: Request, login_id: str):
-    """Save the signed-in session as a connected account."""
+    """Save the signed-in session as a connected account.
+
+    Serves both browsers: a login id belonging to a sign-in the owner did in
+    their OWN browser brings the session back from their machine, and any
+    other id captures it from the window this API hosts.
+    """
     from src.anubis.utils.connected_accounts import get_provider, public_account_view
     from src.anubis.utils.connected_accounts.browser_login import (
         finish_login,
         verify_login_token,
     )
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.desktop_login import (
+        finish_desktop_login,
+        get_desktop_login,
+    )
     from src.anubis.utils.connected_accounts.tool_factories import tool_names_for
 
     token = _login_token_from_request(request)
@@ -4236,10 +5413,22 @@ async def connect_account_browser_finish(request: Request, login_id: str):
     user_id = str(payload.get("user_id") or "")
     nonce = payload.get("nonce")
     existing_records = await _connected_account_records_without_session(user_id)
+    signed_in_on_own_browser = get_desktop_login(login_id) is not None
     try:
-        finished = await finish_login(
-            app.state.context, login_id=login_id, user_id=user_id, existing_records=existing_records
-        )
+        if signed_in_on_own_browser:
+            finished = await finish_desktop_login(
+                app.state.context,
+                login_id=login_id,
+                user_id=user_id,
+                existing_records=existing_records,
+            )
+        else:
+            finished = await finish_login(
+                app.state.context,
+                login_id=login_id,
+                user_id=user_id,
+                existing_records=existing_records,
+            )
         record = finished["record"]
         provider = get_provider(str(record.get("provider") or ""))
         _enforce_connection_caps(existing_records, provider, record)
@@ -4260,6 +5449,9 @@ async def connect_account_browser_finish(request: Request, login_id: str):
             "account_address": view.get("account_address"),
             "tool_count": len(tool_names_for(provider, record)),
             "heuristic_signed_in": finished.get("heuristic_signed_in"),
+            "signed_in_on": "your own browser" if signed_in_on_own_browser else "a hosted window",
+            "device_label": finished.get("device_label"),
+            "cookie_count": finished.get("cookie_count"),
         },
         status_code=200,
     )
@@ -4267,19 +5459,25 @@ async def connect_account_browser_finish(request: Request, login_id: str):
 
 @app.post("/connect_account/browser/{login_id}/cancel")
 async def connect_account_browser_cancel(request: Request, login_id: str):
-    """Close a sign-in window without saving anything."""
+    """Close a sign-in without saving anything.
+
+    A sign-in the owner started in their own browser leaves the tab alone —
+    it is their window, on their machine, and closing it is theirs to do.
+    """
     from src.anubis.utils.connected_accounts.browser_login import (
         cancel_login,
         verify_login_token,
     )
     from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.desktop_login import cancel_desktop_login
 
     token = _login_token_from_request(request)
     try:
         payload = verify_login_token(app.state.context, token, login_id)
     except BrowserSessionError as session_error:
         raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
-    cancelled = await cancel_login(login_id, str(payload.get("user_id") or ""))
+    user_id = str(payload.get("user_id") or "")
+    cancelled = cancel_desktop_login(login_id, user_id) or await cancel_login(login_id, user_id)
     return JSONResponse(content={"ok": False, "cancelled": cancelled}, status_code=200)
 
 
@@ -4356,6 +5554,76 @@ async def connect_account_oauth_start(
     return JSONResponse(content=started, status_code=200)
 
 
+def _normalized_reconnect_key(reconnect_account_key: str | None) -> str | None:
+    """The bare account key a "sign in again" names, without its card prefix."""
+    reconnect_key = str(reconnect_account_key or "").strip() or None
+    if reconnect_key and reconnect_key.startswith("account:"):
+        reconnect_key = reconnect_key[len("account:"):]
+    return reconnect_key
+
+
+async def _start_sign_in_browser(
+    *,
+    user_id: str,
+    assistant_id: str,
+    provider: Any,
+    site_url: str | None,
+    name: str | None,
+    reconnect_account_key: str | None,
+    device_id: str | None = None,
+    prefer_hosted_browser: bool = False,
+) -> dict:
+    """Open a sign-in page for the owner — in THEIR browser when one is reachable.
+
+    The owner's own browser is the first choice for every site: the vendors
+    that refuse an automated browser (Google above all) accept it, and the
+    owner is frequently signed in there already. It needs the connector
+    running on a machine of theirs, so when no machine is online — or the card
+    explicitly asked for the hosted window — the sign-in falls back to the
+    browser this API hosts rather than refusing to connect at all.
+    """
+    from src.anubis.utils.connected_accounts.browser_login import start_login
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.desktop_login import (
+        desktop_sign_in_available,
+        start_desktop_login,
+    )
+
+    if not prefer_hosted_browser and desktop_sign_in_available(user_id, device_id):
+        try:
+            return await start_desktop_login(
+                app.state.context,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                provider=provider,
+                site_url=site_url,
+                name=name,
+                reconnect_account_key=reconnect_account_key,
+                device_id=device_id,
+            )
+        except BrowserSessionError as desktop_error:
+            # A machine that went offline between the check and the call, or a
+            # connector too old for the sign-in tools, is a reason to use the
+            # hosted window — not a reason to fail the connection.
+            logger.info(
+                "Falling back to the hosted sign-in browser: %s", desktop_error.detail
+            )
+    try:
+        started = await start_login(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            provider=provider,
+            site_url=site_url,
+            name=name,
+            reconnect_account_key=reconnect_account_key,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    started["login_mode"] = "browser_session"
+    return started
+
+
 async def _start_browser_fallback(
     request: Request,
     current_user: dict,
@@ -4365,28 +5633,17 @@ async def _start_browser_fallback(
     name: str | None = None,
     reconnect_account_key: str | None = None,
 ) -> dict:
-    """Open the live sign-in browser for a vendor whose OAuth app is not configured."""
-    from src.anubis.utils.connected_accounts.browser_login import start_login
-    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
-
+    """Open a sign-in page for a vendor whose OAuth application is not configured."""
     user_id = current_user["identities"][0]["user_id"]
-    reconnect_key = str(reconnect_account_key or "").strip() or None
-    if reconnect_key and reconnect_key.startswith("account:"):
-        reconnect_key = reconnect_key[len("account:"):]
-    try:
-        started = await start_login(
-            app.state.context,
-            user_id=user_id,
-            assistant_id=str(personal_avatar.get("assistant_id")),
-            provider=provider,
-            site_url=provider.login_url,
-            name=str(name or "").strip() or provider.display_name,
-            reconnect_account_key=reconnect_key,
-        )
-    except BrowserSessionError as session_error:
-        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
-    started["login_mode"] = "browser_session"
-    started["fallback"] = "browser_session"
+    started = await _start_sign_in_browser(
+        user_id=user_id,
+        assistant_id=str(personal_avatar.get("assistant_id")),
+        provider=provider,
+        site_url=provider.login_url,
+        name=str(name or "").strip() or provider.display_name,
+        reconnect_account_key=_normalized_reconnect_key(reconnect_account_key),
+    )
+    started["fallback"] = started.get("login_mode") or "browser_session"
     return started
 
 
@@ -4524,16 +5781,21 @@ async def connect_mailbox(
 ):
     """Connect one of the owner's email accounts to their personal avatar.
 
-    Body: ``provider`` (default "gmail"), ``email_address``, ``app_password``.
-    Kept as an alias of ``POST /connect_account`` for clients that predate the
-    generic route; the behaviour — prove by real login, encrypt, store, never
-    log the plaintext — is identical because both routes share one body.
+    Body: ``provider`` (default "email_account"), ``email_address``,
+    ``password``, and optionally ``imap_host`` / ``smtp_host`` for a domain that
+    publishes no settings. Kept as an alias of ``POST /connect_account`` for
+    clients that predate the generic route; the behaviour — prove by real login,
+    encrypt, store, never log the plaintext — is identical because both routes
+    share one body. ``app_password`` is still read so a browser tab opened
+    before the field was renamed still connects; it is never offered.
     """
     body = await request.json()
-    provider_name = str(body.get("provider") or "gmail").strip().lower()
+    provider_name = str(body.get("provider") or "email_account").strip().lower()
     fields = {
         "email_address": body.get("email_address"),
-        "app_password": body.get("app_password"),
+        "password": body.get("password") or body.get("app_password"),
+        "imap_host": body.get("imap_host"),
+        "smtp_host": body.get("smtp_host"),
     }
     return await _connect_account_from_fields(
         request, current_user, provider_name, fields
@@ -4560,17 +5822,25 @@ async def connectable_providers(
     from src.anubis.utils.connected_accounts.connection_tools import (
         build_connect_card,
     )
+    from src.anubis.utils.connected_accounts.desktop_login import choose_device
     from src.anubis.utils.connected_accounts.providers import (
         CATEGORY_ORDER,
         catalog_providers,
     )
 
+    # Whether a sign-in would open in the owner's OWN browser right now. The
+    # picker says which machine the tab will appear on, so nobody is left
+    # watching for a window that opened on a different desk.
+    sign_in_device = choose_device(str(current_user["identities"][0]["user_id"]))
     return JSONResponse(
         content={
             "categories": list(CATEGORY_ORDER),
             "providers": [
                 build_connect_card(provider) for provider in catalog_providers()
             ],
+            "sign_in_in_your_own_browser": sign_in_device is not None,
+            "sign_in_device_label": getattr(sign_in_device, "device_label", None),
+            "sign_in_device_id": getattr(sign_in_device, "device_id", None),
         },
         status_code=200,
     )
@@ -4600,6 +5870,236 @@ async def list_connected_accounts(
         content={"accounts": [public_account_view(record) for record in records]},
         status_code=200,
     )
+
+
+@app.get("/social_subscriptions")
+async def list_social_subscriptions(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Report what the personal avatar is subscribed to, and what it has learned.
+
+    This is what the owner sees to know the feature is alive: which accounts are
+    proven theirs, which are subscribed, how each one is notified, and what has
+    arrived recently. An account connected but unproven is reported plainly
+    rather than hidden, because "nothing is arriving" needs a reason attached.
+    """
+    from src.anubis.utils.connected_accounts.ownership import ownership_of
+    from src.anubis.utils.connected_accounts.providers import (
+        KIND_SOCIAL,
+        get_provider,
+    )
+    from src.anubis.utils.subscriptions.repository import (
+        get_subscription_repository,
+    )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+
+    records = [
+        record
+        for record in await _connected_account_records(client, user_id)
+        if record.get("kind") == KIND_SOCIAL
+    ]
+    repository = get_subscription_repository()
+    subscriptions = await repository.list_for_avatar(assistant_id)
+    by_connection = {
+        str(subscription.get("connection_key") or ""): subscription
+        for subscription in subscriptions
+    }
+
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        account_key = str(record.get("account_key") or "")
+        provider = get_provider(str(record.get("provider") or ""))
+        ownership = ownership_of(record)
+        subscription = by_connection.get(account_key)
+        rows.append(
+            {
+                "account_key": account_key,
+                "provider": record.get("provider"),
+                "display_label": record.get("display_label"),
+                "handle": ownership.get("handle"),
+                "profile_url": ownership.get("profile_url"),
+                "ownership_state": ownership.get("state"),
+                "ownership_method": ownership.get("method"),
+                "ownership_detail": ownership.get("detail"),
+                # A source nobody can sign in to is claimed by putting this
+                # token where only its owner could put it. Shown only while it
+                # is still unproven, because afterwards it is just clutter.
+                "verification_token": (
+                    (record.get("transport") or {}).get("verification_token")
+                    if ownership.get("state") != "proven"
+                    else None
+                ),
+                "subscribable": bool(provider and provider.is_subscribable),
+                "content_transport": (
+                    provider.content_transport if provider else None
+                ),
+                "pushes_content": bool(provider and provider.pushes_content),
+                "subscription_status": (subscription or {}).get("status"),
+                "subscription_detail": (subscription or {}).get("detail"),
+                "last_event_at": (subscription or {}).get("last_event_at"),
+                "expires_at": (subscription or {}).get("expires_at"),
+            }
+        )
+
+    events = await repository.list_events_for_avatar(assistant_id, limit=25)
+    return JSONResponse(
+        content={
+            "assistant_id": assistant_id,
+            "accounts": rows,
+            "recent_events": [
+                {
+                    "provider": event.get("provider"),
+                    "url": event.get("url"),
+                    "title": event.get("title"),
+                    "state": event.get("state"),
+                    "detail": event.get("detail"),
+                    "received_at": event.get("received_at"),
+                }
+                for event in events
+            ],
+        },
+        status_code=200,
+    )
+
+
+@app.post("/social_subscriptions/{account_key:path}/verify")
+async def verify_social_account_ownership(
+    account_key: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check again whether this account belongs to the avatar's person.
+
+    The action behind "Not verified" in the interface. It exists because the
+    one proof an owner can act on — placing a token in a feed they control —
+    happens after the connection, so there has to be a way to ask again.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        OWNERSHIP_PROVEN,
+        prove_ownership,
+    )
+    from src.anubis.utils.connected_accounts.store import (
+        get_connected_account,
+        save_connected_account,
+    )
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+
+    store = getattr(app.state, "store", None)
+    record = await get_connected_account(store, user_id, account_key)
+    if record is None or str(record.get("assistant_id") or "") != assistant_id:
+        raise HTTPException(status_code=404, detail="No such connected account.")
+
+    ownership = await prove_ownership(app.state.context, store, record)
+    record["ownership"] = ownership
+    if ownership.get("state") == OWNERSHIP_PROVEN:
+        await _capture_social_crawl_seed(record, ownership)
+    await save_connected_account(store, user_id, record)
+
+    if ownership.get("state") == OWNERSHIP_PROVEN:
+        # Proving it is what unlocks everything else, so the crawl and the
+        # subscription follow immediately rather than waiting for a reconnect.
+        schedule_background(_onboard_social_account(record))
+
+    return JSONResponse(content={"ownership": ownership}, status_code=200)
+
+
+@app.post("/social_subscriptions/{account_key:path}/pull_more")
+async def pull_more_social_content(
+    account_key: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Walk further into what this account has already published.
+
+    The initial crawl stops at the tier's item cap, which is a spending limit
+    rather than a judgement about how much of the person's work matters. This
+    is the owner saying to spend more, and it resumes from what the last pass
+    already visited instead of paying for the same pages twice.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        is_owned_by_personal_avatar,
+        refusal_reason,
+    )
+    from src.anubis.utils.connected_accounts.store import get_connected_account
+    from src.anubis.utils.subscriptions.crawl import crawl_connected_account
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+
+    store = getattr(app.state, "store", None)
+    record = await get_connected_account(store, user_id, account_key)
+    if record is None or str(record.get("assistant_id") or "") != assistant_id:
+        raise HTTPException(status_code=404, detail="No such connected account.")
+    if not is_owned_by_personal_avatar(record, personal_avatar_id=assistant_id):
+        raise HTTPException(
+            status_code=403,
+            detail=refusal_reason(record, personal_avatar_id=assistant_id)
+            or "This account is not proven to be yours.",
+        )
+
+    avatar_name, avatar_description, tier_name = await _avatar_context_for_crawl(
+        user_id, assistant_id
+    )
+    already_seen = await _already_crawled_urls(assistant_id)
+
+    async def _run_pull() -> None:
+        report = await crawl_connected_account(
+            app.state.context,
+            record=record,
+            personal_avatar_id=assistant_id,
+            user_id=user_id,
+            avatar_name=avatar_name,
+            avatar_description=avatar_description,
+            tier_name=tier_name,
+            already_seen=already_seen,
+            store=store,
+        )
+        logger.info(
+            "Pull-more on %s: %s, %s ingested",
+            account_key,
+            report.get("status"),
+            report.get("ingested"),
+        )
+
+    schedule_background(_run_pull())
+    return JSONResponse(
+        content={
+            "status": "started",
+            "detail": "Walking further into what this account has published.",
+        },
+        status_code=202,
+    )
+
+
+async def _already_crawled_urls(assistant_id: str) -> set[str]:
+    """Addresses this avatar has already taken in, so a second pass skips them."""
+    from src.anubis.utils.subscriptions.repository import (
+        get_subscription_repository,
+    )
+
+    repository = get_subscription_repository()
+    events = await repository.list_events_for_avatar(assistant_id, limit=1000)
+    return {str(event.get("url") or "") for event in events if event.get("url")}
 
 
 async def _device_rows_for_user(client: Any, user_id: str) -> list[dict[str, Any]]:
@@ -4881,6 +6381,31 @@ async def disconnect_account(
             detail=f"No connected account {account_key!r} to disconnect.",
         )
     await _delete_connected_account_record(client, user_id, account_key)
+
+    # A subscription outlives nothing. Leaving the row behind would keep a
+    # platform pushing to a callback that can no longer resolve an account, and
+    # every one of those deliveries would be refused and recorded for an
+    # account the owner believes they removed.
+    if existing.get("kind") == "social":
+        try:
+            from src.anubis.utils.subscriptions.repository import (
+                get_subscription_repository,
+            )
+
+            removed = await get_subscription_repository().delete_for_connection(
+                account_key
+            )
+            if removed:
+                logger.info(
+                    "Removed %s content subscription(s) with %s.",
+                    removed,
+                    account_key,
+                )
+        except Exception:  # noqa: BLE001 - the account is already disconnected
+            logger.exception(
+                "Could not remove the subscriptions for %s.", account_key
+            )
+
     if existing.get("kind") == "mcp_server":
         from src.anubis.utils.connected_accounts.mcp_server_tools import (
             forget_cached_tools,
@@ -5118,6 +6643,39 @@ async def import_mailbox_writing_samples(
     )
 
 
+def _research_on_create_enabled(context) -> bool:
+    """Whether creating an avatar starts a research job for it on its own.
+
+    Separate from ``DEEP_RESEARCH_ENABLED`` so the automatic trigger can be
+    switched off while the manual "Research & verify facts" button keeps
+    working — they fail in different ways and are worth turning off separately.
+    """
+    flag = str(getattr(context, "research_on_create_enabled", "true") or "true")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _research_account_discovery_enabled(context) -> bool:
+    """Whether a finished research run asks the owner about the accounts it found."""
+    flag = str(
+        getattr(context, "research_account_discovery_enabled", "true") or "true"
+    )
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _personal_avatar_research_on_naming_enabled(context) -> bool:
+    """Whether naming a personal avatar starts a research job for the owner.
+
+    Separate from both ``DEEP_RESEARCH_ENABLED`` and ``RESEARCH_ON_CREATE_ENABLED``
+    because this trigger researches the ACCOUNT HOLDER rather than a character the
+    account holder invented, and an operator may reasonably want that off while
+    ordinary avatar research stays on.
+    """
+    flag = str(
+        getattr(context, "personal_avatar_research_on_naming_enabled", "true") or "true"
+    )
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.post("/create_avatar")
 async def create_avatar(
     name: str,
@@ -5128,6 +6686,7 @@ async def create_avatar(
     longitude: Optional[float] = None,
     location_name: Optional[str] = None,
     geofence_radius_meters: Optional[int] = None,
+    research_hint: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
 ):
 
@@ -5196,13 +6755,109 @@ async def create_avatar(
             await _demote_other_personal_avatars(
                 client, user_id, keep_assistant_id=assistant_id
             )
+            # Readers with no authenticated session (the learning sweeper, a
+            # graph node) find this avatar through the pointer.
+            from src.anubis.utils.personal_avatar import (
+                record_personal_avatar_pointer,
+            )
 
-        return JSONResponse(content=create_avatar_response, status_code=200)
+            await record_personal_avatar_pointer(client, user_id, assistant_id)
+
+        # A new avatar knows nothing, looks like nothing, and sounds like
+        # nothing until someone feeds it. Research starts here, on every tier,
+        # so the avatar is already learning by the time its settings screen
+        # opens; when it has no portrait or no reference recording, the same run
+        # goes looking for those too. Contradicted facts still wait for the
+        # creator in the existing review queue.
+        #
+        # Its own try/except: the avatar HAS been created by this point, and a
+        # research failure must not turn that into a 500 the client reads as
+        # "no avatar exists".
+        research_job_body = None
+        if _research_on_create_enabled(context):
+            try:
+                research_job = _start_deep_research_job(
+                    app.state,
+                    current_user,
+                    assistant_id=assistant_id,
+                    creator_id=user_id,
+                    subject_name=name,
+                    subject_description=description,
+                    research_hint=research_hint,
+                    assistant_metadata=metadata,
+                )
+                research_job_body = {
+                    "job_id": research_job.job_id,
+                    "status": research_job.status,
+                    "status_url": f"/research_job/{research_job.job_id}",
+                    "progress_url": f"/research_job/{research_job.job_id}/progress",
+                    "proposals_url": f"/avatar/{assistant_id}/research/proposals",
+                }
+            except Exception as research_error:  # noqa: BLE001 - the avatar exists either way
+                logger.warning(
+                    "Avatar %s was created but research did not start: %s",
+                    assistant_id,
+                    research_error,
+                )
+
+        created_record = dict(create_avatar_response or {})
+        if research_job_body is not None:
+            created_record["research_job"] = research_job_body
+        # A personal avatar cannot learn its own voice until it holds a
+        # reference recording: that clip is the anchor every later utterance is
+        # matched against, and without it the avatar cannot tell its person from
+        # anyone else in the room. Research may well find one — it is looking
+        # already — so this states the requirement and where to satisfy it
+        # rather than refusing the creation.
+        if is_personal_avatar_of_creator:
+            created_record["reference_audio_required"] = {
+                "reason": "A reference recording is what lets this avatar "
+                "recognise your voice, so it can learn to speak in your voice "
+                "as you talk to it.",
+                "record_url": "/avatar_voice/samples",
+                "upload_url": "/update_avatar_identity_with_media",
+                "status_url": "/avatar_voice",
+                "being_researched": research_job_body is not None,
+            }
+        return JSONResponse(content=created_record, status_code=200)
     except Exception as creation_error:
         logger.exception(f"Error creating avatar {name}")
         raise HTTPException(
             detail=f"Error creating avatar {name}: {creation_error}", status_code=500
         )
+
+
+def _social_proof_required() -> bool:
+    """Whether sharing demands a proven social account (env-gated)."""
+    return str(
+        getattr(app.state.context, "require_social_proof_for_sharing", "false") or ""
+    ).strip().lower() in {"true", "1", "yes"}
+
+
+async def _proven_social_accounts_for(
+    user_id: str, assistant_id: str
+) -> list[dict[str, Any]]:
+    """Return this avatar's social accounts whose ownership has been proven.
+
+    Filtered through ``social_providers()`` rather than through "the user has
+    any connected account": a mailbox or a machine proves nothing about whose
+    face an avatar wears, and treating one as proof would open exactly the hole
+    that registry function was written to close.
+    """
+    from src.anubis.utils.connected_accounts.ownership import (
+        is_owned_by_personal_avatar,
+    )
+    from src.anubis.utils.connected_accounts.providers import social_providers
+    from src.anubis.utils.connected_accounts.store import read_connected_accounts
+
+    allowed = {provider.name for provider in social_providers()}
+    records = await read_connected_accounts(getattr(app.state, "store", None), user_id)
+    return [
+        record
+        for record in records
+        if str(record.get("provider") or "") in allowed
+        and is_owned_by_personal_avatar(record, personal_avatar_id=assistant_id)
+    ]
 
 
 @app.post("/share_avatar")
@@ -5255,6 +6910,25 @@ async def share_avatar(
                 "shared publicly."
             ),
         )
+
+    # The personal-avatar flag says the owner CLAIMS this is their likeness.
+    # A connected social account they proved they control is the only thing in
+    # the product that BACKS that claim, which is what ``social_providers()``
+    # has always documented itself as the allow-list for. Behind a setting
+    # because turning it on refuses sharing for an avatar that has no connected
+    # account yet, and that has to be a deliberate change rather than a
+    # surprise.
+    if is_public and not is_admin and _social_proof_required():
+        proven = await _proven_social_accounts_for(user_id, assistant_id)
+        if not proven:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Sharing your avatar publishes your likeness, so first "
+                    "connect a social account you own and let it be verified. "
+                    "That connection is what shows the likeness is yours."
+                ),
+            )
 
     try:
         # LangGraph merges metadata by key, so this leaves user_id and the
@@ -5407,6 +7081,80 @@ async def modify_avatar(
         await _demote_other_personal_avatars(
             client, user_id, keep_assistant_id=assistant_id
         )
+        from src.anubis.utils.personal_avatar import record_personal_avatar_pointer
+
+        await record_personal_avatar_pointer(client, user_id, assistant_id)
+
+    # Naming the personal avatar is the moment research becomes safe to run.
+    #
+    # ``create_personal_avatar`` deliberately does NOT research the avatar it
+    # provisions: at provisioning time the only name available is the local part
+    # of an email address, and researching "j.smith" would spend money learning
+    # about whoever that string happens to match and write a stranger's facts,
+    # face and voice into the account holder's own avatar. That module's
+    # docstring says research "belongs to a flow where the owner has given a real
+    # name" — this is that flow, and nothing else in the product was it.
+    #
+    # Three guards stand between a rename and a research run: the avatar must be
+    # this caller's own personal avatar, the new name must look like a real
+    # person's name rather than the placeholder wearing a space, and the store
+    # claim must be unwon. Its own try/except, because the rename HAS succeeded
+    # by this point and a research failure must not turn that into a 500.
+    research_job_body = None
+    if new_avatar_name and _personal_avatar_research_on_naming_enabled(
+        app.state.context
+    ):
+        try:
+            from src.anubis.utils.personal_avatar import (
+                claim_personal_avatar_research,
+                looks_like_a_real_person_name,
+            )
+
+            updated_metadata = (result or {}).get("metadata") or {}
+            caller_user_id = current_user["identities"][0]["user_id"]
+            avatar_is_the_callers_own_personal_avatar = (
+                updated_metadata.get("is_personal_avatar_of_creator") is True
+                and updated_metadata.get("user_id") == caller_user_id
+            )
+            if avatar_is_the_callers_own_personal_avatar and (
+                looks_like_a_real_person_name(
+                    new_avatar_name, email_address=current_user.get("email")
+                )
+            ):
+                claimed = await claim_personal_avatar_research(
+                    app.state.store,
+                    creator_id=caller_user_id,
+                    assistant_id=assistant_id,
+                )
+                if claimed:
+                    research_job = _start_deep_research_job(
+                        app.state,
+                        current_user,
+                        assistant_id=assistant_id,
+                        creator_id=caller_user_id,
+                        subject_name=new_avatar_name,
+                        subject_description=(
+                            new_avatar_description or (result or {}).get("description")
+                        ),
+                        research_hint=None,
+                        assistant_metadata=updated_metadata,
+                    )
+                    research_job_body = {
+                        "job_id": research_job.job_id,
+                        "status": research_job.status,
+                        "status_url": f"/research_job/{research_job.job_id}",
+                        "progress_url": f"/research_job/{research_job.job_id}/progress",
+                        "proposals_url": f"/avatar/{assistant_id}/research/proposals",
+                    }
+        except Exception as research_error:  # noqa: BLE001 - the rename still succeeded
+            logger.exception(
+                "Could not start research after naming the personal avatar %s: %s",
+                assistant_id,
+                research_error,
+            )
+
+    if research_job_body is not None and isinstance(result, dict):
+        result = {**result, "research_job": research_job_body}
 
     return JSONResponse(content=result, status_code=200)
 
@@ -6339,6 +8087,126 @@ async def geo_checkin(
     }
 
 
+async def accrue_voice_from_spoken_turns(
+    app_state,
+    current_user: dict,
+    *,
+    assistant_id: str,
+    thread_id: Optional[str],
+    turns: list,
+) -> None:
+    """Grow the avatar's voice corpus from the owner's speech in a live turn.
+
+    Runs after the reply has streamed, through ``schedule_background``, so it
+    costs the conversation nothing. Everything it needs was already paid for:
+    the utterance was diarized to produce the speaker script, so the owner's
+    windows are cut out of audio that diarization had already preprocessed.
+
+    Only the caller's own personal avatar accrues — the owner's voice is the
+    avatar's voice for that one avatar and no other — and only when a reference
+    audio clip is already stored, which is what let the diarizer attribute the
+    owner in the first place. Both are re-checked inside
+    ``accrue_voice_from_spoken_turn``; the assistant lookup happens here rather
+    than on the reply path.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.capture import accrue_voice_from_spoken_turn
+
+    if not turns:
+        return
+    try:
+        user_id = current_user["identities"][0]["user_id"]
+        client = get_client(headers={"API-KEY": current_user["API_KEY"]})
+        assistant = await client.assistants.get(assistant_id=assistant_id)
+        metadata = assistant.get("metadata") or {}
+        is_personal = (
+            metadata.get("is_personal_avatar_of_creator") is True
+            and str(metadata.get("user_id") or "") == user_id
+        )
+        if not is_personal:
+            return
+        repository = get_media_asset_repository()
+        for turn in turns:
+            await accrue_voice_from_spoken_turn(
+                turn,
+                repository,
+                getattr(app_state, "context", None),
+                getattr(app_state, "store", None),
+                user_id=user_id,
+                assistant_id=assistant_id,
+                is_personal_avatar=True,
+                avatar_name=str(assistant.get("name") or ""),
+                thread_id=thread_id,
+            )
+    except Exception:  # noqa: BLE001 - the voice is a bonus, the conversation is not
+        logger.debug("Voice accrual from the spoken turn failed", exc_info=True)
+
+
+def _account_display_name(current_user: dict) -> str:
+    """The name on the account, for a caller who sent no name of their own."""
+    for key in ("name", "nickname", "given_name", "username"):
+        value = str(current_user.get(key) or "").strip()
+        # Auth0 fills ``name`` with the email address when the account has no
+        # real name, and an email address is not what anybody is called.
+        if value and "@" not in value:
+            return value
+    email = str(current_user.get("email") or "").strip()
+    local_part = email.split("@", 1)[0].strip() if email else ""
+    return local_part
+
+
+async def _resolve_spoken_turn_labels(
+    langgraph_client,
+    current_user: dict,
+    *,
+    assistant_id: str,
+    your_name: Optional[str],
+) -> tuple[str, str, bool]:
+    """Who is at the microphone, who the avatar is, and whether they are one person.
+
+    The reference clip the diarizer matches voices against is the AVATAR's
+    voice. On a personal avatar — the one flagged as a portrait of its own
+    creator, being talked to by that creator — the avatar's voice is the
+    speaker's voice, so a voice matching the reference is the speaker and the
+    two names are one name. On every other avatar they are two different
+    people. Reading the avatar's name as the speaker's name there is what put
+    the avatar's own name in front of the person's questions: the reference was
+    offered to the diarizer under the speaker's name, and
+    ``claim_lone_speaker_as_owner`` then claimed the one voice in the room —
+    the person — as the avatar.
+
+    :returns: ``(speaker label, avatar label, avatar portrays the speaker)``.
+    """
+    from src.anubis.utils.personal_avatar import PERSONAL_AVATAR_METADATA_FLAG
+    from src.anubis.utils.voice.speakers import DEFAULT_OWNER_LABEL
+
+    user_id = current_user["identities"][0]["user_id"]
+    avatar_name = ""
+    avatar_portrays_the_speaker = False
+    try:
+        assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
+        metadata = assistant.get("metadata") or {}
+        avatar_name = str(assistant.get("name") or "").strip()
+        avatar_portrays_the_speaker = bool(
+            metadata.get(PERSONAL_AVATAR_METADATA_FLAG) is True
+            and str(metadata.get("user_id") or "") == user_id
+        )
+    except Exception:  # noqa: BLE001 - a lookup failure must not lose the turn
+        logger.debug("Could not read the avatar for speaker labelling", exc_info=True)
+
+    spoken_for = (your_name or "").strip()
+    if not spoken_for and avatar_portrays_the_speaker:
+        # The avatar IS this person, so the avatar's name is theirs.
+        spoken_for = avatar_name
+    if not spoken_for:
+        spoken_for = _account_display_name(current_user)
+    return (
+        spoken_for or DEFAULT_OWNER_LABEL,
+        avatar_name or DEFAULT_OWNER_LABEL,
+        avatar_portrays_the_speaker,
+    )
+
+
 async def label_spoken_turn_files(
     app_state,
     current_user: dict,
@@ -6364,6 +8232,7 @@ async def label_spoken_turn_files(
     )
     from src.anubis.utils.media_assets import get_media_asset_repository
     from src.anubis.utils.voice.speakers import (
+        avatar_label_for,
         diarize_spoken_turn,
         speaker_labels_enabled,
     )
@@ -6392,14 +8261,17 @@ async def label_spoken_turn_files(
     if not audio_uploads:
         return attached, message, None, None
 
-    owner_label = (your_name or "").strip()
     langgraph_client = get_client(headers={"API-KEY": current_user["API_KEY"]})
-    if not owner_label:
-        try:
-            assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
-            owner_label = str(assistant.get("name") or "").strip()
-        except Exception:  # noqa: BLE001 - the label falls back to "Owner"
-            owner_label = ""
+    (
+        owner_label,
+        avatar_label,
+        avatar_portrays_the_speaker,
+    ) = await _resolve_spoken_turn_labels(
+        langgraph_client,
+        current_user,
+        assistant_id=assistant_id,
+        your_name=your_name,
+    )
     recent_avatar_replies = await _recent_avatar_reply_texts(langgraph_client, thread_id)
     user_id = current_user["identities"][0]["user_id"]
     repository = get_media_asset_repository()
@@ -6411,6 +8283,7 @@ async def label_spoken_turn_files(
     avatar_spoke = False
     owner_identified = False
     duration_seconds = 0.0
+    accrual_turns: list = []
     for upload in audio_uploads:
         await upload.seek(0)
         raw = await upload.read()
@@ -6427,7 +8300,10 @@ async def label_spoken_turn_files(
                 assistant_id=assistant_id,
                 thread_id=thread_id,
                 owner_label=owner_label,
+                avatar_label=avatar_label,
+                avatar_portrays_the_speaker=avatar_portrays_the_speaker,
                 recent_avatar_replies=recent_avatar_replies,
+                store=getattr(app_state, "store", None),
             )
         except Exception as diarization_error:  # noqa: BLE001
             logger.exception("Speaker labelling failed")
@@ -6463,13 +8339,29 @@ async def label_spoken_turn_files(
         owner_identified = owner_identified or bool(record["owner_identified"])
         duration_seconds += float(record["duration_seconds"] or 0.0)
         owner_label = record["owner_label"]
+        accrual_turns.append(spoken)
+
+    # The owner just spoke; that speech is what this avatar's voice is made of.
+    schedule_background(
+        accrue_voice_from_spoken_turns(
+            app_state,
+            current_user,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            turns=accrual_turns,
+        )
+    )
 
     script = "\n".join(scripts).strip()
     typed = (message or "").strip()
     combined = "\n\n".join(part for part in (typed, script) if part)
     speakers_record = {
         "owner_label": owner_label,
-        "avatar_label": f"{owner_label} (avatar)",
+        # The avatar's name, which is the speaker's name only when the avatar is
+        # a portrait of the speaker — on anybody else's avatar these are two
+        # different people and labelling the speaker with the avatar's name is
+        # the bug this pair of fields exists to keep apart.
+        "avatar_label": avatar_label_for(avatar_label),
         "owner_identified": owner_identified,
         "owner_spoke": owner_spoke,
         "avatar_spoke": avatar_spoke,
@@ -6482,7 +8374,17 @@ async def label_spoken_turn_files(
     # the room (other people, another avatar, this avatar's own playback, or
     # nothing intelligible) is triaged so the avatar does not answer itself.
     nothing_was_heard = not combined
-    if nothing_was_heard:
+    if nothing_was_heard and avatar_spoke:
+        # The microphone heard this avatar's own voice out of a speaker and
+        # nothing else. The script carries none of those words — they are
+        # already in the thread as the avatar's own reply, and repeating them
+        # as though the person had said them is exactly the confusion the
+        # script avoids — but the turn is not empty either: the room was quiet
+        # apart from the avatar, which is something triage should see rather
+        # than a blank.
+        combined = "(only this avatar's own voice was heard, played back in the room)"
+        nothing_was_heard = False
+    elif nothing_was_heard:
         combined = "(nothing intelligible was heard)"
     if other_speakers or not owner_spoke:
         additional_kwargs = build_ambient_additional_kwargs(
@@ -6569,6 +8471,8 @@ def enforce_ambient_request(
     captured_at: Optional[str],
     voice_mode: bool,
     thread_id: Optional[str],
+    camera_facing: Optional[str] = None,
+    narrate: bool = False,
 ) -> dict:
     """Gate an ``ambient=true`` turn and build the hidden message's tag.
 
@@ -6580,6 +8484,12 @@ def enforce_ambient_request(
     misconfigured or hostile client cannot beat (429 with ``Retry-After``).
     Returns the ``additional_kwargs`` that mark the ``HumanMessage`` hidden and
     carry the observation record the graph's triage node completes.
+
+    ``narrate=True`` marks the observation as captured under scene narration:
+    the conversation partner asked to be told, continuously, what the camera
+    is pointed at, so the graph describes and speaks this one instead of
+    triaging it. The gates above still apply — narration is ambient vision
+    with the silence taken out, not a way around its limits.
     """
     from src.anubis.utils.ambient.observations import (
         ambient_throttle,
@@ -6618,15 +8528,37 @@ def enforce_ambient_request(
                     f"{max_bytes} byte ceiling for ambient observations."
                 ),
             )
+    # Scene narration has its own, much lower floor, and applying the ordinary
+    # one to it was a bug: the browser would pace itself for a person walking
+    # and have every second look refused with 429. An ambient look is context
+    # the avatar may never use; a narrated look is the next thing somebody who
+    # cannot see gets to know, so it is allowed to come far more often.
+    ambient_floor_seconds = ambient_context.ambient_capture_min_interval_seconds
+    # Falls back to the ordinary floor rather than raising: a context missing
+    # the narration setting should narrate slowly, not refuse every observation
+    # with a 500 — this path is the one a person relies on to be told what is
+    # in front of them.
+    minimum_interval_seconds = float(
+        (
+            getattr(
+                ambient_context,
+                "scene_narration_min_interval_seconds",
+                ambient_floor_seconds,
+            )
+            if narrate
+            else ambient_floor_seconds
+        )
+        or 0
+    )
     seconds_to_wait = ambient_throttle.check_and_mark(
-        thread_id, float(ambient_context.ambient_capture_min_interval_seconds or 0)
+        thread_id, minimum_interval_seconds
     )
     if seconds_to_wait is not None:
         raise HTTPException(
             status_code=429,
             detail=(
                 "Ambient observations on this conversation are limited to one every "
-                f"{ambient_context.ambient_capture_min_interval_seconds:g} seconds."
+                f"{minimum_interval_seconds:g} seconds."
             ),
             headers={"Retry-After": str(int(seconds_to_wait) + 1)},
         )
@@ -6638,6 +8570,8 @@ def enforce_ambient_request(
         captured_at=captured_at,
         voice_mode=voice_mode,
         image_filenames=list(image_filenames or []),
+        camera_facing=camera_facing,
+        narrate=bool(narrate),
     )
 
 
@@ -6865,6 +8799,14 @@ async def message_avatar(
     sources: Optional[str] = Form(None),
     captured_at: Optional[str] = Form(None),
     voice_mode: bool = Form(False),
+    camera_facing: Optional[str] = Form(None),
+    motion_track: Optional[str] = Form(None),
+    narrate: bool = Form(False),
+    live_shares: Optional[str] = Form(None),
+    may_control_shares: bool = Form(False),
+    peekable_shares: Optional[str] = Form(None),
+    scene_narration: Optional[str] = Form(None),
+    scene_narration_seconds: Optional[float] = Form(None),
     diarize: bool = Form(False),
     at_place: bool = Form(False),
     ambient_action_observation_id: Optional[str] = Form(None),
@@ -6897,6 +8839,13 @@ async def message_avatar(
     # clip rides the same call as another source, so the avatar always receives
     # one message per capture tick. Signed-in callers only; the API enforces a
     # minimum interval per thread.
+    # ``narrate=true`` on an ambient turn says scene narration — the
+    # accessibility mode in which a conversation partner who cannot see the
+    # scene has the camera described to them continuously — is switched on:
+    # the observation is described for that listener and spoken, never triaged.
+    # ``scene_narration`` (``on`` / ``off``) is the browser's report of that
+    # switch on EVERY turn; a client that can narrate sends it, and only then is
+    # the avatar given the tool that flips the switch by being asked.
     # ``like`` / ``dislike`` rate the avatar's previous reply on ``thread_id``;
     # ``feedback`` marks this message as feedback about the avatar (stored and
     # used from the very next reply). Both are collected by the continuous
@@ -6976,10 +8925,26 @@ async def message_avatar(
             captured_at=captured_at,
             voice_mode=voice_mode,
             thread_id=thread_id,
+            camera_facing=camera_facing,
+            narrate=narrate,
         )
         refuse_ambient_observation_on_busy_thread(
             getattr(request.app.state, "active_message_turns", None), thread_id
         )
+        if (motion_track or "").strip():
+            # The wireframe window the browser recorded over this share (see
+            # src/anubis/utils/motion/). Recorded at the API edge, outside the
+            # graph and off the reply's path; the first webcam still is the
+            # frame the identity gate compares with the reference image.
+            schedule_background(
+                record_motion_track_from_request(
+                    current_user,
+                    assistant_id=assistant_id,
+                    motion_track=motion_track,
+                    camera_facing=camera_facing,
+                    frame_data_uri=_webcam_frame_data_uri(multimodal_content, image_filenames),
+                )
+            )
     ambient_action_additional_kwargs: dict | None = None
     if (ambient_action_observation_id or "").strip():
         from src.anubis.utils.ambient.observations import (
@@ -7020,6 +8985,31 @@ async def message_avatar(
         ) = await _connection_acknowledgement_turn(
             current_user["identities"][0]["user_id"], connection_key
         )
+        # The connection is made and acknowledged; now look again at what the
+        # open web could not answer, using what the account itself shows. Its own
+        # try/except and a background task: the owner's reply must not wait on a
+        # research job, and a research failure must not cost them the reply.
+        try:
+            acknowledged_provider = str(
+                (
+                    (connection_acknowledgement_additional_kwargs or {}).get(
+                        "connection"
+                    )
+                    or {}
+                ).get("provider")
+                or ""
+            )
+            if acknowledged_provider:
+                schedule_background(
+                    _continue_research_after_connection(
+                        current_user, assistant_id.strip(), acknowledged_provider
+                    )
+                )
+        except Exception:  # noqa: BLE001 - the account IS connected
+            logger.debug(
+                "Could not start follow-up research after a connection",
+                exc_info=True,
+            )
 
     user_name = your_name
     user_description = your_description
@@ -7145,6 +9135,57 @@ async def message_avatar(
     # the system prompt) — anyone may talk to a geo-located avatar from anywhere,
     # so this is never a permission check.
     config["configurable"]["visitor_present_at_place"] = bool(at_place)
+    # ``live_shares`` names what the browser has live AT THIS MOMENT (a JSON
+    # list or comma-separated: ``webcam``, ``screen``). Two things read it: the
+    # LIVE_SHARES section of the system prompt, which keeps the avatar from
+    # narrating an observation of a screen that stopped being shared as though
+    # that screen were still in view, and the ``look_now`` tool gate — the tool
+    # is attached only when something is live, because only a browser with a
+    # live share can answer the pause the tool opens. Absent or empty means
+    # nothing is shared, which is the ordinary case for a typed conversation.
+    config["configurable"]["live_shares"] = live_shares or ""
+    # ``may_control_shares`` is the avatar-settings permission, reported by the
+    # browser that holds it: this avatar may open the camera for a single look
+    # and may switch a share off. It is per browser on purpose — a permission
+    # over this device's camera must not follow the account onto a device where
+    # the owner never granted it — so the browser both reports and enforces it,
+    # and the field only decides whether the tools are offered at all.
+    config["configurable"]["may_control_shares"] = bool(may_control_shares)
+    # ``peekable_shares`` is what the browser can open for ONE look right now,
+    # which is not the same thing as what is being shared: the camera when its
+    # peek permission is granted in this browser, the desktop when the owner
+    # granted a desktop peek this browser is still holding open. Neither is
+    # watched — a peekable source feeds no ambient observation — and the
+    # desktop can only ever get here by a grant the person gave with a real
+    # gesture, because no browser lets a page start a screen capture on its
+    # own. A client that sends nothing is read the way clients were read before
+    # the field existed (see ``peekable_sources`` in ``look_tools.py``).
+    config["configurable"]["peekable_shares"] = peekable_shares or ""
+    # ``scene_narration`` is the browser's report of the accessibility switch:
+    # ``on`` while the camera is being described to the conversation partner
+    # continuously, ``off`` when this browser could do that but is not, and
+    # absent from every client that cannot narrate at all. The tool that flips
+    # the switch by being asked (``set_scene_narration``) is attached only when
+    # the field is present, so no client is promised a mode it cannot run.
+    config["configurable"]["scene_narration"] = scene_narration or ""
+    # How often the browser is reading the scene out at this moment. The avatar
+    # is asked to make "more often" and "less often" into a number, and it
+    # cannot do that without knowing where it is starting from.
+    config["configurable"]["scene_narration_seconds"] = scene_narration_seconds
+    # Remember this turn's whole report of what can be seen, keyed by thread.
+    # A look pauses the run and is answered by a SECOND request, which rebuilds
+    # every tool from its own configuration; without the same report in hand,
+    # the rebuilt tool takes a path that never collects the frame the browser
+    # captured. The resume sends the report itself; this is what answers it
+    # when the resume does not.
+    _remember_look_context(
+        request.app.state,
+        thread_id,
+        live_shares=live_shares,
+        peekable_shares=peekable_shares,
+        may_control_shares=may_control_shares,
+        scene_narration=scene_narration,
+    )
     config["configurable"]["include_quality_metrics"] = include_quality_metrics
     config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
         current_user, adapter
@@ -7270,6 +9311,7 @@ async def message_avatar(
                 include_usage_metrics=include_usage_metrics,
                 spoken_turn_frame=spoken_turn_frame,
                 ambient=ambient,
+                request_hashed_ip=resolve_request_hashed_ip(request),
             ),
             media_type="text/event-stream",
             headers={
@@ -7285,18 +9327,73 @@ async def message_avatar(
         context=app.state.context,
     )
 
+    # AI monitoring on the non-streaming path. The graph stamps the verdict on the
+    # refusal it wrote, so the ban is recorded here and the caller is answered with
+    # 403 and the appeal address rather than with an ordinary reply.
+    request_hashed_ip = resolve_request_hashed_ip(request)
+    moderation_verdict = (
+        getattr(result["messages"][-1], "response_metadata", None) or {}
+    ).get("moderation_violation")
+    if moderation_verdict:
+        from src.security.bans import ban_refusal_detail
+
+        ban = await ban_account(
+            request.app.state,
+            ban_subject_from_user(current_user, request_hashed_ip),
+            reason=str(
+                moderation_verdict.get("reasoning") or "terms of service violation"
+            ),
+            violated_clauses=list(moderation_verdict.get("violated_clauses") or []),
+            source="message",
+            excerpt=str(moderation_verdict.get("excerpt") or ""),
+        )
+        return JSONResponse(
+            {
+                "detail": ban_refusal_detail(
+                    ban, app.state.context.ban_appeal_contact_email
+                ),
+                "moderation": {"banned": True, **moderation_verdict},
+                "content": result["messages"][-1].content,
+                "thread_id": thread_id,
+                "request_id": request.state.request_id,
+            },
+            status_code=403,
+        )
+    # The deep judge reads the same message once the caller has their reply.
+    schedule_background(
+        _judge_message_after_reply(
+            request.app.state,
+            current_user,
+            message_text=_message_text_for_moderation(human_message),
+            request_hashed_ip=request_hashed_ip,
+        )
+    )
+
     # Update most_recent_message
     langgraph_client = get_client(headers=langgraph_client_headers)
-    thread_metadata = {
-        "thread_metadata": {
-            "user_id": user_id,
-            "assistant_id": assistant_id,
-            "most_recent_message": datetime.now(UTC).isoformat(),
-            "conversation_title": conversation_title_data,
-        },
-        "graph_id": "Anubis",
-    }
-    await langgraph_client.threads.update(thread_id=thread_id, metadata=thread_metadata)
+    await _write_thread_metadata(
+        langgraph_client,
+        thread_id,
+        _thread_metadata_updates(
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            conversation_title_value=conversation_title_data,
+        ),
+    )
+
+    # A conversation this turn just started has no name. Naming it is a
+    # classification call the caller is not waiting on, so it runs after the
+    # reply has been assembled and its result reaches the browser on the next
+    # listing of conversations rather than in this response.
+    schedule_background(
+        _name_new_conversation(
+            thread_id,
+            langgraph_client_headers=langgraph_client_headers,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    )
 
     response_data = {}
     response_data["content"] = result["messages"][-1].content
@@ -7378,6 +9475,128 @@ async def stop_avatar_message(
     )
 
 
+def _remember_look_context(
+    app_state,
+    thread_id: Optional[str],
+    *,
+    live_shares: Optional[str],
+    peekable_shares: Optional[str],
+    may_control_shares: bool,
+    scene_narration: Optional[str] = None,
+) -> None:
+    """Record what a turn's browser reported it could see, for that turn's pause."""
+    registry = getattr(app_state, "look_contexts", None)
+    if registry is None:
+        return
+    registry.remember(
+        thread_id,
+        LookContext(
+            live_shares=live_shares or "",
+            peekable_shares=peekable_shares or "",
+            may_control_shares=bool(may_control_shares),
+            scene_narration=scene_narration or "",
+        ),
+    )
+
+
+def _look_context_for_resume(
+    app_state,
+    thread_id: Optional[str],
+    *,
+    live_shares: Optional[str],
+    peekable_shares: Optional[str],
+    may_control_shares: bool,
+    scene_narration: Optional[str] = None,
+) -> LookContext:
+    """The share context a resumed run must be given, for the tools it rebuilds.
+
+    A resumed run rebuilds ``look_now`` from THIS request's configuration, so a
+    resume that carries no share report rebuilds a tool that believes nothing
+    is shared and nothing may be opened. That tool then returns ``not_shared``
+    without ever reaching the ``interrupt`` holding the browser's answer, and
+    the frame the browser captured a moment ago is thrown away — the avatar
+    opens the person's camera and then tells them it cannot see anything.
+
+    What the client sent wins, because the client is reporting the present. A
+    client that sent nothing falls back to what the paused turn recorded.
+    """
+    from_request = LookContext(
+        live_shares=live_shares or "",
+        peekable_shares=peekable_shares or "",
+        may_control_shares=bool(may_control_shares),
+        scene_narration=scene_narration or "",
+    )
+    if from_request.says_anything():
+        return from_request
+    registry = getattr(app_state, "look_contexts", None)
+    remembered = registry.recall(thread_id) if registry is not None else None
+    return remembered or from_request
+
+
+async def describe_look_frames(
+    files: list[UploadFile], sources_form_value: Optional[str]
+) -> list[dict]:
+    """Describe the frames a browser sent to answer a ``look_now`` pause.
+
+    The frames are the live webcam / screen at the moment the avatar asked to
+    look, so they are described with the prompt an ambient observation uses,
+    focused on which of the two views the frame came from (``describe_look_
+    prompt_for``), and handed back as the resume value. Nothing is written to
+    the thread: a look is the avatar's own glance, not a turn in the
+    conversation.
+
+    :param files: The captured frames, one per source.
+    :param sources_form_value: A JSON list or comma-separated names aligned
+        with ``files``; the filename stem decides when the value is absent.
+    :returns: ``[{"source": ..., "description": ...}]``, skipping any frame
+        that could not be read.
+    """
+    from src.anubis.utils.ambient.observations import resolve_sources
+    from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
+    from src.anubis.utils.schema import describe_look_prompt_for
+
+    filenames = [(uploaded.filename or "image.jpg") for uploaded in files]
+    sources = resolve_sources(filenames, sources_form_value)
+    # One describer per source, not one for both. A camera still and a desktop
+    # still answer different questions, and a describer told which one it holds
+    # writes about the person in the first and about the work in the second —
+    # which is what lets the avatar keep the two views apart in its reply.
+    describers: dict[str, ImageDescriptionClass] = {}
+
+    def describer_for(source: str) -> ImageDescriptionClass:
+        if source not in describers:
+            describers[source] = ImageDescriptionClass(
+                system_prompt=describe_look_prompt_for(source)
+            )
+        return describers[source]
+
+    observations: list[dict] = []
+    for index, uploaded in enumerate(files):
+        source = sources[index] if index < len(sources) else "image"
+        try:
+            content = await uploaded.read()
+            content_type, content = prepare_still_image_upload(
+                uploaded.content_type or "image/jpeg", content
+            )
+            data_uri = (
+                f"data:{content_type};base64,"
+                f"{base64.b64encode(content).decode('utf-8')}"
+            )
+            described = await describer_for(source).describe(
+                data_uri, filenames[index]
+            )
+        except Exception:
+            # One unreadable frame must not lose the look: the other sources
+            # still answer, and a look with nothing readable at all reports
+            # itself as unavailable rather than as an empty scene.
+            logger.exception("A look_now frame could not be described (%s)", source)
+            continue
+        description = str((described or {}).get("description") or "").strip()
+        if description:
+            observations.append({"source": source, "description": description})
+    return observations
+
+
 @app.post("/message/{assistant_id}/resume")
 async def resume_avatar_message(
     request: Request,
@@ -7385,6 +9604,13 @@ async def resume_avatar_message(
     thread_id: str = Form(...),
     decision: str = Form("apply"),
     items: Optional[str] = Form(None),
+    files: OptionalUploadFiles = None,
+    sources: Optional[str] = Form(None),
+    live_shares: Optional[str] = Form(None),
+    may_control_shares: bool = Form(False),
+    peekable_shares: Optional[str] = Form(None),
+    scene_narration: Optional[str] = Form(None),
+    scene_narration_seconds: Optional[float] = Form(None),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     user_timezone: Optional[str] = Form(None),
@@ -7392,9 +9618,22 @@ async def resume_avatar_message(
     include_usage_metrics: bool = Form(True),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
-    """Resume a run paused for human approval (edit/delete identity fact).
+    """Resume a run paused for human approval (edit/delete identity fact) or for a look.
 
-    ``decision`` is ``apply`` | ``cancel``. ``items`` (JSON list) carries the owner's
+    ``decision`` is ``apply`` | ``cancel`` | ``looked``. ``looked`` answers a
+    ``look_now`` pause — nobody approved anything; the browser captured one
+    frame per source the avatar asked for and sent them as ``files``, named by
+    ``sources``. Those frames are described here and handed to the paused tool
+    as the resume value. A browser that could not capture resumes with
+    ``looked`` and no files, which the tool reports as an unavailable look.
+    ``live_shares`` / ``peekable_shares`` / ``may_control_shares`` are the same
+    share report the paused turn sent and MUST be sent again: the resumed run
+    rebuilds ``look_now`` from this request, and a rebuilt tool that believes
+    nothing is shared returns "not shared" without ever reading the frames
+    attached here. A client that omits them falls back to what the paused turn
+    recorded for this thread. ``scene_narration`` rides with them for the same
+    reason: the rebuilt ``set_scene_narration`` tool is attached only when the
+    client says it can narrate. ``items`` (JSON list) carries the owner's
     per-document decisions — one entry per matched document with ``index`` and an ``action``
     ∈ ``skip`` | ``accept`` | ``edit`` | ``remove`` (plus ``corrected_text`` /
     ``correction_context`` when the action is ``edit``). Any matched document the owner did
@@ -7409,8 +9648,10 @@ async def resume_avatar_message(
     decision_aliases = {"approve": "apply", "reject": "cancel"}
     raw_decision = (decision or "apply").strip().lower()
     decision_value = decision_aliases.get(raw_decision, raw_decision)
-    if decision_value not in ("apply", "cancel"):
-        raise HTTPException(status_code=400, detail="decision must be apply or cancel.")
+    if decision_value not in ("apply", "cancel", "looked"):
+        raise HTTPException(
+            status_code=400, detail="decision must be apply, cancel, or looked."
+        )
 
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
     if not config:
@@ -7525,6 +9766,25 @@ async def resume_avatar_message(
     config_update["configurable"]["thread_id"] = thread_id
     config["configurable"].update(config_update["configurable"])
     config["configurable"]["user_timezone"] = user_timezone
+    # A resumed run re-enters ``think`` and rebuilds every tool from what is in
+    # this configurable — including ``look_now``, which decides between taking
+    # the pause (and so collecting the answer carried by this very request) and
+    # reporting that there is nothing to look at, purely from these three
+    # fields. Restore the paused turn's report, or the look being answered here
+    # is discarded unread. See ``_look_context_for_resume``.
+    look_context = _look_context_for_resume(
+        request.app.state,
+        thread_id,
+        live_shares=live_shares,
+        peekable_shares=peekable_shares,
+        may_control_shares=may_control_shares,
+        scene_narration=scene_narration,
+    )
+    config["configurable"]["live_shares"] = look_context.live_shares
+    config["configurable"]["peekable_shares"] = look_context.peekable_shares
+    config["configurable"]["may_control_shares"] = look_context.may_control_shares
+    config["configurable"]["scene_narration"] = look_context.scene_narration
+    config["configurable"]["scene_narration_seconds"] = scene_narration_seconds
     config["configurable"]["include_quality_metrics"] = include_quality_metrics
 
     graph = app.state.graph
@@ -7534,6 +9794,17 @@ async def resume_avatar_message(
     # whole correction; ``apply`` carries the owner's per-item decisions. The tool defaults any
     # un-acted item to ``skip``, so an empty/missing list is a safe no-op.
     resume_payload: dict = {"type": decision_value}
+    if decision_value == "looked":
+        # A look answers itself: the frames the browser just captured are
+        # described and handed straight to the paused ``look_now`` tool. No
+        # observation is written to the thread and nobody was asked to approve
+        # anything, so none of the per-document decision handling below runs.
+        observations = await describe_look_frames(list(files or []), sources)
+        resume_payload["observations"] = observations
+        if not observations:
+            resume_payload["message"] = (
+                "The browser could not capture the shared view just now."
+            )
     if items:
         try:
             parsed_items = json.loads(items)
@@ -7928,6 +10199,49 @@ async def get_thread_messages(
         # failure raised inside the platform's own state read is invisible here.
         logger.exception("Could not load the messages of thread %s", thread_id)
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
+
+
+@app.post("/conversations/{thread_id}/title")
+async def name_conversation_route(
+    request: Request,
+    thread_id: str,
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user_or_anonymous_user),
+):
+    """Name a conversation from its whole transcript.
+
+    Called by the browser when the reader leaves a conversation — switching to
+    another conversation, starting a new one, or closing the page. A
+    conversation is named once when it starts, from an opening exchange that is
+    all there is to read at that point; by the time the reader leaves, the
+    conversation has usually moved on to the subject it was actually about, and
+    this is where that subject becomes the name.
+
+    A name the reader typed in the sidebar is never replaced. The response
+    carries the name the conversation now has, and ``"renamed"`` says whether
+    this request is what wrote it, so a browser that fired this request while
+    navigating away can ignore the answer without wondering what it missed.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    langgraph_client_headers = {"API-KEY": current_user["API_KEY"]}
+    try:
+        conversation_name = await name_conversation_thread(
+            thread_id,
+            langgraph_client_headers=langgraph_client_headers,
+            only_when_unnamed=False,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - a name is a convenience
+        logger.warning("Could not name conversation %s", thread_id, exc_info=True)
+        conversation_name = ""
+    return JSONResponse(
+        {
+            "thread_id": thread_id,
+            "conversation_title": conversation_name,
+            "renamed": bool(conversation_name),
+        }
+    )
 
 
 @app.post("/ambient_preferences/{assistant_id}")
@@ -8889,6 +11203,31 @@ def prepare_still_image_upload(declared_mime: str, body: bytes) -> tuple[str, by
     )
 
 
+def url_fetch_allows_private_hosts() -> bool:
+    """Whether this deployment may download a URL that resolves inside its network.
+
+    Off everywhere that faces the internet. It exists because a development
+    fixture is sometimes served from ``localhost``, and turning the guard off
+    for the whole process is clearer than sprinkling exceptions through the
+    call sites.
+    """
+    flag = str(getattr(app.state.context, "url_fetch_allow_private_hosts", None) or "false")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _unsafe_url_refusal(error: UnsafeUrlError) -> HTTPException:
+    """Turn a host-guard refusal into the 400 the caller already handles.
+
+    The message says the URL was refused without naming the address it resolved
+    to, so probing this endpoint tells an attacker nothing about the network.
+    """
+    logger.warning("Refused to fetch a URL that resolves internally: %s", error)
+    return HTTPException(
+        status_code=400,
+        detail="That URL could not be fetched because it does not resolve to a public address.",
+    )
+
+
 async def probe_remote_url_content_type(url: str) -> str:
     """Best-effort Content-Type for a remote URL (HEAD, then ranged GET + sniff).
 
@@ -8903,7 +11242,14 @@ async def probe_remote_url_content_type(url: str) -> str:
 
     if mediawiki_article_api_target(url):
         return "text/html"
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+    allow_private = url_fetch_allows_private_hosts()
+    try:
+        await assert_public_host(url, allow_private=allow_private)
+    except UnsafeUrlError as unsafe_url:
+        raise _unsafe_url_refusal(unsafe_url) from unsafe_url
+    # follow_redirects stays off so every hop is re-checked by
+    # get_with_public_host_guard rather than followed blind.
+    async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
         head_ct = ""
         try:
             head = await client.head(url)
@@ -8918,7 +11264,15 @@ async def probe_remote_url_content_type(url: str) -> str:
             pass
         if head_ct and head_ct != "application/octet-stream":
             return head_ct
-        resp = await client.get(url, headers={"Range": "bytes=0-511"})
+        try:
+            resp = await get_with_public_host_guard(
+                client,
+                url,
+                headers={"Range": "bytes=0-511"},
+                allow_private=allow_private,
+            )
+        except UnsafeUrlError as unsafe_url:
+            raise _unsafe_url_refusal(unsafe_url) from unsafe_url
         resp.raise_for_status()
         body_ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         if body_ct and body_ct != "application/octet-stream":
@@ -8955,16 +11309,32 @@ MAX_REMOTE_URL_DOWNLOAD_BYTES = 25 * 1024 * 1024
 async def fetch_remote_url_bytes(
     url: str,
     max_bytes: int = MAX_REMOTE_URL_DOWNLOAD_BYTES,
+    *,
+    allow_private: bool | None = None,
 ) -> tuple[bytes, str]:
     """Download a URL and return (body, Content-Type without parameters).
 
     MediaWiki article URLs are fetched through the parse API so Fandom
     ``/wiki/…`` pages (Cloudflare-challenged HTML skins) still ingest.
+
+    Every download passes through here, so this is where the host guard lives:
+    the URL's host must resolve to a public address, and each redirect hop is
+    re-checked before it is followed. That matters most for the portrait the
+    deep-research acquisition downloads, whose URL came from a search engine
+    rather than from the account holder. ``allow_private`` defaults to the
+    deployment's ``URL_FETCH_ALLOW_PRIVATE_HOSTS`` setting.
     """
     from src.anubis.utils.classes.URLDocumentLoaderClass import (
         ARTICLE_FETCH_USER_AGENT,
         fetch_mediawiki_article_html,
     )
+
+    if allow_private is None:
+        allow_private = url_fetch_allows_private_hosts()
+    try:
+        await assert_public_host(url, allow_private=allow_private)
+    except UnsafeUrlError as unsafe_url:
+        raise _unsafe_url_refusal(unsafe_url) from unsafe_url
 
     mediawiki = await fetch_mediawiki_article_html(url)
     if mediawiki is not None:
@@ -8977,10 +11347,17 @@ async def fetch_remote_url_bytes(
                 ),
             )
         return body, header_ct
-    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=120.0) as client:
         try:
-            r = await client.get(url, headers={"User-Agent": ARTICLE_FETCH_USER_AGENT})
+            r = await get_with_public_host_guard(
+                client,
+                url,
+                headers={"User-Agent": ARTICLE_FETCH_USER_AGENT},
+                allow_private=allow_private,
+            )
             r.raise_for_status()
+        except UnsafeUrlError as unsafe_url:
+            raise _unsafe_url_refusal(unsafe_url) from unsafe_url
         except httpx.HTTPStatusError as fetch_error:
             status = (
                 fetch_error.response.status_code
@@ -9762,6 +12139,7 @@ async def _run_emotion_media_job(
             proceed_despite_moderation_risk=proceed_despite_moderation_risk,
             progress=_progress,
             metrics=_record_metric,
+            motion_prompts=await _motion_blocks(assistant_id),
         )
         failures = manifest.get("failures") or []
         await repository.update_job(
@@ -10303,6 +12681,158 @@ async def add_avatar_voice_sample(
     return JSONResponse({"added_seconds": seconds, **status.as_dict()})
 
 
+@app.post("/avatar_voice/capture_consent")
+async def set_avatar_voice_capture_consent(
+    assistant_id: str = Form(...),
+    granted: bool = Form(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Record whether talking to this avatar in voice mode may grow its voice.
+
+    Recording a reference clip says who the avatar sounds like; it does not by
+    itself agree to every later conversation being kept, so the two are asked
+    together and this answer is revocable here and in the settings panel. A
+    declined avatar still transcribes and still answers — it simply stops
+    learning the voice. No tier gate: accrual costs no vendor call, so an
+    account on any plan arrives at an upgrade with its voice already built.
+    """
+    from src.anubis.utils.voice.capture import set_consent
+    from src.anubis.utils.voice.corpus import voice_status_for
+
+    repository = _voice_repository_or_503()
+    assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "change voice learning for that avatar"
+    )
+    user_id = current_user["identities"][0]["user_id"]
+    await set_consent(
+        repository, user_id=user_id, assistant_id=assistant_id, granted=bool(granted)
+    )
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+        store=app.state.store,
+    )
+    return JSONResponse(status.as_dict())
+
+
+# Metadata key mirroring the avatar's chosen standard voice. The voice row is
+# the record; this note lets every screen holding the avatar know that a banned
+# clone no longer silences it, without a second request.
+STANDARD_VOICE_METADATA_KEY = "standard_voice_id"
+
+
+async def note_standard_voice_on_avatar(
+    assistant_id: str, current_user: dict, voice_id: str | None
+) -> None:
+    """Mirror the standard-voice choice onto the avatar's metadata. Never raises."""
+    try:
+        token = current_user["API_KEY"]
+        client = get_client(headers={"API-KEY": f"{token}"})
+        await client.assistants.update(
+            assistant_id=assistant_id,
+            metadata={STANDARD_VOICE_METADATA_KEY: voice_id},
+        )
+    except Exception:  # noqa: BLE001 - the note is advisory, never fatal
+        logger.warning(
+            "Could not note the standard voice on avatar %s",
+            assistant_id,
+            exc_info=True,
+        )
+
+
+@app.get("/avatar_voice/standard_voices")
+async def list_avatar_standard_voices(
+    gender: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """The vendor's stock voices of one gender an avatar may speak with.
+
+    Query: ``gender`` (``female`` or ``male``). Each entry carries ``voice_id``,
+    ``name``, ``accent``, ``age``, ``description`` and a public ``preview_url``
+    the Voice panel plays so the owner can choose by ear.
+    """
+    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.standard_voices import (
+        STANDARD_VOICE_GENDERS,
+        list_standard_voices,
+        normalize_gender,
+    )
+
+    if normalize_gender(gender) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="gender must be one of: " + ", ".join(STANDARD_VOICE_GENDERS),
+        )
+    try:
+        voices = await list_standard_voices(app.state.context, gender=gender)
+    except elevenlabs_client.ElevenLabsNotConfiguredError as missing_key:
+        raise HTTPException(status_code=503, detail=str(missing_key))
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+    return JSONResponse({"gender": normalize_gender(gender), "voices": voices})
+
+
+@app.post("/avatar_voice/standard_voice")
+async def set_avatar_standard_voice(
+    assistant_id: str = Form(...),
+    voice_id: str = Form(""),
+    current_user: dict = Depends(get_current_user),
+):
+    """Choose the stock voice the avatar speaks with while it has no usable clone.
+
+    Form: ``assistant_id``, ``voice_id`` (a voice from
+    ``GET /avatar_voice/standard_voices``; empty clears the choice). The pick is
+    a fallback only: once a clone is usable, the clone speaks. Returns the
+    updated voice status.
+    """
+    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.corpus import voice_status_for
+    from src.anubis.utils.voice.standard_voices import (
+        find_standard_voice,
+        set_standard_voice,
+    )
+
+    repository = _voice_repository_or_503()
+    _assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "choose a standard voice for that avatar"
+    )
+    user_id = current_user["identities"][0]["user_id"]
+    chosen_voice_id = str(voice_id or "").strip()
+    voice: dict | None = None
+    if chosen_voice_id:
+        try:
+            voice = await find_standard_voice(
+                app.state.context, voice_id=chosen_voice_id
+            )
+        except elevenlabs_client.ElevenLabsNotConfiguredError as missing_key:
+            raise HTTPException(status_code=503, detail=str(missing_key))
+        except elevenlabs_client.ElevenLabsError as vendor_error:
+            raise HTTPException(status_code=502, detail=str(vendor_error))
+        if voice is None:
+            raise HTTPException(
+                status_code=404,
+                detail="That voice is not one of the standard voices.",
+            )
+    await set_standard_voice(
+        repository, user_id=user_id, assistant_id=assistant_id, voice=voice
+    )
+    await note_standard_voice_on_avatar(
+        assistant_id, current_user, voice["voice_id"] if voice else None
+    )
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+        store=app.state.store,
+    )
+    return JSONResponse(status.as_dict())
+
+
 @app.post("/avatar_voice/reference")
 async def set_avatar_voice_reference(
     request: Request,
@@ -10580,6 +13110,99 @@ async def rebuild_avatar_voice(
     return JSONResponse(status.as_dict())
 
 
+async def accrue_voice_from_dictation(
+    current_user: dict,
+    *,
+    assistant_id: str,
+    audio_data_uri: str,
+    duration_seconds: float,
+) -> None:
+    """Grow the avatar's voice corpus from the owner's speech in a dictated utterance.
+
+    Runs after the response, through ``schedule_background``. Whisper reports
+    words and not who said them, so the recording is diarized against the
+    avatar's stored reference clip before anything is kept — a microphone picks
+    up whoever is near it, and being the signed-in owner is not evidence that the
+    voice on it is theirs. The diarization is metered like any other, and the
+    audio is the mp3 ``transcribe_audio`` already produced, so no second
+    preprocessing pass is needed.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.capture import accrue_voice_from_utterance
+
+    try:
+        user_id = current_user["identities"][0]["user_id"]
+        client = get_client(headers={"API-KEY": current_user["API_KEY"]})
+        assistant = await client.assistants.get(assistant_id=assistant_id)
+        metadata = assistant.get("metadata") or {}
+        if (
+            metadata.get("is_personal_avatar_of_creator") is not True
+            or str(metadata.get("user_id") or "") != user_id
+        ):
+            return
+        started = time.perf_counter()
+
+        def meter(diarized: dict) -> None:
+            usage = diarized.get("usage") or {}
+            schedule_background(
+                persist_api_metrics_row(
+                    app.state.pool,
+                    inference_type="diarization",
+                    prompt_tokens=int(usage.get("input_tokens") or 0),
+                    completion_tokens=int(usage.get("output_tokens") or 0),
+                    total_tokens=int(usage.get("total_tokens") or 0),
+                    cost_usd=float(diarized.get("total_cost") or 0.0),
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    model_name=str(diarized.get("model") or ""),
+                )
+            )
+
+        await accrue_voice_from_utterance(
+            audio_data_uri,
+            duration_seconds,
+            get_media_asset_repository(),
+            app.state.context,
+            app.state.store,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            is_personal_avatar=True,
+            avatar_name=str(assistant.get("name") or ""),
+            filename="utterance.mp3",
+            content_type="audio/mpeg",
+            on_diarized=meter,
+        )
+    except Exception:  # noqa: BLE001 - dictation must not fail over the voice
+        logger.debug("Voice accrual from dictation failed", exc_info=True)
+
+
+async def voice_readiness_block(current_user: dict, assistant_id: str) -> dict | None:
+    """The small voice-readiness record a live client watches for.
+
+    Voice mode discovers a missing voice by trying to speak and catching the
+    refusal. Reporting readiness alongside each transcription is what lets it
+    notice the opposite — that the voice has just become usable — and start
+    speaking in the middle of the conversation instead of after a reload.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.voice.corpus import voice_readiness
+
+    try:
+        repository = get_media_asset_repository()
+        if repository is None or is_anonymous_user(current_user):
+            return None
+        return await voice_readiness(
+            repository,
+            app.state.context,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - a missing block just means no change reported
+        logger.debug("Could not read voice readiness", exc_info=True)
+        return None
+
+
 @app.post("/transcribe")
 async def transcribe_recording(
     assistant_id: str = Form(...),
@@ -10620,8 +13243,25 @@ async def transcribe_recording(
         )
     except Exception:  # noqa: BLE001
         logger.debug("Could not record transcription metrics", exc_info=True)
+
+    # The person just spoke in their own voice. On their own personal avatar
+    # that speech is what the avatar's voice is made of, so it is offered to the
+    # corpus — gated, inside, on a reference clip already being in place.
+    if not is_anonymous_user(current_user):
+        schedule_background(
+            accrue_voice_from_dictation(
+                current_user,
+                assistant_id=assistant_id,
+                audio_data_uri=str(result.get("audio_base64_preprocessed") or ""),
+                duration_seconds=float(result.get("file_duration_s") or 0.0),
+            )
+        )
     return JSONResponse(
-        {"text": text, "duration_seconds": result.get("file_duration_s")}
+        {
+            "text": text,
+            "duration_seconds": result.get("file_duration_s"),
+            "voice": await voice_readiness_block(current_user, assistant_id),
+        }
     )
 
 
@@ -10630,15 +13270,18 @@ async def speak_text(
     request: Request,
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
-    """Render text in the avatar's cloned voice and return the audio.
+    """Render text in the avatar's voice and return the audio.
 
     Body: ``assistant_id``, ``text``. Uses the professional clone once it is
-    fine-tuned, otherwise the instant clone; with neither, answers 409
-    ``voice_not_ready`` and the collected seconds so the client can prompt the
-    owner to record. A clone ElevenLabs has banned answers 409 ``voice_blocked``
-    — a distinct condition from having no clone, and one no amount of further
-    recording fixes. Characters spoken are recorded in ``api_metrics`` and, when
-    the meter exists, reported to Stripe.
+    fine-tuned, otherwise the instant clone; with neither usable, the standard
+    voice the owner chose (``POST /avatar_voice/standard_voice``); with none of
+    the three, answers 409 ``voice_not_ready`` and the collected seconds so the
+    client can prompt the owner to record or pick a voice. A clone ElevenLabs
+    has banned, with no standard voice to stand in, answers 409
+    ``voice_blocked`` — a distinct condition from having no clone, and one no
+    amount of further recording fixes. ``X-Voice-Kind`` names which voice
+    spoke. Characters spoken are recorded in ``api_metrics`` and, when the
+    meter exists, reported to Stripe.
     """
     from src.anubis.utils.voice import elevenlabs_client
     from src.anubis.utils.voice.corpus import (
@@ -10649,6 +13292,7 @@ async def speak_text(
         voice_record_blocked_reason,
         voice_status_for,
     )
+    from src.anubis.utils.voice.standard_voices import standard_voice_of
 
     repository = _voice_repository_or_503()
     body = await request.json()
@@ -10676,13 +13320,19 @@ async def speak_text(
         )
 
     kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
-    # A voice already known to be banned is refused without calling the vendor:
-    # the answer cannot change, and the call would be billed for a 403.
     stored_voice = await repository.get_voice(assistant_id) or {}
+    standard_voice = standard_voice_of(stored_voice)
+    # A voice already known to be banned is refused without calling the vendor:
+    # the answer cannot change, and the call would be billed for a 403. With a
+    # standard voice chosen, the avatar speaks with that instead.
     if voice_id is not None and voice_record_blocked(stored_voice):
         reason = voice_record_blocked_reason(stored_voice)
         await note_blocked_voice_on_avatar(assistant_id, current_user, reason)
-        return _blocked_voice_response(reason)
+        if standard_voice is None:
+            return _blocked_voice_response(reason)
+        kind, voice_id = "standard", standard_voice["voice_id"]
+    if voice_id is None and standard_voice is not None:
+        kind, voice_id = "standard", standard_voice["voice_id"]
     if voice_id is None:
         status = await voice_status_for(
             repository,
@@ -10696,8 +13346,9 @@ async def speak_text(
             content={
                 "error": "voice_not_ready",
                 "detail": (
-                    "This avatar has no cloned voice yet. Record about two minutes of "
-                    "the avatar speaking in settings to create one."
+                    "This avatar has no voice yet. Record about two minutes of "
+                    "the avatar speaking in settings to clone one, or choose a "
+                    "standard voice there."
                 ),
                 "collected_seconds": status.collected_seconds,
                 "instant_minimum_seconds": status.instant_minimum_seconds,
@@ -10714,6 +13365,10 @@ async def speak_text(
             app.state.context, voice_id=voice_id, text=text, model_id=model_id
         )
     except elevenlabs_client.ElevenLabsVoiceBlockedError as blocked_error:
+        if kind == "standard":
+            # A stock voice the vendor refuses is the vendor's problem, not a
+            # ban on the avatar's clone; do not mark the clone as blocked.
+            raise HTTPException(status_code=502, detail=str(blocked_error))
         # The ban was applied between the last safety check and this request.
         # Record it so the settings Voice panel stops advertising the voice and
         # later speak attempts are refused without a vendor round trip.
@@ -10788,6 +13443,344 @@ async def _meter_speech_characters(
         logger.debug("Could not report speech meter event", exc_info=True)
 
 
+
+# --- How the person moves (src/anubis/utils/motion/) -------------------------
+
+
+def _motion_repository_or_503() -> Any:
+    from src.anubis.utils.motion import get_motion_repository
+
+    repository = get_motion_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Motion learning is not configured.")
+    return repository
+
+
+async def _motion_blocks(assistant_id: str) -> dict[str, str]:
+    from src.anubis.utils.motion.prompt_section import read_motion_blocks
+
+    return await read_motion_blocks(assistant_id, app.state.context)
+
+
+async def _motion_block_for(assistant_id: str, emotion: str) -> str | None:
+    blocks = await _motion_blocks(assistant_id)
+    return blocks.get(emotion) or blocks.get("neutral") or None
+
+
+def _webcam_frame_data_uri(multimodal_content: Any, image_filenames: list | None) -> str | None:
+    """Return the first webcam still of an ambient turn as a data URI, for the identity gate."""
+    if not isinstance(multimodal_content, list):
+        return None
+    names = list(image_filenames or [])
+    index = 0
+    fallback: str | None = None
+    for block in multimodal_content:
+        if not isinstance(block, dict) or block.get("type") != "image_url":
+            continue
+        url = str(((block.get("image_url") or {}).get("url")) or "")
+        name = str(names[index]) if index < len(names) else ""
+        index += 1
+        if not url.startswith("data:"):
+            continue
+        if "webcam" in name.lower() or "camera" in name.lower():
+            return url
+        fallback = fallback or url
+    return fallback
+
+
+async def record_motion_track_from_request(
+    current_user: dict,
+    *,
+    assistant_id: str,
+    motion_track: str,
+    camera_facing: str | None,
+    frame_data_uri: str | None,
+    source: str | None = None,
+) -> dict:
+    """Gate and record one motion window from any caller.
+
+    The browser's ambient loop, a decoder process, or a device all land here:
+    the window is parsed against its landmark set, the avatar and its owner
+    are resolved, the per-source identity policy runs (a camera is proved by
+    a vision match against the reference image, a neural source by the
+    caller owning the personal avatar), and only then is the window folded
+    into the avatar's motion profile.
+    """
+    import json
+
+    from src.anubis.utils.media_generation.reference_image import read_reference_image
+    from src.anubis.utils.motion.codec import window_from_payload
+    from src.anubis.utils.motion.identity import verify_identity
+    from src.anubis.utils.motion.repository import MOTION_SOURCES, SOURCE_LIVE_CAMERA
+    from src.anubis.utils.motion.service import record_motion_window
+    from src.anubis.utils.personal_avatar import is_personal_avatar
+
+    context = app.state.context
+    flag = str(getattr(context, "motion_learning_enabled", None) or "true").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return {"recorded": False, "reason": "disabled"}
+    if is_anonymous_user(current_user):
+        return {"recorded": False, "reason": "signed-in users only"}
+    repository = _motion_repository_or_503()
+    try:
+        payload = json.loads(motion_track) if isinstance(motion_track, str) else motion_track
+        window = window_from_payload(payload)
+    except (ValueError, TypeError) as parse_error:
+        logger.info("Motion window rejected: %s", parse_error)
+        return {"recorded": False, "reason": f"invalid window: {parse_error}"}
+    window.source = str(source or window.source or SOURCE_LIVE_CAMERA)
+    if window.source not in MOTION_SOURCES:
+        return {"recorded": False, "reason": f"unknown source {window.source!r}"}
+    max_bytes = int(getattr(context, "motion_track_max_bytes", 0) or 0)
+    if max_bytes and window.byte_length() > max_bytes:
+        return {"recorded": False, "reason": "window larger than MOTION_TRACK_MAX_BYTES"}
+    try:
+        assistant, creator_user_id = await resolve_assistant_for_creator(
+            assistant_id, current_user, "record how this avatar's person moves"
+        )
+    except HTTPException as ownership_error:
+        return {"recorded": False, "reason": str(ownership_error.detail)}
+    reference = await read_reference_image(app.state.store, creator_user_id, assistant_id)
+    verdict = await verify_identity(
+        source=window.source,
+        user_id=creator_user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal_avatar(assistant),
+        camera_facing=camera_facing,
+        reference_image_data_uri=str((reference or {}).get("reference_image_data") or "") or None,
+        frame_data_uri=frame_data_uri,
+        minimum_confidence=float(getattr(context, "motion_identity_min_confidence", 0.8) or 0.8),
+        reverify_seconds=float(getattr(context, "motion_identity_reverify_seconds", 600.0) or 600.0),
+    )
+    if not verdict.accepted:
+        logger.info("Motion window for %s not attributed: %s", assistant_id, verdict.reason)
+        return {"recorded": False, "reason": verdict.reason}
+    window.identity_confidence = verdict.confidence
+    try:
+        return await record_motion_window(
+            repository, context, user_id=creator_user_id, assistant_id=assistant_id, window=window
+        )
+    except Exception as record_error:  # noqa: BLE001 - never surface as a reply failure
+        logger.warning("Motion window for %s could not be recorded: %s", assistant_id, record_error)
+        return {"recorded": False, "reason": "could not be recorded"}
+
+
+async def _score_generated_clip_motion(
+    *, user_id: str, assistant_id: str, emotion: str, asset_id: str
+) -> None:
+    """Wireframe a finished clip and score it against the person (motion_fidelity)."""
+    import os
+    import tempfile
+
+    context = app.state.context
+    flag = str(getattr(context, "motion_fidelity_check_enabled", None) or "true").strip().lower()
+    if flag not in ("1", "true", "yes", "on") or not asset_id:
+        return
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.motion import get_motion_repository
+    from src.anubis.utils.motion.repository import SOURCE_GENERATED_CLIP
+    from src.anubis.utils.motion.service import record_fidelity
+    from src.anubis.utils.motion.video_tracks import extract_motion_windows
+
+    media_repository = get_media_asset_repository()
+    motion_repository = get_motion_repository()
+    if media_repository is None or motion_repository is None:
+        return
+    try:
+        asset = await media_repository.get_emotion_asset(asset_id)
+        if not asset or not asset.get("bytes"):
+            return
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(asset["bytes"])
+            path = handle.name
+        try:
+            windows = await asyncio.to_thread(extract_motion_windows, path, context)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if not windows:
+            return
+        generated = windows[0].window
+        generated.source = SOURCE_GENERATED_CLIP
+        generated.emotion = emotion
+        score = await record_fidelity(
+            motion_repository, context, user_id=user_id, assistant_id=assistant_id,
+            emotion=emotion, generated_window=generated, asset_id=asset_id,
+        )
+        logger.info("Motion fidelity of clip %s for %s (%s): %.2f", asset_id, assistant_id, emotion, score.get("overall", 0.0))
+    except Exception as fidelity_error:  # noqa: BLE001 - a score is never worth a failure
+        logger.info("Motion fidelity check skipped for %s: %s", asset_id, fidelity_error)
+
+
+@app.post("/avatar_motion_tracks")
+async def post_avatar_motion_track(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record one motion window from any source.
+
+    Body: ``assistant_id``, ``window`` (the JSON shape ``window_to_payload``
+    produces: a landmark set version, per-stream base64 float16 buffers with
+    their sample rates, and ``face_encoding``), optional ``camera_facing``,
+    ``frame_data_uri`` (one still for the identity gate) and ``source``
+    (``live_camera``, ``neural_decoder``). The browser's ambient loop sends
+    its windows on ``POST /message/{assistant_id}`` instead; this route is
+    for everything else — a decoder reading motor cortex included.
+    """
+    import json
+
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    window = body.get("window")
+    if not assistant_id or not isinstance(window, dict):
+        raise HTTPException(status_code=400, detail="assistant_id and window are required.")
+    result = await record_motion_track_from_request(
+        current_user,
+        assistant_id=assistant_id,
+        motion_track=json.dumps(window),
+        camera_facing=body.get("camera_facing"),
+        frame_data_uri=body.get("frame_data_uri"),
+        source=body.get("source"),
+    )
+    status = 202 if result.get("recorded") else 200
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.get("/avatar_motion_profile")
+async def get_avatar_motion_profile(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Report what has been learned about how the avatar's person moves.
+
+    The scalar signature per emotion, the recurring movements with their
+    prototype trajectories (per named coordinate over normalized time), the
+    coverage in seconds, the fidelity of generated clips, and the exact
+    behavioural text those numbers render to.
+    """
+    from src.anubis.utils.motion.primitives import Primitive
+
+    repository = _motion_repository_or_503()
+    await resolve_assistant_for_creator(assistant_id, current_user, "read this avatar's motion profile")
+    profile = await repository.get_profile(assistant_id) or {}
+    signatures = {
+        str(record["emotion"]): {
+            "windows_observed": record.get("windows_observed"),
+            "seconds_observed": record.get("seconds_observed"),
+            "signature": record.get("signature") or {},
+        }
+        for record in await repository.list_signatures(assistant_id)
+    }
+    primitives = []
+    for record in await repository.list_primitives(assistant_id):
+        primitive = Primitive.from_record(record)
+        primitives.append(
+            {
+                "primitive_id": primitive.primitive_id,
+                "emotion": primitive.emotion,
+                "channel": primitive.channel,
+                "occurrences": primitive.occurrences,
+                "duration_mean": primitive.duration_mean,
+                "duration_std": primitive.duration_std,
+                "amplitude_mean": primitive.amplitude_mean,
+                "amplitude_std": primitive.amplitude_std,
+                "context": primitive.context,
+                "prototype": primitive.prototype_as_lists(),
+            }
+        )
+    basis = await repository.get_current_basis(assistant_id)
+    tracks = await repository.list_tracks(assistant_id)
+    golden = await repository.list_golden_segments(assistant_id)
+    return JSONResponse(
+        {
+            "assistant_id": assistant_id,
+            "role_section": profile.get("role_section") or "",
+            "blocks": profile.get("blocks") or {},
+            "motion_fidelity": profile.get("motion_fidelity") or {},
+            "seconds_observed": profile.get("seconds_observed") or 0.0,
+            "signatures": signatures,
+            "primitives": primitives,
+            "basis": (
+                {
+                    "basis_id": basis["basis_id"],
+                    "component_count": basis["component_count"],
+                    "reconstruction_error": basis["reconstruction_error"],
+                    "fitted_seconds": basis["fitted_seconds"],
+                    "landmark_set_version": basis["landmark_set_version"],
+                }
+                if basis
+                else None
+            ),
+            "tracks": {
+                "count": len(tracks),
+                "seconds": sum(float(t.get("duration_seconds") or 0.0) for t in tracks),
+                "by_source": {
+                    source: sum(1 for t in tracks if t.get("source") == source)
+                    for source in sorted({str(t.get("source")) for t in tracks})
+                },
+            },
+            "golden": {
+                "count": len(golden),
+                "seconds": sum(float(g.get("duration_seconds") or 0.0) for g in golden),
+            },
+        }
+    )
+
+
+@app.get("/avatar_motion_basis")
+async def get_avatar_motion_basis(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the avatar's current expression basis, for a browser to encode locally.
+
+    Once a basis exists the browser projects each face frame onto it and
+    sends coefficients rather than the dense mesh — a few dozen values a
+    frame instead of 1,434 — so a continuous camera costs about 40 KB per
+    ten-second window on the wire. 404 until enough golden face mesh has
+    been recorded to fit one.
+    """
+    import base64
+
+    repository = _motion_repository_or_503()
+    await resolve_assistant_for_creator(assistant_id, current_user, "read this avatar's motion basis")
+    basis = await repository.get_current_basis(assistant_id)
+    if basis is None:
+        raise HTTPException(status_code=404, detail="No expression basis has been fitted for this avatar yet.")
+    return JSONResponse(
+        {
+            "basis_id": basis["basis_id"],
+            "landmark_set_version": basis["landmark_set_version"],
+            "component_count": basis["component_count"],
+            "reconstruction_error": basis["reconstruction_error"],
+            "fitted_seconds": basis["fitted_seconds"],
+            "mean_b64": base64.b64encode(basis["mean"]).decode("ascii"),
+            "components_b64": base64.b64encode(basis["components"]).decode("ascii"),
+            "dtype": "float32",
+        }
+    )
+
+
+@app.delete("/avatar_motion_tracks")
+async def delete_avatar_motion_tracks(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Forget everything learned about how this avatar's person moves."""
+    from src.anubis.utils.motion.identity import live_camera_identity_cache
+
+    repository = _motion_repository_or_503()
+    _assistant, creator_user_id = await resolve_assistant_for_creator(
+        assistant_id, current_user, "delete this avatar's motion record"
+    )
+    counts = await repository.delete_all_for_avatar(assistant_id)
+    live_camera_identity_cache.forget(creator_user_id, assistant_id)
+    return JSONResponse({"assistant_id": assistant_id, "deleted": counts})
+
+
 @app.post("/lip_sync")
 async def start_lip_sync_clip(
     request: Request,
@@ -10837,6 +13830,7 @@ async def start_lip_sync_clip(
             text=text,
             emotion=emotion,
             voice_id=voice_id,
+            motion_prompt=await _motion_block_for(assistant_id, emotion),
         )
     except elevenlabs_client.ElevenLabsError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
@@ -10873,6 +13867,14 @@ async def get_lip_sync_clip(
         raise HTTPException(status_code=502, detail=str(vendor_error))
     if result.get("newly_completed"):
         detail = job.get("detail") or {}
+        schedule_background(
+            _score_generated_clip_motion(
+                user_id=job["user_id"],
+                assistant_id=job["assistant_id"],
+                emotion=str(detail.get("emotion") or "neutral"),
+                asset_id=str(result.get("asset_id") or ""),
+            )
+        )
         seconds = float(detail.get("estimated_seconds") or 0.0)
         await _meter_video_seconds(
             current_user,
@@ -11243,6 +14245,8 @@ async def _build_media_entries_for_file(
     reference_audio: bool,
     user_id: str,
     assistant_id: str,
+    bootstrap: bool = False,
+    reference_source_url: str | None = None,
 ) -> list:
     """Build the ``media_files`` entries for a single uploaded file.
 
@@ -11326,6 +14330,11 @@ async def _build_media_entries_for_file(
                 "assistant_id": assistant_id,
                 "reference_audio": False,
                 "reference_image": True,
+                # Marks a portrait the deep-research acquisition found rather
+                # than one a person chose, so the store write refuses to
+                # overwrite the creator's own picture.
+                "bootstrap_reference": bool(bootstrap),
+                "reference_source_url": reference_source_url,
                 "base64_encoded_str": make_data_uri(mime, content),
                 "namespace_filename": raw_name
                 if not "." in raw_name
@@ -11599,6 +14608,7 @@ async def _build_media_entries_for_url(
     user_id: str,
     assistant_id: str,
     rich: bool,
+    bootstrap: bool = False,
 ) -> list:
     """Build the ``media_files`` entries for a single URL.
 
@@ -11630,6 +14640,8 @@ async def _build_media_entries_for_url(
                 "assistant_id": assistant_id,
                 "reference_audio": False,
                 "reference_image": True,
+                "bootstrap_reference": bool(bootstrap),
+                "reference_source_url": url_clean if bootstrap else None,
                 "base64_encoded_str": make_data_uri(img_mime, body),
                 "namespace_filename": namespace_safe_formatted_filename
                 if not "." in namespace_safe_formatted_filename
@@ -12410,6 +15422,26 @@ async def _start_media_batch(
         for playlist_url in playlist_urls
     ]
 
+
+    async def _ban_uploader_for_violation(verdict: dict) -> None:
+        """Ban the uploader after the graph refused an item of this batch.
+
+        The graph has already stopped the violating item before anything was
+        indexed, analyzed, or turned into training data; the consequences that
+        need the connection pool and the Stripe client belong here. Uploading
+        requires a signed-in account, so the account identifiers name the subject
+        on their own and no hashed client address is recorded — unlike a message,
+        which an anonymous visitor can send.
+        """
+        await ban_account(
+            app.state,
+            ban_subject_from_user(current_user, None),
+            reason=str(verdict.get("reasoning") or "terms of service violation"),
+            violated_clauses=list(verdict.get("violated_clauses") or []),
+            source="upload",
+            excerpt=str(verdict.get("source") or ""),
+        )
+
     master.task = asyncio.create_task(
         run_batch_media_job(
             master,
@@ -12421,6 +15453,7 @@ async def _start_media_batch(
             existing_namespaces=sorted(existing_namespaces),
             registry=registry,
             deferred_expanders=deferred_expanders,
+            on_moderation_violation=_ban_uploader_for_violation,
         )
     )
 
@@ -12487,6 +15520,8 @@ async def start_identity_media_job_from_chat(
     urls: list[str],
     reference_image: bool = False,
     reference_audio: bool = False,
+    bootstrap: bool = False,
+    reference_source_url: str | None = None,
 ) -> dict:
     """Start the media batch the in-chat identity-update tool asked for.
 
@@ -12495,6 +15530,17 @@ async def start_identity_media_job_from_chat(
     endpoint builds, then hands them to ``_start_media_batch``. Refusals
     (allotment, rate limit, every item rejected) come back as a ``status``
     dictionary rather than raising, because the caller is a tool inside a turn.
+
+    ``bootstrap`` marks the one caller that is exempt from the UPLOAD capability
+    gate: the deep-research acquisition installing a reference asset the avatar
+    does not have. Creating an avatar starts research on every tier, so an
+    acquisition refused for a free-tier account would leave exactly the empty
+    avatar the feature exists to prevent. The exemption is narrow by
+    construction and asserted below — it carries one item, that item must be a
+    reference image or a reference clip, and the acquisition runs at most once
+    per avatar. Nothing else is relaxed: the token estimate, the allotment
+    check, the rate limit and the metering all still run, and a general upload
+    batch can never travel this way.
     """
     config = {
         "configurable": {
@@ -12519,15 +15565,29 @@ async def start_identity_media_job_from_chat(
             "status_code": 403,
             "detail": "Only the avatar's creator can update its identity.",
         }
-    try:
-        enforce_tier_capability(current_user, TierCapability.UPLOAD)
-    except HTTPException as refusal:
-        return {
-            "status": "refused",
-            "status_code": refusal.status_code,
-            "detail": refusal.detail,
-        }
     reference_mode = bool(reference_image or reference_audio)
+    if bootstrap:
+        # Keep the exemption to the shape it was granted for. A caller that
+        # passes bootstrap=True with a general batch is a bug, and refusing it
+        # here is cheaper than discovering it as an unbilled upload path.
+        if not reference_mode or (len(attachments) + len(urls)) != 1:
+            return {
+                "status": "refused",
+                "status_code": 400,
+                "detail": (
+                    "The acquisition path carries exactly one reference image or "
+                    "one reference recording."
+                ),
+            }
+    else:
+        try:
+            enforce_tier_capability(current_user, TierCapability.UPLOAD)
+        except HTTPException as refusal:
+            return {
+                "status": "refused",
+                "status_code": refusal.status_code,
+                "detail": refusal.detail,
+            }
     media_files: list = []
     rejected_items: list[dict] = []
     playlist_urls: list[str] = []
@@ -12542,6 +15602,8 @@ async def start_identity_media_job_from_chat(
                     reference_audio=bool(reference_audio),
                     user_id=user_id,
                     assistant_id=assistant_id,
+                    bootstrap=bool(bootstrap),
+                    reference_source_url=reference_source_url,
                 )
             )
         except Exception as file_entry_error:  # noqa: BLE001 - per-item skip
@@ -12562,6 +15624,7 @@ async def start_identity_media_job_from_chat(
                     user_id=user_id,
                     assistant_id=assistant_id,
                     rich=single_url or reference_mode,
+                    bootstrap=bool(bootstrap),
                 )
             )
         except Exception as url_entry_error:  # noqa: BLE001 - per-item skip
@@ -13539,8 +16602,15 @@ def _start_deep_research_job(
     subject_description: str | None,
     research_hint: str | None,
     assistant_metadata: dict | None = None,
+    bootstrap: bool = True,
 ):
-    """Register and launch one research job; the pipeline runs as a background task."""
+    """Register and launch one research job; the pipeline runs as a background task.
+
+    ``bootstrap`` decides whether the run may also acquire the reference image
+    and reference audio the avatar is missing. It is on by default because an
+    avatar with no picture and no voice is the thing this feature exists to fix;
+    pass ``False`` to research the facts alone.
+    """
     from src.anubis.utils.research.deep_research import run_deep_research
     from src.api.research_jobs import add_event as add_research_event
     from src.api.research_jobs import create_research_job
@@ -13564,6 +16634,96 @@ def _start_deep_research_job(
         subject_name=subject_name,
     )
 
+    # What the research pipeline is lent so it can acquire a portrait and a
+    # voice. These four operations are all API-side — downloading bytes,
+    # starting a media batch, waiting on the media-job registry — and the
+    # pipeline may not import this module, so they are handed over rather than
+    # imported. See src/anubis/utils/research/asset_bootstrap.py.
+    from src.api.chat_attachments import TurnAttachment
+
+    bootstrap_assistant_ctx = {
+        "name": subject_name,
+        "description": subject_description,
+        "metadata": assistant_metadata or {},
+    }
+
+    async def _fetch_image_bytes(url: str) -> tuple[str, bytes, str]:
+        """Download and normalize one candidate photograph.
+
+        The host guard inside fetch_remote_url_bytes matters more here than
+        anywhere else: this URL came from a search engine, not from the account
+        holder.
+        """
+        body, header_content_type = await fetch_remote_url_bytes(
+            url,
+            max_bytes=int(
+                getattr(context, "deep_research_bootstrap_image_max_bytes", 0)
+                or MAX_REMOTE_URL_DOWNLOAD_BYTES
+            ),
+        )
+        image_mime, body = prepare_still_image_upload(header_content_type, body)
+        return image_mime, body, make_data_uri(image_mime, body)
+
+    async def _start_reference_image_job(
+        *, filename: str, mime_type: str, content: bytes, source_url: str | None = None
+    ) -> dict:
+        """Install already-downloaded bytes as the portrait.
+
+        The bytes travel as an attachment rather than the URL travelling again:
+        one download, and no window in which the URL could serve a different
+        picture the second time it is fetched.
+        """
+        return await start_identity_media_job_from_chat(
+            user_id=creator_id,
+            assistant_id=assistant_id,
+            assistant_ctx=bootstrap_assistant_ctx,
+            current_user=current_user,
+            attachments=[
+                TurnAttachment(
+                    filename=filename, mime_type=mime_type, content=content
+                )
+            ],
+            urls=[],
+            reference_image=True,
+            bootstrap=True,
+            reference_source_url=source_url,
+        )
+
+    async def _start_reference_audio_job(*, url: str) -> dict:
+        """Ingest one recording so it becomes the reference clip and voice corpus."""
+        return await start_identity_media_job_from_chat(
+            user_id=creator_id,
+            assistant_id=assistant_id,
+            assistant_ctx=bootstrap_assistant_ctx,
+            current_user=current_user,
+            attachments=[],
+            urls=[url],
+            reference_audio=True,
+            bootstrap=True,
+        )
+
+    async def _await_media_job(job_id: str, timeout_seconds: float) -> str:
+        """Wait for a media job to finish, or give up and let it carry on."""
+        media_job = app_state.media_jobs.get(job_id)
+        if media_job is None:
+            return "unknown"
+        try:
+            await asyncio.wait_for(media_job.done.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            return "pending"
+        return getattr(media_job, "status", "unknown")
+
+    bootstrap_gateway = None
+    if bootstrap:
+        from src.anubis.utils.research.asset_bootstrap import BootstrapGateway
+
+        bootstrap_gateway = BootstrapGateway(
+            fetch_image_bytes=_fetch_image_bytes,
+            start_reference_image_job=_start_reference_image_job,
+            start_reference_audio_job=_start_reference_audio_job,
+            await_media_job=_await_media_job,
+        )
+
     async def _run() -> None:
         job.started_at = time.time()
         job.status = "running"
@@ -13578,6 +16738,7 @@ def _start_deep_research_job(
                 research_hint=research_hint,
                 emit=lambda payload: add_research_event(job, payload),
                 is_cancelled=lambda: job.cancelled,
+                bootstrap=bootstrap_gateway,
             )
             if summary.get("cancelled"):
                 finish_research_job(
@@ -13666,6 +16827,67 @@ def _start_deep_research_job(
                         model_name=None,
                         meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
                     )
+            # The accounts the research turned up become questions in the
+            # owner's agent inbox. Deliberately NOT a message: this job holds no
+            # thread, the owner may not be in a conversation at all, and the ask
+            # has to survive until the owner is ready to answer — which the inbox
+            # already does, raising the item on every turn until it is resolved.
+            #
+            # Its own try/except: the research succeeded, and a failure to ask a
+            # question must never be reported as a failed research run.
+            try:
+                if (assistant_metadata or {}).get(
+                    "is_personal_avatar_of_creator"
+                ) is True and _research_account_discovery_enabled(context):
+                    from src.anubis.utils.connected_accounts import (
+                        bound_accounts_for,
+                    )
+                    from src.anubis.utils.research.discovered_accounts import (
+                        candidate_accounts_from_research,
+                        create_account_discovery_inbox_items,
+                        record_discovered_accounts,
+                    )
+
+                    connected_provider_names = {
+                        str(account.get("provider") or "")
+                        for account in await bound_accounts_for(
+                            app_state.store, creator_id, assistant_id
+                        )
+                    }
+                    discovered = candidate_accounts_from_research(
+                        summary,
+                        connected_provider_names=connected_provider_names,
+                        maximum=int(
+                            getattr(context, "research_account_discovery_maximum", 3)
+                            or 3
+                        ),
+                    )
+                    if discovered:
+                        await record_discovered_accounts(
+                            app_state.store,
+                            creator_id=creator_id,
+                            assistant_id=assistant_id,
+                            job_id=job.job_id,
+                            subject_name=subject_name,
+                            accounts=discovered,
+                        )
+                        await create_account_discovery_inbox_items(
+                            creator_id=creator_id,
+                            assistant_id=assistant_id,
+                            subject_name=subject_name,
+                            job_id=job.job_id,
+                            accounts=discovered,
+                            store=app_state.store,
+                        )
+                        summary["discovered_accounts"] = [
+                            account.provider for account in discovered
+                        ]
+            except Exception as discovery_error:  # noqa: BLE001 - research still succeeded
+                logger.exception(
+                    "Deep research job %s could not raise the account questions: %s",
+                    job.job_id,
+                    discovery_error,
+                )
             finish_research_job(job, result=summary)
         except asyncio.CancelledError:
             finish_research_job(
@@ -13826,6 +17048,51 @@ async def list_avatar_research_proposals(
     )
     proposals = await list_proposals(request.app.state.store, creator_id, assistant_id)
     return JSONResponse({"assistant_id": assistant_id, "proposals": proposals})
+
+
+@app.get("/avatar/{assistant_id}/research/bootstrap")
+async def get_avatar_research_bootstrap(
+    request: Request, assistant_id: str, current_user: dict = Depends(get_current_user)
+):
+    """Report what the research managed to acquire for this avatar, and what it did not.
+
+    The progress stream is long gone by the time the creator opens the settings
+    screen, so the outcome is read from where the acquisition recorded it. This
+    is what lets the portrait tile say "no photograph of this subject could be
+    found — add one" instead of the generic empty-state prompt.
+    """
+    from src.anubis.utils.research.asset_bootstrap import read_bootstrap_outcome
+
+    _assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="read that avatar's research results",
+    )
+    outcome = await read_bootstrap_outcome(
+        request.app.state.store, creator_id=creator_id, assistant_id=assistant_id
+    )
+    if outcome is None:
+        return JSONResponse({"assistant_id": assistant_id, "bootstrap": None})
+    portrait = outcome.get("portrait") or {}
+    voice = outcome.get("voice") or {}
+    return JSONResponse(
+        {
+            "assistant_id": assistant_id,
+            "bootstrap": {
+                "status": outcome.get("status"),
+                "finished_at": outcome.get("finished_at"),
+                "portrait_attempted": bool(outcome.get("portrait")),
+                "portrait_acquired": bool(portrait.get("acquired")),
+                "portrait_reason": portrait.get("reason"),
+                "portrait_source_url": portrait.get("source_url"),
+                "voice_attempted": bool(outcome.get("voice")),
+                "voice_acquired": bool(voice.get("acquired")),
+                "voice_reason": voice.get("reason"),
+                "voice_source_url": voice.get("source_url"),
+                "voice_title": voice.get("title"),
+            },
+        }
+    )
 
 
 class ResearchResolutionItem(BaseModel):

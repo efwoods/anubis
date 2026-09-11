@@ -58,9 +58,14 @@ class _FakeDescriber:
 
 @pytest.fixture
 def workflow(monkeypatch):
+    # The speech cooldown is a process-local singleton, so one test's spoken
+    # observation would otherwise silence the next test's.
+    from src.anubis.utils.ambient.observations import ambient_speech_cooldown
+
+    ambient_speech_cooldown._last_spoken.clear()
     monkeypatch.setattr(nodes_module, "ImageDescriptionClass", _FakeDescriber)
     _FakeDescriber.prompts = []
-    decisions = {"next": "ignore", "calls": []}
+    decisions = {"next": "ignore", "calls": [], "salience": 0.95}
 
     async def fake_classify(context, **kwargs):
         decisions["calls"].append(kwargs)
@@ -69,7 +74,7 @@ def workflow(monkeypatch):
             needs_owner_action=decisions["next"] == "notify",
             observation_kind="writing_code",
             summary="A person writes code.",
-            salience=0.4,
+            salience=decisions.get("salience", 0.95),
             reason="test",
             proposed_action=decisions.get("proposed_action", "none"),
             action_description=decisions.get("action_description", ""),
@@ -102,13 +107,14 @@ def workflow(monkeypatch):
     return app, decisions, avatar_runs
 
 
-def _ambient_turn(message_id="obs-message", voice_mode=False):
+def _ambient_turn(message_id="obs-message", voice_mode=False, camera_facing=None):
     kwargs = build_ambient_additional_kwargs(
         sources=["webcam", "screen"],
         captured_at="2026-09-04T15:00:00Z",
         voice_mode=voice_mode,
         image_filenames=["webcam.jpg", "screen.jpg"],
         observation_id="obs-1",
+        camera_facing=camera_facing,
     )
     return HumanMessage(
         id=message_id,
@@ -181,7 +187,10 @@ async def test_a_respond_decision_reaches_the_avatar_with_the_instruction(workfl
     )
 
     assert len(avatar_runs) == 1
-    assert avatar_runs[0].content.endswith(RESPOND_INSTRUCTION)
+    # The instruction is followed by the reason the triage chose to speak,
+    # which is the specific thing the avatar is told to react to.
+    assert RESPOND_INSTRUCTION in avatar_runs[0].content
+    assert avatar_runs[0].content.endswith("[AMBIENT_REASON] test")
     assert messages[0].additional_kwargs["ambient"]["decision"] == "respond"
     assert messages[0].additional_kwargs["ambient"]["voice_mode"] is True
     assert (
@@ -253,3 +262,104 @@ async def test_earlier_observations_are_handed_to_the_classifier(workflow):
     ] == ["obs-1"]
     state = await app.aget_state(config)
     assert [message.id for message in state.values["messages"]] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_a_low_salience_respond_is_demoted_and_the_avatar_stays_quiet(workflow):
+    """A remark not worth making does not reach the conversation partner.
+
+    This is the case that produced a run of unprompted messages on a quiet
+    webcam: the classifier judges one observation at a time, so a low-stakes
+    'respond' repeated often enough becomes a stream of interruptions.
+    """
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "respond"
+    decisions["salience"] = 0.10
+    messages, custom = await _run(app, _ambient_turn(), "low-salience-thread")
+
+    assert avatar_runs == []
+    ambient = messages[0].additional_kwargs["ambient"]
+    assert ambient["decision"] == "ignore"
+    assert ambient["demoted_from"] == "respond"
+    assert "below the respond floor" in ambient["demotion_reason"]
+    # The observation is still kept as context even though nothing was said.
+    assert messages[0].content.startswith("[AMBIENT_OBSERVATION")
+    assert not any(isinstance(message, AIMessage) for message in messages)
+    decision_frames = [
+        frame for frame in custom if frame.get("type") == "ambient_decision"
+    ]
+    assert decision_frames and decision_frames[-1]["decision"] == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_a_notify_needs_more_salience_than_a_respond(workflow):
+    """A card interrupts more than a reply, so the notify floor sits higher."""
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "notify"
+    # Above the respond floor of 0.55, below the notify floor of 0.70.
+    decisions["salience"] = 0.60
+    messages, _custom = await _run(app, _ambient_turn(), "notify-floor-thread")
+
+    assert avatar_runs == []
+    ambient = messages[0].additional_kwargs["ambient"]
+    assert ambient["decision"] == "ignore"
+    assert ambient["demoted_from"] == "notify"
+    # A demoted observation offers nothing, because no card is ever shown.
+    assert ambient["proposed_action"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_the_avatar_does_not_speak_twice_inside_the_quiet_period(workflow):
+    """Having just spoken, the avatar stays quiet about the next observation."""
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "respond"
+    # Above every floor, but below the cooldown override of 0.90.
+    decisions["salience"] = 0.80
+
+    first_messages, _first = await _run(
+        app, _ambient_turn(message_id="obs-first"), "cooldown-thread"
+    )
+    assert len(avatar_runs) == 1
+    assert first_messages[0].additional_kwargs["ambient"]["decision"] == "respond"
+
+    second_messages, _second = await _run(
+        app, _ambient_turn(message_id="obs-second"), "cooldown-thread"
+    )
+    # Still one avatar run: the second observation was noticed silently.
+    assert len(avatar_runs) == 1
+    second_ambient = second_messages[-1].additional_kwargs["ambient"]
+    assert second_ambient["decision"] == "ignore"
+    assert "the avatar spoke recently" in second_ambient["demotion_reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_salient_enough_observation_overrides_the_quiet_period(workflow):
+    """Something urgent is not silenced by a cooldown an ordinary remark began."""
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "respond"
+    decisions["salience"] = 0.80
+    await _run(app, _ambient_turn(message_id="obs-first"), "override-thread")
+    assert len(avatar_runs) == 1
+
+    decisions["salience"] = 0.95
+    messages, _custom = await _run(
+        app, _ambient_turn(message_id="obs-second"), "override-thread"
+    )
+    assert len(avatar_runs) == 2
+    observations = [
+        message for message in messages if "ambient" in message.additional_kwargs
+    ]
+    assert observations[-1].additional_kwargs["ambient"]["decision"] == "respond"
+
+
+@pytest.mark.asyncio
+async def test_the_classifier_is_told_which_way_the_camera_points(workflow):
+    """A rear camera reads as the person's own view of the world."""
+    app, decisions, _avatar_runs = workflow
+    decisions["next"] = "ignore"
+    await _run(
+        app,
+        _ambient_turn(camera_facing="environment"),
+        "facing-thread",
+    )
+    assert decisions["calls"][0]["camera_facing"] == "world"

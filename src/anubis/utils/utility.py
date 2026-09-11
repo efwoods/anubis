@@ -909,22 +909,49 @@ async def get_video_duration_seconds(
             return float(clip.duration or 0.0)
 
 
-async def get_remote_video_duration_seconds(url: str) -> float:
-    """Return a remote (YouTube or direct) video's duration from metadata only.
+async def get_remote_video_metadata(url: str) -> dict:
+    """Return what a remote video says about itself, without downloading it.
 
     Probes with yt_dlp ``extract_info(download=False)`` — the same pattern as
     ``list_available_subtitles`` — on a worker thread so the event loop is
-    never blocked. Nothing is downloaded. Raises when the extractor fails or
-    reports no duration; the caller decides the fallback.
+    never blocked. Nothing is downloaded.
+
+    The keys returned are the ones a caller needs to decide whether a video is
+    worth the far more expensive download and transcription: ``duration`` in
+    seconds, ``title``, ``uploader``, ``description``, ``thumbnail``,
+    ``live_status`` (a stream in progress has no fixed duration and cannot be
+    transcribed as a recording) and ``age_limit``. Raises when the extractor
+    fails; the caller decides the fallback.
     """
 
-    def _probe() -> float:
+    def _probe() -> dict:
         ydl_options = {"quiet": True, "skip_download": True}
         with yt_dlp.YoutubeDL(ydl_options) as ydl:
             info = ydl.extract_info(url, download=False)
-        return float(info.get("duration") or 0.0)
+        info = info or {}
+        return {
+            "duration": float(info.get("duration") or 0.0),
+            "title": str(info.get("title") or ""),
+            "uploader": str(info.get("uploader") or info.get("channel") or ""),
+            "description": str(info.get("description") or ""),
+            "thumbnail": str(info.get("thumbnail") or ""),
+            "live_status": info.get("live_status"),
+            "age_limit": int(info.get("age_limit") or 0),
+        }
 
     return await asyncio.to_thread(_probe)
+
+
+async def get_remote_video_duration_seconds(url: str) -> float:
+    """Return a remote (YouTube or direct) video's duration from metadata only.
+
+    A thin reading of ``get_remote_video_metadata`` for the callers that only
+    need to bill or bound by length. Raises when the extractor fails; a video
+    that reports no duration comes back as ``0.0`` and the caller decides the
+    fallback.
+    """
+    metadata = await get_remote_video_metadata(url)
+    return float(metadata.get("duration") or 0.0)
 
 
 async def get_remote_playlist_video_durations(url: str) -> list[float]:

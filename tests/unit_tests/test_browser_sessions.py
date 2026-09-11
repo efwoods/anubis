@@ -145,11 +145,18 @@ def fake_browser(monkeypatch):
     browser_login._live_logins.clear()
 
 
+# These exercise BROWSER-SESSION sign-in, so they need providers that still sign in
+# through a browser. The vendor providers they originally used (openai, anthropic,
+# langsmith) moved to an api_key credential mechanism and no longer carry a
+# login_url, which made start_login refuse them with "A site address to sign in to
+# is required."
+
+
 @pytest.mark.asyncio
 async def test_start_and_finish_store_an_encrypted_session(fake_browser):
     context = _context()
     started = await browser_login.start_login(
-        context, user_id="auth0|owner", assistant_id="a", provider=get_provider("langsmith")
+        context, user_id="auth0|owner", assistant_id="a", provider=get_provider("github")
     )
     assert started["view_url"].startswith(f"/connect_account/browser/{started['login_id']}?t=")
     token = started["view_url"].split("?t=", 1)[1]
@@ -159,14 +166,14 @@ async def test_start_and_finish_store_an_encrypted_session(fake_browser):
         browser_login.verify_login_token(context, token, "another-login")
 
     login = browser_login.get_live_login(started["login_id"])
-    login.page.url = "https://smith.langchain.com/projects"
+    login.page.url = "https://github.com/settings/profile"
     login.page.html = "<a href='/logout'>Log out</a>"
     finished = await browser_login.finish_login(
         context, login_id=started["login_id"], user_id="auth0|owner", existing_records=[]
     )
     record = finished["record"]
     assert finished["heuristic_signed_in"] is True
-    assert record["account_key"].startswith("langsmith:smith.langchain.com#")
+    assert record["account_key"].startswith("github:github.com#")
     assert record["credential_mechanism"] == "browser_session"
     assert "cookie-value" not in json.dumps(public_account_view(record))
     assert browser_sessions.decrypt_storage_state(record, context)["cookies"][0]["value"] == "cookie-value"
@@ -181,10 +188,10 @@ async def test_start_and_finish_store_an_encrypted_session(fake_browser):
 @pytest.mark.asyncio
 async def test_logins_are_capped_and_a_custom_site_needs_an_address(fake_browser):
     context = _context()
-    await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("openai"))
-    await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("anthropic"))
+    await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("github"))
+    await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("twitch"))
     with pytest.raises(browser_sessions.BrowserSessionError) as raised:
-        await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("langsmith"))
+        await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("vercel"))
     assert raised.value.status_code == 409
     browser_login._live_logins.clear()
     with pytest.raises(browser_sessions.BrowserSessionError) as missing:
@@ -195,7 +202,7 @@ async def test_logins_are_capped_and_a_custom_site_needs_an_address(fake_browser
 @pytest.mark.asyncio
 async def test_input_is_forwarded_and_never_logged(fake_browser, caplog):
     context = _context()
-    started = await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("openai"))
+    started = await browser_login.start_login(context, user_id="u", assistant_id="a", provider=get_provider("github"))
     login = browser_login.get_live_login(started["login_id"])
     viewport = {"width": 1280, "height": 800}
     caplog.set_level("DEBUG")
@@ -205,7 +212,7 @@ async def test_input_is_forwarded_and_never_logged(fake_browser, caplog):
     await browser_login.dispatch_input(login, {"type": "navigate", "url": "https://evil.test/"}, viewport)
     assert ("click", (10.0, 20.0), {"button": "left"}) in login.page.mouse.actions
     assert ("insert_text", ("hunter2-password",), {}) in login.page.keyboard.actions
-    assert login.page.url == "https://platform.openai.com/login"
+    assert login.page.url == "https://github.com/login"
     assert "hunter2-password" not in caplog.text
 
 

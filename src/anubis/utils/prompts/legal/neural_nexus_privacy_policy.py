@@ -1,3 +1,9 @@
+"""Neural Nexus's own privacy policy, as text.
+
+Import this through the package (``from src.anubis.utils.prompts.legal import
+PRIVACY_POLICY``), never by module path.
+"""
+
 PRIVACY_POLICY = """
 Privacy Policy
 
@@ -24,12 +30,21 @@ c. User-Generated Content
 
 Any content you upload, such as text, images, or other data, may be collected and stored to provide the Service's functionality.
 
+d. Your Conversations
+
+The messages you type or speak to the Service are your own words. We use your own messages, exactly as we use anything else you give us, to build and train your own personal avatar so that your personal avatar speaks the way you speak. This applies to every conversation you hold, including a conversation you hold with an avatar somebody else created: what you said is yours, and it is used only for your own personal avatar.
+
+We use only your own messages. We never use another person's messages to build your avatar, we never use the assistant's replies as though they were your words, and we never use your conversations to train any model other than your own personal avatar.
+
+We do not copy your conversations into a separate training store. The training is derived from the conversations already held in your account, which means that deleting a conversation also removes it from that training. You can turn this use off at any time in your account settings.
+
 2. How We Use Your Information
 
 We use your information to:
 
 - Provide, maintain, and improve the Service.
 - Personalize your experience, such as recommending content or features.
+- Build and train your own personal avatar from the content you give us and from your own messages, unless you have turned that off.
 - Process transactions and manage subscriptions.
 - Communicate with you, including sending service-related updates or promotional materials (with your consent).
 - Monitor and analyze usage to optimize performance and detect fraud.
@@ -43,6 +58,8 @@ We do not sell your personal information. We may share your data in the followin
 - Legal Compliance: When required by law, such as in response to a subpoena or court order.
 - Business Transfers: In connection with a merger, acquisition, or sale of assets, with notice to users.
 - With Your Consent: For any other purpose with your explicit permission.
+
+We do not use your conversations to train any model other than your own personal avatar, and we do not share your conversations with another user's avatar.
 
 4. Data Security
 

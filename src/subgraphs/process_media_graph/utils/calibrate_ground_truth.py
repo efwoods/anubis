@@ -6,7 +6,8 @@ profile blob), and recalibrates the empirical threshold + IsolationForest.
 """
 
 import logging
-from typing import Any, Dict, List
+from collections import Counter
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 from langgraph.store.base import BaseStore
@@ -42,6 +43,11 @@ _QUOTE_CORPUS_READ_LIMIT = 10000
 # own quotes (this also purges artifacts stored before discovery cleaned its
 # corpus, e.g. @mention-chain phrases).
 KEY_PHRASE_PROFILE_KEY = "key_phrase_profile"
+# Sibling key in the SAME namespace holding the per-phrase scores, the judge's
+# classifications and the judgement cache. Kept separate rather than folded into
+# the primary key so the primary key keeps its bare-list shape for the two hot
+# read paths (system-prompt build, per-reply style scoring) with no migration.
+KEY_PHRASE_PROFILE_DETAIL_KEY = "key_phrase_profile_detail"
 
 
 def _quote_text_from_store_value(value: Any) -> str | None:
@@ -71,8 +77,49 @@ def _quote_text_from_store_value(value: Any) -> str | None:
     return None
 
 
+
+def _target_name_from_quote_metadata(
+    store_items: Any, documents: List[Document]
+) -> Optional[str]:
+    """The most frequently attested target name across the quote corpus.
+
+    Only the signature-phrase judge uses this, and only to steer borderline
+    calls: knowing the speaker is a rocket engineer makes "orbit" read as
+    subject matter rather than as a verbal habit. The assistant id is
+    deliberately NOT used as a substitute — a bare identifier tells the judge
+    nothing and reads as noise in the prompt — so an avatar whose quotes carry
+    no target name is simply judged without one.
+    """
+    name_counts: Counter = Counter()
+    for document in documents or []:
+        name = (document.metadata or {}).get("target_name")
+        if isinstance(name, str) and name.strip():
+            name_counts[name.strip()] += 1
+    for item in store_items or []:
+        value = getattr(item, "value", None)
+        if not isinstance(value, dict):
+            continue
+        metadata = value.get("metadata")
+        if not isinstance(metadata, dict):
+            kwargs = value.get("kwargs")
+            metadata = kwargs.get("metadata") if isinstance(kwargs, dict) else None
+        if not isinstance(metadata, dict):
+            continue
+        name = metadata.get("target_name")
+        if isinstance(name, str) and name.strip():
+            name_counts[name.strip()] += 1
+    if not name_counts:
+        return None
+    return name_counts.most_common(1)[0][0]
+
+
 async def _load_quote_corpus_by_doc_id(
-    store: BaseStore, user_id: str, assistant_id: str, documents: List[Document]
+    store: BaseStore,
+    user_id: str,
+    assistant_id: str,
+    documents: List[Document],
+    *,
+    collected_store_items: Optional[List[Any]] = None,
 ) -> Dict[str, str]:
     """Return ``{document_id: text}`` for the FULL quote corpus of this avatar.
 
@@ -82,6 +129,10 @@ async def _load_quote_corpus_by_doc_id(
     passed-in documents are merged in explicitly (and take precedence). Keying by
     ``document_id`` — the store key these docs live under — keeps the map aligned
     with the per-document feature dict and the delete-by-doc-id flow.
+
+    ``collected_store_items``, when given, is filled with the raw store items so
+    the caller can read their metadata (the target's name, for the judge)
+    without paying for a second read of a corpus that may hold ten thousand rows.
     """
     doc_id_to_text: Dict[str, str] = {}
 
@@ -108,6 +159,9 @@ async def _load_quote_corpus_by_doc_id(
             raise
         logger.warning("asearch over quotes failed (%s); using new documents only", exc)
         prior_items = []
+    if collected_store_items is not None:
+        collected_store_items.extend(prior_items or [])
+
     for item in prior_items or []:
         text = _quote_text_from_store_value(getattr(item, "value", {}))
         if text:
@@ -131,9 +185,13 @@ async def _store_signature_key_phrases(
 
     Stored at ``(user_id, assistant_id, KEY_PHRASE_PROFILE_KEY)`` under the same
     key, as ``{"value": json.dumps(phrase_list)}`` — mirroring how the
-    "style_profile" blob is stored/retrieved. The caller passes the already-
-    unioned (previous ∪ newly-discovered) and corpus-attested list, so writing
-    here upserts the reconciled set.
+    "style_profile" blob is stored/retrieved. The caller passes the ranked,
+    capped and corpus-attested list, so writing here upserts the reconciled set.
+
+    The list is stored in RANK order (most distinctive first), not sorted
+    alphabetically, because the prompt renders a prefix of it. Nothing
+    downstream depends on alphabetical order: ``key_phrase_occurrence_rate``
+    sums over the whole set and is order-independent.
     """
     import json
 
@@ -142,6 +200,51 @@ async def _store_signature_key_phrases(
         key=KEY_PHRASE_PROFILE_KEY,
         value={"value": json.dumps(phrase_list)},
     )
+
+
+async def _store_key_phrase_profile_detail(
+    store: BaseStore,
+    user_id: str,
+    assistant_id: str,
+    envelope: dict,
+) -> None:
+    """Persist the scores, judgements and judgement cache beside the phrase list.
+
+    The judgement cache is the reason this record exists at all: the judge runs
+    at a low but non-zero temperature, so re-judging the same phrase every
+    calibration would make the stored set drift, and every drift forces a full
+    recomputation of every document's stylometric row. Caching the judgement
+    keeps a stable corpus producing a stable set.
+    """
+    import json
+
+    await store.aput(
+        (user_id, assistant_id, KEY_PHRASE_PROFILE_KEY),
+        key=KEY_PHRASE_PROFILE_DETAIL_KEY,
+        value={"value": json.dumps(envelope)},
+    )
+
+
+async def _load_key_phrase_profile_detail(
+    store: BaseStore, user_id: str, assistant_id: str
+) -> dict:
+    """Read the detail record; an empty mapping when absent or unreadable.
+
+    An avatar calibrated before this record existed simply returns ``{}``, which
+    means "no cached judgements" — the next calibration pays for a full judging
+    pass once and caches the result.
+    """
+    from src.anubis.utils.dataset.key_phrases import load_key_phrase_profile_detail
+
+    try:
+        item = await store.aget(
+            (user_id, assistant_id, KEY_PHRASE_PROFILE_KEY),
+            key=KEY_PHRASE_PROFILE_DETAIL_KEY,
+        )
+    except Exception:  # noqa: BLE001 - a missing sibling key must never fail calibration
+        return {}
+    detail_str = (getattr(item, "value", None) or {}).get("value", None)
+    return load_key_phrase_profile_detail(detail_str)
 
 
 async def _load_previous_key_phrases(
@@ -188,8 +291,10 @@ async def calibrate_ground_truth(
 
     Beyond the per-document stylometric features it always maintained, this now:
 
-    * discovers the avatar's SIGNATURE KEY PHRASES over the full quote corpus and
-      stores the (previous ∪ new) union as the ``key_phrase_profile`` blob, and
+    * discovers the avatar's SIGNATURE KEY PHRASES over the full quote corpus
+      and stores the ranked, capped result as the ``key_phrase_profile`` blob
+      (previously-stored phrases are re-measured and compete for the cap rather
+      than being unioned in, which is what bounds the set across uploads), and
     * keeps every per-document feature row's ``key_phrase_rate`` measured against
       the CURRENT phrase set.
 
@@ -218,7 +323,6 @@ async def calibrate_ground_truth(
 
     import numpy as np
 
-    from src.anubis.utils.dataset.key_phrases import discover_key_phrases
     from src.anubis.utils.dataset.style_features import (
         FEATURE_NAMES,
         GROUND_TRUTH_FEATURES_DICT_KEY,
@@ -237,26 +341,30 @@ async def calibrate_ground_truth(
         return np.array([features[name] for name in FEATURE_NAMES], dtype=np.float64)
 
     # ── 1. Assemble the full quote corpus and (re)discover signature phrases. ──
+    quote_store_items: List[Any] = []
     doc_id_to_text = await _load_quote_corpus_by_doc_id(
-        store, user_id, assistant_id, documents
+        store,
+        user_id,
+        assistant_id,
+        documents,
+        collected_store_items=quote_store_items,
     )
-    # Phrase mining walks every 2-, 3- and 4-gram of the whole corpus. That is
-    # linear rather than quadratic work, but the corpus is now the avatar's FULL
-    # quote history (this function is driven from the store, not from one
-    # upload's documents), so keep the pure-Python scan off the event loop the
-    # same way the two feature-extraction passes below already are.
-    key_phrases_detailed = await asyncio.to_thread(
-        discover_key_phrases, list(doc_id_to_text.values())
+    # Two-stage discovery over the avatar's FULL quote history. Stage one is a
+    # pure-Python scan that the orchestrator keeps off the event loop; stage two
+    # is one batched structured-output judging pass that separates the phrases
+    # marking HOW this person talks from the ones that merely name WHAT they
+    # talk about — a distinction no statistic can make, because a person who
+    # discusses one subject constantly produces the same statistical signature
+    # as a person with a verbal habit.
+    #
+    # The previously-stored phrases are NOT unioned in. They are handed to the
+    # orchestrator as incumbents, re-measured against the current corpus, and
+    # keep their place only if the evidence still supports them. The old union
+    # is what made the stored list grow by roughly forty phrases per upload
+    # until the prompt was rendering hundreds of them.
+    from src.anubis.utils.dataset.key_phrase_judgement import (
+        build_signature_key_phrase_profile,
     )
-    discovered_key_phrases = [phrase["phrase"] for phrase in key_phrases_detailed]
-
-    # Union the newly-discovered phrases with the previously-stored ones, then
-    # keep only phrases ATTESTED in the current cleaned corpus (a signature
-    # phrase must occur in the avatar's own quotes; discovered phrases are
-    # attested by construction, stale artifacts from pre-cleaning phrase sets
-    # are not). Persisted BEFORE feature work so the signature-phrase section
-    # and the key_phrase_rate reference set stay in sync. Sorted for a
-    # deterministic stored order.
     from src.anubis.utils.dataset.key_phrases import (
         build_corpus_phrase_attestation_set,
     )
@@ -264,15 +372,79 @@ async def calibrate_ground_truth(
     previous_key_phrases = await _load_previous_key_phrases(
         store, user_id, assistant_id
     )
+    previous_profile_detail = await _load_key_phrase_profile_detail(
+        store, user_id, assistant_id
+    )
+    # The detail record is the authority on the incumbent set once it exists;
+    # before it exists the legacy bare list is, so an avatar calibrated under
+    # the old scheme still gets its phrases re-measured rather than discarded.
+    if not previous_profile_detail.get("phrases") and previous_key_phrases:
+        previous_profile_detail = {
+            **previous_profile_detail,
+            "phrases": list(previous_key_phrases),
+        }
+
+    target_speaker_name = _target_name_from_quote_metadata(
+        quote_store_items, documents
+    )
+
+    key_phrase_profile = None
+    try:
+        key_phrase_profile = await build_signature_key_phrase_profile(
+            list(doc_id_to_text.values()),
+            speaker_name=target_speaker_name,
+            previous_profile_detail=previous_profile_detail,
+        )
+        discovered_key_phrases = list(key_phrase_profile.phrases)
+    except Exception as exc:  # noqa: BLE001
+        # Never lose a working phrase set because discovery or judging failed.
+        # An empty set here would route calibration down the full-recompute
+        # path AND strip the avatar's SIGNATURE PHRASES section at the same time.
+        logger.warning(
+            "Signature key-phrase discovery failed for %s (%s); keeping the "
+            "previously stored phrase set of %d",
+            assistant_id,
+            exc,
+            len(previous_key_phrases),
+        )
+        discovered_key_phrases = list(previous_key_phrases)
+
+    # Keep only phrases ATTESTED in the current cleaned corpus: a signature
+    # phrase must occur in the avatar's own quotes. Discovered phrases are
+    # attested by construction; a retained incumbent from a corpus that is no
+    # longer readable is not. Order is preserved because the list is stored
+    # most-distinctive-first and the prompt renders a prefix of it. Persisted
+    # BEFORE feature work so the prompt section and the key_phrase_rate
+    # reference set stay in sync.
     attested_phrases = build_corpus_phrase_attestation_set(
         list(doc_id_to_text.values())
     )
-    key_phrases = sorted(
-        phrase
-        for phrase in set(discovered_key_phrases) | set(previous_key_phrases)
-        if phrase in attested_phrases
-    )
+    key_phrases = [
+        phrase for phrase in discovered_key_phrases if phrase in attested_phrases
+    ]
     await _store_signature_key_phrases(store, user_id, assistant_id, key_phrases)
+    if key_phrase_profile is not None:
+        from src.anubis.utils.dataset.key_phrases import (
+            build_key_phrase_profile_detail_envelope,
+        )
+
+        await _store_key_phrase_profile_detail(
+            store,
+            user_id,
+            assistant_id,
+            build_key_phrase_profile_detail_envelope(
+                key_phrases,
+                [
+                    entry
+                    for entry in key_phrase_profile.entries
+                    if entry.get("phrase") in set(key_phrases)
+                ],
+                key_phrase_profile.judgement_cache,
+                classification_histogram=(
+                    key_phrase_profile.classification_histogram
+                ),
+            ),
+        )
 
     # ── 2. Rebuild the per-document feature dict. ──────────────────────────────
     ground_truth_namespace = (user_id, assistant_id, GROUND_TRUTH_FEATURES_DICT_KEY)

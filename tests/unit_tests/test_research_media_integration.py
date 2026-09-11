@@ -122,3 +122,71 @@ def test_a_proposal_with_nothing_stored_still_reads_sensibly():
     # The panel words a contradiction against a stored fact differently from a
     # contradiction among the sources alone, so it is told which this is.
     assert preview["has_stored_fact"] is False
+
+
+""" What the acquisition already ingested is not ingested a second time """
+
+
+@pytest.mark.asyncio
+async def test_a_recording_the_acquisition_took_is_not_transcribed_twice(monkeypatch):
+    """The chosen video reaches the media pipeline once, not once per path.
+
+    The acquisition hands its winning video straight to the media pipeline, and
+    that same video is very often also one of the pages a verified fact came
+    from. Transcribing it twice would download, diarize and transcribe the whole
+    recording a second time, which is the single most expensive thing this
+    pipeline does.
+    """
+    from types import SimpleNamespace
+
+    from langgraph.store.memory import InMemoryStore
+
+    from src.anubis.utils.research import deep_research
+
+    chosen_video = "https://www.youtube.com/watch?v=abcdefghijk"
+    other_page = "https://example.com/a-profile"
+
+    async def _no_facts(*args, **kwargs):
+        return []
+
+    async def _brief(*args, **kwargs):
+        return deep_research.ResearchBrief(
+            subject_summary="A mathematician.", open_questions=[], topics=[]
+        )
+
+    async def _bootstrap(*args, **kwargs):
+        return {"media_urls": [chosen_video]}
+
+    monkeypatch.setattr(deep_research, "load_existing_identity_facts", _no_facts)
+    monkeypatch.setattr(deep_research, "build_research_brief", _brief)
+    monkeypatch.setattr(
+        deep_research,
+        "verified_source_urls",
+        lambda to_apply, limit: [chosen_video, other_page],
+    )
+    monkeypatch.setattr(
+        "src.anubis.utils.research.asset_bootstrap.run_asset_bootstrap", _bootstrap
+    )
+
+    summary = await deep_research.run_deep_research(
+        InMemoryStore(),
+        SimpleNamespace(
+            deep_research_max_queries=1,
+            deep_research_max_sources=1,
+            deep_research_max_topics=1,
+            deep_research_concurrency=1,
+            deep_research_follow_up_rounds=0,
+            deep_research_max_media_items=24,
+        ),
+        creator_id="auth0|creator",
+        assistant_id="assistant-1",
+        subject_name="Ada Lovelace",
+        subject_description=None,
+        research_hint=None,
+        emit=lambda payload: None,
+        bootstrap=object(),
+    )
+
+    assert summary["bootstrap_media_urls"] == [chosen_video]
+    # The page the acquisition did not take still goes through; the video does not.
+    assert summary["media_source_urls"] == [other_page]

@@ -41,7 +41,7 @@ from src.anubis.utils.connected_accounts import (
     social_providers,
 )
 from src.api import webapp as webapp_module
-from src.anubis.utils.connected_accounts.testing_support import use_legacy_gmail
+from src.anubis.utils.connected_accounts.testing_support import use_password_mailbox
 
 USER_ID = "auth0-user-abc"
 ASSISTANT_ID = "assistant-personal"
@@ -89,7 +89,7 @@ class _StoreAPI:
 
 def _install(monkeypatch, store_api, context=None):
     """Point the endpoints at a fake SDK client and a resolved personal avatar."""
-    use_legacy_gmail(monkeypatch)
+    use_password_mailbox(monkeypatch)
     monkeypatch.setattr(
         webapp_module, "get_client", lambda **kwargs: SimpleNamespace(store=store_api)
     )
@@ -124,9 +124,9 @@ def _reject_credentials(monkeypatch):
 
 def _body(**overrides):
     payload = {
-        "provider": "gmail",
+        "provider": "email_account",
         "email_address": ADDRESS,
-        "app_password": APP_PASSWORD,
+        "password": APP_PASSWORD,
     }
     payload.update(overrides)
     return SimpleNamespace(json=_async_returning(payload))
@@ -156,11 +156,47 @@ async def test_a_rejected_password_stores_nothing(monkeypatch):
         )
 
     assert raised.value.status_code == 400
-    # The message has to send the owner to the right place, because "wrong
-    # password" alone makes people retype the same account password.
-    assert "app password" in raised.value.detail.lower()
-    assert "apppasswords" in raised.value.detail
+    # A refused password is exactly that, and the message names the server that
+    # refused it so the owner knows which account to check.
+    detail = raised.value.detail.lower()
+    assert "imap.example.com" in detail
+    assert ADDRESS in detail
+    # No surface may send a person off to generate a secret.
+    assert "app password" not in detail
     assert store_api.items == {}, "nothing may be stored when verification fails"
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_refuses_passwords_says_so_before_trying_one(monkeypatch):
+    """Google withdrew password access; typing one can only ever be rejected.
+
+    The owner must be told which company made that change and which sign-in it
+    wants instead, BEFORE a login is attempted — a bare "authentication failed"
+    is what makes a person type the same doomed password a second time.
+    """
+    from src.anubis.utils.connected_accounts.testing_support import use_legacy_gmail
+    from src.anubis.utils.tools.email import imap_client
+
+    store_api = _StoreAPI()
+    _install(monkeypatch, store_api)
+    use_legacy_gmail(monkeypatch)
+
+    def _must_not_run(credentials):
+        raise AssertionError("no login may be attempted against a withdrawn provider")
+
+    monkeypatch.setattr(imap_client, "verify_credentials", _must_not_run)
+
+    with pytest.raises(webapp_module.HTTPException) as raised:
+        await webapp_module.connect_mailbox(
+            request=_body(provider="gmail"), current_user=_current_user()
+        )
+
+    assert raised.value.status_code == 400
+    detail = raised.value.detail.lower()
+    assert "google" in detail
+    assert "sign-in" in detail
+    assert "app password" not in detail
+    assert store_api.items == {}
 
 
 @pytest.mark.asyncio
@@ -226,7 +262,7 @@ async def test_connecting_stores_ciphertext_and_returns_neither_secret(monkeypat
     )
     assert response.status_code == 200
 
-    key = account_key("gmail", ADDRESS)
+    key = account_key("email_account", ADDRESS)
     stored = store_api.items[key]
     assert stored["encrypted_secret"] != APP_PASSWORD, "the secret must be encrypted"
     assert (
@@ -242,7 +278,7 @@ async def test_connecting_stores_ciphertext_and_returns_neither_secret(monkeypat
 async def test_listing_never_returns_the_password_or_the_ciphertext(monkeypatch):
     context = _context()
     record = build_account_record(
-        provider=get_provider("gmail"),
+        provider=get_provider("email_account"),
         account_address=ADDRESS,
         display_label="evan",
         encrypted_secret=secret_store.encrypt_secret(APP_PASSWORD, context),
@@ -265,7 +301,7 @@ async def test_listing_never_returns_the_password_or_the_ciphertext(monkeypatch)
 def test_the_public_projection_is_a_whitelist():
     """A field added to the record later must not leak by default."""
     record = build_account_record(
-        provider=get_provider("gmail"),
+        provider=get_provider("email_account"),
         account_address=ADDRESS,
         display_label="evan",
         encrypted_secret="ciphertext",
@@ -314,7 +350,7 @@ async def test_reconnecting_refreshes_one_record_and_keeps_its_label(monkeypatch
 
     await webapp_module.connect_mailbox(request=_body(), current_user=_current_user())
     await webapp_module.connect_mailbox(
-        request=_body(app_password="rotated password"), current_user=_current_user()
+        request=_body(password="rotated password"), current_user=_current_user()
     )
 
     assert len(store_api.items) == 1
@@ -333,7 +369,7 @@ async def test_the_account_cap_is_enforced_for_new_accounts_only(monkeypatch):
     # Reconnecting the SAME account must still work at the cap, or rotating a
     # password would lock the owner out of their own mailbox.
     await webapp_module.connect_mailbox(
-        request=_body(app_password="rotated"), current_user=_current_user()
+        request=_body(password="rotated"), current_user=_current_user()
     )
     assert len(store_api.items) == 1
 
@@ -349,14 +385,14 @@ async def test_the_account_cap_is_enforced_for_new_accounts_only(monkeypatch):
 async def test_disconnecting_removes_exactly_one_account(monkeypatch):
     context = _context()
     first = build_account_record(
-        provider=get_provider("gmail"),
+        provider=get_provider("email_account"),
         account_address="evan@personal.com",
         display_label="evan",
         encrypted_secret="c1",
         assistant_id=ASSISTANT_ID,
     )
     second = build_account_record(
-        provider=get_provider("gmail"),
+        provider=get_provider("email_account"),
         account_address="evan@work.com",
         display_label="evan 2",
         encrypted_secret="c2",
@@ -380,7 +416,7 @@ async def test_disconnecting_without_an_account_key_deletes_nothing(monkeypatch)
     """The /disconnect_mcp defect: an omitted identifier meaning 'delete all'."""
     context = _context()
     record = build_account_record(
-        provider=get_provider("gmail"),
+        provider=get_provider("email_account"),
         account_address=ADDRESS,
         display_label="evan",
         encrypted_secret="c1",
@@ -520,7 +556,7 @@ class _InMemoryStore:
 
 def _stored(address, assistant_id, status="connected"):
     record = build_account_record(
-        provider=get_provider("gmail"),
+        provider=get_provider("email_account"),
         account_address=address,
         display_label=derive_display_label(address),
         encrypted_secret="ciphertext",

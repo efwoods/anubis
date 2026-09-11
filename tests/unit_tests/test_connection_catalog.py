@@ -58,6 +58,7 @@ from src.anubis.utils.connected_accounts.testing_support import (
     open_authorization,
     register_coming_soon_provider,
     use_legacy_gmail,
+    use_password_mailbox,
 )
 
 USER_ID = "auth0-user-abc"
@@ -123,7 +124,7 @@ def _no_published_repository():
 
 
 def _install(monkeypatch, store_api, context=None):
-    use_legacy_gmail(monkeypatch)
+    use_password_mailbox(monkeypatch)
     monkeypatch.setattr(
         webapp_module, "get_client", lambda **kwargs: SimpleNamespace(store=store_api)
     )
@@ -363,7 +364,7 @@ async def test_connect_account_route_connects_a_custom_server(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_connect_account_route_accepts_flat_fields_for_gmail(monkeypatch):
+async def test_connect_account_route_accepts_flat_fields_for_a_mailbox(monkeypatch):
     from src.anubis.utils.tools.email import imap_client
 
     store_api = _StoreAPI()
@@ -373,15 +374,15 @@ async def test_connect_account_route_accepts_flat_fields_for_gmail(monkeypatch):
     response = await webapp_module.connect_account_route(
         request=_json_request(
             {
-                "provider": "gmail",
+                "provider": "email_account",
                 "email_address": "evan@example.com",
-                "app_password": "pw",
+                "password": "pw",
             }
         ),
         current_user=_current_user(),
     )
     assert response.status_code == 200
-    assert "gmail:evan@example.com" in store_api.items
+    assert "email_account:evan@example.com" in store_api.items
 
 
 @pytest.mark.asyncio

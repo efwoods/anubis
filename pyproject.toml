@@ -118,6 +118,12 @@ dependencies = [
     # a sentence telling the person to convert the photo, so the dependency is
     # what makes an iPhone photo usable at all.
     "pillow-heif>=1.7.0",
+    # Wireframes over the person (src/anubis/utils/motion/): the same
+    # PoseLandmarker and FaceLandmarker the browser runs, so a track learned
+    # from an uploaded video and one learned from the live camera are written
+    # against the same named coordinates. 1.0.x ships a py3-none manylinux_2_28
+    # wheel with no protobuf pin; verified to import on the wolfi image.
+    "mediapipe>=1.0.1",
 ]
 
 [project.optional-dependencies]

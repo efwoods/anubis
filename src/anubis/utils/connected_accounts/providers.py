@@ -20,8 +20,9 @@ Fields that carry design decisions:
     that actually evidence a public identity may be ``"social"``.
 
 ``credential_mechanism`` decides how a connection is established
-    ``"app_password"`` collects a credential in a form and verifies it by
-    logging in. ``"mcp_url"`` collects a server address (and an optional bearer
+    ``"app_password"`` (the constant is :data:`MECHANISM_PASSWORD`; the string
+    is historical) collects an address and the owner's own account password in
+    a form and verifies both by logging in. ``"mcp_url"`` collects a server address (and an optional bearer
     token) and verifies it by listing the server's tools. ``"auth0_identity"``
     links a secondary identity onto the account. ``"oauth"`` runs an
     authorization-code redirect and stores a refresh token.
@@ -37,25 +38,35 @@ Fields that carry design decisions:
     connect attempt is refused with a plain message rather than a broken form.
 
 How an owner signs in (``login_mode``)
-    The owner never types a credential into Neural Nexus. The connect card's
-    button opens the vendor's OWN sign-in page in a popup: Google's consent
-    screen for Gmail, Calendar, Analytics, and YouTube; GitHub's, X's, and
-    Vercel's authorization pages; Plaid Link for a bank; and, for any site
-    with no OAuth at all, a live browser the API hosts, where the owner signs
-    in on the site's real login page and the signed-in session is kept. The
-    ``login_mode`` property derives the popup kind from the mechanism so the
-    card, the routes, and the tools agree.
+    Two shapes, and only two. Either the owner gives an address and their own
+    account password on the card, and the handler proves them by logging in to
+    the account's own protocol; or the card opens the vendor's OWN sign-in page
+    in a popup — a consent screen, Plaid Link for a bank, or a live browser on
+    the site's real login page for a site with no OAuth at all. The
+    ``login_mode`` property derives which from the mechanism so the card, the
+    routes, and the tools agree.
 
-Gmail through Google sign-in (an accepted trade-off)
-    Reading a mailbox needs the restricted scope ``https://mail.google.com/``.
-    Until the OAuth client passes Google verification and the CASA assessment,
-    the consent screen stays in Testing status: only listed test users may sign
-    in and refresh tokens expire after seven days. An expired token is surfaced
-    as a ``needs_reconnect`` status and the card is raised again; nothing
-    silently breaks. App passwords are deliberately NOT offered: the owner asked
-    for the official Google login and nothing else, and since 2025-03-14 Google
-    accepts only OAuth 2.0 or an app password over IMAP anyway. Existing
-    app-password records keep working through ``mailbox_credentials_for``.
+An address and a password comes first
+    A desktop mail client adds an account from an address and a password and
+    finds the servers itself. :data:`EMAIL_ACCOUNT_PROVIDER` is that row, and
+    ``mail_autoconfig.discover_mail_settings`` is that discovery, so one row
+    covers every IMAP provider in the world instead of one row per company.
+    A provider row is only needed when a company wants something a password
+    cannot express.
+
+**No app passwords, anywhere.** Nothing here asks an owner to generate a
+    sixteen-character secret, offers one as an alternative, or names one in a
+    label, a placeholder, or a help link. A generated secret is a chore handed
+    to every person individually, which is precisely what the address-and-
+    password row exists to avoid. Google, Microsoft, and Yahoo have each
+    withdrawn password authentication for mail access; those three connect
+    through a certified OAuth client instead, where the owner signs in with the
+    *same* address and account password on the provider's own page.
+    ``mail_autoconfig.withdrawn_password_provider`` recognises their hosts, so
+    an owner who types such an address is told which sign-in that provider
+    wants rather than being handed a rejection for a password that was never
+    going to work. Records connected before this rule keep working unchanged
+    through ``mailbox_credentials_for``.
 """
 
 from __future__ import annotations
@@ -95,7 +106,15 @@ ALL_KINDS = frozenset(
 )
 
 # Credential mechanisms.
-MECHANISM_APP_PASSWORD = "app_password"
+# The owner supplies an address and their own account password, and the
+# handler proves both by logging in. The stored value is still the historical
+# ``"app_password"`` string so records written before this rename keep working
+# with no migration; the NAME changed because the mechanism never required an
+# app password and calling it one taught every reader the wrong thing. Nothing
+# in the product asks an owner for a generated secret.
+MECHANISM_PASSWORD = "app_password"
+# Deprecated spelling, kept so an import of the old name still resolves.
+MECHANISM_APP_PASSWORD = MECHANISM_PASSWORD
 MECHANISM_AUTH0_IDENTITY = "auth0_identity"
 MECHANISM_OAUTH = "oauth"
 MECHANISM_MCP_URL = "mcp_url"
@@ -103,9 +122,18 @@ MECHANISM_DEVICE_PAIRING = "device_pairing"
 MECHANISM_PLAID_LINK = "plaid_link"
 MECHANISM_BROWSER_SESSION = "browser_session"
 MECHANISM_URL_ONLY = "url_only"
+# The owner names a site and the connection is worked out from the site itself:
+# if it offers a Model Context Protocol server, that is the way in, and the
+# server's own dynamic client registration means no application to create and
+# no credential to paste. See ``mcp_discovery``.
+MECHANISM_SITE_DISCOVERY = "site_discovery"
+# The vendor publishes no OAuth for third-party applications but issues the
+# owner a personal API key, which is the route it documents and supports. The
+# key is proved at connect time and stored encrypted like any other credential.
+MECHANISM_API_KEY = "api_key"
 ALL_MECHANISMS = frozenset(
     {
-        MECHANISM_APP_PASSWORD,
+        MECHANISM_PASSWORD,
         MECHANISM_AUTH0_IDENTITY,
         MECHANISM_OAUTH,
         MECHANISM_MCP_URL,
@@ -113,13 +141,56 @@ ALL_MECHANISMS = frozenset(
         MECHANISM_PLAID_LINK,
         MECHANISM_BROWSER_SESSION,
         MECHANISM_URL_ONLY,
+        MECHANISM_SITE_DISCOVERY,
+        MECHANISM_API_KEY,
+    }
+)
+
+# How a provider announces that the owner has published something new. This is
+# the transport a content subscription uses, and it is deliberately separate
+# from ``credential_mechanism``: how an account is CONNECTED says nothing about
+# how it ANNOUNCES. YouTube connects by OAuth and announces by WebSub; Instagram
+# connects by browser session and announces by emailing the owner.
+#
+# There is no polling value on purpose. A subscription either receives a push
+# from the platform or recognises the platform's own notification to the owner;
+# a provider that can do neither is reported as not subscribable rather than
+# being swept on a timer.
+CONTENT_TRANSPORT_WEBSUB = "websub"
+CONTENT_TRANSPORT_EVENTSUB = "eventsub"
+CONTENT_TRANSPORT_META_GRAPH = "meta_graph"
+CONTENT_TRANSPORT_EMAIL_NOTIFICATION = "email_notification"
+CONTENT_TRANSPORT_NONE = "none"
+ALL_CONTENT_TRANSPORTS = frozenset(
+    {
+        CONTENT_TRANSPORT_WEBSUB,
+        CONTENT_TRANSPORT_EVENTSUB,
+        CONTENT_TRANSPORT_META_GRAPH,
+        CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+        CONTENT_TRANSPORT_NONE,
+    }
+)
+
+# The transports the platform itself pushes to our callback. Everything else
+# reaches us because the owner's mailbox received the platform's notification.
+PUSH_CONTENT_TRANSPORTS = frozenset(
+    {
+        CONTENT_TRANSPORT_WEBSUB,
+        CONTENT_TRANSPORT_EVENTSUB,
+        CONTENT_TRANSPORT_META_GRAPH,
     }
 )
 
 # Mechanisms whose connect flow is a form the owner completes on the card.
 # ``url_only`` is a form too (a website address, no credential).
 FORM_MECHANISMS = frozenset(
-    {MECHANISM_APP_PASSWORD, MECHANISM_MCP_URL, MECHANISM_URL_ONLY}
+    {
+        MECHANISM_PASSWORD,
+        MECHANISM_MCP_URL,
+        MECHANISM_URL_ONLY,
+        MECHANISM_SITE_DISCOVERY,
+        MECHANISM_API_KEY,
+    }
 )
 
 # How the card signs the owner in. Derived from the mechanism so every surface
@@ -130,9 +201,11 @@ LOGIN_MODE_PLAID_LINK = "plaid_link"
 LOGIN_MODE_BROWSER_SESSION = "browser_session"
 LOGIN_MODE_NONE = "none"
 LOGIN_MODES_BY_MECHANISM: dict[str, str] = {
-    MECHANISM_APP_PASSWORD: LOGIN_MODE_FORM,
+    MECHANISM_PASSWORD: LOGIN_MODE_FORM,
     MECHANISM_MCP_URL: LOGIN_MODE_FORM,
     MECHANISM_URL_ONLY: LOGIN_MODE_FORM,
+    MECHANISM_SITE_DISCOVERY: LOGIN_MODE_FORM,
+    MECHANISM_API_KEY: LOGIN_MODE_FORM,
     MECHANISM_OAUTH: LOGIN_MODE_OAUTH_POPUP,
     MECHANISM_PLAID_LINK: LOGIN_MODE_PLAID_LINK,
     MECHANISM_BROWSER_SESSION: LOGIN_MODE_BROWSER_SESSION,
@@ -247,10 +320,12 @@ class ConnectedAccountProvider:
         featured: Whether the row appears in the Featured section.
         availability: One of :data:`ALL_AVAILABILITIES`.
         connect_endpoint: The route a form-mechanism card posts its fields to.
-        imap_host: IMAP server, for ``app_password`` providers only.
-        imap_port: IMAP TLS port, for ``app_password`` providers only.
-        smtp_host: SMTP submission server, for ``app_password`` providers only.
-        smtp_port: SMTP submission port, for ``app_password`` providers only.
+        imap_host: IMAP server, for password providers only. Left empty on
+            the generic email row, where the servers are discovered from the
+            address instead of being written down per provider.
+        imap_port: IMAP TLS port, for password providers only.
+        smtp_host: SMTP submission server, for password providers only.
+        smtp_port: SMTP submission port, for password providers only.
         drafts_mailbox: IMAP folder that holds drafts. Gmail exposes this as
             ``"[Gmail]/Drafts"`` rather than the ``"Drafts"`` most other servers
             use, which is exactly the sort of per-provider detail this table
@@ -297,6 +372,11 @@ class ConnectedAccountProvider:
     connect_fields: tuple[ConnectFieldSpec, ...] = ()
     pairing_instructions: str = ""
     install_url: str | None = None
+    # True for a row that names no company and finds the servers from the
+    # address instead (see ``mail_autoconfig``). Such a row legitimately has no
+    # ``imap_host``; every row that DOES name a company still must declare one,
+    # which is why this is an explicit opt-out rather than a relaxed check.
+    discovers_servers: bool = False
     # Suggested questions shown once the account is connected, so the owner
     # can start using the connection without wording a query from scratch.
     # Each is {"label": short chip text, "prompt": the message sent to chat}.
@@ -315,6 +395,41 @@ class ConnectedAccountProvider:
     # A device-bound provider is connected through a machine running the
     # daemon rather than through a credential of its own.
     device_bound: bool = False
+    # True for the few vendors whose terms forbid keeping a signed-in session
+    # and reading their pages, so the key they issue is the ONLY route allowed.
+    # Everywhere else the owner's own login comes first; this flag is the narrow
+    # exception, and it exists so that exception is stated per vendor rather
+    # than hidden in the ordering. See ``vendor_key_tools`` for the finding.
+    terms_require_api_key: bool = False
+    # How this provider announces newly published content, and what the owner's
+    # mailbox should watch for when the answer is an email notification.
+    # ``notification_sender_domains`` is matched against the sending domain of a
+    # message, which is what keeps the notification reader from treating every
+    # message from a social network as a publication event.
+    content_transport: str = CONTENT_TRANSPORT_NONE
+    notification_sender_domains: tuple[str, ...] = ()
+    # Template that turns the owner's handle into the public profile the crawl
+    # starts from, e.g. ``"https://www.instagram.com/{handle}/"``. A provider
+    # whose crawl seed is discovered another way (YouTube's uploads playlist,
+    # read from the API at connect time) leaves this unset.
+    profile_url_template: str | None = None
+
+    @property
+    def pushes_content(self) -> bool:
+        """Whether the platform itself calls our webhook when content appears."""
+        return self.content_transport in PUSH_CONTENT_TRANSPORTS
+
+    @property
+    def is_subscribable(self) -> bool:
+        """Whether new content from this provider can reach the avatar at all."""
+        return self.content_transport != CONTENT_TRANSPORT_NONE
+
+    def profile_url_for(self, handle: str) -> str | None:
+        """Return the owner's public profile URL, or ``None`` without a template."""
+        cleaned = (handle or "").strip().lstrip("@")
+        if not cleaned or not self.profile_url_template:
+            return None
+        return self.profile_url_template.format(handle=cleaned)
 
     @property
     def login_mode(self) -> str:
@@ -351,6 +466,131 @@ class ConnectedAccountProvider:
         return COMING_SOON_MESSAGE.format(display_name=self.display_name)
 
 
+# The row a mail client would be. One provider for every IMAP host on earth:
+# the owner types the address and their own account password, and
+# ``mail_autoconfig.discover_mail_settings`` finds the servers, so there is no
+# per-company row to write and nothing for the owner to look up. The host and
+# port fields are deliberately empty — they are filled in per record from what
+# discovery returned, which is also why ``build_account_record`` accepts
+# overrides.
+EMAIL_ACCOUNT_PROVIDER = ConnectedAccountProvider(
+    name="email_account",
+    kind=KIND_MAILBOX,
+    credential_mechanism=MECHANISM_PASSWORD,
+    display_name="Email account",
+    category=CATEGORY_MAIL,
+    summary="Search, read, draft, and send email",
+    send_supported=True,
+    sent_mailbox="Sent",
+    card_description=(
+        "Connect any email account with your address and password, the way a "
+        "mail application does. The servers are found for you."
+    ),
+    icon_key="email",
+    discovers_servers=True,
+    starter_prompts=(
+        {
+            "label": "What needs a reply?",
+            "prompt": "What emails need a reply, and can you draft responses in my voice?",
+        },
+        {
+            "label": "Summarize my inbox",
+            "prompt": "Summarize the important emails from the last three days.",
+        },
+        {
+            "label": "Unsubscribe candidates",
+            "prompt": "Which newsletters or senders could I unsubscribe from?",
+        },
+    ),
+    connect_fields=(
+        ConnectFieldSpec(
+            name="email_address",
+            label="Email address",
+            input_type="email",
+            placeholder="you@example.com",
+            help_text="The address of the mailbox to connect.",
+        ),
+        ConnectFieldSpec(
+            name="password",
+            label="Password",
+            input_type="password",
+            placeholder="Your email password",
+            help_text="The password you use to sign in to this email account.",
+        ),
+        ConnectFieldSpec(
+            name="imap_host",
+            label="IMAP server",
+            placeholder="Found automatically",
+            help_text=(
+                "Only needed if your provider publishes no settings — leave "
+                "empty and they will be discovered."
+            ),
+            required=False,
+        ),
+        ConnectFieldSpec(
+            name="smtp_host",
+            label="Outgoing server",
+            placeholder="Found automatically",
+            help_text="Only needed alongside the IMAP server above.",
+            required=False,
+        ),
+    ),
+)
+
+# The calendar half of the same idea, over CalDAV. Fastmail, Nextcloud, iCloud,
+# Zimbra, Zoho, and every self-hosted or corporate calendar server speak it, so
+# one row covers them all from an address and a password.
+CALENDAR_ACCOUNT_PROVIDER = ConnectedAccountProvider(
+    name="calendar_account",
+    kind=KIND_CALENDAR,
+    credential_mechanism=MECHANISM_PASSWORD,
+    display_name="Calendar account",
+    category=CATEGORY_CALENDAR,
+    summary="Read the schedule and book appointments",
+    card_description=(
+        "Connect any calendar with your address and password. The avatar can "
+        "read your schedule, find free time, and book appointments you ask for."
+    ),
+    icon_key="calendar",
+    discovers_servers=True,
+    starter_prompts=(
+        {
+            "label": "What is on this week?",
+            "prompt": "What is on my calendar this week?",
+        },
+        {
+            "label": "Find me an hour",
+            "prompt": "Find me a free hour on Thursday afternoon.",
+        },
+    ),
+    connect_fields=(
+        ConnectFieldSpec(
+            name="email_address",
+            label="Email address",
+            input_type="email",
+            placeholder="you@example.com",
+            help_text="The address you sign in to this calendar with.",
+        ),
+        ConnectFieldSpec(
+            name="password",
+            label="Password",
+            input_type="password",
+            placeholder="Your calendar password",
+            help_text="The password you use to sign in to this account.",
+        ),
+        ConnectFieldSpec(
+            name="server_url",
+            label="Calendar server",
+            placeholder="Found automatically",
+            help_text=(
+                "Only needed if your provider publishes no settings — leave "
+                "empty and it will be discovered."
+            ),
+            required=False,
+        ),
+    ),
+)
+
 GMAIL_PROVIDER = ConnectedAccountProvider(
     name="gmail",
     kind=KIND_MAILBOX,
@@ -369,9 +609,18 @@ GMAIL_PROVIDER = ConnectedAccountProvider(
     card_description="Search, read, draft, and send email. Sign in with Google.",
     icon_key="gmail",
     starter_prompts=(
-        {"label": 'What needs a reply?', "prompt": 'What emails need a reply, and can you draft responses in my voice?'},
-        {"label": 'Summarize my inbox', "prompt": 'Summarize the important emails from the last three days.'},
-        {"label": 'Unsubscribe candidates', "prompt": 'Which newsletters or senders could I unsubscribe from?'},
+        {
+            "label": "What needs a reply?",
+            "prompt": "What emails need a reply, and can you draft responses in my voice?",
+        },
+        {
+            "label": "Summarize my inbox",
+            "prompt": "Summarize the important emails from the last three days.",
+        },
+        {
+            "label": "Unsubscribe candidates",
+            "prompt": "Which newsletters or senders could I unsubscribe from?",
+        },
     ),
     oauth_config_key="google",
     oauth_scopes=("openid", "email", "https://mail.google.com/"),
@@ -447,8 +696,10 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
     credential_mechanism=MECHANISM_OAUTH,
     display_name="Google Calendar",
     category=CATEGORY_CALENDAR,
-    summary="Check your schedule",
-    card_description="Read your calendar so the avatar knows your schedule.",
+    summary="Read the schedule and book appointments",
+    card_description=(
+        "Read your calendar and book, change, or cancel the appointments you ask for."
+    ),
     icon_key="google_calendar",
     login_url="https://accounts.google.com/ServiceLogin?continue=https://calendar.google.com/",
     home_url="https://calendar.google.com/",
@@ -457,6 +708,7 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
         "openid",
         "email",
         "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar.events",
     ),
 )
 
@@ -488,6 +740,8 @@ YOUTUBE_PROVIDER = ConnectedAccountProvider(
     summary="Your channel's videos, statistics, and comments",
     card_description="Read your channel's videos, statistics, and comments.",
     icon_key="youtube",
+    content_transport=CONTENT_TRANSPORT_WEBSUB,
+    notification_sender_domains=("youtube.com", "google.com"),
     login_url="https://accounts.google.com/ServiceLogin?continue=https://studio.youtube.com/",
     home_url="https://studio.youtube.com/",
     oauth_config_key="google",
@@ -514,9 +768,18 @@ GITHUB_PROVIDER = ConnectedAccountProvider(
     login_url="https://github.com/login",
     home_url="https://github.com/notifications",
     starter_prompts=(
-        {"label": 'Last sprint', "prompt": 'What happened in my repositories in the last sprint?'},
-        {"label": 'Feature requests', "prompt": 'Are there open feature requests or bugs I should know about?'},
-        {"label": 'Work in progress', "prompt": 'What is currently in progress across my repositories?'},
+        {
+            "label": "Last sprint",
+            "prompt": "What happened in my repositories in the last sprint?",
+        },
+        {
+            "label": "Feature requests",
+            "prompt": "Are there open feature requests or bugs I should know about?",
+        },
+        {
+            "label": "Work in progress",
+            "prompt": "What is currently in progress across my repositories?",
+        },
     ),
 )
 
@@ -530,6 +793,11 @@ X_PROVIDER = ConnectedAccountProvider(
     send_supported=True,
     card_description="Read your posts and post replies as you.",
     icon_key="twitter",
+    # X offers no webhook on the free tier, but it emails the owner when the
+    # owner posts, so the notification transport carries it.
+    content_transport=CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+    notification_sender_domains=("x.com", "twitter.com"),
+    profile_url_template="https://x.com/{handle}",
     oauth_config_key="x",
     login_url="https://x.com/i/flow/login",
     home_url="https://x.com/notifications",
@@ -563,13 +831,23 @@ COINBASE_PROVIDER = ConnectedAccountProvider(
     ),
     icon_key="coinbase",
     oauth_config_key="coinbase",
-    oauth_scopes=("wallet:user:read", "wallet:accounts:read", "wallet:transactions:read"),
+    oauth_scopes=(
+        "wallet:user:read",
+        "wallet:accounts:read",
+        "wallet:transactions:read",
+    ),
     login_url="https://www.coinbase.com/signin",
     home_url="https://www.coinbase.com/dashboard",
     starter_prompts=(
-        {"label": 'My balances', "prompt": 'What are my Coinbase balances and total holdings value?'},
-        {"label": 'Recent activity', "prompt": 'Show my recent Coinbase transactions.'},
-        {"label": 'Gains and losses', "prompt": 'How have my holdings changed recently?'},
+        {
+            "label": "My balances",
+            "prompt": "What are my Coinbase balances and total holdings value?",
+        },
+        {"label": "Recent activity", "prompt": "Show my recent Coinbase transactions."},
+        {
+            "label": "Gains and losses",
+            "prompt": "How have my holdings changed recently?",
+        },
     ),
 )
 
@@ -588,53 +866,89 @@ PLAID_PROVIDER = ConnectedAccountProvider(
     ),
     icon_key="bank",
     starter_prompts=(
-        {"label": 'Subscriptions overview', "prompt": 'What subscriptions and recurring charges am I currently paying for?'},
-        {"label": 'Reduce spending', "prompt": 'Where could I reduce spending, subscriptions, or fees this year?'},
-        {"label": 'Spending breakdown', "prompt": 'How is my money split across categories this month? Chart it.'},
-        {"label": 'Recent large charges', "prompt": 'Show my largest transactions in the last 30 days.'},
+        {
+            "label": "Subscriptions overview",
+            "prompt": "What subscriptions and recurring charges am I currently paying for?",
+        },
+        {
+            "label": "Reduce spending",
+            "prompt": "Where could I reduce spending, subscriptions, or fees this year?",
+        },
+        {
+            "label": "Spending breakdown",
+            "prompt": "How is my money split across categories this month? Chart it.",
+        },
+        {
+            "label": "Recent large charges",
+            "prompt": "Show my largest transactions in the last 30 days.",
+        },
     ),
 )
 
 LANGSMITH_PROVIDER = ConnectedAccountProvider(
     name="langsmith",
     kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    credential_mechanism=MECHANISM_API_KEY,
     display_name="LangSmith",
     category=CATEGORY_VENDOR,
     summary="Traces, runs, and usage of your LangSmith organization",
     card_description="Sign in to LangSmith so the avatar can read usage and cost.",
     icon_key="langsmith",
-    login_url="https://smith.langchain.com/",
     home_url="https://smith.langchain.com/",
-    recipe_key="langsmith",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="lsv2_...",
+            help_text="From your LangSmith settings page.",
+        ),
+    ),
+    terms_require_api_key=True,
 )
 
 OPENAI_PROVIDER = ConnectedAccountProvider(
     name="openai",
     kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    credential_mechanism=MECHANISM_API_KEY,
     display_name="OpenAI",
     category=CATEGORY_VENDOR,
     summary="Usage and costs of your OpenAI organization",
     card_description="Sign in to the OpenAI platform so the avatar can read usage.",
     icon_key="openai",
-    login_url="https://platform.openai.com/login",
     home_url="https://platform.openai.com/usage",
-    recipe_key="openai",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="sk-...",
+            help_text="From platform.openai.com under API keys. Spend figures need an administrator key.",
+        ),
+    ),
+    terms_require_api_key=True,
 )
 
 ANTHROPIC_PROVIDER = ConnectedAccountProvider(
     name="anthropic",
     kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    credential_mechanism=MECHANISM_API_KEY,
     display_name="Claude (Anthropic)",
     category=CATEGORY_VENDOR,
     summary="Usage and costs of your Anthropic console",
     card_description="Sign in to the Anthropic console so the avatar can read usage.",
     icon_key="anthropic",
-    login_url="https://console.anthropic.com/login",
     home_url="https://console.anthropic.com/settings/usage",
-    recipe_key="anthropic",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="sk-ant-...",
+            help_text="From console.anthropic.com under API keys. Spend figures need an administrator key.",
+        ),
+    ),
+    terms_require_api_key=True,
 )
 
 WEBSITE_PROVIDER = ConnectedAccountProvider(
@@ -666,38 +980,85 @@ WEBSITE_PROVIDER = ConnectedAccountProvider(
         ),
     ),
     starter_prompts=(
-        {"label": 'Audit my site', "prompt": 'Audit my website: content, search visibility, links, and accessibility.'},
-        {"label": 'What changed?', "prompt": 'What changed on my website since the last audit?'},
-        {"label": 'Traffic', "prompt": 'How much traffic did my website get this month?'},
+        {
+            "label": "Audit my site",
+            "prompt": "Audit my website: content, search visibility, links, and accessibility.",
+        },
+        {
+            "label": "What changed?",
+            "prompt": "What changed on my website since the last audit?",
+        },
+        {
+            "label": "Traffic",
+            "prompt": "How much traffic did my website get this month?",
+        },
     ),
 )
 
 CUSTOM_SITE_PROVIDER = ConnectedAccountProvider(
     name="custom_site",
-    kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
-    display_name="Custom site",
+    kind=KIND_MCP_SERVER,
+    credential_mechanism=MECHANISM_SITE_DISCOVERY,
+    display_name="Any site",
     category=CATEGORY_CUSTOM,
-    summary="Sign in to any website and let the avatar use your account",
+    summary="Connect a site the way the site itself offers",
     featured=False,
     card_description=(
-        "Sign in to any website on its own login page. The avatar keeps the "
-        "signed-in session and can read and act on your account there."
+        "Name a site and the avatar works out how to reach it. A site that "
+        "runs a Model Context Protocol server needs nothing else — no "
+        "application to create, no key to paste."
     ),
     icon_key="url",
     connect_fields=(
         ConnectFieldSpec(
-            name="name",
-            label="Name",
-            placeholder="My dashboard",
-            help_text="How the avatar refers to this site in conversation.",
+            name="site_url",
+            label="Site address",
+            input_type="url",
+            placeholder="example.com",
+            help_text="The site's address. The rest is worked out from there.",
         ),
         ConnectFieldSpec(
+            name="name",
+            label="Name",
+            placeholder="Taken from the site",
+            help_text="How the avatar refers to this site in conversation.",
+            required=False,
+        ),
+    ),
+)
+
+SIGNED_IN_SITE_PROVIDER = ConnectedAccountProvider(
+    name="signed_in_site",
+    kind=KIND_MCP_SERVER,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="Any site you sign in to",
+    category=CATEGORY_CUSTOM,
+    summary="Sign in once; the avatar reads and acts on the site afterwards",
+    featured=False,
+    card_description=(
+        "For a site that offers no connector and no key: sign in on the site's "
+        "own login page, once. The avatar keeps that signed-in session and uses "
+        "it to read the site, and to post and fill things in, without opening a "
+        "window again."
+    ),
+    icon_key="url",
+    connect_fields=(
+        ConnectFieldSpec(
             name="site_url",
-            label="Sign-in page address",
+            label="Sign-in address",
             input_type="url",
-            placeholder="https://example.com/login",
-            help_text="The page where you sign in. Opens in a window for you to sign in on.",
+            placeholder="example.com/login",
+            help_text=(
+                "The page you would use to sign in yourself. The avatar stays on "
+                "this site and never carries the session anywhere else."
+            ),
+        ),
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            placeholder="Taken from the site",
+            help_text="How the avatar refers to this site in conversation.",
+            required=False,
         ),
     ),
 )
@@ -735,6 +1096,9 @@ INSTAGRAM_PROVIDER = ConnectedAccountProvider(
     summary="Your posts, captions, and comments",
     card_description="Sign in to Instagram so the avatar can read your posts.",
     icon_key="instagram",
+    content_transport=CONTENT_TRANSPORT_META_GRAPH,
+    notification_sender_domains=("instagram.com", "mail.instagram.com"),
+    profile_url_template="https://www.instagram.com/{handle}/",
     login_url="https://www.instagram.com/accounts/login/",
     home_url="https://www.instagram.com/",
     recipe_key="instagram",
@@ -749,6 +1113,9 @@ TWITCH_PROVIDER = ConnectedAccountProvider(
     summary="Your channel, streams, and chat history",
     card_description="Sign in to Twitch so the avatar can read your channel.",
     icon_key="twitch",
+    content_transport=CONTENT_TRANSPORT_EVENTSUB,
+    notification_sender_domains=("twitch.tv",),
+    profile_url_template="https://www.twitch.tv/{handle}",
     login_url="https://www.twitch.tv/login",
     home_url="https://www.twitch.tv/",
     recipe_key="twitch",
@@ -763,6 +1130,9 @@ FACEBOOK_PROVIDER = ConnectedAccountProvider(
     summary="Your posts and pages",
     card_description="Sign in to Facebook so the avatar can read your posts and pages.",
     icon_key="facebook",
+    content_transport=CONTENT_TRANSPORT_META_GRAPH,
+    notification_sender_domains=("facebookmail.com", "facebook.com"),
+    profile_url_template="https://www.facebook.com/{handle}",
     login_url="https://www.facebook.com/login/",
     home_url="https://www.facebook.com/",
     recipe_key="facebook",
@@ -777,9 +1147,94 @@ LINKEDIN_PROVIDER = ConnectedAccountProvider(
     summary="Your profile, posts, and messages",
     card_description="Sign in to LinkedIn so the avatar can read your profile and posts.",
     icon_key="linkedin",
+    content_transport=CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+    notification_sender_domains=("linkedin.com", "e.linkedin.com"),
+    profile_url_template="https://www.linkedin.com/in/{handle}/",
     login_url="https://www.linkedin.com/login",
     home_url="https://www.linkedin.com/feed/",
     recipe_key="linkedin",
+)
+
+TIKTOK_PROVIDER = ConnectedAccountProvider(
+    name="tiktok",
+    kind=KIND_SOCIAL,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="TikTok",
+    category=CATEGORY_SOCIAL,
+    summary="Your videos and captions",
+    card_description="Sign in to TikTok so the avatar can read your videos.",
+    icon_key="tiktok",
+    content_transport=CONTENT_TRANSPORT_EMAIL_NOTIFICATION,
+    notification_sender_domains=("tiktok.com", "account.tiktok.com"),
+    profile_url_template="https://www.tiktok.com/@{handle}",
+    login_url="https://www.tiktok.com/login",
+    home_url="https://www.tiktok.com/",
+    recipe_key="tiktok",
+)
+
+# A podcast or any other feed. The only row here that needs no sign-in at all:
+# the owner names a feed, and the feed itself is public. Because nothing is
+# signed in, nothing about this row proves the owner owns it — see
+# ``ownership.py``, which is what stops an unproven feed from reaching identity.
+PODCAST_FEED_PROVIDER = ConnectedAccountProvider(
+    name="podcast_feed",
+    kind=KIND_SOCIAL,
+    credential_mechanism=MECHANISM_URL_ONLY,
+    display_name="Podcast or feed",
+    category=CATEGORY_SOCIAL,
+    summary="Your podcast episodes as they publish",
+    card_description=(
+        "Name your podcast's feed so every new episode reaches your avatar."
+    ),
+    icon_key="podcast",
+    content_transport=CONTENT_TRANSPORT_WEBSUB,
+    connect_fields=(
+        ConnectFieldSpec(
+            name="site_url",
+            label="Feed address",
+            placeholder="https://example.com/podcast.xml",
+            help_text=(
+                "The RSS or Atom address of your show. A page address works "
+                "too — the feed is found from it."
+            ),
+        ),
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            required=False,
+            placeholder="My podcast",
+        ),
+    ),
+)
+
+# Any public profile the owner publishes from that is not one of the named
+# platforms: a Substack, a personal blog, a Medium page.
+PROFILE_URL_PROVIDER = ConnectedAccountProvider(
+    name="profile_url",
+    kind=KIND_SOCIAL,
+    credential_mechanism=MECHANISM_URL_ONLY,
+    display_name="Any profile you publish from",
+    category=CATEGORY_SOCIAL,
+    summary="A blog, newsletter, or profile page",
+    card_description=(
+        "Name a page you publish from so new writing reaches your avatar."
+    ),
+    icon_key="profile",
+    content_transport=CONTENT_TRANSPORT_WEBSUB,
+    connect_fields=(
+        ConnectFieldSpec(
+            name="site_url",
+            label="Address",
+            placeholder="https://example.substack.com",
+            help_text="The feed is discovered from the page.",
+        ),
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            required=False,
+            placeholder="My newsletter",
+        ),
+    ),
 )
 
 DISCORD_PROVIDER = ConnectedAccountProvider(
@@ -857,6 +1312,8 @@ GMAIL_APP_PASSWORD_PROVIDER = ConnectedAccountProvider(
 PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     provider.name: provider
     for provider in (
+        EMAIL_ACCOUNT_PROVIDER,
+        CALENDAR_ACCOUNT_PROVIDER,
         GMAIL_PROVIDER,
         PLAID_PROVIDER,
         COINBASE_PROVIDER,
@@ -875,17 +1332,134 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
         TWITCH_PROVIDER,
         FACEBOOK_PROVIDER,
         LINKEDIN_PROVIDER,
+        TIKTOK_PROVIDER,
+        PODCAST_FEED_PROVIDER,
+        PROFILE_URL_PROVIDER,
         DISCORD_PROVIDER,
         SLACK_PROVIDER,
         DESKTOP_MCP_PROVIDER,
         CUSTOM_MCP_PROVIDER,
         CUSTOM_SITE_PROVIDER,
+        SIGNED_IN_SITE_PROVIDER,
     )
 }
 
 
 # Names a person (or the model) may use for a provider that is registered
 # under another name.
+def provider_for_host(hostname: str) -> ConnectedAccountProvider | None:
+    """Return the registered provider that already covers ``hostname``, if any.
+
+    A person naming "github.com" should be sent down GitHub's OAuth route rather
+    than asked to sign in through a browser and have a session kept: the
+    supported route is better in every way, and for some vendors keeping a
+    session instead is against their terms. Matching is on the registrable
+    domain of a provider's own ``home_url`` / ``login_url``, so a provider is
+    only claimed when it says itself which site it is for.
+
+    A provider whose own address carries a subdomain claims only that exact host.
+    ``smith.langchain.com`` is LangSmith; ``academy.langchain.com`` is a
+    different service that happens to share a domain, and offering the LangSmith
+    connector for it would be wrong. A provider whose address is the bare domain
+    (``github.com``) claims its subdomains too, because there the vendor and the
+    domain are the same thing.
+
+    Google's providers are deliberately excluded from the match: several of them
+    share ``accounts.google.com`` as a login address, so a host match there would
+    pick an arbitrary one of Gmail, Calendar, Analytics and YouTube.
+    """
+    from urllib.parse import urlparse
+
+    wanted = (hostname or "").strip().lower().rstrip(".")
+    if not wanted:
+        return None
+    for provider in PROVIDER_REGISTRY.values():
+        for address in (provider.home_url, provider.login_url):
+            if not address:
+                continue
+            try:
+                candidate_host = (urlparse(address).hostname or "").lower()
+            except Exception:  # noqa: BLE001 - a malformed entry claims nothing
+                continue
+            if not candidate_host or candidate_host.endswith("google.com"):
+                continue
+            if candidate_host == wanted:
+                return provider
+            # Only a provider named by its bare domain speaks for subdomains.
+            if candidate_host == _registrable_domain(
+                candidate_host
+            ) and wanted.endswith("." + candidate_host):
+                return provider
+    return None
+
+
+def _registrable_domain(hostname: str) -> str:
+    """Return the last two labels of a hostname, lowercased.
+
+    Good enough to tell "console.x.ai" from "github.com" without carrying a
+    public-suffix list. It over-matches on multi-part suffixes such as
+    ``co.uk``; the cost of that is offering a slightly wrong provider, which the
+    owner sees and can decline, never a wrong credential being used.
+    """
+    cleaned = (hostname or "").strip().lower().rstrip(".")
+    if not cleaned:
+        return ""
+    labels = [label for label in cleaned.split(".") if label]
+    if len(labels) < 2:
+        return cleaned
+    return ".".join(labels[-2:])
+
+
+# The address a person's PUBLIC profile lives at is often not the address the
+# connector signs in to. A channel is read at ``studio.youtube.com`` but linked
+# from ``youtube.com``; a profile is read at ``www.instagram.com`` but written
+# ``instagram.com`` as often as not. ``provider_for_host`` deliberately refuses
+# both of those, because it decides where a SIGN-IN is routed and a provider
+# there may only claim a host it names itself.
+#
+# This table is the discovery-time counterpart: it answers "a page at this host
+# suggests an account of this kind", which is a question whose wrong answer costs
+# only a question put to the owner, never a credential sent to the wrong vendor.
+# Keep the two apart; do not fold this into ``provider_for_host``.
+PUBLIC_PROFILE_HOSTS: dict[str, str] = {
+    "facebook.com": "facebook",
+    "github.com": "github",
+    "instagram.com": "instagram",
+    "linkedin.com": "linkedin",
+    "twitch.tv": "twitch",
+    "twitter.com": "twitter",
+    "x.com": "twitter",
+    "youtube.com": "youtube",
+}
+
+
+def provider_for_public_profile_host(
+    hostname: str,
+) -> ConnectedAccountProvider | None:
+    """Return the provider whose accounts live at ``hostname``, for discovery only.
+
+    Used when deep research has read a page and the question is whether that page
+    looks like an account the subject owns. Tries the strict sign-in matcher
+    first, then the public-profile table above, matching on the registrable
+    domain so ``www.youtube.com`` and ``m.youtube.com`` both answer YouTube.
+
+    Never use this to decide where a sign-in goes — ``provider_for_host`` is that
+    function, and its stricter rule is deliberate.
+    """
+    strict_match = provider_for_host(hostname)
+    if strict_match is not None:
+        return strict_match
+    cleaned = (hostname or "").strip().lower().rstrip(".")
+    if not cleaned:
+        return None
+    provider_name = PUBLIC_PROFILE_HOSTS.get(cleaned) or PUBLIC_PROFILE_HOSTS.get(
+        _registrable_domain(cleaned)
+    )
+    if not provider_name:
+        return None
+    return PROVIDER_REGISTRY.get(provider_name)
+
+
 PROVIDER_NAME_ALIASES: dict[str, str] = {
     "x": "twitter",
     "x.com": "twitter",
@@ -983,14 +1557,22 @@ def validate_registry() -> None:
                 f"availability {provider.availability!r}; expected one of "
                 f"{sorted(ALL_AVAILABILITIES)}."
             )
-        if provider.kind == KIND_MAILBOX and not provider.imap_host:
+        if (
+            provider.kind == KIND_MAILBOX
+            and not provider.imap_host
+            and not provider.discovers_servers
+            and provider.credential_mechanism == MECHANISM_PASSWORD
+        ):
             raise ValueError(
-                f"Mailbox provider {provider.name!r} must declare an imap_host."
+                f"Mailbox provider {provider.name!r} must declare an imap_host "
+                "or set discovers_servers."
             )
         if (
             provider.kind == KIND_MAILBOX
             and provider.send_supported
             and not provider.smtp_host
+            and not provider.discovers_servers
+            and provider.credential_mechanism == MECHANISM_PASSWORD
         ):
             raise ValueError(
                 f"Provider {provider.name!r} supports sending but declares no "

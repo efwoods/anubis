@@ -291,6 +291,18 @@ class GlobalState(TypedDict):
 
     route_decision: str = ""
 
+    """ AI Monitoring """
+
+    # The screen and verdict on the latest human message (message workflow):
+    # {"screen": {...omni-moderation outcome...}, "verdict": {violation, reasoning,
+    # violated_clauses, excerpt}}. Written by the inline moderation branch.
+    moderation_response: dict
+
+    # The verdict that stopped an upload (process-media workflow), in the verdict
+    # shape above. Its presence is what routes the media graph to END before
+    # anything is indexed, analyzed, or turned into training data.
+    moderation_violation: dict
+
     """ Conversation compaction """
 
     # The deep agent's summarization event (cutoff index + summary message),

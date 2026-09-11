@@ -127,6 +127,7 @@ def build_account_record(
     encrypted_secret: str | None,
     assistant_id: str,
     transport: dict[str, Any] | None = None,
+    connection_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the stored value for one connected account.
 
@@ -139,9 +140,33 @@ def build_account_record(
     every record — a custom Model Context Protocol server's URL, transport, and
     the tool names its probe returned — so the record shape stays one dictionary
     for every kind while each kind keeps what it needs.
+
+    ``connection_overrides`` replaces connection details the provider row cannot
+    know. The generic email row names no company, so its servers come from
+    autoconfiguration per address rather than from the registry; writing them
+    onto the record here is what lets every later turn reach the mailbox without
+    rediscovering anything. Only the connection-detail keys below are
+    overridable, so a caller cannot use this to rewrite the account's identity,
+    its owner, or its status.
     """
     now = datetime.now(UTC).isoformat()
-    return {
+    overridable = {
+        "imap_host",
+        "imap_port",
+        "smtp_host",
+        "smtp_port",
+        "drafts_mailbox",
+        "sent_mailbox",
+        "send_supported",
+    }
+    unknown_keys = set(connection_overrides or {}) - overridable
+    if unknown_keys:
+        raise ValueError(
+            "build_account_record received connection overrides it does not "
+            f"allow: {sorted(unknown_keys)}. Only connection details may be "
+            "overridden."
+        )
+    record = {
         "account_key": account_key(provider.name, account_address),
         "provider": provider.name,
         "kind": provider.kind,
@@ -162,6 +187,14 @@ def build_account_record(
         "connected_at": now,
         "last_verified_at": now,
     }
+    record.update(
+        {
+            key: value
+            for key, value in (connection_overrides or {}).items()
+            if value is not None
+        }
+    )
+    return record
 
 
 def public_account_view(record: dict[str, Any]) -> dict[str, Any]:

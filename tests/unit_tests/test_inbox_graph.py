@@ -144,7 +144,14 @@ async def test_notify_pauses_for_the_owner_and_learns_the_decision(repositories,
     assert pending, "the run must be paused on an interrupt"
     payload = pending[0].value
     assert payload["action_request"]["action"] == "notify_owner"
-    assert payload["config"]["allow_edit"] is False
+    # An edit is how the owner names a different action for a notification
+    # ("do not reply, put this on my calendar"), so edits are offered here.
+    assert payload["config"]["allow_edit"] is True
+    assert payload["action_request"]["args"]["available_actions"] == [
+        "send_reply",
+        "notify_owner",
+        "create_calendar_event",
+    ]
 
     resolved = await poller.resume_inbox_item(
         _context(), item_id=item["item_id"], human_response={"type": "accept", "args": None}
@@ -260,14 +267,49 @@ def test_the_preference_prior_rewards_consistent_accepts_and_caps_strangers():
     capped, _ = triage.preference_prior([], auto_send_threshold=0.9)
     assert capped < 0.9
     strong, _ = triage.preference_prior(
-        [{"decision": "accept", "count": 4}], auto_send_threshold=0.9
+        [{"decision": "accept", "count": 4, "sender": "alice@example.com"}],
+        auto_send_threshold=0.9,
     )
     assert strong == 1.0
     mixed, _ = triage.preference_prior(
-        [{"decision": "accept", "count": 2}, {"decision": "ignore", "count": 2}], auto_send_threshold=0.9
+        [
+            {"decision": "accept", "count": 2, "sender": "alice@example.com"},
+            {"decision": "ignore", "count": 2, "sender": "alice@example.com"},
+        ],
+        auto_send_threshold=0.9,
     )
     assert 0.3 < mixed < 0.7
     assert triage.combine_confidence(0.95, strong) == pytest.approx(0.95)
+
+
+def test_a_coarse_preference_is_weaker_evidence_than_this_correspondent():
+    """G3: a decision about a message kind must never outvote one about a person."""
+    about_this_person = {"decision": "accept", "count": 1, "sender": "alice@example.com"}
+    about_the_room = {"decision": "accept", "count": 1, "sender_domain": "example.com"}
+    about_the_kind_alone = {"decision": "accept", "count": 1}
+    assert (
+        triage.preference_specificity_weight(about_this_person)
+        > triage.preference_specificity_weight(about_the_room)
+        > triage.preference_specificity_weight(about_the_kind_alone)
+    )
+
+    # One coarse "ignore" cannot overturn the owner's own history with a person.
+    prior, _ = triage.preference_prior(
+        [
+            {"decision": "accept", "count": 4, "sender": "alice@example.com"},
+            {"decision": "ignore", "count": 1},
+        ],
+        auto_send_threshold=0.9,
+    )
+    assert prior > 0.9
+
+    # With no history for this sender at all, the coarse row still speaks, and
+    # still leaves the decision short of the automatic-send threshold.
+    coarse_only, reason = triage.preference_prior(
+        [{"decision": "ignore", "count": 3}], auto_send_threshold=0.9
+    )
+    assert coarse_only < 0.9
+    assert reason
 
 
 # --------------------------------------------------------------------------
@@ -298,4 +340,7 @@ async def test_the_count_and_items_routes_report_the_owner_inbox(repositories, m
     )
     body = listing.body.decode("utf-8")
     assert "Lunch?" in body
-    assert "notify_owner" not in body, "the panel view is the item, not the raw interrupt"
+    assert "action_request" not in body, "the panel view is the item, not the raw interrupt"
+    assert "config" not in body, "the panel view is the item, not the raw interrupt"
+    # The picker beside the Edit toggle is populated from the item itself.
+    assert "create_calendar_event" in body

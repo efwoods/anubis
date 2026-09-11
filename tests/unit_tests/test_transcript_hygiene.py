@@ -438,7 +438,7 @@ def _segment(speaker, text, start, end):
 
 
 def _no_owner_clip(monkeypatch):
-    async def none_clip(repository, assistant_id, max_seconds):
+    async def none_clip(repository, assistant_id, **kwargs):
         return None
 
     monkeypatch.setattr(speakers_module, "owner_reference_clip", none_clip)
@@ -496,6 +496,8 @@ def test_hallucinated_segments_are_dropped_from_a_spoken_turn(monkeypatch):
     assert [segment.text for segment in spoken.segments] == [
         "Can you order me a pizza?"
     ]
+    assert spoken.segments[0].is_owner
+    assert spoken.script == "Can you order me a pizza?"
     assert "MBC" not in spoken.script
 
 

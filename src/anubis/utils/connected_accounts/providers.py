@@ -127,6 +127,10 @@ MECHANISM_URL_ONLY = "url_only"
 # server's own dynamic client registration means no application to create and
 # no credential to paste. See ``mcp_discovery``.
 MECHANISM_SITE_DISCOVERY = "site_discovery"
+# The vendor publishes no OAuth for third-party applications but issues the
+# owner a personal API key, which is the route it documents and supports. The
+# key is proved at connect time and stored encrypted like any other credential.
+MECHANISM_API_KEY = "api_key"
 ALL_MECHANISMS = frozenset(
     {
         MECHANISM_PASSWORD,
@@ -185,6 +189,7 @@ FORM_MECHANISMS = frozenset(
         MECHANISM_MCP_URL,
         MECHANISM_URL_ONLY,
         MECHANISM_SITE_DISCOVERY,
+        MECHANISM_API_KEY,
     }
 )
 
@@ -200,6 +205,7 @@ LOGIN_MODES_BY_MECHANISM: dict[str, str] = {
     MECHANISM_MCP_URL: LOGIN_MODE_FORM,
     MECHANISM_URL_ONLY: LOGIN_MODE_FORM,
     MECHANISM_SITE_DISCOVERY: LOGIN_MODE_FORM,
+    MECHANISM_API_KEY: LOGIN_MODE_FORM,
     MECHANISM_OAUTH: LOGIN_MODE_OAUTH_POPUP,
     MECHANISM_PLAID_LINK: LOGIN_MODE_PLAID_LINK,
     MECHANISM_BROWSER_SESSION: LOGIN_MODE_BROWSER_SESSION,
@@ -603,9 +609,18 @@ GMAIL_PROVIDER = ConnectedAccountProvider(
     card_description="Search, read, draft, and send email. Sign in with Google.",
     icon_key="gmail",
     starter_prompts=(
-        {"label": 'What needs a reply?', "prompt": 'What emails need a reply, and can you draft responses in my voice?'},
-        {"label": 'Summarize my inbox', "prompt": 'Summarize the important emails from the last three days.'},
-        {"label": 'Unsubscribe candidates', "prompt": 'Which newsletters or senders could I unsubscribe from?'},
+        {
+            "label": "What needs a reply?",
+            "prompt": "What emails need a reply, and can you draft responses in my voice?",
+        },
+        {
+            "label": "Summarize my inbox",
+            "prompt": "Summarize the important emails from the last three days.",
+        },
+        {
+            "label": "Unsubscribe candidates",
+            "prompt": "Which newsletters or senders could I unsubscribe from?",
+        },
     ),
     oauth_config_key="google",
     oauth_scopes=("openid", "email", "https://mail.google.com/"),
@@ -683,8 +698,7 @@ GOOGLE_CALENDAR_PROVIDER = ConnectedAccountProvider(
     category=CATEGORY_CALENDAR,
     summary="Read the schedule and book appointments",
     card_description=(
-        "Read your calendar and book, change, or cancel the appointments you "
-        "ask for."
+        "Read your calendar and book, change, or cancel the appointments you ask for."
     ),
     icon_key="google_calendar",
     login_url="https://accounts.google.com/ServiceLogin?continue=https://calendar.google.com/",
@@ -754,9 +768,18 @@ GITHUB_PROVIDER = ConnectedAccountProvider(
     login_url="https://github.com/login",
     home_url="https://github.com/notifications",
     starter_prompts=(
-        {"label": 'Last sprint', "prompt": 'What happened in my repositories in the last sprint?'},
-        {"label": 'Feature requests', "prompt": 'Are there open feature requests or bugs I should know about?'},
-        {"label": 'Work in progress', "prompt": 'What is currently in progress across my repositories?'},
+        {
+            "label": "Last sprint",
+            "prompt": "What happened in my repositories in the last sprint?",
+        },
+        {
+            "label": "Feature requests",
+            "prompt": "Are there open feature requests or bugs I should know about?",
+        },
+        {
+            "label": "Work in progress",
+            "prompt": "What is currently in progress across my repositories?",
+        },
     ),
 )
 
@@ -808,13 +831,23 @@ COINBASE_PROVIDER = ConnectedAccountProvider(
     ),
     icon_key="coinbase",
     oauth_config_key="coinbase",
-    oauth_scopes=("wallet:user:read", "wallet:accounts:read", "wallet:transactions:read"),
+    oauth_scopes=(
+        "wallet:user:read",
+        "wallet:accounts:read",
+        "wallet:transactions:read",
+    ),
     login_url="https://www.coinbase.com/signin",
     home_url="https://www.coinbase.com/dashboard",
     starter_prompts=(
-        {"label": 'My balances', "prompt": 'What are my Coinbase balances and total holdings value?'},
-        {"label": 'Recent activity', "prompt": 'Show my recent Coinbase transactions.'},
-        {"label": 'Gains and losses', "prompt": 'How have my holdings changed recently?'},
+        {
+            "label": "My balances",
+            "prompt": "What are my Coinbase balances and total holdings value?",
+        },
+        {"label": "Recent activity", "prompt": "Show my recent Coinbase transactions."},
+        {
+            "label": "Gains and losses",
+            "prompt": "How have my holdings changed recently?",
+        },
     ),
 )
 
@@ -833,53 +866,89 @@ PLAID_PROVIDER = ConnectedAccountProvider(
     ),
     icon_key="bank",
     starter_prompts=(
-        {"label": 'Subscriptions overview', "prompt": 'What subscriptions and recurring charges am I currently paying for?'},
-        {"label": 'Reduce spending', "prompt": 'Where could I reduce spending, subscriptions, or fees this year?'},
-        {"label": 'Spending breakdown', "prompt": 'How is my money split across categories this month? Chart it.'},
-        {"label": 'Recent large charges', "prompt": 'Show my largest transactions in the last 30 days.'},
+        {
+            "label": "Subscriptions overview",
+            "prompt": "What subscriptions and recurring charges am I currently paying for?",
+        },
+        {
+            "label": "Reduce spending",
+            "prompt": "Where could I reduce spending, subscriptions, or fees this year?",
+        },
+        {
+            "label": "Spending breakdown",
+            "prompt": "How is my money split across categories this month? Chart it.",
+        },
+        {
+            "label": "Recent large charges",
+            "prompt": "Show my largest transactions in the last 30 days.",
+        },
     ),
 )
 
 LANGSMITH_PROVIDER = ConnectedAccountProvider(
     name="langsmith",
     kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    credential_mechanism=MECHANISM_API_KEY,
     display_name="LangSmith",
     category=CATEGORY_VENDOR,
     summary="Traces, runs, and usage of your LangSmith organization",
     card_description="Sign in to LangSmith so the avatar can read usage and cost.",
     icon_key="langsmith",
-    login_url="https://smith.langchain.com/",
     home_url="https://smith.langchain.com/",
-    recipe_key="langsmith",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="lsv2_...",
+            help_text="From your LangSmith settings page.",
+        ),
+    ),
+    terms_require_api_key=True,
 )
 
 OPENAI_PROVIDER = ConnectedAccountProvider(
     name="openai",
     kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    credential_mechanism=MECHANISM_API_KEY,
     display_name="OpenAI",
     category=CATEGORY_VENDOR,
     summary="Usage and costs of your OpenAI organization",
     card_description="Sign in to the OpenAI platform so the avatar can read usage.",
     icon_key="openai",
-    login_url="https://platform.openai.com/login",
     home_url="https://platform.openai.com/usage",
-    recipe_key="openai",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="sk-...",
+            help_text="From platform.openai.com under API keys. Spend figures need an administrator key.",
+        ),
+    ),
+    terms_require_api_key=True,
 )
 
 ANTHROPIC_PROVIDER = ConnectedAccountProvider(
     name="anthropic",
     kind=KIND_ANALYTICS,
-    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    credential_mechanism=MECHANISM_API_KEY,
     display_name="Claude (Anthropic)",
     category=CATEGORY_VENDOR,
     summary="Usage and costs of your Anthropic console",
     card_description="Sign in to the Anthropic console so the avatar can read usage.",
     icon_key="anthropic",
-    login_url="https://console.anthropic.com/login",
     home_url="https://console.anthropic.com/settings/usage",
-    recipe_key="anthropic",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="sk-ant-...",
+            help_text="From console.anthropic.com under API keys. Spend figures need an administrator key.",
+        ),
+    ),
+    terms_require_api_key=True,
 )
 
 WEBSITE_PROVIDER = ConnectedAccountProvider(
@@ -911,9 +980,18 @@ WEBSITE_PROVIDER = ConnectedAccountProvider(
         ),
     ),
     starter_prompts=(
-        {"label": 'Audit my site', "prompt": 'Audit my website: content, search visibility, links, and accessibility.'},
-        {"label": 'What changed?', "prompt": 'What changed on my website since the last audit?'},
-        {"label": 'Traffic', "prompt": 'How much traffic did my website get this month?'},
+        {
+            "label": "Audit my site",
+            "prompt": "Audit my website: content, search visibility, links, and accessibility.",
+        },
+        {
+            "label": "What changed?",
+            "prompt": "What changed on my website since the last audit?",
+        },
+        {
+            "label": "Traffic",
+            "prompt": "How much traffic did my website get this month?",
+        },
     ),
 )
 
@@ -938,6 +1016,42 @@ CUSTOM_SITE_PROVIDER = ConnectedAccountProvider(
             input_type="url",
             placeholder="example.com",
             help_text="The site's address. The rest is worked out from there.",
+        ),
+        ConnectFieldSpec(
+            name="name",
+            label="Name",
+            placeholder="Taken from the site",
+            help_text="How the avatar refers to this site in conversation.",
+            required=False,
+        ),
+    ),
+)
+
+SIGNED_IN_SITE_PROVIDER = ConnectedAccountProvider(
+    name="signed_in_site",
+    kind=KIND_MCP_SERVER,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="Any site you sign in to",
+    category=CATEGORY_CUSTOM,
+    summary="Sign in once; the avatar reads and acts on the site afterwards",
+    featured=False,
+    card_description=(
+        "For a site that offers no connector and no key: sign in on the site's "
+        "own login page, once. The avatar keeps that signed-in session and uses "
+        "it to read the site, and to post and fill things in, without opening a "
+        "window again."
+    ),
+    icon_key="url",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="site_url",
+            label="Sign-in address",
+            input_type="url",
+            placeholder="example.com/login",
+            help_text=(
+                "The page you would use to sign in yourself. The avatar stays on "
+                "this site and never carries the session anywhere else."
+            ),
         ),
         ConnectFieldSpec(
             name="name",

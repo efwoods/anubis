@@ -344,6 +344,16 @@ def provisioning_script(monkeypatch: pytest.MonkeyPatch):
     return module, fake_stripe
 
 
+def _expected_catalog_size() -> int:
+    """One base-fee product per tier plus one product per metered dimension.
+
+    Derived from TIER_DEFINITIONS rather than hardcoded: the catalog grows every
+    time a tier gains a meter, and a literal here goes stale silently the moment
+    it does.
+    """
+    return sum(1 + len(d.meter_allotments) for d in TIER_DEFINITIONS.values())
+
+
 def _edit_pro_tier(monkeypatch: pytest.MonkeyPatch, **changes: Any) -> None:
     """Apply an edit to the pro tier definition, as an operator edits tiers.py."""
     monkeypatch.setitem(
@@ -470,9 +480,9 @@ def test_first_run_creates_the_catalog(provisioning_script) -> None:
     module, fake_stripe = provisioning_script
     config = module.provision()
 
-    # free: base + 1 meter; pro: base + 2; premium: base + 4.
-    assert fake_stripe.active_product_count() == 10
-    assert fake_stripe.active_price_count() == 10
+    # One base-fee product per tier plus one per metered dimension.
+    assert fake_stripe.active_product_count() == _expected_catalog_size()
+    assert fake_stripe.active_price_count() == _expected_catalog_size()
     assert not fake_stripe.archived_price_ids
     assert set(config["tiers"]) == {"free", "pro", "premium"}
 
@@ -511,8 +521,8 @@ def test_editing_a_price_replaces_it_and_archives_the_old_one(
     assert fake_stripe.prices[new_price_id]["unit_amount"] == 2_100
     assert fake_stripe.prices[new_price_id]["lookup_key"] == "nn_pro_base_v2"
     # No product churn, and still one active price per lookup key.
-    assert fake_stripe.active_product_count() == 10
-    assert fake_stripe.active_price_count() == 10
+    assert fake_stripe.active_product_count() == _expected_catalog_size()
+    assert fake_stripe.active_price_count() == _expected_catalog_size()
     lookup_keys = fake_stripe.active_lookup_keys()
     assert len(lookup_keys) == len(set(lookup_keys))
 
@@ -537,7 +547,7 @@ def test_editing_an_allotment_replaces_the_metered_price(
     new_price_id = edited_config["tiers"]["pro"]["metered_prices"]["messaging_tokens"]
     assert fake_stripe.archived_price_ids == [superseded_price_id]
     assert fake_stripe.prices[new_price_id]["tiers"][0]["up_to"] == 7_000_000
-    assert fake_stripe.active_price_count() == 10
+    assert fake_stripe.active_price_count() == _expected_catalog_size()
 
 
 def test_rerunning_after_an_edit_does_not_thrash(
@@ -565,7 +575,7 @@ def test_rerunning_after_an_edit_does_not_thrash(
     assert settled_config == again_config
     assert not fake_stripe.created_price_calls
     assert not fake_stripe.archived_price_ids
-    assert fake_stripe.active_price_count() == 10
+    assert fake_stripe.active_price_count() == _expected_catalog_size()
 
 
 def test_live_subscription_is_migrated_onto_the_new_price(

@@ -269,7 +269,13 @@ def test_connecting_a_site_hands_the_address_to_the_connector_path(monkeypatch):
     assert delegated["fields"]["name"] == "Acme"
 
 
-def test_a_site_offering_nothing_says_so_and_names_the_alternative(monkeypatch):
+def test_a_site_offering_nothing_falls_through_to_signing_in(monkeypatch):
+    """No connector is not the end of the road — it is the next rung.
+
+    This used to refuse and tell the owner to go find a connector address
+    themselves. Naming a site should be enough: when the site publishes nothing,
+    the owner signs in to it once and the avatar keeps that session.
+    """
     from src.anubis.utils.connected_accounts import connect_handlers, get_provider
 
     async def _nothing(site, context, **kwargs):
@@ -277,7 +283,7 @@ def test_a_site_offering_nothing_says_so_and_names_the_alternative(monkeypatch):
 
     monkeypatch.setattr(mcp_discovery, "discover_mcp_server", _nothing)
 
-    with pytest.raises(connect_handlers.ConnectRefused) as raised:
+    with pytest.raises(connect_handlers.ConnectNeedsLogin) as raised:
         asyncio.run(
             connect_handlers.connect_account(
                 connect_handlers.ConnectRequest(
@@ -289,6 +295,5 @@ def test_a_site_offering_nothing_says_so_and_names_the_alternative(monkeypatch):
             )
         )
 
-    detail = raised.value.detail
-    assert "acme.test" in detail
-    assert "custom connector" in detail
+    assert raised.value.provider.name == "signed_in_site"
+    assert "acme.test" in raised.value.login_request["site_url"]

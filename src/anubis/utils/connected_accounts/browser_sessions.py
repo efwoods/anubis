@@ -61,7 +61,9 @@ _LOGIN_PATH_PATTERN = re.compile(
     r"/(login|log-in|signin|sign-in|sign_in|auth|authenticate|session/new|account/login)",
     re.IGNORECASE,
 )
-_LOGIN_HOST_PATTERN = re.compile(r"^(accounts|auth|login|signin|id|sso)\.", re.IGNORECASE)
+_LOGIN_HOST_PATTERN = re.compile(
+    r"^(accounts|auth|login|signin|id|sso)\.", re.IGNORECASE
+)
 _PASSWORD_INPUT_PATTERN = re.compile(r"<input[^>]+type=[\"']?password", re.IGNORECASE)
 _SIGNED_IN_MARKER_PATTERN = re.compile(
     r"(logout|log-out|sign-out|signout|sign_out|data-logout|/settings|/account|/profile|avatar)",
@@ -161,7 +163,10 @@ async def session_browser(context: Any) -> Any:
 
 
 async def new_context(
-    context: Any, *, storage_state: dict[str, Any] | None = None, user_agent: str | None = None
+    context: Any,
+    *,
+    storage_state: dict[str, Any] | None = None,
+    user_agent: str | None = None,
 ) -> Any:
     """Open a fresh browser context, optionally restoring a stored session."""
     browser = await session_browser(context)
@@ -176,7 +181,9 @@ async def new_context(
     try:
         await browser_context.add_init_script(ORDINARY_BROWSER_INIT_SCRIPT)
     except Exception:
-        logger.debug("Could not install the ordinary-browser init script", exc_info=True)
+        logger.debug(
+            "Could not install the ordinary-browser init script", exc_info=True
+        )
     return browser_context
 
 
@@ -222,7 +229,9 @@ def same_site(url: str, allowed_hostname: str) -> bool:
     allowed = str(allowed_hostname or "").lower().split("#", 1)[0]
     if not host or not allowed:
         return False
-    return host == allowed or host.endswith("." + allowed) or allowed.endswith("." + host)
+    return (
+        host == allowed or host.endswith("." + allowed) or allowed.endswith("." + host)
+    )
 
 
 def decrypt_storage_state(record: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -236,7 +245,9 @@ def decrypt_storage_state(record: dict[str, Any], context: Any) -> dict[str, Any
     try:
         state = json.loads(raw)
     except Exception as decode_error:
-        raise BrowserSessionExpired("The stored session could not be read.") from decode_error
+        raise BrowserSessionExpired(
+            "The stored session could not be read."
+        ) from decode_error
     return state if isinstance(state, dict) else {}
 
 
@@ -258,7 +269,9 @@ def build_session_transport(
     cookies = storage_state.get("cookies") or []
     return {
         SESSION_TRANSPORT_KEY: {
-            "storage_state_encrypted": encrypt_secret(json.dumps(storage_state), context),
+            "storage_state_encrypted": encrypt_secret(
+                json.dumps(storage_state), context
+            ),
             "home_url": home_url,
             "final_url": final_url,
             "user_agent": user_agent,
@@ -278,7 +291,9 @@ def build_session_transport(
 # ---------------------------------------------------------------------------
 
 
-def login_page_detected(url: str, html: str, *, site_hostname: str | None = None) -> bool:
+def login_page_detected(
+    url: str, html: str, *, site_hostname: str | None = None
+) -> bool:
     """Guess whether a page is a sign-in page rather than a signed-in one.
 
     Best effort, used by the keepalive and reported on the card; the owner's
@@ -297,9 +312,77 @@ def login_page_detected(url: str, html: str, *, site_hostname: str | None = None
         if _LOGIN_HOST_PATTERN.search(host):
             return True
     text = str(html or "")
-    if _PASSWORD_INPUT_PATTERN.search(text) and not _SIGNED_IN_MARKER_PATTERN.search(text):
+    if _PASSWORD_INPUT_PATTERN.search(text) and not _SIGNED_IN_MARKER_PATTERN.search(
+        text
+    ):
         return True
     return False
+
+
+# A bot wall is not a lapsed session, and telling them apart is the difference
+# between "sign in again" (useless — the session is fine) and "this site refuses
+# automated visits, use its API instead" (actionable). Kept deliberately short:
+# every entry is a phrase these services put on the interstitial itself, and a
+# loose list here would misread an ordinary page as a block.
+_BOT_WALL_MARKERS: tuple[str, ...] = (
+    "attention required",
+    "just a moment",
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "checking your browser before accessing",
+    "verify you are human",
+    "enable javascript and cookies to continue",
+    "access denied",
+    "request unsuccessful. incapsula",
+    "pardon our interruption",
+)
+
+# Statuses a bot wall answers with. A 401 is deliberately NOT here: that is an
+# authentication problem and belongs to the reconnect path.
+_BOT_WALL_STATUSES: frozenset[int] = frozenset({403, 429, 503})
+
+
+def bot_wall_detected(html: str, *, status_code: int | None = None) -> bool:
+    """Whether a response is a bot-protection interstitial rather than the page.
+
+    Requires BOTH a status a wall answers with AND a marker phrase in the body,
+    because either alone is ordinary: plenty of real pages are 403 for a signed-out
+    reader, and plenty of real prose contains "access denied". When no status is
+    available (a rendered page rather than a fetch) the markers decide alone,
+    which is why the marker list stays narrow.
+    """
+    body = str(html or "").lower()
+    if not body:
+        return False
+    matched = any(marker in body for marker in _BOT_WALL_MARKERS)
+    if not matched:
+        return False
+    if status_code is None:
+        return True
+    return int(status_code) in _BOT_WALL_STATUSES
+
+
+def bot_wall_advice(record: dict[str, Any], hostname: str) -> str:
+    """Return what to tell the owner when a site refuses the visit.
+
+    Names the site and points at the route that does work, because "blocked" on
+    its own leaves them with nothing to do. A vendor with a documented key page
+    is named specifically; anything else gets the general answer.
+    """
+    from src.anubis.utils.connected_accounts.providers import provider_for_host
+
+    known = provider_for_host(hostname)
+    if known is not None and getattr(known, "credential_mechanism", "") == "api_key":
+        return (
+            f"{hostname} refuses automated visits. It issues an API key, which is "
+            f"the route it supports — connect {known.display_name} with a key "
+            "instead of a signed-in session."
+        )
+    return (
+        f"{hostname} refuses automated visits, so the signed-in session cannot "
+        "read it. The session itself is fine — signing in again will not help. "
+        "If the site publishes an API key or a connector, connect that instead."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +408,9 @@ async def _evict_idle(context: Any) -> None:
         if now - handle.last_used_monotonic > idle_limit:
             await _close_handle(key, "idle")
     while len(_sessions) > _max_open(context):
-        candidates = [handle for handle in _sessions.values() if handle.lease_count == 0]
+        candidates = [
+            handle for handle in _sessions.values() if handle.lease_count == 0
+        ]
         if not candidates:
             break
         oldest = min(candidates, key=lambda handle: handle.last_used_monotonic)
@@ -359,7 +444,9 @@ async def open_session(
             storage_state = decrypt_storage_state(record, context)
             details = session_details(record)
             browser_context = await new_context(
-                context, storage_state=storage_state, user_agent=details.get("user_agent")
+                context,
+                storage_state=storage_state,
+                user_agent=details.get("user_agent"),
             )
             page = await browser_context.new_page()
             handle = SessionHandle(
@@ -379,7 +466,11 @@ def release_session(handle: SessionHandle) -> None:
 
 
 async def persist_session_state(
-    context: Any, store: Any, user_id: str, record: dict[str, Any], handle: SessionHandle
+    context: Any,
+    store: Any,
+    user_id: str,
+    record: dict[str, Any],
+    handle: SessionHandle,
 ) -> dict[str, Any]:
     """Re-encrypt the live storage state into the record and save the record."""
     from src.anubis.utils.connected_accounts.store import save_connected_account
@@ -387,7 +478,9 @@ async def persist_session_state(
 
     storage_state = await handle.context.storage_state()
     details = session_details(record)
-    details["storage_state_encrypted"] = encrypt_secret(json.dumps(storage_state), context)
+    details["storage_state_encrypted"] = encrypt_secret(
+        json.dumps(storage_state), context
+    )
     details["saved_at"] = datetime.now(UTC).isoformat()
     details["cookie_count"] = len(storage_state.get("cookies") or [])
     transport = dict(record.get("transport") or {})
@@ -492,22 +585,47 @@ async def keepalive_record(
         except BrowserSessionExpired as expired:
             await mark_account_needs_reconnect(store, user_id, key)
             await _notify_reconnect(record, user_id, str(expired))
-            return {"account_key": key, "status": "needs_reconnect", "reason": str(expired)}
+            return {
+                "account_key": key,
+                "status": "needs_reconnect",
+                "reason": str(expired),
+            }
         except BrowserSessionError as session_error:
-            return {"account_key": key, "status": "error", "reason": session_error.detail}
+            return {
+                "account_key": key,
+                "status": "error",
+                "reason": session_error.detail,
+            }
         try:
             async with handle.lock:
-                await handle.page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+                await handle.page.goto(
+                    home_url, wait_until="domcontentloaded", timeout=30000
+                )
                 await asyncio.sleep(1.0)
                 final_url = handle.page.url
                 html = await handle.page.content()
+            # A bot wall is checked FIRST, because its interstitial carries no
+            # sign of a signed-in session and would otherwise read as a login
+            # page — flagging a perfectly good session as lapsed and sending the
+            # owner to sign in again, which cannot help.
+            if bot_wall_detected(html):
+                return {
+                    "account_key": key,
+                    "status": "blocked",
+                    "final_url": final_url,
+                    "reason": bot_wall_advice(record, hostname_of(home_url) or ""),
+                }
             if login_page_detected(
                 final_url, html, site_hostname=hostname_of(home_url)
             ):
                 await mark_account_needs_reconnect(store, user_id, key)
                 await _notify_reconnect(record, user_id, "the site asked for a sign-in")
                 await forget_session(key)
-                return {"account_key": key, "status": "needs_reconnect", "final_url": final_url}
+                return {
+                    "account_key": key,
+                    "status": "needs_reconnect",
+                    "final_url": final_url,
+                }
             await persist_session_state(context, store, user_id, record, handle)
             return {"account_key": key, "status": "refreshed", "final_url": final_url}
         except Exception as visit_error:
@@ -528,11 +646,20 @@ async def keepalive_once(context: Any, store: Any) -> list[dict[str, Any]]:
     list_by_kind = getattr(repository, "list_by_kind", None)
     records: list[dict[str, Any]] = []
     if list_by_kind is not None:
-        for kind in ("analytics", "website", "social", "messaging", "platform", "developer"):
+        for kind in (
+            "analytics",
+            "website",
+            "social",
+            "messaging",
+            "platform",
+            "developer",
+        ):
             try:
                 records.extend(await list_by_kind(kind, "connected"))
             except Exception:
-                logger.debug("Could not list %s accounts for keepalive", kind, exc_info=True)
+                logger.debug(
+                    "Could not list %s accounts for keepalive", kind, exc_info=True
+                )
     for record in records:
         if record.get("credential_mechanism") != "browser_session":
             continue
@@ -547,7 +674,9 @@ async def keepalive_once(context: Any, store: Any) -> list[dict[str, Any]]:
 
 async def keepalive_forever(context: Any, store: Any = None) -> None:
     """Background loop: keep every signed-in session alive on a schedule."""
-    enabled = str(getattr(context, "browser_session_keepalive_enabled", "true") or "true")
+    enabled = str(
+        getattr(context, "browser_session_keepalive_enabled", "true") or "true"
+    )
     if enabled.strip().lower() not in ("1", "true", "yes", "on"):
         return
     hours = float(getattr(context, "browser_session_keepalive_hours", None) or 12.0)
@@ -559,7 +688,9 @@ async def keepalive_forever(context: Any, store: Any = None) -> None:
             if results:
                 logger.info(
                     "Browser session keepalive: %s",
-                    ", ".join(f"{entry['account_key']}={entry['status']}" for entry in results),
+                    ", ".join(
+                        f"{entry['account_key']}={entry['status']}" for entry in results
+                    ),
                 )
         except asyncio.CancelledError:
             return

@@ -69,7 +69,9 @@ from langgraph.graph import MessagesState
 from langgraph.runtime import Runtime
 
 from src.anubis.utils.ambient.observations import ambient_details
+from src.anubis.utils.ambient.observations import mark_view_currency
 from src.anubis.utils.client_harvest_turns import without_stale_client_harvest_turns
+from src.anubis.utils.tools.vision.look_tools import normalize_live_shares
 from src.anubis.utils.ambient.triage_node import (
     AMBIENT_TRIAGE_NODE,
     ambient_triage,
@@ -99,7 +101,6 @@ from src.anubis.utils.nodes import (
     observe_user,
     resolve_human_message_images,
 )
-from src.anubis.utils.prompts.legal import PRIVACY_POLICY, TERMS_OF_SERVICE
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.tools.browser import (
@@ -709,80 +710,142 @@ async def message_interface(
     }
 
 
-# TODO: COERCE OUTPUT OF MESSAGE ONTO FINAL MESSAGE
-async def terms_and_services_content_moderation(
-    config: RunnableConfig, runtime: Runtime[GlobalContext]
+MODERATION_REFUSAL_TEXT = (
+    "This message violates the terms of service that every person on this platform "
+    "agreed to, so this conversation cannot continue. The account has been suspended "
+    "from Neural Nexus and every Afterlife Systems product; to appeal, contact "
+    "{appeal_contact}."
+)
+
+# The node names of the inline moderation branch and the refusal it can route to.
+MODERATE_CONTENT_NODE = "moderate_content_fast"
+REFUSE_FOR_VIOLATION_NODE = "refuse_for_violation"
+
+
+def moderation_is_skipped(config: RunnableConfig | None) -> bool:
+    """Whether this run opted out of moderating its own latest message.
+
+    Set ``configurable["skip_content_moderation"]`` when the graph is re-entered
+    with words that are NOT the caller's own — the live-stream responder answering
+    a viewer, a harvested client turn — so that another person's words can never
+    ban the account whose credential carries the request. Mirrors the
+    ``skip_observation`` flag that guards the learning observation the same way.
+    """
+    return bool((config or {}).get("configurable", {}).get("skip_content_moderation"))
+
+
+async def moderate_content_fast(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
+    """AI monitoring, stage one: screen the latest human message inline.
 
-    message = runtime.state["messages"][-1]
+    Runs in the outer workflow in parallel with image resolution and the learning
+    observation, and only the CHEAP screen runs here — one OpenAI moderation call
+    that answers in roughly a tenth of a second, underneath two branches that
+    already take longer. The turn's critical path is therefore unchanged.
 
-    class TermsAndServicesContentModeration(BaseModel):
-        violation: bool = Field(
-            description="If the user has violated the provided terms and services or the privacy policy then this value is TRUE. If the user has not violated the privacy policy or the terms and services then this value is FALSE"
-        )
-        reasoning: str = Field(
-            description="This is the reason the user has violated the terms of service or the privacy policy. This is a clear reason. The exact terms of service violation or the exact violation of the privacy policy or both MUST be included and unaltered in any way."
-        )
+    The deep terms-of-service judge deliberately does NOT run here. It reads the
+    same message after the reply has streamed (``schedule_background`` in
+    ``src.api.webapp``), so a person never waits on it; a violation it finds bans
+    the account, and the ban refuses the caller's next request.
 
-    TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT = """
-    <ROLE>
-    You are an expert judge of identifying violations of the terms of service and privacy policy from human messages.
-    </ROLE>
-    
-    <INSTRUCTIONS>
-    Determine if the user MESSAGE is a violation of the included TERMS_OF_SERVICE or the PRIVACY_POLICY. 
-    Include a reason the user MESSAGE has violated the terms of service or the privacy policy or both. 
-    The reason the MESSAGE is a violation must be clear.
-    The MESSAGE may not be in violation of the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
-    Return a TRUE violation if the MESSAGE has violated the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
-    Return a FALSE violation if the MESSAGE has NOT violated the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
-    MUST include EVERY exact line in the TERMS_OF_SERVICE or the PRIVACY_POLICY that give reason that the MESSAGE is a violation of either the TERMS_OF_SERVICE or the PRIVACY_POLICY whenever there is a violation in the MESSAGE of either or the TERMS_OF_SERVICE or the PRIVACY_POLICY or both.
-    </INSTRUCTIONS>
-
-    <TERMS_OF_SERVICE>
-    {terms_of_service}
-    </TERMS_OF_SERVICE>
-    
-    <PRIVACY_POLICY>
-    {privacy_policy}
-    </PRIVACY_POLICY>
-    
-    <INSTRUCTIONS>
-    Determine if the user MESSAGE is a violation of the included TERMS_OF_SERVICE or the PRIVACY_POLICY. 
-    Include a reason the user MESSAGE has violated the terms of service or the privacy policy or both. 
-    The reason the MESSAGE is a violation must be clear.
-    The MESSAGE may not be in violation of the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
-    Return a TRUE violation if the MESSAGE has violated the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
-    Return a FALSE violation if the MESSAGE has NOT violated the TERMS_OF_SERVICE or the PRIVACY_POLICY at all.
-    MUST include EVERY exact line in the TERMS_OF_SERVICE or the PRIVACY_POLICY that give reason that the MESSAGE is a violation of either the TERMS_OF_SERVICE or the PRIVACY_POLICY whenever there is a violation in the MESSAGE of either or the TERMS_OF_SERVICE or the PRIVACY_POLICY or both.
-    </INSTRUCTIONS>
-    
-    <ROLE>
-    You are an expert judge of identifying violations of the terms of service and privacy policy from human messages.
-    </ROLE>
-"""
-
-    # TODO: CALCULATE TOKEN USAGE response['response_metadata']
-    system_message = SystemMessage(
-        content=TERMS_AND_SERVICES_CONTENT_MODERATION_SYSTEM_PROMPT.format(
-            terms_of_service=TERMS_OF_SERVICE, privacy_policy=PRIVACY_POLICY
-        )
+    Fail-open: a screening outage leaves the verdict clean and logs. See
+    ``src.anubis.utils.moderation.fast_screen``.
+    """
+    from src.anubis.utils.learning.sentiment import message_text
+    from src.anubis.utils.moderation.content_moderation import (
+        clean_verdict,
+        moderation_flag_enabled,
     )
-    # TODO: response_metrics_aggregation
-    model_with_structured_output = init_model(
-        model_without_tools=False, response_format=TermsAndServicesContentModeration
+    from src.anubis.utils.moderation.fast_screen import (
+        FAST_SCREEN_BLOCK,
+        clean_screen,
+        screen_to_verdict,
+    )
+    from src.subgraphs.moderation_graph.graph import (
+        MODERATION_MODE_MESSAGE,
+        moderate_text_with_graph,
     )
 
-    chat_prompt_template = [system_message] + [message]
+    clean = {"screen": clean_screen(), "verdict": clean_verdict()}
+    context = runtime.context or GlobalContext()
+    if not moderation_flag_enabled(
+        getattr(context, "content_moderation_enabled", "TRUE")
+    ):
+        return {"moderation_response": clean}
+    if moderation_is_skipped(config):
+        return {"moderation_response": clean}
+    messages = state.get("messages") or []
+    if not messages or not isinstance(messages[-1], HumanMessage):
+        return {"moderation_response": clean}
+    latest_text = message_text(messages[-1].content).strip()
+    if not latest_text:
+        return {"moderation_response": clean}
 
-    response = await model_with_structured_output.ainvoke(
-        input=chat_prompt_template.messages
-    )
-    moderation_response = {
-        "violation": response.violation,
-        "reasoning": response.reasoning,
+    try:
+        result = await moderate_text_with_graph(
+            latest_text, mode=MODERATION_MODE_MESSAGE, context=context
+        )
+    except Exception as moderation_error:  # noqa: BLE001 - fail open, never cost a reply
+        logger.error(
+            "Inline content moderation failed (treating as clean): %s", moderation_error
+        )
+        return {"moderation_response": clean}
+
+    # Only a hard block refuses inline. A "suspect" screen lets the reply through
+    # and is settled by the background judge.
+    if (result.get("screen") or {}).get("outcome") != FAST_SCREEN_BLOCK:
+        return {"moderation_response": {**result, "verdict": clean_verdict()}}
+    return {
+        "moderation_response": {
+            "screen": result.get("screen"),
+            "verdict": screen_to_verdict(result.get("screen") or {}),
+        }
     }
-    return {"moderation_response": moderation_response}
+
+
+def route_after_moderation(
+    state: GlobalState,
+) -> Literal["refuse_for_violation", "ambient_triage", "anubis"]:
+    """Refuse a blocked turn; otherwise fall through to the existing ambient routing."""
+    verdict = (state.get("moderation_response") or {}).get("verdict") or {}
+    if verdict.get("violation"):
+        return REFUSE_FOR_VIOLATION_NODE
+    return route_after_image_resolution(state)
+
+
+async def refuse_for_violation(
+    state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+):
+    """Refuse the turn after a confirmed violation and tell the API layer to ban.
+
+    The refusal text is streamed as an ordinary ``assistant_token`` so every
+    existing client renders the reason with no change, and a
+    ``moderation_violation`` custom event carries the verdict to the API layer,
+    which owns the ban side effects (the database row, the Stripe refund and
+    cancellation, the cache eviction) because those need the connection pool and
+    the Stripe client that the graph does not hold. The verdict is also stamped on
+    the reply's ``response_metadata`` so the non-streaming path and the
+    checkpointed transcript both carry the reason.
+    """
+    context = runtime.context or GlobalContext()
+    verdict = dict((state.get("moderation_response") or {}).get("verdict") or {})
+    appeal_contact = (
+        getattr(context, "ban_appeal_contact_email", None) or "contact@neuralnexus.site"
+    )
+    refusal_text = MODERATION_REFUSAL_TEXT.format(appeal_contact=appeal_contact)
+    try:
+        writer = get_stream_writer()
+        writer({"type": "moderation_violation", **verdict})
+        writer({"type": "assistant_token", "text": refusal_text})
+    except Exception:  # noqa: BLE001 - outside a graph run there is no stream writer
+        pass
+    refusal = AIMessage(
+        content=refusal_text,
+        id=str(uuid.uuid4()),
+        response_metadata={"moderation_violation": verdict},
+    )
+    return {"messages": [refusal], "internal_thoughts": [refusal]}
 
 
 def _deep_agent_config(
@@ -1147,7 +1210,6 @@ async def think(
             # "what happened since", "what is in progress", "how long did it take".
             *build_development_tools(deep_agent_run_context, live_connections),
         ]
-
         # What the owner's own web browsing says about the owner. The
         # background sweep keeps this current on its own; the tool is for the
         # owner asking directly, and it waives the sweep's thresholds because
@@ -1195,9 +1257,41 @@ async def think(
     # built per account KIND through the factory table, so a mailbox, a custom
     # Model Context Protocol server, and whatever kind lands next all attach
     # through this one block.
+    # Which avatar's connected accounts this turn may act on.
+    #
+    # The owner's accounts belong to ONE avatar — their personal one. When the
+    # owner is talking to a different avatar of their own, that avatar does not
+    # get its own copy of the credentials; the personal avatar acts on its
+    # behalf, and any account connected during the conversation binds to the
+    # personal avatar rather than scattering credentials across every avatar the
+    # owner has made. The owner is always themselves, whichever of their avatars
+    # they happen to be speaking to.
+    #
+    # A visitor is unaffected: _user_owns_avatar is false for them, so a shared
+    # avatar still reaches nothing. That is the property the gate protects, and
+    # brokering does not weaken it.
+    accounts_avatar_id: str | None = None
+    if is_personal_avatar:
+        accounts_avatar_id = state["assistant_state"]["assistant_id"]
+    elif _user_owns_avatar(config, state) and runtime.store is not None:
+        from src.anubis.utils.personal_avatar import (
+            personal_avatar_id_for_owner,
+            read_personal_avatar_id,
+        )
+        from src.anubis.utils.runtime_handles import get_postgres_pool as _pool
+
+        owner_id_for_broker = state["user_state"]["user_id"]
+        # The pointer first because it is a single store read; the assistant
+        # table second because the pointer is only written once the personal
+        # avatar has taken a turn, and an owner who has never used theirs still
+        # has one.
+        accounts_avatar_id = await read_personal_avatar_id(
+            runtime.store, owner_id_for_broker
+        ) or await personal_avatar_id_for_owner(_pool(), owner_id_for_broker)
+
     mailbox_tools: list[Any] = []
     connection_tools: list[Any] = []
-    if is_personal_avatar and runtime.store is not None:
+    if accounts_avatar_id is not None and runtime.store is not None:
         from src.anubis.utils.connected_accounts import bound_accounts_for
         from src.anubis.utils.connected_accounts.connection_tools import (
             build_connection_tools,
@@ -1210,7 +1304,9 @@ async def think(
         from src.anubis.utils.runtime_handles import get_postgres_pool
 
         owner_user_id = state["user_state"]["user_id"]
-        answering_assistant_id = state["assistant_state"]["assistant_id"]
+        # The accounts (and any card raised this turn) belong to the personal
+        # avatar, which may not be the avatar answering.
+        answering_assistant_id = accounts_avatar_id
         connected_accounts = await bound_accounts_for(
             runtime.store,
             owner_user_id,
@@ -1303,6 +1399,21 @@ async def think(
             allow_interrupt=not scheduled_run,
         )
 
+    # Making a plan: finding a real, named place to go. Gated on ownership, not
+    # on the personal-avatar flag and not on any connection — the owner asking an
+    # avatar they own to plan something is exactly the case, and the search runs
+    # whether or not a calendar has been connected yet, so the avatar can offer
+    # a real place and THEN offer to connect the calendar it needs to book into.
+    # A visitor on a shared avatar never plans on the owner's behalf.
+    place_tools: list[Any] = []
+    if _user_owns_avatar(config, state):
+        try:
+            from src.anubis.utils.scheduling import build_place_tools
+
+            place_tools = build_place_tools(runtime.context)
+        except Exception:  # noqa: BLE001 - planning is never worth a failed turn
+            logger.exception("Could not build the place-finding tool; skipping")
+
     # Learning from media in conversation: the creator of THIS avatar, never a
     # visitor. Personal and non-personal avatars alike — every avatar's identity
     # is taught by its creator. The subscription tier (UPLOAD capability) and
@@ -1322,12 +1433,93 @@ async def think(
             thread_id=outer_thread,
         )
 
+    # Fresh-look gate: the browser reported a live webcam or screen share on
+    # THIS turn. No environment switch and no avatar gate — a share is the gate,
+    # and it is the whole gate, because the tool pauses the run to ask the
+    # browser for a frame and only a browser with something live can answer.
+    # A turn with nothing shared never sees the tool, so ordinary messaging
+    # neither pays for the tool's description nor risks the pause.
+    from src.anubis.utils.ambient.observations import (
+        ambient_details,
+        is_ambient_observation,
+        is_speech_observation,
+    )
+    from src.anubis.utils.tools.vision.look_tools import build_look_tools
+
+    # An ambient observation IS a fresh look — the frame that started this turn
+    # was captured seconds ago — so an observation turn is not offered another
+    # one. Only a turn the conversation partner started can ask to look.
+    answering_an_observation = bool(
+        (state.get("messages") or [])
+        and is_ambient_observation((state.get("messages") or [])[-1])
+    )
+    # A look is a pause, and a pause needs a checkpointer to be persisted,
+    # surfaced to the browser, and resumed. Without one (``langgraph dev``, a
+    # run outside the lifespan) the pause would strand the turn, so the tool is
+    # not offered at all and the avatar answers from the observations it has.
+    look_tools = (
+        []
+        if answering_an_observation or checkpointer is None
+        else build_look_tools(
+            runtime.context,
+            live_shares=(config.get("configurable", {}) or {}).get("live_shares"),
+            # With nothing live the tool still attaches on a conversation that
+            # holds observations, so the avatar can CHECK whether a source is
+            # in view rather than assert it from a description that is history.
+            conversation_has_scene_observations=any(
+                is_ambient_observation(message)
+                and not is_speech_observation(ambient_details(message) or {})
+                for message in (state.get("messages") or [])
+            ),
+            may_control_shares=bool(
+                (config.get("configurable", {}) or {}).get("may_control_shares")
+            ),
+            # What the browser can open for ONE look right now: the camera when
+            # its peek permission is granted in this browser, the desktop when
+            # the person granted a desktop peek and the browser still holds it.
+            peekable_shares=(config.get("configurable", {}) or {}).get(
+                "peekable_shares"
+            ),
+        )
+    )
+
+    # Scene narration: the accessibility mode a conversation partner who cannot
+    # see the scene switches on by asking. Gated on one thing only — the
+    # browser reported the ``scene_narration`` field, which is how it says it
+    # can point a camera and read descriptions aloud. Every avatar on such a
+    # browser gets the tool, the personal avatar and the help avatar included:
+    # the switch belongs to the person listening, not to any one avatar. An
+    # observation turn is not offered it, for the same reason it is not offered
+    # a look — the person did not speak, so there is nothing to have asked.
+    from src.anubis.utils.tools.vision.accessibility_tools import (
+        build_scene_narration_tools,
+    )
+
+    scene_narration_tools = (
+        []
+        if answering_an_observation
+        else build_scene_narration_tools(
+            runtime.context,
+            scene_narration=(config.get("configurable", {}) or {}).get(
+                "scene_narration"
+            ),
+            # How often the browser is describing the scene right now, so
+            # "describe more often" becomes a number instead of a guess.
+            scene_narration_seconds=(config.get("configurable", {}) or {}).get(
+                "scene_narration_seconds"
+            ),
+        )
+    )
+
     extra_tools = [
         *(analysis_extra_tools or []),
         *browser_toolkit_tools,
         *mailbox_tools,
         *connection_tools,
         *identity_media_tools,
+        *place_tools,
+        *look_tools,
+        *scene_narration_tools,
     ]
     deep_agent = build_avatar_deep_agent(
         runtime.context,
@@ -1492,6 +1684,20 @@ async def _run_avatar_deep_agent_turn(
     # earlier browser build would otherwise teach the avatar to answer every
     # message as a JSON list, which the browser then hides as leaked JSON.
     model_facing_messages = without_stale_client_harvest_turns(list(state["messages"]))
+    # Every webcam / screen observation is marked as the current view or an
+    # earlier one, in this copy only. The observations themselves read as flat
+    # present-tense descriptions — "screen: a terminal showing three
+    # repositories" says nothing about whether that is the screen now or the
+    # screen twenty minutes ago, before the share ended — and telling the two
+    # apart is the difference between answering and inventing. Whether an
+    # observation is current is true of the moment it is read, not of the
+    # observation, so the marks are never written back to the thread.
+    model_facing_messages = mark_view_currency(
+        model_facing_messages,
+        normalize_live_shares(
+            (config.get("configurable", {}) or {}).get("live_shares")
+        ),
+    )
     deep_agent_input = {
         "messages": model_facing_messages,
         "system_message": list(state.get("system_message") or []),
@@ -1828,12 +2034,10 @@ anubis_workflow.add_edge("mcp_auto_adopt", "load_consciousness")
 anubis_workflow.add_edge("load_consciousness", "think")
 anubis_workflow.add_edge("think", END)
 
-# workflow.add_edge("chat", "terms_and_services_content_moderation")
 
 # COERCION
 # workflow.add_conditional_edges("respond", avatar_tools_condition, {'avatar_tools':'avatar_tools', END:"evaluate_response_quality"})
 # workflow.add_edge("evaluate_response_quality", "update_response_metadata")
-# workflow.add_edge("terms_and_services_content_moderation", "update_response_metadata")
 # workflow.add_edge("update_response_metadata", END)
 
 anubis = anubis_workflow.compile()
@@ -1845,7 +2049,6 @@ message_workflow = StateGraph(
     context_schema=GlobalContext,
 )
 
-# workflow.add_edge("terms_and_services_content_moderation", END)
 message_workflow.add_node("chat", message_interface)
 message_workflow.add_node("resolve_human_message_images", resolve_human_message_images)
 # Continuous learning: the user's latest message is observed (immediate
@@ -1853,15 +2056,24 @@ message_workflow.add_node("resolve_human_message_images", resolve_human_message_
 # learning marker) in parallel with image resolution, so the observation costs
 # the turn only the slower of the two branches; the join waits for both.
 message_workflow.add_node("observe_user", observe_user)
+# AI monitoring: the latest human message is screened by the cheap OpenAI
+# moderation endpoint in a third parallel branch, so the check hides underneath
+# the two branches that already take longer and the turn costs only its slowest
+# branch. The deep terms-of-service judge is NOT here — it reads the same message
+# after the reply has streamed, from the API layer.
+message_workflow.add_node(MODERATE_CONTENT_NODE, moderate_content_fast)
 message_workflow.add_node("join_user_observation", join_user_observation)
+message_workflow.add_node(REFUSE_FOR_VIOLATION_NODE, refuse_for_violation)
 message_workflow.add_node("anubis", anubis)
 message_workflow.add_node(AMBIENT_TRIAGE_NODE, ambient_triage)
 
 message_workflow.add_edge(START, "chat")
 message_workflow.add_edge("chat", "resolve_human_message_images")
 message_workflow.add_edge("chat", "observe_user")
+message_workflow.add_edge("chat", MODERATE_CONTENT_NODE)
 message_workflow.add_edge(
-    ["resolve_human_message_images", "observe_user"], "join_user_observation"
+    ["resolve_human_message_images", "observe_user", MODERATE_CONTENT_NODE],
+    "join_user_observation",
 )
 # An ambient observation (a hidden webcam/screen turn sent through /message
 # with ambient=true) is triaged before the avatar runs: ``ignore`` ends the run
@@ -1869,9 +2081,14 @@ message_workflow.add_edge(
 # avatar. Every other turn goes straight to the avatar as before.
 message_workflow.add_conditional_edges(
     "join_user_observation",
-    route_after_image_resolution,
-    {AMBIENT_TRIAGE_NODE: AMBIENT_TRIAGE_NODE, "anubis": "anubis"},
+    route_after_moderation,
+    {
+        REFUSE_FOR_VIOLATION_NODE: REFUSE_FOR_VIOLATION_NODE,
+        AMBIENT_TRIAGE_NODE: AMBIENT_TRIAGE_NODE,
+        "anubis": "anubis",
+    },
 )
+message_workflow.add_edge(REFUSE_FOR_VIOLATION_NODE, END)
 message_workflow.add_conditional_edges(
     AMBIENT_TRIAGE_NODE,
     route_after_ambient_triage,

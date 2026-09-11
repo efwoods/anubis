@@ -92,9 +92,9 @@ _MARKUP_DEBRIS_TOKENS = frozenset({"https", "http", "www", "co", "amp"})
 
 
 def build_corpus_phrase_attestation_set(
-    documents: Sequence[str], *, ngram_sizes: tuple = (2, 3, 4)
+    documents: Sequence[str], *, ngram_sizes: tuple = (1, 2, 3, 4)
 ) -> set:
-    """Every 2–4-word phrase that actually occurs in the CLEANED corpus.
+    """Every 1–4-word phrase that actually occurs in the CLEANED corpus.
 
     Used to validate a previously-stored signature-phrase set against the
     current quote corpus: a signature phrase, by definition, must occur in the
@@ -105,6 +105,12 @@ def build_corpus_phrase_attestation_set(
     drops them. Tokenisation matches :func:`discover_key_phrases` exactly
     (clean_text then tokenize), so any discovered phrase is attested by
     construction.
+
+    Single words are included in the default sizes because the two-stage
+    discovery in :mod:`src.anubis.utils.dataset.key_phrase_candidates` can
+    produce them — a person's most characteristic marker is often a single
+    word. Widening the default only ever ADDS attested phrases, so the
+    artifact-dropping behaviour described above is unchanged.
     """
     from src.anubis.utils.dataset.style_features import clean_text
 
@@ -272,3 +278,86 @@ def discover_key_phrases(
         key=lambda item: item["keyness_log2_over_generic_english"], reverse=True
     )
     return scored[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# Stored profile payload
+#
+# The phrase profile lives under two keys in one store namespace. The primary
+# key keeps holding a BARE JSON LIST of strings, exactly as it always has,
+# because two hot read paths — the system-prompt build in ``nodes.py`` and the
+# per-reply style scoring in ``graph.py`` — consume that shape on every single
+# turn and must not have to learn a new one. A sibling detail key carries the
+# scores, the judgements and the judgement cache.
+#
+# The loader below accepts every shape the primary key has ever held, so an
+# avatar calibrated before the two-stage rewrite reads back correctly with no
+# migration step.
+# ---------------------------------------------------------------------------
+
+KEY_PHRASE_PROFILE_DETAIL_ENVELOPE_VERSION = 1
+
+
+def load_key_phrase_profile_phrase_list(stored_value: Any) -> List[str]:
+    """The signature phrases, from any shape the profile key has ever held.
+
+    Accepts a bare list, a detail envelope, or a JSON string of either, and
+    always returns well-formed phrase strings. Order is preserved deliberately:
+    the list is now stored most-distinctive-first and callers take a prefix.
+    """
+    import json as _json
+
+    value: Any = stored_value
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        try:
+            value = _json.loads(value)
+        except (TypeError, ValueError):
+            return []
+
+    if isinstance(value, dict):
+        value = value.get("phrases")
+
+    if not isinstance(value, list):
+        return []
+
+    return [
+        phrase
+        for phrase in value
+        if isinstance(phrase, str) and phrase_is_well_formed(phrase)
+    ]
+
+
+def load_key_phrase_profile_detail(stored_value: Any) -> Dict[str, Any]:
+    """The detail envelope, or an empty mapping when absent or unreadable."""
+    import json as _json
+
+    value: Any = stored_value
+    if isinstance(value, str):
+        if not value.strip():
+            return {}
+        try:
+            value = _json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return value
+
+
+def build_key_phrase_profile_detail_envelope(
+    phrases: Sequence[str],
+    entries: Sequence[Dict[str, Any]],
+    judgement_cache: Dict[str, Any],
+    *,
+    classification_histogram: Dict[str, int] | None = None,
+) -> Dict[str, Any]:
+    """The detail record written alongside the bare phrase list."""
+    return {
+        "envelope_version": KEY_PHRASE_PROFILE_DETAIL_ENVELOPE_VERSION,
+        "phrases": list(phrases),
+        "entries": list(entries),
+        "judgement_cache": dict(judgement_cache),
+        "classification_histogram": dict(classification_histogram or {}),
+    }

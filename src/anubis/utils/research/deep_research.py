@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 
 from src.anubis.utils.research.web_search import (
     SearchResult,
-    read_page_text,
+    read_page,
     search_web,
 )
 
@@ -67,6 +67,21 @@ _SOURCE_TEXT_CHARACTER_LIMIT = 12_000
 # the clustering. Enough to catch a contradiction, bounded so a well-fed avatar
 # does not push the brief past the model's context window.
 _EXISTING_FACT_LIMIT = 200
+
+# How much of one page the researcher agent is shown per search result. The full
+# page is kept on the SearchResult for fact extraction; this is only what goes
+# into the model's context while it decides whether to search again, and a whole
+# page per result would fill that context after two searches.
+_SOURCE_EXCERPT_FOR_MODEL = 2_000
+
+# Ceiling on the compression step's input, so a topic that gathered a great many
+# pages cannot overflow the model that cleans them up.
+_COMPRESSION_INPUT_LIMIT = 60_000
+
+# Hard ceiling on model calls in one topic's loop, counting reflections as well
+# as searches. The search budget in the prompt is the real limit; this is the
+# backstop for a model that reflects forever without ever finishing.
+_MAX_AGENT_TURNS = 14
 
 # A fact the avatar already holds is a "source" for clustering purposes, so a
 # single web page that contradicts a held fact is still a two-source cluster
@@ -212,6 +227,79 @@ Read the topic's assignment and the titles and excerpts of the sources gathered.
 When the assignment is not answered, write up to three follow-up web search queries that would close the gap, and name the gap in one sentence. Never repeat a query listed under QUERIES_ALREADY_RUN.
 </INSTRUCTIONS>
 """
+
+RESEARCH_AGENT_SYSTEM_PROMPT = """
+<Role>
+You are a research assistant gathering information about one topic concerning one named subject. Your research runs as a tool-calling loop: you choose what to search for, you read what comes back, and you decide when you have enough.
+</Role>
+
+<Available_Tools>
+You have two tools:
+1. search_the_web: run one web search and read the pages it returns.
+2. record_reflection: write down what you have found, what is still missing, and what you intend to do next.
+
+Use record_reflection after every single search_the_web call. The reflection is not shown to anyone and is not part of the research; it is the deliberate pause that makes the next decision a considered one rather than a reflex.
+</Available_Tools>
+
+<Instructions>
+Work the way a researcher with a limited budget works.
+1. Read the assignment carefully. Decide what would actually answer it about this specific subject.
+2. Start broad. The first search should be a wide query naming the subject, not a narrow one.
+3. After each search, call record_reflection: what did this search establish, what is still missing, and is that gap worth another search?
+4. Narrow as you go. Later searches should aim at the specific gaps the reflections named, never repeat a query already run.
+5. Stop as soon as the assignment is answered. Do not keep searching for completeness that nobody asked for.
+</Instructions>
+
+<Hard_Limits>
+Search budget, which exists to stop one topic spending the whole research run:
+- A straightforward assignment: two or three search_the_web calls at most.
+- A difficult assignment: up to five search_the_web calls, and no more.
+- Always stop after five search_the_web calls, whether or not the assignment is answered. Report what you did find.
+
+Stop immediately when any of these is true:
+- The assignment is answered.
+- Three or more sources cover the assignment.
+- The last two searches returned much the same information as each other.
+</Hard_Limits>
+
+<Guarding_Against_The_Wrong_Person>
+Many people share a name. A source that names the subject but describes a different person — a different occupation, a different country, a different century — is not about this subject, and a fact taken from it would be written into the wrong person's identity. Say so in a reflection when you see it, and search in a way that separates the two.
+</Guarding_Against_The_Wrong_Person>
+
+<Finishing>
+When you are done, reply with a plain message and no tool call. That message ends the research on this topic.
+</Finishing>
+"""
+
+
+COMPRESSION_SYSTEM_PROMPT = """
+<Role>
+You are cleaning up the findings a researcher gathered about one topic concerning one named subject, by web search. The researcher has finished; your job is to make what they found legible without losing any of it.
+</Role>
+
+<Task>
+Rewrite the gathered information in a cleaner form. Repeat the relevant statements verbatim rather than summarizing them. The purpose of this step is only to remove duplication and material that has nothing to do with the assignment. When three sources state the same thing, say that three sources state it and give the statement once.
+
+Losing information here is the failure to avoid. A later step reads only what you write, so anything you leave out is gone.
+</Task>
+
+<What_To_Exclude>
+Exclude the researcher's own reflections, which were recorded with record_reflection. Those are the researcher's internal reasoning about what to do next; they contain no information about the subject and must not reach the findings.
+
+Include everything that came back from search_the_web.
+</What_To_Exclude>
+
+<Citations>
+Every statement keeps the address of the page it came from, written inline after the statement. End with a Sources section listing every page the researcher read, so no source is lost.
+</Citations>
+
+<Output_Format>
+**Queries run**
+**Findings**
+**Sources**
+</Output_Format>
+"""
+
 
 EXTRACTION_SYSTEM_PROMPT = """
 <ROLE>
@@ -418,20 +506,34 @@ async def gather_sources(
 
 
 async def read_sources(
-    sources: list[SearchResult], *, concurrency: int
+    sources: list[SearchResult], *, concurrency: int, collect_images: bool = False
 ) -> list[SearchResult]:
-    """Fill in the page text of every source that arrived without content."""
+    """Fill in the page text of every source that arrived without content.
+
+    With ``collect_images`` the same fetch also harvests the pictures each page
+    declares as representing itself, so the asset acquisition gets portrait
+    candidates from the pages the research was already reading. It is off unless
+    the run may actually acquire a portrait: a source that arrived with its
+    content already filled in (Tavily returns page text inline) would otherwise
+    be fetched a second time purely for pictures nothing is going to look at.
+    """
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def _read(source: SearchResult) -> SearchResult:
-        if source.content:
+        wants_images = collect_images and not source.images
+        if source.content and not wants_images:
             return source
         async with semaphore:
             try:
-                source.content = await read_page_text(source.url)
+                page = await read_page(source.url, collect_images=wants_images)
+                if not source.content:
+                    source.content = page.text
+                if wants_images:
+                    source.images = page.images
             except Exception as read_error:  # noqa: BLE001 - one unreadable page is not fatal
                 logger.info("Could not read %s: %s", source.url, read_error)
-                source.content = source.snippet
+                if not source.content:
+                    source.content = source.snippet
         return source
 
     return list(await asyncio.gather(*(_read(source) for source in sources)))
@@ -505,6 +607,287 @@ async def extract_facts(
     return [fact for facts in nested for fact in facts]
 
 
+# ── the researcher agent: a tool-calling loop with a reflection tool ─────────
+#
+# This is the shape the LangChain deep-research course's researcher sub-agent
+# uses, and the reason it is a loop rather than a fixed sequence: the model,
+# not the pipeline, decides whether what it has read answers the assignment.
+# A fixed "search, reflect, search once more" spends a second search it does not
+# need on an easy topic and stops one short on a hard one. The two tools are the
+# search and a reflection the model records before deciding what to do next.
+#
+# The budget is enforced twice over — stated in the prompt so the model plans
+# against it, and capped in code below so a model that ignores it still cannot
+# spend the whole run on one topic.
+
+
+def _reflection_tool_result(reflection: str) -> str:
+    """Record one reflection and hand it straight back to the model.
+
+    The tool does nothing but acknowledge. Its whole value is that calling it
+    forces the model to state its findings, its gaps, and its intent before it
+    chooses the next action, instead of firing off another search by reflex.
+    The reflections are deliberately kept out of the compressed findings: they
+    are reasoning about the research, not information about the subject.
+    """
+    return f"Reflection recorded: {reflection}"
+
+
+def _format_sources_for_model(sources: list[SearchResult], *, limit: int) -> str:
+    """Render what one search returned as the tool result the model reads."""
+    if not sources:
+        return "No results."
+    blocks = []
+    for source in sources:
+        body = (source.content or source.snippet or "").strip()
+        blocks.append(
+            f'<source url="{source.url}" title="{source.title}">\n'
+            f"{body[:limit]}\n"
+            f"</source>"
+        )
+    return "\n\n".join(blocks)
+
+
+async def run_topic_research_agent(
+    subject: str,
+    topic: ResearchTopic,
+    *,
+    context: Any,
+    max_sources: int,
+    max_searches: int,
+    concurrency: int,
+    collect_images: bool,
+    emit: EventSink,
+    is_cancelled: Callable[[], bool],
+) -> dict[str, Any]:
+    """Research one topic in a tool-calling loop; return the messages and sources.
+
+    Returns ``{"messages", "sources", "queries"}``. The sources are kept as
+    ``SearchResult`` objects rather than only as text, because everything
+    downstream needs more than the prose: verification needs each fact's source
+    URL, the media hand-off needs the page addresses, and the portrait
+    acquisition needs the pictures those pages declared.
+    """
+    from langchain_core.messages import ToolMessage
+    from langchain_core.tools import tool
+
+    from src.anubis.utils.model import init_model
+
+    collected: dict[str, SearchResult] = {}
+    queries_run: list[str] = []
+    searches_used = 0
+
+    @tool
+    async def search_the_web(query: str) -> str:
+        """Search the web for one query and read the pages that come back.
+
+        Args:
+            query: What to search for. Name the subject explicitly; a bare topic
+                word will return pages about someone else with the same name.
+        """
+        nonlocal searches_used
+        searches_used += 1
+        queries_run.append(query)
+        emit(
+            {
+                "type": "research_progress",
+                "stage": "searching",
+                "topic": topic.topic,
+                "queries": [query],
+            }
+        )
+        found = await gather_sources(
+            [query],
+            per_query=max(3, max_sources // 2),
+            max_sources=max_sources,
+            context=context,
+            seen_urls=set(collected),
+        )
+        found = await read_sources(
+            found, concurrency=concurrency, collect_images=collect_images
+        )
+        for source in found:
+            collected.setdefault(source.url, source)
+        emit(
+            {
+                "type": "research_progress",
+                "stage": "searched",
+                "topic": topic.topic,
+                "sources": [
+                    {"url": source.url, "title": source.title} for source in found
+                ],
+            }
+        )
+        return _format_sources_for_model(found, limit=_SOURCE_EXCERPT_FOR_MODEL)
+
+    @tool
+    async def record_reflection(reflection: str) -> str:
+        """Record what you have found, what is missing, and what you will do next.
+
+        Args:
+            reflection: Your assessment of the research so far and your intent.
+        """
+        emit(
+            {
+                "type": "research_progress",
+                "stage": "reflecting",
+                "topic": topic.topic,
+                "gap_summary": reflection,
+            }
+        )
+        return _reflection_tool_result(reflection)
+
+    tools_by_name = {
+        "search_the_web": search_the_web,
+        "record_reflection": record_reflection,
+    }
+    try:
+        model = init_model(tools=list(tools_by_name.values()), tool_choice="auto")
+    except Exception as model_error:  # noqa: BLE001 - fall back to fixed queries
+        # A provider this deployment cannot reach must not cost the topic. The
+        # fallback below still searches, using queries the pipeline writes.
+        logger.warning(
+            "The researcher for %r could not start: %s", topic.topic, model_error
+        )
+        model = None
+
+    messages: list[Any] = [
+        SystemMessage(content=RESEARCH_AGENT_SYSTEM_PROMPT),
+        HumanMessage(
+            content=(
+                f"<SUBJECT>\n{subject}\n</SUBJECT>\n"
+                f"<ASSIGNMENT>\n{topic.topic}: {topic.assignment}\n</ASSIGNMENT>"
+            )
+        ),
+    ]
+
+    # One turn per model call. The cap counts turns, not searches, so a model
+    # that only reflects still terminates.
+    for _turn in range(_MAX_AGENT_TURNS if model is not None else 0):
+        if is_cancelled():
+            break
+        try:
+            response = await model.ainvoke(messages)
+        except Exception as agent_error:  # noqa: BLE001 - keep whatever was gathered
+            logger.warning(
+                "The researcher for %r stopped early: %s", topic.topic, agent_error
+            )
+            break
+        if isinstance(response, tuple):
+            response = response[0]
+        messages.append(response)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            # A reply with no tool call is the model saying it is finished —
+            # the same routing decision should_continue makes in the course.
+            break
+        for tool_call in tool_calls:
+            name = tool_call.get("name")
+            chosen = tools_by_name.get(name)
+            if chosen is None:
+                observation = f"There is no tool called {name!r}."
+            elif name == "search_the_web" and searches_used >= max_searches:
+                # The budget the prompt states, enforced where a model cannot
+                # talk its way past it.
+                observation = (
+                    "The search budget for this topic is spent. "
+                    "Report what you have found."
+                )
+            else:
+                try:
+                    observation = await chosen.ainvoke(tool_call.get("args") or {})
+                except Exception as tool_error:  # noqa: BLE001 - one failed tool is not fatal
+                    logger.info("Tool %s failed: %s", name, tool_error)
+                    observation = f"That tool call failed: {tool_error}"
+            messages.append(
+                ToolMessage(
+                    content=str(observation),
+                    name=str(name),
+                    tool_call_id=tool_call.get("id") or str(uuid.uuid4()),
+                )
+            )
+    else:
+        if model is not None:
+            logger.info(
+                "The researcher for %r hit the turn cap; compressing what it has.",
+                topic.topic,
+            )
+
+    if not collected and not is_cancelled():
+        # The model never searched, or every search failed. Fall back to the
+        # queries the pipeline would have written itself, so a topic is never
+        # silently dropped.
+        fallback_queries = await write_topic_queries(
+            subject, topic, queries_run, max_queries=2
+        )
+        found = await gather_sources(
+            fallback_queries,
+            per_query=max(3, max_sources // 2),
+            max_sources=max_sources,
+            context=context,
+        )
+        found = await read_sources(
+            found, concurrency=concurrency, collect_images=collect_images
+        )
+        for source in found:
+            collected.setdefault(source.url, source)
+        queries_run.extend(fallback_queries)
+
+    return {
+        "messages": messages,
+        "sources": list(collected.values()),
+        "queries": queries_run,
+    }
+
+
+async def compress_topic_research(
+    subject: str, topic: ResearchTopic, messages: list[Any]
+) -> str:
+    """Rewrite what the researcher gathered, verbatim but cleaned and cited.
+
+    The course's compression step, and it earns its place for the same reason
+    there: the loop leaves behind a transcript in which the same claim appears
+    in three tool results and the researcher's own reasoning is mixed in with
+    the sources. What comes out is the findings alone, deduplicated, each
+    statement still carrying the page it came from.
+    """
+    from langchain_core.messages import ToolMessage
+
+    from src.anubis.utils.model import init_model
+
+    # Only what the search tool returned. The reflections are the researcher
+    # reasoning about its own progress and say nothing about the subject.
+    gathered = [
+        message
+        for message in messages
+        if isinstance(message, ToolMessage) and message.name == "search_the_web"
+    ]
+    if not gathered:
+        return ""
+    transcript = "\n\n".join(str(message.content) for message in gathered)
+    human_text = (
+        f"<SUBJECT>\n{subject}\n</SUBJECT>\n"
+        f"<ASSIGNMENT>\n{topic.topic}: {topic.assignment}\n</ASSIGNMENT>\n"
+        f"<GATHERED>\n{transcript[:_COMPRESSION_INPUT_LIMIT]}\n</GATHERED>"
+    )
+    try:
+        model = init_model()
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=COMPRESSION_SYSTEM_PROMPT),
+                HumanMessage(content=human_text),
+            ]
+        )
+        if isinstance(response, tuple):
+            response = response[0]
+        return str(getattr(response, "content", "") or "")
+    except Exception as compression_error:  # noqa: BLE001 - the sources still stand
+        logger.warning(
+            "Compressing the findings for %r failed: %s", topic.topic, compression_error
+        )
+        return ""
+
+
 async def research_one_topic(
     subject: str,
     topic: ResearchTopic,
@@ -516,72 +899,42 @@ async def research_one_topic(
     follow_up_rounds: int,
     emit: EventSink,
     is_cancelled: Callable[[], bool],
+    collect_images: bool = False,
 ) -> dict[str, Any]:
-    """Search, read, reflect, and compress one topic into facts.
+    """Research one topic and return the facts it establishes.
 
-    The researcher runs one search round, judges whether the topic's assignment
-    is answered, and runs up to ``follow_up_rounds`` further rounds on the gaps
-    the reflection names — the search / reflect / search loop the course's
-    researcher sub-agent runs, bounded so one topic cannot spend the whole job.
+    Three steps, the researcher sub-agent of the LangChain deep-research course
+    applied to one topic about one person:
+
+    1. **The agent loop** — the model searches, records a reflection, and decides
+       for itself whether to search again or stop. ``max_searches`` is its
+       budget.
+    2. **Compression** — the loop's transcript is rewritten into clean, cited
+       findings with the researcher's own reflections stripped out.
+    3. **Extraction** — facts are pulled per source, so every fact keeps the
+       address of the page that supports it. That attribution is what the
+       verifier clusters on and what the media hand-off follows, so extraction
+       reads the pages themselves rather than the compressed prose.
+
+    ``max_queries`` is the agent's search budget; ``follow_up_rounds`` is no
+    longer a round count, and is added to the budget so a deployment that raised
+    it still gets a longer leash.
     """
-    queries_run: list[str] = []
-    seen_urls: set[str] = set()
-    topic_sources: list[SearchResult] = []
+    max_searches = max(1, max_queries + max(0, follow_up_rounds))
 
-    queries = await write_topic_queries(
-        subject, topic, queries_run, max_queries=max_queries
+    researched = await run_topic_research_agent(
+        subject,
+        topic,
+        context=context,
+        max_sources=max_sources,
+        max_searches=max_searches,
+        concurrency=concurrency,
+        collect_images=collect_images,
+        emit=emit,
+        is_cancelled=is_cancelled,
     )
-    for round_index in range(max(1, 1 + follow_up_rounds)):
-        if is_cancelled() or not queries:
-            break
-        queries_run.extend(queries)
-        emit(
-            {
-                "type": "research_progress",
-                "stage": "searching",
-                "topic": topic.topic,
-                "queries": queries,
-            }
-        )
-        found = await gather_sources(
-            queries,
-            per_query=max(3, max_sources // 2),
-            max_sources=max_sources,
-            context=context,
-            seen_urls=seen_urls,
-        )
-        found = await read_sources(found, concurrency=concurrency)
-        for source in found:
-            seen_urls.add(source.url)
-        topic_sources.extend(found)
-        emit(
-            {
-                "type": "research_progress",
-                "stage": "searched",
-                "topic": topic.topic,
-                "sources": [
-                    {"url": source.url, "title": source.title} for source in found
-                ],
-            }
-        )
-        if round_index >= follow_up_rounds or is_cancelled():
-            break
-        reflection = await reflect_on_topic(subject, topic, topic_sources, queries_run)
-        if reflection.topic_is_answered or not reflection.follow_up_queries:
-            break
-        emit(
-            {
-                "type": "research_progress",
-                "stage": "reflecting",
-                "topic": topic.topic,
-                "gap_summary": reflection.gap_summary,
-            }
-        )
-        queries = [
-            query.strip()
-            for query in reflection.follow_up_queries
-            if query.strip() and query.strip() not in queries_run
-        ][: max(1, max_queries)]
+    topic_sources: list[SearchResult] = researched["sources"]
+    queries_run: list[str] = researched["queries"]
 
     if is_cancelled():
         return {
@@ -589,7 +942,11 @@ async def research_one_topic(
             "sources": topic_sources,
             "facts": [],
             "queries": queries_run,
+            "compressed_research": "",
         }
+
+    emit({"type": "research_progress", "stage": "compressing", "topic": topic.topic})
+    compressed = await compress_topic_research(subject, topic, researched["messages"])
 
     emit({"type": "research_progress", "stage": "extracting", "topic": topic.topic})
     facts = await extract_facts(
@@ -608,6 +965,7 @@ async def research_one_topic(
         "sources": topic_sources,
         "facts": facts,
         "queries": queries_run,
+        "compressed_research": compressed,
     }
 
 
@@ -740,9 +1098,7 @@ def partition_verified_facts(
     return to_apply, to_review
 
 
-def verified_source_urls(
-    to_apply: list[dict[str, Any]], *, limit: int
-) -> list[str]:
+def verified_source_urls(to_apply: list[dict[str, Any]], *, limit: int) -> list[str]:
     """Rank the source URLs behind facts the research verified, best-supported first.
 
     Only sources that actually corroborated a fact are handed to the media
@@ -763,9 +1119,7 @@ def verified_source_urls(
             if not cleaned:
                 continue
             support_count[cleaned] = support_count.get(cleaned, 0) + 1
-    ranked = sorted(
-        support_count.items(), key=lambda pair: (-pair[1], pair[0])
-    )
+    ranked = sorted(support_count.items(), key=lambda pair: (-pair[1], pair[0]))
     return [url for url, _ in ranked[:limit]]
 
 
@@ -867,8 +1221,16 @@ async def run_deep_research(
     research_hint: str | None,
     emit: EventSink,
     is_cancelled: Callable[[], bool] = lambda: False,
+    bootstrap: Any | None = None,
 ) -> dict[str, Any]:
-    """Scope, research, verify, and apply. Emits progress; returns the job summary."""
+    """Scope, research, verify, and apply. Emits progress; returns the job summary.
+
+    ``bootstrap`` is an ``asset_bootstrap.BootstrapGateway`` when this run may
+    also acquire the reference image and reference audio the avatar is missing.
+    It is passed in rather than imported because the operations it wraps live in
+    the API layer, which imports this module. Passing ``None`` runs exactly the
+    fact research this function has always run.
+    """
     max_queries = int(getattr(context, "deep_research_max_queries", 4) or 4)
     max_sources = int(getattr(context, "deep_research_max_sources", 12) or 12)
     max_topics = int(getattr(context, "deep_research_max_topics", 4) or 4)
@@ -905,6 +1267,7 @@ async def run_deep_research(
                 follow_up_rounds=follow_up_rounds,
                 emit=emit,
                 is_cancelled=is_cancelled,
+                collect_images=bootstrap is not None,
             )
             for topic in brief.topics
         )
@@ -915,9 +1278,15 @@ async def run_deep_research(
     sources_by_url: dict[str, SearchResult] = {}
     web_facts: list[dict[str, Any]] = []
     queries_run: list[str] = []
+    # The cleaned, cited findings per topic. Facts are what the avatar learns;
+    # this is the readable account of what the research actually read, kept on
+    # the job summary so the run can be inspected after the fact.
+    compressed_by_topic: dict[str, str] = {}
     for result in topic_results:
         web_facts.extend(result["facts"])
         queries_run.extend(result["queries"])
+        if result.get("compressed_research"):
+            compressed_by_topic[result["topic"]] = result["compressed_research"]
         for source in result["sources"]:
             sources_by_url.setdefault(source.url, source)
 
@@ -936,6 +1305,29 @@ async def run_deep_research(
         }
     )
 
+    # Acquiring the portrait and the voice needs the pages this research just
+    # read, and nothing that comes after. Start it here, alongside verification,
+    # so the video transcription — much the slowest thing either half does —
+    # begins minutes earlier than it would if acquisition waited its turn.
+    bootstrap_task = None
+    if bootstrap is not None:
+        from src.anubis.utils.research.asset_bootstrap import run_asset_bootstrap
+
+        bootstrap_task = asyncio.create_task(
+            run_asset_bootstrap(
+                store,
+                context,
+                creator_id=creator_id,
+                assistant_id=assistant_id,
+                subject_name=subject_name,
+                subject_summary=brief.subject_summary,
+                sources=list(sources_by_url.values()),
+                gateway=bootstrap,
+                emit=emit,
+                is_cancelled=is_cancelled,
+            )
+        )
+
     emit({"type": "research_progress", "stage": "verifying"})
     clusters = await cluster_facts(web_facts + existing_facts)
     verified = list(
@@ -947,6 +1339,8 @@ async def run_deep_research(
             counts[entry["status"]] += 1
     emit({"type": "research_progress", "stage": "verified", **counts})
     if is_cancelled():
+        if bootstrap_task is not None:
+            bootstrap_task.cancel()
         return {"cancelled": True}
 
     to_apply, to_review = partition_verified_facts(verified)
@@ -999,6 +1393,34 @@ async def run_deep_research(
         to_apply,
         limit=int(getattr(context, "deep_research_max_media_items", 0) or 0),
     )
+
+    # Wait for the acquisition that was started alongside verification. It is
+    # best-effort by construction: a failure or a timeout costs the portrait and
+    # the voice, never the facts this run already applied.
+    bootstrap_summary: dict[str, Any] = {}
+    if bootstrap_task is not None:
+        try:
+            bootstrap_summary = await bootstrap_task
+        except asyncio.CancelledError:
+            bootstrap_summary = {"cancelled": True}
+        except Exception as bootstrap_error:  # noqa: BLE001 - the research still succeeded
+            logger.exception("Asset acquisition failed for %s", assistant_id)
+            bootstrap_summary = {"error": str(bootstrap_error)}
+    # A source the acquisition already ingested must not be handed to the media
+    # pipeline a second time: the chosen video would be downloaded, diarized and
+    # transcribed twice, which is the single most expensive thing this pipeline
+    # does.
+    bootstrap_media_urls = list(bootstrap_summary.get("media_urls") or [])
+    if bootstrap_media_urls:
+        already_ingested = {
+            url.strip().rstrip("/").lower() for url in bootstrap_media_urls
+        }
+        media_source_urls = [
+            url
+            for url in media_source_urls
+            if url.strip().rstrip("/").lower() not in already_ingested
+        ]
+
     emit(
         {
             "type": "research_progress",
@@ -1010,7 +1432,10 @@ async def run_deep_research(
         "subject_summary": brief.subject_summary,
         "open_questions": brief.open_questions,
         "media_source_urls": media_source_urls,
+        "bootstrap": bootstrap_summary,
+        "bootstrap_media_urls": bootstrap_media_urls,
         "topics": [topic.topic for topic in brief.topics],
+        "compressed_research": compressed_by_topic,
         "queries": queries_run,
         "sources": [
             {"url": source.url, "title": source.title, "provider": source.provider}

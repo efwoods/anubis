@@ -31,7 +31,11 @@ from src.anubis.utils.billing.stripe_usage import (
     reconcile_period_usage,
     stripe_usage_source_of_truth_enabled,
 )
-from src.anubis.utils.billing.tiers import SubscriptionTier, UsageMeter
+from src.anubis.utils.billing.tiers import (
+    TIER_DEFINITIONS,
+    SubscriptionTier,
+    UsageMeter,
+)
 from src.security.anonymous_billing import (
     AnonymousBillingRecord,
     _billing_record_from_subscription,
@@ -263,12 +267,16 @@ def test_the_stripe_read_is_enabled_by_default_and_when_the_value_is_blank(monke
 # ---------------------------------------------------------------------------
 
 
-def _anonymous_free_tier_subscription():
+def _anonymous_free_tier_subscription(cycle_start=None, cycle_end=None):
     """A $0 anonymous free-tier subscription as Stripe returns it today.
 
     Flexible billing mode reports the period on the subscription ITEMS, which is
-    the shape the live anonymous customers carry.
+    the shape the live anonymous customers carry. The cycle defaults to the fixed
+    dates the record-parsing tests assert; a caller that needs the cycle to be the
+    CURRENT one passes its own.
     """
+    cycle_start = cycle_start or datetime(2026, 7, 16, 3, 35, 49, tzinfo=timezone.utc)
+    cycle_end = cycle_end or datetime(2026, 8, 16, 3, 35, 49, tzinfo=timezone.utc)
     return {
         "id": "sub_anonymous",
         "status": "active",
@@ -276,16 +284,8 @@ def _anonymous_free_tier_subscription():
             "data": [
                 {
                     "id": "si_base",
-                    "current_period_start": int(
-                        datetime(
-                            2026, 7, 16, 3, 35, 49, tzinfo=timezone.utc
-                        ).timestamp()
-                    ),
-                    "current_period_end": int(
-                        datetime(
-                            2026, 8, 16, 3, 35, 49, tzinfo=timezone.utc
-                        ).timestamp()
-                    ),
+                    "current_period_start": int(cycle_start.timestamp()),
+                    "current_period_end": int(cycle_end.timestamp()),
                 }
             ]
         },
@@ -314,10 +314,13 @@ def test_a_missing_subscription_leaves_the_window_to_the_configured_default():
     assert billing_record == AnonymousBillingRecord(stripe_customer_id="cus_anonymous")
 
 
-def _anonymous_user_with_billing_record():
+def _anonymous_user_with_billing_record(cycle_start=None, cycle_end=None):
     """The anonymous user shape ``get_anonymous_user_with_anonymous_api_key`` builds."""
     billing_record = _billing_record_from_subscription(
-        "cus_anonymous", _anonymous_free_tier_subscription()
+        "cus_anonymous",
+        _anonymous_free_tier_subscription(
+            cycle_start=cycle_start, cycle_end=cycle_end
+        ),
     )
     return {
         "id": "supabase-anonymous-id",
@@ -411,12 +414,23 @@ async def test_the_status_endpoint_reports_stripe_usage_to_an_anonymous_caller()
     """BUG 2: an anonymous visitor could not read their own usage at all."""
     from src.api.webapp import verify_subscription_status
 
+    # The endpoint takes the LATEST of the local window and Stripe's, against the
+    # real clock, so the Stripe cycle only governs while it is the current one.
+    # Anchoring it to now keeps this asserting Stripe's window rather than
+    # quietly asserting the calendar-month fallback once the date moves on.
+    cycle_start = datetime.now(timezone.utc).replace(
+        microsecond=0
+    ) - timedelta(days=3)
+    cycle_end = cycle_start + timedelta(days=31)
+
     stripe_client, meter_api = _fake_stripe_client([342_864.0])
     response = await verify_subscription_status(
         request=_endpoint_request(
             stripe_client, {UsageMeter.MESSAGING_TOKENS: MESSAGING_METER_ID}
         ),
-        current_user=_anonymous_user_with_billing_record(),
+        current_user=_anonymous_user_with_billing_record(
+            cycle_start=cycle_start, cycle_end=cycle_end
+        ),
     )
 
     assert response["anonymous"] is True
@@ -425,12 +439,21 @@ async def test_the_status_endpoint_reports_stripe_usage_to_an_anonymous_caller()
     assert response["pay_per_use_enabled"] is False
     # The window is Stripe's cycle, and the usage is Stripe's aggregation — the
     # exact figures the customer portal displays for the same visitor.
-    assert response["usage_period_start"] == "2026-07-16T03:35:49+00:00"
-    assert response["usage_period_end"] == "2026-08-16T03:35:49+00:00"
+    assert response["usage_period_start"] == cycle_start.isoformat()
+    assert response["usage_period_end"] == cycle_end.isoformat()
+    # Derived from the tier table rather than hardcoded: the free allotment has
+    # changed once already, and a literal here asserts an old product decision
+    # rather than the arithmetic this endpoint is responsible for.
+    free_allotment = (
+        TIER_DEFINITIONS[SubscriptionTier.FREE]
+        .meter_allotments[UsageMeter.MESSAGING_TOKENS]
+        .monthly_allotment
+    )
+    used = 342_864
     messaging = response["meters"][UsageMeter.MESSAGING_TOKENS.value]
-    assert messaging["used_to_date"] == 342_864
-    assert messaging["remaining"] == 0
-    assert messaging["over_allotment"] == 142_864
+    assert messaging["used_to_date"] == used
+    assert messaging["remaining"] == max(0, free_allotment - used)
+    assert messaging["over_allotment"] == max(0, used - free_allotment)
     assert len(meter_api.calls) == 1
 
 

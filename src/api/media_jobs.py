@@ -100,6 +100,11 @@ class MediaJob:
     # Identity documents this job indexed. Fact verification runs after the
     # batch only when the batch actually taught the avatar something.
     indexed_identity_document_count: int = 0
+    # AI monitoring: the terms-of-service verdict that stopped this item (or, on
+    # the master, the first child's verdict). Set from the graph's
+    # ``moderation_violation`` progress event; the batch runner then bans the
+    # uploader through the callback the upload endpoint supplies.
+    moderation_violation: Optional[Dict[str, Any]] = None
     # Append-only history of progress payloads. Subscribers replay from index 0,
     # then wait on ``_updated`` for new appends — this supports late joiners and
     # multiple concurrent subscribers.
@@ -385,6 +390,15 @@ async def run_single_item_job(
                 stage = payload.get("stage")
                 if stage == "item_error":
                     item_errors.append(str(payload.get("error") or "unknown"))
+                elif stage == "moderation_violation":
+                    child.moderation_violation = {
+                        "violation": True,
+                        "reasoning": payload.get("reasoning"),
+                        "violated_clauses": payload.get("violated_clauses"),
+                        "source": payload.get("source") or child.filename,
+                    }
+                    if master.moderation_violation is None:
+                        master.moderation_violation = dict(child.moderation_violation)
                 elif stage == "converting_complete":
                     last_complete = payload
                 elif stage == "indexed_namespace_counts":
@@ -415,7 +429,18 @@ async def run_single_item_job(
         # surfaced in the result.
         indexed = (last_complete or {}).get("indexed")
         skipped = (last_complete or {}).get("skipped")
-        if item_errors and not indexed:
+        if child.moderation_violation is not None:
+            # The graph refused this item before anything was indexed, so it is
+            # finished as an error carrying the reason rather than as a partial
+            # success: nothing about this upload reached the avatar.
+            finish_job(
+                child,
+                error=(
+                    "Content violates the terms of service; nothing was indexed. "
+                    + str(child.moderation_violation.get("reasoning") or "")
+                ).strip(),
+            )
+        elif item_errors and not indexed:
             finish_job(child, error="; ".join(item_errors[:10]))
         else:
             finish_job(
@@ -682,8 +707,18 @@ async def run_batch_media_job(
     deferred_expanders: Optional[
         List[Callable[[], Awaitable[Optional[List[Dict[str, Any]]]]]]
     ] = None,
+    on_moderation_violation: Optional[
+        Callable[[Dict[str, Any]], Awaitable[None]]
+    ] = None,
 ) -> None:
     """Orchestrate a batch: one child task per item, one shared concurrency pool.
+
+    ``on_moderation_violation`` is awaited once, with the first child's verdict,
+    when any item in the batch violated the terms of service; the upload endpoint
+    passes the callback that bans the uploader. The graph has already routed the
+    violating item to the end before anything was indexed, so this callback owns
+    only the consequences the graph cannot reach: the ban row, the Stripe
+    cancellation and refund, and the cache eviction.
 
     ``items`` is a list of ``{"child": MediaJob, "media_file": {...}}``. A single
     ``Semaphore(concurrency)`` is registered for this batch so every item — and
@@ -790,6 +825,24 @@ async def run_batch_media_job(
         # outcome via run_single_item_job).
         await asyncio.gather(*child_tasks, return_exceptions=True)
 
+        # AI monitoring: a violating upload bans the uploader. Awaited here, once
+        # per batch, so the ban is recorded before the batch reports finished and
+        # before the post-batch calibration spends anything on content that was
+        # refused.
+        if master.moderation_violation is not None and on_moderation_violation is not None:
+            add_event(
+                master,
+                {
+                    "type": "media_progress",
+                    "stage": "account_banned",
+                    "reasoning": master.moderation_violation.get("reasoning"),
+                },
+            )
+            try:
+                await on_moderation_violation(master.moderation_violation)
+            except Exception as ban_error:  # noqa: BLE001 - the batch still settles
+                logger.exception("Ban after an upload violation failed: %s", ban_error)
+
         # Refit the avatar's direct-quote cloud from everything this batch just
         # indexed. Awaited inside the master's own task, before the batch is
         # reported finished: an upload is not really done until the avatar can be
@@ -825,7 +878,12 @@ async def run_batch_media_job(
                     "items_error": statuses.count("error"),
                     "items_cancelled": statuses.count("cancelled"),
                     "items": _summarize_children(children),
-                    "message": "Batch processing finished",
+                    "moderation_violation": master.moderation_violation,
+                    "message": (
+                        "Upload refused: content violates the terms of service"
+                        if master.moderation_violation is not None
+                        else "Batch processing finished"
+                    ),
                 },
             )
     except Exception as exc:  # noqa: BLE001 - surface every failure via the master job

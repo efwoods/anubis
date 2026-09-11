@@ -157,6 +157,12 @@ GROUP_AVAILABLE_ACTIONS = (
 )
 GROUP_PLATFORM_SOURCE_KINDS = ("slack", "discord", "twitch")
 
+# Items this system wrote for the owner rather than items that arrived from
+# somebody. A scheduled report and an account the research turned up both have
+# nobody to reply TO, so offering "send a reply" beside them is an action the
+# panel cannot carry out. The owner acknowledges these, or ignores them.
+NOTIFY_ONLY_SOURCE_KINDS = ("report", "account_discovery")
+
 
 def available_actions_for(item: dict[str, Any]) -> list[str]:
     """Which actions the owner may pick between for one item.
@@ -169,7 +175,10 @@ def available_actions_for(item: dict[str, Any]) -> list[str]:
     recorded = item.get("available_actions")
     if isinstance(recorded, (list, tuple)) and recorded:
         return [str(action) for action in recorded]
-    if str(item.get("source_kind") or "") in GROUP_PLATFORM_SOURCE_KINDS:
+    source_kind = str(item.get("source_kind") or "")
+    if source_kind in NOTIFY_ONLY_SOURCE_KINDS:
+        return [ACTION_NOTIFY_OWNER]
+    if source_kind in GROUP_PLATFORM_SOURCE_KINDS:
         return list(GROUP_AVAILABLE_ACTIONS)
     return list(MAILBOX_AVAILABLE_ACTIONS)
 

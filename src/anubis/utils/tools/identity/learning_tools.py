@@ -74,6 +74,33 @@ class WhatFeelsRealAndContext(BaseModel):
     )
 
 
+class PsychologicalCorrectionAndContext(BaseModel):
+    """One correction the owner dictated to the avatar's learned psychological profile."""
+
+    dimension: str = Field(
+        description=(
+            "The dimension of the profile being corrected. One of: love_languages, "
+            "dialogue_emotional_triggers, emotional_baseline, attachment_style, "
+            "schwartz_values, moral_foundations, myers_briggs, personality_archetypes, "
+            "defense_mechanisms, core_motivations, conversation_subtleties, dark_traits."
+        )
+    )
+    correction: str = Field(
+        description=(
+            "One complete standalone first-person sentence stating what is actually "
+            "true of the target, written as the target would say it about themselves. "
+            "For example: 'I do not need to be told I did well; I would rather someone "
+            "just showed up.'"
+        )
+    )
+    correction_context: str = Field(
+        description=(
+            "A concise summary of the whole message in which the correction was made, "
+            "so the stored correction carries enough context to apply."
+        )
+    )
+
+
 def _tool_message(content: str, runtime: ToolRuntime) -> Command:
     return Command(
         update={"messages": [ToolMessage(content=content, tool_call_id=runtime.tool_call_id)]}
@@ -174,6 +201,84 @@ async def record_what_feels_real(
     return _tool_message(f"Recorded ({label}): {statement}", runtime)
 
 
+@tool(
+    "correct_psychological_profile",
+    return_direct=False,
+    args_schema=PsychologicalCorrectionAndContext,
+)
+async def correct_psychological_profile(
+    dimension: str,
+    correction: str,
+    correction_context: str,
+    runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
+) -> Command:
+    """<INSTRUCTIONS>
+    Correct the learned PSYCHOLOGICAL PROFILE when the owner of this avatar tells you that something about how you feel, what moves you, what you value, or how you treat people is wrong.
+    Call this tool ONCE PER DISTINCT CORRECTION. A single message may correct several things; make one call for each.
+    Write the correction as one first-person sentence in your own voice, as the person themselves would say it, and set correction_context to a concise summary of the whole message.
+    Name the dimension the correction belongs to, so the correction sits with the readings it is fixing.
+    </INSTRUCTIONS>
+
+    <EXAMPLE>
+    Owner: "You keep fishing for compliments. That is not me. I would much rather someone just turned up and helped."
+    One call:
+      dimension: "love_languages"
+      correction: "I do not need to be told I did well; I would rather someone just showed up and helped."
+    </EXAMPLE>
+
+    <RESTRICTIONS>
+    NEVER call this tool for a fact about a life: a name, a job, a relationship, an event. Those are identity facts and belong to the identity tools.
+    NEVER call this tool for how the person conversing with you wants to be treated; that is a preference and belongs to learn_user_preference.
+    NEVER call this tool for anyone other than the owner of this avatar. Only the owner can say what is true of the person the avatar represents.
+    NEVER call this tool twice with the same correction.
+    </RESTRICTIONS>
+    """
+    updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
+        runtime.config
+    )
+    user_id = updated_user_state.get("user_id")
+    assistant_id = updated_assistant_state.get("assistant_id")
+    creator_id = (
+        ((runtime.config or {}).get("configurable", {}).get("assistant_ctx") or {}).get(
+            "metadata"
+        )
+        or {}
+    ).get("user_id")
+    if not creator_id or creator_id != user_id:
+        # Only the owner may say what is true of the person the avatar represents.
+        return _tool_message(
+            "Only the owner of this avatar can correct what is true of them.", runtime
+        )
+
+    from src.anubis.utils.psycho.profile import (
+        merge_findings_into_profile,
+        read_profile_record,
+        write_profile_record,
+    )
+
+    existing = await read_profile_record(runtime.store, creator_id, assistant_id)
+    profile = merge_findings_into_profile(
+        existing,
+        [
+            {
+                "dimension": dimension,
+                "kind": "narrative",
+                "statements": [
+                    {"statement": correction, "evidence": correction_context}
+                ],
+            }
+        ],
+    )
+    written = await write_profile_record(
+        runtime.store, creator_id, assistant_id, profile
+    )
+    if not written:
+        return _tool_message(
+            f"Could not record the correction: {correction}", runtime
+        )
+    return _tool_message(f"Corrected ({dimension}): {correction}", runtime)
+
+
 class ModerationPreferenceAndContext(BaseModel):
     """One rule the owner dictates for how the avatar behaves in a group conversation."""
 
@@ -257,11 +362,13 @@ async def learn_moderation_preference(
 LEARNING_TOOLS = [
     learn_user_preference,
     record_what_feels_real,
+    correct_psychological_profile,
     learn_moderation_preference,
 ]
 
 __all__ = [
     "LEARNING_TOOLS",
+    "correct_psychological_profile",
     "learn_moderation_preference",
     "learn_user_preference",
     "record_what_feels_real",

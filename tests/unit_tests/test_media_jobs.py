@@ -665,9 +665,13 @@ async def test_playlist_entries_get_composite_namespace(monkeypatch):
     )
 
     playlist_ns = _namespace_for(playlist_url)
+    # One opaque uuid5 derived from BOTH identities: disambiguated from the same
+    # video in another playlist, but emitted as a single hash so the store key
+    # holds no "::" separator. The playlist is recovered from
+    # playlist_namespace_filename, not by parsing this key.
     assert [i["metadata"]["namespace_filename"] for i in items] == [
-        f"{playlist_ns}::{_namespace_for(watch_a)}",
-        f"{playlist_ns}::{_namespace_for(watch_b)}",
+        _namespace_for(f"{playlist_ns}::{_namespace_for(watch_a)}"),
+        _namespace_for(f"{playlist_ns}::{_namespace_for(watch_b)}"),
     ]
     for item, title in zip(items, ("Episode A", "Episode B")):
         meta = item["metadata"]
@@ -772,10 +776,8 @@ async def test_create_reference_media_from_playlist_forces_multispeaker_and_inhe
     captured = {}
 
     class _FakeLoader:
-        async def load(
-            self, url, user_id=None, assistant_id=None, expect_multispeaker=False
-        ):
-            captured["expect_multispeaker"] = expect_multispeaker
+        async def load(self, url, *, user_id=None, assistant_id=None):
+            captured["loaded_url"] = url
             return [{"type": "audio", "content": "hi", "metadata": {}}]
 
     monkeypatch.setattr(nodes_mod, "URLDocumentLoaderClass", _FakeLoader)
@@ -800,7 +802,9 @@ async def test_create_reference_media_from_playlist_forces_multispeaker_and_inhe
         assistant_id="a",
     )
 
-    assert captured["expect_multispeaker"] is True
+    assert captured["loaded_url"] == parent_item["url"]
+    # The reference-media intent reaches the child item, which is what makes the
+    # child transcribe as multi-speaker downstream.
     assert captured["child_create_reference_media_from_playlist"] is True
 
 
@@ -913,7 +917,9 @@ async def test_create_reference_media_from_playlist_single_speaker_classified_no
             "dialogue path must not run in create_reference_media_from_playlist mode"
         )
 
-    async def _fake_classify(*, metadata, user_id, assistant_id, media_item):
+    async def _fake_classify(
+        metadata, user_id, assistant_id, media_item, store=None, namespace_hint=None
+    ):
         captured["classify_text"] = media_item.get("content")
         return [Document(page_content="chunk", metadata={"namespace": "quote"})]
 
@@ -969,9 +975,15 @@ async def test_expand_youtube_playlist_to_media_entries(monkeypatch):
     )
 
     playlist_ns = _namespace_safe_formatted_filename(playlist_url)
+    # One opaque uuid5 per video, derived from the playlist and the video
+    # together; the store key deliberately carries no "::" separator.
     assert [e["namespace_filename"] for e in entries] == [
-        f"{playlist_ns}::{_namespace_safe_formatted_filename(watch_a)}",
-        f"{playlist_ns}::{_namespace_safe_formatted_filename(watch_b)}",
+        _namespace_safe_formatted_filename(
+            f"{playlist_ns}::{_namespace_safe_formatted_filename(watch_a)}"
+        ),
+        _namespace_safe_formatted_filename(
+            f"{playlist_ns}::{_namespace_safe_formatted_filename(watch_b)}"
+        ),
     ]
     assert [e["filename"] for e in entries] == [
         "My Playlist::Episode A",

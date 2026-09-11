@@ -62,7 +62,9 @@ import numpy as np
 # (this module lives under data/, so ``src`` is not importable otherwise).
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.anubis.utils.dataset.key_phrases import discover_key_phrases  # noqa: E402
+from src.anubis.utils.dataset.key_phrase_candidates import (  # noqa: E402
+    discover_key_phrase_candidates,
+)
 from src.anubis.utils.dataset.style_features import (  # noqa: E402
     FEATURE_NAMES,
     STYLE_FEATURE_VECTOR_VERSION,
@@ -166,8 +168,26 @@ def build(corpus_path: Path = BASELINE_CORPUS_PATH) -> BaselineBuildResult:
     # column is measured against the SAME phrase set the rows will be scored under
     # at baseline-build time (there is no avatar phrase set here). Persist the
     # phrase list for transparency/reproducibility.
+    #
+    # STAGE ONE ONLY, deliberately. The two-stage avatar pipeline follows the
+    # statistical shortlist with a language-model judge that separates a
+    # SPEAKER's style markers from the subjects that speaker discusses. That
+    # question is a category error here: this corpus is the generic pole, not a
+    # person, so the judge would classify essentially every candidate as ordinary
+    # English and hand back an empty set — which would pin key_phrase_rate to
+    # zero for every row and leave the Mahalanobis covariance with a
+    # zero-variance column to invert.
+    #
+    # Note that discovery contrasts a corpus against this same corpus here
+    # (stage one's reference IS the baseline corpus). That is not degenerate: the
+    # reference is an interpolated back-off model, which under-predicts fixed
+    # collocations, so the phrases that surface are exactly the raw model's own
+    # set expressions ("are you asking about", "in the human sense"). Measured on
+    # the committed corpus this yields a smaller set than the previous scoring
+    # (8 rather than 40) that covers MORE rows (47% versus 42% non-zero), so the
+    # column keeps real variance.
     baseline_key_phrases = [
-        phrase["phrase"] for phrase in discover_key_phrases(texts)
+        candidate.phrase for candidate in discover_key_phrase_candidates(texts)
     ]
     _KEY_PHRASES_PATH.write_text(
         json.dumps(baseline_key_phrases, indent=2), encoding="utf-8"

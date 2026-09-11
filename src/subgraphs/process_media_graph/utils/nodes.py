@@ -25,7 +25,6 @@ from langgraph.store.base import BaseStore
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
-from src.anubis.utils.store_cache import invalidate_store_cache_entry
 from src.anubis.utils.voice.reference_audio import (
     read_usable_reference_audio,
     reference_audio_lock,
@@ -198,6 +197,7 @@ async def _collect_voice_clip_from_isolated_audio(
             "Voice clip collection skipped for %s: %s", assistant_id, clip_error
         )
 
+
 async def _learn_motion_from_video(
     context: Any,
     store: Any,
@@ -296,7 +296,6 @@ async def _learn_motion_from_video(
         logger.info("Motion analysis of %s: %d of %d windows attributed to %s", filename, recorded, len(windows), assistant_id)
     except Exception as motion_error:  # noqa: BLE001 - never fail the upload
         logger.warning("Motion analysis skipped for %s: %s", assistant_id, motion_error)
-
 
 
 async def _collect_voice_clips_from_target_turns(
@@ -615,6 +614,11 @@ async def process_uploaded_files_and_label_media_type(
             assistant_id = file_data.get("assistant_id")
             reference_image = file_data.get("reference_image")
             reference_audio = file_data.get("reference_audio")
+            # Set only by the deep-research acquisition. It travels with the
+            # entry so the store write can refuse to overwrite a portrait the
+            # creator uploaded while the research was running.
+            bootstrap_reference = file_data.get("bootstrap_reference", False)
+            reference_source_url = file_data.get("reference_source_url")
             create_reference_media_from_playlist = file_data.get(
                 "create_reference_media_from_playlist", False
             )
@@ -642,6 +646,8 @@ async def process_uploaded_files_and_label_media_type(
                         "user_id": user_id,
                         "assistant_id": assistant_id,
                         "reference_image": reference_image,
+                        "bootstrap_reference": bootstrap_reference,
+                        "reference_source_url": reference_source_url,
                         "namespace_filename": namespace_filename,
                     },
                 }
@@ -792,6 +798,8 @@ async def process_uploaded_files_and_label_media_type(
                             "user_id": user_id,
                             "assistant_id": assistant_id,
                             "reference_image": reference_image,
+                            "bootstrap_reference": bootstrap_reference,
+                            "reference_source_url": reference_source_url,
                             "namespace_filename": namespace_filename,
                         },
                     }
@@ -1004,9 +1012,11 @@ async def analyze_documents(
     """Fan registered analyzers out over queued docs in parallel; merge results.
 
     For every ``analysis_acceptable`` Document, run each applicable analyzer
-    from :data:`ANALYSIS_SCAFFOLD_RUNNERS`. The default analyzer set is the
-    full registry; a Document narrows it by listing analyzer keys in
-    ``metadata["analysis_scaffolds"]``. Every analyzer produces
+    from :data:`ANALYSIS_SCAFFOLD_RUNNERS`. The default analyzer set comes from
+    ``default_scaffolds_for_document`` — chosen from the document's
+    ``classified_situation`` so a document only pays for the analyzers its kind
+    can actually support — and a Document overrides that choice by listing
+    analyzer keys in ``metadata["analysis_scaffolds"]``. Every analyzer produces
     ``analysis``-namespace Documents which are merged into the vector-store
     index batch so ``index_docs`` persists them alongside the source docs.
 
@@ -1026,7 +1036,10 @@ async def analyze_documents(
             "documents_to_be_analyzed_for_context_storage_and_prompt_injection_of_assistant": "delete"
         }
 
-    from src.anubis.utils.analysis.analysis_methods import ANALYSIS_SCAFFOLD_RUNNERS
+    from src.anubis.utils.analysis.analysis_methods import (
+        ANALYSIS_SCAFFOLD_RUNNERS,
+        default_scaffolds_for_document,
+    )
 
     queue: List[Document] = list(
         state.get(
@@ -1043,9 +1056,11 @@ async def analyze_documents(
     labels: List[str] = []
     coros = []
     for doc in queue:
-        scaffolds = doc.metadata.get("analysis_scaffolds") or list(
-            ANALYSIS_SCAFFOLD_RUNNERS.keys()
-        )
+        # The default analyzer set is chosen from the document's kind rather than
+        # being the whole registry: running every analyzer on every document is
+        # what made this branch too expensive to leave switched on. A document
+        # still narrows or widens the choice with metadata["analysis_scaffolds"].
+        scaffolds = default_scaffolds_for_document(doc)
         for name in scaffolds:
             runner = ANALYSIS_SCAFFOLD_RUNNERS.get(name)
             if runner is None:
@@ -1453,8 +1468,18 @@ async def process_media_item_task(
                 # an api endpoint provides an endpoint to allow for the search of the store for metadata for "emotion", "content_type", and "synthetic" to display the images on load of the avatar once and caches all results then uses the results on emotion trigger.
                 # The frontend searches the metadata for "emotion", "content_type", and "synthetic" to display the images
 
-                namespace = (user_id, assistant_id, "reference_image")
+                from src.anubis.utils.media_generation.reference_image import (
+                    store_reference_image,
+                )
+
                 doc_json = doc.to_json()
+                # A portrait the deep-research acquisition found must never
+                # replace one the creator chose: the two can be in flight at
+                # the same moment, because the avatar-creation screen uploads
+                # the creator's photo while the research job is already
+                # running. The acquisition marks its entry, and that mark is
+                # the only thing that makes this write conditional.
+                bootstrap_reference = bool(metadata.get("bootstrap_reference", False))
 
                 # What the reference depicts decides how its emotion media is
                 # prompted: a person's stills change only the facial
@@ -1483,35 +1508,45 @@ async def process_media_item_task(
                     moderation_reasons=reference_assessment.get("moderation_reasons"),
                 )
 
-                await store.aput(
-                    namespace,
-                    key=assistant_id,
-                    value={
-                        "reference_image_data": full_uri,
-                        "document": doc_json,
-                        **assessment_store_fields(reference_assessment),
-                    },
+                # store_reference_image invalidates the process-wide store
+                # cache load_consciousness reads through, so the new portrait
+                # is picked up on the next message.
+                portrait_was_written = await store_reference_image(
+                    store,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    image_data_uri=full_uri,
+                    document_json=doc_json,
+                    assessment_fields=assessment_store_fields(reference_assessment),
+                    source_url=metadata.get("reference_source_url") or None,
+                    replace=not bootstrap_reference,
                 )
-                # load_consciousness reads this entry through a process-wide
-                # cache; drop the cached copy so the new reference image is
-                # picked up on the next message.
-                invalidate_store_cache_entry(namespace, assistant_id)
-
-                # A new portrait drops stills and idle loops from the previous
-                # face. New stills and loops wait for Create generative
-                # reference videos — uploading the reference must not spend
-                # at the vendor.
-                configurable = (config or {}).get("configurable") or {}
-                await _generate_emotion_media_after_reference_image(
-                    runtime.context,
-                    user_id,
-                    assistant_id,
-                    full_uri,
-                    subject=reference_subject,
-                    assessment=reference_assessment,
-                    subscription_tier=configurable.get("subscription_tier"),
-                    minimum_tier=configurable.get("emotion_media_minimum_tier"),
-                )
+                if not portrait_was_written:
+                    # The creator's own portrait is already stored. Leave it,
+                    # and leave the emotion media generated from it alone —
+                    # _generate_emotion_media_after_reference_image deletes
+                    # every still and idle loop of the previous face, so
+                    # calling it here would destroy media the creator paid for.
+                    _emit_media_progress(
+                        "reference_image_skipped",
+                        reason="This avatar already has a portrait; the researched one was discarded.",
+                    )
+                else:
+                    # A new portrait drops stills and idle loops from the
+                    # previous face. New stills and loops wait for Create
+                    # generative reference videos — uploading the reference
+                    # must not spend at the vendor.
+                    configurable = (config or {}).get("configurable") or {}
+                    await _generate_emotion_media_after_reference_image(
+                        runtime.context,
+                        user_id,
+                        assistant_id,
+                        full_uri,
+                        subject=reference_subject,
+                        assessment=reference_assessment,
+                        subscription_tier=configurable.get("subscription_tier"),
+                        minimum_tier=configurable.get("emotion_media_minimum_tier"),
+                    )
                 doc.metadata.update(
                     {
                         "namespace": "reference_image",
@@ -2602,6 +2637,20 @@ async def process_media_item_task(
                     turns=turns,
                 )
 
+            # How the person moves, from the same video (video only; every
+            # other media type returns at once inside). A further analysis
+            # distilled into text beside the ones above.
+            await _learn_motion_from_video(
+                runtime.context,
+                store,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_type=media_type,
+                payload_uri=payload_uri,
+                filename=filename,
+                turns=turns,
+            )
+
             if len(distinct_speakers) > 1:
                 # Multiple speakers -> full dialogue processing. Outputs:
                 # multi-turn adapter conversation, per-target quote Documents
@@ -2636,20 +2685,6 @@ async def process_media_item_task(
                     d.metadata["namespace_filename"] = namespace_filename
                 all_documents.extend(documents)
                 return all_documents
-
-            # How the person moves, from the same video (video only; every
-            # other media type returns at once inside). A further analysis
-            # distilled into text beside the ones above.
-            await _learn_motion_from_video(
-                runtime.context,
-                store,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                media_type=media_type,
-                payload_uri=payload_uri,
-                filename=filename,
-                turns=turns,
-            )
 
             if len(distinct_speakers) == 1:
                 # Single speaker -> gate on whether it is the target.

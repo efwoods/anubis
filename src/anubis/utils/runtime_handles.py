@@ -56,6 +56,30 @@ def get_identity_media_job_starter() -> IdentityMediaJobStarter | None:
     return _identity_media_job_starter
 
 
+# Connecting an account that deep research turned up should feed the NEXT round
+# of research, but ``_start_deep_research_job`` lives in ``src/api/webapp.py``
+# because it needs ``app.state`` and the API-side bootstrap callbacks, and a
+# graph module cannot import the web application without a circular import. Same
+# arrangement as the identity-media starter above: the lifespan publishes the
+# starter, the connect tool reads it, and ``None`` (``langgraph dev``, unit tests
+# without the lifespan) simply means the connection is made and no follow-up
+# research runs — never a failed turn.
+DeepResearchJobStarter = Callable[..., Any]
+
+_deep_research_job_starter: DeepResearchJobStarter | None = None
+
+
+def set_deep_research_job_starter(starter: DeepResearchJobStarter) -> None:
+    """Publish the callable that starts a deep-research job from inside the graph."""
+    global _deep_research_job_starter
+    _deep_research_job_starter = starter
+
+
+def get_deep_research_job_starter() -> DeepResearchJobStarter | None:
+    """Return the published research starter, or ``None`` when the lifespan has not run."""
+    return _deep_research_job_starter
+
+
 # Process-wide ``SentenceTransformer`` reused across fact-correction calls. The
 # fact-correction tool does sentence-level semantic matching to locate a claim buried in
 # a long verbatim document, which needs to embed arbitrary sentences at runtime (the
@@ -156,7 +180,14 @@ async def _flush_embed_batch() -> None:
         for indices, future in request_index_maps:
             if future.done():
                 continue
-            future.set_result(unique_embeddings[indices])
+            # Select row by row rather than with a list of indices. Fancy indexing
+            # is a numpy/torch feature, and an embedder that hands back a plain
+            # list of vectors — some wrappers ignore convert_to_numpy — raises
+            # "list indices must be integers or slices, not list" here. Every
+            # caller of this batcher treats a failure as best-effort and carries
+            # on without scores, so the break was silent: salience pruning simply
+            # stopped happening and every stale memory was kept.
+            future.set_result([unique_embeddings[index] for index in indices])
     except Exception as exc:
         for _, future in request_index_maps:
             if not future.done():
@@ -172,8 +203,8 @@ async def async_score_query_against_texts(query: str, texts: list[str]) -> list[
 
     def _similarity() -> list[float]:
         def _run(model: Any) -> list[float]:
-            query_embedding = embeddings[0:1]
-            text_embeddings = embeddings[1:]
+            query_embedding = list(embeddings[0:1])
+            text_embeddings = list(embeddings[1:])
             similarities = model.similarity(query_embedding, text_embeddings)[0]
             return [float(score) for score in similarities]
 

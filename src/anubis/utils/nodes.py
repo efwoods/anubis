@@ -30,6 +30,11 @@ from src.anubis.utils.learning.sentiment import (
     update_current_conversation_sentiment,
 )
 from src.anubis.utils.state import GlobalState
+from src.anubis.utils.psycho.current_emotion import (
+    read_current_emotion_text,
+    refresh_current_emotion,
+)
+from src.anubis.utils.psycho.profile import read_profile_text
 from src.anubis.utils.store_cache import aget_through_cache
 from src.anubis.utils.utility import (
     merge_dedup_threshold_documents,
@@ -142,7 +147,10 @@ async def resolve_human_message_images(
     (minus the consumed ``image_filenames``), so an ambient observation stays
     hidden and tagged after the images are gone. An ambient observation is
     described with ``DESCRIBE_AMBIENT_IMAGE_PROMPT`` (what the person is doing,
-    what is on the screen) and each section is labelled by source
+    what is on the screen) — or, when scene narration is on, with
+    ``DESCRIBE_SCENE_FOR_NARRATION_PROMPT``, which describes the scene for
+    somebody who cannot see it and is about to hear this read aloud — and each
+    section is labelled by source
     (``webcam`` / ``screen``) under an ``[AMBIENT_OBSERVATION ...]`` header
     the triage node reads. Every description's usage is folded into the
     ``image_model_*`` state channels and emitted as an
@@ -155,6 +163,7 @@ async def resolve_human_message_images(
     from src.anubis.utils.ambient.observations import (
         ambient_details,
         is_ambient_observation,
+        is_narration_observation,
         observation_header,
     )
 
@@ -185,7 +194,17 @@ async def resolve_human_message_images(
     filenames = additional_kwargs.pop("image_filenames", None) or []
     ambient = ambient_details(last) if is_ambient_observation(last) else None
     sources = list((ambient or {}).get("sources") or [])
-    if ambient is not None:
+    if ambient is not None and is_narration_observation(ambient):
+        # Scene narration: this description is read aloud, within seconds, to
+        # somebody who cannot see the scene. A description written for an
+        # avatar deciding whether to speak is the wrong description here — it
+        # leads with what is interesting rather than with what is in the way.
+        from src.anubis.utils.schema import DESCRIBE_SCENE_FOR_NARRATION_PROMPT
+
+        descriptor = ImageDescriptionClass(
+            system_prompt=DESCRIBE_SCENE_FOR_NARRATION_PROMPT
+        )
+    elif ambient is not None:
         from src.anubis.utils.schema import DESCRIBE_AMBIENT_IMAGE_PROMPT
 
         descriptor = ImageDescriptionClass(system_prompt=DESCRIBE_AMBIENT_IMAGE_PROMPT)
@@ -404,6 +423,37 @@ async def observe_user(
         update["current_conversation_sentiment"] = render_conversation_sentiment(
             conversation_sentiment
         )
+
+    # The avatar's own emotional state is moved by this turn. It reuses the Go
+    # Emotions reading gathered above and adds no model call, which is what lets
+    # it live in this branch: the whole node runs in parallel with the reply's
+    # other preparation, so the state costs the turn nothing it was not already
+    # spending. Best effort throughout — an avatar with no emotional baseline yet
+    # simply has no state to move.
+    if store is not None and creator_id and assistant_id and _flag_enabled(
+        getattr(context, "current_emotion_enabled", "TRUE")
+    ):
+        try:
+            advanced_emotion = await refresh_current_emotion(
+                store,
+                creator_id,
+                assistant_id,
+                incoming_message_text=latest_text,
+                incoming_message_base_emotion=(
+                    immediate_sentiment.get("base_emotion")
+                    if isinstance(immediate_sentiment, dict)
+                    else None
+                ),
+                half_life_hours=float(
+                    getattr(context, "current_emotion_decay_hours", 6.0) or 6.0
+                ),
+            )
+            if advanced_emotion:
+                update["current_assistant_emotions"] = advanced_emotion.get(
+                    "rendered", ""
+                )
+        except Exception as emotion_error:  # noqa: BLE001 - never cost the user a reply
+            logger.warning("observe_user: emotional state failed: %s", emotion_error)
     return update
 
 
@@ -546,6 +596,9 @@ async def _build_consciousness_system_message_update(
     # in which case the current-conversation section is simply empty.
     learning_thread_id = config.get("configurable", {}).get("thread_id")
     learning_context = _global_context_from_runtime(runtime)
+    psychological_profile_max_characters = int(
+        getattr(learning_context, "psychological_profile_max_characters", 6000) or 6000
+    )
     learning_retrieval_limit = int(
         getattr(learning_context, "learning_prompt_retrieval_limit", 10) or 10
     )
@@ -588,6 +641,8 @@ async def _build_consciousness_system_message_update(
         analyzed_trait_items,
         style_profile_ITEM,
         learning_sections,
+        psychological_profile_text,
+        current_assistant_emotion_text,
     ) = await asyncio.gather(
         # Fallback name searches only run when the context did not provide a name
         (
@@ -647,6 +702,20 @@ async def _build_consciousness_system_message_update(
             query=query if isinstance(query, str) else str(query),
             limit=learning_retrieval_limit,
         ),
+        # The consolidated psychological profile and the avatar's live emotional
+        # state. Both are single-key records read through the store cache, added
+        # to the gather that was already running rather than to a new round trip,
+        # so neither costs the turn measurable time. They are deliberately NOT
+        # retrieved by similarity: how a person gives affection or reacts under
+        # strain bears on every reply, not only on replies whose topic happens to
+        # resemble the finding.
+        read_profile_text(
+            runtime.store,
+            creator_id,
+            assistant_id,
+            max_characters=psychological_profile_max_characters,
+        ),
+        read_current_emotion_text(runtime.store, creator_id, assistant_id),
     )
 
     # Both names are read back out of ``state`` further down, where the prompt is
@@ -864,60 +933,37 @@ async def _build_consciousness_system_message_update(
     """ Retrieve Signature Key Phrases """
     # The avatar's auto-discovered signature phrases (built by calibrate_ground_truth
     # from the direct quotes). Stored owner-scoped at
-    # (creator_id, assistant_id, "key_phrase_profile") as a JSON list; rendered
-    # here into the LLM-legible block injected as the <SIGNATURE PHRASES> section.
-    # Empty string when none have been discovered yet.
-    import json as _json
-
+    # (creator_id, assistant_id, "key_phrase_profile") as a JSON list, ordered
+    # most distinctive first; rendered here into the LLM-legible block injected
+    # as the <SIGNATURE PHRASES> section. Empty string when none have been
+    # discovered yet.
     key_phrase_profile_ITEM = await runtime.store.aget(
         (creator_id, assistant_id, "key_phrase_profile"), "key_phrase_profile"
     )
     key_phrase_list_str = getattr(key_phrase_profile_ITEM, "value", {}).get("value", "")
-    try:
-        key_phrase_list = _json.loads(key_phrase_list_str) if key_phrase_list_str else []
-    except (TypeError, ValueError):
-        key_phrase_list = []
-    # Render-time guard: phrase sets stored before discovery cleaned its corpus
-    # contain markup debris ("https t co ...") — never show those to the model.
-    # The stored set itself heals on the avatar's next calibration.
-    from src.anubis.utils.dataset.key_phrases import phrase_is_well_formed
-
-    key_phrases_str = "\n".join(
-        f'- "{phrase}"'
-        for phrase in key_phrase_list
-        if phrase_is_well_formed(phrase)
+    # The loader accepts every shape this key has ever held (a bare list, a
+    # detail envelope, or a JSON string of either) and applies the shape guard
+    # that keeps markup debris from phrase sets stored before discovery cleaned
+    # its corpus ("https t co ...") out of the prompt.
+    from src.anubis.utils.dataset.key_phrases import (
+        load_key_phrase_profile_phrase_list,
     )
 
-    """ Retrieve Emotions """
-
-    # from src.anubis.utils.prompts.psycho_analysis import plutchik_emotional_wheel_analysis_prompt
-    # from src.anubis.utils.state import EmotionSummarization
-
-    # if state['current_assistant_emotions'] is None or state['current_assistant_emotions'] == "":
-    #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt
-    #     emotional_model = init_model(context=runtime.context, response_format=EmotionSummarization)
-    #     historical_assistant_emotion_items = await runtime.store.asearch(assistant_identity_namespace, query=["I am feeling", "feeling"])
-    #     historical_assistant_emotion_documents = reduce_docs(historical_assistant_emotion_items)
-    #     historical_feelings_str = "\n\n".join([document.metadata.get("fact") for document in historical_user_feelings_documents if document.metadata.get("fact", "") != ""])
-    #     emotion_summarization = await emotional_model.ainvoke(input = [SystemMessage(content = EMOTIONAL_ANALYSIS_PROMPT), HumanMessage(content=historical_feelings_str)])
-    #     current_assistant_emotions = emotion_summarization.emotional_summary
-
-    # # Search user feelings
-    # if state['current_user_feelings'] is None or state['current_user_feelings'] == "":
-    #     EMOTIONAL_ANALYSIS_PROMPT = plutchik_emotional_wheel_analysis_prompt
-    #     emotional_model = init_model(context=runtime.context, response_format=EmotionSummarization)
-
-    #     historical_user_feelings_items = await runtime.store.asearch(user_identity_namespace, query=["I am feeling", "feeling"])
-    #     historical_user_feelings_documents = reduce_docs(historical_user_feelings_items)
-    #     historical_feelings_str = "\n\n".join([document.metadata.get("fact") for document in historical_user_feelings_documents if document.metadata.get("fact", "") != ""])
-
-    #     historical_user_feelings_items = await runtime.store.asearch(user_id, assistant_id, "memory", query=["I am feeling", "feeling"])
-    #     historical_user_feelings_documents = reduce_docs(historical_user_feelings_items)
-    #     historical_feelings_str = historical_feelings_str + "\n\n".join([document.metadata.get("fact") for document in historical_user_feelings_documents if document.metadata.get("fact", "") != ""])
-
-    #     emotion_summarization = await emotional_model.ainvoke(input = [SystemMessage(content = EMOTIONAL_ANALYSIS_PROMPT), HumanMessage(content=historical_feelings_str)])
-
-    #     current_user_emotions = emotion_summarization.emotional_summary
+    key_phrase_list = load_key_phrase_profile_phrase_list(key_phrase_list_str)
+    # Cap what reaches the prompt. Discovery caps the STORED set too, but a set
+    # written before that cap existed can hold hundreds of phrases — roughly
+    # forty per upload under the old accumulate-forever scheme — and every one of
+    # them was being rendered on every single turn. Because the list is stored
+    # most-distinctive-first, the prefix is the best of it.
+    prompt_phrase_limit = max(
+        1,
+        int(
+            getattr(learning_context, "key_phrase_prompt_maximum_phrases", 25) or 25
+        ),
+    )
+    key_phrases_str = "\n".join(
+        f'- "{phrase}"' for phrase in key_phrase_list[:prompt_phrase_limit]
+    )
 
     prompt_builder = DynamicPromptBuilder()
 
@@ -954,6 +1000,12 @@ async def _build_consciousness_system_message_update(
 
     """ Create System Prompt """
 
+    # How the avatar's own person moves, measured (src/anubis/utils/motion/):
+    # one primary-key read, empty until enough footage or camera time exists.
+    from src.anubis.utils.motion.prompt_section import read_how_you_move_section
+
+    how_you_move_section = await read_how_you_move_section(assistant_id, runtime.context)
+
     populated_identity_template = prompt_builder.build_prompt(
         assistant_name=assistant_name,
         assistant_description=assistant_description,
@@ -961,6 +1013,11 @@ async def _build_consciousness_system_message_update(
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
         analyzed_traits=analyzed_traits,
+        # The consolidated psychology of the target, and what the avatar is
+        # feeling right now (see src/anubis/utils/psycho/).
+        psychological_profile=psychological_profile_text,
+        how_you_move=how_you_move_section,
+        assistant_emotions=current_assistant_emotion_text or None,
         style_profile_str=style_profile_str,
         key_phrases_str=key_phrases_str,
         direct_quotes=direct_quotes,
@@ -986,12 +1043,6 @@ async def _build_consciousness_system_message_update(
         ask_what_feels_real=should_ask_what_feels_real(
             learning_sections,
             int(getattr(learning_context, "ask_what_feels_real_after_messages", 5) or 0),
-    # How the avatar's own person moves, measured (src/anubis/utils/motion/):
-    # one primary-key read, empty until enough footage or camera time exists.
-    from src.anubis.utils.motion.prompt_section import read_how_you_move_section
-
-    how_you_move_section = await read_how_you_move_section(assistant_id, runtime.context)
-
         ),
     )
 
@@ -999,11 +1050,6 @@ async def _build_consciousness_system_message_update(
 
     # prepend system message
     logger.info(f"state['messages']: {state['messages']}")
-        # The consolidated psychology of the target, and what the avatar is
-        # feeling right now (see src/anubis/utils/psycho/).
-        psychological_profile=psychological_profile_text,
-        how_you_move=how_you_move_section,
-        assistant_emotions=current_assistant_emotion_text or None,
 
     system_message_str = populated_identity_template.messages[0].content
 
@@ -1246,6 +1292,87 @@ async def _build_consciousness_system_message_update(
                 "</CONNECTOR_STATUS>\n"
             )
 
+    # The owner talking to ANOTHER avatar they own reaches the personal avatar's
+    # accounts, because the personal avatar is the owner's standing proxy and the
+    # one place credentials live (see the brokering in ``graph.py``). The tools
+    # are attached there; the prompt has to agree, or the avatar holds a calendar
+    # it was never told about and goes on saying it cannot help. A visitor is
+    # unaffected: the owner check below is false for them.
+    owner_of_this_avatar = (
+        avatar_owner_id is not None and avatar_owner_id == user_id
+    )
+    if owner_of_this_avatar and not is_personal_avatar:
+        try:
+            from src.anubis.utils.connected_accounts import (
+                STATUS_CONNECTED,
+                bound_accounts_for,
+                get_provider,
+            )
+            from src.anubis.utils.personal_avatar import (
+                personal_avatar_id_for_owner,
+                read_personal_avatar_id,
+            )
+            from src.anubis.utils.prompts.system_prompts import (
+                CONNECT_MAILBOX_PROMPT,
+                MAILBOX_CAPABILITY_PROMPT,
+            )
+            from src.anubis.utils.runtime_handles import get_postgres_pool
+
+            brokered_avatar_id = await read_personal_avatar_id(
+                runtime.store, user_id
+            ) or await personal_avatar_id_for_owner(get_postgres_pool(), user_id)
+            if brokered_avatar_id:
+                brokered_accounts = await bound_accounts_for(
+                    runtime.store, user_id, brokered_avatar_id
+                )
+                connected_lines = []
+                for account in brokered_accounts:
+                    provider = get_provider(str(account.get("provider") or ""))
+                    provider_name = (
+                        provider.display_name if provider else account.get("provider")
+                    )
+                    detail = (
+                        account.get("display_label")
+                        or account.get("account_address")
+                        or ""
+                    )
+                    connected_lines.append(f"{provider_name}: {detail}")
+                if any(
+                    account.get("kind") == "mailbox"
+                    and account.get("status") == STATUS_CONNECTED
+                    for account in brokered_accounts
+                ):
+                    system_message_str += MAILBOX_CAPABILITY_PROMPT
+                system_message_str += CONNECT_MAILBOX_PROMPT
+                system_message_str += (
+                    "\n<CONNECTED_ACCOUNTS>\n"
+                    + (
+                        "Connected for the conversation partner: "
+                        + "; ".join(connected_lines)
+                        + "."
+                        if connected_lines
+                        else "No accounts are connected for the conversation "
+                        "partner yet."
+                    )
+                    + " These accounts belong to the conversation partner, who owns "
+                    "this avatar, and this avatar may act on them on the "
+                    "conversation partner's behalf.\n"
+                    "</CONNECTED_ACCOUNTS>\n"
+                )
+        except Exception:  # noqa: BLE001 - a prompt section never fails a turn
+            logger.debug(
+                "Brokered account sections unavailable for the prompt", exc_info=True
+            )
+
+    # Making a plan: the owner of this avatar may ask for one, and the answer is
+    # a real place at a real time written to a real calendar. Attached for any
+    # avatar the conversation partner owns, mirroring where the place-finding
+    # tool is attached in ``graph.py``.
+    if owner_of_this_avatar:
+        from src.anubis.utils.prompts.system_prompts import MAKING_PLANS_PROMPT
+
+        system_message_str = system_message_str + MAKING_PLANS_PROMPT
+
     # Agent inbox — the personal avatar only. The count and the top subjects
     # are named so the avatar raises pending items at the start of a
     # conversation without spending a tool call, and never invents one.
@@ -1380,12 +1507,18 @@ async def _build_consciousness_system_message_update(
     try:
         from src.anubis.utils.ambient.observations import (
             ambient_details,
+            build_live_shares_block,
             is_ambient_observation,
             is_speech_observation,
         )
         from src.anubis.utils.prompts.system_prompts import (
             AMBIENT_VISION_CAPABILITY_PROMPT,
             SPOKEN_ROOM_CAPABILITY_PROMPT,
+            SPOKEN_ROOM_PERSONAL_AVATAR_PROMPT,
+        )
+        from src.anubis.utils.tools.vision.look_tools import (
+            normalize_live_shares,
+            peekable_sources,
         )
         from src.anubis.utils.voice.speakers import spoken_turn_of
 
@@ -1396,10 +1529,87 @@ async def _build_consciousness_system_message_update(
             for message in thread_messages
         )
         heard_speech = any(spoken_turn_of(message) for message in thread_messages)
-        if seen_scene:
+        # The accessibility switch, as the browser reported it this turn. Only
+        # ON changes the prompt: a browser that could narrate but is not, and a
+        # client that never could, both read as the conversation always did.
+        from src.anubis.utils.tools.vision.accessibility_tools import (
+            NARRATION_ON,
+            normalize_scene_narration_state,
+        )
+
+        scene_narration_on = (
+            normalize_scene_narration_state(
+                (config or {}).get("configurable", {}).get("scene_narration")
+            )
+            == NARRATION_ON
+        )
+        # Narration switched on ahead of the first observation still needs the
+        # capability block: the observations are seconds away, and the first
+        # one must not be read as a scene the assistant chose to bring up.
+        if seen_scene or scene_narration_on:
             system_message_str = system_message_str + AMBIENT_VISION_CAPABILITY_PROMPT
         if heard_speech:
             system_message_str = system_message_str + SPOKEN_ROOM_CAPABILITY_PROMPT
+            # Whose voice the unlabelled lines are depends on whether this
+            # avatar is a portrait of the person at the microphone. On their
+            # own avatar their words are the avatar's own intentions; on
+            # anybody else's avatar they are a conversation partner talking.
+            # Saying the first of somebody else's avatar is how a person's own
+            # question comes back to them in the avatar's name.
+            speaking_avatar_metadata = (
+                (config or {}).get("configurable", {}).get("assistant_ctx", {}) or {}
+            ).get("metadata", {}) or {}
+            if (
+                speaking_avatar_metadata.get("is_personal_avatar_of_creator") is True
+                and speaking_avatar_metadata.get("user_id") is not None
+                and speaking_avatar_metadata.get("user_id") == user_id
+            ):
+                system_message_str = (
+                    system_message_str + SPOKEN_ROOM_PERSONAL_AVATAR_PROMPT
+                )
+
+        # What is shared THIS MOMENT, as against what the thread's observations
+        # describe. Without this the avatar reads an observation of a screen the
+        # conversation partner stopped sharing as a description of that screen
+        # now — the thread keeps every observation and none of them expire.
+        live_sources = normalize_live_shares(
+            (config or {}).get("configurable", {}).get("live_shares")
+        )
+        # The look is offered only when the tool is actually attached. An
+        # ambient observation turn carries its own fresh frame and is given no
+        # look tool (see ``graph.py``), so it must not be told to call one.
+        from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
+
+        answering_an_observation = bool(
+            thread_messages and is_ambient_observation(thread_messages[-1])
+        )
+        # The same two conditions ``graph.py`` gates the tool on, so the prompt
+        # never tells the avatar to call a tool this turn was not given.
+        may_control_shares = bool(
+            (config or {}).get("configurable", {}).get("may_control_shares")
+        )
+        peekable = peekable_sources(
+            (config or {}).get("configurable", {}).get("peekable_shares"),
+            may_control_shares=may_control_shares,
+        )
+        look_is_attached = (
+            not answering_an_observation
+            and get_deep_agent_checkpointer() is not None
+            and (
+                bool(live_sources)
+                or seen_scene
+                or may_control_shares
+                or bool(peekable)
+            )
+        )
+        system_message_str = system_message_str + build_live_shares_block(
+            live_sources,
+            thread_messages,
+            can_look_now=look_is_attached,
+            may_control_shares=may_control_shares and look_is_attached,
+            peekable_sources=peekable if look_is_attached else [],
+            scene_narration_on=scene_narration_on,
+        )
     except Exception:  # noqa: BLE001 - the block must never fail a turn
         logger.debug("Ambient-vision block unavailable for the prompt", exc_info=True)
 

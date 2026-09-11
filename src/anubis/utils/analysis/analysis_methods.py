@@ -604,3 +604,87 @@ ANALYSIS_SCAFFOLD_RUNNERS: dict[str, Any] = {
     "standardized_questions": _run_standardized_questions,
     **{name: _make_narrative_runner(name) for name in _NARRATIVE_ANALYZER_SPECS},
 }
+
+
+""" DEFAULT SCAFFOLD SETS PER DOCUMENT KIND
+
+Running every registered analyzer on every document is what kept the whole
+analysis branch switched off: the ``standardized_questions`` analyzer alone asks
+the entire standardized identity question bank, which is roughly two hundred
+structured-output calls for ONE document, and the narrative analyzers each cost
+two more.
+
+So the default analyzer set is chosen from the document's
+``classified_situation`` — which every producer in the media pipeline already
+writes — instead of being the whole registry. A document can still override the
+choice by writing ``metadata["analysis_scaffolds"]`` explicitly.
+
+The rules follow what each kind of document can actually support. A biographical
+fact answers questions about a life, so the question bank belongs there and
+nowhere else. A dialogue is the only place another person's words are present to
+trigger the target, so that is where emotional triggers are read. A monologue or a
+series of quotes carries voice and stance but no interaction, so it gets the
+trait analyzers without the trigger analyzer.
+"""
+
+# The narrative analyzers that pay for themselves on any text carrying the
+# target's own stance.
+_NARRATIVE_CORE_SCAFFOLDS = (
+    "beliefs",
+    "relationships",
+    "values",
+    "opinions",
+    "goals",
+    "fears",
+    "flaws",
+)
+
+# The full narrative set, worth its cost only where the document is about the
+# target's life rather than one remark of theirs.
+_NARRATIVE_FULL_SCAFFOLDS = _NARRATIVE_CORE_SCAFFOLDS + (
+    "wants",
+    "needs",
+    "description",
+    "identity",
+    "history",
+)
+
+DEFAULT_SCAFFOLDS_BY_SITUATION: dict[str, tuple[str, ...]] = {
+    "biographical_facts": ("ocean", "standardized_questions")
+    + _NARRATIVE_FULL_SCAFFOLDS,
+    "dialogue": ("ocean", "emotional_triggers") + _NARRATIVE_CORE_SCAFFOLDS,
+    "monologue": ("ocean",) + _NARRATIVE_CORE_SCAFFOLDS,
+    "tweets_or_quotes": ("ocean",) + _NARRATIVE_CORE_SCAFFOLDS,
+}
+
+# What a document with no recognised classification gets: the cheap, broadly
+# applicable analyzers, never the question bank.
+FALLBACK_SCAFFOLDS: tuple[str, ...] = ("ocean",) + _NARRATIVE_CORE_SCAFFOLDS
+
+
+def default_scaffolds_for_document(document: Document) -> list[str]:
+    """The analyzers a document runs when it does not name them itself.
+
+    ``standardized_questions`` is additionally gated by
+    ``STANDARDIZED_QUESTION_ANALYSIS_ENABLED`` because even on the one document
+    kind it suits, it is the most expensive analyzer in the registry by two orders
+    of magnitude.
+    """
+    from src.anubis.utils.context import GlobalContext
+
+    metadata = document.metadata or {}
+    explicit = metadata.get("analysis_scaffolds")
+    if explicit:
+        return list(explicit)
+    situation = str(metadata.get("classified_situation") or "").strip().lower()
+    scaffolds = list(DEFAULT_SCAFFOLDS_BY_SITUATION.get(situation, FALLBACK_SCAFFOLDS))
+    if "standardized_questions" in scaffolds:
+        enabled = (
+            str(GlobalContext().standardized_question_analysis_enabled or "FALSE")
+            .strip()
+            .upper()
+            == "TRUE"
+        )
+        if not enabled:
+            scaffolds.remove("standardized_questions")
+    return scaffolds

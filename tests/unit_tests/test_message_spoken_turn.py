@@ -40,14 +40,15 @@ def _upload(name: str, content_type: str, payload: bytes = b"abc") -> UploadFile
     )
 
 
-def _turn(segments, *, owner_identified=True):
+def _turn(segments, *, owner_identified=True, owner_label="Evan", avatar_label=""):
     others = sorted(
         {segment.speaker for segment in segments if not segment.is_owner and not segment.is_avatar}
     )
     return SpokenTurn(
         script=speakers_module.render_speaker_script(segments),
         segments=segments,
-        owner_label="Evan",
+        owner_label=owner_label,
+        avatar_label=avatar_label,
         owner_identified=owner_identified,
         other_speakers=others,
         duration_seconds=3.0,
@@ -67,12 +68,25 @@ def harness(monkeypatch):
         return True
 
     monkeypatch.setattr(webapp_module, "persist_api_metrics_row", fake_metrics_row)
+    # Live voice runs on the caller's own personal avatar, so that is what the
+    # default harness is: the avatar IS the person at the microphone, and the
+    # avatar's name is therefore theirs too. The opposite case — somebody
+    # else's avatar — is covered below, because that is where reading the
+    # avatar's name as the speaker's name goes wrong.
     monkeypatch.setattr(
         webapp_module,
         "get_client",
         lambda **kwargs: SimpleNamespace(
             assistants=SimpleNamespace(
-                get=_async_return({"name": "Evan Woods", "metadata": {}})
+                get=_async_return(
+                    {
+                        "name": "Evan Woods",
+                        "metadata": {
+                            "is_personal_avatar_of_creator": True,
+                            "user_id": "u1",
+                        },
+                    }
+                )
             )
         ),
     )
@@ -124,13 +138,20 @@ async def test_owner_only_utterance_is_a_visible_spoken_turn(monkeypatch, harnes
     )
 
     assert remaining == [image], "only the audio attachment is consumed"
-    assert message == "Evan: What is on my calendar?"
+    # The person at the microphone is not named: there is one person the
+    # avatar is talking to, and prefixing their own words with a name told the
+    # avatar nothing while getting the name wrong on every avatar that is not
+    # a portrait of that person.
+    assert message == "What is on my calendar?"
     assert kwargs["kind"] == "spoken_turn" and "ambient" not in kwargs
     assert kwargs["speakers"]["owner_spoke"] is True
     assert kwargs["speakers"]["others_spoke"] is False
     assert frame == {"content": message, "speakers": kwargs["speakers"]}
     assert seen["audio_bytes"] == b"opus-bytes"
-    assert seen["owner_label"] == "Evan Woods", "the avatar's name labels the owner"
+    assert seen["owner_label"] == "Evan Woods", (
+        "on a personal avatar the avatar's name IS the speaker's name"
+    )
+    assert seen["avatar_portrays_the_speaker"] is True
     assert seen["thread_id"] == "t1"
     assert harness and harness[0]["inference_type"] == "diarization"
     assert harness[0]["total_tokens"] == 5 and harness[0]["cost_usd"] == 0.001
@@ -160,7 +181,8 @@ async def test_utterance_with_others_is_a_visible_microphone_observation(monkeyp
     )
 
     assert remaining == []
-    assert message == "typed note\n\nEvan: Say hi to Maria.\nSpeaker 2: Hello, avatar."
+    # Only the third voice is named. The person's own line carries no label.
+    assert message == "typed note\n\nSay hi to Maria.\nSpeaker 2: Hello, avatar."
     assert kwargs["kind"] == observations.AMBIENT_MESSAGE_KIND
     assert kwargs["hidden"] is False, "what was heard stays in the transcript"
     assert kwargs["ambient"]["sources"] == ["microphone"]
@@ -170,6 +192,64 @@ async def test_utterance_with_others_is_a_visible_microphone_observation(monkeyp
 
     human = HumanMessage(content=message, additional_kwargs=kwargs)
     assert route_after_image_resolution({"messages": [human]}) == "ambient_triage"
+
+
+@pytest.mark.asyncio
+async def test_somebody_elses_avatar_never_labels_the_speaker_with_its_own_name(
+    monkeypatch,
+):
+    """The regression: talking to an avatar of someone else, in that person's name.
+
+    ``Shivon Zilis: what are you seeing right now?`` — the person's own
+    question, read back to them under the avatar's name — because the speaker
+    label fell back to the avatar's name and the avatar's reference clip was
+    offered to the diarizer as though it were the speaker's voice.
+    """
+    monkeypatch.setattr(
+        webapp_module,
+        "get_client",
+        lambda **kwargs: SimpleNamespace(
+            assistants=SimpleNamespace(
+                get=_async_return(
+                    # Somebody else's avatar: no personal flag, another creator.
+                    {"name": "Shivon Zilis", "metadata": {"user_id": "u2"}}
+                )
+            )
+        ),
+    )
+
+    async def fake_metrics_row(pool, **kwargs):
+        return True
+
+    monkeypatch.setattr(webapp_module, "persist_api_metrics_row", fake_metrics_row)
+    segments = [
+        LabelledSegment("owner", "What are you seeing right now?", 0.0, 2.0, is_owner=True)
+    ]
+    seen = _install_fake_diarizer(
+        monkeypatch,
+        _turn(segments, owner_label="owner", avatar_label="Shivon Zilis"),
+    )
+    _remaining, message, kwargs, _frame = await webapp_module.label_spoken_turn_files(
+        SimpleNamespace(pool=None),
+        CURRENT_USER,
+        files=[_upload("utterance.webm", "audio/webm", b"x")],
+        message="",
+        assistant_id="a1",
+        thread_id="t1",
+        your_name=None,
+        request_id="r1",
+    )
+
+    assert message == "What are you seeing right now?"
+    assert "Shivon Zilis" not in message
+    # The speaker is the account holder, taken from their own account, and the
+    # avatar's stored reference clip is the AVATAR's voice, not theirs — so a
+    # voice matching it is the avatar's playback and never the person.
+    assert seen["owner_label"] == "owner"
+    assert seen["avatar_label"] == "Shivon Zilis"
+    assert seen["avatar_portrays_the_speaker"] is False
+    assert kwargs["speakers"]["avatar_label"] == "Shivon Zilis (avatar)"
+    assert kwargs["speakers"]["owner_label"] == "owner"
 
 
 @pytest.mark.asyncio
@@ -319,13 +399,20 @@ async def test_echo_only_utterance_is_triaged_not_answered(monkeypatch, harness)
         your_name="Evan",
         request_id="r1",
     )
-    assert message == "Evan (avatar): The project kicks off next Monday."
+    # The avatar's own playback is left out of the script — those words are
+    # already in the thread as the avatar's reply, and an unlabelled echo would
+    # read as the person saying them back. The turn still says what happened.
+    assert message == (
+        "(only this avatar's own voice was heard, played back in the room)"
+    )
     assert kwargs["kind"] == observations.AMBIENT_MESSAGE_KIND, "nothing to answer: triage it"
     assert kwargs["hidden"] is False
     assert kwargs["speakers"]["avatar_spoke"] is True
     assert kwargs["speakers"]["owner_spoke"] is False
     assert kwargs["speakers"]["other_speakers"] == []
-    assert frame["speakers"]["avatar_label"] == "Evan (avatar)"
+    # The avatar's label is the AVATAR's name, never the name the speaker was
+    # addressed by; here the caller sent "Evan" and the avatar is "Evan Woods".
+    assert frame["speakers"]["avatar_label"] == "Evan Woods (avatar)"
 
 
 @pytest.mark.asyncio

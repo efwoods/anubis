@@ -22,7 +22,10 @@ from typing import Any
 from langgraph.types import Command
 
 from src.anubis.utils.inbox.repository import (
+    NOTIFY_ONLY_SOURCE_KINDS,
+    STATE_IGNORED,
     STATE_PENDING_OWNER,
+    STATE_RESOLVED,
     get_inbox_repository,
     sender_domain_of,
 )
@@ -217,6 +220,22 @@ async def resume_inbox_item(
         return None
     if item.get("state") != STATE_PENDING_OWNER:
         return item
+
+    # An item this system wrote for the owner has no paused triage run behind
+    # it: nothing ever interrupted, so there is no checkpoint for ``Command(resume=...)``
+    # to deliver a decision to, and invoking the graph would start a fresh run
+    # that triages a notification as though it were incoming mail. Record the
+    # owner's decision and close the item here instead.
+    if str(item.get("source_kind") or "") in NOTIFY_ONLY_SOURCE_KINDS:
+        decision = str((human_response or {}).get("action") or "").strip().lower()
+        await repository.update_item(
+            item_id,
+            state=STATE_IGNORED if decision == "ignore" else STATE_RESOLVED,
+            owner_decision=human_response,
+            resolved_at=datetime.now(UTC),
+        )
+        return await repository.get_item(item_id)
+
     config = _run_config(item, None)
     try:
         await _graph().ainvoke(

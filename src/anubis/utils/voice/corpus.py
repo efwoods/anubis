@@ -136,6 +136,17 @@ class VoiceStatus:
     # asks the owner for a better recording on the strength of these two.
     reference_audio_usable: bool = False
     reference_audio_problem: str | None = None
+    # Whether talking to this avatar in voice mode grows its voice, and the one
+    # thing standing in the way when it does not. ``accrual_consent`` is the
+    # owner's answer, or ``None`` when they have not been asked yet.
+    accrual_enabled: bool = False
+    accrual_blocked_reason: str | None = None
+    accrual_consent: str | None = None
+    # The vendor's stock voice the owner chose for the avatar to speak with
+    # while it has no usable clone: ``{"voice_id", "name", "gender"}`` or
+    # ``None``. Reported whether or not a clone exists, so the panel can show
+    # the pick without a second read.
+    standard_voice: dict[str, Any] | None = None
     detail: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -458,6 +469,83 @@ async def rebuild_instant_voice(
     )
 
 
+INSTANT_REFRESHED_DETAIL_KEY = "instant_refreshed_at_target"
+"""``detail`` marker so the one refresh at the target happens exactly once."""
+
+
+def instant_refresh_enabled(context: Any) -> bool:
+    """Whether a clone built from less than the target is rebuilt at the target."""
+    return str(
+        getattr(context, "instant_voice_refresh_at_target_enabled", "") or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def refresh_instant_voice_at_target(
+    repository: Any,
+    context: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    avatar_name: str = "",
+    record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild an instant clone once, the first time the corpus reaches the target.
+
+    ``ensure_instant_voice`` builds the first clone at the minimum and never
+    rebuilds, so an avatar whose corpus crossed sixty seconds mid-conversation
+    keeps a clone trained on sixty seconds however much it goes on to hear. That
+    is the right default for an upload — the owner chose what to upload — but
+    not for speech accrued as a side effect of talking, where waiting a few more
+    minutes produces a markedly better voice for free.
+
+    This replaces such a clone exactly once, when the corpus first reaches
+    ``ELEVENLABS_INSTANT_VOICE_CLONE_TARGET_SECONDS``, which is the behaviour
+    that field's own description has always claimed. A clone already built from
+    the target seconds or more is left alone, as is one the vendor has blocked —
+    rebuilding a banned voice only earns the same ban.
+
+    Returns the voice record, unchanged when no refresh was due.
+    """
+    record = record or await _voice_record(repository, user_id, assistant_id)
+    if not instant_refresh_enabled(context) or not voice_configured(context):
+        return record
+    detail = record.get("detail") or {}
+    if detail.get(INSTANT_REFRESHED_DETAIL_KEY) or voice_record_blocked(record):
+        return record
+    if not record.get("instant_voice_id"):
+        return record
+
+    thresholds = VoiceThresholds.from_context(context)
+    if float(record.get("instant_voice_seconds") or 0.0) >= thresholds.instant_target:
+        return record
+    collected = float(await repository.total_voice_seconds(assistant_id))
+    if collected < thresholds.instant_target:
+        return record
+
+    # Marked before the rebuild, not after: a rebuild that fails leaves the
+    # avatar with no instant voice and the ordinary retry on the next status
+    # read builds one, and marking afterwards would let a failing vendor be
+    # asked to rebuild on every later clip.
+    record["detail"] = {
+        **detail,
+        INSTANT_REFRESHED_DETAIL_KEY: datetime.now(tz=UTC).timestamp(),
+    }
+    await repository.upsert_voice(record)
+    logger.info(
+        "Refreshing the instant voice for %s: clone built from %.0fs, corpus now %.0fs",
+        assistant_id,
+        float(record.get("instant_voice_seconds") or 0.0),
+        collected,
+    )
+    return await rebuild_instant_voice(
+        repository,
+        context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        avatar_name=avatar_name,
+    )
+
+
 async def prepare_professional_voice(
     repository: Any,
     context: Any,
@@ -731,6 +819,27 @@ async def resolve_active_voice_id(
     return "none", None
 
 
+async def resolve_speaking_voice(
+    repository: Any, assistant_id: str
+) -> tuple[str, str | None]:
+    """Which voice actually speaks: a usable clone first, else the standard voice.
+
+    ``("professional"|"instant"|"standard"|"none", id)``. A clone the vendor
+    has banned does not count as usable, so an avatar with a banned clone and
+    a standard voice speaks with the standard voice.
+    """
+    from src.anubis.utils.voice.standard_voices import standard_voice_of
+
+    record = await repository.get_voice(assistant_id) or {}
+    kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
+    if voice_id is not None and not voice_record_blocked(record):
+        return kind, voice_id
+    standard = standard_voice_of(record)
+    if standard is not None:
+        return "standard", standard["voice_id"]
+    return "none", None
+
+
 def voice_seconds_by_document(clips: list[dict[str, Any]]) -> dict[str, float]:
     """Seconds of stored speech per source document name."""
     seconds_by_document: dict[str, float] = {}
@@ -808,6 +917,56 @@ def _instant_clone_retry_due(
     return datetime.now(tz=UTC).timestamp() - failed_at >= INSTANT_CLONE_RETRY_SECONDS
 
 
+async def voice_readiness(
+    repository: Any,
+    context: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+) -> dict[str, Any]:
+    """A cheap read of whether the avatar can speak yet, and how far along it is.
+
+    ``voice_status_for`` is what the settings panel renders and it asks the
+    vendor whether the clone is still allowed to speak. That is far too much for
+    something reported on every spoken turn, so this reads the stored row and
+    the corpus total only. It is what tells a live conversation that the voice
+    has just become usable, so the avatar starts speaking without a reload.
+    """
+    from src.anubis.utils.voice.standard_voices import standard_voice_of
+
+    record = await _voice_record(repository, user_id, assistant_id)
+    thresholds = VoiceThresholds.from_context(context)
+    active, active_id = await resolve_speaking_voice(repository, assistant_id)
+    standard_voice = standard_voice_of(record)
+    readiness = {
+        "active_voice": active,
+        "has_voice": active_id is not None,
+        # A banned clone silences the avatar only while no standard voice
+        # stands in for it; the client latches ``blocked`` into text-only replies.
+        "blocked": voice_record_blocked(record) and standard_voice is None,
+        "standard_voice": standard_voice,
+    }
+    # Whether an avatar can speak is plain to anyone who presses speak, so it is
+    # reported to whoever is talking. How much speech it holds is the owner's
+    # business, and the row already names the owner, so telling them apart costs
+    # no extra lookup. A row that does not exist yet defaults to the caller and
+    # holds nothing to disclose.
+    if str(record.get("user_id") or "") != str(user_id or ""):
+        return readiness
+    readiness.update(
+        {
+            "collected_seconds": float(
+                await repository.total_voice_seconds(assistant_id)
+            ),
+            "instant_minimum_seconds": thresholds.instant_minimum,
+            "professional_state": str(
+                record.get("professional_state") or VOICE_STATE_NOT_STARTED
+            ),
+        }
+    )
+    return readiness
+
+
 async def voice_status_for(
     repository: Any,
     context: Any,
@@ -841,6 +1000,18 @@ async def voice_status_for(
     )
     clips = await repository.list_voice_clips(assistant_id)
     active, active_id = await resolve_active_voice_id(repository, assistant_id)
+    from src.anubis.utils.voice.capture import accrual_blocked_reason, consent_state
+    from src.anubis.utils.voice.standard_voices import standard_voice_of
+
+    accrual_consent = consent_state(record)
+    accrual_blocked = await accrual_blocked_reason(
+        repository,
+        context,
+        store,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal_avatar,
+    )
     reference_audio_document: str | None = None
     reference_audio_usable = False
     reference_audio_problem: str | None = None
@@ -896,6 +1067,10 @@ async def voice_status_for(
         reference_audio_document=reference_audio_document,
         reference_audio_usable=reference_audio_usable,
         reference_audio_problem=reference_audio_problem,
+        accrual_enabled=accrual_blocked is None,
+        accrual_blocked_reason=accrual_blocked,
+        accrual_consent=accrual_consent,
+        standard_voice=standard_voice_of(record),
         detail={
             k: v
             for k, v in (record.get("detail") or {}).items()

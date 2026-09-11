@@ -1,9 +1,9 @@
 {
-  "baseline_response_threshold": 49.9148420404602,
+  "baseline_response_threshold": 50.6303957447559,
   "conversation_count": 161,
   "feature_width": 28,
-  "generated_at": "2026-09-03T18:18:30+00:00",
-  "key_phrase_count": 40,
+  "generated_at": "2026-09-10T17:55:11+00:00",
+  "key_phrase_count": 8,
   "model": "gpt-5.6-luna",
   "model_completion_cost": "0.0000012",
   "model_prompt_cost": "0.0000002",

@@ -35,6 +35,7 @@ from src.anubis.utils.connected_accounts.providers import (
     KIND_MESSAGING,
     KIND_SOCIAL,
     KIND_WEBSITE,
+    MECHANISM_API_KEY,
     MECHANISM_BROWSER_SESSION,
     MECHANISM_OAUTH,
     MECHANISM_PASSWORD,
@@ -126,6 +127,16 @@ def _oauth_vendor_factory(
     return tools
 
 
+def _api_key_factory(
+    context: Any, accounts: list[dict[str, Any]], **runtime: Any
+) -> list[Any]:
+    from src.anubis.utils.connected_accounts.vendor_key_tools import (
+        build_vendor_key_tools,
+    )
+
+    return build_vendor_key_tools(context, accounts, store=runtime.get("store"))
+
+
 def _calendar_factory(
     context: Any, accounts: list[dict[str, Any]], **runtime: Any
 ) -> list[Any]:
@@ -153,10 +164,32 @@ def _calendar_factory(
     return tools
 
 
+def _analytics_factory(
+    context: Any, accounts: list[dict[str, Any]], **runtime: Any
+) -> list[Any]:
+    """Analytics accounts, whichever way each one was connected.
+
+    A vendor that issues an API key and one that runs an OAuth application both
+    file as analytics, so the split lives here rather than in the prompt.
+    """
+    key_accounts = [
+        record
+        for record in accounts
+        if record.get("credential_mechanism") == MECHANISM_API_KEY
+    ]
+    other_accounts = [record for record in accounts if record not in key_accounts]
+    tools: list[Any] = []
+    if key_accounts:
+        tools.extend(_api_key_factory(context, key_accounts, **runtime))
+    if other_accounts:
+        tools.extend(_oauth_vendor_factory(context, other_accounts, **runtime))
+    return tools
+
+
 TOOL_FACTORIES: dict[str, ToolFactory] = {
     KIND_MAILBOX: _mailbox_factory,
     KIND_MCP_SERVER: _mcp_server_factory,
-    KIND_ANALYTICS: _oauth_vendor_factory,
+    KIND_ANALYTICS: _analytics_factory,
     KIND_WEBSITE: _website_factory,
     KIND_BANK: _bank_factory,
     KIND_DEVELOPER: _oauth_vendor_factory,
@@ -233,6 +266,12 @@ def tool_names_for(provider: Any, record: dict[str, Any] | None = None) -> list[
         from src.anubis.utils.connected_accounts.caldav_tools import CALDAV_TOOL_NAMES
 
         return list(CALDAV_TOOL_NAMES)
+    if mechanism == MECHANISM_API_KEY:
+        from src.anubis.utils.connected_accounts.vendor_key_tools import (
+            VENDOR_KEY_TOOL_NAMES,
+        )
+
+        return list(VENDOR_KEY_TOOL_NAMES.get(name, ()))
     if name in _VENDOR_API_TOOL_NAMES and mechanism == MECHANISM_OAUTH:
         return list(_VENDOR_API_TOOL_NAMES[name])
     if mechanism == MECHANISM_BROWSER_SESSION:

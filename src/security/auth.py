@@ -107,6 +107,37 @@ def resolve_request_hashed_ip(request: Request) -> str:
     return _hash_key(request.headers.get("x-forwarded-for"))
 
 
+async def refuse_if_banned(
+    request: Request,
+    *,
+    user_id: str | None = None,
+    hashed_ip: str | None = None,
+    email: str | None = None,
+) -> None:
+    """Raise 403 when any of the identifiers carries an active ban.
+
+    Reads the Postgres ``banned_accounts`` table through ``src.security.bans``
+    (cached briefly there). A missing pool — unit tests, or an app that has not
+    finished starting — means no ban can be known, so nothing is refused.
+    """
+    from src.security.bans import ban_refusal_detail, find_active_ban
+
+    application_state = getattr(getattr(request, "app", None), "state", None)
+    pool = getattr(application_state, "pool", None)
+    if pool is None:
+        return
+    ban = await find_active_ban(pool, user_id=user_id, hashed_ip=hashed_ip, email=email)
+    if ban is None:
+        return
+    context = getattr(application_state, "context", None)
+    raise HTTPException(
+        status_code=403,
+        detail=ban_refusal_detail(
+            ban, getattr(context, "ban_appeal_contact_email", None)
+        ),
+    )
+
+
 async def update_assistant_config(
     hashed_api_key: str,
     provider_encoded_user_id: str,
@@ -712,6 +743,13 @@ async def signup_user(
     name: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
 ) -> dict:
+    # AI monitoring: a banned person may not create a new account with the same
+    # email or from the same IP. Checked before the Auth0 create so no
+    # identity-provider record is minted for a refused signup.
+    await refuse_if_banned(
+        request, email=email, hashed_ip=resolve_request_hashed_ip(request)
+    )
+
     api_key = generate_api_key()
     api_key_hash = _hash_key(api_key)
 
@@ -1163,6 +1201,15 @@ async def get_user_with_api_key(
         return None
     user = users[0]
 
+    # AI monitoring: a banned account is refused before anything else happens
+    # (before caching, enrollment, or provisioning). The Postgres bans table is
+    # the only source of truth — Auth0 is never consulted or written for bans.
+    await refuse_if_banned(
+        request,
+        user_id=((user.get("identities") or [{}])[0] or {}).get("user_id"),
+        email=user.get("email"),
+    )
+
     if user["email_verified"] != True:
         if require_verified_email:
             raise HTTPException(
@@ -1582,6 +1629,10 @@ async def get_anonymous_user_with_anonymous_api_key(
     #   VPN_SIMULATED    2a1201bb6c0061be63fc4ce58a048136fa91d3afea9e21f62ae7988a20cc09f1
     #   NO_VPN_SIMULATED 72aefc13eebd36bf5ec1cbfa1f2e930117a62e07f600dc618c18725f3d52be15
     hashed_ip = resolve_request_hashed_ip(request)
+
+    # AI monitoring: anonymous traffic from a banned IP is refused. An anonymous
+    # visitor IS the hashed IP, so the ban lookup is by that key.
+    await refuse_if_banned(request, hashed_ip=hashed_ip)
 
     # async with _cache_lock:
     #     if cache_key in _api_key_cache:
@@ -2588,9 +2639,21 @@ async def check_subscription_status(request: Request, current_user: dict) -> dic
     email = current_user.get("email")
 
     # Anonymous / email-less users are always the free tier and never have a Stripe
-    # subscription to look up, so short-circuit before touching Stripe.
+    # SUBSCRIPTION to look up, so short-circuit before touching Stripe. They do,
+    # however, have a Stripe CUSTOMER — resolve_or_create_anonymous_billing_record
+    # creates one per hashed address so their metered usage is attributable — and
+    # returning a bare default here threw that customer id away, so the usage
+    # endpoint reported no customer for a visitor who has one. Carry through what
+    # the anonymous billing record already resolved.
     if not email:
-        return SubscriptionStatus().to_dict()
+        anonymous_status = SubscriptionStatus(
+            customer_id=(
+                (subscription_status or {}).get("customer_id")
+                or current_user["app_metadata"].get("stripe_customer_id")
+            ),
+            status=(subscription_status or {}).get("status"),
+        )
+        return anonymous_status.to_dict()
 
     if not subscription_status or not subscription_status.get("subscription_id"):
         # Identify the customer server-side by email rather than scanning every

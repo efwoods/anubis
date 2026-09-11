@@ -168,13 +168,20 @@ async def test_first_verified_request_creates_the_flagged_personal_avatar(
     }
     # The creator_id store item is written exactly as /create_avatar writes it,
     # so every downstream reader treats an auto-provisioned avatar identically.
-    assert client.store.put_item_calls == [
-        (
-            (created["assistant_id"], "creator_id"),
-            "creator_id",
-            {"value": "new-account"},
-        )
+    assert (
+        (created["assistant_id"], "creator_id"),
+        "creator_id",
+        {"value": "new-account"},
+    ) in client.store.put_item_calls
+    # The per-user pointer is written alongside it, because a background sweeper
+    # and a graph node both need to answer "which avatar is this person's own"
+    # and neither holds a client authenticated as the person.
+    ((pointer_namespace, pointer_key, pointer_value),) = [
+        call for call in client.store.put_item_calls if call[1] == "personal_avatar"
     ]
+    assert pointer_namespace == ("personal_avatar_of_user", "new-account")
+    assert pointer_value["value"]["assistant_id"] == created["assistant_id"]
+    assert len(client.store.put_item_calls) == 2
     ((auth0_user_id, fields),) = recorded_app_metadata_writes
     assert auth0_user_id == "auth0|new-account"
     assert fields[PERSONAL_AVATAR_PROVISIONED_MARKER] is True
@@ -411,10 +418,15 @@ async def test_the_endpoint_provisions_rather_than_reporting_a_missing_avatar(
     assert "mailbox" in capability_names
     # Nothing is connected yet, so every connection-backed capability reports
     # not_configured while adapter training — which no connection step gates —
-    # is already active.
+    # is already active. Adapter training reports what it actually has to learn
+    # from rather than the bare word "active", so a brand-new account can see
+    # that it has given the avatar nothing yet.
     statuses = {entry["name"]: entry["status"] for entry in payload["capabilities"]}
     assert statuses["desktop_data_servers"] == "not_configured"
-    assert statuses["adapter_training_from_conversations"] == "active"
+    adapter_training = statuses["adapter_training_from_conversations"]
+    assert adapter_training["state"] == "active"
+    assert adapter_training["uploaded_quotes"] == 0
+    assert adapter_training["conversation_turns"] == 0
 
 
 @pytest.mark.asyncio

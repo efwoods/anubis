@@ -25,6 +25,7 @@ from typing import Any, Awaitable, Callable
 from src.anubis.utils.connected_accounts.providers import (
     KIND_CALENDAR,
     LOGIN_MODE_FORM,
+    MECHANISM_API_KEY,
     MECHANISM_AUTH0_IDENTITY,
     MECHANISM_BROWSER_SESSION,
     MECHANISM_DEVICE_PAIRING,
@@ -276,8 +277,7 @@ async def connect_password_account(request: ConnectRequest) -> dict[str, Any]:
     except MailboxUnreachableError as unreachable_error:
         raise ConnectRefused(
             503,
-            f"Could not reach {imap_host} to check the credential: "
-            f"{unreachable_error}",
+            f"Could not reach {imap_host} to check the credential: {unreachable_error}",
         )
 
     encrypted_secret = _encrypt(password, request.context)
@@ -476,6 +476,120 @@ async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:
     )
 
 
+async def connect_api_key_account(request: ConnectRequest) -> dict[str, Any]:
+    """Prove one vendor API key by asking the vendor, then describe the account.
+
+    Anthropic, OpenAI, and LangSmith publish no OAuth for third-party
+    applications and issue the owner a personal key instead. That key is the
+    route each of them documents, so it is the one used — and it is proved
+    here, while the owner still has the card in front of them, rather than
+    failing on first use days later.
+    """
+    from src.anubis.utils.connected_accounts.vendor_key_tools import (
+        KEY_PAGES,
+        VendorKeyRejected,
+        VendorUnreachable,
+        verify_api_key,
+    )
+
+    provider = request.provider
+    api_key = str(request.fields.get("api_key") or "").strip()
+    if not api_key:
+        raise ConnectRefused(
+            400,
+            f"An API key is required. Copy one from "
+            f"{KEY_PAGES.get(provider.name, provider.display_name)}.",
+        )
+
+    try:
+        await verify_api_key(provider.name, api_key)
+    except VendorKeyRejected as rejected:
+        raise ConnectRefused(400, str(rejected))
+    except VendorUnreachable as unreachable:
+        raise ConnectRefused(
+            503, f"{provider.display_name} could not be reached: {unreachable}"
+        )
+
+    # The key itself is the account's identity here; the last four characters
+    # let the owner tell two keys apart without the key ever being shown.
+    address = f"{provider.name}:{api_key[-4:]}"
+    key = account_key(provider.name, address)
+    label = deduplicate_label(
+        request.text("name") or provider.display_name, request.existing_records, key
+    )
+    return build_account_record(
+        provider=provider,
+        account_address=address,
+        display_label=label,
+        encrypted_secret=_encrypt(api_key, request.context),
+        assistant_id=request.assistant_id,
+    )
+
+
+async def _connect_site_without_mcp_server(
+    request: ConnectRequest, *, origin: str, host: str
+) -> dict[str, Any]:
+    """Continue the ladder for a site that publishes no connector.
+
+    The order is the owner's, and it puts **their own login first**:
+
+    1. **Signing in as themselves**, with the address and password they already
+       use for the site. This is the default for every site, because it is the
+       thing an owner can always do, needs nothing registered anywhere, and
+       gives the avatar exactly the access the owner has — no more.
+    2. **A provider that already covers this site**, when signing in is not the
+       right route for it: a vendor whose terms require the key they issue
+       (``terms_require_api_key``), or one that offers only OAuth.
+    3. **An API key, last**, because it is the least like being the owner: a
+       separate secret to find, paste and rotate, and at several vendors it
+       reads a different, narrower slice than the account does.
+
+    The one exception in step 2 is deliberate and narrow. ``vendor_key_tools``
+    records that keeping a signed-in session and reading the pages of Anthropic,
+    OpenAI and LangSmith is against the terms of all three. Those rows carry
+    ``terms_require_api_key``, so naming one of them still asks for a key —
+    protecting the owner's account rather than quietly doing the forbidden thing.
+    """
+    from src.anubis.utils.connected_accounts.providers import (
+        MECHANISM_API_KEY,
+        get_provider,
+        provider_for_host,
+    )
+
+    known = provider_for_host(host)
+    if known is not None and known.name != request.provider.name:
+        forbids_sessions = bool(getattr(known, "terms_require_api_key", False))
+        # An API-key row that does NOT forbid sessions is skipped here and left
+        # to the bottom of the ladder: the owner asked for their own login to be
+        # tried before a key.
+        is_key_route = known.credential_mechanism == MECHANISM_API_KEY
+        if forbids_sessions or not is_key_route:
+            return await connect_account(
+                ConnectRequest(
+                    provider=known,
+                    fields=dict(request.fields),
+                    assistant_id=request.assistant_id,
+                    context=request.context,
+                    existing_records=request.existing_records,
+                )
+            )
+
+    signed_in = get_provider("signed_in_site")
+    if signed_in is None:  # pragma: no cover - registry guarantees this row
+        raise ConnectRefused(
+            400,
+            f"{host} offers no connector and no sign-in route is configured.",
+        )
+    raise ConnectNeedsLogin(
+        signed_in,
+        {
+            "provider": signed_in.name,
+            "site_url": request.text("site_url") or origin,
+            "name": request.text("name") or host,
+        },
+    )
+
+
 async def connect_site_by_discovery(request: ConnectRequest) -> dict[str, Any]:
     """Connect a site the way the site itself offers, or say that it offers none.
 
@@ -504,13 +618,10 @@ async def connect_site_by_discovery(request: ConnectRequest) -> dict[str, Any]:
 
     found = await discover_mcp_server(origin, request.context)
     if found is None:
-        raise ConnectRefused(
-            400,
-            f"{host} does not offer a Model Context Protocol server, so there "
-            "is no supported way for the avatar to use an account there. If "
-            f"{host} publishes an API key or a connector address, connect it "
-            "as a custom connector instead.",
-        )
+        # No connector. Walk the rest of the ladder rather than refusing: the
+        # point of naming a site is that the owner should not have to know which
+        # of these routes it supports.
+        return await _connect_site_without_mcp_server(request, origin=origin, host=host)
 
     mcp_provider = get_provider("custom_mcp") or request.provider
     return await connect_mcp_server_account(
@@ -588,8 +699,7 @@ async def connect_website(request: ConnectRequest) -> dict[str, Any]:
         import httpx
 
         timeout_seconds = float(
-            getattr(request.context, "connect_oauth_http_timeout_seconds", None)
-            or 15.0
+            getattr(request.context, "connect_oauth_http_timeout_seconds", None) or 15.0
         )
         async with httpx.AsyncClient(
             timeout=timeout_seconds, follow_redirects=True
@@ -648,6 +758,7 @@ CONNECT_HANDLERS: dict[str, ConnectHandler] = {
     MECHANISM_PASSWORD: connect_password_account,
     MECHANISM_MCP_URL: connect_mcp_server_account,
     MECHANISM_URL_ONLY: connect_website,
+    MECHANISM_API_KEY: connect_api_key_account,
     MECHANISM_SITE_DISCOVERY: connect_site_by_discovery,
     MECHANISM_OAUTH: _needs_popup_login,
     MECHANISM_PLAID_LINK: _needs_popup_login,

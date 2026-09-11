@@ -12,6 +12,8 @@ What is used (see ``_EMOTION_MEDIA_GENERATION_COST_REPORT.md`` §5.5–5.9):
   → CAPTCHA (``verification.captcha.get`` / ``verify``) → ``voices.pvc.train``
   → poll ``voices.get(voice_id).fine_tuning.state``.
 - Speech: ``text_to_speech.convert`` (bytes) for the speak button and voice mode.
+- Standard voices: ``voices.search(category="premade", gender=...)`` for the
+  stock voice an avatar without a usable clone speaks with.
 - Lip-sync: ``assets.create`` + ``POST /v1/flows/video`` (raw HTTP, since the
   typed request models track individual vendor models).
 
@@ -373,6 +375,34 @@ async def synthesize_speech(
     return await _run(_convert)
 
 
+async def list_premade_voices(context: Any, *, gender: str) -> list[dict[str, Any]]:
+    """Return the vendor's own premade voices of one gender, as plain dictionaries.
+
+    These are the stock voices every account may use; an avatar with no usable
+    clone speaks with one the owner picks. ``labels`` carries the vendor's
+    ``gender`` / ``accent`` / ``age`` / ``description`` tags and ``preview_url``
+    a public sample.
+    """
+
+    def _search() -> list[dict[str, Any]]:
+        client = _client(context)
+        voices: list[dict[str, Any]] = []
+        next_page_token: str | None = None
+        while True:
+            page = client.voices.search(
+                category="premade",
+                gender=gender,
+                page_size=100,
+                next_page_token=next_page_token,
+            )
+            voices.extend(_model_to_dict(voice) for voice in (page.voices or []))
+            next_page_token = getattr(page, "next_page_token", None)
+            if not next_page_token or not getattr(page, "has_more", False):
+                return voices
+
+    return await _run(_search)
+
+
 # --- lip-sync (Phase 5) --------------------------------------------------------------
 
 
@@ -396,6 +426,8 @@ async def create_lip_sync_video(
     image_asset_id: str,
     audio_asset_id: str,
     resolution: str = "720p",
+    prompt: str | None = None,
+    video_asset_id: str | None = None,
 ) -> str:
     """Start a lip-sync generation (image + audio → video); return the generation id.
 
@@ -412,6 +444,12 @@ async def create_lip_sync_video(
         "audio": {"type": "asset", "asset_id": audio_asset_id},
         "resolution": resolution,
     }
+    if video_asset_id:
+        payload["video"] = {"type": "asset", "asset_id": video_asset_id}
+    else:
+        payload["image"] = {"type": "asset", "asset_id": image_asset_id}
+    if prompt and str(prompt).strip():
+        payload["prompt"] = str(prompt).strip()
     async with httpx.AsyncClient(base_url=ELEVENLABS_BASE_URL, timeout=120.0) as client:
         response = await client.post(
             "/v1/flows/video",
@@ -432,8 +470,6 @@ async def create_lip_sync_video(
         raise ElevenLabsError(
             "ElevenLabs returned no generation id for the lip-sync clip."
         )
-    prompt: str | None = None,
-    video_asset_id: str | None = None,
     return str(generation_id)
 
 
@@ -444,12 +480,6 @@ async def get_lip_sync_video(context: Any, *, generation_id: str) -> dict[str, A
     async with httpx.AsyncClient(base_url=ELEVENLABS_BASE_URL, timeout=60.0) as client:
         response = await client.get(
             f"/v1/flows/video/{generation_id}",
-    if video_asset_id:
-        payload["video"] = {"type": "asset", "asset_id": video_asset_id}
-    else:
-        payload["image"] = {"type": "asset", "asset_id": image_asset_id}
-    if prompt and str(prompt).strip():
-        payload["prompt"] = str(prompt).strip()
             headers={"xi-api-key": _api_key(context)},
         )
     if response.status_code >= 400:

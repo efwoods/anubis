@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -235,6 +236,16 @@ async def create_personal_avatar(
     itself and the ``creator_id`` store item — so every downstream reader of
     ``creator_id`` treats an auto-provisioned avatar exactly like a manually
     created one.
+
+    Note what this deliberately does NOT do. ``/create_avatar`` starts a
+    deep-research job for the avatar it creates, and this function does not,
+    because it runs on the API-key authentication path the first time an account
+    is seen and the name it has to work with at that moment is the local part of
+    an email address (see ``default_personal_avatar_name``). Researching
+    "j.smith" on the web would spend money learning about whoever that string
+    happens to match and write a stranger's facts, face and voice into the
+    account holder's own avatar. Research for a personal avatar belongs to a
+    flow where the owner has given a real name.
     """
     assistant_id = str(uuid4())
     created_avatar = await client.assistants.create(
@@ -257,6 +268,8 @@ async def create_personal_avatar(
     )
 
     await demote_other_personal_avatars(client, user_id, keep_assistant_id=assistant_id)
+    # Readers with no authenticated session find this avatar through the pointer.
+    await record_personal_avatar_pointer(client, user_id, assistant_id)
     return created_avatar
 
 
@@ -338,6 +351,9 @@ async def ensure_personal_avatar_for_user(
             await demote_other_personal_avatars(
                 client, user_id, keep_assistant_id=personal_avatar.get("assistant_id")
             )
+            await record_personal_avatar_pointer(
+                client, user_id, str(personal_avatar.get("assistant_id") or "")
+            )
 
         provisioned_fields = {
             PERSONAL_AVATAR_PROVISIONED_MARKER: True,
@@ -368,6 +384,14 @@ async def resolve_personal_avatar(
 
     personal_avatar = await find_personal_avatar(client, user_id)
     if personal_avatar is not None:
+        # Heal the pointer for an account provisioned before the pointer existed.
+        # Deliberately here rather than in ``load_consciousness``: every route
+        # that needs the personal avatar already passes through this function,
+        # so the pointer is repaired without a single store read being added to
+        # the path a reply travels.
+        await record_personal_avatar_pointer(
+            client, user_id, str(personal_avatar.get("assistant_id") or "")
+        )
         return personal_avatar
 
     # A missing avatar means either provisioning never ran for this account or a
@@ -377,19 +401,280 @@ async def resolve_personal_avatar(
     return await ensure_personal_avatar_for_user(request, user, api_key)
 
 
+PERSONAL_AVATAR_POINTER_NAMESPACE_ROOT = "personal_avatar_of_user"
+"""Namespace root of the per-user pointer naming that user's personal avatar."""
+
+PERSONAL_AVATAR_POINTER_KEY = "personal_avatar"
+
+
+def personal_avatar_pointer_namespace(user_id: str) -> tuple[str, str]:
+    """Return the store namespace holding one user's personal-avatar pointer."""
+    return (PERSONAL_AVATAR_POINTER_NAMESPACE_ROOT, user_id)
+
+
+async def record_personal_avatar_pointer(
+    store_or_client: Any, user_id: str, assistant_id: str
+) -> None:
+    """Note which avatar is this user's personal avatar, for readers with no session.
+
+    ``find_personal_avatar`` needs a LangGraph software development kit client
+    authenticated as the user, which a background sweeper and a graph node both
+    lack — the sweeper holds only the store, and the graph holds only the store
+    and the identifiers on the turn. This pointer is how those readers answer
+    "which avatar is this speaker's own" without an authenticated call.
+
+    Accepts either flavour of store: the in-process ``BaseStore`` (``aput``) that
+    graph nodes hold, or the software development kit's ``StoreClient``
+    (``put_item``) that the provisioning path holds. Best effort — a missing
+    pointer costs a reader nothing except skipping that user, which is why no
+    caller waits on the result.
+    """
+    if store_or_client is None or not user_id or not assistant_id:
+        return
+    namespace = personal_avatar_pointer_namespace(user_id)
+    value = {
+        "value": {
+            "assistant_id": assistant_id,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    }
+    try:
+        if hasattr(store_or_client, "aput"):
+            await store_or_client.aput(
+                namespace, key=PERSONAL_AVATAR_POINTER_KEY, value=value
+            )
+            return
+        store_api = getattr(store_or_client, "store", None)
+        if store_api is not None and hasattr(store_api, "put_item"):
+            await store_api.put_item(
+                list(namespace), key=PERSONAL_AVATAR_POINTER_KEY, value=value
+            )
+            return
+        if hasattr(store_or_client, "put_item"):
+            await store_or_client.put_item(
+                list(namespace), key=PERSONAL_AVATAR_POINTER_KEY, value=value
+            )
+    except Exception as write_error:  # noqa: BLE001 - never block the caller
+        logger.debug(
+            "Could not record the personal avatar pointer for %s: %s",
+            user_id,
+            write_error,
+        )
+
+
+async def read_personal_avatar_id(store: Any, user_id: str) -> str | None:
+    """Return the identifier of this user's personal avatar, or ``None``.
+
+    ``None`` means only "no pointer has been written for this user yet", never
+    "this user has no personal avatar" — every account has one. A reader that
+    gets ``None`` should skip the user and try again later, by which time a turn
+    on the personal avatar will have healed the pointer.
+    """
+    if store is None or not user_id:
+        return None
+    try:
+        item = await store.aget(
+            personal_avatar_pointer_namespace(user_id), PERSONAL_AVATAR_POINTER_KEY
+        )
+    except Exception as read_error:  # noqa: BLE001 - a missing row is not an error
+        logger.debug("Personal avatar pointer lookup failed: %s", read_error)
+        return None
+    if item is None:
+        return None
+    value = getattr(item, "value", None)
+    if value is None and isinstance(item, dict):
+        value = item.get("value")
+    inner = (value or {}).get("value") if isinstance(value, dict) else None
+    if isinstance(inner, dict):
+        return str(inner.get("assistant_id") or "") or None
+    if isinstance(value, dict) and value.get("assistant_id"):
+        return str(value["assistant_id"])
+    return None
+
+
+PERSONAL_AVATAR_RESEARCH_CLAIM_CATEGORY = "personal_avatar_research_claim"
+"""Store-namespace category recording that research has run for a personal avatar."""
+
+
+def personal_avatar_research_claim_namespace(
+    creator_id: str, assistant_id: str
+) -> tuple[str, str, str]:
+    """Return the store namespace holding this avatar's research claim."""
+    return (creator_id, assistant_id, PERSONAL_AVATAR_RESEARCH_CLAIM_CATEGORY)
+
+
+def _normalized_name_text(value: str) -> str:
+    """Lower-case ``value`` and reduce the separators used in addresses to spaces.
+
+    ``j.smith``, ``j_smith`` and ``J Smith`` all normalise to ``j smith``, which
+    is what lets :func:`looks_like_a_real_person_name` recognise an email local
+    part that has merely been prettied up.
+    """
+    lowered = (value or "").strip().lower()
+    for separator in (".", "_", "-", "+"):
+        lowered = lowered.replace(separator, " ")
+    return " ".join(lowered.split())
+
+
+def looks_like_a_real_person_name(
+    candidate: str, *, email_address: str | None = None
+) -> bool:
+    """Report whether ``candidate`` is a real person's name the owner supplied.
+
+    ``create_personal_avatar`` refuses to research the avatar it provisions
+    because the only name available at that moment is the local part of an email
+    address, and researching ``j.smith`` on the web would spend money learning
+    about whoever that string happens to match. This predicate is the guard that
+    lets a LATER rename start research: research may run once the owner has
+    replaced the placeholder with a name a person would actually be called.
+
+    A candidate qualifies only when every one of these holds:
+
+    - two or more whitespace-separated parts, at least one of which is a word
+      rather than an initial, so a single word is refused while "J. R. R.
+      Tolkien" is allowed;
+    - letters, hyphens, apostrophes and periods only, with no digits and no ``@``;
+    - the candidate is not the ``"Personal Avatar"`` placeholder;
+    - and, when ``email_address`` is given, the candidate does not normalise to
+      the address's local part or to the whole address. This is the load-bearing
+      rule: ``J Smith`` for ``j.smith@example.com`` is the placeholder wearing a
+      space, not a name the owner chose.
+    """
+    cleaned = (candidate or "").strip()
+    if not cleaned or "@" in cleaned:
+        return False
+    if cleaned.casefold() == "personal avatar":
+        return False
+    if any(character.isdigit() for character in cleaned):
+        return False
+
+    parts = cleaned.split()
+    if len(parts) < 2:
+        return False
+    if not all(
+        all(character.isalpha() or character in "-'." for character in part)
+        for part in parts
+    ):
+        return False
+    # At least one part has to be a name rather than an initial. Initials are
+    # perfectly real — "J. R. R. Tolkien" is a name a person goes by — so the
+    # rule is about the whole name, not about each part. The placeholder case
+    # this used to catch ("J Smith" for j.smith@example.com) is caught by the
+    # address comparison below, which is the check that actually knows what the
+    # placeholder was.
+    if not any(len(part.strip(".'-")) >= 2 for part in parts):
+        return False
+
+    if email_address and "@" in email_address:
+        local_part = email_address.split("@", 1)[0]
+        normalized_candidate = _normalized_name_text(cleaned)
+        if normalized_candidate in (
+            _normalized_name_text(local_part),
+            _normalized_name_text(email_address),
+        ):
+            return False
+    return True
+
+
+async def claim_personal_avatar_research(
+    store: Any, *, creator_id: str, assistant_id: str
+) -> bool:
+    """Record that research has started for this avatar; report whether this call won.
+
+    Returns ``False`` when a claim already exists, which is what limits the naming
+    trigger to one research run per personal avatar. The claim lives in the store
+    rather than in memory so that renaming the avatar again after a restart still
+    does not re-research the owner. Mirrors ``claim_bootstrap`` in
+    ``src/anubis/utils/research/asset_bootstrap.py``.
+
+    Pressing "Research & verify facts" by hand is unaffected: that route never
+    consults this claim, because a deliberate press is the owner asking for
+    exactly the run this guard exists to prevent happening by accident.
+    """
+    namespace = personal_avatar_research_claim_namespace(creator_id, assistant_id)
+    try:
+        existing_claim = await store.aget(namespace, assistant_id)
+    except Exception as read_error:  # noqa: BLE001 - a missing row is not an error
+        logger.debug(
+            "Personal avatar research claim lookup failed (continuing): %s", read_error
+        )
+        existing_claim = None
+    if existing_claim is not None:
+        return False
+    try:
+        await store.aput(
+            namespace,
+            key=assistant_id,
+            value={"status": "claimed", "claimed_at": datetime.now(UTC).isoformat()},
+        )
+    except Exception as write_error:  # noqa: BLE001 - never block the rename
+        logger.warning(
+            "Could not record the personal avatar research claim for %s: %s",
+            assistant_id,
+            write_error,
+        )
+        return False
+    return True
+
+
+async def personal_avatar_id_for_owner(pool: Any, user_id: str) -> str | None:
+    """Return the id of ``user_id``'s personal avatar, read straight from Postgres.
+
+    ``resolve_personal_avatar`` is the API-layer answer and needs a LangGraph
+    client, a request and an API key. The graph has none of those in the middle
+    of a turn, but it does have the pool, and the personal avatar is only ever a
+    row in ``assistant`` carrying this owner's id and the personal flag.
+
+    Returns ``None`` when the owner has no personal avatar yet. That is a real
+    state — provisioning happens on the first API-key authentication — and the
+    caller treats it as "no brokered connections", never as an error.
+    """
+    if pool is None or not user_id:
+        return None
+    query = (
+        "SELECT assistant_id FROM assistant "
+        "WHERE metadata->>'user_id' = %s "
+        "AND metadata->>'is_personal_avatar_of_creator' = 'true' "
+        "ORDER BY created_at ASC LIMIT 1"
+    )
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(query, (user_id,))
+                row = await cursor.fetchone()
+    except Exception:  # noqa: BLE001 - a lookup failure means no brokering, not a broken turn
+        logger.debug(
+            "Could not resolve the personal avatar for brokering", exc_info=True
+        )
+        return None
+    if not row:
+        return None
+    return str(row[0])
+
+
 __all__ = [
     "DEFAULT_PERSONAL_AVATAR_DESCRIPTION",
     "PERSONAL_AVATAR_CAPABILITIES",
     "PERSONAL_AVATAR_IDENTIFIER_FIELD",
     "PERSONAL_AVATAR_METADATA_FLAG",
+    "PERSONAL_AVATAR_POINTER_KEY",
+    "PERSONAL_AVATAR_POINTER_NAMESPACE_ROOT",
     "PERSONAL_AVATAR_PROVISIONED_MARKER",
+    "PERSONAL_AVATAR_RESEARCH_CLAIM_CATEGORY",
     "PersonalAvatarCapability",
     "bare_user_identifier",
+    "claim_personal_avatar_research",
     "create_personal_avatar",
     "default_personal_avatar_name",
     "demote_other_personal_avatars",
     "ensure_personal_avatar_for_user",
     "find_personal_avatar",
     "is_personal_avatar",
+    "looks_like_a_real_person_name",
+    "personal_avatar_id_for_owner",
+    "personal_avatar_pointer_namespace",
+    "personal_avatar_research_claim_namespace",
+    "read_personal_avatar_id",
+    "record_personal_avatar_pointer",
     "resolve_personal_avatar",
 ]

@@ -337,3 +337,136 @@ def test_a_meta_change_yields_the_media_permalink():
     )
     assert items[0]["external_item_id"] == "media-9"
     assert items[0]["url"] == "https://instagram.com/p/abc"
+
+
+# -- feed discovery ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_address_that_is_already_a_feed_is_used_as_is(monkeypatch):
+    """The common podcast case: the owner pastes the address their host gave them."""
+
+    class _Response:
+        status_code = 200
+        text = '<?xml version="1.0"?><rss version="2.0"><channel/></rss>'
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return _Response()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _Client())
+    found = await transports.discover_feed_url("https://example.com/podcast.xml")
+    assert found == "https://example.com/podcast.xml"
+
+
+@pytest.mark.asyncio
+async def test_a_page_advertising_a_feed_resolves_to_it(monkeypatch):
+    """A person naming their blog means "watch what I publish there"."""
+
+    class _Response:
+        status_code = 200
+        text = (
+            "<html><head><link rel='alternate' "
+            "type='application/rss+xml' href='/feed.xml'></head></html>"
+        )
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return _Response()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _Client())
+    found = await transports.discover_feed_url("https://example.com/blog")
+    assert found == "https://example.com/feed.xml"
+
+
+@pytest.mark.asyncio
+async def test_a_page_with_no_feed_cannot_be_subscribed(monkeypatch):
+    """Reported as not subscribable rather than silently polled."""
+
+    class _Response:
+        status_code = 200
+        text = "<html><body>Nothing here</body></html>"
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return _Response()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _Client())
+    assert await transports.discover_feed_url("https://example.com") is None
+
+
+def test_a_callback_must_be_a_public_https_address():
+    """A platform accepts a private address, then delivers nowhere."""
+    from types import SimpleNamespace
+
+    assert (
+        transports.callback_url_for(
+            SimpleNamespace(social_webhook_callback_base_url=""), "youtube"
+        )
+        is None
+    )
+    assert (
+        transports.callback_url_for(
+            SimpleNamespace(social_webhook_callback_base_url="http://localhost:9600"),
+            "youtube",
+        )
+        is None
+    )
+    assert transports.callback_url_for(
+        SimpleNamespace(social_webhook_callback_base_url="https://api.example.com"),
+        "youtube",
+    ) == "https://api.example.com/social_webhook/youtube"
+
+
+@pytest.mark.asyncio
+async def test_a_platform_that_announces_nothing_is_not_subscribed(monkeypatch):
+    """Never swept on a timer; the owner is told it cannot deliver."""
+    from types import SimpleNamespace
+
+    from src.anubis.utils.connected_accounts import providers as providers_module
+
+    row = providers_module.get_provider("youtube")
+    monkeypatch.setitem(
+        providers_module.PROVIDER_REGISTRY,
+        "youtube",
+        type(row)(
+            **{
+                **{
+                    field: getattr(row, field)
+                    for field in row.__dataclass_fields__
+                },
+                "content_transport": providers_module.CONTENT_TRANSPORT_NONE,
+            }
+        ),
+    )
+    outcome = await transports.subscribe_to_content(
+        SimpleNamespace(social_webhook_callback_base_url="https://api.example.com"),
+        record=_proven_record(),
+        personal_avatar_id="avatar-1",
+        user_id="owner-1",
+    )
+    assert outcome["status"] == "not_subscribable"

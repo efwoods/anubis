@@ -534,3 +534,45 @@ async def renew_subscriptions_forever(context: Any) -> None:
             raise
         except Exception:  # noqa: BLE001 - the loop outlives one bad pass
             logger.exception("A subscription renewal pass failed.")
+
+
+async def discover_feed_url(site_url: str) -> str | None:
+    """Find the feed a page publishes through, or recognise a feed address itself.
+
+    A person naming their blog means "watch what I publish there", and the feed
+    is how that is watched. Looking it up here rather than asking the owner for
+    it is the difference between pasting an address and knowing what an Atom
+    link is.
+    """
+    import re
+
+    import httpx
+
+    if not site_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(site_url)
+            if response.status_code >= 400:
+                return None
+            body = response.text
+    except Exception:  # noqa: BLE001 - an unreachable page advertises no feed
+        return None
+
+    # The address may already BE the feed, which is the common case for a
+    # podcast: the owner pastes the address their host gave them.
+    opening = body[:400].lower()
+    if "<rss" in opening or "<feed" in opening:
+        return site_url
+
+    match = re.search(
+        r'<link[^>]+type=["\']application/(?:rss|atom)\+xml["\'][^>]*>',
+        body,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    href = re.search(r'href=["\']([^"\']+)["\']', match.group(0), re.IGNORECASE)
+    if not href:
+        return None
+    return urljoin(site_url, href.group(1))

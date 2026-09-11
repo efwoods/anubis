@@ -4320,6 +4320,12 @@ async def _onboard_social_account(record: dict[str, Any]) -> None:
     if not (user_id and assistant_id and account_key):
         return
 
+    # A source with no sign-in needs two things before it can even be judged:
+    # the feed it publishes through, and the token the owner will place in it to
+    # claim it. Both are prepared here so the ownership check has something to
+    # look for and the interface has something to show.
+    await _prepare_feed_source(record)
+
     try:
         ownership = await prove_ownership(context, store, record)
     except Exception:  # noqa: BLE001 - a failed proof is a state, not a crash
@@ -4385,6 +4391,30 @@ async def _onboard_social_account(record: dict[str, Any]) -> None:
         )
     except Exception:  # noqa: BLE001 - never surfaces to the owner's request
         logger.exception("The initial crawl of %s failed", account_key)
+
+
+async def _prepare_feed_source(record: dict[str, Any]) -> None:
+    """Give a no-login source its feed address and its verification token.
+
+    Only for sources that carry no credential — a podcast feed, a blog, a
+    profile page. Everything else proves itself by having been signed in to,
+    and needs neither.
+    """
+    from src.anubis.utils.connected_accounts.ownership import new_verification_token
+    from src.anubis.utils.connected_accounts.providers import MECHANISM_URL_ONLY
+    from src.anubis.utils.subscriptions.transports import discover_feed_url
+
+    if str(record.get("credential_mechanism") or "") != MECHANISM_URL_ONLY:
+        return
+    transport = dict(record.get("transport") or {})
+    if not transport.get("verification_token"):
+        transport["verification_token"] = new_verification_token()
+    if not transport.get("feed_url"):
+        site_url = str(transport.get("site_url") or "")
+        discovered = await discover_feed_url(site_url)
+        if discovered:
+            transport["feed_url"] = discovered
+    record["transport"] = transport
 
 
 async def _capture_social_crawl_seed(
@@ -5389,6 +5419,14 @@ async def list_social_subscriptions(
                 "ownership_state": ownership.get("state"),
                 "ownership_method": ownership.get("method"),
                 "ownership_detail": ownership.get("detail"),
+                # A source nobody can sign in to is claimed by putting this
+                # token where only its owner could put it. Shown only while it
+                # is still unproven, because afterwards it is just clutter.
+                "verification_token": (
+                    (record.get("transport") or {}).get("verification_token")
+                    if ownership.get("state") != "proven"
+                    else None
+                ),
                 "subscribable": bool(provider and provider.is_subscribable),
                 "content_transport": (
                     provider.content_transport if provider else None

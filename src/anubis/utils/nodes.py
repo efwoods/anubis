@@ -986,6 +986,12 @@ async def _build_consciousness_system_message_update(
         ask_what_feels_real=should_ask_what_feels_real(
             learning_sections,
             int(getattr(learning_context, "ask_what_feels_real_after_messages", 5) or 0),
+    # How the avatar's own person moves, measured (src/anubis/utils/motion/):
+    # one primary-key read, empty until enough footage or camera time exists.
+    from src.anubis.utils.motion.prompt_section import read_how_you_move_section
+
+    how_you_move_section = await read_how_you_move_section(assistant_id, runtime.context)
+
         ),
     )
 
@@ -993,6 +999,11 @@ async def _build_consciousness_system_message_update(
 
     # prepend system message
     logger.info(f"state['messages']: {state['messages']}")
+        # The consolidated psychology of the target, and what the avatar is
+        # feeling right now (see src/anubis/utils/psycho/).
+        psychological_profile=psychological_profile_text,
+        how_you_move=how_you_move_section,
+        assistant_emotions=current_assistant_emotion_text or None,
 
     system_message_str = populated_identity_template.messages[0].content
 

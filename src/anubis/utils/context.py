@@ -1790,6 +1790,171 @@ class GlobalContext:
             "description": "Maximum tokens per chunk when map-reducing a single oversized user message."
         },
     )
+    """ <Motion wireframe (how the person moves)> """
+
+    motion_learning_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether motion tracks (named body joints and the face mesh through time) are recorded and folded into the avatar's motion profile, from the live camera, from uploaded video, or from a decoder. Set to false to refuse every motion window while leaving the rest of the platform untouched. Env MOTION_LEARNING_ENABLED."
+        },
+    )
+
+    motion_landmark_set_version: str = field(
+        default="mediapipe_body33_face478_v1",
+        metadata={
+            "description": "The landmark set new tracks are written against (see src/anubis/utils/motion/landmarks.py). Old rows keep the version they were written with and stay decodable; bump this when a denser set (hands, iris, a decoder's limb set) is registered. Env MOTION_LANDMARK_SET_VERSION."
+        },
+    )
+
+    motion_face_sample_rate_hz: float = field(
+        default=30.0,
+        metadata={
+            "description": "Face-mesh frames per second recorded from uploaded video. Micro-expressions last 40 to 200 milliseconds, so a rate under about 25 Hz aliases them away. The browser paces itself with VITE_MOTION_FACE_FPS. Env MOTION_FACE_SAMPLE_RATE_HZ."
+        },
+    )
+
+    motion_body_sample_rate_hz: float = field(
+        default=15.0,
+        metadata={
+            "description": "Body-joint frames per second recorded from uploaded video; gestures are slower than expressions, so half the face rate is enough. The browser paces itself with VITE_MOTION_BODY_FPS. Env MOTION_BODY_SAMPLE_RATE_HZ."
+        },
+    )
+
+    motion_track_window_seconds: float = field(
+        default=10.0,
+        metadata={
+            "description": "How many seconds of motion one window holds. Windows are the unit every source sends and the unit primitives are cut from; the browser flushes one per VITE_MOTION_TRACK_WINDOW_SECONDS onto the ambient observation it already sends. Env MOTION_TRACK_WINDOW_SECONDS."
+        },
+    )
+
+    motion_track_max_bytes: int = field(
+        default=4_000_000,
+        metadata={
+            "description": "Largest motion window accepted from a client, in bytes of decoded buffers; a dense bootstrap window of ten seconds with the full face mesh at 30 Hz is about 900 KB, a basis-encoded window about 40 KB. Larger windows receive 413. Env MOTION_TRACK_MAX_BYTES."
+        },
+    )
+
+    motion_track_retention_seconds_per_avatar: float = field(
+        default=600.0,
+        metadata={
+            "description": "How many seconds of compact motion track to keep per avatar per emotion; older tracks are pruned first. At roughly 376 bytes a frame this is a few megabytes per avatar, smaller than one idle-loop clip. Env MOTION_TRACK_RETENTION_SECONDS_PER_AVATAR."
+        },
+    )
+
+    motion_golden_seconds_per_avatar: float = field(
+        default=120.0,
+        metadata={
+            "description": "How many seconds of raw, uncompressed face mesh to keep per avatar as the golden set: the ground truth the expression basis is fitted from, and what a denser landmark set or a future motion-transfer model would train on. Curated for identity confidence and emotion coverage, not recency. Env MOTION_GOLDEN_SECONDS_PER_AVATAR."
+        },
+    )
+
+    motion_basis_components: int = field(
+        default=48,
+        metadata={
+            "description": "How many principal components the per-avatar expression basis keeps. Forty-eight coefficients stand in for the 1,434 values of a 478-point mesh frame; the reconstruction error is recorded on the basis row. Env MOTION_BASIS_COMPONENTS."
+        },
+    )
+
+    motion_basis_min_seconds: float = field(
+        default=60.0,
+        metadata={
+            "description": "Seconds of golden face mesh needed before the first expression basis is fitted for an avatar. Until then dense windows are kept whole; the browser sends dense windows only during this bootstrap and coefficient windows afterwards. Env MOTION_BASIS_MIN_SECONDS."
+        },
+    )
+
+    motion_primitive_max_count: int = field(
+        default=8,
+        metadata={
+            "description": "How many recurring movements (primitives) to keep per avatar per emotion per channel; the least frequent are dropped when the dictionary is full. Env MOTION_PRIMITIVE_MAX_COUNT."
+        },
+    )
+
+    motion_primitive_min_occurrences: int = field(
+        default=3,
+        metadata={
+            "description": "How many times a recurring movement must have been seen before the prompt may describe it. Env MOTION_PRIMITIVE_MIN_OCCURRENCES."
+        },
+    )
+
+    motion_signature_min_seconds: float = field(
+        default=30.0,
+        metadata={
+            "description": "Seconds of motion a scalar measurement (blink rate, resting head tilt, gesture rate) must rest on before the prompt may state it; below this the reading stays in the signature but never reaches a prompt. Env MOTION_SIGNATURE_MIN_SECONDS."
+        },
+    )
+
+    motion_identity_min_confidence: float = field(
+        default=0.8,
+        metadata={
+            "description": "Least confidence, from zero to one, the vision comparison against the reference image must report before a camera or video window is attributed to the avatar's person. Anything below is discarded, never attributed. Env MOTION_IDENTITY_MIN_CONFIDENCE."
+        },
+    )
+
+    motion_identity_reverify_seconds: float = field(
+        default=600.0,
+        metadata={
+            "description": "How long a live-camera identity verification stays valid before the next window costs another vision comparison. Env MOTION_IDENTITY_REVERIFY_SECONDS."
+        },
+    )
+
+    motion_analysis_max_video_seconds: float = field(
+        default=600.0,
+        metadata={
+            "description": "Longest span of an uploaded video that is wireframed, in seconds; the rest of a longer video is skipped for motion (its transcript and other analyses are unaffected). Landmarking is local CPU, so this caps time rather than money. Env MOTION_ANALYSIS_MAX_VIDEO_SECONDS."
+        },
+    )
+
+    motion_prompt_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the rendered motion block reaches the prompts that generate video and stills, and the avatar's HOW YOU MOVE section. Set to false to keep recording motion without letting the block drive anything. Env MOTION_PROMPT_ENABLED."
+        },
+    )
+
+    lip_sync_prompt_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the lip-sync generation sends a prompt field: the cinematic foundation line plus the person's measured motion block, which is the vendor's behavioural channel (gestures, head, gaze, demeanour on creatify-aurora). A vendor 4xx naming the field falls back to the image-and-audio-only request once and records that on the job. Env LIP_SYNC_PROMPT_ENABLED."
+        },
+    )
+
+    lip_sync_cinematic_prompt: str = field(
+        default="Medium close-up of the person, same framing, lighting, clothing and background as the supplied image. No camera movement, no zoom, no new objects.",
+        metadata={
+            "description": "The stable first line of every lip-sync prompt: framing, lighting and what must not change. The person's measured motion block is appended under it as the behavioural layer. Env LIP_SYNC_CINEMATIC_PROMPT."
+        },
+    )
+
+    motion_fidelity_check_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether a finished lip-sync or idle-loop clip is wireframed with the same extractor and scored against the person's motion profile, measurement by measurement and movement by movement, as motion_fidelity on the profile. Costs local CPU only. Env MOTION_FIDELITY_CHECK_ENABLED."
+        },
+    )
+
+    motion_model_cache_dir: str = field(
+        default="/tmp/anubis-motion-models",
+        metadata={
+            "description": "Directory the MediaPipe landmarker model files are downloaded to on first use for server-side wireframing of uploaded video. Env MOTION_MODEL_CACHE_DIR."
+        },
+    )
+
+    motion_pose_model_url: str = field(
+        default="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        metadata={
+            "description": "Where the PoseLandmarker model file is fetched from on first use. Env MOTION_POSE_MODEL_URL."
+        },
+    )
+
+    motion_face_model_url: str = field(
+        default="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        metadata={
+            "description": "Where the FaceLandmarker model file is fetched from on first use. Env MOTION_FACE_MODEL_URL."
+        },
+    )
+
+    """ </Motion wireframe (how the person moves)> """
+
 
     system_prompt_max_tokens: int = field(
         default=120000,

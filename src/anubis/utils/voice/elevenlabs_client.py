@@ -397,12 +397,18 @@ async def create_lip_sync_video(
     audio_asset_id: str,
     resolution: str = "720p",
 ) -> str:
-    """Start a lip-sync generation (image + audio → video); return the generation id."""
+    """Start a lip-sync generation (image + audio → video); return the generation id.
+
+    ``prompt`` is the vendor's behavioural channel: on ``creatify-aurora`` it
+    directs how the person moves — gestures, head, gaze, demeanour — and is
+    where the person's measured motion block goes (see
+    ``src/anubis/utils/motion/motion_prompt.py``). ``video_asset_id`` sends a
+    clip in place of the still for models that animate a video input.
+    """
     import httpx
 
-    payload = {
+    payload: dict[str, Any] = {
         "model_id": model_id,
-        "image": {"type": "asset", "asset_id": image_asset_id},
         "audio": {"type": "asset", "asset_id": audio_asset_id},
         "resolution": resolution,
     }
@@ -426,6 +432,8 @@ async def create_lip_sync_video(
         raise ElevenLabsError(
             "ElevenLabs returned no generation id for the lip-sync clip."
         )
+    prompt: str | None = None,
+    video_asset_id: str | None = None,
     return str(generation_id)
 
 
@@ -436,6 +444,12 @@ async def get_lip_sync_video(context: Any, *, generation_id: str) -> dict[str, A
     async with httpx.AsyncClient(base_url=ELEVENLABS_BASE_URL, timeout=60.0) as client:
         response = await client.get(
             f"/v1/flows/video/{generation_id}",
+    if video_asset_id:
+        payload["video"] = {"type": "asset", "asset_id": video_asset_id}
+    else:
+        payload["image"] = {"type": "asset", "asset_id": image_asset_id}
+    if prompt and str(prompt).strip():
+        payload["prompt"] = str(prompt).strip()
             headers={"xi-api-key": _api_key(context)},
         )
     if response.status_code >= 400:

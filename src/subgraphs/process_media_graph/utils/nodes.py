@@ -198,6 +198,106 @@ async def _collect_voice_clip_from_isolated_audio(
             "Voice clip collection skipped for %s: %s", assistant_id, clip_error
         )
 
+async def _learn_motion_from_video(
+    context: Any,
+    store: Any,
+    *,
+    user_id: str,
+    assistant_id: str,
+    media_type: str,
+    payload_uri: str,
+    filename: str | None,
+    turns: list,
+) -> None:
+    """Wireframe an uploaded video and fold how the person moves into the avatar.
+
+    Video only: every other media type returns at once. This is a further
+    analysis beside the transcript, the voice clips and the psychological
+    findings, and like them it must never fail the upload. Frames are
+    landmarked in a worker thread with the same models the browser runs; each
+    window's sample frame is compared with the avatar's reference image
+    before the window is attributed (``src/anubis/utils/motion/identity.py``),
+    so footage of somebody else teaches nothing.
+    """
+    if media_type != "video" or not payload_uri:
+        return
+    flag = str(getattr(context, "motion_learning_enabled", None) or "true").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    from src.anubis.utils.motion.repository import (
+        SOURCE_UPLOADED_VIDEO,
+        get_motion_repository,
+    )
+
+    repository = get_motion_repository()
+    if repository is None:
+        return
+    try:
+        import os
+        import tempfile
+
+        from src.anubis.utils.media_generation.reference_image import (
+            read_reference_image,
+        )
+        from src.anubis.utils.motion.identity import verify_identity
+        from src.anubis.utils.motion.service import record_motion_window
+        from src.anubis.utils.motion.video_tracks import extract_motion_windows
+        from src.anubis.utils.utility import _decode_base64_media_payload
+
+        reference = await read_reference_image(store, user_id, assistant_id)
+        reference_uri = str((reference or {}).get("reference_image_data") or "")
+        if not reference_uri:
+            logger.info("Motion analysis skipped for %s: the avatar has no reference image", assistant_id)
+            return
+        speech = [
+            {"start": float(turn["start"]), "end": float(turn["end"]), "kind": "speaking"}
+            for turn in (turns or [])
+            if turn.get("is_target") and turn.get("start") is not None and turn.get("end") is not None
+        ]
+        raw = _decode_base64_media_payload(payload_uri)
+        suffix = os.path.splitext(filename or "")[1] or ".mp4"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            handle.write(raw)
+            path = handle.name
+        try:
+            windows = await asyncio.to_thread(
+                extract_motion_windows, path, context,
+                source_document_name=filename, speech=speech,
+            )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        recorded = 0
+        for extracted in windows:
+            verdict = await verify_identity(
+                source=SOURCE_UPLOADED_VIDEO,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                is_personal_avatar=False,
+                camera_facing=None,
+                reference_image_data_uri=reference_uri,
+                frame_data_uri=extracted.sample_frame_data_uri,
+                minimum_confidence=float(getattr(context, "motion_identity_min_confidence", 0.8) or 0.8),
+                reverify_seconds=float(getattr(context, "motion_identity_reverify_seconds", 600.0) or 600.0),
+            )
+            if not verdict.accepted:
+                logger.info(
+                    "Motion window at %.0fs of %s not attributed to %s: %s",
+                    extracted.start_seconds, filename, assistant_id, verdict.reason,
+                )
+                continue
+            extracted.window.identity_confidence = verdict.confidence
+            await record_motion_window(
+                repository, context, user_id=user_id, assistant_id=assistant_id, window=extracted.window
+            )
+            recorded += 1
+        logger.info("Motion analysis of %s: %d of %d windows attributed to %s", filename, recorded, len(windows), assistant_id)
+    except Exception as motion_error:  # noqa: BLE001 - never fail the upload
+        logger.warning("Motion analysis skipped for %s: %s", assistant_id, motion_error)
+
+
 
 async def _collect_voice_clips_from_target_turns(
     context: Any,
@@ -2536,6 +2636,20 @@ async def process_media_item_task(
                     d.metadata["namespace_filename"] = namespace_filename
                 all_documents.extend(documents)
                 return all_documents
+
+            # How the person moves, from the same video (video only; every
+            # other media type returns at once inside). A further analysis
+            # distilled into text beside the ones above.
+            await _learn_motion_from_video(
+                runtime.context,
+                store,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                media_type=media_type,
+                payload_uri=payload_uri,
+                filename=filename,
+                turns=turns,
+            )
 
             if len(distinct_speakers) == 1:
                 # Single speaker -> gate on whether it is the target.

@@ -13,6 +13,12 @@ Per reply, in voice mode with video enabled:
 
 Cost is recorded per clip (``lip_sync``) using the configured per-second rate
 and the clip's estimated duration, and reported to the video meter.
+
+The generation carries a ``prompt`` — the vendor's behavioural channel — built
+from a stable cinematic line plus the person's measured motion block
+(``src/anubis/utils/motion/motion_prompt.py``), so the clip moves the way the
+person moves. The clip cache key includes a digest of that prompt: a matured
+motion profile renders a new clip rather than serving the old motion.
 """
 
 from __future__ import annotations
@@ -51,10 +57,36 @@ def lip_sync_enabled(context: Any) -> bool:
     )
 
 
-def text_digest(text: str) -> str:
-    """Stable key for one spoken text (whitespace- and case-insensitive)."""
+def text_digest(text: str, prompt: str | None = None) -> str:
+    """Return a stable key for one spoken text (whitespace- and case-insensitive).
+
+    When a behavioural ``prompt`` drove the clip, the key carries a digest of
+    that prompt too, so a clip rendered under an older motion profile is not
+    served for a newer one.
+    """
     normalized = " ".join(str(text or "").lower().split())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    if prompt and str(prompt).strip():
+        prompt_normalized = " ".join(str(prompt).split())
+        digest += "-" + hashlib.sha256(prompt_normalized.encode("utf-8")).hexdigest()[:8]
+    return digest
+
+
+def lip_sync_prompt_enabled(context: Any) -> bool:
+    """Report whether the lip-sync generation may send the behavioural prompt."""
+    flag = str(getattr(context, "lip_sync_prompt_enabled", None) or "true").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def build_lip_sync_prompt(context: Any, motion_prompt: str | None) -> str | None:
+    """Build the layered prompt: cinematic foundation, then the person's measured motion."""
+    if not lip_sync_prompt_enabled(context):
+        return None
+    from src.anubis.utils.motion.motion_prompt import compose_video_prompt
+
+    cinematic = str(getattr(context, "lip_sync_cinematic_prompt", None) or "").strip()
+    composed = compose_video_prompt(cinematic, motion_prompt or "")
+    return composed or None
 
 
 def estimate_duration_seconds(text: str) -> float:
@@ -64,10 +96,10 @@ def estimate_duration_seconds(text: str) -> float:
 
 
 async def find_cached_clip(
-    repository: Any, *, assistant_id: str, emotion: str, text: str
+    repository: Any, *, assistant_id: str, emotion: str, text: str, prompt: str | None = None
 ) -> dict[str, Any] | None:
-    """Return the stored clip for this emotion + text, if one exists."""
-    digest = text_digest(text)
+    """Return the stored clip for this emotion + text (+ prompt), if one exists."""
+    digest = text_digest(text, prompt)
     for asset in await repository.list_emotion_assets(assistant_id):
         if (
             asset.get("asset_kind") == ASSET_KIND_LIP_SYNC
@@ -124,14 +156,19 @@ async def start_lip_sync(
     text: str,
     emotion: str,
     voice_id: str,
+    motion_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Begin (or short-circuit) a lip-sync clip for one reply.
+
+    ``motion_prompt`` is the person's measured motion block for this emotion;
+    it becomes the behavioural layer of the generation prompt.
 
     Returns ``{"status": "completed", "asset_id"}`` when a cached clip exists,
     otherwise ``{"status": "pending", "job_id", "generation_id"}``.
     """
+    prompt = build_lip_sync_prompt(context, motion_prompt)
     cached = await find_cached_clip(
-        repository, assistant_id=assistant_id, emotion=emotion, text=text
+        repository, assistant_id=assistant_id, emotion=emotion, text=text, prompt=prompt
     )
     if cached is not None:
         return {"status": "completed", "asset_id": cached["asset_id"], "cached": True}
@@ -155,17 +192,36 @@ async def start_lip_sync(
         name=f"{assistant_id}-speech.mp3",
         mime_type="audio/mpeg",
     )
-    generation_id = await elevenlabs_client.create_lip_sync_video(
-        context,
-        model_id=str(
-            getattr(context, "elevenlabs_lip_sync_model", None) or "creatify-aurora"
-        ),
-        image_asset_id=image_asset_id,
-        audio_asset_id=audio_asset_id,
-        resolution=str(
-            getattr(context, "elevenlabs_lip_sync_resolution", None) or "720p"
-        ),
-    )
+    model_id = str(getattr(context, "elevenlabs_lip_sync_model", None) or "creatify-aurora")
+    resolution = str(getattr(context, "elevenlabs_lip_sync_resolution", None) or "720p")
+    prompt_sent = bool(prompt)
+    # The field is passed only when there is one, so a vendor client (or a
+    # test double) that predates it is called exactly as before.
+    prompt_arguments = {"prompt": prompt} if prompt else {}
+    try:
+        generation_id = await elevenlabs_client.create_lip_sync_video(
+            context,
+            model_id=model_id,
+            image_asset_id=image_asset_id,
+            audio_asset_id=audio_asset_id,
+            resolution=resolution,
+            **prompt_arguments,
+        )
+    except elevenlabs_client.ElevenLabsError as vendor_error:
+        # A vendor model that does not know the field refuses the whole
+        # request; retry once without it and record that on the job so the
+        # fallback is not rediscovered per clip.
+        if not prompt or "prompt" not in str(vendor_error).lower():
+            raise
+        logger.info("Lip-sync vendor refused the prompt field; retrying without it: %s", vendor_error)
+        prompt_sent = False
+        generation_id = await elevenlabs_client.create_lip_sync_video(
+            context,
+            model_id=model_id,
+            image_asset_id=image_asset_id,
+            audio_asset_id=audio_asset_id,
+            resolution=resolution,
+        )
     job_id = await repository.create_job(
         user_id=user_id,
         assistant_id=assistant_id,
@@ -174,9 +230,11 @@ async def start_lip_sync(
         state=JOB_STATE_RUNNING,
         detail={
             "emotion": emotion,
-            "text_digest": text_digest(text),
+            "text_digest": text_digest(text, prompt),
             "characters": len(text),
             "estimated_seconds": estimate_duration_seconds(text),
+            "prompt": prompt or "",
+            "prompt_sent": prompt_sent,
         },
     )
     return {"status": "pending", "job_id": job_id, "generation_id": generation_id}
@@ -226,6 +284,7 @@ async def poll_lip_sync(
             "duration_seconds": detail.get("estimated_seconds"),
             "vendor": "elevenlabs",
             "vendor_request_id": job.get("vendor_reference"),
+            "prompt": detail.get("prompt") or None,
         }
     )
     await repository.update_job(

@@ -21,6 +21,7 @@ from src.anubis.utils.ambient.observations import (
     DECISION_NOTIFY,
     PROPOSED_ACTION_NONE,
     SOURCE_WEBCAM,
+    is_action_the_avatar_takes_on_behalf,
     normalize_camera_facing_value,
     normalize_proposed_action,
 )
@@ -66,10 +67,12 @@ class AmbientTriageClassification(BaseModel):
         default="none",
         description=(
             "For a 'notify' decision only: the one verb, one lowercase word, the "
-            "avatar will perform once the conversation partner allows this — for "
-            "example 'draft', 'reply', 'remind', 'research', 'summarize', "
-            "'schedule', 'explain'. 'none' for a plain heads-up. Always 'none' "
-            "for 'ignore' and 'respond'."
+            "avatar will perform on the conversation partner's behalf once the "
+            "conversation partner allows this — for example 'draft', 'remind', "
+            "'research', 'summarize', 'schedule', or 'reply' to a waiting "
+            "message. 'none' for a plain heads-up, including any scene the "
+            "avatar cannot act on (a local dialog, a terminal close prompt). "
+            "Always 'none' for 'ignore' and 'respond'."
         ),
     )
     action_description: str = Field(
@@ -100,7 +103,7 @@ The webcam and the screen are captured on a timer, not because the conversation 
 - Do not repeat, in different words, something an earlier observation in this conversation already prompted the avatar to say. Read EARLIER_OBSERVATIONS before deciding, and choose 'ignore' when the avatar would only be saying the same thing again.
 - Set salience honestly, from zero to one: how much this observation matters to the conversation partner right now. An observation that merely shows the conversation partner present and well is near zero. Salience gates whether the avatar is allowed to speak at all, so do not inflate it to justify a decision.
 - The conversation partner's recorded decisions are precedent. A note written by the conversation partner is a standing instruction and overrides every rule above.
-- For a 'notify' decision, name a proposed action when the avatar could usefully do something once the conversation partner allows this. The proposed action is ONE verb, one lowercase word, that the avatar will perform: 'draft' (write the answer to that email or message), 'reply' (say something useful about what was seen), 'remind' (set a reminder), 'research' (look the error or the topic up), 'summarize', 'schedule', 'explain', or another single verb that fits. Detail what the verb means here in action_description, starting with the same verb. Choose 'none' for a plain heads-up. Never propose an action for 'ignore' or 'respond'.
+- For a 'notify' decision, name a proposed action only when the avatar can do something on the conversation partner's behalf once the conversation partner allows this. The proposed action is ONE verb, one lowercase word, that the avatar will perform: 'draft' (write the answer to that email or message), 'reply' (send or draft an answer to a waiting message, email, or call), 'remind' (set a reminder), 'research' (look the error or the topic up), 'summarize', 'schedule', or another single verb the avatar can actually carry out. Detail what the verb means here in action_description, starting with the same verb. Choose 'none' for a plain heads-up, and choose 'none' when the conversation partner must act on their own machine — a terminal close dialog, an OS prompt, a button only they can click. Never propose 'reply' to mean 'say something useful about what was seen': the heads-up already said that. Never propose an action for 'ignore' or 'respond'.
 - The precedent says how the conversation partner treated earlier offers of the same kind: when the conversation partner let the avatar act and liked the result, offer the action again; when the conversation partner replied in person, disliked what the avatar did, or left the notice alone, prefer a plain heads-up or 'ignore'.
 - Name the observation kind with a short lowercase label so the same kind is recognized next time.
 - Write the summary in one line, present tense, neutral third person, without naming a camera, a webcam, or a screenshot.
@@ -244,9 +247,14 @@ def normalize_classification(response: Any) -> AmbientTriageClassification:
         :300
     ]
     # An offer belongs to a heads-up only, and an offer with no wording is no
-    # offer: the card would have nothing to put on the button.
+    # offer: the card would have nothing to put on the button. Talking about
+    # what was seen, or clicking a local dialog, is also no offer — those are
+    # not actions the avatar takes on the conversation partner's behalf.
     if decision != DECISION_NOTIFY or not action_description:
         proposed_action = PROPOSED_ACTION_NONE
+    elif not is_action_the_avatar_takes_on_behalf(proposed_action, action_description):
+        proposed_action = PROPOSED_ACTION_NONE
+        action_description = ""
     if proposed_action == PROPOSED_ACTION_NONE:
         action_description = ""
     return AmbientTriageClassification(

@@ -12,10 +12,19 @@ from langgraph.runtime import Runtime
 from src.anubis.utils.billing.system_prompt_estimate_cache import (
     record_system_prompt_token_estimate,
 )
+from src.anubis.utils.client_harvest_turns import (
+    conversation_suggestion_harvest_system_instruction,
+    identity_retrieval_query_for_suggestion_harvest,
+    is_conversation_suggestion_harvest_text,
+)
 from src.anubis.utils.classes.DynamicPromptBuilder import DynamicPromptBuilder
 from src.anubis.utils.classes.ImageDescriptionClass import ImageDescriptionClass
 from src.anubis.utils.context import AssistantContext, GlobalContext, UserContext
 from src.anubis.utils.geo import geo_location_of, render_avatar_place_section
+from src.anubis.utils.organization_links import (
+    organization_links_from_identity,
+    render_organization_links_section,
+)
 from src.anubis.utils.learning.bulk_learning import mark_thread_pending
 from src.anubis.utils.learning.engagement import record_engagement
 from src.anubis.utils.learning.feedback import (
@@ -199,10 +208,20 @@ async def resolve_human_message_images(
         # somebody who cannot see the scene. A description written for an
         # avatar deciding whether to speak is the wrong description here — it
         # leads with what is interesting rather than with what is in the way.
-        from src.anubis.utils.schema import DESCRIBE_SCENE_FOR_NARRATION_PROMPT
+        from src.anubis.utils.schema import describe_scene_for_narration_prompt
+        from src.anubis.utils.tools.vision.accessibility_tools import (
+            NARRATION_PACE_OPTIONS,
+            narration_word_budget,
+        )
 
+        # How long this reading may run to follows how often readings arrive:
+        # eighty words is a twenty-second reading, which at a five-second pace
+        # leaves the listener permanently behind the scene.
+        pace_seconds = ambient.get("narration_seconds") or NARRATION_PACE_OPTIONS[0]
         descriptor = ImageDescriptionClass(
-            system_prompt=DESCRIBE_SCENE_FOR_NARRATION_PROMPT
+            system_prompt=describe_scene_for_narration_prompt(
+                narration_word_budget(pace_seconds), pace_seconds
+            )
         )
     elif ambient is not None:
         from src.anubis.utils.schema import DESCRIBE_AMBIENT_IMAGE_PROMPT
@@ -564,10 +583,21 @@ async def _build_consciousness_system_message_update(
     """
     # embedding model microsoft/harrier-oss-v1-270m uses instructions in the query for retrieval as trained
 
-    query = state["messages"][-1].content
-    if isinstance(query, list):
-        _TASK_DESCRIPTION = "Given the query, retrieve information that is salient to the conversation and semantically similar to the query text."
-        query = f"Instruct: {_TASK_DESCRIPTION}\nQuery: {query[0]['text']}"
+    last_message_content = state["messages"][-1].content
+    last_message_text = message_text(last_message_content)
+    # A composer-chip harvest is machine traffic about JSON lists. Searching
+    # identity with that wording ranks documents about suggestions instead of
+    # who the avatar is — opening chips then come back as generic check-ins.
+    if is_conversation_suggestion_harvest_text(last_message_text):
+        query = identity_retrieval_query_for_suggestion_harvest(
+            assistant_name=assistant_name,
+            assistant_description=assistant_description,
+        )
+    else:
+        query = last_message_content
+        if isinstance(query, list):
+            _TASK_DESCRIPTION = "Given the query, retrieve information that is salient to the conversation and semantically similar to the query text."
+            query = f"Instruct: {_TASK_DESCRIPTION}\nQuery: {query[0]['text']}"
 
     creator_id = config["configurable"]["assistant_ctx"]["metadata"]["user_id"]
 
@@ -1010,6 +1040,12 @@ async def _build_consciousness_system_message_update(
         assistant_name=assistant_name,
         assistant_description=assistant_description,
         assistant_identity=assistant_identity,
+        assistant_organization_links=render_organization_links_section(
+            organization_links_from_identity(
+                assistant_description=assistant_description,
+                identity_documents=assistant_identity,
+            )
+        ),
         retrieved_memories=retrieved_memories,
         retrieved_knowledge=retrieved_knowledge,
         analyzed_traits=analyzed_traits,
@@ -1612,6 +1648,12 @@ async def _build_consciousness_system_message_update(
         )
     except Exception:  # noqa: BLE001 - the block must never fail a turn
         logger.debug("Ambient-vision block unavailable for the prompt", exc_info=True)
+
+    harvest_instruction = conversation_suggestion_harvest_system_instruction(
+        last_message_text
+    )
+    if harvest_instruction:
+        system_message_str = system_message_str + harvest_instruction
 
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended

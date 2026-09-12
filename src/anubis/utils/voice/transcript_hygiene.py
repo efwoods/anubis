@@ -72,6 +72,11 @@ KNOWN_HALLUCINATED_CAPTIONS: frozenset[str] = frozenset(
         "Copyright WDR",
         "Thank you for joining us",
         "Thanks for joining us",
+        "Thank you for your time",
+        "Thanks for your time",
+        "Thank you for your attention",
+        "Thank you very much",
+        "Thank you very much for watching",
         "Thank you for listening",
         "Thanks for listening",
         "We'll see you next time",
@@ -257,6 +262,65 @@ def drop_hallucinated_text(text: str, *, description: str = "transcript") -> str
             logger.info(
                 "Dropped a hallucinated %s from the speech model: %r", description, text
             )
+        return ""
+    return text
+
+
+_WORD_PATTERN = re.compile(r"[\w']+", re.UNICODE)
+_PROMPT_PHRASE_SPLIT_PATTERN = re.compile(r"[.!?,;:。！？\n]+")
+_SENTENCE_SPLIT_PATTERN = re.compile(r"[.!?。！？\n]+")
+
+
+def _words(text: str) -> list[str]:
+    folded = unicodedata.normalize("NFKC", text or "").casefold()
+    return _WORD_PATTERN.findall(folded)
+
+
+def is_prompt_echo(text: str, prompt: str | None) -> bool:
+    """Report whether the transcript only repeats the transcription prompt.
+
+    whisper-1 conditions on the ``prompt`` text as if the prompt were the
+    previous transcript. On a clip with no clear speech the model continues
+    that "transcript" instead, so a prompt that held example questions such as
+    "What is on my screen?" came back as the person's words: "What is on my
+    screen right now? What do you see on my screen right now?". A transcript is
+    an echo when every sentence is one of the prompt's phrases, or when every
+    word of the transcript appears in the prompt (the model reshuffled the
+    prompt's words and added nothing of the person's own).
+    """
+    prompt_text = (prompt or "").strip()
+    if not prompt_text or not normalise_caption(text):
+        return False
+    prompt_phrases = {
+        normalise_caption(piece)
+        for piece in _PROMPT_PHRASE_SPLIT_PATTERN.split(prompt_text)
+        if normalise_caption(piece)
+    }
+    prompt_phrases.add(normalise_caption(prompt_text))
+    sentences = [
+        normalise_caption(piece)
+        for piece in _SENTENCE_SPLIT_PATTERN.split(text or "")
+        if normalise_caption(piece)
+    ]
+    if sentences and all(sentence in prompt_phrases for sentence in sentences):
+        return True
+    prompt_words = set(_words(prompt_text))
+    transcript_words = _words(text)
+    return bool(transcript_words) and all(
+        word in prompt_words for word in transcript_words
+    )
+
+
+def drop_prompt_echo(
+    text: str, prompt: str | None, *, description: str = "transcript"
+) -> str:
+    """Return the text, or an empty string when the text only repeats the prompt."""
+    if is_prompt_echo(text, prompt):
+        logger.info(
+            "Dropped a %s that only echoed the transcription prompt: %r",
+            description,
+            text,
+        )
         return ""
     return text
 

@@ -44,11 +44,41 @@ _LEFT_BROW_TOP, _LEFT_EYE_TOP = 334, 386
 _RIGHT_BROW_TOP, _RIGHT_EYE_TOP = 105, 159
 _LEFT_IRIS, _RIGHT_IRIS = (473, 474, 475, 476, 477), (468, 469, 470, 471, 472)
 
-BLINK_EAR_THRESHOLD = 0.21
+# A blink closes the eye to well under its own open aspect ratio; the
+# threshold is relative to this person's open eye in this window, because a
+# fixed number flickers on landmark jitter (98 "blinks" a minute on a still
+# face, measured) and differs between faces and glasses. A closure must last
+# at least two frames to count.
+BLINK_EAR_RELATIVE_THRESHOLD = 0.6
+BLINK_MIN_FRAMES = 2
 BLINK_BURST_WINDOW_SECONDS = 0.4
-VISIBILITY_THRESHOLD = 0.5
-STILL_SPEED_SHOULDERS_PER_SECOND = 0.15
-GESTURE_SPEED_SHOULDERS_PER_SECOND = 0.6
+# A joint is trusted only when the model saw it: MediaPipe extrapolates joints
+# past the image edge with visibility around 0.7 and those points jitter at
+# five to fifteen shoulder widths a second (measured on a phone clip with the
+# wrists and hips out of frame), so the bar is high and the frame margin real.
+VISIBILITY_THRESHOLD = 0.7
+FRAME_MARGIN = 0.03
+# Speeds in shoulder widths per second, measured after a short moving average:
+# landmark jitter and a hand-held camera put every joint in small motion at
+# once, so the floors sit above that noise, not at zero.
+SMOOTHING_SECONDS = 0.15
+STILL_SPEED_SHOULDERS_PER_SECOND = 0.35
+GESTURE_SPEED_SHOULDERS_PER_SECOND = 1.2
+# A gesture is a hand that went somewhere: a burst of speed only counts when
+# the wrist ends up at least this far (shoulder widths) from where the burst
+# began. Jitter is fast but goes nowhere.
+GESTURE_MIN_DISPLACEMENT_SHOULDERS = 0.25
+# BlazePose z is not an absolute depth; lean is reported as how far forward of
+# this person's own resting position they go, capped where z stops meaning
+# anything.
+FORWARD_LEAN_MAX_DEGREES = 45.0
+# A wrist this far in front of the torso (shoulder widths, toward the camera)
+# is holding the camera — a phone at arm's length — and every shake of that
+# hand is parallax, not a gesture. Gestures happen near torso depth.
+CAMERA_HAND_DEPTH_SHOULDERS = -1.0
+# Stillness is judged on the head and torso; a fidgeting hand or a leg at the
+# frame edge does not make a still person restless.
+_STILLNESS_JOINTS = ("nose", "left_shoulder", "right_shoulder", "left_hip", "right_hip")
 EYE_CONTACT_YAW_DEGREES = 12.0
 EYE_CONTACT_PITCH_DEGREES = 12.0
 
@@ -62,6 +92,37 @@ class Measurement:
     value: float | str
     seconds: float
     samples: int = 1
+
+
+def smoothing_frames(rate_hz: float, seconds: float = SMOOTHING_SECONDS) -> int:
+    """Return the odd frame count that spans ``seconds`` at ``rate_hz`` (at least 3)."""
+    frames = max(3, int(round(seconds * max(rate_hz, 1.0))))
+    return frames if frames % 2 else frames + 1
+
+
+def _smooth(series: np.ndarray, frames: int = 3) -> np.ndarray:
+    """Return a centred moving average along axis 0 (odd window, edges shortened)."""
+    array = np.asarray(series, dtype=np.float32)
+    if frames <= 1 or array.shape[0] < 3:
+        return array
+    window = min(frames, array.shape[0] if array.shape[0] % 2 else array.shape[0] - 1)
+    if window < 3:
+        return array
+    kernel = np.ones(window, dtype=np.float32) / window
+    pad = window // 2
+    flat = array.reshape(array.shape[0], -1)
+    padded = np.pad(flat, ((pad, pad), (0, 0)), mode="edge")
+    smoothed = np.stack([np.convolve(padded[:, column], kernel, mode="valid") for column in range(flat.shape[1])], axis=1)
+    return smoothed.reshape(array.shape)
+
+
+def reliable_joint_mask(raw_joints: np.ndarray, index: int) -> np.ndarray:
+    """Frames where a joint was actually seen: visible enough and inside the image."""
+    x = raw_joints[:, index, 0]
+    y = raw_joints[:, index, 1]
+    visible = raw_joints[:, index, 3] > VISIBILITY_THRESHOLD
+    inside = (x > FRAME_MARGIN) & (x < 1.0 - FRAME_MARGIN) & (y > FRAME_MARGIN) & (y < 1.0 - FRAME_MARGIN)
+    return visible & inside
 
 
 def _rate_per_minute(count: int, seconds: float) -> float:
@@ -137,7 +198,15 @@ def measure_face(window: MotionWindow, basis: Any | None) -> dict[str, Measureme
             for frame in points
         ]
     )
-    closed = ear < BLINK_EAR_THRESHOLD
+    open_ear = float(np.percentile(ear, 75)) if ear.size else 0.0
+    closed = ear < open_ear * BLINK_EAR_RELATIVE_THRESHOLD if open_ear > 1e-6 else np.zeros_like(ear, dtype=bool)
+    # Drop closures shorter than the minimum: those are jitter, not blinks.
+    for start in _onsets(closed):
+        end = start
+        while end < closed.size and closed[end]:
+            end += 1
+        if end - start < BLINK_MIN_FRAMES:
+            closed[start:end] = False
     blink_starts = _onsets(closed)
     blink_count = int(blink_starts.size)
     result: dict[str, Measurement] = {
@@ -295,10 +364,12 @@ def measure_body(window: MotionWindow) -> dict[str, Measurement]:
     tilt = np.degrees(np.arctan2(shoulder_vector[:, 1], np.where(np.abs(shoulder_vector[:, 0]) > 1e-6, shoulder_vector[:, 0], 1e-6)))
     result["shoulder_tilt_degrees"] = Measurement(float(np.median(tilt)), seconds)
 
-    nose_z = joints[:, BODY_JOINT_INDEX["nose"], 2]
-    result["forward_lean_degrees"] = Measurement(
-        float(np.degrees(np.arctan(np.median(-nose_z)))), seconds
-    )
+    # How far forward of rest this person goes: the 90th percentile of the
+    # nose's forward excursion from its own median, as an angle, capped.
+    nose_z = _smooth(joints[:, BODY_JOINT_INDEX["nose"], 2], smoothing_frames(rate))
+    forward = -(nose_z - float(np.median(nose_z)))
+    lean = float(np.degrees(np.arctan(max(0.0, float(np.percentile(forward, 90))))))
+    result["forward_lean_degrees"] = Measurement(min(lean, FORWARD_LEAN_MAX_DEGREES), seconds)
 
     mid_shoulder_x = (raw[:, BODY_JOINT_INDEX["left_shoulder"], 0] + raw[:, BODY_JOINT_INDEX["right_shoulder"], 0]) / 2.0
     sway_units = mid_shoulder_x / np.where(shoulder_width[seen] > 1e-4, shoulder_width[seen], 1.0)
@@ -309,11 +380,22 @@ def measure_body(window: MotionWindow) -> dict[str, Measurement]:
         float(np.percentile(sway_units, 95) - np.percentile(sway_units, 5)), seconds
     )
 
-    velocities = np.linalg.norm(np.diff(joints[:, :, :3], axis=0), axis=2) * rate  # [frames-1, joints]
-    total_speed = velocities.mean(axis=1)
-    result["stillness_fraction"] = Measurement(
-        float(np.mean(total_speed < STILL_SPEED_SHOULDERS_PER_SECOND)), seconds
-    )
+    positions = _smooth(joints[:, :, :3], smoothing_frames(rate))
+    stillness_indices = [BODY_JOINT_INDEX[name] for name in _STILLNESS_JOINTS]
+    velocities = np.linalg.norm(np.diff(positions[:, stillness_indices, :], axis=0), axis=2) * rate
+    reliable = np.stack([reliable_joint_mask(raw, index) for index in stillness_indices], axis=1)
+    reliable = reliable[1:] & reliable[:-1]
+    # The median over the joints that were actually seen, so one extrapolated
+    # hip at the frame edge does not make a still person restless.
+    masked = np.where(reliable, velocities, np.nan)
+    with np.errstate(all="ignore"):
+        total_speed = np.nanmedian(masked, axis=1)
+    judged = ~np.isnan(total_speed)
+    if judged.any():
+        result["stillness_fraction"] = Measurement(
+            float(np.mean(total_speed[judged] < STILL_SPEED_SHOULDERS_PER_SECOND)),
+            float(judged.sum() / rate),
+        )
 
     hand_names = ("left_wrist", "right_wrist")
     gesture_counts: dict[str, int] = {}
@@ -326,11 +408,21 @@ def measure_body(window: MotionWindow) -> dict[str, Measurement]:
     shoulder_to_nose = np.where(shoulder_to_nose > 1e-4, shoulder_to_nose, 1.0)
     for name in hand_names:
         index = BODY_JOINT_INDEX[name]
-        visible = joints[:, index, 3] > VISIBILITY_THRESHOLD
+        visible = reliable_joint_mask(raw, index) & (
+            positions[:, index, 2] > CAMERA_HAND_DEPTH_SHOULDERS
+        )
         visible_any |= visible
-        speed = np.linalg.norm(np.diff(joints[:, index, :3], axis=0), axis=1) * rate
+        speed = np.linalg.norm(np.diff(positions[:, index, :], axis=0), axis=1) * rate
         moving = np.concatenate([[False], speed > GESTURE_SPEED_SHOULDERS_PER_SECOND]) & visible
-        gesture_counts[name] = int(_onsets(moving).size)
+        count = 0
+        for start in _onsets(moving):
+            end = start
+            while end < moving.size and moving[end]:
+                end += 1
+            displacement = np.linalg.norm(positions[start:end, index, :] - positions[max(start - 1, 0), index, :], axis=1)
+            if displacement.size and float(displacement.max()) >= GESTURE_MIN_DISPLACEMENT_SHOULDERS:
+                count += 1
+        gesture_counts[name] = count
         energies[name] = float(np.sum(speed[visible[1:]] ** 2)) if visible.any() else 0.0
         if visible.any():
             distance = np.linalg.norm(joints[visible, index, :3], axis=1)

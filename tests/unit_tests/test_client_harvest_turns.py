@@ -8,7 +8,11 @@ must not teach the avatar to keep answering in JSON.
 from langchain_core.messages import AIMessage, HumanMessage
 
 from src.anubis.utils.client_harvest_turns import (
+    CONVERSATION_SUGGESTION_HARVEST_SYSTEM_PROMPT,
+    conversation_suggestion_harvest_system_instruction,
+    identity_retrieval_query_for_suggestion_harvest,
     is_client_harvest_turn,
+    is_conversation_suggestion_harvest_text,
     is_suggestion_list_reply,
     without_stale_client_harvest_turns,
 )
@@ -70,3 +74,44 @@ def test_clean_threads_pass_through_unchanged() -> None:
     thread = [HumanMessage(content="hi", id="a"), AIMessage(content="Hey.", id="b")]
     assert without_stale_client_harvest_turns(thread) == thread
     assert without_stale_client_harvest_turns([]) == []
+
+
+def test_conversation_suggestion_harvest_is_detected_apart_from_other_harvests() -> None:
+    assert is_conversation_suggestion_harvest_text(HARVEST.content)
+    assert not is_conversation_suggestion_harvest_text(
+        "[neural-nexus:generate-description] Describe yourself."
+    )
+    assert not is_conversation_suggestion_harvest_text("hello there")
+
+
+def test_opening_harvest_instruction_overrides_spoken_paragraph_rules() -> None:
+    instruction = conversation_suggestion_harvest_system_instruction(HARVEST.content)
+    assert instruction == CONVERSATION_SUGGESTION_HARVEST_SYSTEM_PROMPT
+    assert "opening messages" in instruction
+    assert "recruiter" in instruction
+    assert "website link" in instruction
+    assert conversation_suggestion_harvest_system_instruction("hello") == ""
+    assert (
+        conversation_suggestion_harvest_system_instruction(
+            "[neural-nexus:generate-description] Describe yourself."
+        )
+        == ""
+    )
+
+
+def test_suggestion_harvest_retrieves_the_avatar_identity_not_the_chip_wording() -> None:
+    assert identity_retrieval_query_for_suggestion_harvest(
+        assistant_name="National Guard",
+        assistant_description="U.S. Army National Guard recruiter.",
+    ) == "National Guard. U.S. Army National Guard recruiter."
+    assert identity_retrieval_query_for_suggestion_harvest(
+        assistant_name="Mellow Mushroom",
+        assistant_description="",
+    ) == "Who is Mellow Mushroom and what does Mellow Mushroom do?"
+    assert (
+        identity_retrieval_query_for_suggestion_harvest(
+            assistant_name=None,
+            assistant_description=None,
+        )
+        == "Who are you and what do you do?"
+    )

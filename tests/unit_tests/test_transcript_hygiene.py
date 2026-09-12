@@ -29,7 +29,9 @@ from src.anubis.utils.utility import (  # noqa: E402
 from src.anubis.utils.voice.transcript_hygiene import (  # noqa: E402
     clip_is_silent,
     drop_hallucinated_text,
+    drop_prompt_echo,
     is_known_hallucination,
+    is_prompt_echo,
     keep_confident_segments,
     measure_peak_volume_db,
 )
@@ -66,6 +68,9 @@ requires_ffmpeg = pytest.mark.skipif(
         "Thank you for joining us.",
         "We'll see you next time. Bye for now.",
         "Subtitles by the Amara.org community",
+        "Thank you for your time.",
+        "Thanks for your time!",
+        "Thank you very much.",
         "",
         "   ",
     ],
@@ -95,6 +100,61 @@ def test_real_speech_is_kept(text):
 
 def test_drop_hallucinated_text_returns_empty_for_a_caption():
     assert drop_hallucinated_text("MBC 뉴스 이덕영입니다.") == ""
+
+
+# --- prompt echo ------------------------------------------------------------------
+
+SENTENCE_PROMPT = (
+    "Neural Nexus, Anubis, LangGraph, avatar, ambient vision. Words that come up: "
+    "webcam, screen share, screenshot, microphone, camera, front camera, rear camera. "
+    "Questions like: What is on the webcam? What is on my screen? "
+    "What do you see on the webcam right now? Can you look at the screen share?"
+)
+VOCABULARY_PROMPT = (
+    "Neural Nexus, Anubis, LangGraph, avatar, webcam, screen share, screenshot, "
+    "microphone, front camera, rear camera."
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "prompt"),
+    [
+        # The exact phrase from the prompt, returned as speech.
+        ("What is on my screen?", SENTENCE_PROMPT),
+        # Reshuffled prompt words, nothing of the person's own.
+        (
+            "What is on my screen right now? What do you see on my screen right now?",
+            SENTENCE_PROMPT,
+        ),
+        ("Can you look at the screen share?", SENTENCE_PROMPT),
+        # A vocabulary-only prompt echoed back as a list of terms.
+        ("Neural Nexus, Anubis, LangGraph.", VOCABULARY_PROMPT),
+        ("Screen share, webcam, screenshot", VOCABULARY_PROMPT),
+        ("Neural Nexus", VOCABULARY_PROMPT),
+    ],
+)
+def test_prompt_echo_is_recognised(text, prompt):
+    assert is_prompt_echo(text, prompt)
+    assert drop_prompt_echo(text, prompt) == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "prompt"),
+    [
+        # Real questions carry words the vocabulary prompt never held.
+        ("What is on my screen?", VOCABULARY_PROMPT),
+        ("Can you look at my webcam and tell me what you see?", VOCABULARY_PROMPT),
+        ("Order me a pizza, please.", SENTENCE_PROMPT),
+        ("Take a screenshot of this and remember it.", SENTENCE_PROMPT),
+        # No prompt configured, nothing can be an echo.
+        ("What is on my screen?", ""),
+        ("What is on my screen?", None),
+        ("", SENTENCE_PROMPT),
+    ],
+)
+def test_real_speech_is_not_mistaken_for_a_prompt_echo(text, prompt):
+    assert not is_prompt_echo(text, prompt)
+    assert drop_prompt_echo(text, prompt) == text
 
 
 # --- whisper confidence filter ----------------------------------------------------
@@ -356,6 +416,25 @@ def test_low_confidence_live_voice_segments_are_dropped(monkeypatch):
     )
     assert result["text"] == ""
     assert result["dropped_segments"] == 2
+
+
+@requires_ffmpeg
+def test_live_voice_prompt_echo_is_dropped(monkeypatch):
+    _install_fake_speech_client(
+        monkeypatch,
+        "What is on my screen right now? What do you see on my screen right now?",
+    )
+    result = asyncio.run(
+        transcribe_audio(
+            _data_uri(_tone_mp3()),
+            _speech_context(voice_transcription_prompt=SENTENCE_PROMPT),
+            filename="utterance.mp3",
+            reference_audio=False,
+            max_duration_seconds=None,
+            live_voice=True,
+        )
+    )
+    assert result["text"] == ""
 
 
 @requires_ffmpeg

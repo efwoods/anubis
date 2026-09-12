@@ -1408,6 +1408,13 @@ class GlobalContext:
         },
     )
 
+    conversation_starters_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the standard set of three conversation starters is generated once per avatar and stored on the assistant record (metadata.conversation_starters): on avatar creation, again when deep research finishes, and on the owner's request through POST /avatar/{assistant_id}/conversation_starters. Switching this off stops the generation and the storage; the browser then paints its local identity-leaned starters. Env CONVERSATION_STARTERS_ENABLED."
+        },
+    )
+
     research_account_discovery_enabled: str = field(
         default="true",
         metadata={
@@ -2221,7 +2228,7 @@ class GlobalContext:
     voice_transcription_prompt: str = field(
         default="",
         metadata={
-            "description": "Optional text prompt handed to whisper-1 for live-voice utterances (POST /transcribe) to steer style and vocabulary; the diarization model does not accept a prompt. Empty sends none. Env VOICE_TRANSCRIPTION_PROMPT."
+            "description": "Optional text prompt handed to whisper-1 for live-voice utterances (POST /transcribe) to steer spelling and vocabulary; the diarization model does not accept a prompt. Keep the prompt to a comma-separated list of names and terms (Neural Nexus, webcam, screen share). Never put example sentences or questions in the prompt: whisper-1 treats the prompt as the previous transcript and, on a clip with no clear speech, returns those sentences as if the person had said them (\"What is on my screen right now?\"). A transcript made only of the prompt's words is dropped as an echo. Empty sends none. Env VOICE_TRANSCRIPTION_PROMPT."
         },
     )
     voice_no_speech_probability_max: float = field(

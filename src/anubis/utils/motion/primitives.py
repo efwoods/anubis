@@ -45,10 +45,14 @@ CHANNEL_RIGHT_HAND = "body_right_hand"
 CHANNEL_HEAD = "head"
 CHANNEL_FACE = "face"
 
-_HAND_SPEED_ONSET = 0.6  # shoulder widths per second
-_HAND_SPEED_OFFSET = 0.25
-_HEAD_SPEED_ONSET = 25.0  # degrees per second
-_HEAD_SPEED_OFFSET = 8.0
+# Speeds are measured after a short moving average (jitter and a hand-held
+# camera move every joint a little all the time), and the floors sit above
+# that noise: a real gesture moves the wrist a shoulder width or more in well
+# under a second.
+_HAND_SPEED_ONSET = 1.2  # shoulder widths per second
+_HAND_SPEED_OFFSET = 0.5
+_HEAD_SPEED_ONSET = 30.0  # degrees per second
+_HEAD_SPEED_OFFSET = 10.0
 _FACE_SPEED_ONSET = 0.35  # coefficient units per second
 _FACE_SPEED_OFFSET = 0.12
 _MIN_EVENT_SECONDS = 0.12
@@ -200,7 +204,9 @@ def _events_for_series(
 ) -> list[MotionEvent]:
     if series.shape[0] < 4:
         return []
-    speed = np.linalg.norm(np.diff(series, axis=0), axis=1) * rate
+    from src.anubis.utils.motion.measurements import _smooth, smoothing_frames
+
+    speed = np.linalg.norm(np.diff(_smooth(series, smoothing_frames(rate)), axis=0), axis=1) * rate
     if valid is not None:
         speed = np.where(valid[1:] & valid[:-1], speed, 0.0)
     events: list[MotionEvent] = []
@@ -230,7 +236,13 @@ def extract_events(window: MotionWindow, basis: Any | None = None) -> list[Motio
         seen = width > 1e-4
         for channel, name in ((CHANNEL_LEFT_HAND, "left_wrist"), (CHANNEL_RIGHT_HAND, "right_wrist")):
             index = BODY_JOINT_INDEX[name]
-            visible = (joints[:, index, 3] > 0.5) & seen
+            from src.anubis.utils.motion.measurements import (
+                CAMERA_HAND_DEPTH_SHOULDERS,
+                reliable_joint_mask,
+            )
+
+            raw_joints = body.frames.reshape(body.frames.shape[0], -1, BODY_VALUES_PER_JOINT)
+            visible = reliable_joint_mask(raw_joints, index) & seen & (joints[:, index, 2] > CAMERA_HAND_DEPTH_SHOULDERS)
             events.extend(
                 _events_for_series(
                     window, channel, joints[:, index, :3], float(body.sample_rate_hz),

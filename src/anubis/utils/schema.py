@@ -831,9 +831,13 @@ there, in the order a person moving through that place would need it.
 </instruction_hierarchy>
 
 <output_contract>
-- Plain prose, at most 80 words, no bullets, no headings, no labels.
-- One or two sentences is the normal length. Longer only when the scene
-  genuinely carries more the listener needs.
+- Plain prose, AT MOST {word_budget} WORDS, no bullets, no headings, no labels.
+  This is a hard ceiling, not a target: the next description follows in
+  {pace_seconds} seconds, and one that runs long is still being read out when
+  the scene it describes has been left behind.
+- At a tight budget, say the single most important thing and stop. Drop the
+  room, the weather, the colours, the people who are not in the way. Keep what
+  the listener could walk into and what they must act on.
 - ONLY the description; never a preface and never a question.
 </output_contract>
 
@@ -878,6 +882,29 @@ _LOOK_STILL_FOCUS = {
         "</this_still>"
     ),
 }
+
+
+def describe_scene_for_narration_prompt(
+    word_budget: int, pace_seconds: float
+) -> str:
+    """Size the narration spec to how often the listener is being told.
+
+    The pace is not only how often a reading arrives, it is how much a reading
+    can say. Speech runs at roughly two and a half words a second, so eighty
+    words is a twenty-second reading; delivered every five seconds that leaves
+    the listener permanently behind a scene they have already walked out of.
+    Faster has to mean shorter, and this is where that is said to the model
+    rather than hoped for.
+
+    :param word_budget: The ceiling for this reading (see
+        ``narration_word_budget``).
+    :param pace_seconds: How long until the next reading, named in the prompt so
+        the ceiling reads as a consequence rather than an arbitrary rule.
+    :returns: The spec.
+    """
+    return DESCRIBE_SCENE_FOR_NARRATION_PROMPT.replace(
+        "{word_budget}", str(int(word_budget))
+    ).replace("{pace_seconds}", f"{float(pace_seconds):g}")
 
 
 def describe_look_prompt_for(source: str) -> str:

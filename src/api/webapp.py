@@ -1,6 +1,7 @@
 # src/anubis/webapp.py
 
 import asyncio
+import math
 import time
 import base64
 import functools
@@ -1054,14 +1055,27 @@ def _document_reference_role(
     return None
 
 
+def _is_consultable_reference_media(metadata: dict) -> bool:
+    """Whether this Document was uploaded as consultable reference material.
+
+    Distinct from the portrait / voice-sample roles: a menu or price list is
+    stored in the ``document`` namespace and never used to reconstruct identity.
+    Either ``reference_media`` or ``is_reference_media`` is enough; both are
+    stamped on the same write so an older row that only has one still lists.
+    """
+    return bool(metadata.get("reference_media") or metadata.get("is_reference_media"))
+
+
 def _iter_document_labels(
     store_items,
-) -> Iterator[tuple[str, str | None, str | None]]:
-    """Yield (label, key, reference_role) for each stored Document, de-structuring
-    the same value.document.kwargs.metadata path /list and /delete read. Multiple
-    Documents per source (quote / identity / analysis) yield the same triple; the
-    caller de-dupes. ``reference_role`` is "reference_image", "reference_audio",
-    or None — see _document_reference_role."""
+) -> Iterator[tuple[str, str | None, str | None, bool]]:
+    """Yield (label, key, reference_role, is_reference_media) for each stored
+    Document, de-structuring the same value.document.kwargs.metadata path /list
+    and /delete read. Multiple Documents per source (quote / identity / analysis)
+    yield the same quadruple; the caller de-dupes. ``reference_role`` is
+    "reference_image", "reference_audio", or None — see _document_reference_role.
+    ``is_reference_media`` is True for a consultable menu or other reference
+    item that is not identity."""
     for item in store_items or []:
         value = getattr(item, "value", None)
         if value is None and isinstance(item, dict):
@@ -1080,7 +1094,12 @@ def _iter_document_labels(
             item_namespace = item.get("namespace")
         label, key = _document_label_and_key(metadata)
         if label:
-            yield label, key, _document_reference_role(metadata, item_namespace)
+            yield (
+                label,
+                key,
+                _document_reference_role(metadata, item_namespace),
+                _is_consultable_reference_media(metadata),
+            )
 
 
 def _latest_ai_from_stream_update(payload: dict) -> AIMessage | None:
@@ -2238,6 +2257,24 @@ async def resolve_assistant_for_creator(
     return assistant, creator_id
 
 
+def avatar_was_created_by_administrator(
+    creator_user_id: str | None,
+    context: object | None,
+) -> bool:
+    """Whether this avatar was created by the administrator account.
+
+    Explicit reference-media uploads (a menu or other consultable material,
+    stored in the ``document`` namespace and never used to reconstruct
+    identity) are reserved for those avatars. The administrator is named by
+    ``GlobalContext.admin_user_id`` (environment ``ADMIN_USER_ID``), the same
+    identifier ``create_avatar`` stamps onto ``metadata.user_id``.
+    """
+    admin_user_id = getattr(context, "admin_user_id", None)
+    if not admin_user_id or not creator_user_id:
+        return False
+    return str(creator_user_id).strip() == str(admin_user_id).strip()
+
+
 async def get_public_avatars(
     assistant_id: Optional[str] = None, user_id: Optional[str] = None
 ):
@@ -2304,19 +2341,86 @@ def _assistant_without_metadata_if_public(
     return assistant
 
 
+IMAGE_VIEWPORT_METADATA_KEY = "image_viewport"
+
+
+def parse_image_viewport(value: Any) -> dict[str, Any] | None:
+    """The crop everyone should see on this avatar's picture, or None.
+
+    ``scale`` is how far the picture is zoomed (1–8). ``x`` and ``y`` are
+    offsets as fractions of the frame, so the same crop paints a bubble and
+    the voice stage. Media size is optional and only used to keep cover-fit
+    from stretching.
+    """
+    if not isinstance(value, dict):
+        return None
+    try:
+        scale = float(value.get("scale"))
+        x = float(value.get("x", value.get("offsetX", 0)))
+        y = float(value.get("y", value.get("offsetY", 0)))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(scale) or not math.isfinite(x) or not math.isfinite(y):
+        return None
+    scale = min(8.0, max(1.0, scale))
+    x = min(2.0, max(-2.0, x))
+    y = min(2.0, max(-2.0, y))
+    parsed: dict[str, Any] = {"scale": scale, "x": x, "y": y}
+    media_width = value.get("mediaWidth", value.get("media_width"))
+    media_height = value.get("mediaHeight", value.get("media_height"))
+    try:
+        width = float(media_width)
+        height = float(media_height)
+    except (TypeError, ValueError):
+        return parsed
+    if width > 0 and height > 0:
+        parsed["mediaWidth"] = width
+        parsed["mediaHeight"] = height
+    return parsed
+
+
+def image_viewport_of(assistant: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Read the public crop from metadata or a lifted top-level field."""
+    if not isinstance(assistant, dict):
+        return None
+    metadata = assistant.get("metadata")
+    if isinstance(metadata, dict):
+        parsed = parse_image_viewport(metadata.get(IMAGE_VIEWPORT_METADATA_KEY))
+        if parsed is not None:
+            return parsed
+    return parse_image_viewport(assistant.get(IMAGE_VIEWPORT_METADATA_KEY))
+
+
 def _assistant_without_metadata(assistant: dict[str, Any]) -> dict[str, Any]:
     """Drop the metadata, keeping the real-world pin as a public top-level field.
 
     A geo-located avatar's pin is the one piece of metadata that is meant to be
     public: the pin is what places the avatar on the world map and what tells a
-    passer-by that an avatar stands here. Everything else in the metadata — the
-    creator's ``user_id`` above all — stays private, so the pin is lifted out
-    rather than the metadata being kept.
+    passer-by that an avatar stands here. The framed crop of the reference
+    image is public the same way: every visitor should see the picture the
+    owner framed. Everything else in the metadata — the creator's ``user_id``
+    above all — stays private, so those two fields are lifted out rather than
+    the metadata being kept.
     """
     stripped = {k: v for k, v in assistant.items() if k != "metadata"}
     pin = geo_location_of(assistant)
     if pin is not None:
         stripped[GEO_LOCATION_METADATA_KEY] = pin
+    crop = image_viewport_of(assistant)
+    if crop is not None:
+        stripped[IMAGE_VIEWPORT_METADATA_KEY] = crop
+    # The standard set of conversation starters is public the same way: a
+    # visitor opening a new conversation with a shared avatar needs the same
+    # three chips the owner sees, and without them the browser would pay a
+    # hidden avatar turn to produce a list that already exists.
+    from src.anubis.utils.conversation_starters import (
+        CONVERSATION_STARTERS_METADATA_KEY,
+        conversation_starters_record_of,
+    )
+
+    starters_record = conversation_starters_record_of(assistant)
+    if starters_record is not None:
+        stripped[CONVERSATION_STARTERS_METADATA_KEY] = starters_record
     return stripped
 
 
@@ -6800,6 +6904,28 @@ async def create_avatar(
                     research_error,
                 )
 
+        # The standard set of conversation starters is written once per
+        # avatar. When research starts here, the research job writes the set
+        # from verified facts as it finishes; otherwise the set is written now
+        # from the name and description, in the background, so the first
+        # conversation already opens with chips about this avatar and no
+        # browser pays a hidden avatar turn to produce them.
+        if research_job_body is None:
+            from src.anubis.utils.conversation_starters import SOURCE_IDENTITY_ONLY
+            from src.api.message_stops import schedule_background
+
+            schedule_background(
+                refresh_avatar_conversation_starters(
+                    app.state,
+                    current_user,
+                    assistant_id=assistant_id,
+                    creator_id=user_id,
+                    name=name,
+                    description=description,
+                    source=SOURCE_IDENTITY_ONLY,
+                )
+            )
+
         created_record = dict(create_avatar_response or {})
         if research_job_body is not None:
             created_record["research_job"] = research_job_body
@@ -7157,6 +7283,48 @@ async def modify_avatar(
         result = {**result, "research_job": research_job_body}
 
     return JSONResponse(content=result, status_code=200)
+
+
+@app.post("/avatar_image_viewport")
+async def set_avatar_image_viewport(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Store the crop everyone should see on this avatar's picture.
+
+    Body: ``assistant_id`` and the framed viewport (``scale``, ``x``, ``y``,
+    optional ``mediaWidth`` / ``mediaHeight``). Owner-only. Public listings
+    lift the crop so visitors see the same framing without receiving the rest
+    of the metadata.
+    """
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    if not assistant_id:
+        raise HTTPException(status_code=400, detail="assistant_id is required.")
+    viewport = parse_image_viewport(body)
+    if viewport is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Send a framed picture: scale, x, and y.",
+        )
+    await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="frame that avatar's picture",
+    )
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    try:
+        await client.assistants.update(
+            assistant_id=assistant_id,
+            metadata={IMAGE_VIEWPORT_METADATA_KEY: viewport},
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500, detail="Could not save that picture framing."
+        )
+    return JSONResponse(content=viewport, status_code=200)
 
 
 @app.post("/disconnect_mcp")
@@ -13337,7 +13505,11 @@ async def speak_text(
     return Response(
         content=audio_bytes,
         media_type="audio/mpeg",
-        headers={"X-Voice-Kind": kind, "Cache-Control": "no-store"},
+        headers={
+            "X-Voice-Kind": kind,
+            "Access-Control-Expose-Headers": "X-Voice-Kind",
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -14429,6 +14601,7 @@ async def _expand_youtube_playlist_to_media_entries(
     user_id: str,
     assistant_id: str,
     create_reference_media_from_playlist: bool = False,
+    reference_media: bool = False,
 ) -> Optional[list]:
     """Expand a YouTube **playlist** URL into one media entry per video.
 
@@ -14513,6 +14686,7 @@ async def _expand_youtube_playlist_to_media_entries(
                 "reference_audio": False,
                 "reference_image": False,
                 "create_reference_media_from_playlist": create_reference_media_from_playlist,
+                "reference_media": reference_media,
                 # Single opaque uuid5 over the composite so the store key carries
                 # no ``::`` separator. The playlist a video belongs to is recovered
                 # from playlist_namespace_filename below (and from playlist_url /
@@ -15139,6 +15313,7 @@ async def _start_media_batch(
     rejected_items: list[dict],
     current_user: dict,
     create_reference_media_from_playlist: bool = False,
+    reference_media: bool = False,
 ) -> dict:
     """Estimate, enforce, meter, and start one media batch; return the 202 body.
 
@@ -15346,6 +15521,7 @@ async def _start_media_batch(
             user_id=user_id,
             assistant_id=assistant_id,
             create_reference_media_from_playlist=create_reference_media_from_playlist,
+            reference_media=reference_media,
         )
         for playlist_url in playlist_urls
     ]
@@ -15599,6 +15775,7 @@ async def update_avatar_identity_with_media(
     reference_audio: Annotated[bool, Form()] = False,
     reference_image: Annotated[bool, Form()] = False,
     create_reference_media_from_playlist: Annotated[bool, Form()] = False,
+    reference_media: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -15651,6 +15828,15 @@ async def update_avatar_identity_with_media(
     belong to the avatar. It is mutually exclusive with ``reference_image`` /
     ``reference_audio`` (which designate a single target) and applies to every item
     in the request, including expanded playlist children.
+
+    With **reference_media=true** every item is consultable reference material
+    (a restaurant menu, a price list, a holy text) stored in the ``document``
+    namespace. The batch is **not** used to reconstruct identity: no
+    biographical classification, no quote/adapter documents, no psychological
+    analysis. The flag is accepted only for avatars created by the
+    administrator (``ADMIN_USER_ID``); any other avatar is refused with ``403``.
+    It is mutually exclusive with ``reference_image``, ``reference_audio``, and
+    ``create_reference_media_from_playlist``.
     """
     try:
         # Gate: only pro/premium tiers may update avatar identity with media.
@@ -15666,12 +15852,22 @@ async def update_avatar_identity_with_media(
         # Only the creator of an avatar may add media to that avatar's identity.
         # Shared with /list_avatar_documents and /delete_avatar_document, which read
         # and remove the very rows this endpoint writes.
-        assistant, _creator_id = await resolve_assistant_for_creator(
+        assistant, creator_id = await resolve_assistant_for_creator(
             assistant_id,
             current_user,
             action_description="upload media for that avatar",
         )
         assistant_meta = assistant.get("metadata") or {}
+        if reference_media and not (
+            avatar_was_created_by_administrator(creator_id, app.state.context)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "reference_media is only available for avatars created by "
+                    "the administrator."
+                ),
+            )
 
         config = {
             "configurable": {
@@ -15716,6 +15912,18 @@ async def update_avatar_identity_with_media(
                     "reference_image/reference_audio: a reference clip designates a "
                     "single target, while create_reference_media_from_playlist treats every detected "
                     "speaker as the target."
+                ),
+            )
+        if reference_media and (
+            reference_image or reference_audio or create_reference_media_from_playlist
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "reference_media cannot be combined with reference_image, "
+                    "reference_audio, or create_reference_media_from_playlist: "
+                    "reference media is consultable knowledge, not identity "
+                    "or a speaker designation."
                 ),
             )
 
@@ -15903,6 +16111,9 @@ async def update_avatar_identity_with_media(
         if create_reference_media_from_playlist:
             for entry in media_files:
                 entry["create_reference_media_from_playlist"] = True
+        if reference_media:
+            for entry in media_files:
+                entry["reference_media"] = True
 
         return JSONResponse(
             status_code=202,
@@ -15915,6 +16126,7 @@ async def update_avatar_identity_with_media(
                 rejected_items=rejected_items,
                 current_user=current_user,
                 create_reference_media_from_playlist=create_reference_media_from_playlist,
+                reference_media=reference_media,
             ),
         )
 
@@ -16294,9 +16506,14 @@ async def list_avatar_documents(
     # role, so the first non-None role wins and the ordinary siblings never
     # overwrite it back to None.
     reference_role_by_document_label: dict[str, str | None] = {}
-    for label, _key, reference_role in _iter_document_labels(all_document_items):
+    is_reference_media_by_document_label: dict[str, bool] = {}
+    for label, _key, reference_role, is_reference_media in _iter_document_labels(
+        all_document_items
+    ):
         if reference_role_by_document_label.get(label) is None:
             reference_role_by_document_label[label] = reference_role
+        if is_reference_media:
+            is_reference_media_by_document_label[label] = True
 
     uploaded_document_labels = sorted(reference_role_by_document_label)
 
@@ -16334,6 +16551,9 @@ async def list_avatar_documents(
                 == "reference_image",
                 "is_reference_audio": reference_role_by_document_label[label]
                 == "reference_audio",
+                "is_reference_media": is_reference_media_by_document_label.get(
+                    label, False
+                ),
                 "voice_seconds": round(voice_seconds_by_label.get(label, 0.0), 1),
                 "in_voice_corpus": label in voice_seconds_by_label,
             }
@@ -16379,7 +16599,9 @@ async def delete_avatar_documents(
         )
         label_to_key = {
             label: key
-            for label, key, _reference_role in _iter_document_labels(existing_items)
+            for label, key, _reference_role, _is_reference_media in _iter_document_labels(
+                existing_items
+            )
             if key
         }
     except Exception:
@@ -16511,6 +16733,189 @@ RETURNING value #>> '{document,kwargs,metadata,document_id}' AS document_id
 
     return JSONResponse(
         content=f"Successfully deleted: {display_name}", status_code=200
+    )
+
+
+# ---------------------------------------------------------------------------
+# The standard set of conversation starters (generated once per avatar)
+# ---------------------------------------------------------------------------
+
+
+async def refresh_avatar_conversation_starters(
+    app_state,
+    current_user: dict,
+    *,
+    assistant_id: str,
+    creator_id: str,
+    name: str | None,
+    description: str | None,
+    source: str,
+) -> dict | None:
+    """Generate the avatar's three opening chips once and store them on the record.
+
+    One structured-output call on the classification model, grounded in the
+    avatar's name, description, and held identity facts; the result lands in
+    ``metadata.conversation_starters`` (LangGraph merges metadata by key, so
+    the rest of the metadata is untouched). Every browser then reads the same
+    list from the avatar record instead of paying a hidden avatar turn per
+    new conversation.
+
+    Never raises: a set that could not be written leaves the previous set (or
+    nothing) in place, and the browser falls back to its local starters.
+    Returns the stored record, or ``None`` when nothing was written.
+    """
+    from src.anubis.utils.conversation_starters import (
+        CONVERSATION_STARTERS_METADATA_KEY,
+        build_conversation_starters_record,
+        conversation_starters_enabled,
+        generate_conversation_starters,
+    )
+
+    context = getattr(app_state, "context", None)
+    if not conversation_starters_enabled(context):
+        return None
+    try:
+        starters, identity_fact_count = await generate_conversation_starters(
+            getattr(app_state, "store", None),
+            creator_id=creator_id,
+            assistant_id=assistant_id,
+            name=name,
+            description=description,
+        )
+        if len(starters) < 2:
+            logger.warning(
+                "Conversation starters for avatar %s came back unusable (%d kept); "
+                "keeping the previous set",
+                assistant_id,
+                len(starters),
+            )
+            return None
+        record = build_conversation_starters_record(
+            starters, source=source, identity_fact_count=identity_fact_count
+        )
+        token = current_user["API_KEY"]
+        client = get_client(headers={"API-KEY": f"{token}"})
+        await client.assistants.update(
+            assistant_id=assistant_id,
+            metadata={CONVERSATION_STARTERS_METADATA_KEY: record},
+        )
+        logger.info(
+            "Stored %d conversation starters for avatar %s (source=%s, facts=%d)",
+            len(starters),
+            assistant_id,
+            source,
+            identity_fact_count,
+        )
+        return record
+    except Exception:  # noqa: BLE001 - the chips are a convenience, never a failure
+        logger.exception(
+            "Could not refresh the conversation starters of avatar %s", assistant_id
+        )
+        return None
+
+
+async def _resolve_assistant_for_viewer(
+    assistant_id: str, current_user: dict
+) -> tuple[dict, bool]:
+    """Load an avatar the signed-in caller may read: their own, or a public one.
+
+    Returns ``(assistant, caller_is_creator)``. Raises 404 when the avatar is
+    neither the caller's nor public.
+    """
+    user_id = current_user["identities"][0]["user_id"]
+    admin_user_id = getattr(getattr(app.state, "context", None), "admin_user_id", None)
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    assistant: dict | None = None
+    try:
+        assistant = await client.assistants.get(assistant_id)
+    except Exception:  # noqa: BLE001 - fall through to the public listing
+        assistant = None
+    if assistant is None:
+        public_matches = await get_public_avatars(assistant_id=assistant_id)
+        assistant = public_matches[0] if public_matches else None
+    if assistant is None:
+        raise HTTPException(status_code=404, detail="Unknown avatar.")
+    metadata = assistant.get("metadata") or {}
+    creator_id = metadata.get("user_id")
+    caller_is_creator = bool(creator_id) and (
+        user_id == creator_id or user_id == admin_user_id
+    )
+    is_public = metadata.get("is_public")
+    is_public = is_public is True or (
+        isinstance(is_public, str) and is_public.lower() == "true"
+    )
+    if not caller_is_creator and not is_public:
+        raise HTTPException(status_code=404, detail="Unknown avatar.")
+    return assistant, caller_is_creator
+
+
+@app.get("/avatar/{assistant_id}/conversation_starters")
+async def get_avatar_conversation_starters(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the avatar's stored standard set of conversation starters.
+
+    Readable by the creator and by anyone for a public avatar. Returns
+    ``{"assistant_id", "conversation_starters": record | null}``; the record
+    carries ``starters``, ``generated_at``, ``source`` and
+    ``identity_fact_count``. Nothing is generated here — the browser falls
+    back to its local starters when the record is null.
+    """
+    from src.anubis.utils.conversation_starters import (
+        conversation_starters_record_of,
+    )
+
+    assistant, _ = await _resolve_assistant_for_viewer(assistant_id, current_user)
+    return JSONResponse(
+        {
+            "assistant_id": assistant_id,
+            "conversation_starters": conversation_starters_record_of(assistant),
+        }
+    )
+
+
+@app.post("/avatar/{assistant_id}/conversation_starters")
+async def regenerate_avatar_conversation_starters(
+    assistant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Write a fresh standard set for this avatar now (creator-only).
+
+    One classification-model call, grounded in the identity facts the avatar
+    holds today. Returns the same body as the GET; ``conversation_starters``
+    is null when nothing usable could be written (the previous set stays).
+    """
+    from src.anubis.utils.conversation_starters import (
+        SOURCE_OWNER_REQUEST,
+        conversation_starters_enabled,
+        conversation_starters_record_of,
+    )
+
+    if not conversation_starters_enabled(app.state.context):
+        raise HTTPException(
+            status_code=503,
+            detail="Conversation starters are disabled (CONVERSATION_STARTERS_ENABLED).",
+        )
+    assistant, creator_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="regenerate that avatar's conversation starters",
+    )
+    record = await refresh_avatar_conversation_starters(
+        app.state,
+        current_user,
+        assistant_id=assistant_id,
+        creator_id=creator_id,
+        name=assistant.get("name"),
+        description=assistant.get("description"),
+        source=SOURCE_OWNER_REQUEST,
+    )
+    if record is None:
+        record = conversation_starters_record_of(assistant)
+    return JSONResponse(
+        {"assistant_id": assistant_id, "conversation_starters": record}
     )
 
 
@@ -16815,6 +17220,40 @@ def _start_deep_research_job(
                     job.job_id,
                     discovery_error,
                 )
+            # The standard set of conversation starters is written from what
+            # the avatar knows, and research is the moment the avatar comes to
+            # know something. A set written at creation from a bare name and a
+            # one-line description is a placeholder; this is the set visitors
+            # should see. Regenerated when facts were applied, or when the
+            # avatar holds no set yet. Its own try/except and never fatal: the
+            # helper swallows failures and the research still succeeded.
+            from src.anubis.utils.conversation_starters import (
+                SOURCE_DEEP_RESEARCH,
+                conversation_starters_of,
+            )
+
+            holds_starters = bool(
+                conversation_starters_of({"metadata": assistant_metadata or {}})
+            )
+            if summary.get("applied") or not holds_starters:
+                add_research_event(
+                    job,
+                    {
+                        "type": "research_progress",
+                        "stage": "conversation_starters",
+                    },
+                )
+                starters_record = await refresh_avatar_conversation_starters(
+                    app_state,
+                    current_user,
+                    assistant_id=assistant_id,
+                    creator_id=creator_id,
+                    name=subject_name,
+                    description=subject_description,
+                    source=SOURCE_DEEP_RESEARCH,
+                )
+                if starters_record is not None:
+                    summary["conversation_starters"] = starters_record
             finish_research_job(job, result=summary)
         except asyncio.CancelledError:
             finish_research_job(

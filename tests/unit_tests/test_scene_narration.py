@@ -36,6 +36,7 @@ from src.anubis.utils.ambient.triage_node import (
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.tools.vision.accessibility_tools import (
+    NARRATION_PACE_OPTIONS,
     SLOWEST_NARRATION_SECONDS,
     NARRATION_OFF,
     NARRATION_ON,
@@ -354,7 +355,9 @@ async def test_a_narrated_observation_is_described_for_a_listener_and_always_spo
     # The words the browser reads out travel on the decision frame, in full and
     # untruncated: this IS the reading, and a description cut short is a hazard
     # left unsaid.
-    assert decision[0]["narration"] == "webcam: described webcam.jpg"
+    # The source label is stripped: it is written for whoever reads the
+    # thread, and a listener would hear it read out before the scene.
+    assert decision[0]["narration"] == "described webcam.jpg"
 
 
 @pytest.mark.asyncio
@@ -542,7 +545,7 @@ async def test_a_pace_asked_for_in_words_reaches_the_browser(monkeypatch):
         scene_narration_min_interval_seconds = 3.0
 
     tool = build_scene_narration_tools(
-        _Context(), scene_narration="on", scene_narration_seconds=12
+        _Context(), scene_narration="on", scene_narration_seconds=10
     )[0]
     result = await tool.ainvoke(
         {"enabled": True, "every_seconds": 5, "reason": "asked for more often"}
@@ -561,7 +564,7 @@ async def test_a_pace_asked_for_in_words_reaches_the_browser(monkeypatch):
     assert result["status"] == "changed"
     assert result["every_seconds"] == 5.0
     assert "every 5 seconds" in result["message"]
-    assert "instead of every 12" in result["message"]
+    assert "instead of every 10" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -581,10 +584,15 @@ async def test_an_impossible_pace_is_brought_to_the_nearest_one_that_works(monke
     )[0]
 
     faster = await tool.ainvoke({"enabled": True, "every_seconds": 0.2})
-    assert faster["every_seconds"] == 3.0
+    assert faster["every_seconds"] == NARRATION_PACE_OPTIONS[0]
 
     slower = await tool.ainvoke({"enabled": True, "every_seconds": 9999})
     assert slower["every_seconds"] == SLOWEST_NARRATION_SECONDS
+
+    # A pace between two of the five is taken as the nearer one, so the avatar
+    # and the Accessibility page can never disagree about how often it reads.
+    between = await tool.ainvoke({"enabled": True, "every_seconds": 12})
+    assert between["every_seconds"] == 10.0
 
 
 def test_the_tool_tells_the_model_the_pace_it_is_changing_from():
@@ -594,5 +602,67 @@ def test_the_tool_tells_the_model_the_pace_it_is_changing_from():
     tool = build_scene_narration_tools(
         _Context(), scene_narration="on", scene_narration_seconds=8
     )[0]
-    assert "every 8 seconds" in tool.description
-    assert "fastest this device will go is every 3 seconds" in tool.description
+    # 8 is not one of the five, so the avatar is told the one it is actually on.
+    assert "every 10 seconds" in tool.description
+    assert "every 5, 10, 15, 30 or 60 seconds" in tool.description
+    # Faster means shorter as well as more often, and the model has to know
+    # that or "more often" produces readings that overrun their own gap.
+    assert "SHORTER" in tool.description
+
+
+def test_a_faster_pace_makes_each_reading_shorter():
+    """The pace decides how much is said, not only how often.
+
+    Speech runs at roughly two and a half words a second, so an eighty-word
+    description takes twenty seconds to read. Delivered every five seconds it
+    would leave the listener permanently behind a scene they have already
+    walked out of — which is what a pace control that changed only the gap
+    would produce.
+    """
+    from src.anubis.utils.tools.vision.accessibility_tools import (
+        narration_word_budget,
+    )
+
+    budgets = [narration_word_budget(pace) for pace in NARRATION_PACE_OPTIONS]
+    assert budgets == sorted(budgets), "a slower pace must never say less"
+    # Every reading has to fit in its own gap, at about 2.5 words a second.
+    for pace, budget in zip(NARRATION_PACE_OPTIONS, budgets):
+        assert budget / 2.5 < pace, f"a reading at {pace:g}s would overrun"
+    # And nothing is ever cut to uselessness, or allowed to ramble.
+    assert min(budgets) >= 8
+    assert max(budgets) <= 80
+
+
+def test_the_narration_spec_carries_the_budget_and_says_why():
+    from src.anubis.utils.schema import describe_scene_for_narration_prompt
+
+    spec = describe_scene_for_narration_prompt(12, 5)
+    assert "AT MOST 12 WORDS" in spec
+    # Named so the ceiling reads as a consequence rather than an arbitrary rule.
+    assert "follows in\n  5 seconds" in spec or "follows in 5 seconds" in spec
+
+
+def test_the_words_read_out_carry_no_labels_meant_for_a_reader():
+    """A listener must not hear "image webcam dot jpg" before the scene.
+
+    The stored body labels each section by where it came from, for whoever
+    reads the thread. Narration speaks the text verbatim, so those labels would
+    be read out — spending the first second of a five-second reading on
+    nothing, every time.
+    """
+    from src.anubis.utils.ambient.triage_node import spoken_text_of
+
+    assert (
+        spoken_text_of("[Image: webcam.jpg] webcam: Door to your right, two steps.")
+        == "Door to your right, two steps."
+    )
+    assert spoken_text_of("webcam: A kerb ahead.") == "A kerb ahead."
+    assert spoken_text_of("screen: An error box.") == "An error box."
+    # Two sources become one reading rather than two labelled paragraphs.
+    assert (
+        spoken_text_of("webcam: A kerb ahead.\nscreen: An error box.")
+        == "A kerb ahead. An error box."
+    )
+    # A description that simply begins with a bracket keeps its own words.
+    assert spoken_text_of("A door, and a sign.") == "A door, and a sign."
+    assert spoken_text_of("") == ""

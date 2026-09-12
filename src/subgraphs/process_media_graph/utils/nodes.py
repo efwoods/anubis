@@ -996,6 +996,10 @@ async def process_uploaded_files_and_label_media_type(
         except Exception as e:
             logger.error(f"Error processing file {filename}: {e}")
             continue
+        finally:
+            if bool(file_data.get("reference_media", False)):
+                for entry in media_list[file_start_idx:]:
+                    entry.setdefault("metadata", {})["reference_media"] = True
 
     logger.info(f"Converted {len(media_list)} files to media format")
     _emit_media_progress("labeling", total=len(media_list))
@@ -1424,6 +1428,49 @@ async def process_media_item_task(
                             },
                         )
                     ]
+
+            if bool(metadata.get("reference_media")):
+                from src.anubis.utils.classes.ImageDescriptionClass import (
+                    ImageDescriptionClass,
+                )
+                from src.subgraphs.process_media_graph.utils.helper_functions import (
+                    store_explicit_reference_media_documents,
+                )
+
+                described = await ImageDescriptionClass().describe(
+                    image_source, filename
+                )
+                description_text = (described.get("description") or "").strip()
+                if not description_text:
+                    return [
+                        Document(
+                            page_content="[Reference media image produced no readable text]",
+                            metadata={
+                                "status": "error",
+                                "error": "empty_reference_media_image",
+                                "filename": filename,
+                                "namespace_filename": namespace_filename,
+                            },
+                        )
+                    ]
+                return await store_explicit_reference_media_documents(
+                    media_item={
+                        "type": "text",
+                        "content": description_text,
+                        "metadata": {
+                            "filename": filename,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "source": "reference_media_image",
+                            "image_filename": filename,
+                            "namespace_filename": namespace_filename,
+                            "reference_media": True,
+                        },
+                    },
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    namespace_filename=namespace_filename,
+                )
 
             doc = await extract_personality_from_image(
                 image_data=image_source,
@@ -1888,6 +1935,7 @@ async def process_media_item_task(
                         "source": "pdf_page",
                         "pdf_page_index": page_idx,
                         "namespace_filename": namespace_filename,
+                        "reference_media": bool(metadata.get("reference_media")),
                     },
                 }
                 documents = await process_text_to_document(
@@ -1934,7 +1982,11 @@ async def process_media_item_task(
             # next upload that does yield a usable clip takes the stored clip's
             # place rather than leaving the avatar anchored to nothing.
             promoted_to_reference = False
-            if not reference_audio and not create_reference_media_from_playlist:
+            if (
+                not reference_audio
+                and not create_reference_media_from_playlist
+                and not metadata.get("reference_media")
+            ):
                 stored_reference, _stored_reference_problem = (
                     await read_usable_reference_audio(
                         store, user_id, assistant_id, context=runtime.context
@@ -1987,6 +2039,78 @@ async def process_media_item_task(
                         },
                     )
                 ]
+
+            if bool(metadata.get("reference_media")):
+                from src.anubis.utils.utility import (
+                    extract_video_audio_b64,
+                    transcribe_audio,
+                )
+                from src.subgraphs.process_media_graph.utils.helper_functions import (
+                    store_explicit_reference_media_documents,
+                )
+
+                audio_for_transcript = payload_uri
+                if media_type == "video" and payload_uri:
+                    extracted_audio_uri, _extracted_name = extract_video_audio_b64(
+                        payload_uri, filename=filename
+                    )
+                    audio_for_transcript = extracted_audio_uri
+                try:
+                    plain = await transcribe_audio(
+                        audio_base64=audio_for_transcript,
+                        context=runtime.context,
+                        filename=filename,
+                    )
+                    plain_text = (plain.get("text") or "").strip()
+                except Exception as transcription_error:
+                    logger.exception(
+                        "reference_media transcription failed for %s: %s",
+                        filename,
+                        transcription_error,
+                    )
+                    return [
+                        Document(
+                            page_content=(
+                                f"[{media_type.capitalize()} transcription failed: "
+                                f"{transcription_error}]"
+                            ),
+                            metadata={
+                                "status": "error",
+                                "error": f"transcription_failed: {transcription_error}",
+                                "filename": filename,
+                                "namespace_filename": namespace_filename,
+                            },
+                        )
+                    ]
+                if not plain_text:
+                    return [
+                        Document(
+                            page_content="[Reference media produced no transcript]",
+                            metadata={
+                                "status": "error",
+                                "error": "empty_reference_media_transcript",
+                                "filename": filename,
+                                "namespace_filename": namespace_filename,
+                            },
+                        )
+                    ]
+                return await store_explicit_reference_media_documents(
+                    media_item={
+                        "type": "text",
+                        "content": plain_text,
+                        "metadata": {
+                            "filename": filename,
+                            "user_id": user_id,
+                            "assistant_id": assistant_id,
+                            "source": f"reference_media_{media_type}",
+                            "namespace_filename": namespace_filename,
+                            "reference_media": True,
+                        },
+                    },
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    namespace_filename=namespace_filename,
+                )
 
             if (
                 media_type == "audio"
@@ -2933,6 +3057,9 @@ async def _expand_url_media_item(
     parent_create_reference_media_from_playlist = bool(
         (media_item.get("metadata") or {}).get("create_reference_media_from_playlist")
     )
+    parent_reference_media = bool(
+        (media_item.get("metadata") or {}).get("reference_media")
+    )
 
     loader = URLDocumentLoaderClass()
     if semaphore is not None:
@@ -2975,6 +3102,8 @@ async def _expand_url_media_item(
         child_meta = item.setdefault("metadata", {})
         if parent_create_reference_media_from_playlist:
             child_meta.setdefault("create_reference_media_from_playlist", True)
+        if parent_reference_media:
+            child_meta.setdefault("reference_media", True)
         child_ns = child_meta.get("namespace_filename")
         if not child_ns:
             # A keyless child is the single logical content of THIS url item

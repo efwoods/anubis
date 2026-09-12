@@ -24,6 +24,7 @@ from src.anubis.utils.ambient.observations import (
     build_ambient_action_additional_kwargs,
     compose_ambient_action_text,
     compose_observation_text,
+    is_action_the_avatar_takes_on_behalf,
     is_ambient_action,
     is_ambient_observation,
     normalize_proposed_action,
@@ -96,6 +97,62 @@ def test_an_offer_is_one_verb_on_a_heads_up_and_needs_wording():
         "",
     )
     assert normalize_classification(SimpleNamespace()).proposed_action == "none"
+
+
+def test_an_offer_is_only_an_action_the_avatar_takes_on_behalf():
+    assert is_action_the_avatar_takes_on_behalf(
+        "draft", "Draft a reply to the invoice email"
+    )
+    assert is_action_the_avatar_takes_on_behalf(
+        "research", "Research the error on the screen"
+    )
+    assert is_action_the_avatar_takes_on_behalf("reply", "Reply to the invoice email")
+    assert not is_action_the_avatar_takes_on_behalf(
+        "reply", "Say something useful about the terminal"
+    )
+    assert not is_action_the_avatar_takes_on_behalf("explain", "Explain the close dialog")
+    assert not is_action_the_avatar_takes_on_behalf(
+        "cancel", "Cancel the terminal close prompt"
+    )
+    assert not is_action_the_avatar_takes_on_behalf("none", "")
+
+    conversational = normalize_classification(
+        SimpleNamespace(
+            decision="notify",
+            proposed_action="reply",
+            action_description="Say something useful about the terminal dialog",
+        )
+    )
+    assert (conversational.proposed_action, conversational.action_description) == (
+        "none",
+        "",
+    )
+    local_dialog = normalize_classification(
+        SimpleNamespace(
+            decision="notify",
+            proposed_action="cancel",
+            action_description="Cancel the terminal close prompt",
+        )
+    )
+    assert local_dialog.proposed_action == "none"
+    email = normalize_classification(
+        SimpleNamespace(
+            decision="notify",
+            proposed_action="reply",
+            action_description="Reply to the invoice email",
+        )
+    )
+    assert email.proposed_action == "reply"
+    assert (
+        proposed_offer(
+            {
+                "decision": "notify",
+                "proposed_action": "explain",
+                "action_description": "Explain the dialog",
+            }
+        )
+        is None
+    )
 
 
 def test_an_allowed_action_is_a_hidden_turn_that_skips_triage():

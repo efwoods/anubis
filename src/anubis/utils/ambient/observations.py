@@ -35,13 +35,62 @@ DECISION_NOTIFY = "notify"
 AMBIENT_DECISIONS = (DECISION_IGNORE, DECISION_RESPOND, DECISION_NOTIFY)
 
 # What the avatar offers to do about a ``notify`` observation once the
-# conversation partner allows it: one verb the avatar will perform (``draft``,
-# ``reply``, ``remind``, ``research``, ``summarize``, ``schedule`` ...). The
-# card puts the verb on the button and the wording beside it. ``none`` is a
-# plain heads-up.
+# conversation partner allows it: one verb the avatar will perform on the
+# conversation partner's behalf (``draft``, ``remind``, ``research``,
+# ``summarize``, ``schedule``, or ``reply`` to a waiting message). The card
+# puts the verb on the button and the wording beside it. ``none`` is a plain
+# heads-up. Talking about what was seen is not an offer: the heads-up already
+# did that.
 PROPOSED_ACTION_NONE = "none"
 PROPOSED_ACTION_MAX_LETTERS = 20
 _PROPOSED_ACTION_LETTERS = re.compile(r"[^a-z]")
+
+# Verbs that mean the avatar would only talk. A heads-up already said what
+# was noticed, so these must not become action buttons.
+_CONVERSATIONAL_PROPOSED_ACTIONS = frozenset(
+    {
+        "advise",
+        "comment",
+        "explain",
+        "mention",
+        "note",
+        "observe",
+        "remark",
+        "say",
+        "tell",
+        "warn",
+    }
+)
+
+# Verbs that mean clicking or typing on the conversation partner's own
+# machine. The avatar cannot press Cancel on a local dialog.
+_LOCAL_MACHINE_PROPOSED_ACTIONS = frozenset(
+    {
+        "cancel",
+        "click",
+        "close",
+        "dismiss",
+        "press",
+        "tap",
+        "type",
+    }
+)
+
+# A proposed ``reply`` is only on-behalf when the wording names a waiting
+# channel the avatar can actually answer.
+_REPLY_CHANNEL_MARKERS = (
+    "call",
+    "discord",
+    "dm",
+    "email",
+    "inbox",
+    "mail",
+    "message",
+    "slack",
+    "sms",
+    "thread",
+    "tweet",
+)
 
 # The hidden turn that carries an allowed action back to the avatar. The
 # decision recorded on the avatar's reply is ``act`` so the browser can tell a
@@ -239,6 +288,7 @@ def build_ambient_additional_kwargs(
     hidden: bool = True,
     camera_facing: str | None = None,
     narrate: bool = False,
+    narration_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Build the ``additional_kwargs`` of an ambient ``HumanMessage`` before triage.
 
@@ -263,6 +313,9 @@ def build_ambient_additional_kwargs(
             # to classify — the request was made once, for every observation —
             # so this bypasses triage entirely rather than arguing with it.
             "narrate": bool(narrate),
+            # How often the conversation partner is being told, which decides
+            # how LONG this reading may be as well as when the next arrives.
+            "narration_seconds": narration_seconds,
         },
     }
     if image_filenames:
@@ -315,6 +368,28 @@ def normalize_proposed_action(value: Any) -> str:
     return action or PROPOSED_ACTION_NONE
 
 
+def is_action_the_avatar_takes_on_behalf(action: Any, description: Any = "") -> bool:
+    """Whether this offer is something the avatar can do for the conversation partner.
+
+    A plain heads-up has no offer. Talking about what was seen is not an
+    action: the heads-up already did that. Clicking a dialog on the
+    conversation partner's machine is not an action the avatar can take.
+    ``reply`` counts only when the wording names a waiting message, email,
+    or call the avatar could answer.
+    """
+    verb = normalize_proposed_action(action)
+    if verb == PROPOSED_ACTION_NONE:
+        return False
+    if verb in _CONVERSATIONAL_PROPOSED_ACTIONS:
+        return False
+    if verb in _LOCAL_MACHINE_PROPOSED_ACTIONS:
+        return False
+    if verb == "reply":
+        wording = str(description or "").lower()
+        return any(marker in wording for marker in _REPLY_CHANNEL_MARKERS)
+    return True
+
+
 def proposed_offer(ambient: dict[str, Any]) -> tuple[str, str] | None:
     """Return the ``(action, description)`` a notify observation offers, or ``None``."""
     if not ambient or ambient.get("decision") != DECISION_NOTIFY:
@@ -322,6 +397,8 @@ def proposed_offer(ambient: dict[str, Any]) -> tuple[str, str] | None:
     action = normalize_proposed_action(ambient.get("proposed_action"))
     description = str(ambient.get("action_description") or "").strip()
     if action == PROPOSED_ACTION_NONE or not description:
+        return None
+    if not is_action_the_avatar_takes_on_behalf(action, description):
         return None
     return action, description
 

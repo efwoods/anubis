@@ -25,6 +25,59 @@ logger = logging.getLogger(__name__)
 
 CLASSIFICATION_INPUT_CHAR_LIMIT = 5000
 
+REFERENCE_MEDIA_CLASSIFICATION_REASONING = (
+    "Uploaded as reference media: consulted as knowledge, "
+    "not used to reconstruct identity."
+)
+
+
+def reference_media_classification_metadata() -> dict:
+    """Metadata stamped on every Document produced from an explicit
+    ``reference_media`` upload (a menu or other consultable material)."""
+    return {
+        "classified_situation": "proprietary_content",
+        "is_menu_or_religious_text": True,
+        "is_reference_media": True,
+        "reference_media": True,
+        "classification_reasoning": REFERENCE_MEDIA_CLASSIFICATION_REASONING,
+    }
+
+
+async def store_explicit_reference_media_documents(
+    *,
+    media_item: Dict[str, Any],
+    user_id: str,
+    assistant_id: str,
+    namespace_filename: str,
+) -> List[Document]:
+    """Chunk text into the ``document`` namespace without identity analysis.
+
+    Used when the caller marked the upload ``reference_media``: a restaurant
+    menu, a price list, or other consultable material. The chunks are
+    vectorstore-acceptable so the avatar can retrieve them, and they are
+    never adapter-acceptable or analysis-acceptable.
+    """
+    documents = await process_text_media_item_target_for_vectorstore(
+        media_item=media_item,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        classification_metadata=reference_media_classification_metadata(),
+        use_semantic_chunks=False,
+        namespace="document",
+    )
+    for document in documents:
+        document.metadata.update(
+            {
+                "vectorstore_acceptable": True,
+                "adapter_acceptable": False,
+                "analysis_acceptable": False,
+                "namespace_filename": namespace_filename,
+                "reference_media": True,
+                "is_reference_media": True,
+            }
+        )
+    return documents
+
 
 def _coerce_classification_input_to_string(content: Any) -> str:
     """Normalize any text/json content to a string for classifier input."""
@@ -1079,6 +1132,17 @@ async def process_text_to_document(
     if not text_content.strip():
         logger.warning("Empty text content in media_item; returning no documents")
         return []
+
+    if bool((media_item.get("metadata") or {}).get("reference_media")):
+        logger.info(
+            "Explicit reference media -> document namespace (no identity analysis)"
+        )
+        return await store_explicit_reference_media_documents(
+            media_item=media_item,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            namespace_filename=namespace_filename,
+        )
 
     # Structured web page. When the source retained raw HTML and the page parses
     # as a single-subject page (a character wiki, a personal homepage), extract

@@ -12,6 +12,7 @@ observation is persisted as context and no model reply is produced.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, RemoveMessage
@@ -65,6 +66,36 @@ NARRATION_REASON = (
 )
 
 
+#: A label the describer or the image resolver put at the front of a section —
+#: ``[Image: webcam.jpg]``, ``webcam:``, ``screen:``. Written for a reader of
+#: the thread, and nonsense to somebody listening: a person waiting to be told
+#: what is in front of them does not want to hear "image webcam dot jpg".
+_SECTION_LABEL = re.compile(
+    r"^\s*(?:\[[^\]]*\]\s*)?(?:(?:webcam|screen|camera|image|microphone)\s*:\s*)?",
+    re.IGNORECASE,
+)
+
+
+def spoken_text_of(body: str) -> str:
+    """Reduce an observation body to the words that should be read out.
+
+    The stored body is written for the thread: each section is labelled by
+    where it came from, and the image resolver may have prefixed a filename.
+    Narration speaks this text verbatim, so every one of those labels would be
+    read aloud — and a reading that opens with "image webcam dot jpg, webcam"
+    spends the listener's first second on nothing at all.
+
+    :param body: The observation body as stored.
+    :returns: The words to say, sections joined into running prose.
+    """
+    sections: list[str] = []
+    for line in (body or "").splitlines():
+        spoken = _SECTION_LABEL.sub("", line).strip()
+        if spoken:
+            sections.append(spoken)
+    return " ".join(sections).strip()
+
+
 def _narration_decision(body: str) -> dict[str, Any]:
     """Record the decision for an observation captured under scene narration.
 
@@ -80,7 +111,7 @@ def _narration_decision(body: str) -> dict[str, Any]:
     oversight: those exist to keep the avatar from speaking with nothing to
     say, and a standing request is the opposite situation.
     """
-    spoken = " ".join((body or "").split())
+    spoken = " ".join(spoken_text_of(body).split())
     return {
         "decision": DECISION_RESPOND,
         # The words the browser will read out, in full. Not truncated the way

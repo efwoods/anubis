@@ -1147,11 +1147,13 @@ async def transcribe_audio(
     a clip whose peak volume is below ``voice_silence_max_volume_db`` is
     answered with an empty transcript without calling the model, and a
     transcript that is only a memorised caption (``MBC 뉴스 이덕영입니다``,
-    ``Thank you for watching``) is dropped. Uploaded media leaves the flag off.
+    ``Thank you for watching``) or that only repeats the transcription prompt
+    is dropped. Uploaded media leaves the flag off.
     """
     from src.anubis.utils.voice.transcript_hygiene import (
         clip_is_silent,
         drop_hallucinated_text,
+        drop_prompt_echo,
     )
 
     # Remove noise and isolate the vocals; if reference audio, truncate to 9 seconds:
@@ -1204,6 +1206,12 @@ async def transcribe_audio(
         if live_voice:
             result["text"] = drop_hallucinated_text(
                 str(result.get("text") or ""), description="live-voice transcript"
+            )
+            # whisper-1 continues its prompt when the clip holds no clear
+            # speech, so a transcript made only of the prompt's own words is
+            # the prompt coming back, not the person talking.
+            result["text"] = drop_prompt_echo(
+                result["text"], prompt, description="live-voice transcript"
             )
         result["audio_base64_preprocessed"] = audio_base64
         return result

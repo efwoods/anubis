@@ -70,7 +70,9 @@ def test_validate_coordinates_and_radius():
             validate_coordinates(*rejected)
     assert validate_geofence_radius(None) == 50
     assert validate_geofence_radius("120") == 120
-    for rejected in (0, 1, 999999, "wide"):
+    assert validate_geofence_radius(1) == 1
+    assert validate_geofence_radius("1") == 1
+    for rejected in (0, 0.4, 999999, "wide"):
         with pytest.raises(GeoLocationError):
             validate_geofence_radius(rejected)
 

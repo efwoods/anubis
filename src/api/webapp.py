@@ -2429,7 +2429,7 @@ def _build_geo_location_or_400(
     latitude: Optional[float],
     longitude: Optional[float],
     location_name: Optional[str],
-    geofence_radius_meters: Optional[int],
+    geofence_radius_meters: Optional[float],
 ) -> Optional[dict[str, Any]]:
     """Build the validated pin for a create or modify request, or None when unpinned.
 
@@ -6789,7 +6789,7 @@ async def create_avatar(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     location_name: Optional[str] = None,
-    geofence_radius_meters: Optional[int] = None,
+    geofence_radius_meters: Optional[float] = None,
     research_hint: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
 ):
@@ -7117,7 +7117,7 @@ async def modify_avatar(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     location_name: Optional[str] = None,
-    geofence_radius_meters: Optional[int] = None,
+    geofence_radius_meters: Optional[float] = None,
     clear_geo_location: bool = False,
 ):
     # Avatar name changes also need to be applied to the db for consistent identities

@@ -90,6 +90,34 @@ class PreferenceAlignment(BaseModel):
     reason: str = Field(description="One sentence explaining the score.")
 
 
+class OwnerEditLesson(BaseModel):
+    """What the owner's rewrite of a drafted reply teaches about the owner's writing."""
+
+    edit_summary: str = Field(
+        description=(
+            "One sentence naming what the owner changed, written so the same change can be "
+            "recognized next time: 'the owner removed the sign-off', 'the owner shortened "
+            "the reply to two sentences', 'the owner answered the question directly instead "
+            "of thanking the sender first'."
+        )
+    )
+    writing_lesson: str = Field(
+        description=(
+            "One reusable instruction, phrased as a standing preference about how the owner "
+            "writes, that would make the next draft closer to what the owner sent: 'Write "
+            "replies without a closing sign-off', 'Keep replies under three sentences'. "
+            "Empty when the rewrite teaches nothing reusable, such as correcting a single "
+            "fact that applies only to this message."
+        )
+    )
+    changed_substantially: bool = Field(
+        description=(
+            "True when the owner rewrote the substance or the voice of the reply, rather "
+            "than fixing a typo or adjusting a word or two."
+        )
+    )
+
+
 def _describe_preferences(preferences: list[dict[str, Any]]) -> str:
     if not preferences:
         return "The owner has recorded no decisions for this sender or this kind of message."
@@ -146,6 +174,17 @@ The assistant judges whether a drafted reply matches how the owner of a personal
 - Score 0.9 or above only when the precedent clearly supports an automatic reply of this kind and the draft does what the owner's edits asked for.
 - Score 0.5 when there is no relevant precedent.
 - Score below 0.3 when the precedent says the owner handles this sender or kind personally.
+</RULES>
+"""
+
+OWNER_EDIT_SYSTEM_PROMPT = """<TASK>
+The assistant compares a reply drafted for the owner of a personal avatar with the version the owner actually sent after editing the draft. Name what the owner changed, and state the one standing preference about the owner's writing that would have produced the owner's version in the first place.
+</TASK>
+<RULES>
+- Describe what the owner changed, not what the message was about.
+- The writing lesson must be reusable on an unrelated message to an unrelated person. A correction that applies only to this one message — a date, a name, a single fact — teaches nothing reusable, so leave the writing lesson empty in that case.
+- Report a substantial change only when the owner rewrote the substance or the voice of the reply. Fixing a typo, a word, or punctuation is not substantial.
+- Write both fields in plain sentences about the owner. Do not address the owner, and do not mention drafts, avatars, or assistants.
 </RULES>
 """
 
@@ -252,8 +291,151 @@ async def judge_alignment(
     )
 
 
+async def summarize_owner_edit(
+    context: Any, *, draft_body: str, final_body: str, message: dict[str, Any]
+) -> OwnerEditLesson:
+    """Read one owner rewrite for the lesson that generalizes past this message."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from src.anubis.utils.model import init_model
+
+    model = init_model(model_without_tools=False, response_format=OwnerEditLesson)
+    human = (
+        "<INCOMING_MESSAGE>\n"
+        + _describe_message(message)
+        + "\n</INCOMING_MESSAGE>\n\n"
+        "<DRAFTED_FOR_THE_OWNER>\n"
+        + str(draft_body or "")[:6000]
+        + "\n</DRAFTED_FOR_THE_OWNER>\n\n"
+        "<WHAT_THE_OWNER_SENT>\n"
+        + str(final_body or "")[:6000]
+        + "\n</WHAT_THE_OWNER_SENT>"
+    )
+    response = await model.ainvoke(
+        input=[
+            SystemMessage(content=OWNER_EDIT_SYSTEM_PROMPT),
+            HumanMessage(content=human),
+        ]
+    )
+    return OwnerEditLesson(
+        edit_summary=str(getattr(response, "edit_summary", "") or "").strip(),
+        writing_lesson=str(getattr(response, "writing_lesson", "") or "").strip(),
+        changed_substantially=bool(getattr(response, "changed_substantially", False)),
+    )
+
+
+CALENDAR_EVENT_SYSTEM_PROMPT = """<TASK>
+The assistant reads one incoming message and states the appointment the message asks the recipient to attend, so the appointment can be booked on the recipient's calendar.
+</TASK>
+<RULES>
+- Take the day and the time from the message. Write both as ISO 8601: '2026-09-14T15:00:00' for an appointment at a stated time, and '2026-09-14' for a whole day.
+- Resolve a relative day such as 'Thursday' or 'tomorrow' against the date the message was sent, which is given as the message date.
+- Leave the start empty when the message names no day at all. Never invent a day or a time that the message does not state.
+- Leave the end empty when the message states no finish time.
+- The summary is the appointment as the recipient would want to read the appointment on a calendar, naming the other person: 'Call with Dana Rios', 'Dentist'.
+</RULES>
+"""
+
+
+class CalendarEventRequest(BaseModel):
+    """The appointment an incoming message asks the owner to attend."""
+
+    summary: str = Field(
+        description="The appointment's title, as the owner would read the title on a calendar."
+    )
+    start: str = Field(
+        description=(
+            "ISO 8601 start: '2026-09-14T15:00:00' for a stated time, '2026-09-14' for a "
+            "whole day. Empty when the message names no day."
+        )
+    )
+    end: str = Field(
+        description="ISO 8601 finish, or empty when the message states no finish time."
+    )
+    description: str = Field(
+        description="One or two sentences of context from the message, or empty."
+    )
+    location: str = Field(
+        description="Where the appointment happens, including a meeting link, or empty."
+    )
+
+
+async def extract_calendar_event(
+    context: Any, *, message: dict[str, Any]
+) -> CalendarEventRequest:
+    """Read the appointment out of one message so the owner does not retype the appointment."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from src.anubis.utils.model import init_model
+
+    model = init_model(model_without_tools=False, response_format=CalendarEventRequest)
+    response = await model.ainvoke(
+        input=[
+            SystemMessage(content=CALENDAR_EVENT_SYSTEM_PROMPT),
+            HumanMessage(
+                content="<INCOMING_MESSAGE>\n"
+                + _describe_message(message)
+                + "\n</INCOMING_MESSAGE>"
+            ),
+        ]
+    )
+    return CalendarEventRequest(
+        summary=str(getattr(response, "summary", "") or "").strip(),
+        start=str(getattr(response, "start", "") or "").strip(),
+        end=str(getattr(response, "end", "") or "").strip(),
+        description=str(getattr(response, "description", "") or "").strip(),
+        location=str(getattr(response, "location", "") or "").strip(),
+    )
+
+
+SPECIFICITY_WEIGHT_SENDER = 1.0
+SPECIFICITY_WEIGHT_DOMAIN = 0.5
+SPECIFICITY_WEIGHT_MESSAGE_KIND = 0.25
+
+
+def preference_specificity_weight(
+    preference: dict[str, Any],
+    *,
+    sender: str | None = None,
+    sender_domain: str | None = None,
+) -> float:
+    """Weight one recorded decision by how closely the decision speaks to this message.
+
+    A decision the owner made about this exact correspondent is the strongest
+    evidence; one made about everyone in the same domain or the same chat room
+    is weaker; one that matched only on the kind of message is weakest — both
+    the coarse row that lets "the owner always ignores recruiter mail" reach a
+    recruiter who has never written before, and a row about a different person
+    entirely, which ``recall_preferences`` also returns for a matching kind.
+
+    Without this weighting, a decision about somebody else would count for as
+    much as the owner's explicit history with the person now writing.
+    """
+    recorded_sender = str(preference.get("sender") or "").strip().lower()
+    recorded_domain = str(preference.get("sender_domain") or "").strip().lower()
+    this_sender = str(sender or "").strip().lower()
+    this_domain = str(sender_domain or "").strip().lower()
+    if this_sender or this_domain:
+        if recorded_sender and recorded_sender == this_sender:
+            return SPECIFICITY_WEIGHT_SENDER
+        if recorded_domain and recorded_domain == this_domain:
+            return SPECIFICITY_WEIGHT_DOMAIN
+        return SPECIFICITY_WEIGHT_MESSAGE_KIND
+    # Without a sender to compare against, the row's own shape is all there is
+    # to go on.
+    if recorded_sender:
+        return SPECIFICITY_WEIGHT_SENDER
+    if recorded_domain:
+        return SPECIFICITY_WEIGHT_DOMAIN
+    return SPECIFICITY_WEIGHT_MESSAGE_KIND
+
+
 def preference_prior(
-    preferences: list[dict[str, Any]], *, auto_send_threshold: float
+    preferences: list[dict[str, Any]],
+    *,
+    auto_send_threshold: float,
+    sender: str | None = None,
+    sender_domain: str | None = None,
 ) -> tuple[float, str]:
     """Compute the count-based half of the confidence score.
 
@@ -261,15 +443,22 @@ def preference_prior(
     1.0; edits, ignores, and notifies pull it down. With no history at all the
     prior is capped just below the auto-send threshold, so a sender the owner
     has never ruled on always reaches the owner.
+
+    Each recorded decision counts in proportion to how closely the decision
+    speaks to this message (``preference_specificity_weight``), so a decision
+    about this exact correspondent outweighs one about the whole domain or
+    room, which in turn outweighs one that matched only on the kind of message.
     """
     if not preferences:
         return min(
             0.6, auto_send_threshold - 0.05
         ), "no owner decisions yet for this sender or kind"
-    supportive = 0
-    opposing = 0
+    supportive = 0.0
+    opposing = 0.0
     for preference in preferences:
-        count = int(preference.get("count") or 1)
+        count = int(preference.get("count") or 1) * preference_specificity_weight(
+            preference, sender=sender, sender_domain=sender_domain
+        )
         decision = str(preference.get("decision") or "")
         if decision in ("accept", "auto_sent", DECISION_RESPOND):
             supportive += count

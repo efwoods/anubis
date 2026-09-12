@@ -132,7 +132,9 @@ async def test_a_single_source_claim_is_unverified_without_a_model_call(monkeypa
 
     monkeypatch.setattr(deep_research, "invoke_structured", _fail)
 
-    verified = await verify_cluster([_web_fact("I sculpted the memorial.", "https://a")])
+    verified = await verify_cluster(
+        [_web_fact("I sculpted the memorial.", "https://a")]
+    )
 
     assert verified["status"] == "unverified"
     assert verified["supporting_source_urls"] == ["https://a"]
@@ -350,32 +352,226 @@ async def test_research_applies_agreed_facts_and_holds_the_contradiction(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_researcher_stops_searching_once_the_topic_is_answered(monkeypatch):
-    """Reflection ends the loop, so an answered topic costs one search round."""
-    rounds = []
+async def _install_stonemason_research(monkeypatch, store):
+    """Stub one whole research run: two sources, one agreed fact, one contradiction.
+
+    The same scenario as the end-to-end test above, packaged so a second test can
+    run it under a different configuration and compare the two outcomes.
+    """
+    await store.aput(
+        identity_namespace(CREATOR_ID, ASSISTANT_ID),
+        key="fact-held",
+        value={
+            "document": {
+                "kwargs": {
+                    "page_content": wrap_fact_with_context("I was born in 1978.", ""),
+                    "metadata": {"fact": "I was born in 1978."},
+                }
+            }
+        },
+    )
 
     async def _search(query, *, limit, context=None):
-        rounds.append(query)
-        return [SearchResult(url=f"https://{len(rounds)}", title="t", content="c")]
+        return [
+            SearchResult(
+                url="https://a",
+                title="A",
+                content="page a",
+                provider="test",
+                queries=[query],
+            ),
+            SearchResult(
+                url="https://b",
+                title="B",
+                content="page b",
+                provider="test",
+                queries=[query],
+            ),
+        ]
 
-    monkeypatch.setattr(deep_research, "search_web", _search)
-
-    async def _queries(subject, topic, queries_already_run, *, max_queries):
-        return ["first query"]
-
-    monkeypatch.setattr(deep_research, "write_topic_queries", _queries)
-
-    async def _reflect(subject, topic, sources, queries_already_run):
-        return deep_research.ResearchReflection(
-            topic_is_answered=True, follow_up_queries=[]
+    async def _brief(subject, existing_facts, *, max_topics):
+        return ResearchBrief(
+            subject_summary="A stonemason.",
+            open_questions=["When was the subject born?"],
+            topics=[ResearchTopic(topic="history", assignment="Find the dates.")],
         )
 
-    monkeypatch.setattr(deep_research, "reflect_on_topic", _reflect)
+    async def _queries(subject, topic, queries_already_run, *, max_queries):
+        return ["stonemason dates"]
+
+    facts_by_source = {
+        "https://a": [
+            _web_fact("I carved the courthouse frieze.", "https://a"),
+            _web_fact("I was born in 1979.", "https://a"),
+        ],
+        "https://b": [_web_fact("I carved the courthouse frieze.", "https://b")],
+    }
+
+    async def _extract(sources, *, subject, concurrency, topic=""):
+        return [fact for source in sources for fact in facts_by_source[source.url]]
+
+    async def _score(query, texts):
+        head = " ".join(query.split()[:4])
+        return [1.0 if text.startswith(head) else 0.0 for text in texts]
+
+    async def _verify(response_format, system_prompt, human_text):
+        if response_format is deep_research.ResearchReflection:
+            return deep_research.ResearchReflection(
+                topic_is_answered=True, follow_up_queries=[]
+            )
+        if "1979" in human_text:
+            return deep_research.FactVerification(
+                status="inconsistent",
+                proposed_fact="I was born in 1979.",
+                conflicting_statements=["I was born in 1978."],
+                reasoning="The dates differ.",
+            )
+        return deep_research.FactVerification(
+            status="consistent",
+            proposed_fact="I carved the courthouse frieze.",
+            reasoning="Both sources agree.",
+        )
+
+    monkeypatch.setattr(deep_research, "search_web", _search)
+    monkeypatch.setattr(deep_research, "build_research_brief", _brief)
+    monkeypatch.setattr(deep_research, "write_topic_queries", _queries)
+    monkeypatch.setattr(deep_research, "extract_facts", _extract)
+    monkeypatch.setattr(deep_research, "score_similarity", _score)
+    monkeypatch.setattr(deep_research, "invoke_structured", _verify)
+
+
+@pytest.mark.asyncio
+async def test_facts_are_still_applied_while_the_asset_acquisition_runs(monkeypatch):
+    """Attaching the portrait/voice acquisition changes nothing about the facts.
+
+    Acquisition runs as a task alongside verification, so a failure or a hang in
+    it must not cost the research its facts — that is the half the avatar's
+    identity is actually built from. The same scenario as the end-to-end test
+    above is run twice, once with a gateway attached and once without, and the
+    facts applied and the contradictions queued must be identical.
+    """
+
+    async def _run(with_gateway):
+        store = InMemoryStore()
+        await _install_stonemason_research(monkeypatch, store)
+        bootstrap_ran = []
+
+        async def _acquire(*args, **kwargs):
+            bootstrap_ran.append(True)
+            # Acquisition failing is the case that must not touch the facts.
+            raise RuntimeError("no portrait could be downloaded")
+
+        monkeypatch.setattr(
+            "src.anubis.utils.research.asset_bootstrap.run_asset_bootstrap", _acquire
+        )
+        summary = await run_deep_research(
+            store,
+            _context(),
+            creator_id=CREATOR_ID,
+            assistant_id=ASSISTANT_ID,
+            subject_name="A stonemason",
+            subject_description=None,
+            research_hint=None,
+            emit=lambda event: None,
+            is_cancelled=lambda: False,
+            bootstrap=object() if with_gateway else None,
+        )
+        learned = await store.asearch(identity_namespace(CREATOR_ID, ASSISTANT_ID))
+        facts = sorted(
+            (item.value["document"]["kwargs"]["metadata"] or {}).get("fact")
+            for item in learned
+        )
+        return summary, facts, bool(bootstrap_ran)
+
+    with_gateway, facts_with, ran = await _run(True)
+    without_gateway, facts_without, did_not_run = await _run(False)
+
+    assert ran is True and did_not_run is False
+    # The store also holds the fact seeded before the run, so compare the two
+    # runs against each other rather than against a bare list.
+    assert facts_with == facts_without
+    assert "I carved the courthouse frieze." in facts_with
+    # The contradicted date is still held back for review in both runs.
+    assert "I was born in 1979." not in facts_with
+    assert with_gateway["applied"] == without_gateway["applied"] == 1
+    assert with_gateway["proposals"] == without_gateway["proposals"] == 1
+    # The acquisition blew up; the run still reports its facts and says so.
+    assert "error" in with_gateway["bootstrap"]
+
+
+class _ScriptedModel:
+    """A chat model that replays a fixed list of turns, recording what it saw.
+
+    Each entry is either a list of tool calls to emit or a plain string, which
+    ends the loop the way a reply with no tool call does.
+    """
+
+    def __init__(self, turns):
+        self._turns = list(turns)
+        self.calls = 0
+        self.seen_messages = []
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    async def ainvoke(self, messages):
+        from langchain_core.messages import AIMessage
+
+        self.seen_messages = list(messages)
+        self.calls += 1
+        turn = self._turns.pop(0) if self._turns else "Finished."
+        if isinstance(turn, str):
+            return AIMessage(content=turn)
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {"name": name, "args": args, "id": f"call-{index}"}
+                for index, (name, args) in enumerate(turn)
+            ],
+        )
+
+
+def _install_agent_model(monkeypatch, turns):
+    """Point the researcher's model at a scripted transcript; return the model."""
+    model = _ScriptedModel(turns)
+
+    def _init_model(*args, **kwargs):
+        return model
+
+    monkeypatch.setattr("src.anubis.utils.model.init_model", _init_model)
+    return model
+
+
+@pytest.mark.asyncio
+async def test_the_researcher_searches_reflects_and_decides_to_stop(monkeypatch):
+    """The model, not the pipeline, ends the research on a topic.
+
+    This is the whole point of the tool-calling loop: a reply with no tool call
+    is the model saying the assignment is answered, and the loop stops there
+    rather than running a further round it did not ask for.
+    """
+    searched = []
+
+    async def _search(query, *, limit, context=None):
+        searched.append(query)
+        return [SearchResult(url=f"https://{len(searched)}", title="t", content="c")]
+
+    monkeypatch.setattr(deep_research, "search_web", _search)
 
     async def _extract(sources, *, subject, concurrency, topic=""):
         return []
 
     monkeypatch.setattr(deep_research, "extract_facts", _extract)
+    monkeypatch.setattr(deep_research, "compress_topic_research", _no_compression)
+
+    model = _install_agent_model(
+        monkeypatch,
+        [
+            [("search_the_web", {"query": "stonemason dates"})],
+            [("record_reflection", {"reflection": "Dates found; nothing missing."})],
+            "The assignment is answered.",
+        ],
+    )
 
     result = await deep_research.research_one_topic(
         "Name: A stonemason",
@@ -389,39 +585,85 @@ async def test_a_researcher_stops_searching_once_the_topic_is_answered(monkeypat
         is_cancelled=lambda: False,
     )
 
-    assert rounds == ["first query"]
-    assert result["queries"] == ["first query"]
+    assert searched == ["stonemason dates"]
+    assert result["queries"] == ["stonemason dates"]
+    # Three turns: the search, the reflection, and the closing reply.
+    assert model.calls == 3
 
 
 @pytest.mark.asyncio
-async def test_a_thin_topic_runs_the_follow_up_queries(monkeypatch):
-    """An unanswered topic searches the gaps the reflection named, once."""
-    queries_run = []
+async def test_the_researcher_searches_again_on_the_gap_it_named(monkeypatch):
+    """An unanswered topic searches again, and the second query is the model's."""
+    searched = []
 
     async def _search(query, *, limit, context=None):
-        queries_run.append(query)
-        return [SearchResult(url=f"https://{len(queries_run)}", title="t", content="c")]
+        searched.append(query)
+        return [SearchResult(url=f"https://{len(searched)}", title="t", content="c")]
 
     monkeypatch.setattr(deep_research, "search_web", _search)
-
-    async def _queries(subject, topic, queries_already_run, *, max_queries):
-        return ["first query"]
-
-    monkeypatch.setattr(deep_research, "write_topic_queries", _queries)
-
-    async def _reflect(subject, topic, sources, queries_already_run):
-        return deep_research.ResearchReflection(
-            topic_is_answered=False,
-            follow_up_queries=["first query", "second query"],
-            gap_summary="No dates yet.",
-        )
-
-    monkeypatch.setattr(deep_research, "reflect_on_topic", _reflect)
 
     async def _extract(sources, *, subject, concurrency, topic=""):
         return []
 
     monkeypatch.setattr(deep_research, "extract_facts", _extract)
+    monkeypatch.setattr(deep_research, "compress_topic_research", _no_compression)
+
+    _install_agent_model(
+        monkeypatch,
+        [
+            [("search_the_web", {"query": "first query"})],
+            [("record_reflection", {"reflection": "No dates yet; try the archive."})],
+            [("search_the_web", {"query": "second query"})],
+            "Done.",
+        ],
+    )
+
+    result = await deep_research.research_one_topic(
+        "Name: A stonemason",
+        ResearchTopic(topic="history", assignment="Find the dates."),
+        context=_context(),
+        max_queries=2,
+        max_sources=4,
+        concurrency=2,
+        follow_up_rounds=1,
+        emit=lambda payload: None,
+        is_cancelled=lambda: False,
+    )
+
+    assert searched == ["first query", "second query"]
+    assert result["queries"] == ["first query", "second query"]
+
+
+@pytest.mark.asyncio
+async def test_the_search_budget_is_enforced_in_code_not_only_in_the_prompt(
+    monkeypatch,
+):
+    """A model that ignores its stated budget still cannot keep searching.
+
+    The prompt states the budget so the model can plan against it; this is the
+    backstop, because one topic burning the whole run's search allowance is a
+    real cost, not a style problem.
+    """
+    searched = []
+
+    async def _search(query, *, limit, context=None):
+        searched.append(query)
+        return [SearchResult(url=f"https://{len(searched)}", title="t", content="c")]
+
+    monkeypatch.setattr(deep_research, "search_web", _search)
+
+    async def _extract(sources, *, subject, concurrency, topic=""):
+        return []
+
+    monkeypatch.setattr(deep_research, "extract_facts", _extract)
+    monkeypatch.setattr(deep_research, "compress_topic_research", _no_compression)
+
+    # Ten searches asked for, against a budget of max_queries + follow_up_rounds.
+    _install_agent_model(
+        monkeypatch,
+        [[("search_the_web", {"query": f"query {index}"})] for index in range(10)]
+        + ["Done."],
+    )
 
     await deep_research.research_one_topic(
         "Name: A stonemason",
@@ -435,8 +677,104 @@ async def test_a_thin_topic_runs_the_follow_up_queries(monkeypatch):
         is_cancelled=lambda: False,
     )
 
-    # The repeated query is dropped; only the new one is searched again.
-    assert queries_run == ["first query", "second query"]
+    assert len(searched) == 3
+
+
+@pytest.mark.asyncio
+async def test_the_compression_keeps_the_findings_and_drops_the_reflections(
+    monkeypatch,
+):
+    """Reflections are the researcher's reasoning, not information about the subject.
+
+    Letting them through would write the agent's own deliberation into the
+    findings a later step reads as though it were sourced fact.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    compressed_input = {}
+
+    class _CompressionModel:
+        async def ainvoke(self, messages):
+            compressed_input["human"] = messages[-1].content
+            return AIMessage(content="cleaned findings")
+
+    monkeypatch.setattr(
+        "src.anubis.utils.model.init_model", lambda *a, **k: _CompressionModel()
+    )
+
+    messages = [
+        AIMessage(content=""),
+        ToolMessage(
+            content="<source url='https://a'>the frieze was carved in 1903</source>",
+            name="search_the_web",
+            tool_call_id="1",
+        ),
+        ToolMessage(
+            content="Reflection recorded: I still need the birth date.",
+            name="record_reflection",
+            tool_call_id="2",
+        ),
+    ]
+    output = await deep_research.compress_topic_research(
+        "Name: A stonemason",
+        ResearchTopic(topic="history", assignment="Find the dates."),
+        messages,
+    )
+
+    assert output == "cleaned findings"
+    assert "the frieze was carved in 1903" in compressed_input["human"]
+    assert "I still need the birth date" not in compressed_input["human"]
+
+
+@pytest.mark.asyncio
+async def test_a_topic_is_never_dropped_when_the_agent_cannot_run(monkeypatch):
+    """A model failure falls back to pipeline-written queries rather than nothing.
+
+    Returning no sources for a topic would silently narrow the research without
+    anyone being told, so the fallback keeps the topic in the run.
+    """
+    searched = []
+
+    async def _search(query, *, limit, context=None):
+        searched.append(query)
+        return [SearchResult(url="https://a", title="t", content="c")]
+
+    monkeypatch.setattr(deep_research, "search_web", _search)
+
+    async def _queries(subject, topic, queries_already_run, *, max_queries):
+        return ["fallback query"]
+
+    monkeypatch.setattr(deep_research, "write_topic_queries", _queries)
+
+    async def _extract(sources, *, subject, concurrency, topic=""):
+        return []
+
+    monkeypatch.setattr(deep_research, "extract_facts", _extract)
+    monkeypatch.setattr(deep_research, "compress_topic_research", _no_compression)
+
+    def _broken_model(*args, **kwargs):
+        raise RuntimeError("no model configured")
+
+    monkeypatch.setattr("src.anubis.utils.model.init_model", _broken_model)
+
+    result = await deep_research.research_one_topic(
+        "Name: A stonemason",
+        ResearchTopic(topic="history", assignment="Find the dates."),
+        context=_context(),
+        max_queries=2,
+        max_sources=4,
+        concurrency=2,
+        follow_up_rounds=1,
+        emit=lambda payload: None,
+        is_cancelled=lambda: False,
+    )
+
+    assert searched == ["fallback query"]
+    assert [source.url for source in result["sources"]] == ["https://a"]
+
+
+async def _no_compression(subject, topic, messages):
+    return ""
 
 
 # ── resolving what the creator decided ──────────────────────────────────────

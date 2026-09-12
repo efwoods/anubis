@@ -12,7 +12,16 @@ LangChain Agent Inbox app — every one of them delivers the same
       respond → draft_with_avatar → score_confidence → confidence_gate
                   high → send_reply → record_outcome → END
                   low  → await_owner (interrupt: send_reply) → apply_owner_decision
-                         → update_preferences → send_reply → record_outcome → END
+                         → update_preferences → route_by_action → record_outcome → END
+
+``route_by_action`` carries out whichever action the owner chose, which need
+not be the action the avatar proposed: an owner who answers "do not reply, put
+this on my calendar" names ``create_calendar_event`` in the decision and the
+appointment is booked on the owner's connected calendar instead of a reply
+being sent. An owner who rewrites a draft also teaches the avatar's writing —
+the rewrite is recorded through ``src/anubis/utils/learning/feedback.py`` in
+the same shape a rating in chat takes, so the correction reaches every reply
+the avatar writes afterwards, not only the next message from this sender.
 
 Interrupt payloads use the Agent Inbox ``HumanInterrupt`` schema exactly
 (``action_request``, ``config``, ``description``) and resume values are
@@ -36,8 +45,12 @@ from langgraph.types import interrupt
 
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.inbox.repository import (
+    ACTION_CREATE_CALENDAR_EVENT,
+    ACTION_NOTIFY_OWNER,
+    ACTION_SEND_REPLY,
     DECISION_IGNORE,
     DECISION_RESPOND,
+    MAILBOX_AVAILABLE_ACTIONS,
     STATE_AUTO_SENT,
     STATE_FAILED,
     STATE_IGNORED,
@@ -50,8 +63,10 @@ from src.anubis.utils.inbox.repository import (
 
 logger = logging.getLogger(__name__)
 
-ACTION_NOTIFY_OWNER = "notify_owner"
-ACTION_SEND_REPLY = "send_reply"
+# The action names and the list the owner may pick between live in the
+# repository module, so the panel's item view and this graph can never drift
+# apart on what an action is called.
+INBOX_AVAILABLE_ACTIONS = MAILBOX_AVAILABLE_ACTIONS
 
 
 class InboxState(TypedDict, total=False):
@@ -66,6 +81,8 @@ class InboxState(TypedDict, total=False):
     preferences: list[dict[str, Any]]
     classification: dict[str, Any]
     draft: dict[str, Any] | None
+    draft_original: dict[str, Any] | None
+    chosen_action: str | None
     confidence: float
     confidence_detail: dict[str, Any]
     owner_decision: dict[str, Any] | None
@@ -222,7 +239,12 @@ async def score_confidence(
     alignment = await judge_alignment(
         runtime.context, message=state["message"], draft=draft, preferences=preferences
     )
-    prior, prior_reason = preference_prior(preferences, auto_send_threshold=threshold)
+    prior, prior_reason = preference_prior(
+        preferences,
+        auto_send_threshold=threshold,
+        sender=state["message"].get("sender"),
+        sender_domain=sender_domain_of(state["message"].get("sender")),
+    )
     confidence = combine_confidence(alignment.alignment_score, prior)
     detail = {
         "alignment_score": alignment.alignment_score,
@@ -263,6 +285,7 @@ def _human_interrupt(state: InboxState) -> dict[str, Any]:
                     "subject": draft.get("subject"),
                     "body": draft.get("body"),
                     "in_reply_to": message.get("rfc822_message_id"),
+                    "available_actions": list(INBOX_AVAILABLE_ACTIONS),
                 },
             },
             "config": {
@@ -285,12 +308,15 @@ def _human_interrupt(state: InboxState) -> dict[str, Any]:
                 "subject": message.get("subject"),
                 "summary": classification.get("reason"),
                 "needs_owner_action": classification.get("needs_owner_action"),
+                "available_actions": list(INBOX_AVAILABLE_ACTIONS),
             },
         },
         "config": {
+            # An edit on a notify item is how the owner names a different
+            # action ("put this on my calendar"), so edits are allowed here.
             "allow_ignore": True,
             "allow_respond": True,
-            "allow_edit": False,
+            "allow_edit": True,
             "allow_accept": True,
         },
         "description": (
@@ -319,13 +345,25 @@ async def await_owner(
 async def apply_owner_decision(
     state: InboxState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, Any]:
-    """Turn the ``HumanResponse`` into the draft to send (or not)."""
+    """Turn the ``HumanResponse`` into the draft to send (or not).
+
+    The owner may also name a different action than the one the avatar
+    proposed — "do not reply, put this on my calendar" — which arrives as
+    ``args.action`` and is carried in ``chosen_action`` for ``route_by_action``.
+    The draft as the avatar wrote it is kept in ``draft_original`` so the
+    owner's rewrite can be compared against it and learned from.
+    """
     decision = state.get("owner_decision") or {}
     decision_type = str(decision.get("type") or "ignore").lower()
     draft = dict(state.get("draft") or {})
+    draft_original = dict(state.get("draft") or {})
+    chosen_action = None
     if decision_type == "edit":
         args = decision.get("args") or {}
         if isinstance(args, dict):
+            named_action = str(args.get("action") or "").strip().lower()
+            if named_action in INBOX_AVAILABLE_ACTIONS:
+                chosen_action = named_action
             edited = args.get("args") if isinstance(args.get("args"), dict) else args
             draft["subject"] = edited.get("subject") or draft.get("subject")
             draft["body"] = edited.get("body") or draft.get("body")
@@ -346,13 +384,117 @@ async def apply_owner_decision(
         owner_decision={**decision, "type": decision_type},
         draft=draft.get("body"),
     )
-    return {"owner_decision": {**decision, "type": decision_type}, "draft": draft}
+    return {
+        "owner_decision": {**decision, "type": decision_type},
+        "draft": draft,
+        "draft_original": draft_original,
+        "chosen_action": chosen_action,
+    }
+
+
+async def _learn_from_owner_edit(
+    state: InboxState, runtime: Runtime[GlobalContext]
+) -> Any:
+    """Teach the avatar's writing from what the owner actually sent.
+
+    An owner who rewrites a draft is correcting the avatar's voice, which is
+    the same signal a thumbs-up or thumbs-down in chat carries. Writing it
+    through ``src/anubis/utils/learning/feedback.py`` means the nightly
+    aggregation (``aggregate_ratings`` in ``bulk_learning.py``) already folds
+    the correction into the avatar's prompt everywhere the avatar writes, not
+    only in the inbox. Returns the lesson, or ``None`` when nothing was
+    learned; a failure here must never cost the owner their decision.
+    """
+    from src.anubis.utils.inbox.triage import summarize_owner_edit
+    from src.anubis.utils.learning.feedback import (
+        store_message_rating,
+        store_user_preference,
+        store_what_feels_real,
+    )
+    from src.anubis.utils.learning.namespaces import RATING_NEGATIVE, RATING_POSITIVE
+
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return None
+    message = state["message"]
+    original_body = str((state.get("draft_original") or {}).get("body") or "").strip()
+    final_body = str((state.get("draft") or {}).get("body") or "").strip()
+    # An accept dressed as an edit teaches nothing: the owner changed nothing.
+    if not final_body or not original_body or final_body == original_body:
+        return None
+
+    item_id = str(state["item_id"])
+    user_id = str(state["user_id"])
+    assistant_id = str(state["assistant_id"])
+    incoming_text = str(message.get("body_text") or message.get("subject") or "")[:2000]
+    lesson = await summarize_owner_edit(
+        runtime.context,
+        draft_body=original_body,
+        final_body=final_body,
+        message=message,
+    )
+
+    # Two ratings, two distinct message identifiers: ``store_message_rating``
+    # deletes the opposite-polarity record for the SAME identifier, so sharing
+    # one identifier here would make each write erase the other.
+    await store_message_rating(
+        store,
+        user_id,
+        assistant_id,
+        rating=RATING_NEGATIVE,
+        thread_id=item_id,
+        message_id=f"inbox:{item_id}:draft",
+        avatar_message_text=original_body,
+        preceding_user_message_text=incoming_text,
+    )
+    await store_message_rating(
+        store,
+        user_id,
+        assistant_id,
+        rating=RATING_POSITIVE,
+        thread_id=item_id,
+        message_id=f"inbox:{item_id}:sent",
+        avatar_message_text=final_body,
+        preceding_user_message_text=incoming_text,
+    )
+    if lesson.writing_lesson:
+        await store_user_preference(
+            store,
+            user_id,
+            assistant_id,
+            preference=lesson.writing_lesson,
+            preference_context=f"Learned from the owner's rewrite of a reply to {message.get('sender') or 'an incoming message'}.",
+            category="communication_style",
+            source="rating_summary",
+        )
+    if lesson.changed_substantially:
+        await store_what_feels_real(
+            store,
+            user_id,
+            assistant_id,
+            statement=final_body,
+            statement_context=f"The owner sent this instead of the reply the avatar drafted to {message.get('sender') or 'an incoming message'}.",
+            polarity="feels_real",
+            source="inferred",
+            thread_id=item_id,
+            message_id=f"inbox:{item_id}:sent",
+        )
+    return lesson
 
 
 async def update_preferences(
     state: InboxState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, Any]:
-    """Every owner decision teaches the next triage of a similar message."""
+    """Every owner decision teaches the next triage of a similar message.
+
+    Two rows are written for every decision. The first is keyed to this
+    correspondent, the second to the message kind alone — with an empty sender
+    and an empty domain — so a decision the owner makes once reaches a sender
+    who has never written before. ``recall_preferences`` already returns the
+    coarse row at its lowest rank, and ``preference_specificity_weight``
+    already counts the coarse row as weaker evidence, so the generalisation can
+    never outvote the owner's explicit history with one person.
+    """
     decision = state.get("owner_decision") or {}
     classification = state.get("classification") or {}
     message = state["message"]
@@ -360,21 +502,46 @@ async def update_preferences(
     edit_summary = None
     if decision_type == "edit":
         edit_summary = "The owner edited the draft before sending."
-    await _repository().record_preference(
+        try:
+            lesson = await _learn_from_owner_edit(state, runtime)
+        except Exception:  # noqa: BLE001 - learning must never cost a decision
+            logger.exception("Learning from the owner's edit failed; the decision stands")
+        else:
+            if lesson is not None and lesson.edit_summary:
+                edit_summary = lesson.edit_summary
+
+    repository = _repository()
+    message_kind = classification.get("message_kind")
+    await repository.record_preference(
         user_id=state["user_id"],
         assistant_id=state["assistant_id"],
         sender=message.get("sender"),
         sender_domain=sender_domain_of(message.get("sender")),
-        message_kind=classification.get("message_kind"),
+        message_kind=message_kind,
         decision=decision_type,
         edit_summary=edit_summary,
         example_subject=message.get("subject"),
     )
+    if message_kind:
+        # The coarse row. Both key columns are written as empty strings, never
+        # as None: the unique key spans them and Postgres ``ON CONFLICT`` never
+        # matches a NULL, so a None here would duplicate rows on every decision
+        # instead of counting up.
+        await repository.record_preference(
+            user_id=state["user_id"],
+            assistant_id=state["assistant_id"],
+            sender="",
+            sender_domain="",
+            message_kind=message_kind,
+            decision=decision_type,
+            edit_summary=edit_summary,
+            example_subject=message.get("subject"),
+        )
     return {}
 
 
-def route_after_owner(state: InboxState) -> str:
-    """Send when the owner accepted or edited a reply; otherwise just record the outcome."""
+def default_action_for(state: InboxState) -> str:
+    """Return the action the avatar proposed; the owner may name another."""
     decision_type = str(
         (state.get("owner_decision") or {}).get("type") or "ignore"
     ).lower()
@@ -382,7 +549,32 @@ def route_after_owner(state: InboxState) -> str:
         "decision"
     ) == DECISION_RESPOND
     if is_reply_item and decision_type in ("accept", "edit"):
-        return "send_reply"
+        return ACTION_SEND_REPLY
+    return ACTION_NOTIFY_OWNER
+
+
+def route_by_action(state: InboxState) -> str:
+    """Carry out whichever action the owner chose.
+
+    Until now an owner edit could only ever re-send a reply: ``args.action``
+    was read off the ``HumanResponse`` and discarded. The owner can now answer
+    "do not reply, put this on my calendar" by naming a different action, and
+    an explicit ignore always stops here whatever action was named.
+    """
+    decision_type = str(
+        (state.get("owner_decision") or {}).get("type") or "ignore"
+    ).lower()
+    if decision_type == "ignore":
+        return "record_outcome"
+    action = str(state.get("chosen_action") or "").strip().lower() or default_action_for(
+        state
+    )
+    if action == ACTION_SEND_REPLY:
+        # An action the owner named on an item the avatar never drafted a
+        # reply for has nothing to send.
+        return "send_reply" if (state.get("draft") or {}).get("body") else "record_outcome"
+    if action == ACTION_CREATE_CALENDAR_EVENT:
+        return "create_calendar_event"
     return "record_outcome"
 
 
@@ -442,6 +634,72 @@ async def send_reply(
     return {"outcome": STATE_AUTO_SENT if automatic else STATE_SENT}
 
 
+async def create_calendar_event(
+    state: InboxState, config: RunnableConfig, runtime: Runtime[GlobalContext]
+) -> dict[str, Any]:
+    """Book the appointment the message asks for, instead of replying to the message.
+
+    The tool is the one the owner's connected Google Calendar already exposes
+    (``create_calendar_event`` in
+    ``src/anubis/utils/connected_accounts/vendor_api_tools.py``), so this node
+    only has to decide what to book. Details the owner typed into the decision
+    win; anything the owner left out is read from the message itself.
+    """
+    from src.anubis.utils.connected_accounts.store import read_connected_accounts
+    from src.anubis.utils.connected_accounts.tool_factories import (
+        build_tools_for_accounts,
+    )
+    from src.anubis.utils.inbox.triage import extract_calendar_event
+
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return {"outcome": STATE_FAILED, "error": "No store is available to read the owner's calendar accounts."}
+    accounts = await read_connected_accounts(store, str(state["user_id"]))
+    tools = await build_tools_for_accounts(runtime.context, accounts, store=store)
+    tool = next(
+        (
+            candidate
+            for candidate in tools
+            if getattr(candidate, "name", "") == ACTION_CREATE_CALENDAR_EVENT
+        ),
+        None,
+    )
+    if tool is None:
+        return {
+            "outcome": STATE_FAILED,
+            "error": "No calendar account is connected, so the appointment could not be booked.",
+        }
+
+    decision_args = (state.get("owner_decision") or {}).get("args") or {}
+    owner_fields = decision_args.get("args") if isinstance(decision_args, dict) else {}
+    owner_fields = owner_fields if isinstance(owner_fields, dict) else {}
+    appointment = await extract_calendar_event(
+        runtime.context, message=state["message"]
+    )
+    arguments = {
+        "summary": str(owner_fields.get("summary") or appointment.summary or state["message"].get("subject") or "Appointment"),
+        "start": str(owner_fields.get("start") or appointment.start or ""),
+        "end": str(owner_fields.get("end") or appointment.end or "") or None,
+        "description": str(owner_fields.get("description") or appointment.description or ""),
+        "location": str(owner_fields.get("location") or appointment.location or ""),
+    }
+    if not arguments["start"]:
+        return {
+            "outcome": STATE_FAILED,
+            "error": "The message does not say when the appointment is, so nothing was booked.",
+        }
+    result = await tool.ainvoke(arguments)
+    if isinstance(result, dict) and str(result.get("status") or "") not in ("created", "ok"):
+        return {
+            "outcome": STATE_FAILED,
+            "error": str(result.get("error") or "The calendar refused the appointment."),
+        }
+    logger.info(
+        "Inbox item %s booked an appointment instead of replying", state.get("item_id")
+    )
+    return {"outcome": STATE_RESOLVED}
+
+
 async def record_outcome(
     state: InboxState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ) -> dict[str, Any]:
@@ -485,6 +743,7 @@ def build_inbox_workflow() -> StateGraph:
     workflow.add_node("apply_owner_decision", apply_owner_decision)
     workflow.add_node("update_preferences", update_preferences)
     workflow.add_node("send_reply", send_reply)
+    workflow.add_node("create_calendar_event", create_calendar_event)
     workflow.add_node("record_outcome", record_outcome)
 
     workflow.add_edge(START, "accept_message")
@@ -509,10 +768,15 @@ def build_inbox_workflow() -> StateGraph:
     workflow.add_edge("apply_owner_decision", "update_preferences")
     workflow.add_conditional_edges(
         "update_preferences",
-        route_after_owner,
-        {"send_reply": "send_reply", "record_outcome": "record_outcome"},
+        route_by_action,
+        {
+            "send_reply": "send_reply",
+            "create_calendar_event": "create_calendar_event",
+            "record_outcome": "record_outcome",
+        },
     )
     workflow.add_edge("send_reply", "record_outcome")
+    workflow.add_edge("create_calendar_event", "record_outcome")
     workflow.add_edge("record_outcome", END)
     return workflow
 

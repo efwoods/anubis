@@ -26,6 +26,7 @@ from src.anubis.utils.voice import speakers as speakers_module  # noqa: E402
 from src.anubis.utils.voice.speakers import (  # noqa: E402
     LabelledSegment,
     SpokenTurn,
+    claim_lone_speaker_as_owner,
     diarize_spoken_turn,
     label_segments,
     next_other_speaker_label,
@@ -83,6 +84,53 @@ def test_label_segments_without_owner_reference_never_claims_the_owner():
     assert not any(segment.is_owner for segment in labelled)
 
 
+def test_claim_lone_speaker_as_owner_relabels_a_monologue_and_forgets_the_new_label():
+    segments = [
+        LabelledSegment("Speaker 2", "A little bit.", 0.0, 1.0, is_new_speaker=True),
+        LabelledSegment("Speaker 2", "Oh, boy.", 1.1, 1.8, is_new_speaker=True),
+    ]
+    claimed, remaining_new = claim_lone_speaker_as_owner(
+        segments,
+        owner_label="Shivon",
+        new_label_by_raw_name={"A": "Speaker 2"},
+    )
+    assert [segment.speaker for segment in claimed] == ["Shivon", "Shivon"]
+    assert all(segment.is_owner for segment in claimed)
+    assert remaining_new == {}
+
+
+def test_claim_lone_speaker_as_owner_leaves_two_living_voices_alone():
+    segments = [
+        LabelledSegment("Evan", "Say hi.", 0.0, 1.0, is_owner=True),
+        LabelledSegment("Speaker 2", "Hello.", 1.1, 2.0, is_new_speaker=True),
+    ]
+    claimed, remaining_new = claim_lone_speaker_as_owner(
+        segments,
+        owner_label="Evan",
+        new_label_by_raw_name={"A": "Speaker 2"},
+    )
+    assert claimed is segments
+    assert remaining_new == {"A": "Speaker 2"}
+
+
+def test_claim_lone_speaker_as_owner_ignores_avatar_echo_when_counting():
+    segments = [
+        LabelledSegment("Evan (avatar)", "Give him a moment.", 0.0, 1.5, is_avatar=True),
+        LabelledSegment("Speaker 2", "And just that individual version of myself.", 1.6, 3.0),
+    ]
+    claimed, remaining_new = claim_lone_speaker_as_owner(
+        segments,
+        owner_label="Evan",
+        new_label_by_raw_name={"A": "Speaker 2"},
+    )
+    assert [segment.speaker for segment in claimed] == [
+        "Evan (avatar)",
+        "Evan",
+    ]
+    assert claimed[0].is_avatar and claimed[1].is_owner
+    assert remaining_new == {}
+
+
 def test_render_speaker_script_merges_consecutive_lines():
     segments = [
         LabelledSegment("Evan", "Hello.", 0, 1, is_owner=True),
@@ -90,8 +138,11 @@ def test_render_speaker_script_merges_consecutive_lines():
         LabelledSegment("Speaker 2", "Fine, thanks.", 2, 3),
         LabelledSegment("Evan", "Good.", 3, 4, is_owner=True),
     ]
+    # Only the third voice is named. The person at the microphone is the one
+    # person the avatar is talking to, so naming their lines added nothing and
+    # named them wrongly on every avatar that is not a portrait of them.
     assert render_speaker_script(segments) == (
-        "Evan: Hello. How are you?\nSpeaker 2: Fine, thanks.\nEvan: Good."
+        "Hello. How are you?\nSpeaker 2: Fine, thanks.\nGood."
     )
 
 
@@ -237,7 +288,7 @@ def test_diarize_spoken_turn_labels_owner_remembers_others_and_keeps_labels_stab
     assert diarizer.calls[0] == ["Evan"], "the owner's clip is the only known voice at first"
     assert first.owner_identified and first.owner_spoke and first.others_spoke
     assert first.script == (
-        "Evan: This is my colleague.\nSpeaker 2: Nice to meet you, I am Maria.\nSpeaker 3: Hey."
+        "This is my colleague.\nSpeaker 2: Nice to meet you, I am Maria.\nSpeaker 3: Hey."
     )
     assert first.other_speakers == ["Speaker 2", "Speaker 3"]
     # Maria spoke long enough to be remembered; the short "Hey." did not.
@@ -257,12 +308,12 @@ def test_diarize_spoken_turn_labels_owner_remembers_others_and_keeps_labels_stab
 
     second = asyncio.run(diarize_spoken_turn(utterance, **common))
     assert diarizer.calls[1] == ["Evan", "Speaker 2"], "the remembered voice rides along"
-    assert second.script == "Speaker 2: Can you tell me about the project?\nEvan: Go ahead."
+    assert second.script == "Speaker 2: Can you tell me about the project?\nGo ahead."
     assert second.remembered_new_speakers == []
 
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg is not available")
-def test_diarize_spoken_turn_without_owner_recordings_labels_everyone_as_others():
+def test_diarize_spoken_turn_without_owner_recordings_treats_a_lone_speaker_as_the_owner():
     repository = InMemoryMediaAssetRepository()
     utterance = _sine_webm(2.0)
     diarizer = _FakeDiarizer([[_segment("A", "Hello there.", 0.0, 1.5)]])
@@ -281,8 +332,100 @@ def test_diarize_spoken_turn_without_owner_recordings_labels_everyone_as_others(
         )
     )
     assert diarizer.calls == [[]]
-    assert not turn.owner_identified and not turn.owner_spoke
-    assert turn.script == "Speaker 2: Hello there."
+    assert turn.owner_spoke and not turn.others_spoke
+    assert turn.script == "Hello there."
+    assert turn.remembered_new_speakers == []
+    remembered = asyncio.run(repository.list_thread_speakers("a1", "t1", include_bytes=True))
+    assert remembered == []
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg is not available")
+def test_diarize_spoken_turn_treats_a_lone_unmatched_voice_as_the_owner(monkeypatch):
+    monkeypatch.setattr(speakers_module, "_diarize_token_cost", lambda usage, context: 0.0, raising=False)
+    repository = InMemoryMediaAssetRepository()
+    asyncio.run(
+        repository.add_voice_clip(
+            {
+                "user_id": "u1",
+                "assistant_id": "a1",
+                "source": "recording",
+                "mime_type": "audio/mpeg",
+                "bytes": _sine_mp3(4.0),
+                "duration_seconds": 4.0,
+            }
+        )
+    )
+    diarizer = _FakeDiarizer([[_segment("A", "A little bit.", 0.0, 1.4)]])
+    turn = asyncio.run(
+        diarize_spoken_turn(
+            _sine_webm(2.0),
+            mime_type="audio/webm",
+            filename="utterance.webm",
+            context=_context(),
+            repository=repository,
+            user_id="u1",
+            assistant_id="a1",
+            thread_id="t1",
+            owner_label="Shivon",
+            diarizer=diarizer,
+        )
+    )
+    assert diarizer.calls == [["Shivon"]], "the owner's clip was handed in"
+    assert turn.owner_spoke and not turn.others_spoke
+    assert turn.script == "A little bit."
+    assert turn.remembered_new_speakers == []
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg is not available")
+def test_diarize_spoken_turn_does_not_keep_a_remembered_lone_voice_as_someone_else(monkeypatch):
+    monkeypatch.setattr(speakers_module, "_diarize_token_cost", lambda usage, context: 0.0, raising=False)
+    repository = InMemoryMediaAssetRepository()
+    asyncio.run(
+        repository.add_voice_clip(
+            {
+                "user_id": "u1",
+                "assistant_id": "a1",
+                "source": "recording",
+                "mime_type": "audio/mpeg",
+                "bytes": _sine_mp3(4.0),
+                "duration_seconds": 4.0,
+            }
+        )
+    )
+    asyncio.run(
+        repository.add_thread_speaker(
+            {
+                "user_id": "u1",
+                "assistant_id": "a1",
+                "thread_id": "t1",
+                "label": "Speaker 2",
+                "mime_type": "audio/mpeg",
+                "bytes": _sine_mp3(3.0),
+                "duration_seconds": 3.0,
+                "sample_text": "A little bit.",
+            }
+        )
+    )
+    diarizer = _FakeDiarizer(
+        [[_segment("Speaker 2", "to pay your wall, you know.", 0.0, 2.0)]]
+    )
+    turn = asyncio.run(
+        diarize_spoken_turn(
+            _sine_webm(3.0),
+            mime_type="audio/webm",
+            filename="utterance.webm",
+            context=_context(),
+            repository=repository,
+            user_id="u1",
+            assistant_id="a1",
+            thread_id="t1",
+            owner_label="Shivon",
+            diarizer=diarizer,
+        )
+    )
+    assert diarizer.calls == [["Shivon", "Speaker 2"]]
+    assert turn.owner_spoke and not turn.others_spoke
+    assert turn.script == "to pay your wall, you know."
 
 
 # --- the avatar's own voice heard through a speaker --------------------------------
@@ -310,7 +453,7 @@ def test_mark_avatar_echo_relabels_owner_lines_that_repeat_replies():
     ]
     marked = mark_avatar_echo(
         segments,
-        owner_label="Evan",
+        avatar_label="Evan",
         recent_avatar_replies=["The project kicks off next Monday and I will send the plan tonight."],
     )
     assert [segment.speaker for segment in marked] == ["Evan (avatar)", "Evan", "Speaker 2"]
@@ -324,6 +467,7 @@ def test_mark_avatar_echo_relabels_owner_lines_that_repeat_replies():
         owner_identified=True,
         other_speakers=[],
         duration_seconds=5.0,
+        avatar_label="Evan",
     )
     assert turn.avatar_spoke and turn.owner_spoke and not turn.others_spoke
     record = turn.additional_kwargs()["speakers"]

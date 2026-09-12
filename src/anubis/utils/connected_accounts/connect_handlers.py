@@ -23,14 +23,17 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from src.anubis.utils.connected_accounts.providers import (
+    KIND_CALENDAR,
     LOGIN_MODE_FORM,
-    MECHANISM_APP_PASSWORD,
+    MECHANISM_API_KEY,
     MECHANISM_AUTH0_IDENTITY,
     MECHANISM_BROWSER_SESSION,
     MECHANISM_DEVICE_PAIRING,
     MECHANISM_MCP_URL,
     MECHANISM_OAUTH,
+    MECHANISM_PASSWORD,
     MECHANISM_PLAID_LINK,
+    MECHANISM_SITE_DISCOVERY,
     MECHANISM_URL_ONLY,
     ConnectedAccountProvider,
 )
@@ -145,16 +148,32 @@ def _encrypt(secret: str, context: Any) -> str:
         raise ConnectRefused(503, str(configuration_error))
 
 
-async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any]:
-    """Prove a mailbox address + app password by logging in, then describe it.
+async def connect_password_account(request: ConnectRequest) -> dict[str, Any]:
+    """Prove a mailbox address and account password by logging in, then describe it.
 
-    On Gmail the password must be a 16-character app password, not the account
-    password: Google stopped accepting account passwords over IMAP on
-    2025-03-14, and creating an app password requires 2-Step Verification. A
-    rejected credential says exactly that and links to the page that issues one,
-    because "authentication failed" alone sends people to re-type the same wrong
-    secret.
+    This is the path a desktop mail client takes, and the reason the owner is
+    asked for two things and no more. When the provider row names no servers —
+    the generic email row — they are discovered from the address
+    (``mail_autoconfig``) and written onto the record, so every later turn
+    reaches the mailbox without rediscovering anything.
+
+    Three failures are three different answers, because they need three
+    different actions from the owner:
+
+    * the provider has withdrawn password access — say which company did that
+      and which sign-in it wants instead, since no password will ever work;
+    * nothing answered at the address's domain — ask for the server names;
+    * the server answered and rejected the credential — say the password was
+      refused, and nothing else.
+
+    A single "authentication failed" for all three is what sends a person to
+    type the same rejected password a second time.
     """
+    from src.anubis.utils.connected_accounts.mail_autoconfig import (
+        discover_mail_settings,
+        domain_of,
+        withdrawn_password_provider,
+    )
     from src.anubis.utils.tools.email.imap_client import (
         MailboxAuthenticationError,
         MailboxCredentials,
@@ -164,24 +183,85 @@ async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any
 
     provider = request.provider
     email_address = request.text("email_address")
-    app_password = str(request.fields.get("app_password") or "")
+    # ``app_password`` is the field name older clients posted. Accepted so a
+    # stale browser tab still connects; never offered, never labelled.
+    password = str(
+        request.fields.get("password") or request.fields.get("app_password") or ""
+    )
+    if provider.kind == KIND_CALENDAR:
+        return await _connect_calendar_account(request, email_address, password)
     if not provider.is_mailbox:
         raise ConnectRefused(
             400,
             f"{provider.display_name} is not a mailbox and cannot be connected "
             "with an email address and password.",
         )
-    if not email_address or not app_password:
-        raise ConnectRefused(400, "Both email_address and app_password are required.")
+    if not email_address or not password:
+        raise ConnectRefused(400, "Both email_address and password are required.")
+
+    overrides: dict[str, Any] = {}
+    imap_host = provider.imap_host
+    imap_port = provider.imap_port
+    smtp_host = provider.smtp_host
+    smtp_port = provider.smtp_port
+    drafts_mailbox = provider.drafts_mailbox
+    username = email_address
+
+    if not imap_host:
+        # The owner may have typed the servers themselves for a domain that
+        # publishes nothing; that always wins over discovery.
+        typed_imap_host = request.text("imap_host")
+        typed_smtp_host = request.text("smtp_host")
+        if typed_imap_host:
+            imap_host = typed_imap_host
+            smtp_host = typed_smtp_host or typed_imap_host
+        else:
+            settings = await discover_mail_settings(email_address)
+            if settings is None:
+                raise ConnectRefused(
+                    400,
+                    f"No mail settings could be found for {domain_of(email_address)}. "
+                    "Enter the incoming and outgoing server names for this "
+                    "account and connect again.",
+                )
+            if not settings.password_authentication:
+                withdrawn_by = settings.password_withdrawn_by or "This provider"
+                raise ConnectRefused(
+                    400,
+                    f"{withdrawn_by} no longer accepts an account password for "
+                    "mail access, so this address cannot be connected with a "
+                    "password. Connect it with the sign-in button for "
+                    f"{withdrawn_by} instead — the same address and password, "
+                    "typed on their own page.",
+                )
+            imap_host = settings.imap_host
+            imap_port = settings.imap_port
+            smtp_host = settings.smtp_host or settings.imap_host
+            smtp_port = settings.smtp_port
+            username = settings.username_for(email_address)
+        overrides = {
+            "imap_host": imap_host,
+            "imap_port": imap_port,
+            "smtp_host": smtp_host,
+            "smtp_port": smtp_port,
+        }
+    elif withdrawn_password_provider(imap_host):
+        withdrawn_by = withdrawn_password_provider(imap_host)
+        raise ConnectRefused(
+            400,
+            f"{withdrawn_by} no longer accepts an account password for mail "
+            f"access. Connect {provider.display_name} with its sign-in button "
+            "instead — the same address and password, typed on their own page.",
+        )
 
     credentials = MailboxCredentials(
-        account_address=email_address,
-        password=app_password,
-        imap_host=provider.imap_host,
-        imap_port=provider.imap_port,
-        smtp_host=provider.smtp_host,
-        smtp_port=provider.smtp_port,
-        drafts_mailbox=provider.drafts_mailbox,
+        account_address=username,
+        password=password,
+        imap_host=imap_host,
+        imap_port=imap_port,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        drafts_mailbox=drafts_mailbox,
         timeout_seconds=float(
             getattr(request.context, "mailbox_request_timeout_seconds", None) or 30.0
         ),
@@ -191,20 +271,16 @@ async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any
     except MailboxAuthenticationError:
         raise ConnectRefused(
             400,
-            f"{provider.display_name} rejected that address and password. "
-            "Use a 16-character app password, not your account password — "
-            "Google stopped accepting account passwords for mail access on "
-            "14 March 2025. Creating one requires 2-Step Verification: "
-            f"{provider.credential_help_url}",
+            f"{imap_host} rejected that password for {email_address}. Check the "
+            "password you use to sign in to this email account and try again.",
         )
     except MailboxUnreachableError as unreachable_error:
         raise ConnectRefused(
             503,
-            f"Could not reach {provider.display_name} to check the credential: "
-            f"{unreachable_error}",
+            f"Could not reach {imap_host} to check the credential: {unreachable_error}",
         )
 
-    encrypted_secret = _encrypt(app_password, request.context)
+    encrypted_secret = _encrypt(password, request.context)
     key = account_key(provider.name, email_address)
     label = deduplicate_label(
         derive_display_label(email_address), request.existing_records, key
@@ -215,6 +291,78 @@ async def connect_app_password_account(request: ConnectRequest) -> dict[str, Any
         display_label=label,
         encrypted_secret=encrypted_secret,
         assistant_id=request.assistant_id,
+        connection_overrides=overrides or None,
+    )
+
+
+# The name this handler carried when the mechanism was misnamed. Kept so an
+# existing import resolves; new code calls ``connect_password_account``.
+connect_app_password_account = connect_password_account
+
+
+async def _connect_calendar_account(
+    request: ConnectRequest, email_address: str, password: str
+) -> dict[str, Any]:
+    """Prove a calendar account over CalDAV, then describe it.
+
+    The same two things the owner typed for mail, against the calendar's own
+    protocol. The proven principal and calendar-home addresses are kept on the
+    record so no later turn repeats discovery.
+    """
+    from src.anubis.utils.connected_accounts.caldav_client import (
+        CalDavAuthenticationError,
+        CalDavUnreachableError,
+        connect_caldav_account,
+        list_calendars,
+    )
+
+    provider = request.provider
+    if not email_address or not password:
+        raise ConnectRefused(400, "Both email_address and password are required.")
+
+    try:
+        account = await connect_caldav_account(
+            email_address=email_address,
+            password=password,
+            server_url=request.text("server_url"),
+        )
+        calendars = await list_calendars(account)
+    except CalDavAuthenticationError:
+        raise ConnectRefused(
+            400,
+            f"The calendar server rejected that password for {email_address}. "
+            "Check the password you use to sign in to this account and try again.",
+        )
+    except CalDavUnreachableError as unreachable_error:
+        raise ConnectRefused(
+            400,
+            f"No calendar server could be found for {email_address}: "
+            f"{unreachable_error} Enter the calendar server address and try again.",
+        )
+
+    encrypted_secret = _encrypt(password, request.context)
+    key = account_key(provider.name, email_address)
+    label = deduplicate_label(
+        derive_display_label(email_address), request.existing_records, key
+    )
+    return build_account_record(
+        provider=provider,
+        account_address=email_address,
+        display_label=label,
+        encrypted_secret=encrypted_secret,
+        assistant_id=request.assistant_id,
+        transport={
+            "caldav": {
+                "base_url": account.base_url,
+                "principal_url": account.principal_url,
+                "calendar_home_url": account.calendar_home_url,
+                "username": account.username,
+                "calendars": [
+                    {"name": calendar.display_name, "read_only": calendar.read_only}
+                    for calendar in calendars
+                ],
+            }
+        },
     )
 
 
@@ -328,6 +476,168 @@ async def connect_mcp_server_account(request: ConnectRequest) -> dict[str, Any]:
     )
 
 
+async def connect_api_key_account(request: ConnectRequest) -> dict[str, Any]:
+    """Prove one vendor API key by asking the vendor, then describe the account.
+
+    Anthropic, OpenAI, and LangSmith publish no OAuth for third-party
+    applications and issue the owner a personal key instead. That key is the
+    route each of them documents, so it is the one used — and it is proved
+    here, while the owner still has the card in front of them, rather than
+    failing on first use days later.
+    """
+    from src.anubis.utils.connected_accounts.vendor_key_tools import (
+        KEY_PAGES,
+        VendorKeyRejected,
+        VendorUnreachable,
+        verify_api_key,
+    )
+
+    provider = request.provider
+    api_key = str(request.fields.get("api_key") or "").strip()
+    if not api_key:
+        raise ConnectRefused(
+            400,
+            f"An API key is required. Copy one from "
+            f"{KEY_PAGES.get(provider.name, provider.display_name)}.",
+        )
+
+    try:
+        await verify_api_key(provider.name, api_key)
+    except VendorKeyRejected as rejected:
+        raise ConnectRefused(400, str(rejected))
+    except VendorUnreachable as unreachable:
+        raise ConnectRefused(
+            503, f"{provider.display_name} could not be reached: {unreachable}"
+        )
+
+    # The key itself is the account's identity here; the last four characters
+    # let the owner tell two keys apart without the key ever being shown.
+    address = f"{provider.name}:{api_key[-4:]}"
+    key = account_key(provider.name, address)
+    label = deduplicate_label(
+        request.text("name") or provider.display_name, request.existing_records, key
+    )
+    return build_account_record(
+        provider=provider,
+        account_address=address,
+        display_label=label,
+        encrypted_secret=_encrypt(api_key, request.context),
+        assistant_id=request.assistant_id,
+    )
+
+
+async def _connect_site_without_mcp_server(
+    request: ConnectRequest, *, origin: str, host: str
+) -> dict[str, Any]:
+    """Continue the ladder for a site that publishes no connector.
+
+    The order is the owner's, and it puts **their own login first**:
+
+    1. **Signing in as themselves**, with the address and password they already
+       use for the site. This is the default for every site, because it is the
+       thing an owner can always do, needs nothing registered anywhere, and
+       gives the avatar exactly the access the owner has — no more.
+    2. **A provider that already covers this site**, when signing in is not the
+       right route for it: a vendor whose terms require the key they issue
+       (``terms_require_api_key``), or one that offers only OAuth.
+    3. **An API key, last**, because it is the least like being the owner: a
+       separate secret to find, paste and rotate, and at several vendors it
+       reads a different, narrower slice than the account does.
+
+    The one exception in step 2 is deliberate and narrow. ``vendor_key_tools``
+    records that keeping a signed-in session and reading the pages of Anthropic,
+    OpenAI and LangSmith is against the terms of all three. Those rows carry
+    ``terms_require_api_key``, so naming one of them still asks for a key —
+    protecting the owner's account rather than quietly doing the forbidden thing.
+    """
+    from src.anubis.utils.connected_accounts.providers import (
+        MECHANISM_API_KEY,
+        get_provider,
+        provider_for_host,
+    )
+
+    known = provider_for_host(host)
+    if known is not None and known.name != request.provider.name:
+        forbids_sessions = bool(getattr(known, "terms_require_api_key", False))
+        # An API-key row that does NOT forbid sessions is skipped here and left
+        # to the bottom of the ladder: the owner asked for their own login to be
+        # tried before a key.
+        is_key_route = known.credential_mechanism == MECHANISM_API_KEY
+        if forbids_sessions or not is_key_route:
+            return await connect_account(
+                ConnectRequest(
+                    provider=known,
+                    fields=dict(request.fields),
+                    assistant_id=request.assistant_id,
+                    context=request.context,
+                    existing_records=request.existing_records,
+                )
+            )
+
+    signed_in = get_provider("signed_in_site")
+    if signed_in is None:  # pragma: no cover - registry guarantees this row
+        raise ConnectRefused(
+            400,
+            f"{host} offers no connector and no sign-in route is configured.",
+        )
+    raise ConnectNeedsLogin(
+        signed_in,
+        {
+            "provider": signed_in.name,
+            "site_url": request.text("site_url") or origin,
+            "name": request.text("name") or host,
+        },
+    )
+
+
+async def connect_site_by_discovery(request: ConnectRequest) -> dict[str, Any]:
+    """Connect a site the way the site itself offers, or say that it offers none.
+
+    The owner names a site; this asks the site how it wants to be reached. A
+    Model Context Protocol server is the answer whenever there is one, because
+    it needs no application registered anywhere and no credential typed into
+    Neural Nexus — the server states how to sign in and registers this client
+    itself.
+
+    Once found, the address is handed to the Model Context Protocol handler,
+    which already knows how to prove a server, ask for a sign-in, and describe
+    the tools. Discovery adds no second copy of any of that.
+    """
+    from src.anubis.utils.connected_accounts.mcp_discovery import (
+        discover_mcp_server,
+        normalize_site,
+    )
+    from src.anubis.utils.connected_accounts.providers import get_provider
+
+    site = request.text("site_url")
+    if not site:
+        raise ConnectRefused(400, "A site address is required.")
+    origin, host = normalize_site(site)
+    if not origin:
+        raise ConnectRefused(400, f"{site!r} is not a web address.")
+
+    found = await discover_mcp_server(origin, request.context)
+    if found is None:
+        # No connector. Walk the rest of the ladder rather than refusing: the
+        # point of naming a site is that the owner should not have to know which
+        # of these routes it supports.
+        return await _connect_site_without_mcp_server(request, origin=origin, host=host)
+
+    mcp_provider = get_provider("custom_mcp") or request.provider
+    return await connect_mcp_server_account(
+        ConnectRequest(
+            provider=mcp_provider,
+            fields={
+                "server_url": found.server_url,
+                "name": request.text("name") or found.name or host,
+            },
+            assistant_id=request.assistant_id,
+            context=request.context,
+            existing_records=request.existing_records,
+        )
+    )
+
+
 async def _needs_popup_login(request: ConnectRequest) -> dict[str, Any]:
     """OAuth, Plaid Link, and browser sign-ins happen in a popup, not a form.
 
@@ -389,8 +699,7 @@ async def connect_website(request: ConnectRequest) -> dict[str, Any]:
         import httpx
 
         timeout_seconds = float(
-            getattr(request.context, "connect_oauth_http_timeout_seconds", None)
-            or 15.0
+            getattr(request.context, "connect_oauth_http_timeout_seconds", None) or 15.0
         )
         async with httpx.AsyncClient(
             timeout=timeout_seconds, follow_redirects=True
@@ -446,9 +755,11 @@ async def _refuse_device_pairing(request: ConnectRequest) -> dict[str, Any]:
 
 
 CONNECT_HANDLERS: dict[str, ConnectHandler] = {
-    MECHANISM_APP_PASSWORD: connect_app_password_account,
+    MECHANISM_PASSWORD: connect_password_account,
     MECHANISM_MCP_URL: connect_mcp_server_account,
     MECHANISM_URL_ONLY: connect_website,
+    MECHANISM_API_KEY: connect_api_key_account,
+    MECHANISM_SITE_DISCOVERY: connect_site_by_discovery,
     MECHANISM_OAUTH: _needs_popup_login,
     MECHANISM_PLAID_LINK: _needs_popup_login,
     MECHANISM_BROWSER_SESSION: _needs_popup_login,

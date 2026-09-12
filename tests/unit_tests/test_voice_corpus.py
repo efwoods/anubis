@@ -65,6 +65,25 @@ class _FakeVendor:
         # standing unless a test says otherwise.
         self.blocked_voice_ids = set()
         self.safety_lookups = []
+        # The vendor's stock voices, by gender, and every catalogue read made.
+        self.premade = {
+            "female": [
+                {
+                    "voice_id": "std-rachel",
+                    "name": "Rachel",
+                    "preview_url": "https://x/r",
+                },
+                {
+                    "voice_id": "std-alice",
+                    "name": "Alice",
+                    "preview_url": "https://x/a",
+                },
+            ],
+            "male": [
+                {"voice_id": "std-adam", "name": "Adam", "preview_url": "https://x/m"}
+            ],
+        }
+        self.catalogue_reads = []
 
     def install(self, monkeypatch):
         async def create_instant_voice(context, *, name, clips, description=""):
@@ -109,6 +128,13 @@ class _FakeVendor:
         async def voice_is_blocked(context, *, voice_id):
             self.safety_lookups.append(voice_id)
             return voice_id in self.blocked_voice_ids
+
+        async def list_premade_voices(context, *, gender):
+            self.catalogue_reads.append(gender)
+            return [
+                dict(voice, labels={"gender": gender, "accent": "american"})
+                for voice in self.premade.get(gender, [])
+            ]
 
         for name, function in locals().items():
             if name not in ("self", "monkeypatch"):
@@ -160,7 +186,9 @@ async def test_the_instant_clone_is_created_once_at_the_minimum_and_never_rebuil
 
 
 @pytest.mark.asyncio
-async def test_a_non_personal_avatar_keeps_its_clips_after_the_voice_exists(monkeypatch):
+async def test_a_non_personal_avatar_keeps_its_clips_after_the_voice_exists(
+    monkeypatch,
+):
     _FakeVendor().install(monkeypatch)
     repository = InMemoryMediaAssetRepository()
     await _add(repository, _context(), 130)
@@ -303,10 +331,13 @@ async def test_forgetting_a_document_removes_its_clips_and_recomputes_seconds(
     assert record["collected_seconds"] == 50
     assert record["instant_voice_id"] == "ivc-1"  # the trained voice stays
     assert len(repository.clips) == 1
-    assert await corpus.longest_clip_for_document(
-        repository, ASSISTANT_ID, "Mom.m4a"
-    ) is None
-    longest = await corpus.longest_clip_for_document(repository, ASSISTANT_ID, "talk.mp4")
+    assert (
+        await corpus.longest_clip_for_document(repository, ASSISTANT_ID, "Mom.m4a")
+        is None
+    )
+    longest = await corpus.longest_clip_for_document(
+        repository, ASSISTANT_ID, "talk.mp4"
+    )
     assert corpus.clip_data_uri(longest).startswith("data:audio/mpeg;base64,")
 
 
@@ -413,9 +444,13 @@ def test_target_windows_merge_and_skip_non_target_turns():
 
 @pytest.fixture(autouse=True)
 def _clear_repository():
+    from src.anubis.utils.voice import standard_voices
+
     media_repository.set_media_asset_repository(None)
+    standard_voices.clear_catalogue_cache()
     yield
     media_repository.set_media_asset_repository(None)
+    standard_voices.clear_catalogue_cache()
 
 
 def _json_request(payload):
@@ -495,6 +530,244 @@ async def test_speak_returns_audio_in_the_active_voice(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_speak_falls_back_to_the_standard_voice_without_a_clone(monkeypatch):
+    """An avatar with no clone but a chosen standard voice is heard, not refused."""
+    from src.anubis.utils.voice.standard_voices import set_standard_voice
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await set_standard_voice(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        voice={"voice_id": "std-rachel", "name": "Rachel", "gender": "female"},
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _meter(current_user, **kwargs):
+        return None
+
+    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _meter)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+    assert response.status_code == 200
+    assert response.body == b"audio:std-rachel:hello"
+    assert response.headers["x-voice-kind"] == "standard"
+
+
+@pytest.mark.asyncio
+async def test_the_clone_speaks_ahead_of_the_standard_voice(monkeypatch):
+    from src.anubis.utils.voice.standard_voices import set_standard_voice
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-9"}
+    )
+    await set_standard_voice(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        voice={"voice_id": "std-adam", "name": "Adam", "gender": "male"},
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _meter(current_user, **kwargs):
+        return None
+
+    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _meter)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hi"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+    assert response.body == b"audio:ivc-9:hi"
+    assert response.headers["x-voice-kind"] == "instant"
+    # The clone still holds the record's instant id; the standard voice is
+    # reported alongside so the panel can show both.
+    status = await corpus.voice_status_for(
+        repository,
+        _context(),
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        is_personal_avatar=False,
+    )
+    assert status.active_voice == "instant"
+    assert status.standard_voice == {
+        "voice_id": "std-adam",
+        "name": "Adam",
+        "gender": "male",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_clone_speaks_with_the_standard_voice(monkeypatch):
+    """The ban silences the avatar only while no standard voice stands in."""
+    from src.anubis.utils.voice.standard_voices import set_standard_voice
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-9"}
+    )
+    await corpus.mark_voice_blocked(repository, USER_ID, ASSISTANT_ID, reason="banned")
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _noop)
+    monkeypatch.setattr(webapp_module, "note_blocked_voice_on_avatar", _noop)
+    current_user = {"API_KEY": "k", "identities": [{"user_id": USER_ID}]}
+
+    refused = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hi"}),
+        current_user=current_user,
+    )
+    assert refused.status_code == 409
+    assert "voice_blocked" in refused.body.decode("utf-8")
+    readiness_before = await corpus.voice_readiness(
+        repository, _context(), user_id=USER_ID, assistant_id=ASSISTANT_ID
+    )
+    assert readiness_before["blocked"] is True
+    assert readiness_before["has_voice"] is False
+
+    await set_standard_voice(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        voice={"voice_id": "std-adam", "name": "Adam", "gender": "male"},
+    )
+    spoken = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hi"}),
+        current_user=current_user,
+    )
+    assert spoken.status_code == 200
+    assert spoken.body == b"audio:std-adam:hi"
+    assert spoken.headers["x-voice-kind"] == "standard"
+    readiness_after = await corpus.voice_readiness(
+        repository, _context(), user_id=USER_ID, assistant_id=ASSISTANT_ID
+    )
+    assert readiness_after == {
+        **readiness_after,
+        "active_voice": "standard",
+        "has_voice": True,
+        "blocked": False,
+        "standard_voice": {"voice_id": "std-adam", "name": "Adam", "gender": "male"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_standard_voice_catalogue_is_read_per_gender_and_cached(monkeypatch):
+    from src.api import webapp as webapp_module
+
+    vendor = _FakeVendor().install(monkeypatch)
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    current_user = {"API_KEY": "k", "identities": [{"user_id": USER_ID}]}
+
+    first = await webapp_module.list_avatar_standard_voices(
+        gender="female", current_user=current_user
+    )
+    body = __import__("json").loads(first.body)
+    assert body["gender"] == "female"
+    assert [voice["name"] for voice in body["voices"]] == ["Alice", "Rachel"]
+    assert body["voices"][0]["preview_url"] == "https://x/a"
+    assert body["voices"][0]["gender"] == "female"
+    assert body["voices"][0]["accent"] == "american"
+
+    await webapp_module.list_avatar_standard_voices(
+        gender="Female", current_user=current_user
+    )
+    assert vendor.catalogue_reads == ["female"]
+
+    with pytest.raises(webapp_module.HTTPException) as refused:
+        await webapp_module.list_avatar_standard_voices(
+            gender="robot", current_user=current_user
+        )
+    assert refused.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_choosing_a_standard_voice_stores_it_and_notes_the_avatar(monkeypatch):
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None, store=None),
+    )
+
+    async def _owned(assistant_id, current_user, action):
+        return {"assistant_id": assistant_id, "metadata": {}}, False
+
+    noted = []
+
+    async def _note(assistant_id, current_user, voice_id):
+        noted.append(voice_id)
+
+    monkeypatch.setattr(webapp_module, "_owned_assistant_for_voice", _owned)
+    monkeypatch.setattr(webapp_module, "note_standard_voice_on_avatar", _note)
+    current_user = {"API_KEY": "k", "identities": [{"user_id": USER_ID}]}
+
+    chosen = await webapp_module.set_avatar_standard_voice(
+        assistant_id=ASSISTANT_ID, voice_id="std-adam", current_user=current_user
+    )
+    body = __import__("json").loads(chosen.body)
+    assert body["standard_voice"] == {
+        "voice_id": "std-adam",
+        "name": "Adam",
+        "gender": "male",
+    }
+    assert body["active_voice"] == "none"
+    assert noted == ["std-adam"]
+
+    with pytest.raises(webapp_module.HTTPException) as unknown:
+        await webapp_module.set_avatar_standard_voice(
+            assistant_id=ASSISTANT_ID, voice_id="not-a-voice", current_user=current_user
+        )
+    assert unknown.value.status_code == 404
+
+    cleared = await webapp_module.set_avatar_standard_voice(
+        assistant_id=ASSISTANT_ID, voice_id="", current_user=current_user
+    )
+    assert __import__("json").loads(cleared.body)["standard_voice"] is None
+    assert noted == ["std-adam", None]
+    stored = await repository.get_voice(ASSISTANT_ID)
+    assert "standard_voice" not in (stored or {}).get("detail", {})
+
+
+@pytest.mark.asyncio
 async def test_a_plan_refusal_parks_the_professional_voice_until_retried(monkeypatch):
     """ElevenLabs offers professional cloning to the Creator plan and above.
 
@@ -518,7 +791,9 @@ async def test_a_plan_refusal_parks_the_professional_voice_until_retried(monkeyp
     assert record["professional_state"] == "plan_required"
     assert record["detail"]["professional_error_kind"] == "plan_required"
     assert "Creator plan" in record["detail"]["professional_error"]
-    assert record["detail"]["professional_help_url"].startswith("https://elevenlabs.io/")
+    assert record["detail"]["professional_help_url"].startswith(
+        "https://elevenlabs.io/"
+    )
     assert record["instant_voice_id"] == "ivc-1"
     assert len(attempts) == 1
 
@@ -545,7 +820,11 @@ async def test_a_plan_refusal_parks_the_professional_voice_until_retried(monkeyp
 
     monkeypatch.setattr(elevenlabs_client, "create_professional_voice", _accept)
     record = await corpus.retry_professional_voice(
-        repository, context, user_id=USER_ID, assistant_id=ASSISTANT_ID, avatar_name="Evan"
+        repository,
+        context,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        avatar_name="Evan",
     )
     assert record["professional_state"] == "awaiting_verification"
     assert record["professional_voice_id"] == "pvc-1"
@@ -826,7 +1105,9 @@ async def test_a_confirmed_ban_is_noted_on_the_avatar(monkeypatch):
 
     assert len(assistants.updates) == 1
     assert assistants.updates[0]["voice_model_blocked"] is True
-    assert assistants.updates[0]["voice_model_blocked_reason"] == "blocked by the vendor"
+    assert (
+        assistants.updates[0]["voice_model_blocked_reason"] == "blocked by the vendor"
+    )
     # The note is merged in; nothing else about the avatar is disturbed.
     assert assistants.metadata["user_id"] == USER_ID
     assert assistants.metadata["is_personal_avatar_of_creator"] is False
@@ -1051,9 +1332,7 @@ async def test_the_rebuild_route_returns_the_status_of_the_new_voice(monkeypatch
     async def owned_assistant(assistant_id, current_user, action_description=""):
         return {"name": "Evan", "metadata": {}}, {"user_id": USER_ID}
 
-    monkeypatch.setattr(
-        webapp_module, "resolve_assistant_for_creator", owned_assistant
-    )
+    monkeypatch.setattr(webapp_module, "resolve_assistant_for_creator", owned_assistant)
     await _add(repository, _context(), 75)
     assert (await repository.get_voice(ASSISTANT_ID))["instant_voice_id"] == "ivc-1"
 

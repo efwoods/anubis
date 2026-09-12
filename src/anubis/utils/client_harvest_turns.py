@@ -25,12 +25,39 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 CLIENT_HARVEST_MARKER_PREFIX = "[neural-nexus:"
 """Prefix of every browser-sent hidden request (suggestions, description)."""
 
+CONVERSATION_SUGGESTIONS_MARKER = "[neural-nexus:conversation-suggestions]"
+"""Prefix of the hidden turn that asks the avatar for composer chips."""
+
 CLIENT_HARVEST_MESSAGE_KIND = "client_harvest"
 """``additional_kwargs["kind"]`` stamped on a harvest turn by ``/message``."""
 
 SUGGESTION_LIST_MIN_ITEMS = 2
 SUGGESTION_LIST_MAX_ITEMS = 6
 SUGGESTION_LIST_MAX_ITEM_CHARACTERS = 160
+
+CONVERSATION_SUGGESTION_HARVEST_SYSTEM_PROMPT = """
+<CONVERSATION_SUGGESTION_HARVEST>
+This turn is a machine request for composer chips, not a spoken reply.
+The standing instruction to write a normal conversational paragraph does not
+apply. Reply with a JSON array of exactly three short strings and nothing else.
+Do not speak in character as a conversational answer. Do not add a preface.
+
+When the request asks for opening messages (there is no conversation yet):
+each string must be a message a visitor would type to start talking with you,
+grounded in your identity, your role, and what you do.
+A recruiter leans toward hiring or joining. A restaurant leans toward placing
+an order. A pastor leans toward prayer. A loved one leans toward checking in.
+A foundation founder leans toward that foundation's work.
+When you represent an organization, at least one opening message should ask
+you to share that organization's public website link.
+Generic greetings that would fit any avatar are wrong.
+
+When the request includes a conversation excerpt:
+each string is a natural next message the person might send, grounded in what
+was just said, still in the register of talking to you.
+</CONVERSATION_SUGGESTION_HARVEST>
+"""
+"""Override appended when the live turn is a conversation-suggestion harvest."""
 
 
 def _text_of(message: Any) -> str:
@@ -70,6 +97,45 @@ def _is_ai(message: Any) -> bool:
 def is_client_harvest_marker_text(text: str | None) -> bool:
     """Whether a turn's text is a browser harvest request."""
     return str(text or "").lstrip().startswith(CLIENT_HARVEST_MARKER_PREFIX)
+
+
+def is_conversation_suggestion_harvest_text(text: str | None) -> bool:
+    """Whether a turn's text is the composer-chip harvest, not another harvest."""
+    return str(text or "").lstrip().startswith(CONVERSATION_SUGGESTIONS_MARKER)
+
+
+def conversation_suggestion_harvest_system_instruction(text: str | None) -> str:
+    """System-prompt appendix for a live conversation-suggestion harvest.
+
+    The identity prompt tells the avatar to write a spoken paragraph and never
+    add follow-up suggestions. That instruction must be overridden for the
+    turn that exists only to fill the chips above the composer.
+    """
+    if not is_conversation_suggestion_harvest_text(text):
+        return ""
+    return CONVERSATION_SUGGESTION_HARVEST_SYSTEM_PROMPT
+
+
+def identity_retrieval_query_for_suggestion_harvest(
+    *,
+    assistant_name: str | None,
+    assistant_description: str | None,
+) -> str:
+    """Store query that retrieves who this avatar is, not the harvest wording.
+
+    The harvest text is about JSON chips. Using that text as the identity
+    query ranks documents about suggestions instead of the avatar's role
+    (recruiting, taking orders, pastoral care).
+    """
+    name = (assistant_name or "").strip()
+    description = (assistant_description or "").strip()
+    if name and description:
+        return f"{name}. {description}"
+    if description:
+        return description
+    if name:
+        return f"Who is {name} and what does {name} do?"
+    return "Who are you and what do you do?"
 
 
 def is_client_harvest_turn(message: Any) -> bool:

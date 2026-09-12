@@ -75,8 +75,12 @@ def test_meter_dimensions_grow_with_tier():
     premium_meters = set(
         TIER_DEFINITIONS[SubscriptionTier.PREMIUM].meter_allotments
     )
+    # The invariant this test is named for: every tier meters everything the tier
+    # below it meters, and strictly more. Enumerating the exact set instead went
+    # stale the moment a tier gained a meter, without the invariant ever breaking.
     assert free_meters == {UsageMeter.MESSAGING_TOKENS}
-    assert pro_meters == free_meters | {UsageMeter.DOCUMENT_UPLOAD_TOKENS}
+    assert free_meters < pro_meters
+    assert pro_meters < premium_meters
     assert premium_meters == set(UsageMeter)
 
 

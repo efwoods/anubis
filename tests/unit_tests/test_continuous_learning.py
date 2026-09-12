@@ -330,7 +330,15 @@ async def test_run_account_learning_sweep_end_to_end(monkeypatch):
     assert list(pending) == [USER]
     counters = await run_account_learning_sweep(store, _FakeGraph({THREAD: messages}), USER, pending[USER])
 
-    assert counters == {"threads": 1, "ratings_aggregated": 1, "inferred_records": 3}
+    # ``style_recalibrated`` is 0 here because this account has no personal-avatar
+    # pointer: the sweep skips folding a person's own words into their avatar's
+    # style rather than guessing which avatar is theirs.
+    assert counters == {
+        "threads": 1,
+        "ratings_aggregated": 1,
+        "inferred_records": 3,
+        "style_recalibrated": 0,
+    }
     history = await store.aget(sentiment_namespace(USER, AVATAR), f"history:{THREAD}")
     assert "warmed up" in history.value["document"]["kwargs"]["page_content"]
     preferences = await store.asearch(preference_namespace(USER, AVATAR), limit=10)

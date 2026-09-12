@@ -17,6 +17,7 @@ for results that arrived without content is read with the plain-text fetch
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -36,6 +37,22 @@ _USER_AGENT = "Mozilla/5.0 (compatible; NeuralNexusResearch/1.0)"
 
 
 @dataclass
+class ImageCandidate:
+    """One picture the search or a read page offered, and where it came from.
+
+    ``origin`` names how the picture was found — a Tavily image result, or the
+    tag on a page that declared it — because that is what ranks candidates:
+    a page's ``og:image`` is the picture that page chose to represent itself,
+    which is a far better portrait bet than an arbitrary inline image.
+    """
+
+    url: str
+    description: str = ""
+    origin: str = ""
+    source_url: str = ""
+
+
+@dataclass
 class SearchResult:
     """One web result: where the result came from and what the page says."""
 
@@ -45,6 +62,7 @@ class SearchResult:
     content: str = ""
     provider: str = ""
     queries: list[str] = field(default_factory=list)
+    images: list[ImageCandidate] = field(default_factory=list)
 
 
 def _normalize_url(url: str) -> str:
@@ -201,13 +219,180 @@ def html_to_markdown(html: str) -> str:
     return markdownify(html or "", strip=["script", "style"])
 
 
-async def read_page_text(url: str) -> str:
-    """Read the page as bounded Markdown, fetched through the article loader's HTTP path."""
+# The tags a page uses to declare the picture that represents it, best first.
+# og:image is what a page hands a social card, so it is the page's own answer to
+# "which picture is this page about" — for a biography page, that is a portrait.
+_PAGE_IMAGE_META_PROPERTIES = (
+    ("og:image", "og:image"),
+    ("og:image:secure_url", "og:image"),
+    ("twitter:image", "twitter:image"),
+    ("twitter:image:src", "twitter:image"),
+)
+
+
+def extract_page_images(
+    html: str, base_url: str, *, limit: int = 4
+) -> list[ImageCandidate]:
+    """Return the pictures a page declares as representing itself.
+
+    Reads the social-card tags, then ``link[rel=image_src]``, then JSON-LD
+    ``image``, then — on a MediaWiki page — the first infobox image, which is
+    the lead portrait on a biography article. Relative sources are resolved
+    against ``base_url``. Inline body images are deliberately not collected:
+    they are mostly logos, icons and unrelated illustrations, and every extra
+    candidate costs a download and a vision call downstream.
+    """
+    from urllib.parse import urljoin
+
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates: list[ImageCandidate] = []
+    seen: set[str] = set()
+
+    def remember(raw_url: str, origin: str, description: str = "") -> None:
+        if len(candidates) >= limit:
+            return
+        resolved = _normalize_url(urljoin(base_url, (raw_url or "").strip()))
+        if not resolved or resolved in seen:
+            return
+        seen.add(resolved)
+        candidates.append(
+            ImageCandidate(
+                url=resolved,
+                description=description,
+                origin=origin,
+                source_url=base_url,
+            )
+        )
+
+    page_title = (soup.title.get_text(strip=True) if soup.title else "") or ""
+    for property_name, origin in _PAGE_IMAGE_META_PROPERTIES:
+        for tag in soup.find_all("meta", attrs={"property": property_name}):
+            remember(tag.get("content", ""), origin, page_title)
+        for tag in soup.find_all("meta", attrs={"name": property_name}):
+            remember(tag.get("content", ""), origin, page_title)
+
+    for tag in soup.find_all("link", attrs={"rel": "image_src"}):
+        remember(tag.get("href", ""), "image_src", page_title)
+
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            payload = json.loads(script.string or "")
+        except Exception:  # noqa: BLE001 - malformed JSON-LD is common and not an error
+            continue
+        for entry in payload if isinstance(payload, list) else [payload]:
+            if not isinstance(entry, dict):
+                continue
+            image = entry.get("image")
+            if isinstance(image, str):
+                remember(image, "json-ld", str(entry.get("name") or page_title))
+            elif isinstance(image, dict):
+                remember(str(image.get("url") or ""), "json-ld", str(entry.get("name") or page_title))
+            elif isinstance(image, list):
+                for item in image:
+                    if isinstance(item, str):
+                        remember(item, "json-ld", page_title)
+                    elif isinstance(item, dict):
+                        remember(str(item.get("url") or ""), "json-ld", page_title)
+
+    infobox_image = soup.select_one(".infobox img, #mw-content-text figure img")
+    if infobox_image is not None:
+        remember(infobox_image.get("src", ""), "wikipedia", page_title)
+
+    return candidates
+
+
+@dataclass
+class PageRead:
+    """One page read once: its Markdown text and the pictures it declares."""
+
+    text: str
+    images: list[ImageCandidate] = field(default_factory=list)
+
+
+async def read_page(url: str, *, collect_images: bool = True) -> PageRead:
+    """Fetch a page once and return both its Markdown and its declared pictures.
+
+    The HTML is fetched a single time and used twice. Reading the page for facts
+    and harvesting a portrait candidate from it are the same download, so
+    acquisition costs the research pipeline nothing extra for the pages it was
+    already going to read.
+    """
     from src.anubis.utils.classes.URLDocumentLoaderClass import _httpx_fallback_text
 
     html = await _httpx_fallback_text(url, return_html=True)
     text = html_to_markdown(html)
-    return re.sub(r"[ \t]+", " ", text or "")[:_PAGE_TEXT_CHARACTER_LIMIT]
+    bounded_text = re.sub(r"[ \t]+", " ", text or "")[:_PAGE_TEXT_CHARACTER_LIMIT]
+    images: list[ImageCandidate] = []
+    if collect_images:
+        try:
+            images = extract_page_images(html or "", url)
+        except Exception as image_error:  # noqa: BLE001 - facts matter more than pictures
+            logger.debug("Could not read images from %s: %s", url, image_error)
+    return PageRead(text=bounded_text, images=images)
+
+
+async def read_page_text(url: str) -> str:
+    """Read the page as bounded Markdown, fetched through the article loader's HTTP path."""
+    page = await read_page(url, collect_images=False)
+    return page.text
+
+
+async def search_images(
+    query: str, *, limit: int, context: GlobalContext | None = None
+) -> list[ImageCandidate]:
+    """Search for pictures matching ``query``.
+
+    Tavily is the only provider that answers with images; the DuckDuckGo HTML
+    endpoint the browser path uses has no image results at all. A deployment
+    with no Tavily key therefore gets an empty list here and falls back to the
+    pictures the read pages declared, which is thinner but still works.
+    """
+    context = context or GlobalContext()
+    api_key = getattr(context, "tavily_api_key", None)
+    if not api_key:
+        return []
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": max(1, min(limit, 20)),
+        "search_depth": "advanced",
+        "include_images": True,
+        "include_image_descriptions": True,
+        "include_raw_content": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
+            response = await client.post(TAVILY_SEARCH_URL, json=payload)
+            response.raise_for_status()
+            body = response.json()
+    except Exception as search_error:  # noqa: BLE001 - a failed image search is not fatal
+        logger.warning("Tavily image search failed for %r: %s", query, search_error)
+        return []
+    candidates: list[ImageCandidate] = []
+    seen: set[str] = set()
+    # Tavily answers with bare URL strings when descriptions are off and with
+    # {"url", "description"} objects when they are on; older responses mix both.
+    for entry in body.get("images") or []:
+        if isinstance(entry, str):
+            raw_url, description = entry, ""
+        elif isinstance(entry, dict):
+            raw_url, description = entry.get("url") or "", entry.get("description") or ""
+        else:
+            continue
+        url = _normalize_url(raw_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        candidates.append(
+            ImageCandidate(
+                url=url, description=description, origin="tavily", source_url=""
+            )
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def merge_results(
@@ -226,6 +411,8 @@ def merge_results(
                 existing.content = result.content
             if not existing.snippet and result.snippet:
                 existing.snippet = result.snippet
+            if not existing.images and result.images:
+                existing.images = result.images
             existing.provider = f"{existing.provider}+{result.provider}"
     return list(merged.values())
 
@@ -251,12 +438,17 @@ async def search_web(
 
 
 __all__ = [
+    "ImageCandidate",
+    "PageRead",
     "SearchResult",
     "browser_search",
+    "extract_page_images",
     "html_to_markdown",
     "merge_results",
     "parse_duckduckgo_html",
+    "read_page",
     "read_page_text",
+    "search_images",
     "search_web",
     "tavily_search",
 ]

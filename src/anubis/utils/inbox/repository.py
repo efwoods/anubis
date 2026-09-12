@@ -135,6 +135,54 @@ def sender_domain_of(sender: str | None) -> str:
     return address.rsplit("@", 1)[-1].strip().lower() if "@" in address else ""
 
 
+ACTION_SEND_REPLY = "send_reply"
+ACTION_NOTIFY_OWNER = "notify_owner"
+ACTION_CREATE_CALENDAR_EVENT = "create_calendar_event"
+ACTION_POST_REPLY = "post_reply"
+ACTION_MODERATE = "moderate"
+
+# What the owner may choose instead of the action the avatar proposed. A
+# mailbox item can be answered, left to the owner, or turned into an
+# appointment; an item from a group conversation is answered in the room the
+# item came from and can carry a moderation action instead.
+MAILBOX_AVAILABLE_ACTIONS = (
+    ACTION_SEND_REPLY,
+    ACTION_NOTIFY_OWNER,
+    ACTION_CREATE_CALENDAR_EVENT,
+)
+GROUP_AVAILABLE_ACTIONS = (
+    ACTION_POST_REPLY,
+    ACTION_NOTIFY_OWNER,
+    ACTION_MODERATE,
+)
+GROUP_PLATFORM_SOURCE_KINDS = ("slack", "discord", "twitch")
+
+# Items this system wrote for the owner rather than items that arrived from
+# somebody. A scheduled report and an account the research turned up both have
+# nobody to reply TO, so offering "send a reply" beside them is an action the
+# panel cannot carry out. The owner acknowledges these, or ignores them.
+NOTIFY_ONLY_SOURCE_KINDS = ("report", "account_discovery")
+
+
+def available_actions_for(item: dict[str, Any]) -> list[str]:
+    """Which actions the owner may pick between for one item.
+
+    The panel renders this list as a picker beside the Edit toggle, so an
+    action a platform cannot carry out must never appear here. An item from a
+    group conversation records the actions its own bot reported as possible;
+    anything else falls back to the actions the platform offers in general.
+    """
+    recorded = item.get("available_actions")
+    if isinstance(recorded, (list, tuple)) and recorded:
+        return [str(action) for action in recorded]
+    source_kind = str(item.get("source_kind") or "")
+    if source_kind in NOTIFY_ONLY_SOURCE_KINDS:
+        return [ACTION_NOTIFY_OWNER]
+    if source_kind in GROUP_PLATFORM_SOURCE_KINDS:
+        return list(GROUP_AVAILABLE_ACTIONS)
+    return list(MAILBOX_AVAILABLE_ACTIONS)
+
+
 def public_item_view(item: dict[str, Any]) -> dict[str, Any]:
     """Project an item as the panel and the chat tools see it (a snippet, not the body)."""
     body = str(item.get("body_text") or "")
@@ -156,6 +204,17 @@ def public_item_view(item: dict[str, Any]) -> dict[str, Any]:
         "confidence_detail": item.get("confidence_detail") or {},
         "state": item.get("state"),
         "owner_decision": item.get("owner_decision"),
+        "available_actions": available_actions_for(item),
+        "platform": (
+            item.get("source_kind")
+            if str(item.get("source_kind") or "") in GROUP_PLATFORM_SOURCE_KINDS
+            else None
+        ),
+        "channel_name": (
+            str(item.get("account_key") or "").split(":", 1)[-1] or None
+            if str(item.get("source_kind") or "") in GROUP_PLATFORM_SOURCE_KINDS
+            else None
+        ),
         "created_at": _isoformat(item.get("created_at")),
         "updated_at": _isoformat(item.get("updated_at")),
         "resolved_at": _isoformat(item.get("resolved_at")),

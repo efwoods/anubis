@@ -35,13 +35,62 @@ DECISION_NOTIFY = "notify"
 AMBIENT_DECISIONS = (DECISION_IGNORE, DECISION_RESPOND, DECISION_NOTIFY)
 
 # What the avatar offers to do about a ``notify`` observation once the
-# conversation partner allows it: one verb the avatar will perform (``draft``,
-# ``reply``, ``remind``, ``research``, ``summarize``, ``schedule`` ...). The
-# card puts the verb on the button and the wording beside it. ``none`` is a
-# plain heads-up.
+# conversation partner allows it: one verb the avatar will perform on the
+# conversation partner's behalf (``draft``, ``remind``, ``research``,
+# ``summarize``, ``schedule``, or ``reply`` to a waiting message). The card
+# puts the verb on the button and the wording beside it. ``none`` is a plain
+# heads-up. Talking about what was seen is not an offer: the heads-up already
+# did that.
 PROPOSED_ACTION_NONE = "none"
 PROPOSED_ACTION_MAX_LETTERS = 20
 _PROPOSED_ACTION_LETTERS = re.compile(r"[^a-z]")
+
+# Verbs that mean the avatar would only talk. A heads-up already said what
+# was noticed, so these must not become action buttons.
+_CONVERSATIONAL_PROPOSED_ACTIONS = frozenset(
+    {
+        "advise",
+        "comment",
+        "explain",
+        "mention",
+        "note",
+        "observe",
+        "remark",
+        "say",
+        "tell",
+        "warn",
+    }
+)
+
+# Verbs that mean clicking or typing on the conversation partner's own
+# machine. The avatar cannot press Cancel on a local dialog.
+_LOCAL_MACHINE_PROPOSED_ACTIONS = frozenset(
+    {
+        "cancel",
+        "click",
+        "close",
+        "dismiss",
+        "press",
+        "tap",
+        "type",
+    }
+)
+
+# A proposed ``reply`` is only on-behalf when the wording names a waiting
+# channel the avatar can actually answer.
+_REPLY_CHANNEL_MARKERS = (
+    "call",
+    "discord",
+    "dm",
+    "email",
+    "inbox",
+    "mail",
+    "message",
+    "slack",
+    "sms",
+    "thread",
+    "tweet",
+)
 
 # The hidden turn that carries an allowed action back to the avatar. The
 # decision recorded on the avatar's reply is ``act`` so the browser can tell a
@@ -67,15 +116,51 @@ _SOURCE_BY_FILENAME_STEM = {
     "audio": SOURCE_MICROPHONE,
 }
 
+CAMERA_FACING_SELF = "self"
+CAMERA_FACING_WORLD = "world"
+
+# What a browser reports for a camera track, mapped to the two directions that
+# matter: "user" is the front camera pointed at the person, "environment" the
+# rear camera pointed at whatever the person is looking at.
+_CAMERA_FACING_BY_TRACK_SETTING: dict[str, str] = {
+    "user": CAMERA_FACING_SELF,
+    "front": CAMERA_FACING_SELF,
+    "self": CAMERA_FACING_SELF,
+    "environment": CAMERA_FACING_WORLD,
+    "rear": CAMERA_FACING_WORLD,
+    "back": CAMERA_FACING_WORLD,
+    "world": CAMERA_FACING_WORLD,
+}
+
+
+def normalize_camera_facing_value(camera_facing: Any) -> str:
+    """Reduce a browser facing mode to ``self`` or ``world``.
+
+    An absent or unrecognized value reads as ``self``, the conservative
+    direction: a camera pointed at the conversation partner carries no request,
+    so the avatar stays quiet unless something else justifies speaking.
+    """
+    key = str(camera_facing or "").strip().lower()
+    return _CAMERA_FACING_BY_TRACK_SETTING.get(key, CAMERA_FACING_SELF)
+
+
 OBSERVATION_HEADER_PREFIX = "[AMBIENT_OBSERVATION"
+
+# Why the triage chose to speak, handed to the avatar as the thing to react
+# to. The system prompt promises the avatar this line exists on a respond
+# turn, so a respond turn must always carry it.
+REASON_LINE_PREFIX = "[AMBIENT_REASON]"
 
 RESPOND_INSTRUCTION = (
     "The conversation partner did not type this: the assistant noticed this on "
-    "the conversation partner's webcam or screen, and decided to speak up. "
-    "React the way this avatar naturally would on noticing this — briefly, in "
-    "the avatar's own voice — or use a tool when a tool helps. Do not read the "
-    "description back, and do not mention a camera or a screenshot unless doing "
-    "so is natural."
+    "the conversation partner's webcam or screen, and decided to speak up. The "
+    "line beginning with [AMBIENT_REASON] names the one specific thing that "
+    "justified speaking. Speak about that thing, in the avatar's own voice and "
+    "briefly, or use a tool when a tool helps. Do not recite the description "
+    "back word for word, and do not mention a camera or a screenshot unless "
+    "doing so is natural. Never pad the reply with presence, reassurance, or a "
+    "check-in: if the named thing warrants only a few words, say only those "
+    "few words."
 )
 
 NOTIFY_INSTRUCTION = (
@@ -84,6 +169,31 @@ NOTIFY_INSTRUCTION = (
     "partner should hear about this. Write one short heads-up message to the "
     "conversation partner saying what was noticed and what the assistant "
     "suggests. Do not take actions and do not call tools."
+)
+
+# Scene narration (the accessibility mode): the conversation partner has asked
+# to be told continuously what is in view, so an observation is not a scene the
+# assistant happened to notice — it is the answer to a question already asked.
+# Nothing is classified on these turns and nothing is weighed for salience:
+# every observation is spoken, because the conversation partner is relying on
+# the assistant for what they cannot see for themselves.
+NARRATE_INSTRUCTION = (
+    "The conversation partner has switched on scene narration: they have asked "
+    "the assistant to tell them what is in view, continuously, and they may not "
+    "be able to see the scene themselves. This description is what the camera "
+    "is pointed at right now. Say what is there, out loud, to the conversation "
+    "partner. Lead with anything that bears on their safety or their next step "
+    "— an obstacle, a step or kerb, a vehicle, a door, a person approaching, a "
+    "sign or a screen they would want read to them — and then the rest of the "
+    "scene in the order it matters. Place things from the conversation "
+    "partner's point of view: to your left, ahead of you, on the far side. "
+    "Read short visible text out exactly as written. Keep it to one or two "
+    "sentences unless something genuinely needs more; this is spoken aloud and "
+    "another description follows in seconds. Say only what is in the "
+    "description: never invent a detail, and when something is unclear say so "
+    "in a few words rather than guessing. Do not greet, do not check in, do "
+    "not say the assistant is looking or watching, and do not mention a "
+    "camera, an image or a frame — just say what is there."
 )
 
 # Spoken turns heard in the room (a live-voice utterance labelled by speaker).
@@ -121,6 +231,7 @@ NOTIFY_INSTRUCTION_WITH_OFFER = NOTIFY_INSTRUCTION + OFFER_SUFFIX
 NOTIFY_INSTRUCTION_SPEECH_WITH_OFFER = NOTIFY_INSTRUCTION_SPEECH + OFFER_SUFFIX
 
 ALL_INSTRUCTIONS = (
+    NARRATE_INSTRUCTION,
     RESPOND_INSTRUCTION,
     NOTIFY_INSTRUCTION,
     RESPOND_INSTRUCTION_SPEECH,
@@ -175,6 +286,9 @@ def build_ambient_additional_kwargs(
     image_filenames: list[str] | None = None,
     observation_id: str | None = None,
     hidden: bool = True,
+    camera_facing: str | None = None,
+    narrate: bool = False,
+    narration_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Build the ``additional_kwargs`` of an ambient ``HumanMessage`` before triage.
 
@@ -190,6 +304,18 @@ def build_ambient_additional_kwargs(
             "sources": list(sources),
             "captured_at": captured_at or "",
             "voice_mode": bool(voice_mode),
+            # Which way the webcam pointed: the triage classifier reads a
+            # world-facing camera as a standing request to be told what is in
+            # view, and a self-facing camera as carrying no request at all.
+            "camera_facing": normalize_camera_facing_value(camera_facing),
+            # Scene narration is on: the conversation partner asked to be told
+            # what is in view and is waiting to hear this one. There is nothing
+            # to classify — the request was made once, for every observation —
+            # so this bypasses triage entirely rather than arguing with it.
+            "narrate": bool(narrate),
+            # How often the conversation partner is being told, which decides
+            # how LONG this reading may be as well as when the next arrives.
+            "narration_seconds": narration_seconds,
         },
     }
     if image_filenames:
@@ -242,6 +368,28 @@ def normalize_proposed_action(value: Any) -> str:
     return action or PROPOSED_ACTION_NONE
 
 
+def is_action_the_avatar_takes_on_behalf(action: Any, description: Any = "") -> bool:
+    """Whether this offer is something the avatar can do for the conversation partner.
+
+    A plain heads-up has no offer. Talking about what was seen is not an
+    action: the heads-up already did that. Clicking a dialog on the
+    conversation partner's machine is not an action the avatar can take.
+    ``reply`` counts only when the wording names a waiting message, email,
+    or call the avatar could answer.
+    """
+    verb = normalize_proposed_action(action)
+    if verb == PROPOSED_ACTION_NONE:
+        return False
+    if verb in _CONVERSATIONAL_PROPOSED_ACTIONS:
+        return False
+    if verb in _LOCAL_MACHINE_PROPOSED_ACTIONS:
+        return False
+    if verb == "reply":
+        wording = str(description or "").lower()
+        return any(marker in wording for marker in _REPLY_CHANNEL_MARKERS)
+    return True
+
+
 def proposed_offer(ambient: dict[str, Any]) -> tuple[str, str] | None:
     """Return the ``(action, description)`` a notify observation offers, or ``None``."""
     if not ambient or ambient.get("decision") != DECISION_NOTIFY:
@@ -249,6 +397,8 @@ def proposed_offer(ambient: dict[str, Any]) -> tuple[str, str] | None:
     action = normalize_proposed_action(ambient.get("proposed_action"))
     description = str(ambient.get("action_description") or "").strip()
     if action == PROPOSED_ACTION_NONE or not description:
+        return None
+    if not is_action_the_avatar_takes_on_behalf(action, description):
         return None
     return action, description
 
@@ -334,6 +484,11 @@ def observation_header(ambient: dict[str, Any]) -> str:
     decision = ambient.get("decision")
     if decision:
         header += f" decision={decision}"
+    if is_narration_observation(ambient):
+        # Marked on the header so that, read back later in the thread, a
+        # description spoken to somebody who could not see is never mistaken
+        # for a scene the assistant chose to bring up on its own.
+        header += " narration=on"
     if proposed_offer(ambient) is not None:
         header += f" proposed_action={normalize_proposed_action(ambient.get('proposed_action'))}"
     return header + "]"
@@ -348,6 +503,18 @@ def split_observation_text(text: str) -> tuple[str | None, str]:
     return first_line, rest.strip()
 
 
+def is_narration_observation(ambient: dict[str, Any] | None) -> bool:
+    """Whether this observation was captured with scene narration switched on.
+
+    A narration observation is the answer to a standing request: the
+    conversation partner asked to be told what is in view and every capture
+    since is part of that answer. It is never classified, never weighed for
+    salience, and never silenced by the quiet period after the avatar last
+    spoke — silence is the one thing it must not produce.
+    """
+    return bool((ambient or {}).get("narrate"))
+
+
 def is_speech_observation(ambient: dict[str, Any]) -> bool:
     """Whether an observation was heard (microphone only), not seen."""
     sources = [str(source) for source in (ambient.get("sources") or [])]
@@ -358,8 +525,12 @@ def strip_instruction(body: str) -> str:
     """Drop a previously appended respond/notify instruction from a body."""
     for instruction in ALL_INSTRUCTIONS:
         marker = "\n\n" + instruction
-        if body.endswith(marker):
-            body = body[: -len(marker)]
+        position = body.find(marker)
+        if position != -1:
+            # Truncate rather than trimming a suffix: a respond instruction is
+            # followed by the [AMBIENT_REASON] line, so the instruction is not
+            # always the last thing in the body.
+            body = body[:position]
             break
     return strip_offer_line(body)
 
@@ -382,7 +553,14 @@ def compose_observation_text(ambient: dict[str, Any], body: str) -> str:
     parts = [lead, strip_offer_line(body).strip()]
     decision = ambient.get("decision")
     heard = is_speech_observation(ambient)
-    if decision == DECISION_RESPOND:
+    if decision == DECISION_RESPOND and is_narration_observation(ambient):
+        # No instruction at all: a narrated observation is not answered by the
+        # avatar. The description IS the reading and the browser speaks it
+        # directly, so an instruction here would be a line of dead text stored
+        # on the thread for nobody. ``NARRATE_INSTRUCTION`` is kept in
+        # ``ALL_INSTRUCTIONS`` so threads written before this still strip clean.
+        pass
+    elif decision == DECISION_RESPOND:
         parts.append(RESPOND_INSTRUCTION_SPEECH if heard else RESPOND_INSTRUCTION)
     elif decision == DECISION_NOTIFY and offer is not None:
         parts.append(
@@ -392,6 +570,17 @@ def compose_observation_text(ambient: dict[str, Any], body: str) -> str:
         )
     elif decision == DECISION_NOTIFY:
         parts.append(NOTIFY_INSTRUCTION_SPEECH if heard else NOTIFY_INSTRUCTION)
+    if (
+        decision == DECISION_RESPOND
+        and len(parts) > 2
+        and not is_narration_observation(ambient)
+    ):
+        # Narration carries no reason line: the reason is the standing request,
+        # and the system prompt promises that line names the one thing that
+        # justified breaking silence. Nothing was broken here.
+        reason = str(ambient.get("reason") or "").strip().replace("\n", " ")
+        if reason:
+            parts[2] += f"\n{REASON_LINE_PREFIX} {reason}"
     return "\n".join(part for part in parts[:2] if part) + (
         "\n\n" + parts[2] if len(parts) > 2 else ""
     )
@@ -504,4 +693,477 @@ class AmbientThrottle:
             self._last_seen.pop(thread_id, None)
 
 
+class AmbientSpeechCooldown:
+    """Process-local quiet period after the avatar speaks about what it noticed.
+
+    ``AmbientThrottle`` bounds how often a thread may be *looked at*. This
+    bounds how often the avatar may *say something* about what was seen, which
+    is a different and much longer interval: a person sharing a webcam consents
+    to being looked at, not to being spoken to every time the classifier finds
+    something remarkable. Without this, the classifier's per-observation
+    judgement is the only thing standing between a long share and a stream of
+    interruptions, and independent draws on a quiet scene eventually produce
+    one.
+    """
+
+    def __init__(self) -> None:
+        """Start with no thread having spoken."""
+        self._last_spoken: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def seconds_remaining(
+        self,
+        thread_id: str | None,
+        cooldown_seconds: float,
+        *,
+        now: float | None = None,
+    ) -> float | None:
+        """Return seconds still to wait, or ``None`` when the avatar may speak.
+
+        This only reads. ``mark_spoken`` records the moment, so that an
+        observation demoted to ``ignore`` for any other reason does not start a
+        cooldown it never earned.
+        """
+        if not thread_id or cooldown_seconds <= 0:
+            return None
+        moment = now if now is not None else time.monotonic()
+        with self._lock:
+            self._evict(moment, cooldown_seconds)
+            previous = self._last_spoken.get(thread_id)
+            if previous is None:
+                return None
+            elapsed = moment - previous
+            if elapsed >= cooldown_seconds:
+                return None
+            return round(cooldown_seconds - elapsed, 3)
+
+    def mark_spoken(self, thread_id: str | None, *, now: float | None = None) -> None:
+        """Record that the avatar has just spoken about an observation."""
+        if not thread_id:
+            return
+        moment = now if now is not None else time.monotonic()
+        with self._lock:
+            self._last_spoken[thread_id] = moment
+
+    def _evict(self, now: float, cooldown_seconds: float) -> None:
+        stale_after = max(cooldown_seconds * 10, 600.0)
+        for thread_id in [
+            key for key, seen in self._last_spoken.items() if now - seen > stale_after
+        ]:
+            self._last_spoken.pop(thread_id, None)
+
+
 ambient_throttle = AmbientThrottle()
+ambient_speech_cooldown = AmbientSpeechCooldown()
+
+
+# --- What is being shared at this exact moment ------------------------------
+#
+# Ambient observations pile up in the thread and never expire. An observation
+# of a screen the conversation partner stopped sharing an hour ago reads
+# exactly like a description of what is on that screen right now, and the
+# avatar, asked what is on the screen, will happily narrate the stale one. The
+# browser reports which sources are live on every turn; these helpers turn that
+# report into a section of the system prompt that separates the present from
+# the record.
+
+#: The freshest description of each source still counts as the present for this
+#: long. Past this, a live source's newest observation is named with its age so
+#: the avatar reaches for ``look_now`` instead of reading the description back.
+LIVE_OBSERVATION_FRESH_SECONDS = 90.0
+
+
+def newest_observation_age_seconds(
+    messages: list[Any], source: str, *, now: float | None = None
+) -> float | None:
+    """How long ago the newest observation of one source was captured.
+
+    :param messages: The thread's messages.
+    :param source: ``webcam`` / ``screen`` / ``microphone``.
+    :param now: Unix seconds to measure against; the clock by default.
+    :returns: Seconds since the newest observation of that source, or ``None``
+        when the conversation holds no observation of that source, or when the
+        one it holds carries no readable ``captured_at``.
+    """
+    from datetime import datetime, timezone
+
+    reference = float(now) if now is not None else datetime.now(timezone.utc).timestamp()
+    for message in reversed(list(messages or [])):
+        if not is_ambient_observation(message):
+            continue
+        details = ambient_details(message) or {}
+        if source not in [str(name) for name in (details.get("sources") or [])]:
+            continue
+        stamp = str(details.get("captured_at") or "").strip()
+        if not stamp:
+            return None
+        try:
+            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, reference - parsed.timestamp())
+    return None
+
+
+def describe_age(seconds: float | None) -> str:
+    """Say an age in words the way a person would say the age out loud."""
+    if seconds is None:
+        return "at an unknown time"
+    if seconds < 60:
+        return "less than a minute ago"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"about {minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = int(minutes // 60)
+    return f"about {hours} hour{'s' if hours != 1 else ''} ago"
+
+
+def build_live_shares_block(
+    live_sources: list[str] | None,
+    messages: list[Any],
+    *,
+    can_look_now: bool,
+    may_control_shares: bool = False,
+    peekable_sources: list[str] | None = None,
+    scene_narration_on: bool = False,
+    now: float | None = None,
+) -> str:
+    """Build the ``<LIVE_SHARES>`` section of the system prompt.
+
+    The section is added only to a conversation that holds at least one scene
+    observation or has something shared right now; a conversation that has
+    never involved a camera keeps the prompt the conversation already had.
+
+    :param live_sources: What the browser reported live on this turn.
+    :param messages: The thread's messages, read for the age of the newest
+        observation of each source.
+    :param can_look_now: Whether the ``look_now`` tool is attached this turn.
+    :param may_control_shares: Whether the owner allowed this avatar, in this
+        browser, to look on its own and to switch a share off.
+    :param peekable_sources: What the browser can open for a single look right
+        now — the camera when its peek permission is granted, the desktop when
+        the owner granted a desktop peek this browser is still holding.
+    :param scene_narration_on: Whether the browser reported scene narration
+        switched on this turn — the camera is being described to the
+        conversation partner continuously because they asked, and usually
+        because they cannot see the scene themselves.
+    :param now: Unix seconds to measure ages against; the clock by default.
+    :returns: The section, or ``""`` when the conversation needs no section.
+    """
+    live = [
+        source
+        for source in (SOURCE_WEBCAM, SOURCE_SCREEN)
+        if source in [str(name) for name in (live_sources or [])]
+    ]
+    peekable = [
+        source
+        for source in (SOURCE_WEBCAM, SOURCE_SCREEN)
+        if source in [str(name) for name in (peekable_sources or [])]
+        and source not in live
+    ]
+    seen = [
+        source
+        for source in (SOURCE_WEBCAM, SOURCE_SCREEN)
+        if newest_observation_age_seconds(messages, source, now=now) is not None
+        or any(
+            is_ambient_observation(message)
+            and source
+            in [str(name) for name in (ambient_details(message) or {}).get("sources") or []]
+            for message in (messages or [])
+        )
+    ]
+    if (
+        not live
+        and not seen
+        and not may_control_shares
+        and not peekable
+        and not scene_narration_on
+    ):
+        return ""
+
+    lines: list[str] = []
+    if scene_narration_on:
+        # Said first, because it changes how every other line is read: the
+        # observations arriving are not scenes the assistant happened to
+        # notice, they are answers to a standing request from somebody who
+        # may have nothing but the assistant's voice to go on.
+        lines.append(
+            "Scene narration is ON. The conversation partner asked to be told "
+            "what is in front of them, continuously, and may not be able to see "
+            "the scene themselves; the camera is pointed outward at the world "
+            "and every observation of it is described to them aloud. Treat "
+            "each observation turn as that description: say what is there, "
+            "lead with anything that bears on their safety or their next step, "
+            "place things from their point of view, read visible text exactly, "
+            "keep it short, and never invent what the description does not "
+            "say. When they speak, answer them; they may be asking about "
+            "something just described. When they ask for the describing to "
+            "stop, call set_scene_narration with enabled=false."
+        )
+    if live:
+        lines.append(
+            "Being shared at this moment: "
+            + " and ".join(live)
+            + "."
+        )
+    else:
+        lines.append("Nothing is being shared at this moment.")
+    # The camera and the desktop are two different views of two different
+    # things, and the avatar answers the wrong question when it treats them as
+    # one "what can I see". Name what each one is, every turn the section is
+    # built, so the choice between them is never a guess.
+    lines.append(
+        "The camera and the desktop are separate views and are never "
+        "interchangeable. The camera shows the conversation partner themselves "
+        "and the room they are in. The desktop shows what is on their screen — "
+        "the application, page, code or error in front of them. Answer a "
+        "question about one only from that one, and say which of the two is "
+        "being described whenever both are in play."
+    )
+    if peekable:
+        lines.append(
+            "Not being shared, but open to a single look right now: "
+            + " and ".join(peekable)
+            + ". The conversation partner allowed this avatar to open "
+            + ("it" if len(peekable) == 1 else "them")
+            + " for one look and close "
+            + ("it" if len(peekable) == 1 else "them")
+            + " again. That is a glance taken when the answer needs it, never "
+            "a standing watch."
+        )
+
+    stopped = [source for source in seen if source not in live]
+    for source in stopped:
+        age = newest_observation_age_seconds(messages, source, now=now)
+        lines.append(
+            f"The {source} is NOT being shared any more. This conversation still "
+            f"holds descriptions of that {source}, the newest captured "
+            f"{describe_age(age)}. Those describe what the {source} used to "
+            "show, not what the "
+            f"{source} shows now."
+        )
+
+    for source in live:
+        age = newest_observation_age_seconds(messages, source, now=now)
+        if age is not None and age > LIVE_OBSERVATION_FRESH_SECONDS:
+            lines.append(
+                f"The newest description of the {source} was captured "
+                f"{describe_age(age)}, so that description may no longer match "
+                f"what the {source} shows."
+            )
+
+    if stopped or not live:
+        lines.append(
+            "Never describe a source that is not being shared as though the "
+            "assistant can see that source now. Say plainly that the "
+            "conversation partner is not sharing it."
+        )
+
+    # The marks the model-facing copy of the conversation carries. Without
+    # this the marks are unexplained text in the middle of an observation.
+    lines.append(
+        "Every webcam / screen observation in this conversation is marked. "
+        f"[{CURRENT_VIEW_MARKER} ...] is what that source shows now. "
+        f"[{EARLIER_VIEW_MARKER} ...] is what that source showed at the time "
+        "named in the mark and is history — the share may have ended, or a "
+        "later look may have replaced it. Describe what is in view now only "
+        f"from a [{CURRENT_VIEW_MARKER}] observation or from a look taken this "
+        f"turn. A [{EARLIER_VIEW_MARKER}] observation may be referred to as "
+        "something seen earlier, never as something in view now."
+    )
+
+    if can_look_now:
+        reachable = live + peekable
+        if reachable:
+            lines.append(
+                "When the conversation partner asks what the assistant sees, or "
+                "when what is on "
+                + " or ".join(reachable)
+                + " at this moment decides the answer, call look_now for a fresh "
+                "look rather than answering from a description already in this "
+                "conversation. Name the source the question is about — webcam "
+                "for the camera, screen for the desktop — instead of asking for "
+                "everything by default."
+            )
+        else:
+            lines.append(
+                "When the conversation partner asks what the assistant sees, "
+                "call look_now rather than answering from a description already "
+                "in this conversation. The tool will confirm that nothing is "
+                "being shared, which is the answer to give."
+            )
+        if may_control_shares and SOURCE_SCREEN not in reachable:
+            lines.append(
+                "The desktop is not being shared and cannot be opened by this "
+                "avatar; asking look_now for it puts a button in front of the "
+                "conversation partner to press."
+            )
+    if may_control_shares or peekable:
+        lines.append(
+            "A camera or a desktop is opened only for the look that needs it "
+            "and is closed straight after — never left running, and never "
+            "opened when nothing about the current scene bears on the answer. "
+            "Use stop_sharing to switch one off when the conversation partner "
+            "asks or when it has plainly served its purpose."
+        )
+
+    return "\n<LIVE_SHARES>\n" + "\n".join(lines) + "\n</LIVE_SHARES>\n"
+
+
+# --- Marking each observation as the current view or an earlier one ---------
+#
+# The LIVE_SHARES section says which sources are shared at this moment, but the
+# observations themselves sit in the thread as flat present-tense descriptions:
+# "screen: a terminal showing three repositories". Read one of those in the
+# middle of a conversation and nothing in it says whether it is what the screen
+# shows now or what the screen showed twenty minutes ago, before the share
+# ended. So each observation is marked, in the copy handed to the model only,
+# with which of the two it is.
+
+#: Appended to an observation that is the newest, still-live look at its sources.
+CURRENT_VIEW_MARKER = "CURRENT VIEW"
+
+#: Appended to every other observation, with the reason it is no longer current.
+EARLIER_VIEW_MARKER = "EARLIER VIEW"
+
+
+def _scene_sources_of(ambient: dict[str, Any]) -> list[str]:
+    """The webcam / screen sources of one observation; a heard turn has none."""
+    return [
+        str(source)
+        for source in (ambient.get("sources") or [])
+        if str(source) in (SOURCE_WEBCAM, SOURCE_SCREEN)
+    ]
+
+
+def describe_view_currency(
+    ambient: dict[str, Any],
+    *,
+    live_sources: list[str],
+    is_newest_for_every_source: bool,
+    age_seconds: float | None,
+) -> str:
+    """Say whether one observation is the current view of its sources, and why.
+
+    :param ambient: The observation's ``ambient`` record.
+    :param live_sources: What is being shared at this moment.
+    :param is_newest_for_every_source: Whether this observation is the most
+        recent one covering each of its own sources.
+    :param age_seconds: How long ago the observation was captured.
+    :returns: The bracketed marker to put after the observation's header.
+    """
+    sources = _scene_sources_of(ambient)
+    if not sources:
+        return ""
+    live = [source for source in sources if source in (live_sources or [])]
+    stopped = [source for source in sources if source not in (live_sources or [])]
+    age = describe_age(age_seconds)
+
+    if stopped:
+        which = " and ".join(stopped)
+        was = "are" if len(stopped) > 1 else "is"
+        reason = (
+            f"the {which} {was} NOT being shared any more, so this describes what "
+            f"the {which} showed {age}, not what the {which} shows now"
+        )
+        if live:
+            reason += f" (the {' and '.join(live)} is still being shared)"
+        return f"[{EARLIER_VIEW_MARKER} — captured {age}; {reason}]"
+
+    if not is_newest_for_every_source:
+        return (
+            f"[{EARLIER_VIEW_MARKER} — captured {age}; a later look at the "
+            f"{' and '.join(sources)} came after this one]"
+        )
+
+    if age_seconds is not None and age_seconds > LIVE_OBSERVATION_FRESH_SECONDS:
+        return (
+            f"[{EARLIER_VIEW_MARKER} — captured {age}; the "
+            f"{' and '.join(sources)} is still being shared, but this is old "
+            "enough that the scene may have changed since]"
+        )
+
+    return f"[{CURRENT_VIEW_MARKER} — captured {age} and still being shared]"
+
+
+def mark_view_currency(
+    messages: list[Any], live_sources: list[str] | None, *, now: float | None = None
+) -> list[Any]:
+    """Return the messages with every scene observation marked current or earlier.
+
+    The returned list is for the model only — the marks are never written back
+    to the thread, because whether an observation is current is true of the
+    moment it is read, not of the observation.
+
+    :param messages: The thread's messages.
+    :param live_sources: What the browser reported live on this turn.
+    :param now: Unix seconds to measure ages against; the clock by default.
+    :returns: A new list; messages that are not scene observations are the very
+        same objects, unchanged.
+    """
+    from datetime import datetime, timezone
+
+    reference = float(now) if now is not None else datetime.now(timezone.utc).timestamp()
+    live = [str(source) for source in (live_sources or [])]
+
+    # Which observation is the newest for each source, walking newest first.
+    newest_seen: set[str] = set()
+    is_newest: dict[int, bool] = {}
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not is_ambient_observation(message):
+            continue
+        sources = _scene_sources_of(ambient_details(message) or {})
+        if not sources:
+            continue
+        is_newest[index] = all(source not in newest_seen for source in sources)
+        newest_seen.update(sources)
+
+    marked: list[Any] = []
+    for index, message in enumerate(messages or []):
+        if index not in is_newest:
+            marked.append(message)
+            continue
+        ambient = ambient_details(message) or {}
+        text = message_text(message)
+        header, body = split_observation_text(text)
+        if not header:
+            marked.append(message)
+            continue
+        marker = describe_view_currency(
+            ambient,
+            live_sources=live,
+            is_newest_for_every_source=is_newest[index],
+            age_seconds=_age_of_stamp(ambient.get("captured_at"), reference),
+        )
+        if not marker:
+            marked.append(message)
+            continue
+        rebuilt = "\n".join(part for part in (f"{header} {marker}", body) if part)
+        try:
+            marked.append(message.model_copy(update={"content": rebuilt}))
+        except AttributeError:
+            # A plain dict message (tests, a client that sent one) is copied by
+            # hand rather than losing its mark.
+            copied = dict(message)
+            copied["content"] = rebuilt
+            marked.append(copied)
+    return marked
+
+
+def _age_of_stamp(stamp: Any, reference: float) -> float | None:
+    """Seconds between an ISO ``captured_at`` and ``reference``, or ``None``."""
+    from datetime import datetime, timezone
+
+    text = str(stamp or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, reference - parsed.timestamp())

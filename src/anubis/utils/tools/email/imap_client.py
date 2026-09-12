@@ -12,7 +12,8 @@ Why the standard library and not ``langchain_google_community.GmailToolkit``
     be dropped in behind the same call sites.
 
     Two authentication mechanisms are supported by :class:`MailboxCredentials`:
-    ``"password"`` (a plain ``LOGIN`` with an app password, kept for providers
+    ``"password"`` (a plain ``LOGIN`` with the account password, which is what
+    most mail providers still accept, kept for providers
     that still use one) and ``"xoauth2"`` (an OAuth access token). Since
     2025-03-14 a regular Google account password no longer authenticates
     against IMAP or SMTP, which is why Gmail uses OAuth.
@@ -307,7 +308,7 @@ def verify_credentials(credentials: MailboxCredentials) -> None:
 
     Raises:
         MailboxAuthenticationError: The server rejected the credential — a
-            revoked or expired OAuth token, or a wrong app password.
+            revoked or expired OAuth token, or a wrong password.
         MailboxUnreachableError: The server could not be reached.
     """
     connection = _connect(credentials)
@@ -670,5 +671,80 @@ def fetch_unseen_messages(
                 fetched.setdefault("uid", message_uid)
                 messages.append(fetched)
         return messages
+    finally:
+        _close(connection)
+
+
+def supports_idle(connection: imaplib.IMAP4_SSL) -> bool:
+    """Whether this server offers IDLE, the push half of IMAP.
+
+    Read from the server's own capability list rather than attempted and
+    recovered from, because a server that does not offer IDLE answers the
+    command with an error that ends the session, and re-establishing a session
+    per mailbox per attempt is exactly the cost IDLE exists to avoid.
+    """
+    try:
+        capabilities = getattr(connection, "capabilities", ()) or ()
+        return any("IDLE" == str(entry).upper() for entry in capabilities)
+    except Exception:  # noqa: BLE001 - an unreadable capability list is a no
+        return False
+
+
+def wait_for_new_mail(
+    credentials: MailboxCredentials,
+    *,
+    timeout_seconds: float = 1500.0,
+) -> bool:
+    """Hold an IDLE connection until the server says something arrived.
+
+    Blocking, and meant to be called through ``asyncio.to_thread``: ``imaplib``
+    is synchronous, and the whole point of this call is to sit still for up to
+    twenty-five minutes without consuming anything.
+
+    Returns True when the server reported new mail, False when the wait ended
+    for any other reason — the refresh window elapsed, the server closed the
+    connection, or IDLE is not offered. A False is not an error: the caller
+    fetches and re-enters the wait either way, which is what makes a server
+    that silently drops IDLE degrade into a slow poll instead of going deaf.
+
+    The timeout must stay under the thirty minutes the IMAP specification
+    allows a server to hold an idle client, or the server hangs up first.
+    """
+    connection = _connect(credentials)
+    try:
+        if not supports_idle(connection):
+            return False
+        _select_mailbox(connection, "INBOX")
+        tag = connection._new_tag()  # noqa: SLF001 - imaplib exposes no public IDLE
+        connection.send(b"%s IDLE\r\n" % tag)
+        # The server answers with a continuation ("+ idling") before anything
+        # else; without consuming it the first untagged reply read below would
+        # be that acknowledgement rather than a mail notification.
+        acknowledgement = connection.readline()
+        if not acknowledgement.startswith(b"+"):
+            return False
+        original_timeout = connection.sock.gettimeout()
+        connection.sock.settimeout(max(60.0, float(timeout_seconds)))
+        try:
+            while True:
+                line = connection.readline()
+                if not line:
+                    return False
+                upper = line.upper()
+                # EXISTS is new mail; RECENT alone can fire for other reasons,
+                # so it is not treated as an arrival.
+                if b"EXISTS" in upper:
+                    return True
+        except TimeoutError:
+            return False
+        except OSError:
+            return False
+        finally:
+            try:
+                connection.sock.settimeout(original_timeout)
+                connection.send(b"DONE\r\n")
+                connection.readline()
+            except Exception:  # noqa: BLE001 - the session is closed below
+                pass
     finally:
         _close(connection)

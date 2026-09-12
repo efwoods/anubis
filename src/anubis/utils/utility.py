@@ -909,22 +909,49 @@ async def get_video_duration_seconds(
             return float(clip.duration or 0.0)
 
 
-async def get_remote_video_duration_seconds(url: str) -> float:
-    """Return a remote (YouTube or direct) video's duration from metadata only.
+async def get_remote_video_metadata(url: str) -> dict:
+    """Return what a remote video says about itself, without downloading it.
 
     Probes with yt_dlp ``extract_info(download=False)`` — the same pattern as
     ``list_available_subtitles`` — on a worker thread so the event loop is
-    never blocked. Nothing is downloaded. Raises when the extractor fails or
-    reports no duration; the caller decides the fallback.
+    never blocked. Nothing is downloaded.
+
+    The keys returned are the ones a caller needs to decide whether a video is
+    worth the far more expensive download and transcription: ``duration`` in
+    seconds, ``title``, ``uploader``, ``description``, ``thumbnail``,
+    ``live_status`` (a stream in progress has no fixed duration and cannot be
+    transcribed as a recording) and ``age_limit``. Raises when the extractor
+    fails; the caller decides the fallback.
     """
 
-    def _probe() -> float:
+    def _probe() -> dict:
         ydl_options = {"quiet": True, "skip_download": True}
         with yt_dlp.YoutubeDL(ydl_options) as ydl:
             info = ydl.extract_info(url, download=False)
-        return float(info.get("duration") or 0.0)
+        info = info or {}
+        return {
+            "duration": float(info.get("duration") or 0.0),
+            "title": str(info.get("title") or ""),
+            "uploader": str(info.get("uploader") or info.get("channel") or ""),
+            "description": str(info.get("description") or ""),
+            "thumbnail": str(info.get("thumbnail") or ""),
+            "live_status": info.get("live_status"),
+            "age_limit": int(info.get("age_limit") or 0),
+        }
 
     return await asyncio.to_thread(_probe)
+
+
+async def get_remote_video_duration_seconds(url: str) -> float:
+    """Return a remote (YouTube or direct) video's duration from metadata only.
+
+    A thin reading of ``get_remote_video_metadata`` for the callers that only
+    need to bill or bound by length. Raises when the extractor fails; a video
+    that reports no duration comes back as ``0.0`` and the caller decides the
+    fallback.
+    """
+    metadata = await get_remote_video_metadata(url)
+    return float(metadata.get("duration") or 0.0)
 
 
 async def get_remote_playlist_video_durations(url: str) -> list[float]:
@@ -1120,11 +1147,13 @@ async def transcribe_audio(
     a clip whose peak volume is below ``voice_silence_max_volume_db`` is
     answered with an empty transcript without calling the model, and a
     transcript that is only a memorised caption (``MBC 뉴스 이덕영입니다``,
-    ``Thank you for watching``) is dropped. Uploaded media leaves the flag off.
+    ``Thank you for watching``) or that only repeats the transcription prompt
+    is dropped. Uploaded media leaves the flag off.
     """
     from src.anubis.utils.voice.transcript_hygiene import (
         clip_is_silent,
         drop_hallucinated_text,
+        drop_prompt_echo,
     )
 
     # Remove noise and isolate the vocals; if reference audio, truncate to 9 seconds:
@@ -1177,6 +1206,12 @@ async def transcribe_audio(
         if live_voice:
             result["text"] = drop_hallucinated_text(
                 str(result.get("text") or ""), description="live-voice transcript"
+            )
+            # whisper-1 continues its prompt when the clip holds no clear
+            # speech, so a transcript made only of the prompt's own words is
+            # the prompt coming back, not the person talking.
+            result["text"] = drop_prompt_echo(
+                result["text"], prompt, description="live-voice transcript"
             )
         result["audio_base64_preprocessed"] = audio_base64
         return result

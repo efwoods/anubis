@@ -63,6 +63,8 @@ class DynamicPromptBuilder:
         retrieved_knowledge: Optional[List[Document]] = None,
         retrieved_memories: Optional[List[Document]] = None,
         analyzed_traits: Optional[List[Document]] = None,
+        psychological_profile: str | None = None,
+        how_you_move: str | None = None,
         style_profile_str: Optional[str] = None,
         key_phrases_str: Optional[str] = None,
         direct_quotes: Optional[List[Document]] = None,
@@ -73,6 +75,7 @@ class DynamicPromptBuilder:
         system_time: Optional[str] = None,
         user_is_creator: Optional[bool] = False,
         assistant_place: Optional[str] = None,
+        assistant_organization_links: Optional[str] = None,
         user_engagement: str | None = None,
         user_feedback_messages: str | None = None,
         positively_rated_messages: str | None = None,
@@ -174,8 +177,15 @@ class DynamicPromptBuilder:
             )
 
         if assistant_emotions is None:
-            # assistant_emotions_str = "Unaware of current emotions of self."
             assistant_emotions_str = ""
+        elif isinstance(assistant_emotions, str):
+            # The avatar's live emotional state arrives already rendered as prose
+            # (see psycho/current_emotion.py: render_current_emotion).
+            assistant_emotions_str = assistant_emotions
+        else:
+            assistant_emotions_str = "\n\n".join(
+                [doc.page_content for doc in assistant_emotions]
+            )
 
         if user_emotions is None:
             # user_emotions_str = "Unaware of the current emotions of the person or people you are addressing."
@@ -233,7 +243,10 @@ class DynamicPromptBuilder:
             "retrieved_knowledge": retrieved_knowledge_str,
             "retrieved_memories": retrieved_memories_str,
             "analyzed_traits": analyzed_traits_str,
+            "psychological_profile": psychological_profile or "",
+            "how_you_move": how_you_move or "",
             "assistant_place": assistant_place or "",
+            "assistant_organization_links": assistant_organization_links or "",
             "style_profile_str": style_profile_str,
             "key_phrases_str": key_phrases_str,
             "direct_quotes": direct_quotes_str,

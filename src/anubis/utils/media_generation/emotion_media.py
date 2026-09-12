@@ -190,6 +190,13 @@ def summarize_failures(failures: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _motion_prompt_for(motion_prompts: dict[str, str] | None, emotion: str) -> str | None:
+    """Return the measured motion block for ``emotion``, falling back to the neutral block."""
+    if not motion_prompts:
+        return None
+    return motion_prompts.get(emotion) or motion_prompts.get("neutral") or None
+
+
 def _with_extra_prompt(base_prompt: str, extra_prompt: str | None) -> str:
     """Append the owner's improvement note, when they gave one."""
     extra = (extra_prompt or "").strip()
@@ -347,6 +354,7 @@ async def generate_emotion_media_for_avatar(
     proceed_despite_moderation_risk: bool = False,
     progress: ProgressCallback | None = None,
     metrics: MetricsCallback | None = None,
+    motion_prompts: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Generate and persist the full emotion set for one avatar.
 
@@ -361,6 +369,11 @@ async def generate_emotion_media_for_avatar(
         asset_kinds: Limit generation to ``still`` and/or ``idle_loop``.
         extra_prompt: Owner note appended to each generation prompt, for a
             targeted redo ("make the blink slower").
+        motion_prompts: The person's measured motion block per emotion (see
+            ``src/anubis/utils/motion/motion_prompt.py``), keyed by emotion
+            with ``neutral`` as the fallback. A still takes the carriage lines;
+            an idle loop replaces its generic breathe-blink-fidget clause with
+            the block. ``None`` or an empty dict means the generic prompts.
         subject: What the reference depicts (``person``,
             ``stylized_character``, ``non_human``); picks the prompt family.
             ``None`` means ``person``.
@@ -541,7 +554,10 @@ async def generate_emotion_media_for_avatar(
             failures.append(_not_attempted(emotion, ASSET_KIND_STILL))
             return
         prompt = _with_extra_prompt(
-            still_prompt_for(emotion, reference_subject), extra_prompt
+            still_prompt_for(
+                emotion, reference_subject, motion_prompt=_motion_prompt_for(motion_prompts, emotion)
+            ),
+            extra_prompt,
         )
         try:
             result = await xai_client.edit_image(
@@ -624,7 +640,10 @@ async def generate_emotion_media_for_avatar(
             )
             return
         prompt = _with_extra_prompt(
-            idle_loop_prompt_for(emotion, reference_subject), extra_prompt
+            idle_loop_prompt_for(
+                emotion, reference_subject, motion_prompt=_motion_prompt_for(motion_prompts, emotion)
+            ),
+            extra_prompt,
         )
         try:
             result = await xai_client.generate_idle_loop(

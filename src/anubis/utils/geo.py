@@ -26,8 +26,10 @@ from typing import Any, Iterable
 
 GEO_LOCATION_METADATA_KEY = "geo_location"
 DEFAULT_GEOFENCE_RADIUS_METERS = 50
-MIN_GEOFENCE_RADIUS_METERS = 5
+# One metre is a doorway — the smallest public arrival area.
+MIN_GEOFENCE_RADIUS_METERS = 1
 MAX_GEOFENCE_RADIUS_METERS = 5000
+GEOFENCE_RADIUS_PRECISION_METERS = 0.01
 EARTH_RADIUS_METERS = 6_371_000.0
 
 
@@ -51,14 +53,23 @@ def validate_coordinates(latitude: Any, longitude: Any) -> tuple[float, float]:
     return latitude_value, longitude_value
 
 
-def validate_geofence_radius(radius_meters: Any) -> int:
-    """Return the geofence radius in whole meters, defaulting when unset."""
+def validate_geofence_radius(radius_meters: Any) -> float:
+    """Return the geofence radius in metres, defaulting when unset.
+
+    One metre is a doorway. Values are stored to the nearest centimetre so a
+    typed 1 m survives the round-trip.
+    """
     if radius_meters is None:
-        return DEFAULT_GEOFENCE_RADIUS_METERS
+        return float(DEFAULT_GEOFENCE_RADIUS_METERS)
     try:
-        radius_value = int(radius_meters)
+        radius_value = float(radius_meters)
     except (TypeError, ValueError):
-        raise GeoLocationError("geofence_radius_meters must be a whole number of meters.")
+        raise GeoLocationError("geofence_radius_meters must be a number of meters.")
+    if math.isnan(radius_value) or math.isinf(radius_value):
+        raise GeoLocationError("geofence_radius_meters must be a number of meters.")
+    radius_value = round(radius_value / GEOFENCE_RADIUS_PRECISION_METERS) * (
+        GEOFENCE_RADIUS_PRECISION_METERS
+    )
     if not (MIN_GEOFENCE_RADIUS_METERS <= radius_value <= MAX_GEOFENCE_RADIUS_METERS):
         raise GeoLocationError(
             f"geofence_radius_meters must be between {MIN_GEOFENCE_RADIUS_METERS} "

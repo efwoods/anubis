@@ -27,6 +27,10 @@ VENDOR_COINBASE = "coinbase"
 
 GOOGLE_MAIL_SCOPE = "https://mail.google.com/"
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+# Read and write on the events of every calendar the owner can reach. Google
+# classes this as SENSITIVE, not restricted, so it needs ordinary verification
+# to pass the hundred-user cap and no security assessment.
+GOOGLE_CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GOOGLE_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
 GOOGLE_YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 GOOGLE_IDENTITY_SCOPES: tuple[str, ...] = ("openid", "email")
@@ -111,6 +115,7 @@ OAUTH_PROVIDERS: dict[str, OAuthProviderConfig] = {
             *GOOGLE_IDENTITY_SCOPES,
             GOOGLE_MAIL_SCOPE,
             GOOGLE_CALENDAR_SCOPE,
+            GOOGLE_CALENDAR_EVENTS_SCOPE,
             GOOGLE_ANALYTICS_SCOPE,
             GOOGLE_YOUTUBE_SCOPE,
         ),

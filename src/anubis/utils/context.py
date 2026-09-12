@@ -387,6 +387,136 @@ class GlobalContext:
         },
     )
 
+    standardized_question_analysis_enabled: str = field(
+        default="FALSE",
+        metadata={
+            "description": "TRUE to let the standardized-question analyzer run. It asks the whole standardized identity question bank about a document, which is roughly two hundred structured-output calls for that one document, so it is off by default and is narrowed to biographical documents by the analysis_scaffolds metadata key. Env STANDARDIZED_QUESTION_ANALYSIS_ENABLED."
+        },
+    )
+
+    """ <Psychological analysis (passive latent-feature analysis of the target)> """
+
+    enable_psychological_analysis: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to run the psycho_analysis_graph branch of process_media_graph, which reads the target's latent psychology (love languages, emotional triggers in dialogue, attachment style, values, moral foundations, typology, defenses, drives, conversational habits) from uploaded media and writes the consolidated psychological profile injected into the avatar's system prompt. FALSE skips the branch; every other upload stage is unaffected. Env ENABLE_PSYCHOLOGICAL_ANALYSIS."
+        },
+    )
+
+    psychological_analysis_concurrency: int = field(
+        default=6,
+        metadata={
+            "description": "Maximum psychological dimensions analyzed in parallel per upload. Every dimension is one structured-output call per selected document, so this bounds the fan-out of a single upload against the model provider's rate limit. Env PSYCHOLOGICAL_ANALYSIS_CONCURRENCY."
+        },
+    )
+
+    psychological_analysis_dimensions: str = field(
+        default=None,
+        metadata={
+            "description": "Comma-separated list of psychological dimensions to analyze, naming keys of the dimension registry in src/subgraphs/psycho_analysis_graph/utils/dimensions.py (for example love_languages,attachment_style). Empty runs every registered dimension except the ones disabled by their own flag. Env PSYCHOLOGICAL_ANALYSIS_DIMENSIONS."
+        },
+    )
+
+    psychological_analysis_max_documents: int = field(
+        default=6,
+        metadata={
+            "description": "Maximum documents from one upload that the psychological analysis reads. Every document costs one structured-output call per dimension, so this is the single biggest lever on what an upload costs: at six documents and twelve dimensions an upload spends seventy-two calls. The dimensions describe stable traits, so reading every chunk of a long transcript pays many times over to reach the same conclusion and produces near-duplicate findings; the selection keeps the documents richest in the target's own words. Env PSYCHOLOGICAL_ANALYSIS_MAX_DOCUMENTS."
+        },
+    )
+
+    enable_dark_trait_analysis: str = field(
+        default="FALSE",
+        metadata={
+            "description": "TRUE to let the dark-trait dimension (Machiavellianism, narcissism, psychopathy, sadism) run. Off by default: the reading is easy to draw from thin evidence and it is not needed to reproduce how a person actually speaks. Env ENABLE_DARK_TRAIT_ANALYSIS."
+        },
+    )
+
+    psychological_profile_max_characters: int = field(
+        default=6000,
+        metadata={
+            "description": "Ceiling on the rendered psychological profile injected into the avatar's system prompt. The profile is loaded on every turn, so an unbounded profile would grow the billed input tokens of every message. Env PSYCHOLOGICAL_PROFILE_MAX_CHARACTERS."
+        },
+    )
+
+    current_emotion_decay_hours: float = field(
+        default=6.0,
+        metadata={
+            "description": "Half-life in hours over which the avatar's current emotional state decays back toward the baseline emotional profile read from the uploaded media. Zero disables decay, so the state holds until the next conversation moves it. Env CURRENT_EMOTION_DECAY_HOURS."
+        },
+    )
+
+    current_emotion_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to track the avatar's current emotional state across a conversation and render it into the YOUR EMOTIONS section of the system prompt. The state is refreshed inside the existing observe_user branch and adds no model call. Env CURRENT_EMOTION_ENABLED."
+        },
+    )
+
+    """ <AI monitoring (content moderation and account bans)> """
+
+    content_moderation_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to screen every message and every uploaded document against the terms of service and the privacy policy; a confirmed violation bans the account. FALSE disables both the inline screen and the background judge. Env CONTENT_MODERATION_ENABLED."
+        },
+    )
+
+    content_moderation_fast_screen_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to run the OpenAI moderation endpoint as the inline first pass on every message. It is free and answers in roughly a tenth of a second, so it is the only moderation stage allowed on the critical path of a reply. Env CONTENT_MODERATION_FAST_SCREEN_ENABLED."
+        },
+    )
+
+    content_moderation_fast_screen_model: str = field(
+        default="omni-moderation-latest",
+        metadata={
+            "description": "The OpenAI moderation model used for the inline first pass. Moderation is an OpenAI-only API, so this is used regardless of MODEL_PROVIDER, reading OPENAI_API_KEY and falling back to the general provider key. Env CONTENT_MODERATION_FAST_SCREEN_MODEL."
+        },
+    )
+
+    content_moderation_fast_screen_threshold: float = field(
+        default=0.9,
+        metadata={
+            "description": "Category score, from zero to one, at or above which the inline screen refuses the turn outright instead of deferring to the background judge. Lower catches more and refuses more false positives; the value is clamped into the endpoint's own zero-to-one range. Env CONTENT_MODERATION_FAST_SCREEN_THRESHOLD."
+        },
+    )
+
+    content_moderation_deep_judge_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to run the structured-output terms-of-service and privacy-policy judge. On the chat path it runs after the reply has streamed, so it never costs the reader latency; on the upload path it gates indexing. Env CONTENT_MODERATION_DEEP_JUDGE_ENABLED."
+        },
+    )
+
+    content_moderation_max_characters: int = field(
+        default=6000,
+        metadata={
+            "description": "Characters per judge window. Long documents are judged in windows of this size, up to a bounded number of windows, so one very large upload cannot cost an unbounded classification call. Env CONTENT_MODERATION_MAX_CHARACTERS."
+        },
+    )
+
+    content_moderation_concurrency: int = field(
+        default=4,
+        metadata={
+            "description": "Maximum documents judged in parallel when an upload is moderated. Env CONTENT_MODERATION_CONCURRENCY."
+        },
+    )
+
+    ban_refund_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to cancel the banned account's Stripe subscription and refund the latest paid invoice when a ban is recorded. Env BAN_REFUND_ENABLED."
+        },
+    )
+
+    ban_appeal_contact_email: str = field(
+        default="contact@neuralnexus.site",
+        metadata={
+            "description": "The address a banned person is told to contact to appeal the ban. Env BAN_APPEAL_CONTACT_EMAIL."
+        },
+    )
+
     audio_transcription_model: str = field(
         default=None, metadata={"description": "Audio transcription model name."}
     )
@@ -456,6 +586,59 @@ class GlobalContext:
     )
 
     """ </Stylistic + Knowledge Profile thresholds> """
+
+    """ <Signature key-phrase discovery> """
+
+    key_phrase_judgement_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE runs the language-model judge that separates a speaker's style markers from their subject matter after the statistical shortlist is built. FALSE keeps the shortlist unjudged, which is the rollback. Env KEY_PHRASE_JUDGEMENT_ENABLED."
+        },
+    )
+    key_phrase_judgement_batch_size: int = field(
+        default=20,
+        metadata={
+            "description": "How many candidate phrases each structured-output judging call classifies. Kept modest because a structured-output call does not reliably return one record per input and stops early on long answers; candidates a round leaves out are re-asked with the batch halved. Env KEY_PHRASE_JUDGEMENT_BATCH_SIZE."
+        },
+    )
+    key_phrase_judgement_concurrency: int = field(
+        default=4,
+        metadata={
+            "description": "How many judging calls may run at once. Env KEY_PHRASE_JUDGEMENT_CONCURRENCY."
+        },
+    )
+    key_phrase_judgement_timeout_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Ceiling on the whole judging fan-out. Exceeding it falls back to the statistical shortlist rather than consuming the much larger ground-truth calibration budget. Env KEY_PHRASE_JUDGEMENT_TIMEOUT_SECONDS."
+        },
+    )
+    key_phrase_candidate_shortlist_size: int = field(
+        default=200,
+        metadata={
+            "description": "How many statistically-selected candidates are handed to the judge. This is the direct cost dial for judging. Env KEY_PHRASE_CANDIDATE_SHORTLIST_SIZE."
+        },
+    )
+    key_phrase_profile_maximum_phrases: int = field(
+        default=25,
+        metadata={
+            "description": "Hard ceiling on how many signature phrases are stored for one avatar. The set is re-ranked and capped on every calibration rather than accumulated, so this bounds growth across uploads. Env KEY_PHRASE_PROFILE_MAXIMUM_PHRASES."
+        },
+    )
+    key_phrase_prompt_maximum_phrases: int = field(
+        default=25,
+        metadata={
+            "description": "Ceiling on how many signature phrases are rendered into the SIGNATURE PHRASES system-prompt section. Also bounds phrase lists stored before the ceiling existed. Env KEY_PHRASE_PROMPT_MAXIMUM_PHRASES."
+        },
+    )
+    key_phrase_incumbency_score_bonus: float = field(
+        default=0.25,
+        metadata={
+            "description": "Score bonus, in log-ratio units, given to a phrase already stored for this avatar so the capped list does not oscillate when two phrases score almost identically. Zero disables it. Env KEY_PHRASE_INCUMBENCY_SCORE_BONUS."
+        },
+    )
+
+    """ </Signature key-phrase discovery> """
 
     """ <Deep Agent (think node) tuning> """
 
@@ -908,6 +1091,136 @@ class GlobalContext:
         },
     )
 
+    """ <Content subscriptions: the personal avatar's own accounts, crawled and subscribed> """
+
+    social_webhook_callback_base_url: str = field(
+        default=None,
+        metadata={
+            "description": "Public https base address platforms call when the owner publishes, e.g. https://api.example.com. The callback becomes <base>/social_webhook/<provider>. Must be reachable from the public internet: in development this is a tunnel address, and leaving it empty disables every push transport (notification transports still work). Env SOCIAL_WEBHOOK_CALLBACK_BASE_URL."
+        },
+    )
+
+    social_webhook_lease_seconds: int = field(
+        default=432000,
+        metadata={
+            "description": "Lease length requested from a WebSub hub, in seconds. A lease that lapses stops delivering silently, so the renewal task refreshes each one before this elapses. Env SOCIAL_WEBHOOK_LEASE_SECONDS."
+        },
+    )
+
+    social_subscription_renewal_interval_seconds: float = field(
+        default=3600.0,
+        metadata={
+            "description": "How often the renewal task looks for leases about to expire. This is a timer over stored expiry times, not a poll of any platform. Env SOCIAL_SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS."
+        },
+    )
+
+    social_subscription_renewal_margin_seconds: float = field(
+        default=86400.0,
+        metadata={
+            "description": "How long before a lease expires it is renewed. Generous on purpose: a missed renewal is invisible until the owner notices content has stopped arriving. Env SOCIAL_SUBSCRIPTION_RENEWAL_MARGIN_SECONDS."
+        },
+    )
+
+    social_crawl_max_items_free: int = field(
+        default=5,
+        metadata={
+            "description": "Most items the initial crawl may ingest for a free-tier owner. Every item costs a transcription or description call, so this is a spending limit rather than a quality setting. Env SOCIAL_CRAWL_MAX_ITEMS_FREE."
+        },
+    )
+
+    social_crawl_max_items_pro: int = field(
+        default=50,
+        metadata={
+            "description": "Most items the initial crawl may ingest for a pro-tier owner. Env SOCIAL_CRAWL_MAX_ITEMS_PRO."
+        },
+    )
+
+    social_crawl_max_items_premium: int = field(
+        default=300,
+        metadata={
+            "description": "Most items the initial crawl may ingest for a premium-tier owner. Env SOCIAL_CRAWL_MAX_ITEMS_PREMIUM."
+        },
+    )
+
+    social_crawl_max_depth: int = field(
+        default=3,
+        metadata={
+            "description": "How many levels out from the account's own profile the breadth-first crawl may walk. Each level multiplies, and the material actually belonging to the person is concentrated in the first two. Env SOCIAL_CRAWL_MAX_DEPTH."
+        },
+    )
+
+    social_crawl_max_nodes: int = field(
+        default=200,
+        metadata={
+            "description": "Ceiling on addresses one crawl may visit, counting pages that are judged and then pruned. Bounds the relevance calls, which are paid for whether or not the page is kept. Env SOCIAL_CRAWL_MAX_NODES."
+        },
+    )
+
+    social_crawl_relevance_minimum_score: float = field(
+        default=0.5,
+        metadata={
+            "description": "How strongly a page must belong to the avatar's person before it is ingested and its links followed, from 0 to 1. Raising it makes the crawl stricter about what counts as the person's own content. Env SOCIAL_CRAWL_RELEVANCE_MINIMUM_SCORE."
+        },
+    )
+
+    require_social_proof_for_sharing: str = field(
+        default="false",
+        metadata={
+            "description": "Whether sharing a personal avatar requires at least one social account proven to belong to the owner. Sharing a likeness is a claim about a real person, and a proven account is what backs that claim. Turning this on refuses sharing for an already-shared avatar that has no connected social account, so enable it deliberately. Env REQUIRE_SOCIAL_PROOF_FOR_SHARING."
+        },
+    )
+
+    imap_idle_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether connected mailboxes are watched with IMAP IDLE, so a new message wakes triage in seconds instead of at the next poll. Servers that refuse IDLE fall back to the interval poll on their own. Env IMAP_IDLE_ENABLED."
+        },
+    )
+
+    imap_idle_refresh_seconds: float = field(
+        default=1500.0,
+        metadata={
+            "description": "How often an IDLE connection is renewed. The IMAP specification requires a client to re-issue IDLE at least every 29 minutes, so this stays below that. Env IMAP_IDLE_REFRESH_SECONDS."
+        },
+    )
+
+    twitch_client_id: str = field(
+        default=None,
+        metadata={
+            "description": "Twitch application client id, used to register EventSub subscriptions for the owner's own channel. Empty means Twitch notices are read from the owner's mailbox instead. Env TWITCH_CLIENT_ID."
+        },
+    )
+
+    twitch_app_access_token: str = field(
+        default=None,
+        metadata={
+            "description": "Twitch application access token for EventSub registration. Env TWITCH_APP_ACCESS_TOKEN."
+        },
+    )
+
+    twitch_eventsub_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Fallback secret for verifying Twitch EventSub deliveries when a subscription carries none of its own. Env TWITCH_EVENTSUB_SECRET."
+        },
+    )
+
+    meta_webhook_verify_token: str = field(
+        default=None,
+        metadata={
+            "description": "Token Meta echoes when verifying the Instagram and Facebook webhook callback. Env META_WEBHOOK_VERIFY_TOKEN."
+        },
+    )
+
+    meta_app_secret: str = field(
+        default=None,
+        metadata={
+            "description": "Meta application secret, used to verify the signature on Instagram and Facebook deliveries. Env META_APP_SECRET."
+        },
+    )
+
+    """ </Content subscriptions: the personal avatar's own accounts, crawled and subscribed> """
+
     """ </Connected accounts (mailbox and social) for the personal avatar> """
 
     """ <Emotion media generation (xAI images and idle-loop videos)> """
@@ -998,6 +1311,17 @@ class GlobalContext:
 
     """ </Emotion media generation (xAI images and idle-loop videos)> """
 
+    """ <Remote URL fetching> """
+
+    url_fetch_allow_private_hosts: str = field(
+        default="false",
+        metadata={
+            "description": "Whether the API may download a URL whose host resolves to an address inside this deployment's network. Off in every deployment that faces the internet: a URL chosen by a search engine or a language model must never be able to reach the container's own services or the cloud metadata endpoint. Turn it on only in development, and only when a test fixture is served from localhost. Env URL_FETCH_ALLOW_PRIVATE_HOSTS."
+        },
+    )
+
+    """ </Remote URL fetching> """
+
     """ <Deep research with web-based fact verification> """
 
     deep_research_enabled: str = field(
@@ -1067,6 +1391,111 @@ class GlobalContext:
         default=4,
         metadata={
             "description": "Concurrent page reads and fact-extraction calls per researcher. Env DEEP_RESEARCH_CONCURRENCY."
+        },
+    )
+
+    research_on_create_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether creating an avatar starts a deep-research job for that avatar on its own. Switching this off leaves the manual 'Research & verify facts' button working exactly as before; only the automatic trigger stops. Env RESEARCH_ON_CREATE_ENABLED."
+        },
+    )
+
+    personal_avatar_research_on_naming_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether giving the personal avatar a real person's name starts one deep-research job for the account holder. Separate from RESEARCH_ON_CREATE_ENABLED because this trigger researches the account holder rather than a character the account holder invented. The run happens at most once per personal avatar, and a name that is only the email local part never starts one. Env PERSONAL_AVATAR_RESEARCH_ON_NAMING_ENABLED."
+        },
+    )
+
+    conversation_starters_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the standard set of three conversation starters is generated once per avatar and stored on the assistant record (metadata.conversation_starters): on avatar creation, again when deep research finishes, and on the owner's request through POST /avatar/{assistant_id}/conversation_starters. Switching this off stops the generation and the storage; the browser then paints its local identity-leaned starters. Env CONVERSATION_STARTERS_ENABLED."
+        },
+    )
+
+    research_account_discovery_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether a finished research run asks the owner, through the agent inbox, about the accounts that run turned up. Switching this off leaves the research itself untouched and stops only the questions. Env RESEARCH_ACCOUNT_DISCOVERY_ENABLED."
+        },
+    )
+
+    research_account_discovery_maximum: int = field(
+        default=3,
+        metadata={
+            "description": "Ceiling on how many account questions one research run may put in the owner's inbox. Each question is one item waiting on the owner, so the ceiling is about the owner's attention rather than about cost. Env RESEARCH_ACCOUNT_DISCOVERY_MAXIMUM."
+        },
+    )
+
+    conversation_training_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether what a person types or says to Neural Nexus is used, like anything else that person gives the product, to build that person's own avatar. The words are read from the conversations already stored and never copied anywhere; switching this off stops the reading. Env CONVERSATION_TRAINING_ENABLED."
+        },
+    )
+
+    speaker_quote_minimum_characters: int = field(
+        default=40,
+        metadata={
+            "description": "Shortest message that counts as a quote of the person who wrote it. A turn below this length is read past when the person's own words are gathered, so 'ok' and 'yes' never reach the style profile or the training data. Env SPEAKER_QUOTE_MINIMUM_CHARACTERS."
+        },
+    )
+
+    deep_research_bootstrap_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether a deep-research run may acquire the reference image and reference audio an avatar is missing. Switching this off leaves fact research untouched and stops every image download, video probe, and transcription the acquisition would have started. Env DEEP_RESEARCH_BOOTSTRAP_ENABLED."
+        },
+    )
+
+    deep_research_bootstrap_max_image_candidates: int = field(
+        default=8,
+        metadata={
+            "description": "Ceiling on how many candidate photographs one avatar's acquisition may download and put in front of the vision model before giving up on finding a portrait. Each candidate costs one download and one vision call. Env DEEP_RESEARCH_BOOTSTRAP_MAX_IMAGE_CANDIDATES."
+        },
+    )
+
+    deep_research_bootstrap_image_max_bytes: int = field(
+        default=10485760,
+        metadata={
+            "description": "Largest candidate photograph the acquisition will download, in bytes. Deliberately tighter than the 25 MiB ceiling on a person's own upload, because this URL came from a search engine rather than from the account holder. Env DEEP_RESEARCH_BOOTSTRAP_IMAGE_MAX_BYTES."
+        },
+    )
+
+    deep_research_bootstrap_min_portrait_confidence: float = field(
+        default=0.7,
+        metadata={
+            "description": "How sure the vision model must be that a candidate photograph shows the named subject before that photograph becomes the avatar's reference image. Below this the candidate is rejected and the next one is tried. Env DEEP_RESEARCH_BOOTSTRAP_MIN_PORTRAIT_CONFIDENCE."
+        },
+    )
+
+    deep_research_bootstrap_max_video_candidates: int = field(
+        default=6,
+        metadata={
+            "description": "Ceiling on how many candidate videos one avatar's acquisition may probe for duration and title before choosing the recording to learn the voice from. Each probe is a yt_dlp metadata call and downloads nothing. Env DEEP_RESEARCH_BOOTSTRAP_MAX_VIDEO_CANDIDATES."
+        },
+    )
+
+    deep_research_bootstrap_min_video_seconds: float = field(
+        default=120.0,
+        metadata={
+            "description": "Shortest candidate video the acquisition will accept as the voice source. A clip below this rarely holds enough of the subject speaking to seed a voice model. Env DEEP_RESEARCH_BOOTSTRAP_MIN_VIDEO_SECONDS."
+        },
+    )
+
+    deep_research_bootstrap_max_video_seconds: float = field(
+        default=2400.0,
+        metadata={
+            "description": "Longest candidate video the acquisition will accept as the voice source. This is the ceiling on what one automatically created avatar may cost in transcription and diarization, so it is the main cost bound on acquisition running for every tier. Env DEEP_RESEARCH_BOOTSTRAP_MAX_VIDEO_SECONDS."
+        },
+    )
+
+    deep_research_bootstrap_media_wait_seconds: float = field(
+        default=900.0,
+        metadata={
+            "description": "How long the acquisition waits for the media job it started to finish before reporting the asset as still pending. The media job carries on regardless; this only decides when the research run stops watching it. Env DEEP_RESEARCH_BOOTSTRAP_MEDIA_WAIT_SECONDS."
         },
     )
 
@@ -1172,6 +1601,34 @@ class GlobalContext:
         },
     )
 
+    voice_mode_capture_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "Whether speaking to a personal avatar in voice mode accrues the owner's speech to that avatar's voice corpus. Accrual additionally requires a stored reference audio clip and the owner's consent. Env VOICE_MODE_CAPTURE_ENABLED."
+        },
+    )
+
+    voice_mode_capture_min_segment_seconds: float = field(
+        default=1.0,
+        metadata={
+            "description": "Shortest owner segment in a spoken turn that is worth keeping for the voice corpus. Shorter windows are mostly onset and release and make a clone worse. Env VOICE_MODE_CAPTURE_MIN_SEGMENT_SECONDS."
+        },
+    )
+
+    voice_mode_capture_max_seconds_per_turn: float = field(
+        default=30.0,
+        metadata={
+            "description": "Most seconds one spoken turn may contribute to the voice corpus, so a single long monologue cannot dominate the clone. Env VOICE_MODE_CAPTURE_MAX_SECONDS_PER_TURN."
+        },
+    )
+
+    instant_voice_refresh_at_target_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "Whether an instant voice clone built from less than ELEVENLABS_INSTANT_VOICE_CLONE_TARGET_SECONDS is rebuilt once, the first time the corpus reaches that target. Env INSTANT_VOICE_REFRESH_AT_TARGET_ENABLED."
+        },
+    )
+
     """ </Voice cloning and speech (ElevenLabs)> """
 
     """ <Agent inbox (triage of incoming messages for the personal avatar)> """
@@ -1206,6 +1663,80 @@ class GlobalContext:
 
     """ </Agent inbox (triage of incoming messages for the personal avatar)> """
 
+    """ <Group conversations (Slack, Discord, Twitch)> """
+
+    group_conversation_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Process-wide switch for the avatar taking part in group conversations. When this is not true, the /groups routes answer 404 and no bot can reach the triage graph. Env GROUP_CONVERSATION_ENABLED."
+        },
+    )
+
+    group_conversation_concurrency: int = field(
+        default=4,
+        metadata={
+            "description": "How many messages from one batch are decided in parallel. Each message is one graph run, so this bounds the model calls a single busy room can start at once. Env GROUP_CONVERSATION_CONCURRENCY."
+        },
+    )
+
+    group_max_events_per_request: int = field(
+        default=100,
+        metadata={
+            "description": "Ceiling on the messages one bot may send in a single batch; a larger batch is refused rather than truncated, so a bot is never left believing messages were decided when the messages were dropped. Env GROUP_MAX_EVENTS_PER_REQUEST."
+        },
+    )
+
+    group_auto_respond_confidence: float = field(
+        default=0.9,
+        metadata={
+            "description": "Confidence at or above which the avatar posts a reply in a room without being asked and without the owner seeing the reply first. Below it, the reply waits for the owner. Env GROUP_AUTO_RESPOND_CONFIDENCE."
+        },
+    )
+
+    group_auto_moderate_confidence: float = field(
+        default=0.97,
+        metadata={
+            "description": "Confidence at or above which the avatar carries out a moderation action without the owner. Higher than the reply threshold because moderating somebody is harder to undo than saying something. A timeout or a ban additionally requires the owner to have allowed that same action in that same room before, whatever this value is. Env GROUP_AUTO_MODERATE_CONFIDENCE."
+        },
+    )
+
+    group_recent_events_for_triage: int = field(
+        default=12,
+        metadata={
+            "description": "How many preceding messages from the room are handed to the classifier as context, so the avatar reads the room rather than one line out of context. Env GROUP_RECENT_EVENTS_FOR_TRIAGE."
+        },
+    )
+
+    group_precedent_recall_limit: int = field(
+        default=8,
+        metadata={
+            "description": "How many of the owner's rules and past decisions are retrieved by similarity for each message being decided. Env GROUP_PRECEDENT_RECALL_LIMIT."
+        },
+    )
+
+    group_auto_react_confidence: float = field(
+        default=0.75,
+        metadata={
+            "description": "Confidence at or above which the avatar adds an emoji reaction without being asked. Deliberately lower than the reply threshold: a reaction is cheap to be wrong about and is most of what makes somebody feel present in a room, whereas an avatar that only reacts when it is nearly certain reacts almost never. Env GROUP_AUTO_REACT_CONFIDENCE."
+        },
+    )
+
+    group_follow_up_max_delay_seconds: int = field(
+        default=86400,
+        metadata={
+            "description": "The longest the avatar may defer something it said it would come back to. A follow-up further out than this is clamped, because an avatar that resurfaces a week-old message reads as broken rather than conscientious. Env GROUP_FOLLOW_UP_MAX_DELAY_SECONDS."
+        },
+    )
+
+    group_history_catch_up_messages: int = field(
+        default=50,
+        metadata={
+            "description": "How many messages a bot reads back when the avatar joins a room or returns after being offline, so the avatar comes back knowing what it missed rather than starting blank. Env GROUP_HISTORY_CATCH_UP_MESSAGES."
+        },
+    )
+
+    """ </Group conversations (Slack, Discord, Twitch)> """
+
     """ <Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
     ambient_capture_enabled: str = field(
@@ -1236,7 +1767,278 @@ class GlobalContext:
         },
     )
 
+    ambient_respond_salience_floor: float = field(
+        default=0.55,
+        metadata={
+            "description": "Least salience, from zero to one, at which a triaged ambient observation classified 'respond' is allowed to reach the avatar and become a spoken reply. A 'respond' below this floor is demoted to 'ignore': the observation is still kept as hidden conversation context, but the avatar says nothing. Raise this floor to make the avatar speak up less often about what the avatar notices. Env AMBIENT_RESPOND_SALIENCE_FLOOR."
+        },
+    )
+
+    ambient_notify_salience_floor: float = field(
+        default=0.70,
+        metadata={
+            "description": "Least salience, from zero to one, at which a triaged ambient observation classified 'notify' is allowed to become a notification card. This floor is higher than AMBIENT_RESPOND_SALIENCE_FLOOR because a card interrupts the conversation partner more than a spoken reply does. A 'notify' below this floor is demoted to 'ignore'. Env AMBIENT_NOTIFY_SALIENCE_FLOOR."
+        },
+    )
+
+    ambient_respond_cooldown_seconds: float = field(
+        default=300.0,
+        metadata={
+            "description": "Seconds of quiet required on one conversation thread after the avatar speaks about something the avatar noticed, before another ambient observation on that same thread may become a reply or a notification card. This cooldown bounds how often ambient vision can interrupt regardless of what the classifier decides; an observation refused by the cooldown is demoted to 'ignore' and kept as hidden context. Env AMBIENT_RESPOND_COOLDOWN_SECONDS."
+        },
+    )
+
+    ambient_respond_cooldown_override_salience: float = field(
+        default=0.90,
+        metadata={
+            "description": "Salience, from zero to one, at or above which an ambient observation ignores AMBIENT_RESPOND_COOLDOWN_SECONDS and reaches the conversation partner anyway. This exists so that something genuinely urgent the avatar notices is not silenced by a cooldown started by an ordinary remark. Env AMBIENT_RESPOND_COOLDOWN_OVERRIDE_SALIENCE."
+        },
+    )
+
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
+
+    """ <Scene narration (the accessibility mode: what is in view, read aloud)> """
+
+    scene_narration_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the avatar may switch on scene narration, the accessibility mode in which the conversation partner's outward-facing camera is described continuously and every description is read aloud to them. Set to false to withhold the set_scene_narration tool from every turn; observations already flowing are unaffected. Env SCENE_NARRATION_ENABLED."
+        },
+    )
+
+    scene_narration_min_interval_seconds: float = field(
+        default=3.0,
+        metadata={
+            "description": "Server-side floor, in seconds, between two observations on one conversation thread while scene narration is on. Lower than AMBIENT_CAPTURE_MIN_INTERVAL_SECONDS on purpose: an ordinary ambient look is context the avatar may never use, while a narration look is an answer somebody is waiting for, often while walking. The browser paces itself with VITE_SCENE_NARRATION_INTERVAL_SECONDS. Env SCENE_NARRATION_MIN_INTERVAL_SECONDS."
+        },
+    )
+
+    """ </Scene narration (the accessibility mode: what is in view, read aloud)> """
+
+    """ <Motion wireframe (how the person moves)> """
+
+    motion_learning_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether motion tracks (named body joints and the face mesh through time) are recorded and folded into the avatar's motion profile, from the live camera, from uploaded video, or from a decoder. Set to false to refuse every motion window while leaving the rest of the platform untouched. Env MOTION_LEARNING_ENABLED."
+        },
+    )
+
+    motion_landmark_set_version: str = field(
+        default="mediapipe_body33_face478_v1",
+        metadata={
+            "description": "The landmark set new tracks are written against (see src/anubis/utils/motion/landmarks.py). Old rows keep the version they were written with and stay decodable; bump this when a denser set (hands, iris, a decoder's limb set) is registered. Env MOTION_LANDMARK_SET_VERSION."
+        },
+    )
+
+    motion_face_sample_rate_hz: float = field(
+        default=30.0,
+        metadata={
+            "description": "Face-mesh frames per second recorded from uploaded video. Micro-expressions last 40 to 200 milliseconds, so a rate under about 25 Hz aliases them away. The browser paces itself with VITE_MOTION_FACE_FPS. Env MOTION_FACE_SAMPLE_RATE_HZ."
+        },
+    )
+
+    motion_body_sample_rate_hz: float = field(
+        default=15.0,
+        metadata={
+            "description": "Body-joint frames per second recorded from uploaded video; gestures are slower than expressions, so half the face rate is enough. The browser paces itself with VITE_MOTION_BODY_FPS. Env MOTION_BODY_SAMPLE_RATE_HZ."
+        },
+    )
+
+    motion_track_window_seconds: float = field(
+        default=10.0,
+        metadata={
+            "description": "How many seconds of motion one window holds. Windows are the unit every source sends and the unit primitives are cut from; the browser flushes one per VITE_MOTION_TRACK_WINDOW_SECONDS onto the ambient observation it already sends. Env MOTION_TRACK_WINDOW_SECONDS."
+        },
+    )
+
+    motion_track_max_bytes: int = field(
+        default=4_000_000,
+        metadata={
+            "description": "Largest motion window accepted from a client, in bytes of decoded buffers; a dense bootstrap window of ten seconds with the full face mesh at 30 Hz is about 900 KB, a basis-encoded window about 40 KB. Larger windows receive 413. Env MOTION_TRACK_MAX_BYTES."
+        },
+    )
+
+    motion_track_retention_seconds_per_avatar: float = field(
+        default=600.0,
+        metadata={
+            "description": "How many seconds of compact motion track to keep per avatar per emotion; older tracks are pruned first. At roughly 376 bytes a frame this is a few megabytes per avatar, smaller than one idle-loop clip. Env MOTION_TRACK_RETENTION_SECONDS_PER_AVATAR."
+        },
+    )
+
+    motion_golden_seconds_per_avatar: float = field(
+        default=120.0,
+        metadata={
+            "description": "How many seconds of raw, uncompressed face mesh to keep per avatar as the golden set: the ground truth the expression basis is fitted from, and what a denser landmark set or a future motion-transfer model would train on. Curated for identity confidence and emotion coverage, not recency. Env MOTION_GOLDEN_SECONDS_PER_AVATAR."
+        },
+    )
+
+    motion_basis_components: int = field(
+        default=48,
+        metadata={
+            "description": "How many principal components the per-avatar expression basis keeps. Forty-eight coefficients stand in for the 1,434 values of a 478-point mesh frame; the reconstruction error is recorded on the basis row. Env MOTION_BASIS_COMPONENTS."
+        },
+    )
+
+    motion_basis_min_seconds: float = field(
+        default=60.0,
+        metadata={
+            "description": "Seconds of golden face mesh needed before the first expression basis is fitted for an avatar. Until then dense windows are kept whole; the browser sends dense windows only during this bootstrap and coefficient windows afterwards. Env MOTION_BASIS_MIN_SECONDS."
+        },
+    )
+
+    motion_primitive_max_count: int = field(
+        default=8,
+        metadata={
+            "description": "How many recurring movements (primitives) to keep per avatar per emotion per channel; the least frequent are dropped when the dictionary is full. Env MOTION_PRIMITIVE_MAX_COUNT."
+        },
+    )
+
+    motion_primitive_min_occurrences: int = field(
+        default=3,
+        metadata={
+            "description": "How many times a recurring movement must have been seen before the prompt may describe it. Env MOTION_PRIMITIVE_MIN_OCCURRENCES."
+        },
+    )
+
+    motion_signature_min_seconds: float = field(
+        default=30.0,
+        metadata={
+            "description": "Seconds of motion a scalar measurement (blink rate, resting head tilt, gesture rate) must rest on before the prompt may state it; below this the reading stays in the signature but never reaches a prompt. Env MOTION_SIGNATURE_MIN_SECONDS."
+        },
+    )
+
+    motion_identity_min_confidence: float = field(
+        default=0.8,
+        metadata={
+            "description": "Least confidence, from zero to one, the vision comparison against the reference image must report before a camera or video window is attributed to the avatar's person. Anything below is discarded, never attributed. Env MOTION_IDENTITY_MIN_CONFIDENCE."
+        },
+    )
+
+    motion_identity_reverify_seconds: float = field(
+        default=600.0,
+        metadata={
+            "description": "How long a live-camera identity verification stays valid before the next window costs another vision comparison. Env MOTION_IDENTITY_REVERIFY_SECONDS."
+        },
+    )
+
+    motion_analysis_max_video_seconds: float = field(
+        default=600.0,
+        metadata={
+            "description": "Longest span of an uploaded video that is wireframed, in seconds; the rest of a longer video is skipped for motion (its transcript and other analyses are unaffected). Landmarking is local CPU, so this caps time rather than money. Env MOTION_ANALYSIS_MAX_VIDEO_SECONDS."
+        },
+    )
+
+    motion_prompt_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the rendered motion block reaches the prompts that generate video and stills, and the avatar's HOW YOU MOVE section. Set to false to keep recording motion without letting the block drive anything. Env MOTION_PROMPT_ENABLED."
+        },
+    )
+
+    lip_sync_prompt_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the lip-sync generation sends a prompt field: the cinematic foundation line plus the person's measured motion block, which is the vendor's behavioural channel (gestures, head, gaze, demeanour on creatify-aurora). A vendor 4xx naming the field falls back to the image-and-audio-only request once and records that on the job. Env LIP_SYNC_PROMPT_ENABLED."
+        },
+    )
+
+    lip_sync_cinematic_prompt: str = field(
+        default="Medium close-up of the person, same framing, lighting, clothing and background as the supplied image. No camera movement, no zoom, no new objects.",
+        metadata={
+            "description": "The stable first line of every lip-sync prompt: framing, lighting and what must not change. The person's measured motion block is appended under it as the behavioural layer. Env LIP_SYNC_CINEMATIC_PROMPT."
+        },
+    )
+
+    motion_fidelity_check_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether a finished lip-sync or idle-loop clip is wireframed with the same extractor and scored against the person's motion profile, measurement by measurement and movement by movement, as motion_fidelity on the profile. Costs local CPU only. Env MOTION_FIDELITY_CHECK_ENABLED."
+        },
+    )
+
+    motion_model_cache_dir: str = field(
+        default="/tmp/anubis-motion-models",
+        metadata={
+            "description": "Directory the MediaPipe landmarker model files are downloaded to on first use for server-side wireframing of uploaded video. Env MOTION_MODEL_CACHE_DIR."
+        },
+    )
+
+    motion_pose_model_url: str = field(
+        default="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        metadata={
+            "description": "Where the PoseLandmarker model file is fetched from on first use. Env MOTION_POSE_MODEL_URL."
+        },
+    )
+
+    motion_face_model_url: str = field(
+        default="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        metadata={
+            "description": "Where the FaceLandmarker model file is fetched from on first use. Env MOTION_FACE_MODEL_URL."
+        },
+    )
+
+    """ </Motion wireframe (how the person moves)> """
+
+    """ Browsing Insights (what the owner's own web browsing says about the owner) """
+
+    browsing_insights_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to read the owner's browsing history from their connected machines and learn facts and traits from it. Env BROWSING_INSIGHTS_ENABLED."
+        },
+    )
+
+    browsing_insights_poll_seconds: int = field(
+        default=300,
+        metadata={
+            "description": "How often, in seconds, the background browsing sweep asks each connected machine whether any new browsing has happened. The question costs one indexed count per browser profile and no model call. Env BROWSING_INSIGHTS_POLL_SECONDS."
+        },
+    )
+
+    browsing_insights_minimum_new_visits: int = field(
+        default=25,
+        metadata={
+            "description": "How many new page visits a machine must have recorded before a background pass spends a model call on them. A first pass over a machine ignores this. Env BROWSING_INSIGHTS_MINIMUM_NEW_VISITS."
+        },
+    )
+
+    browsing_insights_minimum_seconds_between_analyses: int = field(
+        default=900,
+        metadata={
+            "description": "The shortest gap, in seconds, between two background analyses of one machine's browsing, whatever the visit count. Env BROWSING_INSIGHTS_MINIMUM_SECONDS_BETWEEN_ANALYSES."
+        },
+    )
+
+    browsing_insights_backfill_days: int = field(
+        default=30,
+        metadata={
+            "description": "How many days of existing browsing history are read the first time a machine is analysed, so a newly connected machine teaches the avatar immediately. Env BROWSING_INSIGHTS_BACKFILL_DAYS."
+        },
+    )
+
+    browsing_insights_max_visits_per_pass: int = field(
+        default=2000,
+        metadata={
+            "description": "The most page visits one pass reads from one machine; the rest are left for the next pass rather than skipped. Env BROWSING_INSIGHTS_MAX_VISITS_PER_PASS."
+        },
+    )
+
+    browsing_insights_max_digest_characters: int = field(
+        default=24000,
+        metadata={
+            "description": "The size cap, in characters, of the browsing digest one analysis reads. The digest is trimmed from the end, so the counts and the searches survive a trim. Env BROWSING_INSIGHTS_MAX_DIGEST_CHARACTERS."
+        },
+    )
+
+    browsing_insights_report_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to save a readable report to the reports list for every browsing pass that found something. Env BROWSING_INSIGHTS_REPORT_ENABLED."
+        },
+    )
+
+    """ </Browsing Insights> """
 
     """ Continuous Learning & Personalization """
 
@@ -1279,6 +2081,36 @@ class GlobalContext:
         default="TRUE",
         metadata={
             "description": "TRUE to refresh the structured sentiment summary of the current conversation on every user turn (one classification-model call per turn). Env CONVERSATION_SENTIMENT_PER_TURN_ENABLED."
+        },
+    )
+
+    """ <Automatic conversation naming (sidebar titles written by the messaging service)> """
+
+    conversation_title_enabled: str = field(
+        default="TRUE",
+        metadata={
+            "description": "TRUE to let the messaging service name a conversation from its transcript: once when the conversation is started, and again when the reader leaves the conversation. FALSE leaves every thread unnamed unless the reader types a name. Env CONVERSATION_TITLE_ENABLED."
+        },
+    )
+
+    conversation_title_max_characters: int = field(
+        default=60,
+        metadata={
+            "description": "Longest automatic conversation name, in characters; a longer name is cut on a word boundary and ends with an ellipsis so the sidebar row cannot be overrun. Env CONVERSATION_TITLE_MAX_CHARACTERS."
+        },
+    )
+
+    conversation_title_transcript_tail_messages: int = field(
+        default=20,
+        metadata={
+            "description": "How many of the most recent visible messages the conversation namer reads. A conversation is named after what it is about, which the recent turns carry; reading the whole transcript would spend classification tokens on turns that cannot change the name. Env CONVERSATION_TITLE_TRANSCRIPT_TAIL_MESSAGES."
+        },
+    )
+
+    conversation_title_timeout_seconds: float = field(
+        default=20.0,
+        metadata={
+            "description": "How long the conversation namer waits on the classification model before giving up and leaving the conversation unnamed. Env CONVERSATION_TITLE_TIMEOUT_SECONDS."
         },
     )
 
@@ -1396,7 +2228,7 @@ class GlobalContext:
     voice_transcription_prompt: str = field(
         default="",
         metadata={
-            "description": "Optional text prompt handed to whisper-1 for live-voice utterances (POST /transcribe) to steer style and vocabulary; the diarization model does not accept a prompt. Empty sends none. Env VOICE_TRANSCRIPTION_PROMPT."
+            "description": "Optional text prompt handed to whisper-1 for live-voice utterances (POST /transcribe) to steer spelling and vocabulary; the diarization model does not accept a prompt. Keep the prompt to a comma-separated list of names and terms (Neural Nexus, webcam, screen share). Never put example sentences or questions in the prompt: whisper-1 treats the prompt as the previous transcript and, on a clip with no clear speech, returns those sentences as if the person had said them (\"What is on my screen right now?\"). A transcript made only of the prompt's words is dropped as an echo. Empty sends none. Env VOICE_TRANSCRIPTION_PROMPT."
         },
     )
     voice_no_speech_probability_max: float = field(

@@ -1980,6 +1980,64 @@ class GlobalContext:
 
     """ </Motion wireframe (how the person moves)> """
 
+    """ <Cost and Usage Reporting> """
+
+    google_sheets_service_account_json: dict = field(
+        default=None,
+        metadata={
+            "description": (
+                "Google service account JSON for Sheets API access. "
+                "Preferred for automated reporting. Full JSON object. "
+                "Env GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON."
+            )
+        },
+    )
+
+    cost_reporting_spreadsheet_url: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Google Sheets URL or ID for cost/usage reporting. "
+                "Example: https://docs.google.com/spreadsheets/d/{id}/edit. "
+                "Env COST_REPORTING_SPREADSHEET_URL."
+            )
+        },
+    )
+
+    cost_reporting_range: str = field(
+        default="Metrics!A:G",
+        metadata={
+            "description": (
+                "Sheet range for appending cost metrics in A1 notation. "
+                "Default: Metrics!A:G. Env COST_REPORTING_RANGE."
+            )
+        },
+    )
+
+    cost_alert_daily_threshold_usd: float = field(
+        default=None,
+        metadata={
+            "description": (
+                "Daily spend threshold in USD for cost alerts. "
+                "Alerts sent to agent inbox when exceeded. "
+                "Env COST_ALERT_DAILY_THRESHOLD_USD."
+            )
+        },
+    )
+
+    cost_alert_monthly_threshold_usd: float = field(
+        default=None,
+        metadata={
+            "description": (
+                "Monthly spend threshold in USD for cost alerts. "
+                "Alerts sent to agent inbox when exceeded. "
+                "Env COST_ALERT_MONTHLY_THRESHOLD_USD."
+            )
+        },
+    )
+
+    """ </Cost and Usage Reporting> """
+
     """ Browsing Insights (what the owner's own web browsing says about the owner) """
 
     browsing_insights_enabled: str = field(

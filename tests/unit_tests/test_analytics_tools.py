@@ -8,6 +8,7 @@ import pytest
 
 from src.anubis.utils.analytics.analytics_tools import (
     ANALYTICS_TOOL_NAMES,
+    PLATFORM_METRIC_NAMES,
     build_analytics_tools,
     parse_iso_datetime,
     period_from,
@@ -41,6 +42,7 @@ def _context(admin_user_id="admin"):
         plaid_client_id="c",
         plaid_secret="s",
         plaid_environment="sandbox",
+        analytics_readonly_postgres_uri=None,
     )
 
 
@@ -261,3 +263,27 @@ async def test_forecast_metric_relays_the_method_and_errors():
     assert len(projected["point"]) == 2
     short = await tools["forecast_metric"].ainvoke({"values": [1], "horizon": 2})
     assert short["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_run_analytics_sql_is_forbidden_for_non_admins():
+    tools = _tools()
+    result = await tools["run_analytics_sql"].ainvoke({"sql": "SELECT 1 FROM api_metrics"})
+    assert result["status"] == "forbidden"
+    admin_tools = _tools(context=_context(admin_user_id="owner"))
+    unavailable = await admin_tools["run_analytics_sql"].ainvoke(
+        {"sql": "SELECT 1 FROM api_metrics"}
+    )
+    assert unavailable["status"] == "unavailable"
+
+
+def test_unit_economics_metric_names_are_registered():
+    for name in (
+        "cost_per_avatar",
+        "average_cost_per_message",
+        "average_cost_per_conversation",
+        "cost_per_new_user",
+        "unit_economics",
+    ):
+        assert name in PLATFORM_METRIC_NAMES
+    assert "run_analytics_sql" in ANALYTICS_TOOL_NAMES

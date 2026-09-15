@@ -233,7 +233,22 @@ def public_account_view(record: dict[str, Any]) -> dict[str, Any]:
         else None,
         "site_url": transport.get("site_url"),
         "session_saved_at": browser_session.get("saved_at"),
+        "owner_mobile_e164": transport.get("owner_mobile_e164"),
+        "sip_enabled": bool(transport.get("sip_enabled")),
+        "platform_inbound_number": (
+            _shared_platform_phone_number()
+            if transport.get("sip_enabled")
+            else None
+        ),
     }
+
+
+def _shared_platform_phone_number() -> str | None:
+    """The one shared inbound DID from the environment. Never a per-user number."""
+    import os
+
+    raw = (os.environ.get("PLATFORM_PHONE_NUMBER") or "").strip()
+    return raw or None
 
 
 async def read_connected_accounts(store: Any, user_id: str) -> list[dict[str, Any]]:

@@ -81,6 +81,13 @@ def account_connection_view(record: dict[str, Any]) -> dict[str, Any]:
         sub_label = f"{count} account" + ("" if count == 1 else "s")
     elif provider is not None and provider.kind == "website":
         sub_label = view.get("site_url") or view.get("account_address") or ""
+    elif provider is not None and provider.kind == "telephony":
+        mobile = view.get("owner_mobile_e164") or view.get("account_address") or ""
+        shared = view.get("platform_inbound_number")
+        if shared:
+            sub_label = f"{mobile} · call {shared} from this mobile"
+        else:
+            sub_label = f"{mobile} · verified mobile"
     if view.get("status") == "needs_reconnect":
         sub_label = "Needs sign-in again"
     return {
@@ -108,6 +115,9 @@ def account_connection_view(record: dict[str, Any]) -> dict[str, Any]:
         "institution_name": view.get("institution_name"),
         "account_count": view.get("account_count"),
         "site_url": view.get("site_url"),
+        "owner_mobile_e164": view.get("owner_mobile_e164"),
+        "sip_enabled": view.get("sip_enabled"),
+        "platform_inbound_number": view.get("platform_inbound_number"),
     }
 
 
@@ -141,4 +151,7 @@ def device_connection_view(device: dict[str, Any]) -> dict[str, Any]:
         "institution_name": None,
         "account_count": None,
         "site_url": None,
+        "owner_mobile_e164": None,
+        "sip_enabled": None,
+        "platform_inbound_number": None,
     }

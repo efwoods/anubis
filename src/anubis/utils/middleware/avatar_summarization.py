@@ -60,6 +60,7 @@ from langgraph.types import Command
 from typing_extensions import NotRequired
 
 from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.model import hosted_inference_input_token_limit
 
 logger = logging.getLogger(__name__)
 
@@ -220,10 +221,13 @@ def build_avatar_summarization_middleware(
     """Build the avatar's summarizer from the ``DEEP_AGENT_SUMMARIZATION_*`` settings."""
     context = context or GlobalContext()
     defaults = compute_summarization_defaults(model)
+    configured = int(context.deep_agent_summarization_max_tokens or 120000)
+    window = hosted_inference_input_token_limit(context)
+    trigger_tokens = min(configured, max(4096, window - 2048))
     return AvatarSummarizationMiddleware(
         model=model,
         backend=backend if backend is not None else StateBackend(),
-        trigger=("tokens", int(context.deep_agent_summarization_max_tokens or 120000)),
+        trigger=("tokens", trigger_tokens),
         keep=(
             "messages",
             int(context.deep_agent_summarization_keep_last_n_messages or 20),

@@ -33,6 +33,8 @@ GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GOOGLE_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
 GOOGLE_YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 GOOGLE_IDENTITY_SCOPES: tuple[str, ...] = ("openid", "email")
 
 
@@ -118,6 +120,8 @@ OAUTH_PROVIDERS: dict[str, OAuthProviderConfig] = {
             GOOGLE_CALENDAR_EVENTS_SCOPE,
             GOOGLE_ANALYTICS_SCOPE,
             GOOGLE_YOUTUBE_SCOPE,
+            GOOGLE_SHEETS_SCOPE,
+            GOOGLE_DRIVE_FILE_SCOPE,
         ),
         userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
         identity_from_userinfo=_google_identity,

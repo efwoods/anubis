@@ -37,6 +37,7 @@ from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.middleware.consciousness_refresh_gate import (
     ConsciousnessRefreshGate,
 )
+from src.anubis.utils.middleware.identity_media_once import IdentityMediaOnceMiddleware
 from src.anubis.utils.middleware.avatar_summarization import (
     build_avatar_summarization_middleware,
 )
@@ -222,7 +223,12 @@ def build_avatar_deep_agent(
         model=model,
         tools=tools,
         system_prompt=None,
-        middleware=[refresh_gate, dynamic_prompt, summarization],
+        middleware=[
+            refresh_gate,
+            dynamic_prompt,
+            summarization,
+            IdentityMediaOnceMiddleware(),
+        ],
         state_schema=AvatarDeepAgentState,
         checkpointer=checkpointer,
         store=store,

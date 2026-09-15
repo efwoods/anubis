@@ -75,6 +75,84 @@ def test_window_payload_round_trips_and_validates_widths():
         codec.window_from_payload(payload)
 
 
+def _sparse_right_wrist_payload(frames: int = 8, *, source: str = "neural_decoder") -> dict:
+    rest = np.array([0.38, 0.9, 0.0, 1.0], dtype=np.float32)
+    series = np.tile(rest, (frames, 1))
+    for step in range(frames):
+        phase = step / max(frames - 1, 1)
+        series[step, 0] = 0.38 - 0.25 * np.sin(np.pi * phase)
+        series[step, 1] = 0.9 - 0.1 * np.sin(np.pi * phase)
+    window = codec.MotionWindow(
+        source=source,
+        streams={"body": codec.StreamWindow(series, 15.0)},
+        face_encoding=codec.FACE_ENCODING_NONE,
+    )
+    payload = codec.window_to_payload(window)
+    payload["streams"]["body"]["present_joints"] = ["right_wrist"]
+    payload["streams"]["body"]["values_per_frame"] = 4
+    payload["streams"]["body"]["data_b64"] = codec.window_to_payload(
+        codec.MotionWindow(streams={"body": codec.StreamWindow(series, 15.0)})
+    )["streams"]["body"]["data_b64"]
+    payload["source"] = source
+    return payload
+
+
+def test_neural_decoder_accepts_a_right_wrist_only_body_stream():
+    payload = _sparse_right_wrist_payload()
+    window = codec.window_from_payload(payload)
+    assert window.source == "neural_decoder"
+    joints = window.streams["body"].frames.reshape(-1, 33, 4)
+    assert joints.shape[0] >= 4
+    assert joints.shape[1] == 33
+    right_wrist = landmarks.BODY_JOINT_INDEX["right_wrist"]
+    left_shoulder = landmarks.BODY_JOINT_INDEX["left_shoulder"]
+    right_shoulder = landmarks.BODY_JOINT_INDEX["right_shoulder"]
+    assert np.all(joints[:, right_wrist, 3] == 1.0)
+    assert np.all(joints[:, left_shoulder, 3] == 0.0)
+    assert np.all(joints[:, right_shoulder, 3] == 0.0)
+    width = np.linalg.norm(joints[:, left_shoulder, :2] - joints[:, right_shoulder, :2], axis=1)
+    assert np.all(width > 1e-4)
+
+
+def test_live_camera_still_rejects_a_sparse_body_stream():
+    payload = _sparse_right_wrist_payload(source="live_camera")
+    with pytest.raises(ValueError, match="present_joints"):
+        codec.window_from_payload(payload)
+
+
+def test_live_camera_body_still_requires_the_full_thirty_three_joints():
+    payload = _sparse_right_wrist_payload(source="live_camera")
+    payload["streams"]["body"].pop("present_joints", None)
+    with pytest.raises(ValueError, match="132"):
+        codec.window_from_payload(payload)
+
+
+def test_neural_decoder_full_body_without_present_joints_is_still_valid():
+    window = codec.MotionWindow(
+        source="neural_decoder",
+        streams={"body": codec.StreamWindow(_random_body(8), 15.0)},
+        face_encoding=codec.FACE_ENCODING_NONE,
+    )
+    parsed = codec.window_from_payload(codec.window_to_payload(window))
+    assert parsed.source == "neural_decoder"
+    assert parsed.streams["body"].frames.shape[1] == 132
+
+
+def test_empty_present_joints_is_rejected():
+    payload = _sparse_right_wrist_payload()
+    payload["streams"]["body"]["present_joints"] = []
+    with pytest.raises(ValueError, match="at least one joint"):
+        codec.window_from_payload(payload)
+
+
+def test_unknown_present_joint_is_rejected():
+    payload = _sparse_right_wrist_payload()
+    payload["streams"]["body"]["present_joints"] = ["carpal"]
+    payload["streams"]["body"]["values_per_frame"] = 4
+    with pytest.raises(ValueError, match="Unknown body joint"):
+        codec.window_from_payload(payload)
+
+
 def test_a_face_stream_must_declare_its_encoding():
     window = codec.MotionWindow(
         streams={"face": codec.StreamWindow(_synthetic_face(4), 30.0)},

@@ -153,6 +153,7 @@ from src.anubis.utils.conversation_titles import (
 )
 from src.api.group_conversations import group_conversations_route
 from src.anubis.utils.tools.vision.accessibility_tools import SCENE_NARRATION_EVENT
+from src.anubis.utils.tools.minecraft.minecraft_body_tools import MINECRAFT_ACT_EVENT
 from src.anubis.utils.tools.vision.look_tools import (
     SHARE_REQUEST_EVENT,
     SHARE_STOP_EVENT,
@@ -181,7 +182,12 @@ from src.api.media_jobs import (
     request_cancel,
     run_batch_media_job,
 )
-from src.security.bans import ban_account, ban_subject_from_user
+from src.security.bans import (
+    ban_account,
+    ban_subject_from_user,
+    complete_and_record_moderation_verdict,
+    is_unbannable_administrator,
+)
 from src.security.auth import (
     _tier_from_subscription,
     bearer_credentials_from_request,
@@ -189,8 +195,11 @@ from src.security.auth import (
     get_current_user,
     get_current_user_or_anonymous_user,
     get_current_user_or_anonymous_user_id,
+    get_optional_signed_in_user,
     get_user,
     get_user_with_api_key,
+    optional_api_key_scheme,
+    optional_bearer_scheme,
     resolve_request_hashed_ip,
     security_route,
     update_user_app_metadata_fields,
@@ -899,8 +908,16 @@ logger = logging.getLogger(__name__)
 #: none of them is answered — so the SSE loop forwards them untouched. A frame
 #: missing from this set is silently dropped, which looks to the person like a
 #: tool that ran and did nothing.
+PHONE_CALL_EVENT = "phone_call"
+
 BROWSER_DIRECTED_FRAMES = frozenset(
-    {SHARE_STOP_EVENT, SHARE_REQUEST_EVENT, SCENE_NARRATION_EVENT}
+    {
+        SHARE_STOP_EVENT,
+        SHARE_REQUEST_EVENT,
+        SCENE_NARRATION_EVENT,
+        MINECRAFT_ACT_EVENT,
+        PHONE_CALL_EVENT,
+    }
 )
 
 
@@ -1416,15 +1433,7 @@ async def _finalize_disconnected_turn(
 # What the model vendors say when the operator's own account is out of credit.
 # None of these are the reader's doing, so they are never reported as a 402 —
 # that status sends the reader to billing, and the reader's allotment is fine.
-_VENDOR_CREDIT_EXHAUSTED_MARKERS = (
-    "insufficient_quota",
-    "exceeded your current quota",
-    "credit balance is too low",
-    "billing_hard_limit_reached",
-    "insufficient credits",
-    "insufficient_credits",
-    "out of credits",
-)
+# Shared with the NVIDIA NIM retry so both layers agree on the same refusals.
 
 
 def _stream_error_frame(
@@ -1457,8 +1466,9 @@ def _stream_error_frame(
             "request_id": request_id,
             "thread_id": thread_id,
         }
-    error_text = f"{type(run_error).__name__}: {run_error}".lower()
-    if any(marker in error_text for marker in _VENDOR_CREDIT_EXHAUSTED_MARKERS):
+    from src.anubis.utils.model import vendor_credit_is_exhausted
+
+    if vendor_credit_is_exhausted(run_error):
         return {
             "type": "error",
             "status": 503,
@@ -1479,6 +1489,40 @@ def _stream_error_frame(
         "request_id": request_id,
         "thread_id": thread_id,
     }
+
+
+VENDOR_KEY_REFUSED_DETAIL = (
+    "The speech provider refused this server's API key. "
+    "This is not your Neural Nexus allotment."
+)
+VENDOR_SPEECH_CREDIT_EXHAUSTED_DETAIL = (
+    "The speech provider refused this because the service's credit with it "
+    "is used up. This is on our side, not yours."
+)
+
+
+def _vendor_key_refused_response() -> JSONResponse:
+    """503 when ElevenLabs or OpenAI speech refuses the operator's key."""
+    from src.anubis.utils.model import VENDOR_KEY_REFUSED_CODE
+
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": VENDOR_KEY_REFUSED_CODE,
+            "detail": VENDOR_KEY_REFUSED_DETAIL,
+        },
+    )
+
+
+def _vendor_speech_credit_exhausted_response() -> JSONResponse:
+    """503 when the speech vendor's own account is out of credit."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "model_provider_credit_exhausted",
+            "detail": VENDOR_SPEECH_CREDIT_EXHAUSTED_DETAIL,
+        },
+    )
 
 
 def _message_text_for_moderation(human_message: Any) -> str:
@@ -1549,13 +1593,12 @@ async def _judge_message_after_reply(
         )
         if not verdict.get("violation"):
             return
-        await ban_account(
+        await complete_and_record_moderation_verdict(
             app_state,
             ban_subject_from_user(current_user, request_hashed_ip),
-            reason=str(verdict.get("reasoning") or "terms of service violation"),
-            violated_clauses=list(verdict.get("violated_clauses") or []),
+            verdict,
             source="message",
-            excerpt=str(verdict.get("excerpt") or ""),
+            judged_text=text,
         )
         logger.warning(
             "Background content moderation banned an account after the reply was sent."
@@ -1765,6 +1808,11 @@ async def message_graph_sse(
                     # reset the client's idle-read timer, preventing a premature
                     # "Error in input stream" while the metadata is computed.
                     yield ": keepalive\n\n"
+                elif payload.get("type") == "fact_learned":
+                    # A learn tool just stored a fact or a preference. Forwarded
+                    # so the chat can paint a Learned badge before the reply
+                    # finishes; the same list is repeated on ``done``.
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
                 elif payload.get("type") == "ambient_decision":
                     # The graph triaged an ambient observation (ignore / respond /
                     # notify). Forwarded as its own frame so the client knows the
@@ -1782,18 +1830,14 @@ async def message_graph_sse(
                         key: value for key, value in payload.items() if key != "type"
                     }
                     if app_state is not None and current_user is not None:
-                        await ban_account(
+                        from src.anubis.utils.learning.sentiment import message_text
+
+                        await complete_and_record_moderation_verdict(
                             app_state,
                             ban_subject_from_user(current_user, request_hashed_ip),
-                            reason=str(
-                                moderation_verdict.get("reasoning")
-                                or "terms of service violation"
-                            ),
-                            violated_clauses=list(
-                                moderation_verdict.get("violated_clauses") or []
-                            ),
+                            moderation_verdict,
                             source="message",
-                            excerpt=str(moderation_verdict.get("excerpt") or ""),
+                            judged_text=message_text(human_message.content),
                         )
                     yield f"data: {json.dumps(payload, default=str)}\n\n"
                 elif payload.get("type") in BROWSER_DIRECTED_FRAMES:
@@ -2314,6 +2358,71 @@ async def get_public_avatars(
             return [assistant_query.to_assistant() for assistant_query in data]
 
 
+def _signed_in_user_id(current_user: dict | None) -> str | None:
+    """Return the Auth0 identifier of a signed-in account, or None.
+
+    Anonymous visitors have a hashed IP in the same identities slot; those
+    are not accounts and cannot unlock adult-only search.
+    """
+    if not current_user or is_anonymous_user(current_user):
+        return None
+    identities = current_user.get("identities") or []
+    if identities and isinstance(identities[0], dict):
+        user_id = str(identities[0].get("user_id") or "").strip()
+        if user_id:
+            return user_id
+    return str(current_user.get("user_id") or "").strip() or None
+
+
+async def _adult_discovery_for_viewer(
+    current_user: dict | None,
+) -> dict[str, Any]:
+    """How this viewer treats adult-only avatars in search and listings."""
+    from src.anubis.utils.age_verification import get_age_verification_repository
+    from src.anubis.utils.age_verification.policy import minimum_verification_years
+
+    context = getattr(app.state, "context", None)
+    viewer_user_id = _signed_in_user_id(current_user)
+    viewer_email = None
+    if current_user and not is_anonymous_user(current_user):
+        viewer_email = str(current_user.get("email") or "").strip() or None
+    viewer_is_admin = is_unbannable_administrator(
+        user_id=viewer_user_id,
+        email=viewer_email,
+        context=context,
+    )
+    viewer_age_verified = False
+    if viewer_user_id:
+        repository = get_age_verification_repository()
+        if repository is not None:
+            viewer_age_verified = await repository.is_verified(
+                viewer_user_id,
+                minimum_years=minimum_verification_years(context),
+            )
+    return {
+        "viewer_user_id": viewer_user_id,
+        "viewer_is_admin": viewer_is_admin,
+        "viewer_age_verified": viewer_age_verified,
+    }
+
+
+async def _avatars_visible_to_viewer(
+    avatars: list[dict[str, Any]],
+    current_user: dict | None,
+    *,
+    allow_direct_lookup: bool = False,
+) -> list[dict[str, Any]]:
+    """Drop adult-only avatars this viewer may not discover."""
+    from src.anubis.utils.age_verification.policy import filter_discoverable_avatars
+
+    rights = await _adult_discovery_for_viewer(current_user)
+    return filter_discoverable_avatars(
+        avatars,
+        allow_direct_lookup=allow_direct_lookup,
+        **rights,
+    )
+
+
 def _assistant_without_metadata_if_public(
     assistant: dict[str, Any], viewer_user_id: str | None = None
 ) -> dict[str, Any]:
@@ -2421,6 +2530,17 @@ def _assistant_without_metadata(assistant: dict[str, Any]) -> dict[str, Any]:
     starters_record = conversation_starters_record_of(assistant)
     if starters_record is not None:
         stripped[CONVERSATION_STARTERS_METADATA_KEY] = starters_record
+    # Adult-only is public the same way: the administrator's settings switch
+    # has to read the flag on an avatar somebody else created, and those
+    # records arrive with metadata stripped. The flag names a listing rule,
+    # not a person.
+    from src.anubis.utils.age_verification.policy import (
+        ADULT_ONLY_METADATA_KEY,
+        adult_only_flag_of,
+    )
+
+    if adult_only_flag_of(assistant):
+        stripped[ADULT_ONLY_METADATA_KEY] = True
     return stripped
 
 
@@ -2459,7 +2579,11 @@ logger.info(f"DEBUG_PORT: {os.getenv('DEBUG_PORT', 5678)}")
 logger.info(f"DEV: {os.getenv('DEV', 'false')}")
 
 if os.getenv("DEV", "false").lower() == "true":
-    debugpy.listen(("0.0.0.0", int(os.getenv("DEBUG_PORT", 5678))))
+    try:
+        debugpy.listen(("0.0.0.0", int(os.getenv("DEBUG_PORT", 5678))))
+    except RuntimeError as listen_error:
+        if "already been called" not in str(listen_error):
+            raise
 
 
 @asynccontextmanager
@@ -2471,6 +2595,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize context / context
     app.state.context = GlobalContext()
+    # Group-conversation routes must not re-import this module. Publish the
+    # helpers they need on app.state so a request can call them in-process.
+    app.state.enforce_remaining_allotment = enforce_remaining_allotment
+    app.state.resolve_assistant_for_creator = resolve_assistant_for_creator
     ensure_huggingface_models_cached(app.state.context)
     # Same rationale as the Hub prefetch above: the stylometric feature
     # extractor's corpora are ~20 MB, and paying for them on the first scored
@@ -2506,7 +2634,7 @@ async def lifespan(app: FastAPI):
     # first request can be refused.
     from src.security.bans import ensure_banned_accounts_table
 
-    await ensure_banned_accounts_table(app.state.pool)
+    await ensure_banned_accounts_table(app.state.pool, app.state.context)
     # Connected accounts (mailboxes, custom connectors) live in their own table,
     # keyed by user and personal avatar rather than by an identity provider's
     # namespace. Publish the repository process-wide so graph nodes and tools —
@@ -2577,6 +2705,20 @@ async def lifespan(app: FastAPI):
         logger.error(
             "Usage analytics tables could not be prepared: %s", usage_analytics_boot_error
         )
+    # Age verification: the date of birth that unlocks adult-only avatars in
+    # search. Fail-open on boot so a table error cannot take the API down;
+    # listings then hide adult-only avatars from everyone except a
+    # verified-age viewer and the administrator.
+    try:
+        from src.anubis.utils import age_verification as age_verification_package
+
+        await age_verification_package.ensure_age_verification_table(app.state.pool)
+        age_verification_package.publish_age_verification_repository(app.state.pool)
+    except Exception as age_verification_boot_error:  # noqa: BLE001 - startup must not fail
+        logger.error(
+            "Age verification table could not be prepared: %s",
+            age_verification_boot_error,
+        )
     # Generated avatar media (emotion stills, idle loops, lip-sync clips, voice
     # clips) and the durable media jobs live in their own BYTEA tables.
     from src.anubis.utils import media_assets as media_assets_package
@@ -2606,6 +2748,12 @@ async def lifespan(app: FastAPI):
     await inbox_package.ensure_inbox_tables(app.state.pool)
     inbox_package.set_inbox_repository(
         inbox_package.PostgresInboxRepository(app.state.pool)
+    )
+    from src.anubis.utils.phone import repository as phone_repository
+
+    await phone_repository.ensure_phone_tables(app.state.pool)
+    phone_repository.set_phone_call_repository(
+        phone_repository.PostgresPhoneCallRepository(app.state.pool)
     )
 
     # Content subscriptions: what the owner's own accounts publish, and every
@@ -3459,9 +3607,25 @@ def _refuse_unless_administrator(request: Request, current_user: dict) -> None:
         raise HTTPException(status_code=403, detail="Not permitted.")
 
 
+async def get_current_user_or_anonymous_including_banned(
+    request: Request,
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials=Depends(optional_bearer_scheme),
+):
+    """Same as the anonymous-or-signed-in dependency, but a banned caller is admitted.
+
+    ``GET /ban_status`` is the one route a banned person must still reach.
+    """
+    request.state.skip_ban_refusal = True
+    return await get_current_user_or_anonymous_user(
+        request, "", api_key, bearer_credentials
+    )
+
+
 @app.get("/ban_status")
 async def ban_status(
-    request: Request, current_user: dict = Depends(get_current_user_or_anonymous_user)
+    request: Request,
+    current_user: dict = Depends(get_current_user_or_anonymous_including_banned),
 ):
     """Report whether the caller is banned, and why.
 
@@ -3487,15 +3651,16 @@ async def ban_status(
     )
     if ban is None:
         return {"banned": False}
-    appeal_contact = getattr(
-        request.app.state.context, "ban_appeal_contact_email", None
-    )
+    from src.anubis.utils.inbox.appeals import appeal_contact_phrase
+
     return {
         "banned": True,
         "reason": ban.get("reason"),
         "violated_clauses": ban.get("violated_clauses") or [],
         "banned_at": ban.get("banned_at"),
-        "detail": ban_refusal_detail(ban, appeal_contact),
+        "detail": ban_refusal_detail(
+            ban, appeal_contact_phrase(getattr(request.app.state, "context", None))
+        ),
     }
 
 
@@ -4679,6 +4844,7 @@ async def _connect_account_from_fields(
     """
     from src.anubis.utils.connected_accounts import get_provider, public_account_view
     from src.anubis.utils.connected_accounts.connect_handlers import (
+        ConnectNeedsCode,
         ConnectNeedsLogin,
         ConnectRefused,
         ConnectRequest,
@@ -4699,6 +4865,8 @@ async def _connect_account_from_fields(
     )
 
     existing_records = await _connected_account_records(client, user_id)
+    fields = dict(fields)
+    fields.setdefault("subscription_tier", resolve_tier(current_user).value)
     try:
         record = await connect_account(
             ConnectRequest(
@@ -4713,6 +4881,8 @@ async def _connect_account_from_fields(
         # Not a failure: the provider signs in through a popup. The card opens
         # the login endpoint with the request carried here.
         return JSONResponse(content=needs_login.as_response(), status_code=200)
+    except ConnectNeedsCode as needs_code:
+        return JSONResponse(content=needs_code.as_response(), status_code=200)
     except ConnectRefused as refused:
         raise HTTPException(status_code=refused.status_code, detail=refused.detail)
 
@@ -5134,6 +5304,9 @@ def _after_record_stored(provider: Any, record: dict[str, Any]) -> None:
         forget_cached_tools((record.get("transport") or {}).get("server_url") or "")
     # The first business-category connection seeds the weekly sprint digest
     # and the monthly spend digest; both are deliverable through the inbox.
+    if getattr(provider, "name", None) == "google_sheets":
+        schedule_background(_snapshot_reporting_sheet_after_connect(record))
+
     if provider.category in ("finance", "development", "vendor"):
         try:
             from src.anubis.utils.analytics.schedules import (
@@ -5154,6 +5327,49 @@ def _after_record_stored(provider: Any, record: dict[str, Any]) -> None:
             pass
         except Exception:
             logger.debug("Could not seed default report schedules", exc_info=True)
+
+
+async def _snapshot_reporting_sheet_after_connect(record: dict[str, Any]) -> None:
+    """Pull the reporting spreadsheet the moment Google Sheets is authorised."""
+    from src.anubis.utils.analytics.reference_forecasts import (
+        DEFAULT_REPORTING_SPREADSHEET_ID,
+        record_sheet_rows,
+        rows_from_sheet_values,
+        snapshot_published_reporting_sheet,
+    )
+
+    user_id = str(record.get("user_id") or "")
+    if not user_id:
+        return
+    try:
+        from src.anubis.utils.connected_accounts.oauth_flow import get_fresh_access_token
+
+        token = await get_fresh_access_token(
+            app.state.context, app.state.store, user_id, record
+        )
+    except Exception:
+        token = None
+    if token:
+        import httpx
+
+        spreadsheet_id = DEFAULT_REPORTING_SPREADSHEET_ID
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/Sheet1",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                )
+            values = (response.json() or {}).get("values") or [] if response.status_code < 400 else []
+        except Exception:
+            values = []
+        snapshots = rows_from_sheet_values(
+            values, spreadsheet_id=spreadsheet_id, sheet_title="Sheet1"
+        )
+        if snapshots and getattr(app.state, "pool", None) is not None:
+            await record_sheet_rows(app.state.pool, user_id, snapshots)
+            return
+    if getattr(app.state, "pool", None) is not None:
+        await snapshot_published_reporting_sheet(app.state.pool, user_id)
 
 
 async def _connected_account_records_without_session(user_id: str) -> list[dict[str, Any]]:
@@ -5585,6 +5801,215 @@ async def connect_account_browser_cancel(request: Request, login_id: str):
     return JSONResponse(content={"ok": False, "cancelled": cancelled}, status_code=200)
 
 
+@app.post("/computer/start")
+async def computer_start(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create or resume the owner's long-lived agent computer."""
+    from src.anubis.utils.analytics.platform_metrics import is_platform_admin
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        agent_computer_is_enabled,
+        build_handoff_card,
+        start_computer,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    if not agent_computer_is_enabled(app.state.context):
+        raise HTTPException(status_code=404, detail="The agent computer is disabled.")
+    user_id = current_user["identities"][0]["user_id"]
+    if not is_platform_admin(app.state.context, [], user_id):
+        raise HTTPException(status_code=403, detail="The agent computer is reserved for the platform administrator.")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if not isinstance(body, dict):
+        body = {}
+    token = current_user["API_KEY"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    try:
+        session = await start_computer(
+            app.state.context,
+            user_id=user_id,
+            assistant_id=str(personal_avatar.get("assistant_id")),
+            start_url=str(body.get("start_url") or "").strip() or None,
+            provider=str(body.get("provider") or "").strip() or None,
+            task=str(body.get("task") or "").strip() or None,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    return JSONResponse(
+        content={
+            "session_id": session.session_id,
+            "card": build_handoff_card(session, context=app.state.context),
+        },
+        status_code=200,
+    )
+
+
+@app.get("/computer/{session_id}/preview")
+async def computer_preview(request: Request, session_id: str):
+    """Latest JPEG preview of the agent computer."""
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        capture_preview,
+        get_computer,
+        verify_computer_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_computer_token(app.state.context, token, session_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    session = get_computer(session_id)
+    if session is None or session.user_id != payload.get("user_id"):
+        raise HTTPException(status_code=404, detail="No computer with that id is open.")
+    frame = await capture_preview(session)
+    return JSONResponse(content={"preview_frame": frame, "url": session.current_url})
+
+
+@app.websocket("/computer/{session_id}/stream")
+async def computer_stream(websocket: WebSocket, session_id: str):
+    """Stream frames of the agent computer and forward input."""
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        get_computer,
+        stream_computer,
+        verify_computer_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = websocket.query_params.get("t") or ""
+    try:
+        payload = verify_computer_token(app.state.context, token, session_id)
+    except BrowserSessionError:
+        await websocket.close(code=4401)
+        return
+    session = get_computer(session_id)
+    if session is None or session.user_id != payload.get("user_id") or not session.context_is_open:
+        await websocket.close(code=4404)
+        return
+    await websocket.accept()
+    try:
+        await stream_computer(websocket, session, app.state.context)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@app.post("/computer/{session_id}/handoff")
+async def computer_handoff(request: Request, session_id: str):
+    """Return the Action-needed card for the current page (avatar pauses in the graph)."""
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        build_handoff_card,
+        capture_preview,
+        get_computer,
+        verify_computer_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_computer_token(app.state.context, token, session_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    session = get_computer(session_id)
+    if session is None or session.user_id != payload.get("user_id"):
+        raise HTTPException(status_code=404, detail="No computer with that id is open.")
+    await capture_preview(session)
+    return JSONResponse(content=build_handoff_card(session, context=app.state.context))
+
+
+@app.post("/computer/{session_id}/takeover")
+async def computer_takeover(request: Request, session_id: str):
+    """Mark the computer as taken over. Does not close the context."""
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        get_computer,
+        mark_takeover,
+        verify_computer_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_computer_token(app.state.context, token, session_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    session = get_computer(session_id)
+    if session is None or session.user_id != payload.get("user_id"):
+        raise HTTPException(status_code=404, detail="No computer with that id is open.")
+    mark_takeover(session, True)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "session_id": session.session_id,
+            "takeover": True,
+            "context_closed": False,
+        }
+    )
+
+
+@app.post("/computer/{session_id}/finish")
+async def computer_finish(request: Request, session_id: str):
+    """Persist cookies and keep the Chromium context open."""
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        finish_handoff,
+        get_computer,
+        verify_computer_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+    from src.anubis.utils.connected_accounts.store import read_connected_accounts
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_computer_token(app.state.context, token, session_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    session = get_computer(session_id)
+    if session is None or session.user_id != payload.get("user_id"):
+        raise HTTPException(status_code=404, detail="No computer with that id is open.")
+    existing = await read_connected_accounts(app.state.store, session.user_id)
+    try:
+        finished = await finish_handoff(
+            app.state.context,
+            app.state.store,
+            session,
+            existing_records=existing,
+            pool=app.state.pool,
+        )
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    return JSONResponse(content={"ok": True, **finished})
+
+
+@app.post("/computer/{session_id}/skip")
+async def computer_skip(request: Request, session_id: str):
+    """Advance the dashboard queue without closing the computer."""
+    from src.anubis.utils.connected_accounts.agent_computer import (
+        get_computer,
+        skip_handoff,
+        verify_computer_token,
+    )
+    from src.anubis.utils.connected_accounts.browser_sessions import BrowserSessionError
+
+    token = _login_token_from_request(request)
+    try:
+        payload = verify_computer_token(app.state.context, token, session_id)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    session = get_computer(session_id)
+    if session is None or session.user_id != payload.get("user_id"):
+        raise HTTPException(status_code=404, detail="No computer with that id is open.")
+    try:
+        skipped = await skip_handoff(session)
+    except BrowserSessionError as session_error:
+        raise HTTPException(status_code=session_error.status_code, detail=session_error.detail)
+    return JSONResponse(content={"ok": True, **skipped})
+
+
 @app.post("/connect_account/oauth/start")
 async def connect_account_oauth_start(
     request: Request,
@@ -5945,6 +6370,85 @@ async def connectable_providers(
             "sign_in_in_your_own_browser": sign_in_device is not None,
             "sign_in_device_label": getattr(sign_in_device, "device_label", None),
             "sign_in_device_id": getattr(sign_in_device, "device_id", None),
+        },
+        status_code=200,
+    )
+
+
+@app.post("/mcp/phone")
+async def phone_mcp_server(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Streamable HTTP MCP surface for personal-avatar place, travel, and SIP tools.
+
+    Authenticated with the owner's API key. ``think`` attaches the same tools
+    as native LangChain callables and must not HTTP-call this endpoint.
+    """
+    from src.anubis.utils.connected_accounts import bound_accounts_for
+    from src.anubis.utils.phone.mcp_server import handle_phone_mcp_request
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    personal_avatar = await _resolve_personal_avatar_for_connection(
+        client, request, current_user, token
+    )
+    assistant_id = str(personal_avatar.get("assistant_id") or "")
+    metadata = personal_avatar.get("metadata") or {}
+    is_personal = metadata.get("is_personal_avatar_of_creator") is True
+    accounts = await bound_accounts_for(app.state.store, user_id, assistant_id)
+    body = await request.json()
+    payload = await handle_phone_mcp_request(
+        body,
+        context=app.state.context,
+        store=app.state.store,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        accounts=accounts,
+        is_personal_avatar=is_personal,
+    )
+    return JSONResponse(content=payload, status_code=200)
+
+
+@app.post("/phone_calls/{call_id}/listen")
+async def listen_to_phone_call(
+    request: Request,
+    call_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Subscribe-only LiveKit token for the web listen-in bar."""
+    from src.anubis.utils.phone.livekit_sip import (
+        LiveKitNotConfigured,
+        listen_token,
+    )
+    from src.anubis.utils.phone.repository import get_phone_call_repository
+
+    token = current_user["API_KEY"]
+    user_id = current_user["identities"][0]["user_id"]
+    client = get_client(headers={"API-KEY": f"{token}"})
+    await _resolve_personal_avatar_for_connection(client, request, current_user, token)
+    repository = get_phone_call_repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Phone calls are not available.")
+    stored = await repository.get_call(call_id)
+    if stored is None or stored.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="That phone call was not found.")
+    try:
+        token_jwt = listen_token(
+            app.state.context,
+            room_name=str(stored.get("room_name") or f"phone-{call_id}"),
+            identity=f"web-listen-{user_id}",
+        )
+    except LiveKitNotConfigured as missing:
+        raise HTTPException(status_code=503, detail=str(missing)) from missing
+    return JSONResponse(
+        content={
+            "call_id": call_id,
+            "room_name": stored.get("room_name"),
+            "token": token_jwt,
+            "livekit_url": getattr(app.state.context, "livekit_url", None),
+            "subscribe_only": True,
         },
         status_code=200,
     )
@@ -7114,6 +7618,7 @@ async def modify_avatar(
     new_avatar_name: Optional[str] = None,
     new_avatar_description: Optional[str] = None,
     is_personal_avatar_of_creator: bool = False,
+    adult_only: Optional[bool] = None,
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     location_name: Optional[str] = None,
@@ -7125,6 +7630,7 @@ async def modify_avatar(
     update_personal_avatar_flag = (
         "is_personal_avatar_of_creator" in request.query_params
     )
+    update_adult_only = "adult_only" in request.query_params
     # The pin may be added, moved, or removed long after the avatar was created,
     # so this route — not only /create_avatar — is where a place is set.
     update_geo_location = latitude is not None or longitude is not None
@@ -7138,12 +7644,13 @@ async def modify_avatar(
         and not update_personal_avatar_flag
         and not update_geo_location
         and not clear_geo_location
+        and not update_adult_only
     ):
         raise HTTPException(
             detail=(
                 "Supply at least one of: new avatar name, new avatar description, "
-                "is_personal_avatar_of_creator, a latitude and longitude, or "
-                "clear_geo_location."
+                "is_personal_avatar_of_creator, adult_only, a latitude and "
+                "longitude, or clear_geo_location."
             ),
             status_code=400,
         )
@@ -7155,6 +7662,15 @@ async def modify_avatar(
 
     token = current_user["API_KEY"]
     client = get_client(headers={"API-KEY": f"{token}"})
+    caller_user_id = current_user["identities"][0]["user_id"]
+    context = app.state.context
+    caller_is_admin = caller_user_id == getattr(context, "admin_user_id", None)
+
+    if update_adult_only and not caller_is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the administrator may mark an avatar adult-only.",
+        )
 
     # Moving an avatar in the physical world is the creator's call alone: an
     # avatar that stands at a memorial must not be re-pinned to a storefront by
@@ -7194,6 +7710,12 @@ async def modify_avatar(
         # removes the pin and leaves user_id and is_public untouched.
         update_kwargs.setdefault("metadata", {})[GEO_LOCATION_METADATA_KEY] = (
             None if clear_geo_location else geo_location
+        )
+    if update_adult_only:
+        from src.anubis.utils.age_verification.policy import ADULT_ONLY_METADATA_KEY
+
+        update_kwargs.setdefault("metadata", {})[ADULT_ONLY_METADATA_KEY] = bool(
+            adult_only
         )
 
     try:
@@ -8024,11 +8546,17 @@ async def delete_avatar(
 
 
 @app.get("/list_public_avatars")
-async def list_public_avatars(assistant_id: Optional[str] = None):
+async def list_public_avatars(
+    assistant_id: Optional[str] = None,
+    current_user: dict | None = Depends(get_optional_signed_in_user),
+):
     public_avatars_result = await get_public_avatars(assistant_id=assistant_id)
-    return [
-        _assistant_without_metadata(assistant) for assistant in public_avatars_result
-    ]
+    visible_avatars = await _avatars_visible_to_viewer(
+        public_avatars_result,
+        current_user,
+        allow_direct_lookup=assistant_id is not None,
+    )
+    return [_assistant_without_metadata(assistant) for assistant in visible_avatars]
 
 
 @app.get("/list_user_avatars")
@@ -8037,11 +8565,17 @@ async def list_user_avatars(
 ):
     logger.info("breakpoint")
     if not current_user:
-        public_avatars_result = await get_public_avatars()
+        public_avatars_result = await _avatars_visible_to_viewer(
+            await get_public_avatars(),
+            current_user,
+        )
         return [_assistant_without_metadata_if_public(a) for a in public_avatars_result]
     try:
-        public_avatars_result = await get_public_avatars(
-            user_id=current_user["identities"][0]["user_id"]
+        public_avatars_result = await _avatars_visible_to_viewer(
+            await get_public_avatars(
+                user_id=current_user["identities"][0]["user_id"]
+            ),
+            current_user,
         )
         token = current_user["API_KEY"]
         client = get_client(headers={"API-KEY": f"{token}"})
@@ -8070,18 +8604,24 @@ async def list_user_avatars(
 """ Geo-located avatars """
 
 
-async def _public_geo_candidates() -> list[dict[str, Any]]:
+async def _public_geo_candidates(
+    current_user: dict | None = None,
+) -> list[dict[str, Any]]:
     """Every public avatar, as the map and the proximity search see them.
 
     Only public avatars are placed on a map or announced to a passer-by: a pin
     is an invitation to walk up to an avatar, and an avatar its creator has not
-    shared is not inviting anyone. The public listing already strips the
-    metadata and keeps the pin, so the entries returned here carry no creator
-    identifier.
+    shared is not inviting anyone. Adult-only pins stay off the map until the
+    viewer has verified their age, except for the platform administrator, who
+    still sees them. The public listing already strips the metadata and keeps
+    the pin, so the entries returned here carry no creator identifier.
     """
     return [
         _assistant_without_metadata(assistant)
-        for assistant in await get_public_avatars()
+        for assistant in await _avatars_visible_to_viewer(
+            await get_public_avatars(),
+            current_user,
+        )
     ]
 
 
@@ -8111,7 +8651,7 @@ async def list_geo_avatars(
     wraps across the antimeridian the way a map viewport does.
     """
     avatars = []
-    for assistant in await _public_geo_candidates():
+    for assistant in await _public_geo_candidates(current_user):
         pin = geo_location_of(assistant)
         if pin is None:
             continue
@@ -8163,7 +8703,7 @@ async def list_nearby_avatars(
         "avatars": avatars_near(
             latitude_value,
             longitude_value,
-            await _public_geo_candidates(),
+            await _public_geo_candidates(current_user),
             radius_meters=radius,
             accuracy_meters=accuracy_meters,
         ),
@@ -8205,7 +8745,7 @@ async def geo_checkin(
     nearby = avatars_near(
         latitude_value,
         longitude_value,
-        await _public_geo_candidates(),
+        await _public_geo_candidates(current_user),
         radius_meters=radius,
         accuracy_meters=checkin.accuracy_meters,
     )
@@ -8245,6 +8785,21 @@ async def geo_checkin(
             logger.warning(
                 "Could not record a geo visit for avatar %s", assistant_id, exc_info=True
             )
+
+    if not is_anonymous_user(current_user):
+        try:
+            from src.anubis.utils.phone.owner_location import write_owner_location
+
+            await write_owner_location(
+                app.state.store,
+                visitor_id,
+                latitude=latitude_value,
+                longitude=longitude_value,
+                source="geo_checkin",
+                accuracy_meters=checkin.accuracy_meters,
+            )
+        except Exception:  # noqa: BLE001 - travel origin is best-effort
+            logger.warning("Could not store the owner's web location", exc_info=True)
 
     return {
         "inside_geofence": inside,
@@ -8854,6 +9409,26 @@ async def process_files_for_message(
                 # Audio files - describe that audio was uploaded
                 text_contents.append(f"[Audio File: {filename} - {content_type}]")
 
+            elif content_type.startswith("video/"):
+                from src.anubis.utils.video_still import still_jpeg_from_video_bytes
+
+                still_jpeg = await asyncio.to_thread(
+                    still_jpeg_from_video_bytes, content, filename
+                )
+                if still_jpeg:
+                    base64_image = base64.b64encode(still_jpeg).decode("utf-8")
+                    multimodal_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                        }
+                    )
+                    image_filenames.append(filename)
+                    has_images = True
+                    text_contents.append(f"[Video: {filename}]")
+                else:
+                    text_contents.append(f"[File: {filename} - {content_type}]")
+
             else:
                 # Other file types
                 text_contents.append(f"[File: {filename} - {content_type}]")
@@ -8975,6 +9550,8 @@ async def message_avatar(
     peekable_shares: Optional[str] = Form(None),
     scene_narration: Optional[str] = Form(None),
     scene_narration_seconds: Optional[float] = Form(None),
+    minecraft_body: bool = Form(False),
+    minecraft_world: Optional[str] = Form(None),
     diarize: bool = Form(False),
     at_place: bool = Form(False),
     ambient_action_observation_id: Optional[str] = Form(None),
@@ -8984,6 +9561,7 @@ async def message_avatar(
     ambient_action_summary: Optional[str] = Form(None),
     turn_kind: Optional[str] = Form(None),
     connection_key: Optional[str] = Form(None),
+    owner_location: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user_or_anonymous_user),
 ):
     # ``ambient_action_observation_id`` names a notification card whose offer
@@ -9297,6 +9875,25 @@ async def message_avatar(
         )
     # client-supplied IANA timezone (e.g. "America/New_York") used to localize system_time
     config["configurable"]["user_timezone"] = user_timezone
+    if owner_location and not is_anonymous_user(current_user):
+        parts = [part.strip() for part in str(owner_location).split(",")]
+        if len(parts) == 2:
+            try:
+                from src.anubis.utils.phone.owner_location import write_owner_location
+
+                await write_owner_location(
+                    app.state.store,
+                    current_user["identities"][0]["user_id"],
+                    latitude=float(parts[0]),
+                    longitude=float(parts[1]),
+                    source="chat_turn",
+                )
+            except (TypeError, ValueError):
+                logger.info("Ignoring malformed owner_location on the chat turn")
+            except Exception:
+                logger.warning(
+                    "Could not store owner_location from the chat turn", exc_info=True
+                )
     # ``at_place=true`` says the person sending this message is standing at the
     # real-world place the avatar is pinned to, watching that place through a
     # camera. This changes only how the avatar speaks (the YOUR PLACE section of
@@ -9340,6 +9937,12 @@ async def message_avatar(
     # is asked to make "more often" and "less often" into a number, and it
     # cannot do that without knowing where it is starting from.
     config["configurable"]["scene_narration_seconds"] = scene_narration_seconds
+    # A Mineflayer body standing in Java Edition. ``minecraft_body`` attaches
+    # ``act_in_minecraft``; ``minecraft_world`` is the live snapshot the tool
+    # and the consciousness block read. The conversation partner's words stay
+    # in ``message`` as-is — this is never rewritten into a play prompt.
+    config["configurable"]["minecraft_body"] = "true" if minecraft_body else ""
+    config["configurable"]["minecraft_world"] = minecraft_world or ""
     # Remember this turn's whole report of what can be seen, keyed by thread.
     # A look pauses the run and is answered by a SECOND request, which rebuilds
     # every tool from its own configuration; without the same report in hand,
@@ -9353,6 +9956,8 @@ async def message_avatar(
         peekable_shares=peekable_shares,
         may_control_shares=may_control_shares,
         scene_narration=scene_narration,
+        minecraft_body="true" if minecraft_body else "",
+        minecraft_world=minecraft_world or "",
     )
     config["configurable"]["include_quality_metrics"] = include_quality_metrics
     config["configurable"]["use_adapter_inference"] = resolve_use_adapter_inference(
@@ -9384,11 +9989,14 @@ async def message_avatar(
 
     # Create the human message content
     if multimodal_content:
+        from src.anubis.utils.message_record import additional_kwargs_with_created_at
+
         human_message = HumanMessage(
             id=str(uuid4()),
             content=multimodal_content,
-            additional_kwargs=ambient_additional_kwargs
-            or {"image_filenames": image_filenames},
+            additional_kwargs=additional_kwargs_with_created_at(
+                ambient_additional_kwargs or {"image_filenames": image_filenames}
+            ),
         )
     else:
         # Use text-only content
@@ -9448,10 +10056,14 @@ async def message_avatar(
                     "hidden": True,
                     "kind": CLIENT_HARVEST_MESSAGE_KIND,
                 }
+        from src.anubis.utils.message_record import additional_kwargs_with_created_at
+
         human_message = HumanMessage(
             id=str(uuid4()),
             content=human_message_content,
-            additional_kwargs=human_message_additional_kwargs,
+            additional_kwargs=additional_kwargs_with_created_at(
+                human_message_additional_kwargs
+            ),
         )
 
     conversation_title_data = (
@@ -9503,22 +10115,22 @@ async def message_avatar(
         getattr(result["messages"][-1], "response_metadata", None) or {}
     ).get("moderation_violation")
     if moderation_verdict:
+        from src.anubis.utils.inbox.appeals import appeal_contact_phrase
         from src.security.bans import ban_refusal_detail
 
-        ban = await ban_account(
+        from src.anubis.utils.learning.sentiment import message_text as _message_text
+
+        ban = await complete_and_record_moderation_verdict(
             request.app.state,
             ban_subject_from_user(current_user, request_hashed_ip),
-            reason=str(
-                moderation_verdict.get("reasoning") or "terms of service violation"
-            ),
-            violated_clauses=list(moderation_verdict.get("violated_clauses") or []),
+            moderation_verdict,
             source="message",
-            excerpt=str(moderation_verdict.get("excerpt") or ""),
+            judged_text=_message_text(human_message.content),
         )
         return JSONResponse(
             {
                 "detail": ban_refusal_detail(
-                    ban, app.state.context.ban_appeal_contact_email
+                    ban, appeal_contact_phrase(app.state.context)
                 ),
                 "moderation": {"banned": True, **moderation_verdict},
                 "content": result["messages"][-1].content,
@@ -9651,6 +10263,8 @@ def _remember_look_context(
     peekable_shares: Optional[str],
     may_control_shares: bool,
     scene_narration: Optional[str] = None,
+    minecraft_body: Optional[str] = None,
+    minecraft_world: Optional[str] = None,
 ) -> None:
     """Record what a turn's browser reported it could see, for that turn's pause."""
     registry = getattr(app_state, "look_contexts", None)
@@ -9663,6 +10277,8 @@ def _remember_look_context(
             peekable_shares=peekable_shares or "",
             may_control_shares=bool(may_control_shares),
             scene_narration=scene_narration or "",
+            minecraft_body=minecraft_body or "",
+            minecraft_world=minecraft_world or "",
         ),
     )
 
@@ -9675,6 +10291,8 @@ def _look_context_for_resume(
     peekable_shares: Optional[str],
     may_control_shares: bool,
     scene_narration: Optional[str] = None,
+    minecraft_body: Optional[str] = None,
+    minecraft_world: Optional[str] = None,
 ) -> LookContext:
     """The share context a resumed run must be given, for the tools it rebuilds.
 
@@ -9687,17 +10305,30 @@ def _look_context_for_resume(
 
     What the client sent wins, because the client is reporting the present. A
     client that sent nothing falls back to what the paused turn recorded.
+    Minecraft body fields overlay from memory when the resume omitted them, so
+    a look answered by the companion does not drop ``act_in_minecraft``.
     """
     from_request = LookContext(
         live_shares=live_shares or "",
         peekable_shares=peekable_shares or "",
         may_control_shares=bool(may_control_shares),
         scene_narration=scene_narration or "",
+        minecraft_body=minecraft_body or "",
+        minecraft_world=minecraft_world or "",
     )
-    if from_request.says_anything():
-        return from_request
     registry = getattr(app_state, "look_contexts", None)
     remembered = registry.recall(thread_id) if registry is not None else None
+    if from_request.says_anything() and remembered is not None:
+        return LookContext(
+            live_shares=from_request.live_shares,
+            peekable_shares=from_request.peekable_shares,
+            may_control_shares=from_request.may_control_shares,
+            scene_narration=from_request.scene_narration,
+            minecraft_body=from_request.minecraft_body or remembered.minecraft_body,
+            minecraft_world=from_request.minecraft_world or remembered.minecraft_world,
+        )
+    if from_request.says_anything():
+        return from_request
     return remembered or from_request
 
 
@@ -9779,6 +10410,8 @@ async def resume_avatar_message(
     peekable_shares: Optional[str] = Form(None),
     scene_narration: Optional[str] = Form(None),
     scene_narration_seconds: Optional[float] = Form(None),
+    minecraft_body: bool = Form(False),
+    minecraft_world: Optional[str] = Form(None),
     your_name: Optional[str] = Form(None),
     your_description: Optional[str] = Form(None),
     user_timezone: Optional[str] = Form(None),
@@ -9788,7 +10421,8 @@ async def resume_avatar_message(
 ):
     """Resume a run paused for human approval (edit/delete identity fact) or for a look.
 
-    ``decision`` is ``apply`` | ``cancel`` | ``looked``. ``looked`` answers a
+    ``decision`` is ``apply`` | ``cancel`` | ``looked`` | ``done`` | ``skip``.
+    ``looked`` answers a
     ``look_now`` pause — nobody approved anything; the browser captured one
     frame per source the avatar asked for and sent them as ``files``, named by
     ``sources``. Those frames are described here and handed to the paused tool
@@ -9816,9 +10450,10 @@ async def resume_avatar_message(
     decision_aliases = {"approve": "apply", "reject": "cancel"}
     raw_decision = (decision or "apply").strip().lower()
     decision_value = decision_aliases.get(raw_decision, raw_decision)
-    if decision_value not in ("apply", "cancel", "looked"):
+    if decision_value not in ("apply", "cancel", "looked", "done", "skip"):
         raise HTTPException(
-            status_code=400, detail="decision must be apply, cancel, or looked."
+            status_code=400,
+            detail="decision must be apply, cancel, looked, done, or skip.",
         )
 
     config = current_user.get("app_metadata", {}).get("assistant_config", {})
@@ -9947,12 +10582,16 @@ async def resume_avatar_message(
         peekable_shares=peekable_shares,
         may_control_shares=may_control_shares,
         scene_narration=scene_narration,
+        minecraft_body="true" if minecraft_body else "",
+        minecraft_world=minecraft_world or "",
     )
     config["configurable"]["live_shares"] = look_context.live_shares
     config["configurable"]["peekable_shares"] = look_context.peekable_shares
     config["configurable"]["may_control_shares"] = look_context.may_control_shares
     config["configurable"]["scene_narration"] = look_context.scene_narration
     config["configurable"]["scene_narration_seconds"] = scene_narration_seconds
+    config["configurable"]["minecraft_body"] = look_context.minecraft_body
+    config["configurable"]["minecraft_world"] = look_context.minecraft_world
     config["configurable"]["include_quality_metrics"] = include_quality_metrics
 
     graph = app.state.graph
@@ -13395,6 +14034,15 @@ async def transcribe_recording(
             live_voice=True,
         )
     except Exception as transcription_error:  # noqa: BLE001
+        from src.anubis.utils.model import (
+            vendor_credit_is_exhausted,
+            vendor_key_is_refused,
+        )
+
+        if vendor_credit_is_exhausted(transcription_error):
+            return _vendor_speech_credit_exhausted_response()
+        if vendor_key_is_refused(transcription_error):
+            return _vendor_key_refused_response()
         raise HTTPException(
             status_code=400,
             detail=f"The recording could not be transcribed: {transcription_error}",
@@ -13424,11 +14072,12 @@ async def transcribe_recording(
                 duration_seconds=float(result.get("file_duration_s") or 0.0),
             )
         )
+    voice_block = await voice_readiness_block(current_user, assistant_id)
     return JSONResponse(
         {
             "text": text,
             "duration_seconds": result.get("file_duration_s"),
-            "voice": await voice_readiness_block(current_user, assistant_id),
+            "voice": voice_block,
         }
     )
 
@@ -13547,6 +14196,10 @@ async def speak_text(
             assistant_id, current_user, str(blocked_error)
         )
         return _blocked_voice_response(str(blocked_error))
+    except elevenlabs_client.ElevenLabsKeyRefusedError:
+        return _vendor_key_refused_response()
+    except elevenlabs_client.ElevenLabsCreditsExhaustedError:
+        return _vendor_speech_credit_exhausted_response()
     except elevenlabs_client.ElevenLabsError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
 
@@ -13696,6 +14349,10 @@ async def record_motion_track_from_request(
     repository = _motion_repository_or_503()
     try:
         payload = json.loads(motion_track) if isinstance(motion_track, str) else motion_track
+        if not isinstance(payload, dict):
+            raise ValueError("A motion window is a JSON object.")
+        if source:
+            payload["source"] = str(source)
         window = window_from_payload(payload)
     except (ValueError, TypeError) as parse_error:
         logger.info("Motion window rejected: %s", parse_error)
@@ -14118,6 +14775,8 @@ async def list_inbox_items(
     request: Request,
     state: str = "open",
     limit: int = 50,
+    q: str | None = None,
+    source_kind: str | None = None,
     current_user: dict = Depends(get_current_user),
 ):
     """The owner's inbox items: ``state=open`` (default), ``all``, or one state."""
@@ -14136,7 +14795,11 @@ async def list_inbox_items(
     elif state and state != "all":
         states = (state,)
     items = await repository.list_items(
-        assistant_id=assistant_id, states=states, limit=max(1, min(int(limit), 200))
+        assistant_id=assistant_id,
+        states=states,
+        limit=max(1, min(int(limit), 200)),
+        source_kind=(source_kind or "").strip() or None,
+        query=(q or "").strip() or None,
     )
     return JSONResponse(
         {
@@ -15609,13 +16272,12 @@ async def _start_media_batch(
         on their own and no hashed client address is recorded — unlike a message,
         which an anonymous visitor can send.
         """
-        await ban_account(
+        await complete_and_record_moderation_verdict(
             app.state,
             ban_subject_from_user(current_user, None),
-            reason=str(verdict.get("reasoning") or "terms of service violation"),
-            violated_clauses=list(verdict.get("violated_clauses") or []),
+            verdict,
             source="upload",
-            excerpt=str(verdict.get("source") or ""),
+            judged_text=str(verdict.get("excerpt") or verdict.get("source") or ""),
         )
 
     master.task = asyncio.create_task(
@@ -18119,6 +18781,104 @@ async def _prune_ground_truth_features_for_deleted_docs(
         style_profile_namespace,
         key="style_profile",
         value={"value": style_profile_str},
+    )
+
+
+# ── Age verification (unlocks adult-only avatars in search) ───────────────────
+
+
+class AgeVerificationRequest(BaseModel):
+    """The body of POST /age_verification."""
+
+    date_of_birth: str
+    source: str | None = None
+
+
+def _age_verification_repository_or_503():
+    """Return the published repository, or raise 503 when the lifespan did not bind one."""
+    from src.anubis.utils.age_verification import get_age_verification_repository
+
+    repository = get_age_verification_repository()
+    if repository is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Age verification is not available on this server.",
+        )
+    return repository
+
+
+@app.get("/age_verification")
+async def get_age_verification_route(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return whether this account has confirmed an age that unlocks adult-only search.
+
+    The date of birth itself is never returned.
+    """
+    from src.anubis.utils.age_verification.policy import minimum_verification_years
+    from src.anubis.utils.age_verification.repository import verification_public_view
+
+    if is_anonymous_user(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Age verification requires a signed-in account.",
+        )
+    repository = _age_verification_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.get_verification(user_id)
+    return JSONResponse(
+        content=verification_public_view(
+            row, minimum_years=minimum_verification_years(app.state.context)
+        ),
+        status_code=200,
+    )
+
+
+@app.post("/age_verification")
+async def set_age_verification_route(
+    body: AgeVerificationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Confirm this account's age with a date of birth.
+
+    Adult-only avatars then appear in search for this account. The date of
+    birth is stored only to re-check the minimum age and is never returned.
+    """
+    from src.anubis.utils.age_verification.policy import (
+        date_of_birth_verification_error,
+        minimum_verification_years,
+        parse_date_of_birth,
+    )
+    from src.anubis.utils.age_verification.repository import verification_public_view
+
+    if is_anonymous_user(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Age verification requires a signed-in account.",
+        )
+    try:
+        date_of_birth = parse_date_of_birth(body.date_of_birth)
+    except ValueError as invalid_date:
+        raise HTTPException(status_code=400, detail=str(invalid_date)) from invalid_date
+    minimum_years = minimum_verification_years(app.state.context)
+    refusal = date_of_birth_verification_error(
+        date_of_birth, minimum_years=minimum_years
+    )
+    if refusal is not None:
+        status_code = 400 if "must be" not in refusal else 403
+        if refusal.startswith("You must be"):
+            status_code = 403
+        raise HTTPException(status_code=status_code, detail=refusal)
+    repository = _age_verification_repository_or_503()
+    user_id = current_user["identities"][0]["user_id"]
+    row = await repository.set_verification(
+        user_id,
+        date_of_birth,
+        source=body.source or "account_settings",
+    )
+    return JSONResponse(
+        content=verification_public_view(row, minimum_years=minimum_years),
+        status_code=200,
     )
 
 

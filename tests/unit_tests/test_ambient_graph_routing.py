@@ -72,7 +72,7 @@ def workflow(monkeypatch):
         return AmbientTriageClassification(
             decision=decisions["next"],
             needs_owner_action=decisions["next"] == "notify",
-            observation_kind="writing_code",
+            observation_kind=decisions.get("observation_kind", "writing_code"),
             summary="A person writes code.",
             salience=decisions.get("salience", 0.95),
             reason="test",
@@ -350,6 +350,22 @@ async def test_a_salient_enough_observation_overrides_the_quiet_period(workflow)
         message for message in messages if "ambient" in message.additional_kwargs
     ]
     assert observations[-1].additional_kwargs["ambient"]["decision"] == "respond"
+
+
+@pytest.mark.asyncio
+async def test_a_playful_performance_may_speak_again_inside_the_ordinary_quiet_period(
+    workflow, monkeypatch
+):
+    """A second face gag is a new bid, not five minutes of silence."""
+    monkeypatch.setenv("AMBIENT_PLAYFUL_RESPOND_COOLDOWN_SECONDS", "0")
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "respond"
+    decisions["salience"] = 0.80
+    decisions["observation_kind"] = "playful_performance"
+
+    await _run(app, _ambient_turn(message_id="obs-gag-1"), "gag-thread")
+    await _run(app, _ambient_turn(message_id="obs-gag-2"), "gag-thread")
+    assert len(avatar_runs) == 2
 
 
 @pytest.mark.asyncio

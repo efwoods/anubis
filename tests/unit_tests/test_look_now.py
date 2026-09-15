@@ -973,3 +973,18 @@ def test_the_prompt_section_names_what_can_be_peeked_at():
     assert "open to a single look right now: webcam and screen" in block
     assert "never interchangeable" in block
     assert "never a standing watch" in block
+
+
+def test_look_now_is_not_offered_for_an_attached_file_the_person_asked_to_describe():
+    from src.anubis.utils.tools.vision.look_tools import should_offer_look_now
+
+    attached_video = HumanMessage(
+        content="describe this image place\n\n[File: wireframe.MP4 - video/mp4]"
+    )
+    assert should_offer_look_now([attached_video]) is False
+    described_still = HumanMessage(
+        content="Please describe this image\n\n---\nImage descriptions:\n[logo.png]\nA mark."
+    )
+    assert should_offer_look_now([described_still]) is False
+    assert should_offer_look_now([HumanMessage(content="what is on my screen")]) is True
+    assert should_offer_look_now([HumanMessage(content="hey mom")]) is True

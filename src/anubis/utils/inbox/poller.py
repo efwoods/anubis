@@ -37,6 +37,49 @@ _store: Any | None = None
 _compiled_graph: Any | None = None
 
 
+def _inbox_decision_action(human_response: dict[str, Any] | None) -> str:
+    """The owner's chosen action, from ``args.action``, ``action``, or ``type``."""
+    payload = human_response or {}
+    arguments = payload.get("args")
+    if isinstance(arguments, dict):
+        nested_action = str(arguments.get("action") or "").strip().lower()
+        if nested_action:
+            return nested_action
+    named_action = str(payload.get("action") or "").strip().lower()
+    if named_action:
+        return named_action
+    return str(payload.get("type") or "").strip().lower()
+
+
+async def _apply_moderation_inbox_decision(
+    item: dict[str, Any], decision: str
+) -> None:
+    """Revoke lifts the ban; accept leaves the recorded verdict as it stands."""
+    from src.anubis.utils.runtime_handles import get_postgres_pool
+    from src.security.bans import ACTION_REVOKE_BAN, lift_ban
+
+    if decision != ACTION_REVOKE_BAN:
+        return
+    detail = item.get("confidence_detail") or {}
+    ban_id = str(detail.get("ban_id") or "").strip()
+    if not ban_id:
+        logger.warning(
+            "Moderation inbox item %s has no ban_id to revoke", item.get("item_id")
+        )
+        return
+    pool = get_postgres_pool()
+    if pool is None:
+        logger.error("Cannot revoke ban %s: no postgres pool", ban_id)
+        return
+    lifted = await lift_ban(
+        pool,
+        ban_id,
+        "administrator revoked the ban from the personal-avatar inbox",
+    )
+    if lifted is None:
+        logger.warning("Revoke found no active ban to lift: %s", ban_id)
+
+
 def set_inbox_runtime(checkpointer: Any, store: Any) -> None:
     """Publish the checkpointer and store the in-process graph runs with."""
     global _checkpointer, _store, _compiled_graph
@@ -141,13 +184,24 @@ async def run_inbox_for_message(
     repository = get_inbox_repository()
     if repository is None:
         return None
+    from src.anubis.utils.inbox.appeals import (
+        APPEAL_SOURCE_KIND,
+        appeal_item_fields,
+        email_addresses_from_headers,
+        find_ban_for_appellant,
+        matched_appeal_inbox_address,
+        message_is_ban_appeal,
+    )
+
+    is_appeal = message_is_ban_appeal(message, user_id=user_id, context=context)
+    recorded_source_kind = APPEAL_SOURCE_KIND if is_appeal else source_kind
     external_id = str(
         message.get("rfc822_message_id") or message.get("message_id") or ""
     )
     if external_id:
         existing = await repository.find_item_by_external_id(
             assistant_id=assistant_id,
-            source_kind=source_kind,
+            source_kind=recorded_source_kind,
             account_key=account_key,
             external_id=external_id,
         )
@@ -156,6 +210,31 @@ async def run_inbox_for_message(
     recipients = message.get("recipients")
     if isinstance(recipients, str):
         recipients = [part.strip() for part in recipients.split(",") if part.strip()]
+    recipient_addresses = email_addresses_from_headers(
+        recipients,
+        message.get("cc"),
+        message.get("delivered_to"),
+        message.get("original_to"),
+    )
+    if is_appeal:
+        from src.anubis.utils.runtime_handles import get_postgres_pool
+
+        appeal_ban = await find_ban_for_appellant(
+            get_postgres_pool(), message.get("sender")
+        )
+        item = await repository.create_item(
+            appeal_item_fields(
+                user_id=user_id,
+                assistant_id=assistant_id,
+                account_key=account_key,
+                message=message,
+                recipients=recipient_addresses or list(recipients or []),
+                external_id=external_id or None,
+                ban=appeal_ban,
+                appeal_address=matched_appeal_inbox_address(message, context),
+            )
+        )
+        return await repository.get_item(item["item_id"])
     item = await repository.create_item(
         {
             "user_id": user_id,
@@ -227,10 +306,17 @@ async def resume_inbox_item(
     # that triages a notification as though it were incoming mail. Record the
     # owner's decision and close the item here instead.
     if str(item.get("source_kind") or "") in NOTIFY_ONLY_SOURCE_KINDS:
-        decision = str((human_response or {}).get("action") or "").strip().lower()
+        decision = _inbox_decision_action(human_response)
+        if str(item.get("source_kind") or "") in ("moderation", "appeal"):
+            await _apply_moderation_inbox_decision(item, decision)
+            resolved_state = (
+                STATE_IGNORED if decision == "ignore" else STATE_RESOLVED
+            )
+        else:
+            resolved_state = STATE_IGNORED if decision == "ignore" else STATE_RESOLVED
         await repository.update_item(
             item_id,
-            state=STATE_IGNORED if decision == "ignore" else STATE_RESOLVED,
+            state=resolved_state,
             owner_decision=human_response,
             resolved_at=datetime.now(UTC),
         )

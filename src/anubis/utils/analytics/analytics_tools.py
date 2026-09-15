@@ -31,6 +31,7 @@ ANALYTICS_TOOL_NAMES: tuple[str, ...] = (
     "cancel_report_schedule",
     "list_report_schedules",
     "forecast_metric",
+    "run_analytics_sql",
 )
 
 PLATFORM_METRIC_NAMES: tuple[str, ...] = (
@@ -44,6 +45,11 @@ PLATFORM_METRIC_NAMES: tuple[str, ...] = (
     "spend_by_period",
     "feedback_summary",
     "revenue_estimate",
+    "cost_per_avatar",
+    "average_cost_per_message",
+    "average_cost_per_conversation",
+    "cost_per_new_user",
+    "unit_economics",
 )
 
 FINANCE_METRIC_NAMES: tuple[str, ...] = (
@@ -170,6 +176,13 @@ def build_analytics_tools(
           (group_by "day", "model", or "inference_type")
         - what users love, hate, dislike, and request: "feedback_summary"
         - projected revenue: "revenue_estimate" (monthly recurring revenue by tier)
+        - cost of serving one avatar: "cost_per_avatar"
+        - average cost of one message: "average_cost_per_message"
+        - average cost of one conversation: "average_cost_per_conversation"
+        - product cost of one new user (each creates one personal avatar):
+          "cost_per_new_user" (not advertising CAC; that is query_finances "cac")
+        - all four unit costs at once: "unit_economics"
+          (group_by "product" or "fully_loaded")
 
         Platform-wide numbers are reserved for the platform administrator;
         anyone else receives status "forbidden". Administrator traffic is excluded from the
@@ -180,6 +193,7 @@ def build_analytics_tools(
             since: ISO date or datetime the period starts at (default: thirty days ago).
             until: ISO date or datetime the period ends at (default: now).
             group_by: For "spend_by_period": "day", "model", or "inference_type".
+                For "unit_economics": "product" or "fully_loaded".
         """
         from src.anubis.utils.analytics import platform_metrics
 
@@ -223,6 +237,14 @@ def build_analytics_tools(
                 result = await platform_metrics.spend_by_period(
                     pool, start, end, group_by=group_by or "day"
                 )
+            elif metric_name == "unit_economics":
+                result = await platform_metrics.unit_economics(
+                    pool,
+                    start,
+                    end,
+                    ledger=group_by or platform_metrics.LEDGER_PRODUCT,
+                    user_id=user_id,
+                )
             else:
                 query = getattr(platform_metrics, metric_name)
                 result = await query(pool, start, end)
@@ -256,7 +278,9 @@ def build_analytics_tools(
 
         Transactions are synced from the bank first when the stored copy is
         older than the configured minimum interval. When no bank is connected
-        the answer says so; offer connect_account with provider "plaid".
+        the answer says so. Call connect_account with provider "plaid" only
+        if the conversation partner asked about spending, balances,
+        subscriptions, or another question this tool answers.
 
         Args:
             metric: One of spend, by_category, by_merchant, by_day, cac, accounts.
@@ -365,11 +389,13 @@ def build_analytics_tools(
 
         Returns the daily rows for one provider when ``provider`` is given, and
         the totals by provider, metric, and unit otherwise. When no vendor
-        is connected the answer says so; offer connect_account with the
-        vendor's provider name.
+        is connected the answer says so. Call connect_account with the
+        vendor's provider name only if the conversation partner asked about
+        that vendor's usage or cost.
 
         Args:
-            provider: A provider name such as "openai", "anthropic", or "langsmith".
+            provider: A provider name such as "openai", "elevenlabs", "xai",
+                "cursor", "claude_app", "anthropic", or "langsmith".
             since: ISO date the period starts at (default: thirty days ago).
             until: ISO date the period ends at (default: today).
         """
@@ -391,7 +417,8 @@ def build_analytics_tools(
             if not totals["rows"]:
                 answer["message"] = (
                     "No vendor usage is recorded for the period. Connect a vendor "
-                    "(langsmith, openai, anthropic) with connect_account, or the "
+                    "(langsmith, openai, elevenlabs, xai, cursor, claude_app, anthropic) "
+                    "with connect_account, or the "
                     "connected vendor has not been read yet."
                 )
             return answer
@@ -635,22 +662,53 @@ def build_analytics_tools(
 
     @tool
     async def forecast_metric(
-        values: list[float], horizon: int, season_length: int | None = None
+        values: list[float] | None = None,
+        horizon: int = 30,
+        season_length: int | None = None,
+        series: str | None = None,
+        ledger: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
     ) -> dict[str, Any]:
         """Project a series forward, answering "what does next month or next quarter look like" for revenue, spend, burn rate, or users.
 
         Pass the observed series (one number per period, oldest first) and how
         many periods ahead to project; pass season_length (7 for weekly
         patterns in daily data, 12 for yearly patterns in monthly data) when
-        the series repeats. The answer names the method; say so when
-        relaying the projection, and chart the observed and projected
-        values together with make_chart.
+        the series repeats. For the owner's own burn, pass series
+        "projected_burn" and the tool loads product spend, vendor invoices,
+        bank outflows, new-user growth, subscriptions, and the Google Sheet
+        expected burn. The answer names the method; say so when relaying the
+        projection, and chart the observed and projected values together with
+        make_chart.
 
         Args:
             values: The observed numbers, oldest first (at least three).
             horizon: How many periods ahead to project.
             season_length: The length of a repeating season, when known.
+            series: "projected_burn" to load spend from the database.
+            ledger: For projected_burn: "product" or "fully_loaded".
+            since: ISO start for projected_burn (default: thirty days ago).
+            until: ISO end for projected_burn (default: now).
         """
+        if str(series or "").strip().lower() == "projected_burn":
+            if pool is None:
+                return _unavailable("Projected burn")
+            from src.anubis.utils.analytics.platform_metrics import LEDGER_FULLY_LOADED
+            from src.anubis.utils.analytics.projected_burn import project_burn
+
+            try:
+                start, end = period_from(since, until)
+                return await project_burn(
+                    pool,
+                    user_id,
+                    since=start,
+                    until=end,
+                    horizon=int(horizon or 30),
+                    ledger=str(ledger or LEDGER_FULLY_LOADED),
+                )
+            except Exception as burn_error:  # noqa: BLE001
+                return _error(burn_error)
         try:
             result = forecast_series(
                 [float(value) for value in values or []],
@@ -661,6 +719,45 @@ def build_analytics_tools(
             return _error(forecast_error)
         if "error" in result:
             return {"status": STATUS_ERROR, "message": result["error"]}
+        return {"status": STATUS_OK, **result}
+
+    @tool
+    async def run_analytics_sql(sql: str) -> dict[str, Any]:
+        """Run one read-only SQL query against the analytics tables, answering a question the named metrics do not cover.
+
+        Platform administrator only. The statement must be a single SELECT or
+        WITH against api_metrics, tool_calls, vendor_usage_daily,
+        finance_transactions, assistant, thread, reports, report_schedules, or
+        reference_forecasts. Writes, comments that hide a second statement,
+        and unknown tables are refused. Chart the result with make_chart when
+        it is a series.
+
+        Args:
+            sql: One SELECT or WITH statement.
+        """
+        from src.anubis.utils.analytics import platform_metrics
+        from src.anubis.utils.analytics.sql_gate import (
+            AnalyticsSqlRefused,
+            run_analytics_sql_with_preferred_pool,
+        )
+
+        if not platform_metrics.is_platform_admin(context, accounts, user_id):
+            return {
+                "status": STATUS_FORBIDDEN,
+                "message": (
+                    "Custom analytics queries are reserved for the platform administrator."
+                ),
+            }
+        if pool is None and not str(
+            getattr(context, "analytics_readonly_postgres_uri", None) or ""
+        ).strip():
+            return _unavailable("Custom analytics queries")
+        try:
+            result = await run_analytics_sql_with_preferred_pool(context, pool, sql)
+        except AnalyticsSqlRefused as refused:
+            return {"status": STATUS_ERROR, "message": str(refused)}
+        except Exception as query_error:  # noqa: BLE001
+            return _error(query_error)
         return {"status": STATUS_OK, **result}
 
     return [
@@ -674,6 +771,7 @@ def build_analytics_tools(
         cancel_report_schedule,
         list_report_schedules,
         forecast_metric,
+        run_analytics_sql,
     ]
 
 

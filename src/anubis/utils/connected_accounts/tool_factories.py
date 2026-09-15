@@ -34,6 +34,7 @@ from src.anubis.utils.connected_accounts.providers import (
     KIND_MCP_SERVER,
     KIND_MESSAGING,
     KIND_SOCIAL,
+    KIND_TELEPHONY,
     KIND_WEBSITE,
     MECHANISM_API_KEY,
     MECHANISM_BROWSER_SESSION,
@@ -44,6 +45,12 @@ from src.anubis.utils.connected_accounts.providers import (
 logger = logging.getLogger(__name__)
 
 ToolFactory = Callable[..., Awaitable[list[Any]] | list[Any]]
+
+
+def _telephony_factory(context: Any, accounts: list[dict[str, Any]], **runtime: Any) -> list[Any]:
+    from src.anubis.utils.phone.tools import build_phone_sip_tools
+
+    return build_phone_sip_tools(context, accounts, **runtime)
 
 
 def _mailbox_factory(context: Any, accounts: list[dict[str, Any]], **runtime: Any) -> list[Any]:
@@ -198,6 +205,7 @@ TOOL_FACTORIES: dict[str, ToolFactory] = {
     KIND_HOSTING: _oauth_vendor_factory,
     KIND_CRYPTO: _oauth_vendor_factory,
     KIND_MESSAGING: _oauth_vendor_factory,
+    KIND_TELEPHONY: _telephony_factory,
 }
 
 # Tool names per provider for kinds with a fixed surface, so the connect card
@@ -234,6 +242,7 @@ _VENDOR_API_TOOL_NAMES: dict[str, tuple[str, ...]] = {
         "find_free_time",
     ),
     "google_analytics": ("analytics_traffic_report",),
+    "google_sheets": ("read_google_sheet",),
     "youtube": ("youtube_channel_stats",),
     "coinbase": ("coinbase_accounts", "coinbase_transactions"),
 }
@@ -251,6 +260,10 @@ def tool_names_for(provider: Any, record: dict[str, Any] | None = None) -> list[
     mechanism = str(getattr(provider, "credential_mechanism", "") or "")
     if record and record.get("credential_mechanism") == MECHANISM_BROWSER_SESSION:
         return list(_BROWSER_SESSION_TOOL_NAMES)
+    if kind == KIND_TELEPHONY:
+        from src.anubis.utils.phone.tools import SIP_TOOL_NAMES
+
+        return list(SIP_TOOL_NAMES)
     if kind == KIND_MAILBOX:
         from src.anubis.utils.tools.email.mailbox_tools import MAILBOX_TOOL_NAMES
 

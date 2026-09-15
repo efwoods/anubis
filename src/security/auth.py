@@ -120,21 +120,27 @@ async def refuse_if_banned(
     (cached briefly there). A missing pool — unit tests, or an app that has not
     finished starting — means no ban can be known, so nothing is refused.
     """
-    from src.security.bans import ban_refusal_detail, find_active_ban
+    from src.security.bans import (
+        ban_refusal_detail,
+        find_active_ban,
+        is_unbannable_administrator,
+    )
 
     application_state = getattr(getattr(request, "app", None), "state", None)
     pool = getattr(application_state, "pool", None)
     if pool is None:
         return
+    context = getattr(application_state, "context", None)
+    if is_unbannable_administrator(user_id=user_id, email=email, context=context):
+        return
     ban = await find_active_ban(pool, user_id=user_id, hashed_ip=hashed_ip, email=email)
     if ban is None:
         return
-    context = getattr(application_state, "context", None)
+    from src.anubis.utils.inbox.appeals import appeal_contact_phrase
+
     raise HTTPException(
         status_code=403,
-        detail=ban_refusal_detail(
-            ban, getattr(context, "ban_appeal_contact_email", None)
-        ),
+        detail=ban_refusal_detail(ban, appeal_contact_phrase(context)),
     )
 
 
@@ -1204,11 +1210,13 @@ async def get_user_with_api_key(
     # AI monitoring: a banned account is refused before anything else happens
     # (before caching, enrollment, or provisioning). The Postgres bans table is
     # the only source of truth — Auth0 is never consulted or written for bans.
-    await refuse_if_banned(
-        request,
-        user_id=((user.get("identities") or [{}])[0] or {}).get("user_id"),
-        email=user.get("email"),
-    )
+    # /ban_status sets skip_ban_refusal so the banned person can read why.
+    if not getattr(getattr(request, "state", None), "skip_ban_refusal", False):
+        await refuse_if_banned(
+            request,
+            user_id=((user.get("identities") or [{}])[0] or {}).get("user_id"),
+            email=user.get("email"),
+        )
 
     if user["email_verified"] != True:
         if require_verified_email:
@@ -1516,6 +1524,27 @@ async def get_current_user(
     return user
 
 
+async def get_optional_signed_in_user(
+    request: Request,
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
+) -> dict | None:
+    """Return the signed-in account, or None when the request carries no credential.
+
+    Public listings use this so an unauthenticated gallery load does not mint
+    an anonymous identity. A credential that is present but invalid is still a
+    401: a broken session must not silently look like a visitor.
+    """
+    if not api_key and bearer_credentials is None:
+        return None
+    user = await _resolve_authenticated_user(request, api_key, bearer_credentials)
+    if not user:
+        raise _invalid_credential_error(bearer_credentials)
+    return user
+
+
 async def get_current_user_allow_unverified(
     request: Request,
     api_key: str | None = Depends(optional_api_key_scheme),
@@ -1632,7 +1661,8 @@ async def get_anonymous_user_with_anonymous_api_key(
 
     # AI monitoring: anonymous traffic from a banned IP is refused. An anonymous
     # visitor IS the hashed IP, so the ban lookup is by that key.
-    await refuse_if_banned(request, hashed_ip=hashed_ip)
+    if not getattr(getattr(request, "state", None), "skip_ban_refusal", False):
+        await refuse_if_banned(request, hashed_ip=hashed_ip)
 
     # async with _cache_lock:
     #     if cache_key in _api_key_cache:

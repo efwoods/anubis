@@ -353,4 +353,6 @@ def test_the_result_page_posts_only_to_configured_origins_and_holds_no_token():
     assert '"*"' not in html
     assert "SECRET" not in html
     assert "neural-nexus:login-result" in html
+    assert "Authorization complete!" in html
+    assert "You can close this tab." in html
     assert oauth_flow.allowed_popup_origins(SimpleNamespace(connect_oauth_popup_target_origins="*")) == []

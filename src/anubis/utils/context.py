@@ -144,6 +144,37 @@ class GlobalContext:
     model_completion_cost: float = 0.0
     # metadata={"description": "Completion token cost."},
 
+    nvidia_nim_api_key: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "NVIDIA NIM API key used when the primary text provider "
+                "refuses for lack of credit (DEV). Env NVIDIA_NIM_API_KEY. "
+                "When unset, LLM_PROVIDER_API_KEY is reused if that URL is NVIDIA."
+            )
+        },
+    )
+
+    nvidia_nim_base_url: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "NVIDIA NIM OpenAI-compatible base URL for credit-exhaustion "
+                "fallback. Env NVIDIA_NIM_BASE_URL."
+            )
+        },
+    )
+
+    nvidia_nim_model: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "NVIDIA NIM catalog id used when the primary text provider "
+                "is out of credit. Env NVIDIA_NIM_MODEL."
+            )
+        },
+    )
+
     """ </Inference Model> """
 
     """ <Image Model> """
@@ -513,7 +544,19 @@ class GlobalContext:
     ban_appeal_contact_email: str = field(
         default="contact@neuralnexus.site",
         metadata={
-            "description": "The address a banned person is told to contact to appeal the ban. Env BAN_APPEAL_CONTACT_EMAIL."
+            "description": "The primary address a banned person is told to contact to appeal the ban. Env BAN_APPEAL_CONTACT_EMAIL."
+        },
+    )
+
+    ban_appeal_inbox_addresses: str = field(
+        default="contact@neuralnexus.site,business@neuralnexus.site,support@neuralnexus.site",
+        metadata={
+            "description": (
+                "Comma-separated addresses whose incoming mail is a ban appeal. "
+                "Those messages appear in the administrator's personal-avatar "
+                "inbox after that avatar's mailbox is connected through an "
+                "email provider. Env BAN_APPEAL_INBOX_ADDRESSES."
+            )
         },
     )
 
@@ -811,6 +854,103 @@ class GlobalContext:
         },
     )
 
+    livekit_url: str = field(
+        default=None,
+        metadata={
+            "description": "LiveKit Cloud or self-hosted WebSocket URL for SIP rooms and web listen-in. Empty disables outbound SIP. Env LIVEKIT_URL."
+        },
+    )
+    livekit_api_key: str = field(
+        default=None,
+        metadata={"description": "LiveKit API key. Env LIVEKIT_API_KEY."},
+    )
+    livekit_api_secret: str = field(
+        default=None,
+        metadata={"description": "LiveKit API secret. Env LIVEKIT_API_SECRET."},
+    )
+    livekit_sip_outbound_trunk_id: str = field(
+        default=None,
+        metadata={
+            "description": "Shared outbound SIP trunk id. One trunk for the product, never per user. Env LIVEKIT_SIP_OUTBOUND_TRUNK_ID."
+        },
+    )
+    platform_phone_number: str = field(
+        default=None,
+        metadata={
+            "description": "The one shared inbound DID. Owners call this number from the mobile they verified. Env PLATFORM_PHONE_NUMBER."
+        },
+    )
+    deepgram_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "Deepgram key for phone-call speech-to-text. Env DEEPGRAM_API_KEY."
+        },
+    )
+    nominatim_base_url: str = field(
+        default="https://nominatim.openstreetmap.org",
+        metadata={
+            "description": "Nominatim search base for place lookup. Env NOMINATIM_BASE_URL."
+        },
+    )
+    overpass_base_url: str = field(
+        default="https://overpass-api.de/api/interpreter",
+        metadata={
+            "description": "Overpass interpreter for OSM tags (phone, hours). Env OVERPASS_BASE_URL."
+        },
+    )
+    place_lookup_cache_ttl_seconds: int = field(
+        default=604800,
+        metadata={
+            "description": "How long a (name, city) place lookup is cached, in seconds. Default 7 days. Env PLACE_LOOKUP_CACHE_TTL_SECONDS."
+        },
+    )
+    google_places_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "Optional Google Places fallback when OSM has no phone. Empty means this step never runs. Env GOOGLE_PLACES_API_KEY."
+        },
+    )
+    openroute_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "OpenRouteService key for driving estimates. Missing key skips routing; the call still proceeds. Env OPENROUTE_API_KEY."
+        },
+    )
+    travel_origin_max_age_seconds: int = field(
+        default=1800,
+        metadata={
+            "description": "Maximum age of a stored owner location or geo visit used as a travel origin, in seconds. Default 30 minutes. Env TRAVEL_ORIGIN_MAX_AGE_SECONDS."
+        },
+    )
+    phone_lookup_http_timeout_seconds: float = field(
+        default=15.0,
+        metadata={
+            "description": "HTTP timeout for Nominatim, Overpass, OpenRouteService, and LiveKit SIP. Env PHONE_LOOKUP_HTTP_TIMEOUT_SECONDS."
+        },
+    )
+    twilio_account_sid: str = field(
+        default=None,
+        metadata={"description": "Twilio account SID for SMS verification. Env TWILIO_ACCOUNT_SID."},
+    )
+    twilio_auth_token: str = field(
+        default=None,
+        metadata={"description": "Twilio auth token for SMS verification. Env TWILIO_AUTH_TOKEN."},
+    )
+    twilio_from_number: str = field(
+        default=None,
+        metadata={"description": "Twilio from-number for verification texts. Env TWILIO_FROM_NUMBER."},
+    )
+    phone_verify_http_timeout_seconds: float = field(
+        default=15.0,
+        metadata={"description": "HTTP timeout for the verification SMS sender. Env PHONE_VERIFY_HTTP_TIMEOUT_SECONDS."},
+    )
+    phone_verify_allow_undelivered: str = field(
+        default="FALSE",
+        metadata={
+            "description": "TRUE lets tests and local development issue a confirmation code without sending SMS. Production must stay FALSE. Env PHONE_VERIFY_ALLOW_UNDELIVERED."
+        },
+    )
+
     max_custom_mcp_connectors_per_user: int = field(
         default=10,
         metadata={
@@ -1018,6 +1158,13 @@ class GlobalContext:
         default=250,
         metadata={
             "description": "Milliseconds between frames of a live browser sign-in window when the browser cannot stream frames on the browser's own schedule. Env BROWSER_SESSION_FRAME_INTERVAL_MS."
+        },
+    )
+
+    agent_computer_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether the platform administrator's personal avatar may open a long-lived hosted computer for dashboard sign-in and spend pulls. Env AGENT_COMPUTER_ENABLED."
         },
     )
 
@@ -1795,6 +1942,13 @@ class GlobalContext:
         },
     )
 
+    ambient_playful_respond_cooldown_seconds: float = field(
+        default=6.0,
+        metadata={
+            "description": "Seconds of quiet required on one conversation thread after the avatar reacts to a playful camera performance (a face, a tongue, nostrils, a gag aimed at the webcam) before another such observation may become a reply. Much shorter than AMBIENT_RESPOND_COOLDOWN_SECONDS on purpose: a kid repeating a gag is asking for another reaction, and a five-minute quiet period is what turns the second beat into silence. Env AMBIENT_PLAYFUL_RESPOND_COOLDOWN_SECONDS."
+        },
+    )
+
     """ </Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
     """ <Scene narration (the accessibility mode: what is in view, read aloud)> """
@@ -1814,6 +1968,17 @@ class GlobalContext:
     )
 
     """ </Scene narration (the accessibility mode: what is in view, read aloud)> """
+
+    """ <Minecraft body (latent act_in_minecraft tool)> """
+
+    minecraft_body_enabled: str = field(
+        default="true",
+        metadata={
+            "description": "Whether a Mineflayer body reported on POST /message/{assistant_id} (minecraft_body=true plus the current minecraft_world snapshot) may attach the act_in_minecraft tool. Set to false to withhold the tool from every turn; a companion that is still sending the fields is unaffected except that the avatar cannot move the body. Env MINECRAFT_BODY_ENABLED."
+        },
+    )
+
+    """ </Minecraft body (latent act_in_minecraft tool)> """
 
     """ <Motion wireframe (how the person moves)> """
 
@@ -2294,10 +2459,17 @@ class GlobalContext:
         },
     )
 
+    analytics_readonly_postgres_uri: str = field(
+        default=None,
+        metadata={
+            "description": "Optional read-only Postgres URI for custom analytics SQL. Prefer a role granted SELECT only on analytics tables. When empty, run_analytics_sql uses the application pool and still applies the SELECT gate. Env ANALYTICS_READONLY_POSTGRES_URI."
+        },
+    )
+
     model_token_limit: int = field(
         default=400000,
         metadata={
-            "description": "Maximum context window for the primary inference model, in tokens (absolute count, not thousands)."
+            "description": "Maximum context window for the primary inference model, in tokens (absolute count, not thousands). NVIDIA's hosted Llama 3.2 90B Vision NIM is 32768 regardless of a larger value here; the turn is fitted to that ceiling."
         },
     )
 
@@ -2364,6 +2536,29 @@ class GlobalContext:
         default=None,
         metadata={
             "description": "user_id to allow the creation of public avatars. Reserved for CEO."
+        },
+    )
+
+    age_verification_minimum_years: int = field(
+        default=18,
+        metadata={
+            "description": (
+                "Youngest age, in years, that POST /age_verification accepts. "
+                "Adult-only avatars stay out of search until the signed-in account "
+                "has confirmed this age with a date of birth. Env "
+                "AGE_VERIFICATION_MINIMUM_YEARS."
+            )
+        },
+    )
+
+    admin_account_email: str = field(
+        default="e.woods.business@icloud.com",
+        metadata={
+            "description": (
+                "Email address of the unbannable administrator, the same account "
+                "admin_user_id names. A ban is never enforced against this address. "
+                "Env ADMIN_ACCOUNT_EMAIL."
+            )
         },
     )
 

@@ -202,6 +202,7 @@ def test_the_welcome_page_sources_are_all_in_the_catalog():
         "slack",
         "desktop_mcp",
         "custom_mcp",
+        "phone",
     ):
         assert expected in names
 

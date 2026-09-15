@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import Any
@@ -71,6 +72,55 @@ def message_to_budget_line(msg: BaseMessage) -> str:
 
 def estimate_messages_token_count(messages: list[BaseMessage]) -> int:
     return sum(count_tokens(message_to_budget_line(m)) for m in messages)
+
+
+def estimate_tool_schema_tokens(tools: list[Any] | None) -> int:
+    """Rough token count of tool names, descriptions, and argument schemas."""
+    parts: list[str] = []
+    for tool in tools or []:
+        name = str(getattr(tool, "name", "") or "")
+        description = str(getattr(tool, "description", "") or "")
+        schema_text = ""
+        args_schema = getattr(tool, "args_schema", None)
+        if args_schema is None:
+            args_schema = getattr(tool, "args", None)
+        try:
+            if args_schema is not None and hasattr(args_schema, "model_json_schema"):
+                schema_text = json.dumps(args_schema.model_json_schema())
+            elif isinstance(args_schema, dict):
+                schema_text = json.dumps(args_schema)
+            elif args_schema is not None:
+                schema_text = str(args_schema)
+        except Exception:  # noqa: BLE001 - schema dump must not break a turn
+            schema_text = ""
+        parts.append(f"{name}\n{description}\n{schema_text}")
+    if not parts:
+        return 0
+    return count_tokens("\n".join(parts))
+
+
+def extra_tools_within_inference_window(
+    extra_tools: list[Any] | None,
+    *,
+    core_tools: list[Any] | None,
+    system_text: str,
+    messages: list[Any] | None,
+    window: int,
+) -> list[Any]:
+    """Drop optional tools only when the hosted input ceiling is the 32k NIM window.
+
+    NVIDIA Integrate serves Llama 3.2 90B Vision at 32768 tokens. A 400000
+    ``MODEL_TOKEN_LIMIT`` (OpenAI / Llama 11B) must not drop mailbox or look
+    tools because a tiktoken estimate of tool JSON schemas looked large.
+    """
+    extras = list(extra_tools or [])
+    if not extras:
+        return extras
+    # Keep mailbox, look, and connect tools on every hosted window, including
+    # NVIDIA 90B at 32768. Fitting the turn is the system prompt's job
+    # (DynamicConsciousnessPrompt), not silently removing the tools the
+    # person asked to use.
+    return extras
 
 
 def estimate_total_prompt_tokens(

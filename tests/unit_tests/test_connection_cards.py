@@ -185,3 +185,64 @@ def test_stale_accounts_are_reported(monkeypatch):
     report = {tool.name: tool for tool in stale}["list_connections_needing_sign_in"]
     result = asyncio.run(report.coroutine())
     assert result["count"] == 1 and result["accounts"][0]["provider"] == "gmail"
+
+
+def test_connection_tools_are_offered_to_every_inference_model():
+    """Every model receives ``connect_account``. The prompt, not a catalog
+    gate, keeps a generic question from raising a card.
+    """
+    from src.anubis.utils.connected_accounts.connection_tools import (
+        should_offer_connection_tools,
+    )
+
+    eleven_b = SimpleNamespace(model="meta/llama-3.2-11b-vision-instruct")
+    luna = SimpleNamespace(model="gpt-5.6-luna")
+    ninety_b = SimpleNamespace(model="meta/llama-3.2-90b-vision-instruct")
+
+    for context in (eleven_b, luna, ninety_b):
+        assert should_offer_connection_tools(
+            [HumanMessage(content="How can you help me?")],
+            context=context,
+        ) is True
+        assert should_offer_connection_tools(
+            [HumanMessage(content="hey")],
+            context=context,
+        ) is True
+        assert should_offer_connection_tools(
+            [HumanMessage(content="connect my gmail")],
+            context=context,
+        ) is True
+
+
+def test_connect_account_does_not_default_to_gmail(monkeypatch):
+    tools, raised = _connect_tool(monkeypatch, {"type": "cancel"})
+    result = asyncio.run(tools["connect_account"].coroutine())
+    assert raised == []
+    assert result["status"] == "missing_provider"
+
+
+def test_connect_account_is_only_for_a_request_that_needs_the_account(monkeypatch):
+    """A card is for the current request, not a catalog the avatar showcases.
+
+    Observed failure: the owner asked Shivon to describe an image, and a
+    Finance connect card appeared. The tool and the account-connections
+    prompt must refuse that: unused connectors stay unused.
+    """
+    from src.anubis.utils.analytics.system_prompt_fragments import BUSINESS_ANALYTICS_PROMPT
+    from src.anubis.utils.prompts.system_prompts import (
+        CONNECT_MAILBOX_PROMPT,
+        MAKING_PLANS_PROMPT,
+    )
+
+    tools, _ = _connect_tool(monkeypatch, {"type": "cancel"})
+    description = tools["connect_account"].description
+    stale_description = tools["list_connections_needing_sign_in"].description
+
+    assert "suggest, showcase, or catalog connectors" in description
+    assert "Describing an image" in description
+    assert "Do not offer Finance" in CONNECT_MAILBOX_PROMPT
+    assert "A lapsed account is not a reason to interrupt an unrelated request." in CONNECT_MAILBOX_PROMPT
+    assert "Do not raise a Finance, spreadsheet, or vendor connect card" in BUSINESS_ANALYTICS_PROMPT
+    assert "Do not raise a calendar card on a request that is not a plan." in MAKING_PLANS_PROMPT
+    assert "Do not call this tool at the start" in stale_description
+    assert "the current request does not use" in stale_description

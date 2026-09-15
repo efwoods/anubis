@@ -16,10 +16,124 @@ import logging
 from typing import Any
 
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
 
 IDENTITY_MEDIA_TOOL_NAME = "update_avatar_identity_with_media"
+
+# Phrases that mean the creator is teaching identity, not asking what a file shows.
+_LEARN_FROM_MEDIA_MARKERS = (
+    "learn from",
+    "learn this",
+    "remember this",
+    "remember it",
+    "absorb this",
+    "add this to",
+    "this is you",
+    "this is me",
+    "this is of you",
+    "this is of me",
+    "reference photo",
+    "reference image",
+    "reference portrait",
+    "reference clip",
+    "your portrait",
+    "your identity",
+    "use this as",
+    "make this your",
+)
+
+# A described or attached image the person asked to look at is not teaching.
+_ASK_ABOUT_MEDIA_MARKERS = (
+    "describe this",
+    "describe the",
+    "describe that",
+    "describe it",
+    "describe the image",
+    "describe the picture",
+    "describe the attached",
+    "what's this",
+    "what is this",
+    "what is that",
+    "what's that",
+    "what does this",
+    "what's in this",
+    "what is in this",
+    "look at this",
+    "look at the image",
+    "tell me about this",
+    "explain this image",
+    "explain the image",
+)
+
+
+def _human_message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("text"):
+                parts.append(str(block["text"]))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def should_offer_identity_media_update(
+    messages: list[Any] | None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Whether this turn may attach ``update_avatar_identity_with_media``.
+
+    Llama 3.2 11B otherwise calls that tool on a "describe this image" turn
+    until the deep-agent recursion limit (sixteen identical calls, then
+    GraphRecursionError). Returning a stop message from the tool does not
+    end the loop — the model keeps calling — so the tool must not be offered.
+    """
+    last_human: HumanMessage | None = None
+    for message in reversed(messages or []):
+        if isinstance(message, HumanMessage):
+            last_human = message
+            break
+    text = _human_message_text(last_human) if last_human is not None else ""
+    lowered = text.lower()
+    if any(marker in lowered for marker in _LEARN_FROM_MEDIA_MARKERS):
+        return True
+    if "image descriptions:" in lowered:
+        return False
+    if any(marker in lowered for marker in _ASK_ABOUT_MEDIA_MARKERS):
+        return False
+    attached = list(attachments or [])
+    if attached and all(
+        str(item.get("mime_type") or "").startswith("image/") for item in attached
+    ):
+        return False
+    return True
+
+
+def should_answer_from_described_image(messages: list[Any] | None) -> bool:
+    """Whether this turn already has an image description the avatar should read back.
+
+    Llama 3.2 11B otherwise calls ``learn_information_about_the_user`` or
+    ``connect_account`` instead of answering from the Image descriptions section.
+    """
+    last_human: HumanMessage | None = None
+    for message in reversed(messages or []):
+        if isinstance(message, HumanMessage):
+            last_human = message
+            break
+    if last_human is None:
+        return False
+    lowered = _human_message_text(last_human).lower()
+    if "image descriptions:" not in lowered:
+        return False
+    if any(marker in lowered for marker in _LEARN_FROM_MEDIA_MARKERS):
+        return False
+    return True
 
 
 def _emit_media_job_started(payload: dict[str, Any]) -> None:
@@ -46,6 +160,8 @@ def build_identity_media_tools(
 ) -> list[Any]:
     """Build the identity-update tool bound to this creator, avatar, and turn."""
     from src.anubis.utils.runtime_handles import get_identity_media_job_starter
+
+    already_started: dict[str, Any] = {"result": None}
 
     @tool(IDENTITY_MEDIA_TOOL_NAME)
     async def update_avatar_identity_with_media(
@@ -86,6 +202,23 @@ def build_identity_media_tools(
             reference_audio: The single attached recording is the avatar's reference voice clip.
         """
         from src.api.chat_attachments import get_turn_attachments
+
+        if already_started["result"] is not None:
+            prior = dict(already_started["result"])
+            prior["detail"] = (
+                "This turn already started learning from the media. "
+                "Do not call this tool again. Reply to the conversation partner "
+                "now with no tool calls."
+            )
+            return prior
+        already_started["result"] = {
+            "status": "already_started",
+            "detail": (
+                "This turn already started learning from the media. "
+                "Do not call this tool again. Reply to the conversation partner "
+                "now with no tool calls."
+            ),
+        }
 
         starter = get_identity_media_job_starter()
         if starter is None:
@@ -174,6 +307,7 @@ def build_identity_media_tools(
                     "items_accepted": result.get("items_accepted", 0),
                 }
             )
+        already_started["result"] = result
         return result
 
     return [update_avatar_identity_with_media]

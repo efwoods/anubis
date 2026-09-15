@@ -143,6 +143,80 @@ async def test_growth_active_users_and_spend_groupings():
     assert by_default["columns"][0] == "day"
 
 
+@pytest.mark.asyncio
+async def test_cost_per_avatar_summarises_breakdown_rows():
+    pool = _FakePool(rows=[("avatar-1", "Pastor", 2.5, 10, 3), ("avatar-2", "Evan", 1.5, 4, 1)])
+    result = await platform_metrics.cost_per_avatar(pool, SINCE, UNTIL)
+    statement, params = pool.calls[-1]
+    assert "FROM api_metrics AS metrics" in statement
+    assert "LEFT JOIN assistant" in statement
+    assert params[0] == ["message", "adapter_inference"]
+    assert result["avatars"] == 2
+    assert result["total_cost_usd"] == 4.0
+    assert result["cost_per_avatar"] == 2.0
+    assert result["columns"] == [
+        "assistant_id",
+        "assistant_name",
+        "cost_usd",
+        "messages",
+        "conversations",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_average_cost_per_message_and_conversation_use_message_types():
+    pool = _FakePool(rows=[(8, 4.0, 0.5)])
+    per_message = await platform_metrics.average_cost_per_message(pool, SINCE, UNTIL)
+    assert "inference_type = ANY(%s)" in pool.calls[-1][0]
+    assert per_message["columns"] == ["messages", "total_cost_usd", "average_cost_per_message"]
+    pool.rows = [(3, 6.0, 2.0)]
+    per_conversation = await platform_metrics.average_cost_per_conversation(pool, SINCE, UNTIL)
+    assert "COUNT(DISTINCT thread_id)" in pool.calls[-1][0]
+    assert per_conversation["rows"] == [[3, 6.0, 2.0]]
+
+
+@pytest.mark.asyncio
+async def test_cost_per_new_user_uses_first_seen_cohort():
+    pool = _FakePool(rows=[(2, 5.0, 2.5)])
+    result = await platform_metrics.cost_per_new_user(pool, SINCE, UNTIL)
+    statement, params = pool.calls[-1]
+    assert "MIN(created_at) AS first_seen" in statement
+    assert "FROM cohort" in statement
+    assert params == (SINCE, UNTIL, SINCE, UNTIL)
+    assert result["rows"] == [[2, 5.0, 2.5]]
+    assert "advertising CAC" in result["note"]
+
+
+class _QueuedPool(_FakePool):
+    def __init__(self, batches):
+        super().__init__()
+        self.batches = list(batches)
+
+    def connection(self):
+        if self.batches:
+            self.rows = self.batches.pop(0)
+        return _FakeConnection(self)
+
+
+@pytest.mark.asyncio
+async def test_unit_economics_product_ledger_composes_the_four_metrics():
+    pool = _QueuedPool(
+        [
+            [("avatar-1", "Pastor", 4.0, 8, 2)],
+            [(8, 4.0, 0.5)],
+            [(2, 4.0, 2.0)],
+            [(1, 4.0, 4.0)],
+        ]
+    )
+    result = await platform_metrics.unit_economics(pool, SINCE, UNTIL)
+    assert result["ledger"] == "product"
+    assert result["cost_per_avatar"] == 4.0
+    assert result["average_cost_per_message"] == 0.5
+    assert result["average_cost_per_conversation"] == 2.0
+    assert result["cost_per_new_user"] == 4.0
+    assert result["new_users"] == 1
+
+
 def test_is_platform_admin_is_the_configured_admin_id_alone():
     context = SimpleNamespace(admin_user_id="admin")
     assert is_platform_admin(context, [], "admin") is True

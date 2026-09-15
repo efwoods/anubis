@@ -530,6 +530,75 @@ async def test_speak_returns_audio_in_the_active_voice(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_speak_reports_a_refused_vendor_key_not_empty_funds(monkeypatch):
+    """Play must not look like a spent allotment when ElevenLabs rejects the key."""
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-9"}
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def refused_key(*args, **kwargs):
+        raise elevenlabs_client.ElevenLabsKeyRefusedError(
+            "ElevenLabs rejected the request (401 invalid_api_key: Invalid API key)"
+        )
+
+    monkeypatch.setattr(elevenlabs_client, "synthesize_speech", refused_key)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+    assert response.status_code == 503
+    body = __import__("json").loads(response.body)
+    assert body["error"] == "vendor_key_refused"
+    assert "allotment" in body["detail"].lower()
+    assert "out of funds" not in body["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_speak_reports_empty_vendor_credits_as_credit_exhausted(monkeypatch):
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-9"}
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def out_of_credits(*args, **kwargs):
+        raise elevenlabs_client.ElevenLabsCreditsExhaustedError(
+            "ElevenLabs rejected the request (quota_exceeded: insufficient quota)"
+        )
+
+    monkeypatch.setattr(elevenlabs_client, "synthesize_speech", out_of_credits)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+    assert response.status_code == 503
+    body = __import__("json").loads(response.body)
+    assert body["error"] == "model_provider_credit_exhausted"
+
+
+@pytest.mark.asyncio
 async def test_speak_falls_back_to_the_standard_voice_without_a_clone(monkeypatch):
     """An avatar with no clone but a chosen standard voice is heard, not refused."""
     from src.anubis.utils.voice.standard_voices import set_standard_voice

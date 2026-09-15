@@ -402,10 +402,17 @@ def build_stopped_reply_metadata(
     """
     prompt_tokens = max(0, int(estimated_prompt_tokens or 0))
     completion_tokens = estimate_completion_tokens(partial_text)
+    from src.anubis.utils.message_record import utc_now_isoformat
+    from src.anubis.utils.model import (
+        development_mode_enabled,
+        text_inference_record,
+    )
+
     metadata: dict[str, Any] = {
         "stopped": True,
         "stopped_by": stopped_by,
         "stopped_by_user": stopped_by == "user",
+        "created_at": utc_now_isoformat(),
         "token_usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -415,6 +422,10 @@ def build_stopped_reply_metadata(
     }
     if model_name:
         metadata["model_name"] = model_name
+    if development_mode_enabled():
+        metadata.update(text_inference_record())
+        if not metadata.get("text_model") and model_name:
+            metadata["text_model"] = model_name
     return metadata
 
 

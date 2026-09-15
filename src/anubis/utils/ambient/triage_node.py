@@ -174,6 +174,9 @@ def _gate_by_salience_and_cooldown(
     salience: float,
     thread_id: str | None,
     context: GlobalContext,
+    observation_kind: str | None = None,
+    summary: str | None = None,
+    now: float | None = None,
 ) -> tuple[str, str | None]:
     """Decide whether a 'respond' or 'notify' is actually allowed to interrupt.
 
@@ -183,6 +186,11 @@ def _gate_by_salience_and_cooldown(
     is not worth an interruption at all. A decision arriving inside the quiet
     period after the avatar last spoke is not worth breaking that quiet for,
     unless the observation is salient enough to override the quiet period.
+
+    A playful camera performance uses a much shorter quiet period than an
+    ordinary remark: a kid making faces every few seconds is asking for another
+    reaction, and a five-minute cooldown is what turns the second gag into
+    silence.
 
     Returns the decision to act on, and the reason it was demoted when it was.
     """
@@ -209,13 +217,23 @@ def _gate_by_salience_and_cooldown(
     if salience >= override:
         return decision, None
 
+    from src.anubis.utils.ambient.playful_reactions import (
+        is_playful_camera_performance,
+    )
+
+    playful = is_playful_camera_performance(
+        observation_kind=observation_kind, summary=summary
+    )
+    cooldown_seconds = (
+        context.ambient_playful_respond_cooldown_seconds
+        if playful
+        and context.ambient_playful_respond_cooldown_seconds is not None
+        else context.ambient_respond_cooldown_seconds
+    )
     remaining = ambient_speech_cooldown.seconds_remaining(
         thread_id,
-        float(
-            context.ambient_respond_cooldown_seconds
-            if context.ambient_respond_cooldown_seconds is not None
-            else 0.0
-        ),
+        float(cooldown_seconds if cooldown_seconds is not None else 0.0),
+        now=now,
     )
     if remaining is not None:
         return (
@@ -339,6 +357,8 @@ async def ambient_triage(
         ),
         thread_id=str(thread_id) if thread_id else None,
         context=context,
+        observation_kind=str(decision_fields.get("observation_kind") or ""),
+        summary=str(decision_fields.get("summary") or ""),
     )
     if demotion_reason is not None:
         logger.info(

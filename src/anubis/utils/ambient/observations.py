@@ -561,7 +561,20 @@ def compose_observation_text(ambient: dict[str, Any], body: str) -> str:
         # ``ALL_INSTRUCTIONS`` so threads written before this still strip clean.
         pass
     elif decision == DECISION_RESPOND:
-        parts.append(RESPOND_INSTRUCTION_SPEECH if heard else RESPOND_INSTRUCTION)
+        instruction = RESPOND_INSTRUCTION_SPEECH if heard else RESPOND_INSTRUCTION
+        if not heard:
+            from src.anubis.utils.ambient.playful_reactions import (
+                PLAYFUL_RESPOND_SUFFIX,
+                is_playful_camera_performance,
+            )
+
+            if is_playful_camera_performance(
+                observation_kind=str(ambient.get("observation_kind") or ""),
+                summary=str(ambient.get("summary") or ""),
+                body=str(ambient.get("reason") or ""),
+            ):
+                instruction = instruction + PLAYFUL_RESPOND_SUFFIX
+        parts.append(instruction)
     elif decision == DECISION_NOTIFY and offer is not None:
         parts.append(
             NOTIFY_INSTRUCTION_SPEECH_WITH_OFFER

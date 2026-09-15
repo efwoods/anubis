@@ -70,6 +70,14 @@ class TermsAndServicesContentModeration(BaseModel):
             "in violated_clauses. Empty when there is no violation."
         ),
     )
+    supporting_evidence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Verbatim quotes copied from the CONTENT that directly support the reason. "
+            "Each quote must appear in the CONTENT unaltered. Empty when there is no "
+            "violation. A violation without at least one quote is discarded."
+        ),
+    )
 
 
 CONTENT_MODERATION_SYSTEM_PROMPT = """
@@ -81,8 +89,9 @@ You are an expert judge of violations of the terms of service and the privacy po
 Determine whether the CONTENT violates the TERMS_OF_SERVICE or the PRIVACY_POLICY.
 Return violation TRUE only when the CONTENT itself clearly violates a specific clause: unlawful, harmful, defamatory, or infringing material; attempts to gain unauthorized access; automated abuse; interference with the service; or misuse of another person's private data.
 Return violation FALSE for ordinary conversation, personal stories, opinions, creative writing, questions, and any content that merely mentions a sensitive topic without violating a clause.
-When there is a violation, give a clear reason and quote EVERY exact clause of the TERMS_OF_SERVICE or the PRIVACY_POLICY that the CONTENT violates, unaltered.
-When there is no violation, leave the reason empty and the list of clauses empty.
+When there is a violation, give a clear reason, quote EVERY exact clause of the TERMS_OF_SERVICE or the PRIVACY_POLICY that the CONTENT violates, unaltered, and copy into supporting_evidence the few verbatim lines of the CONTENT that prove that reason. Each supporting_evidence string must appear in the CONTENT.
+Return violation FALSE when you cannot name a reason or cannot quote supporting lines from the CONTENT.
+When there is no violation, leave the reason empty, the list of clauses empty, and supporting_evidence empty.
 THIRD_PARTY_PLATFORM_POLICIES, when present, are the rules of the other companies whose services this content passes through. Treat a violation of those rules as a violation too, and record each one in violated_platform_rules as 'Company: the rule'. Those rules are summaries of another company's documents, not quotations, so never copy one into violated_clauses: violated_clauses holds verbatim lines of the TERMS_OF_SERVICE and the PRIVACY_POLICY above and nothing else.
 </INSTRUCTIONS>
 
@@ -133,6 +142,7 @@ def clean_verdict() -> dict[str, Any]:
         "reasoning": "",
         "violated_clauses": [],
         "violated_platform_rules": [],
+        "supporting_evidence": [],
     }
 
 
@@ -186,14 +196,31 @@ async def judge_text(
             )
             return {**clean_verdict(), "judge_error": str(judge_error)}
         if verdict.violation:
+            quotes = [
+                str(quote).strip()
+                for quote in (getattr(verdict, "supporting_evidence", None) or [])
+                if str(quote).strip()
+            ]
+            haystack = window.casefold()
+            quotes_in_content = [
+                quote for quote in quotes if quote.casefold() in haystack
+            ]
+            reasoning = str(verdict.reasoning or "").strip()
+            if not reasoning or not quotes_in_content:
+                logger.warning(
+                    "Judge returned a violation without a reason and quoted "
+                    "evidence in the content; ignoring that window."
+                )
+                continue
             return {
                 "violation": True,
-                "reasoning": verdict.reasoning,
+                "reasoning": reasoning,
                 "violated_clauses": list(verdict.violated_clauses),
                 "violated_platform_rules": list(
                     getattr(verdict, "violated_platform_rules", []) or []
                 ),
-                "excerpt": window[:500],
+                "supporting_evidence": quotes_in_content,
+                "excerpt": "\n".join(quotes_in_content)[:2000],
             }
     return clean_verdict()
 

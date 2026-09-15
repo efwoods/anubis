@@ -1196,6 +1196,8 @@ async def _build_consciousness_system_message_update(
         from src.anubis.utils.prompts.system_prompts import (
             CONNECT_MAILBOX_PROMPT,
             MAILBOX_CAPABILITY_PROMPT,
+            PERSONAL_AVATAR_PLACE_TRAVEL_PROMPT,
+            PHONE_SIP_CAPABILITY_PROMPT,
         )
 
         bound_mailboxes = [
@@ -1228,10 +1230,44 @@ async def _build_consciousness_system_message_update(
                 "password, or authentication token in a reply.\n"
                 "</MAILBOX_STATUS>\n"
             )
-        # The connection offer block is always present for the owner: an
-        # account that is not connected yet is exactly the one the avatar
-        # should offer, and the block also carries the "sign in again" rule.
-        system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+        # Same gate as think: the connect prompt must not advertise a tool
+        # that is not attached.
+        from src.anubis.utils.connected_accounts.connection_tools import (
+            should_offer_connection_tools,
+        )
+
+        if should_offer_connection_tools(
+            state.get("messages") or [],
+            context=runtime.context,
+        ):
+            system_message_str = system_message_str + CONNECT_MAILBOX_PROMPT
+        system_message_str = system_message_str + PERSONAL_AVATAR_PLACE_TRAVEL_PROMPT
+        bound_phone = [
+            account
+            for account in await bound_accounts_for(runtime.store, user_id, assistant_id)
+            if account.get("kind") == "telephony"
+        ]
+        if bound_phone:
+            from src.anubis.utils.phone.livekit_sip import platform_phone_number
+
+            shared_number = platform_phone_number(runtime.context) or "the shared platform number"
+            mobiles = ", ".join(
+                str(
+                    (account.get("transport") or {}).get("owner_mobile_e164")
+                    or account.get("account_address")
+                    or ""
+                )
+                for account in bound_phone
+            )
+            system_message_str = system_message_str + PHONE_SIP_CAPABILITY_PROMPT
+            system_message_str += (
+                "\n<PHONE_STATUS>\n"
+                f"Phone is connected. Verified mobile: {mobiles}. "
+                f"Inbound: the conversation partner calls {shared_number} from that mobile. "
+                "No private Neural Nexus number is assigned on this account. "
+                "Never reveal LiveKit credentials or SIP trunk identifiers.\n"
+                "</PHONE_STATUS>\n"
+            )
 
         # Every connected account, by kind, plus the accounts whose sign-in
         # lapsed, so the avatar answers "what can you see?" without a tool
@@ -1379,7 +1415,15 @@ async def _build_consciousness_system_message_update(
                     for account in brokered_accounts
                 ):
                     system_message_str += MAILBOX_CAPABILITY_PROMPT
-                system_message_str += CONNECT_MAILBOX_PROMPT
+                from src.anubis.utils.connected_accounts.connection_tools import (
+                    should_offer_connection_tools,
+                )
+
+                if should_offer_connection_tools(
+                    state.get("messages") or [],
+                    context=runtime.context,
+                ):
+                    system_message_str += CONNECT_MAILBOX_PROMPT
                 system_message_str += (
                     "\n<CONNECTED_ACCOUNTS>\n"
                     + (
@@ -1512,27 +1556,33 @@ async def _build_consciousness_system_message_update(
             from src.anubis.utils.prompts.system_prompts import (
                 IDENTITY_MEDIA_UPDATE_PROMPT,
             )
+            from src.anubis.utils.tools.identity.identity_media_tools import (
+                should_offer_identity_media_update,
+            )
             from src.api.chat_attachments import describe_turn_attachments
 
-            system_message_str = system_message_str + IDENTITY_MEDIA_UPDATE_PROMPT
             attached = describe_turn_attachments(
                 config.get("configurable", {}).get("thread_id")
             )
-            if attached:
-                attachment_lines = "; ".join(
-                    f"{item['filename']} ({item['mime_type']}, {item['size_bytes']} bytes)"
-                    for item in attached
-                )
-                system_message_str += (
-                    "\n<ATTACHED_MEDIA>\n"
-                    f"Files attached to this turn: {attachment_lines}.\n"
-                    "</ATTACHED_MEDIA>\n"
-                )
-            else:
-                system_message_str += (
-                    "\n<ATTACHED_MEDIA>\nNo files are attached to this turn.\n"
-                    "</ATTACHED_MEDIA>\n"
-                )
+            if should_offer_identity_media_update(
+                state.get("messages") or [], attached
+            ):
+                system_message_str = system_message_str + IDENTITY_MEDIA_UPDATE_PROMPT
+                if attached:
+                    attachment_lines = "; ".join(
+                        f"{item['filename']} ({item['mime_type']}, {item['size_bytes']} bytes)"
+                        for item in attached
+                    )
+                    system_message_str += (
+                        "\n<ATTACHED_MEDIA>\n"
+                        f"Files attached to this turn: {attachment_lines}.\n"
+                        "</ATTACHED_MEDIA>\n"
+                    )
+                else:
+                    system_message_str += (
+                        "\n<ATTACHED_MEDIA>\nNo files are attached to this turn.\n"
+                        "</ATTACHED_MEDIA>\n"
+                    )
         except Exception:  # noqa: BLE001 - the block must never fail a turn
             logger.debug("Attached-media block unavailable for the prompt", exc_info=True)
 
@@ -1648,6 +1698,31 @@ async def _build_consciousness_system_message_update(
         )
     except Exception:  # noqa: BLE001 - the block must never fail a turn
         logger.debug("Ambient-vision block unavailable for the prompt", exc_info=True)
+
+    try:
+        from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+            build_minecraft_body_block,
+            minecraft_body_is_enabled,
+            minecraft_body_is_live,
+        )
+        from src.anubis.utils.ambient.observations import is_ambient_observation
+
+        minecraft_configurable = (config or {}).get("configurable", {}) or {}
+        if minecraft_body_is_enabled(runtime.context) and minecraft_body_is_live(
+            minecraft_configurable.get("minecraft_body")
+        ):
+            thread_messages = state.get("messages") or []
+            answering_an_observation = bool(
+                thread_messages and is_ambient_observation(thread_messages[-1])
+            )
+            system_message_str = system_message_str + build_minecraft_body_block(
+                world_snapshot=str(
+                    minecraft_configurable.get("minecraft_world") or ""
+                ),
+                tool_is_attached=not answering_an_observation,
+            )
+    except Exception:  # noqa: BLE001 - the block must never fail a turn
+        logger.debug("Minecraft body block unavailable for the prompt", exc_info=True)
 
     harvest_instruction = conversation_suggestion_harvest_system_instruction(
         last_message_text

@@ -106,6 +106,50 @@ async def test_fidelity_scores_a_generated_clip_against_the_person():
     assert (await repository.get_profile("a"))["motion_fidelity"]["neutral"]["overall"] == worse["overall"]
 
 
+def _sparse_sweeping_wrist_window(seconds: float = 30.0, rate: float = 15.0) -> codec.MotionWindow:
+    frames = int(rate * seconds)
+    series = np.zeros((frames, 4), dtype=np.float32)
+    series[:, :] = (0.38, 0.9, 0.0, 1.0)
+    for start_seconds in np.arange(1.0, seconds - 1.0, 3.0):
+        start = int(start_seconds * rate)
+        length = int(0.4 * rate)
+        for step in range(length):
+            phase = step / max(length - 1, 1)
+            series[start + step, 0] = 0.38 - 0.25 * np.sin(np.pi * phase)
+            series[start + step, 1] = 0.9 - 0.1 * np.sin(np.pi * phase)
+    payload = {
+        "schema_version": 1,
+        "source": SOURCE_NEURAL_DECODER,
+        "face_encoding": codec.FACE_ENCODING_NONE,
+        "emotion": "neutral",
+        "streams": {
+            "body": {
+                "sample_rate_hz": rate,
+                "frame_count": frames,
+                "values_per_frame": 4,
+                "present_joints": ["right_wrist"],
+                "data_b64": codec.window_to_payload(
+                    codec.MotionWindow(streams={"body": codec.StreamWindow(series, rate)})
+                )["streams"]["body"]["data_b64"],
+            }
+        },
+    }
+    return codec.window_from_payload(payload)
+
+
+@pytest.mark.asyncio
+async def test_sparse_neural_decoder_window_records_and_renders_hands():
+    repository = InMemoryMotionRepository()
+    context = _context()
+    window = _sparse_sweeping_wrist_window()
+    result = await service.record_motion_window(
+        repository, context, user_id="u", assistant_id="a", window=window
+    )
+    assert result["recorded"] is True
+    profile = await repository.get_profile("a")
+    assert "HANDS:" in (profile.get("role_section") or "")
+
+
 # --- identity ----------------------------------------------------------------
 
 

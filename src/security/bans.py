@@ -50,8 +50,14 @@ CREATE TABLE IF NOT EXISTS {BANNED_ACCOUNTS_TABLE_NAME} (
     refund_id TEXT,
     banned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     lifted_at TIMESTAMPTZ,
-    appeal_note TEXT
+    appeal_note TEXT,
+    enforced BOOLEAN NOT NULL DEFAULT TRUE,
+    skipped_reason TEXT
 );
+ALTER TABLE {BANNED_ACCOUNTS_TABLE_NAME}
+    ADD COLUMN IF NOT EXISTS enforced BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE {BANNED_ACCOUNTS_TABLE_NAME}
+    ADD COLUMN IF NOT EXISTS skipped_reason TEXT;
 CREATE INDEX IF NOT EXISTS banned_accounts_user_id_idx
     ON {BANNED_ACCOUNTS_TABLE_NAME} (user_id) WHERE lifted_at IS NULL;
 CREATE INDEX IF NOT EXISTS banned_accounts_hashed_ip_idx
@@ -62,7 +68,8 @@ CREATE INDEX IF NOT EXISTS banned_accounts_email_idx
 
 _BAN_COLUMNS = (
     "ban_id, user_id, hashed_ip, email, reason, violated_clauses, source, excerpt, "
-    "stripe_customer_id, subscription_id, refund_id, banned_at, lifted_at, appeal_note"
+    "stripe_customer_id, subscription_id, refund_id, banned_at, lifted_at, appeal_note, "
+    "enforced, skipped_reason"
 )
 
 # Every parameter is cast to text explicitly. Postgres cannot infer the type of a
@@ -73,6 +80,7 @@ _BAN_COLUMNS = (
 _FIND_ACTIVE_BAN_SQL = f"""
 SELECT {_BAN_COLUMNS} FROM {BANNED_ACCOUNTS_TABLE_NAME}
 WHERE lifted_at IS NULL
+  AND enforced IS DISTINCT FROM FALSE
   AND (
         (%(user_id)s::text IS NOT NULL AND user_id = %(user_id)s::text)
      OR (%(hashed_ip)s::text IS NOT NULL AND hashed_ip = %(hashed_ip)s::text)
@@ -85,10 +93,22 @@ LIMIT 1;
 _INSERT_BAN_SQL = f"""
 INSERT INTO {BANNED_ACCOUNTS_TABLE_NAME}
     (ban_id, user_id, hashed_ip, email, reason, violated_clauses, source, excerpt,
-     stripe_customer_id, subscription_id, refund_id)
+     stripe_customer_id, subscription_id, refund_id, enforced, skipped_reason)
 VALUES (%(ban_id)s, %(user_id)s, %(hashed_ip)s, %(email)s, %(reason)s,
         %(violated_clauses)s, %(source)s, %(excerpt)s, %(stripe_customer_id)s,
-        %(subscription_id)s, %(refund_id)s);
+        %(subscription_id)s, %(refund_id)s, %(enforced)s, %(skipped_reason)s);
+"""
+
+_LIFT_ADMINISTRATOR_BANS_SQL = f"""
+UPDATE {BANNED_ACCOUNTS_TABLE_NAME}
+SET lifted_at = now(),
+    appeal_note = COALESCE(appeal_note, %(appeal_note)s)
+WHERE lifted_at IS NULL
+  AND (
+        (%(user_id)s::text IS NOT NULL AND user_id = %(user_id)s::text)
+     OR (%(email)s::text IS NOT NULL AND lower(email) = lower(%(email)s::text))
+  )
+RETURNING {_BAN_COLUMNS};
 """
 
 _UPDATE_BAN_REFUND_SQL = f"""
@@ -172,6 +192,83 @@ def _row_to_ban(row: Any) -> dict[str, Any]:
     return record
 
 
+DEFAULT_ADMIN_ACCOUNT_EMAIL = "e.woods.business@icloud.com"
+MODERATION_INBOX_SOURCE_KIND = "moderation"
+ACTION_REVOKE_BAN = "revoke_ban"
+ACTION_ACCEPT_BAN = "accept_ban"
+MODERATION_INBOX_BODY_CHARACTER_LIMIT = 4000
+
+
+def administrator_account_email(context: Any | None) -> str:
+    """The configured administrator email, or the product default."""
+    configured = str(getattr(context, "admin_account_email", None) or "").strip()
+    return configured or DEFAULT_ADMIN_ACCOUNT_EMAIL
+
+
+def administrator_user_id(context: Any | None) -> str | None:
+    """The configured administrator user id, or None when unset."""
+    configured = str(getattr(context, "admin_user_id", None) or "").strip()
+    return configured or None
+
+
+def is_unbannable_administrator(
+    *,
+    user_id: str | None = None,
+    email: str | None = None,
+    context: Any | None = None,
+) -> bool:
+    """Return whether this identity is the unbannable administrator.
+
+    Matches the bare Auth0 user id (``ADMIN_USER_ID``) or the administrator
+    email (``ADMIN_ACCOUNT_EMAIL``, default ``e.woods.business@icloud.com``).
+    Either match is enough, so a drifted identifier cannot leave the account
+    bannable.
+    """
+    admin_id = administrator_user_id(context)
+    if admin_id and user_id and str(user_id).strip() == admin_id:
+        return True
+    admin_email = administrator_account_email(context).casefold()
+    if email and str(email).strip().casefold() == admin_email:
+        return True
+    return False
+
+
+def supporting_evidence_quotes(verdict: Mapping[str, Any] | None) -> list[str]:
+    """The verbatim content quotes the judge named as the bannable lines."""
+    raw = (verdict or {}).get("supporting_evidence")
+    if not isinstance(raw, (list, tuple)):
+        excerpt = str((verdict or {}).get("excerpt") or "").strip()
+        return [excerpt] if excerpt else []
+    quotes: list[str] = []
+    for candidate in raw:
+        quote = str(candidate or "").strip()
+        if quote and quote not in quotes:
+            quotes.append(quote)
+    return quotes
+
+
+def verdict_is_actionable(
+    verdict: Mapping[str, Any] | None, judged_text: str | None = None
+) -> bool:
+    """True when the judge named a reason and at least one quote from the content."""
+    reasoning = str((verdict or {}).get("reasoning") or "").strip()
+    quotes = supporting_evidence_quotes(verdict)
+    if not reasoning or not quotes:
+        return False
+    if judged_text is None:
+        return True
+    haystack = judged_text.casefold()
+    return any(quote.casefold() in haystack for quote in quotes)
+
+
+def _evidence_excerpt(verdict: Mapping[str, Any] | None, fallback: str | None) -> str | None:
+    quotes = supporting_evidence_quotes(verdict)
+    if quotes:
+        return "\n".join(quotes)[:2000]
+    fallback_text = str(fallback or "").strip()
+    return fallback_text[:2000] if fallback_text else None
+
+
 @dataclass(frozen=True)
 class BanSubject:
     """Everything a ban needs to identify and refund one account."""
@@ -211,16 +308,48 @@ def ban_subject_from_user(
     )
 
 
-async def ensure_banned_accounts_table(pool: Any) -> None:
+async def ensure_banned_accounts_table(pool: Any, context: Any | None = None) -> None:
     """Create the ``banned_accounts`` table if missing. Best effort at startup."""
     if pool is None:
         return
     try:
-        # The script holds a CREATE TABLE and three CREATE INDEX statements, and the
-        # pool runs with prepare_threshold=0, so it must be split before it is sent.
+        # The script holds a CREATE TABLE, two ALTER TABLE, and three CREATE INDEX
+        # statements, and the pool runs with prepare_threshold=0, so it must be
+        # split before it is sent.
         await execute_ddl_script(pool, _CREATE_BANNED_ACCOUNTS_TABLE_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure banned_accounts table exists: %s", table_error)
+        return
+    await lift_enforced_bans_for_administrator(pool, context)
+
+
+async def lift_enforced_bans_for_administrator(
+    pool: Any, context: Any | None
+) -> list[dict[str, Any]]:
+    """Lift leftover enforced bans on the administrator so that account can sign in."""
+    if pool is None:
+        return []
+    admin_id = administrator_user_id(context)
+    admin_email = administrator_account_email(context)
+    if not admin_id and not admin_email:
+        return []
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    _LIFT_ADMINISTRATOR_BANS_SQL,
+                    {
+                        "user_id": admin_id,
+                        "email": admin_email,
+                        "appeal_note": "unbannable administrator; lifted on startup",
+                    },
+                )
+                rows = await cursor.fetchall()
+        _clear_ban_cache()
+        return [_row_to_ban(row) for row in rows or []]
+    except Exception as lift_error:  # noqa: BLE001 - leftover rows must not block boot
+        logger.error("Could not lift leftover administrator bans: %s", lift_error)
+        return []
 
 
 async def find_active_ban(
@@ -381,8 +510,18 @@ async def ban_account(
     if existing is not None:
         return existing
 
+    context = getattr(app_state, "context", None)
+    unbannable = is_unbannable_administrator(
+        user_id=subject.user_id, email=subject.email, context=context
+    )
+    enforced = not unbannable
+    skipped_reason = (
+        "unbannable administrator; recorded for audit only" if unbannable else None
+    )
+
     ban_id = str(uuid.uuid4())
     clauses_text = "\n".join(violated_clauses or []) or None
+    excerpt_text = (excerpt or "")[:2000] or None
     try:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
@@ -396,10 +535,12 @@ async def ban_account(
                         "reason": reason,
                         "violated_clauses": clauses_text,
                         "source": source,
-                        "excerpt": (excerpt or "")[:2000] or None,
+                        "excerpt": excerpt_text,
                         "stripe_customer_id": subject.stripe_customer_id,
                         "subscription_id": subject.subscription_id,
                         "refund_id": None,
+                        "enforced": enforced,
+                        "skipped_reason": skipped_reason,
                     },
                 )
     except Exception as insert_error:  # noqa: BLE001
@@ -407,7 +548,6 @@ async def ban_account(
         return None
     _clear_ban_cache()
 
-    context = getattr(app_state, "context", None)
     refund_enabled = (
         str(getattr(context, "ban_refund_enabled", "TRUE") or "TRUE").upper() == "TRUE"
     )
@@ -415,7 +555,8 @@ async def ban_account(
     cancelled_subscription_id: str | None = None
     refund_id: str | None = None
     if (
-        refund_enabled
+        enforced
+        and refund_enabled
         and stripe_client is not None
         and subject.stripe_customer_id
         and not subject.is_anonymous
@@ -441,7 +582,7 @@ async def ban_account(
         except Exception as stripe_error:  # noqa: BLE001
             logger.error("Refund/cancel after ban %s failed: %s", ban_id, stripe_error)
 
-    if subject.user_id:
+    if subject.user_id and enforced:
         try:
             from src.security.auth import _evict_api_key_cache_for_user
 
@@ -452,14 +593,15 @@ async def ban_account(
             )
 
     logger.warning(
-        "Banned account (user=%s ip=%s email=%s source=%s): %s",
+        "%s account (user=%s ip=%s email=%s source=%s): %s",
+        "Recorded (not enforced) ban for" if unbannable else "Banned",
         subject.user_id,
         (subject.hashed_ip or "")[:8],
         subject.email,
         source,
         reason,
     )
-    return {
+    ban_record = {
         "ban_id": ban_id,
         "user_id": subject.user_id,
         "hashed_ip": subject.hashed_ip,
@@ -467,12 +609,141 @@ async def ban_account(
         "reason": reason,
         "violated_clauses": clauses_text,
         "source": source,
-        "excerpt": (excerpt or "")[:2000] or None,
+        "excerpt": excerpt_text,
         "stripe_customer_id": subject.stripe_customer_id,
         "subscription_id": cancelled_subscription_id or subject.subscription_id,
         "refund_id": refund_id,
         "lifted_at": None,
+        "enforced": enforced,
+        "skipped_reason": skipped_reason,
     }
+    await notify_admin_personal_avatar_of_moderation(app_state, subject, ban_record)
+    return ban_record
+
+
+async def record_moderation_verdict(
+    app_state: Any,
+    subject: BanSubject,
+    verdict: Mapping[str, Any],
+    *,
+    source: str,
+    judged_text: str | None = None,
+) -> dict[str, Any] | None:
+    """Record a ban only when the judge named a reason and quoted evidence.
+
+    Fast-screen refusals have no quotes from the content. Those wait here until
+    the deep judge returns both fields; without them nothing is written.
+    """
+    if not verdict_is_actionable(verdict, judged_text):
+        logger.info(
+            "Moderation verdict is not actionable (no reason or quoted evidence); "
+            "no ban recorded for %s",
+            subject.email or subject.user_id,
+        )
+        return None
+    return await ban_account(
+        app_state,
+        subject,
+        reason=str(verdict.get("reasoning") or "").strip(),
+        violated_clauses=list(verdict.get("violated_clauses") or []),
+        source=source,
+        excerpt=_evidence_excerpt(verdict, None),
+    )
+
+
+async def complete_and_record_moderation_verdict(
+    app_state: Any,
+    subject: BanSubject,
+    verdict: Mapping[str, Any] | None,
+    *,
+    source: str,
+    judged_text: str | None = None,
+) -> dict[str, Any] | None:
+    """Judge the text when the incoming verdict lacks quotes, then record it."""
+    incoming = dict(verdict or {})
+    if not verdict_is_actionable(incoming, judged_text) and (judged_text or "").strip():
+        from src.anubis.utils.moderation.content_moderation import judge_text
+
+        incoming = await judge_text(judged_text)
+    return await record_moderation_verdict(
+        app_state, subject, incoming, source=source, judged_text=judged_text
+    )
+
+
+async def notify_admin_personal_avatar_of_moderation(
+    app_state: Any, subject: BanSubject, ban: Mapping[str, Any]
+) -> None:
+    """Put the verdict on the administrator's personal-avatar inbox only."""
+    context = getattr(app_state, "context", None)
+    pool = getattr(app_state, "pool", None)
+    admin_id = administrator_user_id(context)
+    if pool is None or not admin_id:
+        return
+    try:
+        from src.anubis.utils.inbox import get_inbox_repository
+        from src.anubis.utils.inbox.repository import (
+            DECISION_NOTIFY,
+            STATE_PENDING_OWNER,
+        )
+        from src.anubis.utils.personal_avatar import personal_avatar_id_for_owner
+
+        assistant_id = await personal_avatar_id_for_owner(pool, admin_id)
+        repository = get_inbox_repository()
+        if not assistant_id or repository is None:
+            return
+        banned_email = subject.email or "anonymous"
+        enforced = bool(ban.get("enforced", True))
+        subject_line = (
+            f"Verdict (not enforced — administrator): {banned_email}"
+            if not enforced
+            else f"Ban: {banned_email}"
+        )
+        evidence = str(ban.get("excerpt") or "").strip()
+        clauses = str(ban.get("violated_clauses") or "").strip()
+        body_parts = [part for part in (evidence, clauses and f"Clauses:\n{clauses}") if part]
+        body_text = "\n\n".join(body_parts)[:MODERATION_INBOX_BODY_CHARACTER_LIMIT]
+        await repository.create_item(
+            {
+                "user_id": admin_id,
+                "assistant_id": assistant_id,
+                "source_kind": MODERATION_INBOX_SOURCE_KIND,
+                "account_key": None,
+                "external_id": ban.get("ban_id"),
+                "external_thread_id": None,
+                "sender": banned_email,
+                "recipients": [],
+                "subject": subject_line,
+                "body_text": body_text,
+                "received_at": _now_utc(),
+                "message_kind": MODERATION_INBOX_SOURCE_KIND,
+                "decision": DECISION_NOTIFY,
+                "needs_owner_action": True,
+                "reason": str(ban.get("reason") or ""),
+                "confidence": 1.0,
+                "confidence_detail": {
+                    "ban_id": ban.get("ban_id"),
+                    "enforced": enforced,
+                    "violated_clauses": str(ban.get("violated_clauses") or ""),
+                    "supporting_evidence": evidence,
+                    "source": ban.get("source"),
+                    "banned_user_id": subject.user_id,
+                    "banned_email": subject.email,
+                },
+                "state": STATE_PENDING_OWNER,
+            }
+        )
+    except Exception as inbox_error:  # noqa: BLE001 - audit must not fail the ban path
+        logger.error(
+            "Could not write the moderation inbox item for ban %s: %s",
+            ban.get("ban_id"),
+            inbox_error,
+        )
+
+
+def _now_utc():
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC)
 
 
 async def lift_ban(
@@ -507,16 +778,29 @@ async def list_bans(
 
 
 __all__ = [
+    "ACTION_ACCEPT_BAN",
+    "ACTION_REVOKE_BAN",
     "BANNED_ACCOUNTS_TABLE_NAME",
+    "DEFAULT_ADMIN_ACCOUNT_EMAIL",
+    "MODERATION_INBOX_SOURCE_KIND",
     "shared_hashed_ip_values",
     "usable_hashed_ip",
     "BanSubject",
+    "administrator_account_email",
+    "administrator_user_id",
     "ban_account",
     "ban_refusal_detail",
     "ban_subject_from_user",
     "ensure_banned_accounts_table",
     "find_active_ban",
     "is_banned",
+    "is_unbannable_administrator",
     "lift_ban",
+    "lift_enforced_bans_for_administrator",
     "list_bans",
+    "notify_admin_personal_avatar_of_moderation",
+    "complete_and_record_moderation_verdict",
+    "record_moderation_verdict",
+    "supporting_evidence_quotes",
+    "verdict_is_actionable",
 ]

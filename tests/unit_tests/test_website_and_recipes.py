@@ -43,6 +43,27 @@ def test_recipe_parsers_and_urls():
     assert "bucket_width=1d" in url and "start_time=" in url
     assert set(recipes.recipes_for("langsmith")) == {"usage", "usage_page"}
     assert recipes.recipes_for("unknown") == {}
+    eleven = recipes.parse_elevenlabs_usage(
+        {"character_count": 1200, "character_limit": 10000, "cost_usd": 4.5}, {}
+    )
+    assert {"day": eleven[0]["day"], "metric": "characters", "value": 1200.0, "unit": "count"} in [
+        {key: row[key] for key in ("day", "metric", "value", "unit")} for row in eleven
+    ]
+    xai_rows = recipes.parse_xai_billing(
+        {"data": [{"date": "2026-09-01", "cost": 2.25}]}, {}
+    )
+    assert xai_rows == [{"day": "2026-09-01", "metric": "cost", "value": 2.25, "unit": "usd"}]
+    cursor_rows = recipes.parse_cursor_spending(
+        {"subscription": 20, "used_tokens": 8000, "included_tokens": 10000}, {}
+    )
+    assert any(row["metric"] == "subscription" and row["value"] == 20.0 for row in cursor_rows)
+    claude_rows = recipes.parse_claude_app_usage(
+        {"plan_cost": 20, "tokens": 4000}, {}
+    )
+    assert any(row["metric"] == "subscription" for row in claude_rows)
+    assert "usage_section=spend-categories" in recipes.RECIPES["openai"]["usage_page"].url_template
+    assert set(recipes.recipes_for("cursor")) == {"spending", "usage"}
+    assert set(recipes.recipes_for("claude_app")) == {"usage_page"}
 
 
 def test_html_to_text_drops_scripts_and_keeps_lines():

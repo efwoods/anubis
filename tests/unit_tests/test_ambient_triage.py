@@ -246,3 +246,4 @@ async def test_classify_observation_calls_the_model_once_and_normalises(monkeypa
 def test_modules_expose_the_agent_inbox_decisions():
     assert observations_module.AMBIENT_DECISIONS == ("ignore", "respond", "notify")
     assert triage_module.AMBIENT_CLASSIFY_SYSTEM_PROMPT.startswith("<TASK>")
+    assert "playful_performance" in triage_module.AMBIENT_CLASSIFY_SYSTEM_PROMPT

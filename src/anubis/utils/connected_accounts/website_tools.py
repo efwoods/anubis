@@ -476,9 +476,10 @@ def build_website_tools(
     async def website_traffic(connection: str | None = None, since: str | None = None, until: str | None = None) -> dict[str, Any]:
         """Report visitors, sessions, and top pages of a connected website.
 
-        Reads a Google Analytics or Vercel connection bound to the same owner;
-        say plainly (and offer connect_account with provider google_analytics)
-        when none is connected. Dates are ISO strings; default the last 30 days.
+        Reads a Google Analytics or Vercel connection bound to the same owner.
+        When none is connected, say so. Call connect_account with provider
+        google_analytics only if the conversation partner asked about visitors
+        or traffic. Dates are ISO strings; default the last 30 days.
         """
         record, error = _select(connection)
         if error:

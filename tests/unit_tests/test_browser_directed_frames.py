@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from src.anubis.utils.tools.minecraft.minecraft_body_tools import MINECRAFT_ACT_EVENT
 from src.anubis.utils.tools.vision.accessibility_tools import SCENE_NARRATION_EVENT
 from src.anubis.utils.tools.vision.look_tools import (
     SHARE_REQUEST_EVENT,
@@ -145,6 +146,8 @@ def test_every_browser_directed_frame_is_on_the_forwarding_list():
     assert SHARE_STOP_EVENT in webapp_module.BROWSER_DIRECTED_FRAMES
     assert SHARE_REQUEST_EVENT in webapp_module.BROWSER_DIRECTED_FRAMES
     assert SCENE_NARRATION_EVENT in webapp_module.BROWSER_DIRECTED_FRAMES
+    assert MINECRAFT_ACT_EVENT in webapp_module.BROWSER_DIRECTED_FRAMES
+    assert webapp_module.PHONE_CALL_EVENT in webapp_module.BROWSER_DIRECTED_FRAMES
 
 
 @pytest.mark.asyncio
@@ -155,3 +158,14 @@ async def test_a_scene_narration_frame_reaches_the_browser(_quiet_meters):
     switch = {"type": SCENE_NARRATION_EVENT, "state": "on"}
     frames = await _frames([((), "custom", switch)])
     assert switch in frames
+
+
+@pytest.mark.asyncio
+async def test_a_minecraft_act_frame_reaches_the_companion(_quiet_meters):
+    move = {
+        "type": MINECRAFT_ACT_EVENT,
+        "commands": [{"name": "follow", "arguments": []}],
+        "additional_as_is_text": "",
+    }
+    frames = await _frames([((), "custom", move)])
+    assert move in frames, "act_in_minecraft told the model it worked and the body never moved"

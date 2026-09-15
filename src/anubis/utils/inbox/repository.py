@@ -127,6 +127,29 @@ def _isoformat(value: Any) -> Any:
     return value.isoformat() if isinstance(value, datetime) else value
 
 
+def item_matches_inbox_filters(
+    item: dict[str, Any],
+    *,
+    source_kind: str | None = None,
+    query: str | None = None,
+) -> bool:
+    """Whether one item matches the inbox search and source filter."""
+    if source_kind and str(item.get("source_kind") or "") != source_kind:
+        return False
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return True
+    haystack = " ".join(
+        [
+            str(item.get("subject") or ""),
+            str(item.get("reason") or ""),
+            str(item.get("body_text") or ""),
+            str(item.get("sender") or ""),
+        ]
+    ).casefold()
+    return needle in haystack
+
+
 def sender_domain_of(sender: str | None) -> str:
     """Return the domain part of an address, lower-cased ("" when there is none)."""
     address = str(sender or "")
@@ -140,6 +163,11 @@ ACTION_NOTIFY_OWNER = "notify_owner"
 ACTION_CREATE_CALENDAR_EVENT = "create_calendar_event"
 ACTION_POST_REPLY = "post_reply"
 ACTION_MODERATE = "moderate"
+ACTION_REVOKE_BAN = "revoke_ban"
+ACTION_ACCEPT_BAN = "accept_ban"
+MODERATION_SOURCE_KIND = "moderation"
+APPEAL_SOURCE_KIND = "appeal"
+MODERATION_AVAILABLE_ACTIONS = (ACTION_REVOKE_BAN, ACTION_ACCEPT_BAN)
 
 # What the owner may choose instead of the action the avatar proposed. A
 # mailbox item can be answered, left to the owner, or turned into an
@@ -161,7 +189,13 @@ GROUP_PLATFORM_SOURCE_KINDS = ("slack", "discord", "twitch")
 # somebody. A scheduled report and an account the research turned up both have
 # nobody to reply TO, so offering "send a reply" beside them is an action the
 # panel cannot carry out. The owner acknowledges these, or ignores them.
-NOTIFY_ONLY_SOURCE_KINDS = ("report", "account_discovery")
+NOTIFY_ONLY_SOURCE_KINDS = (
+    "report",
+    "account_discovery",
+    "phone_call",
+    MODERATION_SOURCE_KIND,
+    APPEAL_SOURCE_KIND,
+)
 
 
 def available_actions_for(item: dict[str, Any]) -> list[str]:
@@ -176,6 +210,8 @@ def available_actions_for(item: dict[str, Any]) -> list[str]:
     if isinstance(recorded, (list, tuple)) and recorded:
         return [str(action) for action in recorded]
     source_kind = str(item.get("source_kind") or "")
+    if source_kind in (MODERATION_SOURCE_KIND, APPEAL_SOURCE_KIND):
+        return list(MODERATION_AVAILABLE_ACTIONS)
     if source_kind in NOTIFY_ONLY_SOURCE_KINDS:
         return [ACTION_NOTIFY_OWNER]
     if source_kind in GROUP_PLATFORM_SOURCE_KINDS:
@@ -193,7 +229,12 @@ def public_item_view(item: dict[str, Any]) -> dict[str, Any]:
         "account_key": item.get("account_key"),
         "sender": item.get("sender"),
         "subject": item.get("subject"),
-        "snippet": body[:400],
+        "snippet": (
+            body
+            if str(item.get("source_kind") or "")
+            in (MODERATION_SOURCE_KIND, APPEAL_SOURCE_KIND)
+            else body[:400]
+        ),
         "received_at": _isoformat(item.get("received_at")),
         "message_kind": item.get("message_kind"),
         "decision": item.get("decision"),
@@ -289,6 +330,8 @@ class InMemoryInboxRepository:
         assistant_id: str,
         states: tuple[str, ...] | None = None,
         limit: int = 100,
+        source_kind: str | None = None,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return an avatar's items, newest first."""
         rows = [
@@ -296,6 +339,9 @@ class InMemoryInboxRepository:
             for item in self.items.values()
             if item["assistant_id"] == assistant_id
             and (states is None or item["state"] in states)
+            and item_matches_inbox_filters(
+                item, source_kind=source_kind, query=query
+            )
         ]
         rows.sort(key=lambda item: item["created_at"], reverse=True)
         return [dict(row) for row in rows[:limit]]
@@ -540,20 +586,32 @@ class PostgresInboxRepository:
         assistant_id: str,
         states: tuple[str, ...] | None = None,
         limit: int = 100,
+        source_kind: str | None = None,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return an avatar's items, newest first."""
+        clauses = ["assistant_id = %s"]
+        params: list[Any] = [assistant_id]
         if states:
-            rows = await self._fetchall(
-                f"SELECT {_ITEM_COLUMNS} FROM inbox_items WHERE assistant_id = %s AND "
-                "state = ANY(%s) ORDER BY created_at DESC LIMIT %s;",
-                (assistant_id, list(states), int(limit)),
+            clauses.append("state = ANY(%s)")
+            params.append(list(states))
+        if source_kind:
+            clauses.append("source_kind = %s")
+            params.append(source_kind)
+        needle = str(query or "").strip()
+        if needle:
+            like = f"%{needle}%"
+            clauses.append(
+                "(subject ILIKE %s OR reason ILIKE %s OR body_text ILIKE %s "
+                "OR sender ILIKE %s)"
             )
-        else:
-            rows = await self._fetchall(
-                f"SELECT {_ITEM_COLUMNS} FROM inbox_items WHERE assistant_id = %s "
-                "ORDER BY created_at DESC LIMIT %s;",
-                (assistant_id, int(limit)),
-            )
+            params.extend([like, like, like, like])
+        params.append(int(limit))
+        rows = await self._fetchall(
+            f"SELECT {_ITEM_COLUMNS} FROM inbox_items WHERE "
+            f"{' AND '.join(clauses)} ORDER BY created_at DESC LIMIT %s;",
+            tuple(params),
+        )
         return [self._item_row(row) for row in rows]
 
     async def count_open(self, assistant_id: str) -> int:

@@ -582,12 +582,11 @@ def render_popup_result_html(result: dict[str, Any], allowed_origins: list[str])
         "tool_count": result.get("tool_count"),
         "error": result.get("error"),
     }
-    heading = "Connected" if safe_result["ok"] else "Sign-in not completed"
+    heading = "Authorization complete!" if safe_result["ok"] else "Sign-in not completed"
     detail = (
-        f"{safe_result.get('display_label') or safe_result.get('provider') or 'The account'} "
-        "is connected. You can close this window."
+        "You can close this tab."
         if safe_result["ok"]
-        else str(safe_result.get("error") or "Close this window and try again.")
+        else str(safe_result.get("error") or "Close this tab and try again.")
     )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{html.escape(heading)}</title>
@@ -606,6 +605,7 @@ h1{{font-size:1.25rem;margin:0 0 .5rem}}p{{color:#a3a3a8;margin:0}}</style></hea
       }}
     }}
   }} catch (e) {{}}
-  setTimeout(function () {{ try {{ window.close(); }} catch (e) {{}} }}, 400);
+  // The chat card stays on Waiting until tokens are stored. Leave this
+  // tab open so the owner can close it themselves.
 }})();
 </script></body></html>"""

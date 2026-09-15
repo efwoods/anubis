@@ -29,6 +29,9 @@ VENDOR_KEY_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "anthropic": ("anthropic_usage", "anthropic_models"),
     "openai": ("openai_usage", "openai_models"),
     "langsmith": ("langsmith_projects", "langsmith_runs"),
+    "elevenlabs": ("elevenlabs_usage",),
+    "xai": ("xai_usage",),
+    "cursor": ("cursor_usage",),
 }
 
 # Where the owner gets a key, named in every failure so nobody has to search.
@@ -36,6 +39,9 @@ KEY_PAGES: dict[str, str] = {
     "anthropic": "https://console.anthropic.com/settings/keys",
     "openai": "https://platform.openai.com/api-keys",
     "langsmith": "https://smith.langchain.com/settings",
+    "elevenlabs": "https://elevenlabs.io/app/developers/api-keys",
+    "xai": "https://console.x.ai/",
+    "cursor": "https://cursor.com/dashboard/settings",
 }
 
 ADMIN_KEY_PAGES: dict[str, str] = {
@@ -61,6 +67,8 @@ def _headers(provider: str, key: str) -> dict[str, str]:
         return {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}
     if provider == "langsmith":
         return {"x-api-key": key}
+    if provider == "elevenlabs":
+        return {"xi-api-key": key}
     return {"Authorization": f"Bearer {key}"}
 
 
@@ -69,6 +77,9 @@ VERIFY_URLS: dict[str, str] = {
     "anthropic": "https://api.anthropic.com/v1/models?limit=1",
     "openai": "https://api.openai.com/v1/models",
     "langsmith": "https://api.smith.langchain.com/api/v1/sessions?limit=1",
+    "elevenlabs": "https://api.elevenlabs.io/v1/user",
+    "xai": "https://api.x.ai/v1/models",
+    "cursor": "https://api.cursor.com/teams/current",
 }
 
 
@@ -306,5 +317,43 @@ def build_vendor_key_tools(
             }
 
         tools.extend([langsmith_projects, langsmith_runs])
+
+    if "elevenlabs" in by_provider:
+
+        @tool
+        async def elevenlabs_usage() -> dict[str, Any]:
+            """Report ElevenLabs character usage and plan limits."""
+            document, problem = await _get(
+                "elevenlabs", "https://api.elevenlabs.io/v1/user/subscription"
+            )
+            if problem:
+                return problem
+            return {"status": "ok", "report": document}
+
+        tools.append(elevenlabs_usage)
+
+    if "xai" in by_provider:
+
+        @tool
+        async def xai_usage() -> dict[str, Any]:
+            """Report xAI usage when the stored key can reach the usage API."""
+            document, problem = await _get("xai", "https://api.x.ai/v1/usage")
+            if problem:
+                return problem
+            return {"status": "ok", "report": document}
+
+        tools.append(xai_usage)
+
+    if "cursor" in by_provider:
+
+        @tool
+        async def cursor_usage() -> dict[str, Any]:
+            """Report Cursor team spend when an admin key is stored."""
+            document, problem = await _get("cursor", "https://api.cursor.com/teams/current/spend")
+            if problem:
+                return problem
+            return {"status": "ok", "report": document}
+
+        tools.append(cursor_usage)
 
     return tools

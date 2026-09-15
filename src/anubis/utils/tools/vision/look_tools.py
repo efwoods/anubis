@@ -48,6 +48,7 @@ import logging
 from typing import Any
 
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage
 from langgraph.types import interrupt
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,66 @@ SOURCE_PURPOSE = {
 #: running to switch off. Only the first can be stopped while it is merely
 #: peekable rather than shared.
 STOPPABLE_WHILE_PEEKABLE = (SOURCE_SCREEN,)
+
+_ATTACHED_FILE_MARKERS = (
+    "[file:",
+    "[video:",
+    "[image:",
+    "[audio file:",
+    "[pdf file:",
+    "image descriptions:",
+)
+_LIVE_LOOK_MARKERS = (
+    "webcam",
+    "the camera",
+    "my camera",
+    "on my screen",
+    "on the screen",
+    "the screen",
+    "my screen",
+    "what i'm seeing",
+    "what i am seeing",
+    "look at me",
+    "look now",
+    "what do you see",
+)
+
+
+def _human_message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("text"):
+                parts.append(str(block["text"]))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def should_offer_look_now(messages: list[Any] | None) -> bool:
+    """Whether this turn may attach ``look_now``.
+
+    A chat attachment the person asked the avatar to describe is not a request
+    to open the webcam. Llama 3.2 11B otherwise calls ``look_now`` on
+    ``describe this image`` plus an attached video, pausing the reply.
+    """
+    last_human: HumanMessage | None = None
+    for message in reversed(messages or []):
+        if isinstance(message, HumanMessage):
+            last_human = message
+            break
+    if last_human is None:
+        return True
+    lowered = _human_message_text(last_human).lower()
+    if any(marker in lowered for marker in _LIVE_LOOK_MARKERS):
+        return True
+    if any(marker in lowered for marker in _ATTACHED_FILE_MARKERS):
+        return False
+    return True
 
 _SOURCE_ALIASES = {
     "webcam": SOURCE_WEBCAM,

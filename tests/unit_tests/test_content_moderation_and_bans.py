@@ -50,6 +50,7 @@ from src.security.bans import (
     BanSubject,
     ban_account,
     ban_subject_from_user,
+    complete_and_record_moderation_verdict,
     find_active_ban,
     lift_ban,
     list_bans,
@@ -124,6 +125,8 @@ class _FakePool:
         if "WHERE lifted_at IS NULL" in sql and "user_id = %(user_id)s" in sql:
             for ban in reversed(self.bans):
                 if ban["lifted_at"] is not None:
+                    continue
+                if ban.get("enforced") is False:
                     continue
                 if params["user_id"] and ban["user_id"] == params["user_id"]:
                     return [self._row(ban)]
@@ -234,13 +237,18 @@ def clean_screen_everywhere(monkeypatch):
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", _clean)
 
 
-def _verdict(violation: bool, reasoning: str = "") -> TermsAndServicesContentModeration:
+def _verdict(
+    violation: bool,
+    reasoning: str = "",
+    supporting_evidence: list[str] | None = None,
+) -> TermsAndServicesContentModeration:
     return TermsAndServicesContentModeration(
         violation=violation,
         reasoning=reasoning,
         violated_clauses=(
             ["Upload or share content that is unlawful"] if violation else []
         ),
+        supporting_evidence=list(supporting_evidence or []),
     )
 
 
@@ -253,7 +261,11 @@ async def test_judge_text_windows_long_content_and_reports_first_violation(monke
 
     async def fake_model(content, platforms=None):
         seen.append(content)
-        return _verdict("BAD" in content, "contains BAD")
+        return _verdict(
+            "BAD" in content,
+            "contains BAD",
+            ["BAD"] if "BAD" in content else [],
+        )
 
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_model)
     verdict = await judge_text("a" * 12 + "BAD" + "b" * 20, max_characters=12)
@@ -279,7 +291,11 @@ async def test_judge_fails_open_on_model_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_judge_documents_returns_the_violating_source(monkeypatch):
     async def fake_model(content, platforms=None):
-        return _verdict("pirated" in content)
+        return _verdict(
+            "pirated" in content,
+            "pirated material" if "pirated" in content else "",
+            ["pirated"] if "pirated" in content else [],
+        )
 
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_model)
     verdict = await judge_documents(
@@ -376,7 +392,11 @@ async def test_a_clean_upload_is_judged_anyway(monkeypatch):
 
     async def fake_judge(content, platforms=None):
         judged.append(content)
-        return _verdict("pirated" in content, "pirated material")
+        return _verdict(
+            "pirated" in content,
+            "pirated material",
+            ["pirated"] if "pirated" in content else [],
+        )
 
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", fake_screen)
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_judge)
@@ -396,7 +416,7 @@ async def test_a_suspect_screen_is_settled_by_the_judge(monkeypatch):
         return _screen_response(True, {"harassment": True}, {"harassment": 0.42})
 
     async def fake_judge(content, platforms=None):
-        return _verdict(True, "harassment")
+        return _verdict(True, "harassment", ["borderline"])
 
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", fake_screen)
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_judge)
@@ -573,7 +593,11 @@ async def test_moderate_documents_records_the_verdict_on_a_violation(
     monkeypatch, clean_screen_everywhere
 ):
     async def fake_judge(content, platforms=None):
-        return _verdict("pirated" in content)
+        return _verdict(
+            "pirated" in content,
+            "pirated material" if "pirated" in content else "",
+            ["pirated"] if "pirated" in content else [],
+        )
 
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_judge)
     runtime = SimpleNamespace(context=_moderation_context())
@@ -783,6 +807,169 @@ async def test_refuse_if_banned_raises_403_only_for_active_bans():
     await refuse_if_banned(no_pool, user_id="u1")
 
 
+@pytest.mark.asyncio
+async def test_unbannable_administrator_is_recorded_but_not_enforced():
+    pool = _FakePool()
+    stripe = _FakeStripe()
+    context = SimpleNamespace(
+        ban_refund_enabled="TRUE",
+        admin_user_id="6a64d1ef4e063740350632ae",
+        admin_account_email="e.woods.business@icloud.com",
+    )
+    app_state = SimpleNamespace(pool=pool, stripe=stripe, context=context)
+    subject = BanSubject(
+        "6a64d1ef4e063740350632ae",
+        "ip-admin",
+        "e.woods.business@icloud.com",
+        "cus_admin",
+        "sub_admin",
+        False,
+    )
+    ban = await ban_account(
+        app_state,
+        subject,
+        reason="the judge named a reason",
+        violated_clauses=["clause"],
+        source="message",
+        excerpt="quoted line",
+    )
+    assert ban["enforced"] is False
+    assert "unbannable administrator" in (ban["skipped_reason"] or "")
+    assert stripe.deleted == []
+    assert stripe.refunds == []
+    assert await find_active_ban(pool, user_id=subject.user_id) is None
+    assert await find_active_ban(pool, email=subject.email) is None
+
+
+@pytest.mark.asyncio
+async def test_refuse_if_banned_skips_the_administrator():
+    pool = _FakePool()
+    context = SimpleNamespace(
+        ban_appeal_contact_email="appeals@example.com",
+        admin_user_id="admin-1",
+        admin_account_email="e.woods.business@icloud.com",
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(pool=pool, context=context))
+    )
+    pool.bans.append(
+        {
+            "ban_id": "existing",
+            "user_id": "admin-1",
+            "hashed_ip": "ip1",
+            "email": "e.woods.business@icloud.com",
+            "reason": "should never refuse this account",
+            "violated_clauses": None,
+            "source": "message",
+            "excerpt": None,
+            "stripe_customer_id": None,
+            "subscription_id": None,
+            "refund_id": None,
+            "banned_at": "2026-09-12T00:00:00+00:00",
+            "lifted_at": None,
+            "appeal_note": None,
+            "enforced": True,
+            "skipped_reason": None,
+        }
+    )
+    await refuse_if_banned(
+        request, user_id="admin-1", email="e.woods.business@icloud.com"
+    )
+
+
+@pytest.mark.asyncio
+async def test_judge_text_discards_a_violation_without_quoted_evidence(monkeypatch):
+    async def fake_model(content, platforms=None):
+        return _verdict(True, "no quotes from the content")
+
+    monkeypatch.setattr(moderation, "invoke_moderation_model", fake_model)
+    verdict = await judge_text("ordinary memoir")
+    assert verdict["violation"] is False
+    assert verdict["reasoning"] == ""
+    assert verdict["supporting_evidence"] == []
+
+
+@pytest.mark.asyncio
+async def test_fast_screen_style_verdict_does_not_record_a_ban_without_the_judge(
+    monkeypatch,
+):
+    pool = _FakePool()
+    app_state = SimpleNamespace(
+        pool=pool,
+        stripe=_FakeStripe(),
+        context=SimpleNamespace(ban_refund_enabled="TRUE"),
+    )
+    subject = BanSubject("u1", "ip1", "a@b.c", None, None, False)
+
+    async def fake_judge(text, **kwargs):
+        return {
+            "violation": True,
+            "reasoning": "generic screen text",
+            "supporting_evidence": [],
+        }
+
+    monkeypatch.setattr(
+        "src.anubis.utils.moderation.content_moderation.judge_text", fake_judge
+    )
+    recorded = await complete_and_record_moderation_verdict(
+        app_state,
+        subject,
+        {
+            "violation": True,
+            "reasoning": (
+                "The message was refused by automated content screening for sexual."
+            ),
+        },
+        source="message",
+        judged_text="hello there",
+    )
+    assert recorded is None
+    assert pool.bans == []
+
+
+@pytest.mark.asyncio
+async def test_moderation_inbox_item_is_only_on_the_admin_personal_avatar(
+    monkeypatch,
+):
+    from src.anubis.utils.inbox.repository import InMemoryInboxRepository
+
+    repository = InMemoryInboxRepository()
+    monkeypatch.setattr(
+        "src.anubis.utils.inbox.get_inbox_repository", lambda: repository
+    )
+
+    async def fake_personal_avatar(pool, owner_id):
+        assert owner_id == "admin-1"
+        return "admin-personal-avatar"
+
+    monkeypatch.setattr(
+        "src.anubis.utils.personal_avatar.personal_avatar_id_for_owner",
+        fake_personal_avatar,
+    )
+    pool = _FakePool()
+    context = SimpleNamespace(
+        ban_refund_enabled="FALSE",
+        admin_user_id="admin-1",
+        admin_account_email="e.woods.business@icloud.com",
+    )
+    app_state = SimpleNamespace(pool=pool, stripe=None, context=context)
+    await ban_account(
+        app_state,
+        BanSubject("other-user", "ip2", "someone@example.com", None, None, False),
+        reason="the judge named a reason",
+        violated_clauses=["clause"],
+        source="message",
+        excerpt="quoted line from the content",
+    )
+    items = list(repository.items.values())
+    assert len(items) == 1
+    assert items[0]["assistant_id"] == "admin-personal-avatar"
+    assert items[0]["user_id"] == "admin-1"
+    assert items[0]["source_kind"] == "moderation"
+    assert items[0]["sender"] == "someone@example.com"
+    assert "quoted line from the content" in items[0]["body_text"]
+
+
 # ── media jobs ──────────────────────────────────────────────────────────────
 
 
@@ -954,6 +1141,7 @@ async def test_platform_rules_reach_the_judge_and_stay_out_of_violated_clauses(
             reasoning = "broke a platform rule"
             violated_clauses: list[str] = []
             violated_platform_rules = ["Twitch: no automated moderation without disclosure"]
+            supporting_evidence = ["something"]
 
         return Verdict()
 

@@ -88,6 +88,7 @@ KIND_WEBSITE = "website"
 KIND_ANALYTICS = "analytics"
 KIND_HOSTING = "hosting"
 KIND_CRYPTO = "crypto"
+KIND_TELEPHONY = "telephony"
 ALL_KINDS = frozenset(
     {
         KIND_MAILBOX,
@@ -102,6 +103,7 @@ ALL_KINDS = frozenset(
         KIND_ANALYTICS,
         KIND_HOSTING,
         KIND_CRYPTO,
+        KIND_TELEPHONY,
     }
 )
 
@@ -131,6 +133,9 @@ MECHANISM_SITE_DISCOVERY = "site_discovery"
 # owner a personal API key, which is the route it documents and supports. The
 # key is proved at connect time and stored encrypted like any other credential.
 MECHANISM_API_KEY = "api_key"
+# The owner types the mobile they already have; an SMS one-time code proves
+# they still hold that handset. The product does not issue them a new line.
+MECHANISM_PHONE_VERIFY = "phone_verify"
 ALL_MECHANISMS = frozenset(
     {
         MECHANISM_PASSWORD,
@@ -143,6 +148,7 @@ ALL_MECHANISMS = frozenset(
         MECHANISM_URL_ONLY,
         MECHANISM_SITE_DISCOVERY,
         MECHANISM_API_KEY,
+        MECHANISM_PHONE_VERIFY,
     }
 )
 
@@ -190,6 +196,7 @@ FORM_MECHANISMS = frozenset(
         MECHANISM_URL_ONLY,
         MECHANISM_SITE_DISCOVERY,
         MECHANISM_API_KEY,
+        MECHANISM_PHONE_VERIFY,
     }
 )
 
@@ -206,6 +213,7 @@ LOGIN_MODES_BY_MECHANISM: dict[str, str] = {
     MECHANISM_URL_ONLY: LOGIN_MODE_FORM,
     MECHANISM_SITE_DISCOVERY: LOGIN_MODE_FORM,
     MECHANISM_API_KEY: LOGIN_MODE_FORM,
+    MECHANISM_PHONE_VERIFY: LOGIN_MODE_FORM,
     MECHANISM_OAUTH: LOGIN_MODE_OAUTH_POPUP,
     MECHANISM_PLAID_LINK: LOGIN_MODE_PLAID_LINK,
     MECHANISM_BROWSER_SESSION: LOGIN_MODE_BROWSER_SESSION,
@@ -230,6 +238,7 @@ CATEGORY_CALENDAR = "calendar"
 CATEGORY_SOCIAL = "social"
 CATEGORY_MESSAGING = "messaging"
 CATEGORY_DEVICE = "device"
+CATEGORY_PHONE = "phone"
 CATEGORY_CUSTOM = "custom"
 CATEGORY_FINANCE = "finance"
 CATEGORY_DEVELOPMENT = "development"
@@ -248,6 +257,7 @@ CATEGORY_ORDER: tuple[str, ...] = (
     CATEGORY_CALENDAR,
     CATEGORY_SOCIAL,
     CATEGORY_MESSAGING,
+    CATEGORY_PHONE,
     CATEGORY_DEVICE,
     CATEGORY_CUSTOM,
 )
@@ -929,6 +939,136 @@ OPENAI_PROVIDER = ConnectedAccountProvider(
     terms_require_api_key=True,
 )
 
+GOOGLE_SHEETS_PROVIDER = ConnectedAccountProvider(
+    name="google_sheets",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="Google Sheets",
+    category=CATEGORY_VENDOR,
+    summary="Read the owner's reporting and forecast spreadsheets",
+    card_description="Read the reporting spreadsheet the owner names in chat.",
+    icon_key="google_sheets",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://docs.google.com/spreadsheets/",
+    home_url="https://docs.google.com/spreadsheets/",
+    oauth_config_key="google",
+    oauth_scopes=(
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ),
+    starter_prompts=(
+        {
+            "label": "Read the forecast sheet",
+            "prompt": "Read the cost and usage reporting spreadsheet and summarise expected burn.",
+        },
+    ),
+)
+
+GOOGLE_DRIVE_PROVIDER = ConnectedAccountProvider(
+    name="google_drive",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_OAUTH,
+    display_name="Google Drive",
+    category=CATEGORY_VENDOR,
+    summary="Search, read, create, and share files the owner uses with this app",
+    card_description="Search, read, create, and share files.",
+    icon_key="google_drive",
+    login_url="https://accounts.google.com/ServiceLogin?continue=https://drive.google.com/",
+    home_url="https://drive.google.com/",
+    oauth_config_key="google",
+    oauth_scopes=(
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/drive.file",
+    ),
+)
+
+ELEVENLABS_PROVIDER = ConnectedAccountProvider(
+    name="elevenlabs",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_API_KEY,
+    display_name="ElevenLabs",
+    category=CATEGORY_VENDOR,
+    summary="Speech usage and cost of the ElevenLabs workspace",
+    card_description="Add an API key, or sign in on the analytics page through the avatar's computer.",
+    icon_key="elevenlabs",
+    home_url="https://elevenlabs.io/app/developers/analytics/usage",
+    login_url="https://elevenlabs.io/app/sign-in",
+    recipe_key="elevenlabs",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="sk_...",
+            help_text="From elevenlabs.io under Developers > API keys. Optional when signing in on the computer.",
+            required=False,
+        ),
+    ),
+)
+
+XAI_PROVIDER = ConnectedAccountProvider(
+    name="xai",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_API_KEY,
+    display_name="xAI",
+    category=CATEGORY_VENDOR,
+    summary="Image and video billing on the xAI console",
+    card_description="Add an API key, or sign in on the billing page through the avatar's computer.",
+    icon_key="xai",
+    home_url="https://console.x.ai/",
+    login_url="https://console.x.ai/",
+    recipe_key="xai",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="API key",
+            input_type="password",
+            placeholder="xai-...",
+            help_text="From console.x.ai under API keys. Optional when signing in on the computer.",
+            required=False,
+        ),
+    ),
+)
+
+CURSOR_PROVIDER = ConnectedAccountProvider(
+    name="cursor",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_API_KEY,
+    display_name="Cursor",
+    category=CATEGORY_DEVELOPMENT,
+    summary="Cursor subscription spend and included token usage",
+    card_description="Add a team admin key, or sign in on the spending dashboard through the avatar's computer.",
+    icon_key="cursor",
+    home_url="https://cursor.com/dashboard/spending",
+    login_url="https://cursor.com/dashboard/spending",
+    recipe_key="cursor",
+    connect_fields=(
+        ConnectFieldSpec(
+            name="api_key",
+            label="Admin API key",
+            input_type="password",
+            placeholder="key_...",
+            help_text="From Cursor team admin settings. Optional when signing in on the computer.",
+            required=False,
+        ),
+    ),
+)
+
+CLAUDE_APP_PROVIDER = ConnectedAccountProvider(
+    name="claude_app",
+    kind=KIND_ANALYTICS,
+    credential_mechanism=MECHANISM_BROWSER_SESSION,
+    display_name="Claude.ai",
+    category=CATEGORY_DEVELOPMENT,
+    summary="Claude.ai and Claude Code subscription usage",
+    card_description="Sign in on Claude.ai so the avatar can read subscription usage. This is not the Anthropic API console.",
+    icon_key="claude_app",
+    login_url="https://claude.ai/settings/usage",
+    home_url="https://claude.ai/settings/usage",
+    recipe_key="claude_app",
+)
+
 ANTHROPIC_PROVIDER = ConnectedAccountProvider(
     name="anthropic",
     kind=KIND_ANALYTICS,
@@ -1309,6 +1449,49 @@ GMAIL_APP_PASSWORD_PROVIDER = ConnectedAccountProvider(
     ),
 )
 
+PHONE_PROVIDER = ConnectedAccountProvider(
+    name="phone",
+    kind=KIND_TELEPHONY,
+    credential_mechanism=MECHANISM_PHONE_VERIFY,
+    display_name="Phone",
+    category=CATEGORY_PHONE,
+    summary="Use the phone you already have",
+    featured=True,
+    icon_key="phone",
+    card_description=(
+        "Verify the mobile you already have. Call the shared Neural Nexus number "
+        "from that mobile to talk to your avatar. No new number is assigned."
+    ),
+    connect_fields=(
+        ConnectFieldSpec(
+            name="phone_number",
+            label="Your mobile number",
+            input_type="tel",
+            placeholder="+1 404 555 0100",
+            help_text="The phone you already carry. Neural Nexus will text a confirmation code.",
+        ),
+        ConnectFieldSpec(
+            name="verification_code",
+            label="Confirmation code",
+            input_type="text",
+            placeholder="6-digit code",
+            help_text="Leave blank on the first submit. Enter the code from the text to finish.",
+            required=False,
+        ),
+    ),
+    starter_prompts=(
+        {
+            "label": "Kanji's number",
+            "prompt": "What is Kanji's phone number in my city?",
+        },
+        {
+            "label": "Order pizza",
+            "prompt": "Order a large pepperoni from Mellow Mushroom for pickup.",
+        },
+    ),
+)
+
+
 PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
     provider.name: provider
     for provider in (
@@ -1322,6 +1505,12 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
         LANGSMITH_PROVIDER,
         OPENAI_PROVIDER,
         ANTHROPIC_PROVIDER,
+        GOOGLE_SHEETS_PROVIDER,
+        GOOGLE_DRIVE_PROVIDER,
+        ELEVENLABS_PROVIDER,
+        XAI_PROVIDER,
+        CURSOR_PROVIDER,
+        CLAUDE_APP_PROVIDER,
         GOOGLE_ANALYTICS_PROVIDER,
         WEBSITE_PROVIDER,
         VERCEL_PROVIDER,
@@ -1341,6 +1530,7 @@ PROVIDER_REGISTRY: dict[str, ConnectedAccountProvider] = {
         CUSTOM_MCP_PROVIDER,
         CUSTOM_SITE_PROVIDER,
         SIGNED_IN_SITE_PROVIDER,
+        PHONE_PROVIDER,
     )
 }
 

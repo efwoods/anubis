@@ -225,6 +225,9 @@ async def create_episodic_memory(  # EPISODIC MEMORY CREATION IN NAMESPACE (USER
                 ]
             }
         )
+    from src.anubis.utils.learning.fact_learned import announce_fact_learned
+
+    announce_fact_learned(document_metadata["fact"], kind="memory")
     update = {
         "recalled_memory_documents": [assistant_identity_memory_document],
         "messages": [
@@ -1227,6 +1230,9 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
             }
         )
 
+    from src.anubis.utils.learning.fact_learned import announce_fact_learned
+
+    announce_fact_learned(document_metadata["fact"], kind="identity")
     update = {
         "assistant_identity_documents": [assistant_identity_memory_document],
         "messages": [
@@ -1501,6 +1507,9 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
                 ]
             }
         )
+    from src.anubis.utils.learning.fact_learned import announce_fact_learned
+
+    announce_fact_learned(user_fact, kind="identity")
     update = {
         "user_identity_documents": [user_identity_document],
         "messages": [

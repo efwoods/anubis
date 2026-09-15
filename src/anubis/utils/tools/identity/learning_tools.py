@@ -115,7 +115,7 @@ async def learn_user_preference(
     runtime: Annotated[ToolRuntime, InjectedToolArg] = None,
 ) -> Command:
     """<INSTRUCTIONS>
-    Learn a PREFERENCE the user dictates about how the user wants to be treated in conversation: how the user wants to be addressed, what the user wants to talk about or avoid, what reply format the user wants, and how the user wants you to communicate (tone, humor, directness, length).
+    Learn a PREFERENCE the user dictates about how the user wants to be treated in conversation: how the user wants to be addressed, what the user wants to talk about or avoid, what reply format the user wants, how the user wants you to communicate (tone, humor, directness, length), and how the user wants you to react to something they do on camera or in view.
     Call this tool ONCE PER DISTINCT PREFERENCE. A single message may hold several preferences; make one call for each.
     Preserve the preference as the user meant the preference. Set preference_context to a concise summary of the whole message.
     </INSTRUCTIONS>
@@ -126,6 +126,9 @@ async def learn_user_preference(
       1. preference: "The user prefers to be called Sam." category: address
       2. preference: "The user wants short replies." category: communication_style
       3. preference: "The user does not want pep talks or motivational framing." category: communication_style
+    User: "Learn to be surprised when I make a gross face and say You're so gross! Stop that! Yuck!"
+    One call:
+      1. preference: "When the user makes a gross face or a gag on camera, be surprised or disgusted and say You're so gross! Stop that! Yuck!" category: communication_style
     </EXAMPLE>
 
     <RESTRICTIONS>
@@ -150,6 +153,9 @@ async def learn_user_preference(
     )
     if document is None:
         return _tool_message(f"Preference previously learned: {preference}", runtime)
+    from src.anubis.utils.learning.fact_learned import announce_fact_learned
+
+    announce_fact_learned(preference, kind="preference")
     return _tool_message(f"Learned preference: {preference}", runtime)
 
 

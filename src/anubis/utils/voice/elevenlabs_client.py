@@ -53,6 +53,19 @@ class ElevenLabsVoiceBlockedError(ElevenLabsError):
     """
 
 
+class ElevenLabsKeyRefusedError(ElevenLabsError):
+    """The configured ElevenLabs key was rejected.
+
+    Raised for 401 ``invalid_api_key`` / ``unauthorized``. That is a credential
+    the operator must replace, not a spent reader allotment and not an empty
+    ElevenLabs credit balance (those are ``ElevenLabsCreditsExhaustedError``).
+    """
+
+
+class ElevenLabsCreditsExhaustedError(ElevenLabsError):
+    """The ElevenLabs account has no remaining credits or quota."""
+
+
 # ``safety_control`` values on ``GET /v1/voices/{voice_id}`` that mean the voice
 # is banned. A usable voice reports ``None``.
 BLOCKED_VOICE_SAFETY_CONTROLS = frozenset({"ENTERPRISE_BAN", "BAN", "BLOCKED"})
@@ -60,6 +73,12 @@ BLOCKED_VOICE_SAFETY_CONTROLS = frozenset({"ENTERPRISE_BAN", "BAN", "BLOCKED"})
 # The vendor's own names for the blocked-voice refusal, matched against the
 # error body's ``detail.code`` and ``detail.status``.
 _BLOCKED_VOICE_ERROR_NAMES = frozenset({"voice_access_denied", "detected_blocked_voice"})
+_KEY_REFUSED_ERROR_NAMES = frozenset(
+    {"invalid_api_key", "missing_api_key", "unauthorized"}
+)
+_CREDIT_EXHAUSTED_ERROR_NAMES = frozenset(
+    {"quota_exceeded", "insufficient_credits", "payment_required"}
+)
 
 
 def _api_key(context: Any) -> str:
@@ -111,17 +130,36 @@ def _describe_vendor_error(vendor_error: Exception) -> str:
     return str(vendor_error)
 
 
-def _is_blocked_voice_error(vendor_error: Exception) -> bool:
-    """Whether the SDK failure is the permanent blocked-voice refusal."""
+def _named_vendor_statuses(vendor_error: Exception) -> set[str]:
+    """The vendor's ``detail.code`` / ``detail.status`` / ``detail.type`` names."""
     body = getattr(vendor_error, "body", None)
     detail = body.get("detail") if isinstance(body, dict) else None
     if not isinstance(detail, dict):
-        return False
-    named = {
-        str(detail.get("code") or "").strip().lower(),
-        str(detail.get("status") or "").strip().lower(),
-    }
-    return bool(named & _BLOCKED_VOICE_ERROR_NAMES)
+        return set()
+    names: set[str] = set()
+    for field_name in ("code", "status", "type"):
+        value = str(detail.get(field_name) or "").strip().lower()
+        if value:
+            names.add(value)
+    return names
+
+
+def classify_elevenlabs_vendor_error(vendor_error: Exception) -> ElevenLabsError:
+    """Turn an SDK failure into the matching ElevenLabsError subclass.
+
+    A refused key (401 ``invalid_api_key``) is not an empty credit balance.
+    Empty credits are 402 / ``quota_exceeded`` / ``insufficient_credits``.
+    """
+    description = _describe_vendor_error(vendor_error)
+    names = _named_vendor_statuses(vendor_error)
+    status_code = getattr(vendor_error, "status_code", None)
+    if names & _BLOCKED_VOICE_ERROR_NAMES:
+        return ElevenLabsVoiceBlockedError(description)
+    if status_code == 401 or names & _KEY_REFUSED_ERROR_NAMES:
+        return ElevenLabsKeyRefusedError(description)
+    if status_code == 402 or names & _CREDIT_EXHAUSTED_ERROR_NAMES:
+        return ElevenLabsCreditsExhaustedError(description)
+    return ElevenLabsError(description)
 
 
 async def _run(operation: Any, *args: Any, **kwargs: Any) -> Any:
@@ -130,10 +168,7 @@ async def _run(operation: Any, *args: Any, **kwargs: Any) -> Any:
     except ElevenLabsNotConfiguredError:
         raise
     except Exception as vendor_error:  # noqa: BLE001 - normalized for callers
-        description = _describe_vendor_error(vendor_error)
-        if _is_blocked_voice_error(vendor_error):
-            raise ElevenLabsVoiceBlockedError(description) from vendor_error
-        raise ElevenLabsError(description) from vendor_error
+        raise classify_elevenlabs_vendor_error(vendor_error) from vendor_error
 
 
 # The SDK (2.65.0) serializes ``labels`` with ``json.dumps`` before its omit

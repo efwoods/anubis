@@ -20,6 +20,7 @@ from ``webapp`` lazily because ``webapp`` includes this router.
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -55,9 +56,24 @@ def _require_enabled() -> None:
         raise HTTPException(status_code=404, detail="Group conversations are not enabled.")
 
 
-def _store_or_503() -> Any:
-    from src.api.webapp import app
+def _webapp_helpers(request: Request | None = None) -> Any:
+    """Helpers published on ``app.state`` during lifespan. Never re-import webapp."""
+    if request is not None:
+        state = request.app.state
+        if hasattr(state, "enforce_remaining_allotment"):
+            return state
+    for module_name in ("user_router_module", "src.api.webapp"):
+        loaded = sys.modules.get(module_name)
+        if loaded is not None and hasattr(loaded, "enforce_remaining_allotment"):
+            return loaded
+    raise HTTPException(
+        status_code=503, detail="The API is still starting."
+    )
 
+
+def _store_or_503(app: Any | None = None) -> Any:
+    if app is None:
+        app = getattr(_webapp_helpers(), "app", None)
     store = getattr(app.state, "store", None)
     if store is None:
         raise HTTPException(
@@ -67,7 +83,10 @@ def _store_or_503() -> Any:
 
 
 async def resolve_avatar_for_group(
-    assistant_id: str, current_user: dict, platform: str
+    assistant_id: str,
+    current_user: dict,
+    platform: str,
+    request: Request | None = None,
 ) -> tuple[dict, str]:
     """Authorize one caller for one avatar on one platform.
 
@@ -76,9 +95,8 @@ async def resolve_avatar_for_group(
     uses the returned value rather than reading the caller's identity again.
     """
     from src.anubis.utils.personal_avatar import is_personal_avatar
-    from src.api.webapp import resolve_assistant_for_creator
 
-    assistant, creator_user_id = await resolve_assistant_for_creator(
+    assistant, creator_user_id = await _webapp_helpers(request).resolve_assistant_for_creator(
         assistant_id, current_user, "use this avatar in a group conversation"
     )
     if platform in PERSONAL_AVATAR_ONLY_PLATFORMS and not is_personal_avatar(assistant):
@@ -112,7 +130,6 @@ async def receive_group_events(
     from src.anubis.utils.billing.tiers import UsageMeter
     from src.anubis.utils.groups.precedent import record_channel
     from src.anubis.utils.groups.runner import triage_group_events
-    from src.api.webapp import app, enforce_remaining_allotment
 
     _require_enabled()
     payload = await request.json()
@@ -134,12 +151,15 @@ async def receive_group_events(
         return JSONResponse({"assistant_id": assistant_id, "decisions": []})
 
     assistant, creator_user_id = await resolve_avatar_for_group(
-        assistant_id, current_user, events_request.platform
+        assistant_id, current_user, events_request.platform, request
     )
-    await enforce_remaining_allotment(
-        app.state, current_user, UsageMeter.MESSAGES, assistant_id=assistant_id
+    await _webapp_helpers(request).enforce_remaining_allotment(
+        request.app.state,
+        current_user,
+        UsageMeter.MESSAGING_TOKENS,
+        assistant_id=assistant_id,
     )
-    store = _store_or_503()
+    store = _store_or_503(request.app)
     await record_channel(
         store,
         creator_user_id,
@@ -203,9 +223,9 @@ async def correct_group_decision(
     except Exception as validation_error:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(validation_error)) from validation_error
     _, creator_user_id = await resolve_avatar_for_group(
-        assistant_id, current_user, correction.platform
+        assistant_id, current_user, correction.platform, request
     )
-    store = _store_or_503()
+    store = _store_or_503(request.app)
     result = await apply_decision_correction(
         store, creator_user_id, assistant_id, correction
     )
@@ -240,9 +260,9 @@ async def read_group_policy(
     from src.anubis.utils.groups.precedent import list_policy_rules
 
     _require_enabled()
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     return JSONResponse(
-        {"rules": await list_policy_rules(_store_or_503(), creator_user_id, assistant_id)}
+        {"rules": await list_policy_rules(_store_or_503(request.app), creator_user_id, assistant_id)}
     )
 
 
@@ -261,9 +281,9 @@ async def add_group_policy_rule(
     rule = str(payload.get("rule") or "").strip()
     if not rule:
         raise HTTPException(status_code=400, detail="A rule is required.")
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     document = await store_policy_rule(
-        _store_or_503(),
+        _store_or_503(request.app),
         creator_user_id,
         assistant_id,
         rule=rule,
@@ -288,9 +308,9 @@ async def delete_group_policy_rule(
     from src.anubis.utils.groups.precedent import delete_policy_rule
 
     _require_enabled()
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     deleted = await delete_policy_rule(
-        _store_or_503(), creator_user_id, assistant_id, rule_id
+        _store_or_503(request.app), creator_user_id, assistant_id, rule_id
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="No such rule.")
@@ -307,9 +327,9 @@ async def read_group_follow_ups(
     from src.anubis.utils.groups.precedent import due_follow_ups
 
     _require_enabled()
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     pending = await due_follow_ups(
-        _store_or_503(),
+        _store_or_503(request.app),
         creator_user_id,
         assistant_id,
         # A far-future timestamp reads everything, due or not.
@@ -328,9 +348,9 @@ async def read_group_notifications(
     from src.anubis.utils.groups.precedent import list_notifications
 
     _require_enabled()
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     notifications = await list_notifications(
-        _store_or_503(), creator_user_id, assistant_id, unread_only=unread_only
+        _store_or_503(request.app), creator_user_id, assistant_id, unread_only=unread_only
     )
     return JSONResponse(
         {"waiting_count": len(notifications), "notifications": notifications}
@@ -354,9 +374,9 @@ async def acknowledge_group_notifications(
     ]
     if not notification_ids:
         raise HTTPException(status_code=400, detail="notification_ids is required.")
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     acknowledged = await acknowledge_notifications(
-        _store_or_503(), creator_user_id, assistant_id, notification_ids
+        _store_or_503(request.app), creator_user_id, assistant_id, notification_ids
     )
     return JSONResponse({"acknowledged": acknowledged})
 
@@ -370,9 +390,9 @@ async def read_group_channels(
     from src.anubis.utils.groups.precedent import list_channels
 
     _require_enabled()
-    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "")
+    _, creator_user_id = await resolve_avatar_for_group(assistant_id, current_user, "", request)
     return JSONResponse(
-        {"channels": await list_channels(_store_or_503(), creator_user_id, assistant_id)}
+        {"channels": await list_channels(_store_or_503(request.app), creator_user_id, assistant_id)}
     )
 
 
@@ -395,10 +415,10 @@ async def join_group_channel(
             status_code=400, detail="platform and channel_id are required."
         )
     _, creator_user_id = await resolve_avatar_for_group(
-        assistant_id, current_user, platform
+        assistant_id, current_user, platform, request
     )
     channel = await record_channel(
-        _store_or_503(),
+        _store_or_503(request.app),
         creator_user_id,
         assistant_id,
         platform=platform,
@@ -421,10 +441,10 @@ async def leave_group_channel_route(
 
     _require_enabled()
     _, creator_user_id = await resolve_avatar_for_group(
-        assistant_id, current_user, platform.strip().lower()
+        assistant_id, current_user, platform.strip().lower(), request
     )
     left = await forget_channel(
-        _store_or_503(),
+        _store_or_503(request.app),
         creator_user_id,
         assistant_id,
         platform=platform.strip().lower(),

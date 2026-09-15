@@ -31,6 +31,9 @@ def get_analytics_pool() -> Any | None:
 async def ensure_analytics_tables(pool: Any) -> None:
     """Create every analytics table if absent: tool calls, reports, schedules, finance, vendor usage."""
     from src.anubis.utils.analytics.finance import ensure_finance_tables
+    from src.anubis.utils.analytics.reference_forecasts import (
+        ensure_reference_forecasts_table,
+    )
     from src.anubis.utils.analytics.reports import ensure_reports_table
     from src.anubis.utils.analytics.schedules import ensure_schedules_table
     from src.anubis.utils.analytics.tool_calls import ensure_tool_calls_table
@@ -41,6 +44,7 @@ async def ensure_analytics_tables(pool: Any) -> None:
     await ensure_schedules_table(pool)
     await ensure_finance_tables(pool)
     await ensure_vendor_usage_table(pool)
+    await ensure_reference_forecasts_table(pool)
 
 
 def publish_analytics_repositories(pool: Any) -> None:

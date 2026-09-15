@@ -566,3 +566,29 @@ async def test_an_unreadable_attached_image_is_described_not_fatal():
     assert multimodal_content is None
     assert image_filenames == []
     assert "could not be read" in text_content
+
+
+@pytest.mark.asyncio
+async def test_an_attached_video_becomes_an_image_block_from_a_still(monkeypatch):
+    """A chat-attached MP4 must be described from a frame, not left as a filename
+    that makes the avatar open the webcam instead."""
+    from src.anubis.utils import video_still
+    from src.api.webapp import process_files_for_message
+
+    monkeypatch.setattr(
+        video_still,
+        "still_jpeg_from_video_bytes",
+        lambda _bytes, _name=None: JPEG_BYTES,
+    )
+    mp4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64
+    _text, multimodal_content, image_filenames = await process_files_for_message(
+        files=[_upload_file("wireframe.MP4", mp4, "video/mp4")],
+        message="describe this image",
+    )
+    assert image_filenames == ["wireframe.MP4"]
+    image_blocks = [
+        block for block in multimodal_content if block.get("type") == "image_url"
+    ]
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert "[Video: wireframe.MP4]" in _text

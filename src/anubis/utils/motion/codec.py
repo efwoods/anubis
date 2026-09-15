@@ -21,9 +21,23 @@ from typing import Any
 import numpy as np
 
 from src.anubis.utils.motion.landmarks import (
+    BODY_JOINT_INDEX,
+    BODY_JOINT_NAMES,
+    BODY_VALUES_PER_JOINT,
     DEFAULT_LANDMARK_SET_VERSION,
     get_landmark_set,
 )
+
+SOURCE_NEURAL_DECODER = "neural_decoder"
+
+# A decoder may send only the joints it has. Shoulder-width normalize still
+# needs a torso frame, so missing joints sit at this rest pose with visibility
+# 0 — a measurement frame, not claimed decoded data.
+CANONICAL_REST_JOINT_XYZ: dict[str, tuple[float, float, float]] = {
+    "left_shoulder": (0.6, 0.5, 0.0),
+    "right_shoulder": (0.4, 0.5, 0.0),
+    "nose": (0.5, 0.3, -0.05),
+}
 
 FACE_ENCODING_NONE = "none"
 FACE_ENCODING_DENSE = "dense"
@@ -106,6 +120,43 @@ class MotionWindow:
         return sum(int(stream.frames.size) * 2 for stream in self.streams.values())
 
 
+def expand_sparse_body_frames(
+    sparse_frames: np.ndarray, present_joints: list[str]
+) -> np.ndarray:
+    """Expand a named-joint body buffer into the stored 33 × 4 layout.
+
+    ``sparse_frames`` is ``[frames, 4 * len(present_joints)]``. Unknown names
+    are an error. Present joints keep the values they arrived with. Missing
+    joints stay at rest with visibility 0; canonical shoulders and nose are
+    placed so shoulder-width normalize does not divide by zero.
+    """
+    if not present_joints:
+        raise ValueError("present_joints must name at least one joint.")
+    seen: set[str] = set()
+    for name in present_joints:
+        if name not in BODY_JOINT_INDEX:
+            raise ValueError(f"Unknown body joint {name!r}.")
+        if name in seen:
+            raise ValueError(f"present_joints names {name!r} more than once.")
+        seen.add(name)
+    array = np.asarray(sparse_frames, dtype=np.float32)
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    expected_width = BODY_VALUES_PER_JOINT * len(present_joints)
+    if array.shape[1] != expected_width:
+        raise ValueError(
+            f"A sparse body stream with {len(present_joints)} joints needs "
+            f"{expected_width} values per frame, not {array.shape[1]}."
+        )
+    joints = np.zeros((array.shape[0], len(BODY_JOINT_NAMES), BODY_VALUES_PER_JOINT), dtype=np.float32)
+    for name, xyz in CANONICAL_REST_JOINT_XYZ.items():
+        joints[:, BODY_JOINT_INDEX[name], :3] = np.asarray(xyz, dtype=np.float32)
+    for column, name in enumerate(present_joints):
+        start = column * BODY_VALUES_PER_JOINT
+        joints[:, BODY_JOINT_INDEX[name], :] = array[:, start : start + BODY_VALUES_PER_JOINT]
+    return joints.reshape(array.shape[0], -1)
+
+
 def window_to_payload(window: MotionWindow) -> dict[str, Any]:
     """Return the JSON shape a window travels as (buffers base64-encoded)."""
     return {
@@ -136,6 +187,7 @@ def window_from_payload(payload: dict[str, Any]) -> MotionWindow:
     if not isinstance(payload, dict):
         raise ValueError("A motion window is a JSON object.")
     landmark_set = get_landmark_set(payload.get("landmark_set_version"))
+    source = str(payload.get("source") or "live_camera")
     face_encoding = str(payload.get("face_encoding") or FACE_ENCODING_NONE)
     if face_encoding not in (FACE_ENCODING_NONE, FACE_ENCODING_DENSE, FACE_ENCODING_BASIS):
         raise ValueError(f"Unknown face encoding {face_encoding!r}.")
@@ -152,7 +204,21 @@ def window_from_payload(payload: dict[str, Any]) -> MotionWindow:
             raise ValueError(f"Stream {name!r} is not an object.")
         declared_width = raw.get("values_per_frame")
         expected_width = landmark_set.stream(name).values_per_frame
-        if name == "face" and face_encoding == FACE_ENCODING_BASIS:
+        present_joints = raw.get("present_joints")
+        if present_joints is not None and source != SOURCE_NEURAL_DECODER:
+            raise ValueError("present_joints is only valid on a neural_decoder window.")
+        sparse_neural_body = name == "body" and present_joints is not None
+        if sparse_neural_body:
+            if not isinstance(present_joints, list) or not present_joints:
+                raise ValueError("present_joints must name at least one joint.")
+            present_joint_names = [str(joint) for joint in present_joints]
+            width = BODY_VALUES_PER_JOINT * len(present_joint_names)
+            if declared_width is not None and int(declared_width) != width:
+                raise ValueError(
+                    f"Stream {name!r} declares {declared_width} values per frame; "
+                    f"{len(present_joint_names)} present joints need {width}."
+                )
+        elif name == "face" and face_encoding == FACE_ENCODING_BASIS:
             # Coefficients: the width is the basis' component count, not the mesh.
             if not declared_width or int(declared_width) <= 0:
                 raise ValueError("A basis-encoded face stream must declare its width.")
@@ -169,6 +235,8 @@ def window_from_payload(payload: dict[str, Any]) -> MotionWindow:
         except Exception as decode_error:  # noqa: BLE001
             raise ValueError(f"Stream {name!r} is not valid base64.") from decode_error
         frames = decode_frames(data, width)
+        if sparse_neural_body:
+            frames = expand_sparse_body_frames(frames, present_joint_names)
         declared_count = raw.get("frame_count")
         if declared_count is not None and int(declared_count) != frames.shape[0]:
             raise ValueError(
@@ -189,7 +257,7 @@ def window_from_payload(payload: dict[str, Any]) -> MotionWindow:
     confidence = payload.get("identity_confidence")
     return MotionWindow(
         landmark_set_version=landmark_set.version,
-        source=str(payload.get("source") or "live_camera"),
+        source=source,
         emotion=str(payload.get("emotion") or "neutral"),
         captured_at=payload.get("captured_at"),
         streams=streams,

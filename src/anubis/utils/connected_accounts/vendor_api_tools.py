@@ -1,6 +1,6 @@
 """Tools over vendor APIs the owner authorised through OAuth.
 
-GitHub, X, Vercel, Google Calendar, Google Analytics, and YouTube each have an
+GitHub, X, Vercel, Google Calendar, Google Analytics, Google Sheets, and YouTube each have an
 official API; the popup sign-in stored a token bundle and this module presents
 a fresh access token (``get_fresh_access_token``) to that API. Every call is a
 small ``httpx`` request; a lapsed token reports ``needs_reconnect`` so the
@@ -24,6 +24,7 @@ VENDOR_API_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "vercel": ("vercel_deployments", "vercel_usage"),
     "google_calendar": ("calendar_events",),
     "google_analytics": ("analytics_traffic_report",),
+    "google_sheets": ("read_google_sheet",),
     "youtube": ("youtube_channel_stats",),
     "coinbase": ("coinbase_accounts", "coinbase_transactions"),
 }
@@ -681,6 +682,84 @@ def build_vendor_api_tools(context: Any, accounts: list[dict[str, Any]], *, stor
             return {"status": "ok", "account_id": account_id, "transactions": transactions}
 
         tools.extend([coinbase_accounts, coinbase_transactions])
+
+    if "google_sheets" in providers_present:
+        select_sheets = _selector(accounts, "google_sheets")
+
+        @tool
+        async def read_google_sheet(
+            spreadsheet_id: str,
+            sheet_title: str | None = None,
+            connection: str | None = None,
+        ) -> dict[str, Any]:
+            """Read a Google Sheet the owner authorised and snapshot it as the reference forecast.
+
+            ``spreadsheet_id`` is the id in the spreadsheet URL. The first sheet
+            is used when ``sheet_title`` is omitted. Numeric columns become
+            reference_forecasts rows so projected_burn can compare to them.
+
+            Args:
+                spreadsheet_id: The spreadsheet id from the Google Sheets URL.
+                sheet_title: Optional tab name.
+                connection: Narrow to one connected Google account.
+            """
+            record, error = select_sheets(connection)
+            if error:
+                return error
+            token, failure = await _bearer(context, store, record)
+            if failure:
+                return failure
+            status_code, metadata = await _get_json(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
+                token,
+                params={"fields": "sheets.properties.title"},
+            )
+            if status_code >= 400:
+                return {
+                    "status": "error",
+                    "status_code": status_code,
+                    "error": str(metadata)[:500],
+                }
+            titles = [
+                (sheet.get("properties") or {}).get("title")
+                for sheet in (metadata or {}).get("sheets") or []
+            ]
+            chosen_title = sheet_title or next((title for title in titles if title), "Sheet1")
+            quoted = quote(str(chosen_title))
+            status_code, document = await _get_json(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quoted}",
+                token,
+            )
+            if status_code >= 400:
+                return {
+                    "status": "error",
+                    "status_code": status_code,
+                    "error": str(document)[:500],
+                }
+            values = (document or {}).get("values") or []
+            from src.anubis.utils.analytics.reference_forecasts import (
+                record_sheet_rows,
+                rows_from_sheet_values,
+            )
+
+            snapshots = rows_from_sheet_values(
+                values, spreadsheet_id=spreadsheet_id, sheet_title=chosen_title
+            )
+            stored = 0
+            if pool is not None and snapshots:
+                stored = await record_sheet_rows(
+                    pool, str(record.get("user_id") or ""), snapshots
+                )
+            return {
+                "status": "ok",
+                "spreadsheet_id": spreadsheet_id,
+                "sheet_title": chosen_title,
+                "values": values[:200],
+                "snapshots": snapshots[:100],
+                "stored": stored,
+            }
+
+        tools.append(read_google_sheet)
 
     if "youtube" in providers_present:
         select_youtube = _selector(accounts, "youtube")

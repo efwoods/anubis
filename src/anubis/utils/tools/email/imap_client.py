@@ -222,6 +222,13 @@ def _normalize_message(
         "thread_id": thread_id or message_uid,
         "sender": _decode_header_value(parsed.get("From")),
         "recipients": _decode_header_value(parsed.get("To")),
+        "cc": _decode_header_value(parsed.get("Cc")),
+        "delivered_to": _decode_header_value(parsed.get("Delivered-To")),
+        "original_to": _decode_header_value(
+            parsed.get("X-Original-To")
+            or parsed.get("X-Forwarded-To")
+            or parsed.get("Envelope-To")
+        ),
         "subject": _decode_header_value(parsed.get("Subject")),
         "sent_at": sent_at,
         "body_text": body_text[:BODY_TEXT_MAX_CHARACTERS],

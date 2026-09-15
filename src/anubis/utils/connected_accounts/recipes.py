@@ -150,6 +150,85 @@ def parse_text_numbers(text: Any, variables: dict[str, Any]) -> list[dict[str, A
     return rows[:20]
 
 
+def parse_elevenlabs_usage(document: Any, variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse ElevenLabs subscription or character-usage documents."""
+    rows: list[dict[str, Any]] = []
+    today = datetime.now(UTC).date().isoformat()
+    payload = document if isinstance(document, dict) else {}
+    character_count = _number(
+        payload.get("character_count")
+        or payload.get("characters_used")
+        or (payload.get("subscription") or {}).get("character_count")
+    )
+    character_limit = _number(
+        payload.get("character_limit")
+        or (payload.get("subscription") or {}).get("character_limit")
+    )
+    if character_count is not None:
+        rows.append({"day": today, "metric": "characters", "value": character_count, "unit": "count"})
+    if character_limit is not None:
+        rows.append({"day": today, "metric": "character_limit", "value": character_limit, "unit": "count"})
+    cost = _number(payload.get("cost_usd") or payload.get("amount"))
+    if cost is not None:
+        rows.append({"day": today, "metric": "cost", "value": cost, "unit": "usd"})
+    return rows
+
+
+def parse_xai_billing(document: Any, variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse an xAI billing JSON document into daily cost rows."""
+    payload = document if isinstance(document, dict) else {}
+    buckets = payload.get("data") or payload.get("usage") or payload.get("items") or []
+    if isinstance(buckets, list) and buckets:
+        return _rows_from_daily_buckets(
+            buckets,
+            day_key="date",
+            metrics={"cost": ("cost", "usd"), "amount": ("cost", "usd"), "total": ("cost", "usd")},
+        )
+    return parse_text_numbers(document, variables)
+
+
+def parse_cursor_spending(document: Any, variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse Cursor spending or usage JSON into subscription and usage rows."""
+    payload = document if isinstance(document, dict) else {}
+    today = datetime.now(UTC).date().isoformat()
+    rows: list[dict[str, Any]] = []
+    subscription = _number(
+        payload.get("subscription")
+        or payload.get("plan_amount")
+        or payload.get("monthly_plan_usd")
+    )
+    if subscription is not None:
+        rows.append({"day": today, "metric": "subscription", "value": subscription, "unit": "usd"})
+    usage = _number(payload.get("on_demand_spend") or payload.get("usage_usd") or payload.get("overage"))
+    if usage is not None:
+        rows.append({"day": today, "metric": "cost", "value": usage, "unit": "usd"})
+    included = _number(payload.get("included_tokens") or payload.get("included"))
+    if included is not None:
+        rows.append({"day": today, "metric": "included_tokens", "value": included, "unit": "tokens"})
+    used = _number(payload.get("used_tokens") or payload.get("tokens"))
+    if used is not None:
+        rows.append({"day": today, "metric": "usage", "value": used, "unit": "tokens"})
+    if rows:
+        return rows
+    return parse_text_numbers(document, variables)
+
+
+def parse_claude_app_usage(document: Any, variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse Claude.ai settings usage into subscription and token rows."""
+    payload = document if isinstance(document, dict) else {}
+    today = datetime.now(UTC).date().isoformat()
+    rows: list[dict[str, Any]] = []
+    subscription = _number(payload.get("plan_cost") or payload.get("subscription"))
+    if subscription is not None:
+        rows.append({"day": today, "metric": "subscription", "value": subscription, "unit": "usd"})
+    tokens = _number(payload.get("tokens") or payload.get("used_tokens"))
+    if tokens is not None:
+        rows.append({"day": today, "metric": "usage", "value": tokens, "unit": "tokens"})
+    if rows:
+        return rows
+    return parse_text_numbers(document, variables)
+
+
 RECIPES: dict[str, dict[str, Recipe]] = {
     "openai": {
         "costs": Recipe(
@@ -165,9 +244,12 @@ RECIPES: dict[str, dict[str, Recipe]] = {
         "usage_page": Recipe(
             name="usage_page",
             kind=RECIPE_KIND_DOM,
-            url_template="https://platform.openai.com/usage",
+            url_template=(
+                "https://platform.openai.com/settings/organization/usage"
+                "?usage_section=spend-categories"
+            ),
             parser=parse_text_numbers,
-            description="Amounts shown on the usage page (fallback).",
+            description="Amounts shown on the spend-categories usage page (fallback).",
         ),
     },
     "anthropic": {
@@ -206,6 +288,63 @@ RECIPES: dict[str, dict[str, Recipe]] = {
             url_template="https://smith.langchain.com/settings/usage",
             parser=parse_text_numbers,
             description="Amounts shown on the usage page (fallback).",
+        ),
+    },
+    "elevenlabs": {
+        "subscription": Recipe(
+            name="subscription",
+            kind=RECIPE_KIND_JSON,
+            url_template="https://api.elevenlabs.io/v1/user/subscription",
+            parser=parse_elevenlabs_usage,
+            description="Character usage and plan limits for the workspace.",
+        ),
+        "usage_page": Recipe(
+            name="usage_page",
+            kind=RECIPE_KIND_DOM,
+            url_template="https://elevenlabs.io/app/developers/analytics/usage",
+            parser=parse_text_numbers,
+            description="Amounts shown on the ElevenLabs analytics page.",
+        ),
+    },
+    "xai": {
+        "billing": Recipe(
+            name="billing",
+            kind=RECIPE_KIND_JSON,
+            url_template="https://api.x.ai/v1/usage",
+            parser=parse_xai_billing,
+            description="Usage and billing for the xAI team, when the key can reach it.",
+        ),
+        "usage_page": Recipe(
+            name="usage_page",
+            kind=RECIPE_KIND_DOM,
+            url_template="https://console.x.ai/team/1db9c97a-09ce-4be7-bca1-f0fb9e59ec18/settings/billing",
+            parser=parse_text_numbers,
+            description="Amounts shown on the xAI billing page.",
+        ),
+    },
+    "cursor": {
+        "spending": Recipe(
+            name="spending",
+            kind=RECIPE_KIND_DOM,
+            url_template="https://cursor.com/dashboard/spending",
+            parser=parse_text_numbers,
+            description="Monthly plan and overage shown on the Cursor spending page.",
+        ),
+        "usage": Recipe(
+            name="usage",
+            kind=RECIPE_KIND_DOM,
+            url_template="https://cursor.com/dashboard/usage",
+            parser=parse_text_numbers,
+            description="Included and used tokens shown on the Cursor usage page.",
+        ),
+    },
+    "claude_app": {
+        "usage_page": Recipe(
+            name="usage_page",
+            kind=RECIPE_KIND_DOM,
+            url_template="https://claude.ai/settings/usage",
+            parser=parse_claude_app_usage,
+            description="Claude.ai subscription usage (not the Anthropic API console).",
         ),
     },
 }

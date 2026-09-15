@@ -33,6 +33,7 @@ from src.anubis.utils.connected_accounts.providers import (
     MECHANISM_OAUTH,
     MECHANISM_PASSWORD,
     MECHANISM_PLAID_LINK,
+    MECHANISM_PHONE_VERIFY,
     MECHANISM_SITE_DISCOVERY,
     MECHANISM_URL_ONLY,
     ConnectedAccountProvider,
@@ -113,6 +114,39 @@ class ConnectNeedsLogin(Exception):
             "login_mode": self.login_mode,
             "login_endpoint": self.login_endpoint,
             "login_request": self.login_request,
+            "message": self.message,
+            "card": card,
+        }
+
+
+class ConnectNeedsCode(Exception):
+    """The Phone connection sent a confirmation code and is waiting for it."""
+
+    def __init__(
+        self,
+        provider: ConnectedAccountProvider,
+        *,
+        owner_mobile_e164: str,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.owner_mobile_e164 = owner_mobile_e164
+        self.message = message
+
+    def as_response(self) -> dict[str, Any]:
+        """Return the JSON body the route answers with."""
+        from src.anubis.utils.connected_accounts.connection_tools import (
+            build_connect_card,
+        )
+
+        card = build_connect_card(self.provider)
+        card["awaiting_verification_code"] = True
+        card["owner_mobile_e164"] = self.owner_mobile_e164
+        return {
+            "connected": False,
+            "action": "enter_verification_code",
+            "owner_mobile_e164": self.owner_mobile_e164,
             "message": self.message,
             "card": card,
         }
@@ -745,6 +779,78 @@ async def connect_website(request: ConnectRequest) -> dict[str, Any]:
     )
 
 
+async def connect_phone_account(request: ConnectRequest) -> dict[str, Any]:
+    """Verify the mobile the owner already has. Never write a per-user DID."""
+    from src.anubis.utils.phone.enterprise import (
+        PrivateNumberRefused,
+        refuse_private_number_unless_enterprise,
+        wants_private_number,
+    )
+    from src.anubis.utils.phone.numbers import PhoneNumberError, normalize_e164
+    from src.anubis.utils.phone.verify import (
+        check_verification_code,
+        issue_verification_code,
+        send_verification_sms,
+    )
+
+    if wants_private_number(request.fields):
+        try:
+            refuse_private_number_unless_enterprise(
+                request.fields.get("subscription_tier")
+            )
+        except PrivateNumberRefused as refused:
+            raise ConnectRefused(refused.status_code, refused.detail) from refused
+        raise ConnectRefused(
+            501,
+            "A dedicated inbound number is not available yet. "
+            "Verify the mobile you already have and call the shared platform number.",
+        )
+
+    raw_number = request.text("phone_number") or request.text("owner_mobile_e164")
+    try:
+        owner_mobile = normalize_e164(raw_number)
+    except PhoneNumberError as number_error:
+        raise ConnectRefused(400, str(number_error)) from number_error
+
+    code = request.text("verification_code") or request.text("code")
+    if not code:
+        issued = issue_verification_code(owner_mobile)
+        try:
+            await send_verification_sms(owner_mobile, issued, request.context)
+        except PhoneNumberError as send_error:
+            raise ConnectRefused(503, str(send_error)) from send_error
+        raise ConnectNeedsCode(
+            request.provider,
+            owner_mobile_e164=owner_mobile,
+            message=(
+                "A confirmation code was sent to that mobile. "
+                "Enter the code to finish connecting. No new number is assigned."
+            ),
+        )
+
+    if not check_verification_code(owner_mobile, code):
+        raise ConnectRefused(
+            400, "That confirmation code is wrong or has expired. Request a new one."
+        )
+
+    label = deduplicate_label(
+        derive_display_label(owner_mobile),
+        request.existing_records,
+        account_key(request.provider.name, owner_mobile),
+    )
+    return build_account_record(
+        provider=request.provider,
+        account_address=owner_mobile,
+        display_label=label,
+        encrypted_secret=None,
+        assistant_id=request.assistant_id,
+        transport={
+            "owner_mobile_e164": owner_mobile,
+            "sip_enabled": True,
+        },
+    )
+
+
 async def _refuse_device_pairing(request: ConnectRequest) -> dict[str, Any]:
     """Devices connect themselves; the card carries the instructions."""
     raise ConnectRefused(
@@ -759,6 +865,7 @@ CONNECT_HANDLERS: dict[str, ConnectHandler] = {
     MECHANISM_MCP_URL: connect_mcp_server_account,
     MECHANISM_URL_ONLY: connect_website,
     MECHANISM_API_KEY: connect_api_key_account,
+    MECHANISM_PHONE_VERIFY: connect_phone_account,
     MECHANISM_SITE_DISCOVERY: connect_site_by_discovery,
     MECHANISM_OAUTH: _needs_popup_login,
     MECHANISM_PLAID_LINK: _needs_popup_login,

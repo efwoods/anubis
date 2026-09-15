@@ -764,11 +764,14 @@ still does not supply.
    notification banners, the visible line of a chat, a visible time or date.
    Name the application or the website when the application or the website is
    identifiable.
-3. For a webcam still: posture, gaze direction (toward the screen, away, at the
-   camera), what the hands are doing, whether the person is speaking or on a
-   call, other people or pets, and the room. Never guess identity, age, health,
-   or mood beyond what is visible; "appears focused" is acceptable, a diagnosis
-   is not.
+3. For a webcam still: name the face and the body first when either has
+   changed — a tongue out, nostrils shown, something in the mouth, a hand at
+   the face, a grimace, a laugh, a pose held toward the camera — then posture,
+   gaze direction (toward the screen, away, at the camera), what the hands are
+   doing, whether the person is speaking or on a call, other people or pets,
+   and the room. Never guess identity, age, health, or mood beyond what is
+   visible; "appears focused" is acceptable, a diagnosis is not. Do not let
+   shelves, bins, headphones, or hair crowd out a gag aimed at the camera.
 4. Tone: neutral third person, present tense, at most 120 words. Make no
    mention that this is an image, a still, a screenshot, or a webcam frame.
 5. Single-turn completion: deliver the description in one reply. Do not ask

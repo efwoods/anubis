@@ -13,6 +13,7 @@ def test_ambient_settings_have_defaults_and_read_the_environment(monkeypatch):
         "AMBIENT_NOTIFY_SALIENCE_FLOOR",
         "AMBIENT_RESPOND_COOLDOWN_SECONDS",
         "AMBIENT_RESPOND_COOLDOWN_OVERRIDE_SALIENCE",
+        "AMBIENT_PLAYFUL_RESPOND_COOLDOWN_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
     defaults = GlobalContext()
@@ -24,6 +25,7 @@ def test_ambient_settings_have_defaults_and_read_the_environment(monkeypatch):
     assert defaults.ambient_notify_salience_floor == 0.70
     assert defaults.ambient_respond_cooldown_seconds == 300.0
     assert defaults.ambient_respond_cooldown_override_salience == 0.90
+    assert defaults.ambient_playful_respond_cooldown_seconds == 6.0
 
     monkeypatch.setenv("AMBIENT_CAPTURE_ENABLED", "false")
     monkeypatch.setenv("AMBIENT_CAPTURE_MIN_INTERVAL_SECONDS", "5")
@@ -33,6 +35,7 @@ def test_ambient_settings_have_defaults_and_read_the_environment(monkeypatch):
     monkeypatch.setenv("AMBIENT_NOTIFY_SALIENCE_FLOOR", "0.9")
     monkeypatch.setenv("AMBIENT_RESPOND_COOLDOWN_SECONDS", "60")
     monkeypatch.setenv("AMBIENT_RESPOND_COOLDOWN_OVERRIDE_SALIENCE", "0.99")
+    monkeypatch.setenv("AMBIENT_PLAYFUL_RESPOND_COOLDOWN_SECONDS", "4")
     configured = GlobalContext()
     assert configured.ambient_capture_enabled == "false"
     assert configured.ambient_capture_min_interval_seconds == 5.0
@@ -42,3 +45,4 @@ def test_ambient_settings_have_defaults_and_read_the_environment(monkeypatch):
     assert configured.ambient_notify_salience_floor == 0.9
     assert configured.ambient_respond_cooldown_seconds == 60.0
     assert configured.ambient_respond_cooldown_override_salience == 0.99
+    assert configured.ambient_playful_respond_cooldown_seconds == 4.0

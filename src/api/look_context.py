@@ -52,6 +52,11 @@ class LookContext:
     #: ``""`` for a client that cannot narrate. Kept raw for the same reason
     #: as the share fields: it is what the configurable carries.
     scene_narration: str = ""
+    #: Whether a Mineflayer body is live this turn (``true`` / ``""``). Kept
+    #: raw so a ``look_now`` resume can rebuild ``act_in_minecraft``.
+    minecraft_body: str = ""
+    #: The world snapshot the companion sent with the paused turn.
+    minecraft_world: str = ""
 
     def says_anything(self) -> bool:
         """Whether this context reports any way for the avatar to see."""
@@ -60,6 +65,8 @@ class LookContext:
             or (self.peekable_shares or "").strip()
             or self.may_control_shares
             or (self.scene_narration or "").strip()
+            or (self.minecraft_body or "").strip()
+            or (self.minecraft_world or "").strip()
         )
 
 

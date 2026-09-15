@@ -70,6 +70,7 @@ from langgraph.runtime import Runtime
 
 from src.anubis.utils.ambient.observations import ambient_details
 from src.anubis.utils.ambient.observations import mark_view_currency
+from src.anubis.utils.ambient.observations import message_text
 from src.anubis.utils.client_harvest_turns import without_stale_client_harvest_turns
 from src.anubis.utils.tools.vision.look_tools import normalize_live_shares
 from src.anubis.utils.ambient.triage_node import (
@@ -93,7 +94,11 @@ from src.anubis.utils.emotion_mapping import EMOTION_MAPPING
 from src.anubis.utils.huggingface_prefetch import (
     ensure_huggingface_models_cached,
 )
-from src.anubis.utils.model import STRUCTURED_OUTPUT_STREAM_TAG, init_model
+from src.anubis.utils.model import (
+    STRUCTURED_OUTPUT_STREAM_TAG,
+    hosted_inference_input_token_limit,
+    init_model,
+)
 from src.anubis.utils.nltk_prefetch import ensure_nltk_corpora_cached
 from src.anubis.utils.nodes import (
     join_user_observation,
@@ -830,9 +835,9 @@ async def refuse_for_violation(
     """
     context = runtime.context or GlobalContext()
     verdict = dict((state.get("moderation_response") or {}).get("verdict") or {})
-    appeal_contact = (
-        getattr(context, "ban_appeal_contact_email", None) or "contact@neuralnexus.site"
-    )
+    from src.anubis.utils.inbox.appeals import appeal_contact_phrase
+
+    appeal_contact = appeal_contact_phrase(context)
     refusal_text = MODERATION_REFUSAL_TEXT.format(appeal_contact=appeal_contact)
     try:
         writer = get_stream_writer()
@@ -1023,76 +1028,76 @@ async def _stream_deep_agent(
     final_output: dict[str, Any] | None = None
 
     async for event in deep_agent.astream_events(
-        agent_input,
-        config=deep_agent_config,
-        context=context,
-        version="v2",
-    ):
-        ev_name = event.get("event")
-        if ev_name == "on_chat_model_stream":
-            # Skip internal structured-output calls (e.g. the per-document fact-correction
-            # ``ProposedFactEdit`` analyses, run concurrently inside tools). Their tokens are
-            # raw JSON, not a reply — streaming them leaks interleaved JSON into the chat.
-            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
-                continue
-            run_id = event.get("run_id")
-            chunk = event["data"].get("chunk")
-            if chunk is None or run_id is None:
-                continue
-            buf = stream_buffers.setdefault(
-                run_id, {"merged": None, "streamed_text": False}
-            )
-            merged_prev = buf["merged"]
-            buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
-            if not (getattr(buf["merged"], "tool_calls", None) or []):
-                delta = chunk.content
-                if isinstance(delta, str) and delta:
-                    writer({"type": "assistant_token", "text": delta})
-                    buf["streamed_text"] = True
-        elif ev_name == "on_chat_model_end":
-            stream_buffers.pop(event.get("run_id"), None)
-        elif ev_name == "on_tool_start":
-            # Say what the avatar is doing. A data-analysis turn spends most of
-            # its wall-clock time inside tools and streams no reply token until
-            # the analysis is done; without these frames the client can only
-            # show a generic "thinking" indicator for the whole stretch.
-            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
-                continue
-            tool_name = event.get("name") or ""
-            _tool_call_timer.start(event.get("run_id"))
-            writer(
-                {
-                    "type": "status",
-                    "text": _describe_tool_activity(
-                        tool_name, (event.get("data") or {}).get("input")
-                    ),
-                    "tool": tool_name,
-                }
-            )
-        elif ev_name == "on_tool_end":
-            if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
-                continue
-            _record_tool_call_event(
-                event, deep_agent_config, status="success",
-                duration_ms=_tool_call_timer.finish(event.get("run_id")),
-            )
-            writer(
-                {
-                    "type": "status",
-                    "text": _TOOL_FINISHED_ACTIVITY,
-                    "tool": event.get("name") or "",
-                }
-            )
-        elif ev_name == "on_tool_error":
-            _record_tool_call_event(
-                event, deep_agent_config, status="error",
-                duration_ms=_tool_call_timer.finish(event.get("run_id")),
-            )
-        elif ev_name == "on_chain_end":
-            data = event.get("data") or {}
-            output = data.get("output")
-            if isinstance(output, dict) and "messages" in output:
-                final_output = output
+            agent_input,
+            config=deep_agent_config,
+            context=context,
+            version="v2",
+        ):
+            ev_name = event.get("event")
+            if ev_name == "on_chat_model_stream":
+                # Skip internal structured-output calls (e.g. the per-document fact-correction
+                # ``ProposedFactEdit`` analyses, run concurrently inside tools). Their tokens are
+                # raw JSON, not a reply — streaming them leaks interleaved JSON into the chat.
+                if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                    continue
+                run_id = event.get("run_id")
+                chunk = event["data"].get("chunk")
+                if chunk is None or run_id is None:
+                    continue
+                buf = stream_buffers.setdefault(
+                    run_id, {"merged": None, "streamed_text": False}
+                )
+                merged_prev = buf["merged"]
+                buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
+                if not (getattr(buf["merged"], "tool_calls", None) or []):
+                    delta = chunk.content
+                    if isinstance(delta, str) and delta:
+                        writer({"type": "assistant_token", "text": delta})
+                        buf["streamed_text"] = True
+            elif ev_name == "on_chat_model_end":
+                stream_buffers.pop(event.get("run_id"), None)
+            elif ev_name == "on_tool_start":
+                # Say what the avatar is doing. A data-analysis turn spends most of
+                # its wall-clock time inside tools and streams no reply token until
+                # the analysis is done; without these frames the client can only
+                # show a generic "thinking" indicator for the whole stretch.
+                if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                    continue
+                tool_name = event.get("name") or ""
+                _tool_call_timer.start(event.get("run_id"))
+                writer(
+                    {
+                        "type": "status",
+                        "text": _describe_tool_activity(
+                            tool_name, (event.get("data") or {}).get("input")
+                        ),
+                        "tool": tool_name,
+                    }
+                )
+            elif ev_name == "on_tool_end":
+                if STRUCTURED_OUTPUT_STREAM_TAG in (event.get("tags") or []):
+                    continue
+                _record_tool_call_event(
+                    event, deep_agent_config, status="success",
+                    duration_ms=_tool_call_timer.finish(event.get("run_id")),
+                )
+                writer(
+                    {
+                        "type": "status",
+                        "text": _TOOL_FINISHED_ACTIVITY,
+                        "tool": event.get("name") or "",
+                    }
+                )
+            elif ev_name == "on_tool_error":
+                _record_tool_call_event(
+                    event, deep_agent_config, status="error",
+                    duration_ms=_tool_call_timer.finish(event.get("run_id")),
+                )
+            elif ev_name == "on_chain_end":
+                data = event.get("data") or {}
+                output = data.get("output")
+                if isinstance(output, dict) and "messages" in output:
+                    final_output = output
 
     return final_output
 
@@ -1295,6 +1300,7 @@ async def think(
         from src.anubis.utils.connected_accounts import bound_accounts_for
         from src.anubis.utils.connected_accounts.connection_tools import (
             build_connection_tools,
+            should_offer_connection_tools,
         )
         from src.anubis.utils.connected_accounts.tool_factories import (
             build_tools_for_accounts,
@@ -1386,18 +1392,45 @@ async def think(
                     assistant_id=answering_assistant_id,
                 ),
             ]
-        # Offered whether or not anything is connected. The owner with no mailbox
-        # is precisely the owner who needs to connect one, so gating the connect
-        # tool on having a connection would leave no way in.
-        connection_tools = build_connection_tools(
-            runtime.context,
-            store=runtime.store,
-            user_id=owner_user_id,
-            assistant_id=answering_assistant_id,
-            connected_accounts=connected_accounts,
-            stale_accounts=stale_accounts,
-            allow_interrupt=not scheduled_run,
-        )
+        # Offered when this turn asked to connect or use an account. Gating on
+        # having a connection would leave no way in; gating on the last human
+        # message keeps Llama 3.2 11B from raising Gmail on "How can you help me?"
+        if should_offer_connection_tools(
+            state.get("messages") or [],
+            context=runtime.context,
+        ):
+            connection_tools = build_connection_tools(
+                runtime.context,
+                store=runtime.store,
+                user_id=owner_user_id,
+                assistant_id=answering_assistant_id,
+                connected_accounts=connected_accounts,
+                stale_accounts=stale_accounts,
+                allow_interrupt=not scheduled_run,
+            )
+            try:
+                from src.anubis.utils.analytics.platform_metrics import is_platform_admin
+                from src.anubis.utils.connected_accounts.computer_tools import (
+                    build_computer_tools,
+                )
+
+                connection_tools = [
+                    *connection_tools,
+                    *build_computer_tools(
+                        runtime.context,
+                        store=runtime.store,
+                        pool=get_postgres_pool(),
+                        user_id=owner_user_id,
+                        assistant_id=answering_assistant_id,
+                        connected_accounts=connected_accounts,
+                        allow_interrupt=not scheduled_run,
+                        is_admin=is_platform_admin(
+                            runtime.context, connected_accounts, owner_user_id
+                        ),
+                    ),
+                ]
+            except Exception:
+                logger.exception("Could not build the agent-computer tools; skipping")
 
     # Making a plan: finding a real, named place to go. Gated on ownership, not
     # on the personal-avatar flag and not on any connection — the owner asking an
@@ -1423,15 +1456,23 @@ async def think(
     if _user_owns_avatar(config, state):
         from src.anubis.utils.tools.identity.identity_media_tools import (
             build_identity_media_tools,
+            should_offer_identity_media_update,
         )
+        from src.api.chat_attachments import describe_turn_attachments
 
-        identity_media_tools = build_identity_media_tools(
-            deep_agent_run_context,
-            user_id=state["user_state"]["user_id"],
-            assistant_id=state["assistant_state"]["assistant_id"],
-            assistant_ctx=dict(config.get("configurable", {}).get("assistant_ctx") or {}),
-            thread_id=outer_thread,
-        )
+        attached = describe_turn_attachments(outer_thread)
+        if should_offer_identity_media_update(
+            state.get("messages") or [], attached
+        ):
+            identity_media_tools = build_identity_media_tools(
+                deep_agent_run_context,
+                user_id=state["user_state"]["user_id"],
+                assistant_id=state["assistant_state"]["assistant_id"],
+                assistant_ctx=dict(
+                    config.get("configurable", {}).get("assistant_ctx") or {}
+                ),
+                thread_id=outer_thread,
+            )
 
     # Fresh-look gate: the browser reported a live webcam or screen share on
     # THIS turn. No environment switch and no avatar gate — a share is the gate,
@@ -1444,7 +1485,10 @@ async def think(
         is_ambient_observation,
         is_speech_observation,
     )
-    from src.anubis.utils.tools.vision.look_tools import build_look_tools
+    from src.anubis.utils.tools.vision.look_tools import (
+        build_look_tools,
+        should_offer_look_now,
+    )
 
     # An ambient observation IS a fresh look — the frame that started this turn
     # was captured seconds ago — so an observation turn is not offered another
@@ -1459,7 +1503,9 @@ async def think(
     # not offered at all and the avatar answers from the observations it has.
     look_tools = (
         []
-        if answering_an_observation or checkpointer is None
+        if answering_an_observation
+        or checkpointer is None
+        or not should_offer_look_now(state.get("messages") or [])
         else build_look_tools(
             runtime.context,
             live_shares=(config.get("configurable", {}) or {}).get("live_shares"),
@@ -1511,6 +1557,45 @@ async def think(
         )
     )
 
+    # A Mineflayer body standing in Java Edition. Attached only when this
+    # turn reported ``minecraft_body`` and the deployment allows it. An
+    # ambient observation is a look, not a play turn, so the tool stays off.
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        build_minecraft_body_tools,
+    )
+
+    minecraft_body_tools = (
+        []
+        if answering_an_observation
+        else build_minecraft_body_tools(
+            runtime.context,
+            minecraft_body=(config.get("configurable", {}) or {}).get(
+                "minecraft_body"
+            ),
+            minecraft_world=(config.get("configurable", {}) or {}).get(
+                "minecraft_world"
+            ),
+        )
+    )
+
+    # Place lookup and travel belong to the personal avatar itself. They do
+    # not need a Phone connection and they never call a mobile MCP tool.
+    personal_avatar_place_tools: list[Any] = []
+    if is_personal_avatar:
+        try:
+            from src.anubis.utils.phone.tools import (
+                build_personal_avatar_place_tools,
+            )
+
+            personal_avatar_place_tools = build_personal_avatar_place_tools(
+                runtime.context,
+                store=runtime.store,
+                user_id=state["user_state"]["user_id"],
+                assistant_id=state["assistant_state"]["assistant_id"],
+            )
+        except Exception:
+            logger.exception("Could not build personal-avatar place tools; skipping")
+
     extra_tools = [
         *(analysis_extra_tools or []),
         *browser_toolkit_tools,
@@ -1518,9 +1603,35 @@ async def think(
         *connection_tools,
         *identity_media_tools,
         *place_tools,
+        *personal_avatar_place_tools,
         *look_tools,
         *scene_narration_tools,
+        *minecraft_body_tools,
     ]
+    from src.anubis.utils.context_compression import extra_tools_within_inference_window
+    from src.anubis.utils.deep_agent import IDENTITY_TOOLS
+    from src.anubis.utils.tools.consciousness import load_consciousness_tool
+
+    context = runtime.context
+    window = hosted_inference_input_token_limit(context)
+    system_messages = state.get("system_message") or []
+    latest_system = system_messages[-1] if system_messages else None
+    system_text = ""
+    if latest_system is not None:
+        system_content = getattr(latest_system, "content", "")
+        system_text = (
+            system_content
+            if isinstance(system_content, str)
+            else str(system_content or "")
+        )
+    core_tools = [*IDENTITY_TOOLS, load_consciousness_tool]
+    extra_tools = extra_tools_within_inference_window(
+        extra_tools,
+        core_tools=core_tools,
+        system_text=system_text,
+        messages=state.get("messages") or [],
+        window=window,
+    )
     deep_agent = build_avatar_deep_agent(
         runtime.context,
         checkpointer=checkpointer,
@@ -1623,6 +1734,23 @@ async def _attach_post_reply_analysis(
         # does not block the event loop between the streamed reply and the terminal
         # ``done`` SSE frame (which is gated behind this whole block).
         await asyncio.to_thread(_attach_go_emotions_metadata, final_message)
+        from src.anubis.utils.ambient.playful_reactions import (
+            apply_playful_reaction_sentiment,
+        )
+
+        latest_human_text = ""
+        thread_messages = list(state.get("messages") or [])
+        for message in reversed(thread_messages):
+            if isinstance(message, HumanMessage):
+                latest_human_text = message_text(message)
+                break
+        apply_playful_reaction_sentiment(
+            final_message,
+            ambient=_latest_ambient_observation(thread_messages),
+            typed_text=latest_human_text,
+            thread_id=str((config.get("configurable") or {}).get("thread_id") or "")
+            or None,
+        )
         _attach_token_usage_metadata(
             final_message, new_messages, context=runtime.context or GlobalContext()
         )
@@ -1638,6 +1766,10 @@ async def _attach_post_reply_analysis(
     if isinstance(final_message, AIMessage) and ambient_record is not None:
         final_message.response_metadata = dict(final_message.response_metadata or {})
         final_message.response_metadata["ambient"] = ambient_record
+    if isinstance(final_message, AIMessage):
+        from src.anubis.utils.learning.fact_learned import attach_learned_facts_metadata
+
+        attach_learned_facts_metadata(final_message, state.get("messages") or [])
     # Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata.
     if config.get("configurable", {}).get("include_quality_metrics", False):

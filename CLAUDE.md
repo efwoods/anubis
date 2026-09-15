@@ -298,3 +298,23 @@ when adding environment variables, include the environment variable in the .env.
 3. increase the quality of the prompt that instructs the model and uses that data from working memory and consciousness
 4. increase the size of the base model used for inference
 5. increase the quality of the adapters that are attached to the basemodel
+
+
+
+# Global guidance
+
+## Naming
+
+Name every subject. Do not use the pronoun "it" or other stand-in words in
+identifiers, comments, docstrings, commit messages, or prompt text.
+
+- Spell identifiers out fully so the name documents the meaning: write
+  `deep_agent_config`, not `da_config`; `configuration`, not `cfg`;
+  `response`, not `resp`. Standard loop indices (`i`, `j`) are allowed.
+- Do not use acronyms or ad-hoc abbreviations.
+- Do not replace a named subject with: it, its, itself, this, that, these,
+  those, they, them, their, the former, the latter, the value, the result,
+  the thing. Repeat the noun every time (`upload_payload`,
+  `transcript_document`, `GlobalContext`).
+- The explicit-naming rule applies to Anubis prompt text (`system_prompts.py`)
+  as well: instructions to a model must name the subject on every reference.

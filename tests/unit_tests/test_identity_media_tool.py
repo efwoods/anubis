@@ -179,6 +179,120 @@ async def test_a_starter_failure_becomes_a_status_not_an_exception():
     assert result == {"status": "error", "detail": "boom"}
 
 
+def test_a_described_image_without_learn_intent_does_not_offer_the_tool():
+    from langchain_core.messages import HumanMessage
+
+    from src.anubis.utils.tools.identity.identity_media_tools import (
+        should_offer_identity_media_update,
+    )
+
+    describe = HumanMessage(
+        content=(
+            "Please describe this image\n\n"
+            "---\nImage descriptions:\n[logo.png]\nA black Neural Nexus mark."
+        )
+    )
+    assert should_offer_identity_media_update([describe]) is False
+    learn = HumanMessage(
+        content=(
+            "This is you. Learn from this.\n\n"
+            "---\nImage descriptions:\n[me.png]\nA portrait."
+        )
+    )
+    assert should_offer_identity_media_update([learn]) is True
+    assert should_offer_identity_media_update(
+        [HumanMessage(content="hey mom")]
+    ) is True
+    assert should_offer_identity_media_update(
+        [HumanMessage(content="Please describe this image")]
+    ) is False
+    assert should_offer_identity_media_update(
+        [HumanMessage(content="here")],
+        [{"filename": "logo.png", "mime_type": "image/png", "size_bytes": 4}],
+    ) is False
+    assert should_offer_identity_media_update(
+        [HumanMessage(content="this is you")],
+        [{"filename": "me.png", "mime_type": "image/png", "size_bytes": 4}],
+    ) is True
+
+
+def test_a_described_image_to_look_at_must_be_answered_in_text():
+    from langchain_core.messages import HumanMessage
+
+    from src.anubis.utils.tools.identity.identity_media_tools import (
+        should_answer_from_described_image,
+    )
+
+    describe = HumanMessage(
+        content=(
+            "Please describe this image\n\n"
+            "[Image: neuralink-wireframe.PNG]\n\n"
+            "---\nImage descriptions:\n[neuralink-wireframe.PNG]\nA wireframe."
+        )
+    )
+    assert should_answer_from_described_image([describe]) is True
+    learn = HumanMessage(
+        content="This is you. Learn from this.\n\n---\nImage descriptions:\n[me.png]\nA portrait."
+    )
+    assert should_answer_from_described_image([learn]) is False
+    assert should_answer_from_described_image(
+        [HumanMessage(content="hey mom")]
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_the_tool_runs_the_starter_only_once_per_turn():
+    starter = _Starter()
+    runtime_handles.set_identity_media_job_starter(starter)
+    remember_turn_attachments(THREAD_ID, [PORTRAIT], CURRENT_USER)
+    tool = _tool()
+    first = await tool.ainvoke({})
+    second = await tool.ainvoke({})
+    assert first["status"] == "started"
+    assert "Do not call this tool again" in second["detail"]
+    assert len(starter.calls) == 1
+
+
+def test_capability_questions_keep_tools_on_every_model():
+    from types import SimpleNamespace
+
+    from langchain_core.messages import HumanMessage
+
+    from src.anubis.utils.middleware.identity_media_once import (
+        should_answer_in_words_only,
+    )
+
+    eleven_b = SimpleNamespace(model="meta/llama-3.2-11b-vision-instruct")
+    luna = SimpleNamespace(model="gpt-5.6-luna")
+    ninety_b = SimpleNamespace(model="meta/llama-3.2-90b-vision-instruct")
+
+    for context in (eleven_b, luna, ninety_b):
+        assert should_answer_in_words_only(
+            [HumanMessage(content="How can you help me?")],
+            context=context,
+        ) is False
+        assert should_answer_in_words_only(
+            [HumanMessage(content="hey mom")],
+            context=context,
+        ) is False
+
+
+def test_identity_media_once_detects_a_closed_tool_message():
+    from langchain_core.messages import ToolMessage
+
+    from src.anubis.utils.middleware.identity_media_once import (
+        identity_media_tool_already_returned,
+    )
+    from src.anubis.utils.tools.identity.identity_media_tools import (
+        IDENTITY_MEDIA_TOOL_NAME,
+    )
+
+    assert identity_media_tool_already_returned([]) is False
+    assert identity_media_tool_already_returned(
+        [ToolMessage(content="{}", tool_call_id="c1", name=IDENTITY_MEDIA_TOOL_NAME)]
+    ) is True
+
+
 # --------------------------------------------------------------------------- starter
 
 

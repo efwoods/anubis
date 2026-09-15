@@ -59,6 +59,20 @@ logger = logging.getLogger(__name__)
 # run as paused rather than guessing at a form.
 CONNECT_ACCOUNT_INTERRUPT_KIND = "connect_account"
 
+def should_offer_connection_tools(
+    messages: list[Any] | None,
+    *,
+    context: Any | None = None,
+) -> bool:
+    """Whether this turn may attach ``connect_account``.
+
+    Every inference model receives the same tools. The connect-on-request
+    prompt and the tool description keep a generic question from raising a
+    card; the catalog is not withheld from any model.
+    """
+    return True
+
+
 # Kept for callers that imported the old constant; the endpoint a card posts to
 # now comes from the provider row (``connect_endpoint``).
 CONNECT_MAILBOX_ENDPOINT = "/connect_mailbox"
@@ -241,6 +255,7 @@ def build_connection_tools(
     ) -> tuple[dict[str, Any] | None, Any | None]:
         """Prove and store a connection that needs no popup; return (record, needs_login)."""
         from src.anubis.utils.connected_accounts.connect_handlers import (
+            ConnectNeedsCode,
             ConnectNeedsLogin,
             ConnectRefused,
             ConnectRequest,
@@ -266,6 +281,8 @@ def build_connection_tools(
             )
         except ConnectNeedsLogin as needs_login:
             return None, needs_login
+        except ConnectNeedsCode as needs_code:
+            return None, needs_code
         except ConnectRefused:
             raise
         record["user_id"] = user_id
@@ -280,26 +297,37 @@ def build_connection_tools(
 
     @tool
     async def connect_account(
-        provider: str = "gmail",
+        provider: str = "",
         server_url: str | None = None,
         name: str | None = None,
         site_url: str | None = None,
     ) -> dict[str, Any]:
-        """Offer the owner a connection to one of their accounts, in this chat.
+        """Raise a connect card for one account this request cannot proceed without.
 
-        Call this tool when the owner asks to connect, link, or add an account,
-        or asks for something that needs an account that is not connected yet:
-        read or send email (gmail), work in repositories (github), report on
-        spending or burn rate (plaid), read LangSmith / OpenAI / Anthropic usage
-        (langsmith, openai, anthropic), audit or crawl a website (website),
-        post on X (x), read a calendar (google_calendar), or use the tools of a
-        Model Context Protocol server (custom_mcp) or any other site
-        (custom_site). Say in one sentence why the connection helps, then call
-        this tool: a card appears in the conversation and the owner signs in on
-        the vendor's own page in a window. Never ask the owner to type a
-        password, token, or key into the chat; if the owner pastes one anyway,
-        do not use the value, tell the owner to rotate that secret, and call
-        this tool so the owner signs in properly.
+        Call this tool only when the conversation partner asked to connect,
+        link, add, or reconnect an account, or asked for something that cannot
+        be done without an account that is not connected yet. Do not call this
+        tool to suggest, showcase, or catalog connectors. Do not call this tool
+        because an account is not connected: call this tool because THIS
+        request needs that account. Describing an image, answering from
+        identity, chatting, and recalling memories never need a connect card.
+
+        When this request does need an account, the provider names are: read or
+        send email (gmail), work in repositories (github), report on spending
+        or burn rate (plaid), read a reporting spreadsheet (google_sheets),
+        read LangSmith / OpenAI / ElevenLabs / xAI / Cursor / Claude.ai /
+        Anthropic usage (langsmith, openai, elevenlabs, xai, cursor,
+        claude_app, anthropic), audit or crawl a website (website), post on X
+        (x), read a calendar (google_calendar), or use the tools of a Model
+        Context Protocol server (custom_mcp) or any other site (custom_site).
+        Say in one sentence why THIS request needs the account, then call this
+        tool: a card appears in the conversation and the owner authorizes on
+        the vendor's own page. For Cursor, Claude.ai, the OpenAI usage page,
+        ElevenLabs, and xAI without an API key, prefer walk_vendor_dashboards
+        so the owner takes over the avatar's computer. Never ask the owner to
+        type a password, token, or key into the chat; if the owner pastes one
+        anyway, do not use the value, tell the owner to rotate that secret, and
+        call this tool so the owner signs in properly.
 
         The run pauses while the owner completes the card. When the run resumes
         this tool reports which accounts are connected, and the account's tools
@@ -313,7 +341,15 @@ def build_connection_tools(
             name: For custom_mcp or custom_site, how to refer to the connector.
             site_url: For website or custom_site, the site's address.
         """
-        provider_name = str(provider or "gmail").strip().lower()
+        provider_name = str(provider or "").strip().lower()
+        if not provider_name:
+            return {
+                "status": "missing_provider",
+                "error": (
+                    "Name which account this request needs before calling "
+                    "connect_account. Do not default to Gmail."
+                ),
+            }
         if provider_name in ("twitter", "x.com"):
             provider_name = "x"
         if provider_name in ("bank", "finance", "bank_account"):
@@ -516,9 +552,11 @@ def build_connection_tools(
         """Report the owner's connected accounts whose sign-in has lapsed.
 
         Call this tool when a connected account's tool answers
-        ``needs_reconnect``, or at the start of a conversation when the
-        connector status block lists accounts needing sign-in. Then offer to
-        sign in again with connect_account for that provider.
+        ``needs_reconnect``, or when the current request uses an account the
+        CONNECTED_ACCOUNTS section lists as needing sign-in. Then call
+        connect_account for that provider. Do not call this tool at the start
+        of a conversation, and do not raise a reconnect card for an account
+        the current request does not use.
         """
         return {
             "count": len(stale_by_provider),

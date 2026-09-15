@@ -287,6 +287,286 @@ async def active_users(
     return _result(["active_users", "conversations", "messages"], rows)
 
 
+LEDGER_PRODUCT = "product"
+LEDGER_FULLY_LOADED = "fully_loaded"
+UNIT_ECONOMICS_LEDGERS: tuple[str, ...] = (LEDGER_PRODUCT, LEDGER_FULLY_LOADED)
+DEVELOPMENT_OVERHEAD_PROVIDERS: frozenset[str] = frozenset(
+    {"cursor", "claude_app", "claude_code"}
+)
+
+
+async def cost_per_avatar(
+    pool: Any, since: datetime | None = None, until: datetime | None = None
+) -> dict[str, Any]:
+    """Sum product spend per avatar (owner question: what does each avatar cost)."""
+    start, end = default_period(since, until)
+    rows = await _fetchall(
+        pool,
+        """
+        SELECT metrics.assistant_id,
+               assistant.name AS assistant_name,
+               ROUND(SUM(metrics.cost_usd)::numeric, 4) AS cost_usd,
+               COUNT(*) FILTER (WHERE metrics.inference_type = ANY(%s)) AS messages,
+               COUNT(DISTINCT metrics.thread_id) AS conversations
+        FROM api_metrics AS metrics
+        LEFT JOIN assistant ON assistant.assistant_id::text = metrics.assistant_id
+        WHERE metrics.created_at >= %s AND metrics.created_at < %s
+          AND metrics.assistant_id IS NOT NULL
+        GROUP BY metrics.assistant_id, assistant.name
+        ORDER BY cost_usd DESC;
+        """,
+        (list(MESSAGE_INFERENCE_TYPES), start, end),
+    )
+    total_cost = sum(float(row[2] or 0.0) for row in rows)
+    avatars = len(rows)
+    result = _result(
+        ["assistant_id", "assistant_name", "cost_usd", "messages", "conversations"],
+        rows,
+    )
+    result["total_cost_usd"] = round(total_cost, 4)
+    result["avatars"] = avatars
+    result["cost_per_avatar"] = (
+        round(total_cost / avatars, 4) if avatars else None
+    )
+    return result
+
+
+async def average_cost_per_message(
+    pool: Any, since: datetime | None = None, until: datetime | None = None
+) -> dict[str, Any]:
+    """Average product cost of one billed message turn."""
+    start, end = default_period(since, until)
+    rows = await _fetchall(
+        pool,
+        """
+        SELECT COUNT(*) AS messages,
+               ROUND(COALESCE(SUM(cost_usd), 0)::numeric, 4) AS total_cost_usd,
+               CASE WHEN COUNT(*) = 0 THEN NULL
+                    ELSE ROUND((SUM(cost_usd) / COUNT(*))::numeric, 6)
+               END AS average_cost_per_message
+        FROM api_metrics
+        WHERE inference_type = ANY(%s) AND created_at >= %s AND created_at < %s;
+        """,
+        (list(MESSAGE_INFERENCE_TYPES), start, end),
+    )
+    return _result(
+        ["messages", "total_cost_usd", "average_cost_per_message"], rows
+    )
+
+
+async def average_cost_per_conversation(
+    pool: Any, since: datetime | None = None, until: datetime | None = None
+) -> dict[str, Any]:
+    """Average product cost of one conversation (distinct thread)."""
+    start, end = default_period(since, until)
+    rows = await _fetchall(
+        pool,
+        """
+        SELECT COUNT(DISTINCT thread_id) AS conversations,
+               ROUND(COALESCE(SUM(cost_usd), 0)::numeric, 4) AS total_cost_usd,
+               CASE WHEN COUNT(DISTINCT thread_id) = 0 THEN NULL
+                    ELSE ROUND((SUM(cost_usd) / COUNT(DISTINCT thread_id))::numeric, 6)
+               END AS average_cost_per_conversation
+        FROM api_metrics
+        WHERE inference_type = ANY(%s) AND created_at >= %s AND created_at < %s
+          AND thread_id IS NOT NULL;
+        """,
+        (list(MESSAGE_INFERENCE_TYPES), start, end),
+    )
+    return _result(
+        ["conversations", "total_cost_usd", "average_cost_per_conversation"], rows
+    )
+
+
+async def cost_per_new_user(
+    pool: Any, since: datetime | None = None, until: datetime | None = None
+) -> dict[str, Any]:
+    """Product COGS of users whose first billed row falls in the period.
+
+    Each new user creates one personal avatar. This is not advertising CAC;
+    finance ``cac`` remains advertising spend divided by new users.
+    """
+    start, end = default_period(since, until)
+    rows = await _fetchall(
+        pool,
+        """
+        WITH first_seen AS (
+            SELECT user_id, MIN(created_at) AS first_seen
+            FROM api_metrics
+            WHERE user_id IS NOT NULL
+            GROUP BY user_id
+        ),
+        cohort AS (
+            SELECT user_id
+            FROM first_seen
+            WHERE first_seen >= %s AND first_seen < %s
+        )
+        SELECT (SELECT COUNT(*) FROM cohort) AS new_users,
+               ROUND(COALESCE(SUM(metrics.cost_usd), 0)::numeric, 4) AS cohort_cost_usd,
+               CASE WHEN (SELECT COUNT(*) FROM cohort) = 0 THEN NULL
+                    ELSE ROUND((SUM(metrics.cost_usd) / (SELECT COUNT(*) FROM cohort))::numeric, 4)
+               END AS cost_per_new_user
+        FROM api_metrics AS metrics
+        WHERE metrics.user_id IN (SELECT user_id FROM cohort)
+          AND metrics.created_at >= %s AND metrics.created_at < %s;
+        """,
+        (start, end, start, end),
+    )
+    result = _result(["new_users", "cohort_cost_usd", "cost_per_new_user"], rows)
+    result["note"] = (
+        f"{ADMIN_TRAFFIC_NOTE} This is product cost of onboarding, not advertising CAC."
+    )
+    return result
+
+
+async def product_spend_by_day(
+    pool: Any, since: datetime | None = None, until: datetime | None = None
+) -> list[float]:
+    """Return daily product spend oldest-first, for forecasts."""
+    spend = await spend_by_period(pool, since, until, group_by="day")
+    return [float(row[1] or 0.0) for row in spend.get("rows") or []]
+
+
+async def _vendor_cost_usd(
+    pool: Any, user_id: str, since: datetime, until: datetime
+) -> dict[str, Any]:
+    """Sum vendor cost and subscription rows for the owner in the period."""
+    from src.anubis.utils.analytics.vendor_usage import usage_totals
+
+    totals = await usage_totals(pool, user_id, since, until)
+    vendor_cost = 0.0
+    subscription_cost = 0.0
+    development_overhead = 0.0
+    for row in totals.get("rows") or []:
+        provider = str(row[0] or "")
+        metric = str(row[1] or "").strip().lower()
+        unit = str(row[2] or "").strip().lower()
+        value = float(row[3] or 0.0)
+        if unit not in ("", "usd") and metric not in ("cost", "subscription"):
+            continue
+        if metric == "subscription":
+            subscription_cost += value
+        elif metric in ("cost", "amount_seen"):
+            vendor_cost += value
+        else:
+            continue
+        if provider in DEVELOPMENT_OVERHEAD_PROVIDERS:
+            development_overhead += value
+    return {
+        "vendor_cost_usd": round(vendor_cost, 4),
+        "subscription_cost_usd": round(subscription_cost, 4),
+        "development_overhead_usd": round(development_overhead, 4),
+        "vendor_totals": totals,
+    }
+
+
+async def _bank_outflow_usd(
+    pool: Any, user_id: str, since: datetime, until: datetime
+) -> float:
+    """Sum Plaid outflows for the owner in the period."""
+    from src.anubis.utils.analytics.finance import spend_by_period as finance_spend
+
+    spend = await finance_spend(pool, user_id, since, until, group_by="day")
+    return float(spend.get("total_spend_usd") or 0.0)
+
+
+async def unit_economics(
+    pool: Any,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    *,
+    ledger: str = LEDGER_PRODUCT,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the four unit-cost numbers, optionally with a fully-loaded ledger.
+
+    ``ledger=product`` is avatar serving cost from ``api_metrics``.
+    ``ledger=fully_loaded`` adds the owner's vendor invoices and bank outflows.
+    Cursor and Claude sit on the development-overhead line, not in product COGS.
+    """
+    start, end = default_period(since, until)
+    chosen_ledger = str(ledger or LEDGER_PRODUCT).strip().lower()
+    if chosen_ledger not in UNIT_ECONOMICS_LEDGERS:
+        chosen_ledger = LEDGER_PRODUCT
+    per_avatar = await cost_per_avatar(pool, start, end)
+    per_message = await average_cost_per_message(pool, start, end)
+    per_conversation = await average_cost_per_conversation(pool, start, end)
+    per_new_user = await cost_per_new_user(pool, start, end)
+    message_row = (per_message.get("rows") or [[0, 0.0, None]])[0]
+    conversation_row = (per_conversation.get("rows") or [[0, 0.0, None]])[0]
+    new_user_row = (per_new_user.get("rows") or [[0, 0.0, None]])[0]
+    product_cost = float(per_avatar.get("total_cost_usd") or 0.0)
+    payload: dict[str, Any] = {
+        "ledger": LEDGER_PRODUCT,
+        "period_start": start.isoformat(),
+        "period_end": end.isoformat(),
+        "product_cost_usd": product_cost,
+        "avatars": per_avatar.get("avatars") or 0,
+        "cost_per_avatar": per_avatar.get("cost_per_avatar"),
+        "messages": message_row[0],
+        "average_cost_per_message": message_row[2],
+        "conversations": conversation_row[0],
+        "average_cost_per_conversation": conversation_row[2],
+        "new_users": new_user_row[0],
+        "cost_per_new_user": new_user_row[2],
+        "per_avatar": per_avatar,
+        "note": ADMIN_TRAFFIC_NOTE,
+    }
+    if chosen_ledger != LEDGER_FULLY_LOADED:
+        return payload
+    vendor = (
+        await _vendor_cost_usd(pool, str(user_id or ""), start, end)
+        if user_id
+        else {
+            "vendor_cost_usd": 0.0,
+            "subscription_cost_usd": 0.0,
+            "development_overhead_usd": 0.0,
+            "vendor_totals": {"rows": []},
+        }
+    )
+    bank_outflow = (
+        await _bank_outflow_usd(pool, str(user_id), start, end) if user_id else 0.0
+    )
+    fully_loaded = (
+        product_cost
+        + float(vendor["vendor_cost_usd"])
+        + float(vendor["subscription_cost_usd"])
+        + bank_outflow
+    )
+    avatars = int(payload["avatars"] or 0)
+    messages = int(payload["messages"] or 0)
+    conversations = int(payload["conversations"] or 0)
+    new_users = int(payload["new_users"] or 0)
+    payload.update(
+        {
+            "ledger": LEDGER_FULLY_LOADED,
+            "vendor_cost_usd": vendor["vendor_cost_usd"],
+            "subscription_cost_usd": vendor["subscription_cost_usd"],
+            "development_overhead_usd": vendor["development_overhead_usd"],
+            "bank_outflow_usd": round(bank_outflow, 4),
+            "fully_loaded_cost_usd": round(fully_loaded, 4),
+            "fully_loaded_cost_per_avatar": (
+                round(fully_loaded / avatars, 4) if avatars else None
+            ),
+            "fully_loaded_cost_per_message": (
+                round(fully_loaded / messages, 6) if messages else None
+            ),
+            "fully_loaded_cost_per_conversation": (
+                round(fully_loaded / conversations, 6) if conversations else None
+            ),
+            "fully_loaded_cost_per_new_user": (
+                round(fully_loaded / new_users, 4) if new_users else None
+            ),
+            "note": (
+                f"{ADMIN_TRAFFIC_NOTE} Fully-loaded adds vendor invoices and bank "
+                "outflows. Cursor and Claude sit on development_overhead_usd, not "
+                "in product COGS."
+            ),
+        }
+    )
+    return payload
+
+
 async def spend_by_period(
     pool: Any,
     since: datetime | None = None,

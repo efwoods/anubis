@@ -71,6 +71,23 @@ services:
             # recreate from re-downloading ~20 MB. /root/nltk_data is on nltk's
             # default search path, so no NLTK_DATA environment variable is needed.
             - ~/.cache/nltk_data:/root/nltk_data
+
+    phone_worker:
+        image: evdev3/anubis-langgraph-api:latest
+        pull_policy: never
+        env_file:
+            - .env
+        environment:
+            PYTHONPATH: /deps/anubis
+        working_dir: /deps/anubis
+        entrypoint: ["python", "-m", "src.anubis.utils.phone.worker"]
+        depends_on:
+            langgraph-api-prod:
+                condition: service_healthy
+        volumes:
+            - .:/deps/anubis
+        restart: unless-stopped
+
     # One-shot: creates/reuses the Stripe meters, products, prices, and billing-portal
     # configuration for every tier, then writes the resulting id map to the shared
     # volume and exits. Idempotent — meters are matched by event_name, products by

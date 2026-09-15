@@ -11,7 +11,6 @@ always sees the most recent identity, memory, quote, and knowledge context
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -22,7 +21,14 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import SystemMessage
 
-logger = logging.getLogger(__name__)
+from src.anubis.utils.context import GlobalContext
+from src.anubis.utils.context_compression import (
+    estimate_messages_token_count,
+    estimate_tool_schema_tokens,
+    truncate_string_to_token_limit,
+)
+from src.anubis.utils.model import hosted_inference_input_token_limit
+from src.anubis.utils.tokenizer import count_tokens
 
 
 class DynamicConsciousnessPrompt(AgentMiddleware):
@@ -50,7 +56,28 @@ class DynamicConsciousnessPrompt(AgentMiddleware):
         latest = self._latest_system_message(request.state)
         if latest is None:
             return request
-        # ``override`` returns a fresh request; preserves all other fields.
+        context = GlobalContext()
+        window = hosted_inference_input_token_limit(context)
+        content = latest.content if isinstance(latest.content, str) else str(latest.content or "")
+        prompt_tokens = count_tokens(content)
+        tool_tokens = estimate_tool_schema_tokens(getattr(request, "tools", None))
+        message_tokens = estimate_messages_token_count(
+            list(getattr(request, "messages", None) or [])
+        )
+        overhead_tokens = 2048
+        prompt_budget = max(
+            4096, window - tool_tokens - message_tokens - overhead_tokens
+        )
+        # Truncate only for the small NVIDIA 90B NIM window. A 400k
+        # MODEL_TOKEN_LIMIT must leave the identity prompt intact.
+        truncated = window <= 32768 and prompt_tokens > prompt_budget
+        if truncated:
+            content = truncate_string_to_token_limit(content, prompt_budget)
+            message_id = getattr(latest, "id", None)
+            if message_id:
+                latest = SystemMessage(content=content, id=message_id)
+            else:
+                latest = SystemMessage(content=content)
         return request.override(system_message=latest)
 
     def wrap_model_call(  # type: ignore[override]

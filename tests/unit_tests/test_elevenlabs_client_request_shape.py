@@ -91,3 +91,52 @@ def test_vendor_error_is_reduced_to_the_api_detail():
 
     plain = RuntimeError("connection reset")
     assert elevenlabs_client._describe_vendor_error(plain) == "connection reset"
+
+
+def _vendor_error(status_code, detail):
+    vendor_error = Exception("sdk dump")
+    vendor_error.status_code = status_code
+    vendor_error.body = {"detail": detail}
+    return vendor_error
+
+
+def test_a_401_invalid_api_key_is_a_refused_key_not_empty_credits():
+    vendor_error = _vendor_error(
+        401,
+        {
+            "type": "authentication_error",
+            "code": "unauthorized",
+            "message": "Invalid API key",
+            "status": "invalid_api_key",
+        },
+    )
+    classified = elevenlabs_client.classify_elevenlabs_vendor_error(vendor_error)
+    assert isinstance(classified, elevenlabs_client.ElevenLabsKeyRefusedError)
+    assert not isinstance(
+        classified, elevenlabs_client.ElevenLabsCreditsExhaustedError
+    )
+    assert "invalid_api_key" in str(classified)
+
+
+def test_quota_exceeded_is_empty_credits():
+    vendor_error = _vendor_error(
+        400,
+        {
+            "status": "quota_exceeded",
+            "message": "You have insufficient quota to complete the request.",
+        },
+    )
+    classified = elevenlabs_client.classify_elevenlabs_vendor_error(vendor_error)
+    assert isinstance(classified, elevenlabs_client.ElevenLabsCreditsExhaustedError)
+
+
+def test_a_blocked_voice_is_still_the_ban():
+    vendor_error = _vendor_error(
+        403,
+        {
+            "status": "detected_blocked_voice",
+            "message": "This voice is blocked",
+        },
+    )
+    classified = elevenlabs_client.classify_elevenlabs_vendor_error(vendor_error)
+    assert isinstance(classified, elevenlabs_client.ElevenLabsVoiceBlockedError)

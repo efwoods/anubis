@@ -600,11 +600,17 @@ async def _user_message_grounds_fact(
     asserting them and the avatar learns from itself. Both are optional — the check still runs,
     just with less to go on, when either is unavailable.
 
-    Fails OPEN (returns True) on an empty message or model error so transient failures never
-    silently drop a genuine fact — mirrors ``_suggest_correction``'s graceful fallback.
+    Fails CLOSED (returns False) on an empty message or model error. Silent drops on a
+    verifier outage are preferable to writing ROLE / retrieved-consciousness facts into
+    ``identity_memory`` as if the user had just taught them.
     """
-    if not user_message_text.strip():
-        return True
+    if not (user_message_text or "").strip():
+        logger.info(
+            "update_self_identity_mem_from_user_txt: refusing %r — no latest user message "
+            "to ground the fact against",
+            fact,
+        )
+        return False
     try:
         model = init_model(response_format=_UserMessageGroundsFact)
         result = await model.ainvoke(
@@ -641,9 +647,10 @@ async def _user_message_grounds_fact(
         return True
     except Exception:
         logger.exception(
-            "update_self_identity_mem_from_user_txt: fact-grounding check failed; allowing the fact"
+            "update_self_identity_mem_from_user_txt: fact-grounding check failed; "
+            "refusing the fact"
         )
-        return True
+        return False
 
 
 class _ProposedFactStoredFactRelationship(BaseModel):
@@ -974,51 +981,34 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # SAFEGUARD: only learn a fact the user actually shared in their MOST RECENT message.
     # The model often surfaces facts from the avatar's own retrieved consciousness
     # (identity/quote transcripts injected into the system prompt) when the user merely ASKS
-    # about those topics, then "learns" them as if the user had asserted them. Verify the fact
-    # was derived from the latest user message — not retrieved context, the assistant's own
-    # words, or an earlier turn — before storing anything.
+    # about those topics, then "learns" them as if the user had asserted them. Always run the
+    # quote-verified grounding check — never accept on embedding similarity alone.
     latest_user_message_text = _latest_user_message_text(runtime.state.get("messages"))
 
-    _SIMILARITY_THRESHOLD = 0.9
-
-    from src.anubis.utils.runtime_handles import async_score_query_against_texts
-
-    similarity_scores = await async_score_query_against_texts(
+    if not await _user_message_grounds_fact(
+        fact_shared_about_the_assistant_from_the_user,
         latest_user_message_text,
-        [fact_shared_about_the_assistant_from_the_user],
-    )
-    similarity = similarity_scores[0] if similarity_scores else 0.0
-    if similarity < _SIMILARITY_THRESHOLD:
-        """ 
-            If the fact is not similar to the most recent user message 
-            (the fact should come from the user message), then verify with an llm. 
-            If that fails, do not learn the fact.
-        """
-
-        if not await _user_message_grounds_fact(
-            fact_shared_about_the_assistant_from_the_user,
-            latest_user_message_text,
-            assistant_name=_assistant_name_from_config(runtime.config),
-            assistant_previous_message_text=_assistant_message_before_latest_user_message(
-                runtime.state.get("messages")
-            ),
-        ):
-            tool_call_id = runtime.tool_call_id
-            update = {
-                "messages": [
-                    ToolMessage(
-                        content=(
-                            f'Not learned: "{fact_shared_about_the_assistant_from_the_user}" was '
-                            "not shared by the user in their most recent message. "
-                            "Re-extract the fact ONLY from the user's most recent message — "
-                            "never from retrieved documents, your own earlier statements, "
-                            "or older messages in the conversation."
-                        ),
-                        tool_call_id=tool_call_id,
-                    )
-                ]
-            }
-            return Command(update=update)
+        assistant_name=_assistant_name_from_config(runtime.config),
+        assistant_previous_message_text=_assistant_message_before_latest_user_message(
+            runtime.state.get("messages")
+        ),
+    ):
+        tool_call_id = runtime.tool_call_id
+        update = {
+            "messages": [
+                ToolMessage(
+                    content=(
+                        f'Not learned: "{fact_shared_about_the_assistant_from_the_user}" was '
+                        "not shared by the user in their most recent message. "
+                        "Re-extract the fact ONLY from the user's most recent message — "
+                        "never from retrieved documents, your own earlier statements, "
+                        "or older messages in the conversation."
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            ]
+        }
+        return Command(update=update)
 
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
         runtime.config
@@ -1033,13 +1023,16 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
 
     # VERIFY HOW THE PROPOSED FACT RELATES TO WHAT IS ALREADY STORED.
     # Compare against (a) the identity docs already loaded into state this turn and
-    # (b) a live similarity search of the same namespace. We compare against
-    # ``assistant_identity_documents`` — the field ``load_consciousness`` fills from
-    # this exact ``identity_memory`` namespace — NOT ``recalled_memory_documents``,
-    # which comes from the separate episodic ``memory`` namespace and is unrelated
-    # here. The store search must run unconditionally (the previous code gated it on
-    # recalled memories being present, so duplicates slipped through on any turn
-    # with no recalled memories). Mirrors ``learn_information_about_the_user``.
+    # (b) a live similarity search of the same namespace. ``assistant_identity_documents``
+    # holds BOTH media-ingested ``identity`` docs and conversation ``identity_memory``
+    # docs from ``load_consciousness`` — NOT ``recalled_memory_documents``, which comes
+    # from the separate episodic ``memory`` namespace and is unrelated here. Media facts
+    # often carry the claim only inside ``<FACT>…</FACT>`` (no ``metadata.fact``), so
+    # extraction must recover that span or ROLE/media biography is re-written into
+    # ``identity_memory`` as "Told in chat". The store search must run unconditionally
+    # (the previous code gated it on recalled memories being present, so duplicates
+    # slipped through on any turn with no recalled memories). Mirrors
+    # ``learn_information_about_the_user``.
     #
     # A related stored fact is NOT automatically a duplicate: a stored "I don't have a
     # favorite color" scores near-identical by cosine to a proposed "My favorite color
@@ -1048,21 +1041,27 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # resolves each case: an identical fact is refused as previously learned, a
     # conflicting fact redirects the model to ``edit_identity_fact``, and unrelated
     # topical neighbors fall through to a normal create.
-    assistant_identity_documents_text_list = [
-        document.metadata.get("fact")
-        for document in runtime.state.get("assistant_identity_documents", [])
+    state_identity_documents = runtime.state.get("assistant_identity_documents", [])
+    state_clean_facts = [
+        clean_fact
+        for document in state_identity_documents
+        if (clean_fact := _document_clean_fact(document))
     ]
     proposed_norm = _normalize_fact_text(fact_shared_about_the_assistant_from_the_user)
     if any(
-        _normalize_fact_text(fact) == proposed_norm
-        for fact in assistant_identity_documents_text_list
+        _normalize_fact_text(clean_fact) == proposed_norm
+        for clean_fact in state_clean_facts
     ):
-        # Verbatim copy already loaded in state this turn — refuse without any model call.
+        # Verbatim copy already loaded in state this turn (media identity or prior
+        # conversation learning) — refuse without any model call.
         return Command(
             update={
                 "messages": [
                     ToolMessage(
-                        content=f"Fact: {fact_shared_about_the_assistant_from_the_user} previously learned",
+                        content=(
+                            f"Fact: {fact_shared_about_the_assistant_from_the_user} "
+                            "previously learned"
+                        ),
                         tool_call_id=runtime.tool_call_id,
                     )
                 ]
@@ -1092,12 +1091,26 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # dilutes a short fact's cosine, so the proposed fact is re-scored against each hit's
     # CLEAN <FACT> text (same method as ``find_fact_matches``) and gated at the same
     # ``_CORRECTION_MATCH_THRESHOLD`` — so a conflict redirect below always names a fact
-    # that ``edit_identity_fact``'s own search can find again.
-    candidate_stored_facts = [
-        clean_fact
-        for item in assistant_content_store_query_results
-        if (clean_fact := _extract_clean_fact(item))
-    ]
+    # that ``edit_identity_fact``'s own search can find again. State-loaded media identity
+    # facts that never lived in ``identity_memory`` are included so consciousness content
+    # cannot be re-stored as a new conversation fact.
+    candidate_stored_facts = []
+    seen_candidate_facts = set()
+    for clean_fact in state_clean_facts:
+        normalized_clean_fact = _normalize_fact_text(clean_fact)
+        if not normalized_clean_fact or normalized_clean_fact in seen_candidate_facts:
+            continue
+        seen_candidate_facts.add(normalized_clean_fact)
+        candidate_stored_facts.append(clean_fact)
+    for item in assistant_content_store_query_results:
+        clean_fact = _extract_clean_fact(item)
+        if not clean_fact:
+            continue
+        normalized_clean_fact = _normalize_fact_text(clean_fact)
+        if not normalized_clean_fact or normalized_clean_fact in seen_candidate_facts:
+            continue
+        seen_candidate_facts.add(normalized_clean_fact)
+        candidate_stored_facts.append(clean_fact)
     candidate_scores = await _score_sentences(
         fact_shared_about_the_assistant_from_the_user, candidate_stored_facts
     )
@@ -1611,6 +1624,25 @@ def _item_document_id(item) -> str | None:
 # (see ``wrap_fact_with_context``). Media-ingested facts have no ``metadata.fact`` key, so the
 # clean fact must be recovered from the wrapper to score and edit it.
 _FACT_TAG_RE = re.compile(r"<FACT>(.*?)</FACT>", re.DOTALL)
+
+
+def _document_clean_fact(document) -> str:
+    """Bare atomic fact from a Document already loaded in graph state.
+
+    Tool-written conversation facts carry ``metadata.fact``. Media-ingested identity
+    facts usually embed the claim only inside ``<FACT>…</FACT>``. Returns empty when
+    neither is present so long transcripts, reference-image blobs, and other
+    non-atomic documents are not treated as identity facts for dedupe.
+    """
+    metadata = getattr(document, "metadata", None) or {}
+    fact = (metadata.get("fact") or "").strip()
+    if fact:
+        return fact
+    page_content = (getattr(document, "page_content", None) or "").strip()
+    tag_match = _FACT_TAG_RE.search(page_content)
+    if tag_match and tag_match.group(1).strip():
+        return tag_match.group(1).strip()
+    return ""
 
 
 def _extract_clean_fact(item) -> str:

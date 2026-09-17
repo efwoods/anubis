@@ -261,20 +261,20 @@ async def test_grounds_fact_rejects_a_request_about_building_the_avatar(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_grounds_fact_fails_open_on_empty_message(monkeypatch):
-    """No verifiable user text -> do not block (fail open), and never call the model."""
+async def test_grounds_fact_fails_closed_on_empty_message(monkeypatch):
+    """No verifiable user text -> refuse (fail closed), and never call the model."""
     model = _stub_model(monkeypatch, user_message_role="asks_or_requests_only")
-    assert await _user_message_grounds_fact("I grew up in Markham.", "   ") is True
+    assert await _user_message_grounds_fact("I grew up in Markham.", "   ") is False
     assert model.calls == []
 
 
 @pytest.mark.asyncio
-async def test_grounds_fact_fails_open_on_model_error(monkeypatch):
+async def test_grounds_fact_fails_closed_on_model_error(monkeypatch):
     def _boom(**kwargs):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(identity_tools, "init_model", _boom)
-    assert await _user_message_grounds_fact("I grew up in Markham.", "anything") is True
+    assert await _user_message_grounds_fact("I grew up in Markham.", "anything") is False
 
 
 def test_quote_is_present_in_user_message_ignores_case_and_punctuation():
@@ -324,3 +324,139 @@ async def test_grounds_fact_rejects_when_the_verifier_quotes_nothing(monkeypatch
         await _user_message_grounds_fact("I have twins.", "tell me about your family")
         is False
     )
+
+
+def test_document_clean_fact_reads_metadata_and_fact_tag():
+    """Media identity docs often carry the claim only inside ``<FACT>``; tool-written
+    conversation facts carry ``metadata.fact``."""
+    from langchain_core.documents import Document
+
+    from src.anubis.utils.tools.identity.identity_tools import (
+        _document_clean_fact,
+        wrap_fact_with_context,
+    )
+
+    metadata_document = Document(
+        page_content="ignored wrapper",
+        metadata={"fact": "I grew up in Markham, Ontario."},
+    )
+    assert (
+        _document_clean_fact(metadata_document) == "I grew up in Markham, Ontario."
+    )
+
+    media_document = Document(
+        page_content=wrap_fact_with_context(
+            "I believe humans have a lot going on in their own heads.",
+            "biographical source",
+        ),
+        metadata={},
+    )
+    assert (
+        _document_clean_fact(media_document)
+        == "I believe humans have a lot going on in their own heads."
+    )
+
+    assert _document_clean_fact(Document(page_content="a long quote blob", metadata={})) == ""
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_media_identity_fact_already_in_state(monkeypatch):
+    """A fact already held from media identity (``<FACT>`` in state, no metadata.fact)
+    must not be re-stored into ``identity_memory`` as if newly taught in chat."""
+    from langchain_core.documents import Document
+    from langgraph.store.memory import InMemoryStore
+
+    from src.anubis.utils.tools.identity.identity_tools import (
+        update_self_identity_mem_from_user_txt,
+        wrap_fact_with_context,
+    )
+
+    media_fact = "I grew up in Markham, Ontario."
+    media_document = Document(
+        page_content=wrap_fact_with_context(media_fact, "media biography"),
+        metadata={},
+    )
+
+    async def _fake_grounds_fact(*args, **kwargs):
+        return True
+
+    async def _fake_extract(config):
+        return {"user_id": "creator-1"}, {"assistant_id": "asst-1"}
+
+    monkeypatch.setattr(identity_tools, "_user_message_grounds_fact", _fake_grounds_fact)
+    monkeypatch.setattr(identity_tools, "extract_user_id_assistant_id", _fake_extract)
+
+    class _Runtime:
+        store = InMemoryStore()
+        tool_call_id = "tc-media"
+        state = {
+            "messages": [HumanMessage(content="tell me about your childhood")],
+            "assistant_identity_documents": [media_document],
+        }
+        config = {
+            "configurable": {
+                "user_id": "creator-1",
+                "assistant_id": "asst-1",
+                "assistant_ctx": {"metadata": {"user_id": "creator-1"}},
+            }
+        }
+
+    command = await update_self_identity_mem_from_user_txt.coroutine(
+        fact_shared_about_the_assistant_from_the_user=media_fact,
+        fact_context="ctx",
+        runtime=_Runtime(),
+    )
+    assert "previously learned" in command.update["messages"][0].content
+
+
+@pytest.mark.asyncio
+async def test_create_always_runs_grounding_even_when_message_embeds_similarly(
+    monkeypatch,
+):
+    """High embedding similarity alone must not accept a fact — grounding always runs."""
+    from langgraph.store.memory import InMemoryStore
+
+    from src.anubis.utils.tools.identity.identity_tools import (
+        update_self_identity_mem_from_user_txt,
+    )
+
+    grounding_calls: list = []
+
+    async def _fake_grounds_fact(fact, user_message_text, **kwargs):
+        grounding_calls.append((fact, user_message_text))
+        return False
+
+    async def _fake_extract(config):
+        return {"user_id": "creator-1"}, {"assistant_id": "asst-1"}
+
+    monkeypatch.setattr(identity_tools, "_user_message_grounds_fact", _fake_grounds_fact)
+    monkeypatch.setattr(identity_tools, "extract_user_id_assistant_id", _fake_extract)
+
+    class _Runtime:
+        store = InMemoryStore()
+        tool_call_id = "tc-ground"
+        state = {
+            "messages": [
+                HumanMessage(content="please tell me about growing up in Markham")
+            ],
+            "assistant_identity_documents": [],
+        }
+        config = {
+            "configurable": {
+                "user_id": "creator-1",
+                "assistant_id": "asst-1",
+                "assistant_ctx": {"metadata": {"user_id": "creator-1"}},
+            }
+        }
+
+    proposed_fact = "I grew up in Markham, Ontario."
+    command = await update_self_identity_mem_from_user_txt.coroutine(
+        fact_shared_about_the_assistant_from_the_user=proposed_fact,
+        fact_context="ctx",
+        runtime=_Runtime(),
+    )
+    assert grounding_calls == [
+        (proposed_fact, "please tell me about growing up in Markham")
+    ]
+    assert "Not learned:" in command.update["messages"][0].content
+    assert "Learned:" not in command.update["messages"][0].content

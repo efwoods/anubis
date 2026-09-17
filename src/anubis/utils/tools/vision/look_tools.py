@@ -130,7 +130,6 @@ _LIVE_LOOK_MARKERS = (
     "what do you see",
 )
 
-
 def _human_message_text(message: Any) -> str:
     content = getattr(message, "content", "")
     if isinstance(content, str):
@@ -150,8 +149,9 @@ def should_offer_look_now(messages: list[Any] | None) -> bool:
     """Whether this turn may attach ``look_now``.
 
     A chat attachment the person asked the avatar to describe is not a request
-    to open the webcam. Llama 3.2 11B otherwise calls ``look_now`` on
-    ``describe this image`` plus an attached video, pausing the reply.
+    to open the webcam. Live-look markers still offer the tool; attached-file
+    markers keep the catalog from opening the camera for a file already in the
+    message.
     """
     last_human: HumanMessage | None = None
     for message in reversed(messages or []):
@@ -511,7 +511,11 @@ def build_look_tools(
                 f"{' and '.join(looked_at)} in this conversation: any of those "
                 "marked EARLIER VIEW describe what was in view before and are "
                 "history now. Answer from what is here, in the avatar's own "
-                "voice, without reading the description back word for word. "
+                "voice, as a person in conversation — never as a tool report. "
+                "Do not mention look_now, tools, JSON, status, looked_at, "
+                "opened_for_this_look, not_shared, observations, or that a "
+                "look was taken. Do not read the description back word for "
+                "word. "
                 f"Each observation names the view it came from ({views}); keep "
                 "them apart in the answer and say which one is being described "
                 "when both were looked at."

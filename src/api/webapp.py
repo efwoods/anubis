@@ -1433,7 +1433,7 @@ async def _finalize_disconnected_turn(
 # What the model vendors say when the operator's own account is out of credit.
 # None of these are the reader's doing, so they are never reported as a 402 —
 # that status sends the reader to billing, and the reader's allotment is fine.
-# Shared with the NVIDIA NIM retry so both layers agree on the same refusals.
+# Shared with vendor_credit_is_exhausted so both layers agree on the same refusals.
 
 
 def _stream_error_frame(

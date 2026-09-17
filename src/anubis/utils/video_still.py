@@ -1,9 +1,8 @@
 """A single JPEG still from a chat-attached video, for image description.
 
 Chat turns currently turn a video into a ``[File: name - video/mp4]`` line.
-Llama 3.2 11B then calls ``look_now`` on the webcam instead of describing the
-attached clip, and the reply pauses or never names what is in the file. One
-ffmpeg still is enough for the existing image-description path.
+One ffmpeg still feeds the existing image-description path so the avatar can
+name what is in the attached clip without opening the live camera.
 """
 
 from __future__ import annotations

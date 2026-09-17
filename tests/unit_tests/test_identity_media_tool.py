@@ -179,7 +179,8 @@ async def test_a_starter_failure_becomes_a_status_not_an_exception():
     assert result == {"status": "error", "detail": "boom"}
 
 
-def test_a_described_image_without_learn_intent_does_not_offer_the_tool():
+
+def test_identity_media_update_is_offered_on_every_turn():
     from langchain_core.messages import HumanMessage
 
     from src.anubis.utils.tools.identity.identity_media_tools import (
@@ -192,31 +193,20 @@ def test_a_described_image_without_learn_intent_does_not_offer_the_tool():
             "---\nImage descriptions:\n[logo.png]\nA black Neural Nexus mark."
         )
     )
-    assert should_offer_identity_media_update([describe]) is False
-    learn = HumanMessage(
-        content=(
-            "This is you. Learn from this.\n\n"
-            "---\nImage descriptions:\n[me.png]\nA portrait."
-        )
-    )
-    assert should_offer_identity_media_update([learn]) is True
+    assert should_offer_identity_media_update([describe]) is True
     assert should_offer_identity_media_update(
         [HumanMessage(content="hey mom")]
     ) is True
     assert should_offer_identity_media_update(
         [HumanMessage(content="Please describe this image")]
-    ) is False
+    ) is True
     assert should_offer_identity_media_update(
         [HumanMessage(content="here")],
         [{"filename": "logo.png", "mime_type": "image/png", "size_bytes": 4}],
-    ) is False
-    assert should_offer_identity_media_update(
-        [HumanMessage(content="this is you")],
-        [{"filename": "me.png", "mime_type": "image/png", "size_bytes": 4}],
     ) is True
 
 
-def test_a_described_image_to_look_at_must_be_answered_in_text():
+def test_described_image_turns_keep_tools_bound():
     from langchain_core.messages import HumanMessage
 
     from src.anubis.utils.tools.identity.identity_media_tools import (
@@ -230,14 +220,11 @@ def test_a_described_image_to_look_at_must_be_answered_in_text():
             "---\nImage descriptions:\n[neuralink-wireframe.PNG]\nA wireframe."
         )
     )
-    assert should_answer_from_described_image([describe]) is True
-    learn = HumanMessage(
-        content="This is you. Learn from this.\n\n---\nImage descriptions:\n[me.png]\nA portrait."
-    )
-    assert should_answer_from_described_image([learn]) is False
+    assert should_answer_from_described_image([describe]) is False
     assert should_answer_from_described_image(
         [HumanMessage(content="hey mom")]
     ) is False
+
 
 
 @pytest.mark.asyncio
@@ -275,6 +262,13 @@ def test_capability_questions_keep_tools_on_every_model():
             [HumanMessage(content="hey mom")],
             context=context,
         ) is False
+        assert should_answer_in_words_only(
+            [HumanMessage(content='Please say, "Good night, Evan."')],
+            context=context,
+        ) is False
+
+
+
 
 
 def test_identity_media_once_detects_a_closed_tool_message():

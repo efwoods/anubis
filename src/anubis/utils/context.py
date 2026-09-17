@@ -107,7 +107,19 @@ class GlobalContext:
     #     },
     # )
 
-    """ Default Environment Variables """
+    """ Standard Environment Variables """
+
+    """  """ 
+    debug_system_prompt: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "When set to TRUE, log the full populated identity system prompt "
+                "to the process logs and write system_prompt.txt under the repo root. "
+                "Env DEBUG_SYSTEM_PROMPT."
+            )
+        },
+    )
 
     """ <Inference Model> """
 
@@ -144,36 +156,6 @@ class GlobalContext:
     model_completion_cost: float = 0.0
     # metadata={"description": "Completion token cost."},
 
-    nvidia_nim_api_key: str = field(
-        default=None,
-        metadata={
-            "description": (
-                "NVIDIA NIM API key used when the primary text provider "
-                "refuses for lack of credit (DEV). Env NVIDIA_NIM_API_KEY. "
-                "When unset, LLM_PROVIDER_API_KEY is reused if that URL is NVIDIA."
-            )
-        },
-    )
-
-    nvidia_nim_base_url: str = field(
-        default=None,
-        metadata={
-            "description": (
-                "NVIDIA NIM OpenAI-compatible base URL for credit-exhaustion "
-                "fallback. Env NVIDIA_NIM_BASE_URL."
-            )
-        },
-    )
-
-    nvidia_nim_model: str = field(
-        default=None,
-        metadata={
-            "description": (
-                "NVIDIA NIM catalog id used when the primary text provider "
-                "is out of credit. Env NVIDIA_NIM_MODEL."
-            )
-        },
-    )
 
     """ </Inference Model> """
 
@@ -2469,7 +2451,7 @@ class GlobalContext:
     model_token_limit: int = field(
         default=400000,
         metadata={
-            "description": "Maximum context window for the primary inference model, in tokens (absolute count, not thousands). NVIDIA's hosted Llama 3.2 90B Vision NIM is 32768 regardless of a larger value here; the turn is fitted to that ceiling."
+            "description": "Maximum context window for the primary inference model, in tokens (absolute count, not thousands). Set this to the endpoint's real input ceiling so the turn is fitted correctly."
         },
     )
 
@@ -2947,7 +2929,7 @@ class GlobalContext:
     )
 
     baseline_response_threshold: float = field(
-        default=51.57779076844389,
+        default=43.04826020370271,
         metadata={
             "description": "Pre-calculated IQR threshold for the empirical representation of the squared mahalanobis distances of the features presented from the unmodified chatgpt responses using a leave-one-out method. Recalibrated and written back by scripts/retrain_chatgpt_baseline.py whenever the inference model is upgraded, and by data/build_baseline_features_arr.py whenever the feature vector changes (current: 28-wide v4 vector)."
         }

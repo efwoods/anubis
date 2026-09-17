@@ -29,7 +29,6 @@ def test_attach_visible_reply_metadata_writes_created_at_and_dev_text_model(
     record_text_inference(
         model_provider="NVIDIA",
         model="meta/llama-3.2-90b-vision-instruct",
-        used_nvidia_nim_credit_fallback=False,
     )
     reply = AIMessage(content="Hello.")
     message_record.attach_visible_reply_metadata(reply, context=GlobalContext())

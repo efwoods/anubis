@@ -14,7 +14,6 @@ from langchain_core.messages import ToolMessage
 
 from src.anubis.utils.tools.identity.identity_media_tools import (
     IDENTITY_MEDIA_TOOL_NAME,
-    should_answer_from_described_image,
 )
 
 
@@ -29,6 +28,7 @@ def should_answer_in_words_only(
     answered from the tool descriptions rather than by stripping the
     catalog for a smaller hosted model.
     """
+    _ = messages, context
     return False
 
 
@@ -66,10 +66,6 @@ class IdentityMediaOnceMiddleware(AgentMiddleware):
             state_messages
         ) or should_answer_in_words_only(request_messages)
         if words_only:
-            return request.override(tools=[], tool_choice="none")
-        if should_answer_from_described_image(
-            state_messages
-        ) or should_answer_from_described_image(request_messages):
             return request.override(tools=[], tool_choice="none")
         if not identity_media_tool_already_returned(messages):
             return request

@@ -1394,7 +1394,7 @@ async def think(
             ]
         # Offered when this turn asked to connect or use an account. Gating on
         # having a connection would leave no way in; gating on the last human
-        # message keeps Llama 3.2 11B from raising Gmail on "How can you help me?"
+        # message keeps connection tools off ordinary small talk.
         if should_offer_connection_tools(
             state.get("messages") or [],
             context=runtime.context,

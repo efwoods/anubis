@@ -68,9 +68,10 @@ class DynamicConsciousnessPrompt(AgentMiddleware):
         prompt_budget = max(
             4096, window - tool_tokens - message_tokens - overhead_tokens
         )
-        # Truncate only for the small NVIDIA 90B NIM window. A 400k
-        # MODEL_TOKEN_LIMIT must leave the identity prompt intact.
-        truncated = window <= 32768 and prompt_tokens > prompt_budget
+        # Truncate when the assembled identity prompt exceeds the remaining
+        # budget for this MODEL_TOKEN_LIMIT. A large ceiling leaves the
+        # identity prompt intact.
+        truncated = prompt_tokens > prompt_budget
         if truncated:
             content = truncate_string_to_token_limit(content, prompt_budget)
             message_id = getattr(latest, "id", None)

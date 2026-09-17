@@ -1082,7 +1082,8 @@ async def _build_consciousness_system_message_update(
         ),
     )
 
-    logger.info(f"populated_template: {populated_identity_template}")
+    if getattr(runtime.context, "debug_system_prompt", None) == "TRUE":
+        logger.info(f"populated_template: {populated_identity_template}")
 
     # prepend system message
     logger.info(f"state['messages']: {state['messages']}")
@@ -1736,7 +1737,12 @@ async def _build_consciousness_system_message_update(
     # measurement for the message endpoints' pre-request input-token estimate.
     record_system_prompt_token_estimate(user_id, assistant_id, system_message_str)
 
-    _write_dev_system_prompt(system_message_str, runtime)
+    # Estimation builds this prompt with a lightweight SimpleNamespace that only
+    # carries assistant_ctx / user_ctx. Use getattr so a missing
+    # debug_system_prompt cannot fail-closed the pre-request token estimate.
+    if getattr(runtime.context, "debug_system_prompt", None) == "TRUE":
+        _write_dev_system_prompt(system_message_str, runtime)
+    
 
     # Replace-snapshots: each persisted doc channel becomes exactly the merged,
     # de-duplicated, (memory-only) salience-pruned set built above — instead of the
@@ -1804,16 +1810,16 @@ async def build_system_prompt_text_for_estimation(
         "user_state": {"user_id": user_id},
         "assistant_state": {"assistant_id": assistant_id},
     }
-    # ``_build_consciousness_system_message_update`` only reads
-    # ``runtime.store`` and ``runtime.context.assistant_ctx`` /
-    # ``runtime.context.user_ctx`` (as ``AssistantContext``/``UserContext``
-    # instances or plain dicts), so a lightweight stand-in suffices.
+    # ``_build_consciousness_system_message_update`` also reads optional
+    # ``runtime.context.debug_system_prompt`` via getattr (safe when absent).
+    # A lightweight stand-in with assistant_ctx / user_ctx is enough here.
+    estimation_context = SimpleNamespace(
+        assistant_ctx=configurable.get("assistant_ctx") or {},
+        user_ctx=configurable.get("user_ctx") or {},
+    )
     runtime_stand_in = SimpleNamespace(
         store=store,
-        context=SimpleNamespace(
-            assistant_ctx=configurable.get("assistant_ctx") or {},
-            user_ctx=configurable.get("user_ctx") or {},
-        ),
+        context=estimation_context,
     )
     input_update = await _build_consciousness_system_message_update(
         synthetic_state, assistant_config, runtime_stand_in

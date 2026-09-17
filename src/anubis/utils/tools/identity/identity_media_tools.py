@@ -16,71 +16,10 @@ import logging
 from typing import Any
 
 from langchain.tools import tool
-from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
 
 IDENTITY_MEDIA_TOOL_NAME = "update_avatar_identity_with_media"
-
-# Phrases that mean the creator is teaching identity, not asking what a file shows.
-_LEARN_FROM_MEDIA_MARKERS = (
-    "learn from",
-    "learn this",
-    "remember this",
-    "remember it",
-    "absorb this",
-    "add this to",
-    "this is you",
-    "this is me",
-    "this is of you",
-    "this is of me",
-    "reference photo",
-    "reference image",
-    "reference portrait",
-    "reference clip",
-    "your portrait",
-    "your identity",
-    "use this as",
-    "make this your",
-)
-
-# A described or attached image the person asked to look at is not teaching.
-_ASK_ABOUT_MEDIA_MARKERS = (
-    "describe this",
-    "describe the",
-    "describe that",
-    "describe it",
-    "describe the image",
-    "describe the picture",
-    "describe the attached",
-    "what's this",
-    "what is this",
-    "what is that",
-    "what's that",
-    "what does this",
-    "what's in this",
-    "what is in this",
-    "look at this",
-    "look at the image",
-    "tell me about this",
-    "explain this image",
-    "explain the image",
-)
-
-
-def _human_message_text(message: Any) -> str:
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("text"):
-                parts.append(str(block["text"]))
-        return "\n".join(parts)
-    return str(content or "")
 
 
 def should_offer_identity_media_update(
@@ -89,51 +28,21 @@ def should_offer_identity_media_update(
 ) -> bool:
     """Whether this turn may attach ``update_avatar_identity_with_media``.
 
-    Llama 3.2 11B otherwise calls that tool on a "describe this image" turn
-    until the deep-agent recursion limit (sixteen identical calls, then
-    GraphRecursionError). Returning a stop message from the tool does not
-    end the loop — the model keeps calling — so the tool must not be offered.
+    Every provider sees the same catalog; the model decides whether to call
+    the tool from the tool description and the conversation.
     """
-    last_human: HumanMessage | None = None
-    for message in reversed(messages or []):
-        if isinstance(message, HumanMessage):
-            last_human = message
-            break
-    text = _human_message_text(last_human) if last_human is not None else ""
-    lowered = text.lower()
-    if any(marker in lowered for marker in _LEARN_FROM_MEDIA_MARKERS):
-        return True
-    if "image descriptions:" in lowered:
-        return False
-    if any(marker in lowered for marker in _ASK_ABOUT_MEDIA_MARKERS):
-        return False
-    attached = list(attachments or [])
-    if attached and all(
-        str(item.get("mime_type") or "").startswith("image/") for item in attached
-    ):
-        return False
+    _ = messages, attachments
     return True
 
 
 def should_answer_from_described_image(messages: list[Any] | None) -> bool:
-    """Whether this turn already has an image description the avatar should read back.
+    """Whether this turn must strip tools and answer from an image description.
 
-    Llama 3.2 11B otherwise calls ``learn_information_about_the_user`` or
-    ``connect_account`` instead of answering from the Image descriptions section.
+    Tools stay bound for every provider. The model answers from the image
+    descriptions section when that is what the conversation asks for.
     """
-    last_human: HumanMessage | None = None
-    for message in reversed(messages or []):
-        if isinstance(message, HumanMessage):
-            last_human = message
-            break
-    if last_human is None:
-        return False
-    lowered = _human_message_text(last_human).lower()
-    if "image descriptions:" not in lowered:
-        return False
-    if any(marker in lowered for marker in _LEARN_FROM_MEDIA_MARKERS):
-        return False
-    return True
+    _ = messages
+    return False
 
 
 def _emit_media_job_started(payload: dict[str, Any]) -> None:

@@ -61,7 +61,7 @@ def test_image_description_client_uses_image_model_knobs(monkeypatch):
     assert client.keyword_arguments == captured
 
 
-def test_nvidia_unbound_client_is_not_wrapped_when_already_on_nim(monkeypatch):
+def test_nvidia_unbound_client_is_bare_chat_openai(monkeypatch):
     captured = {}
 
     class CapturingChatOpenAI(_FakeChatOpenAI):
@@ -83,57 +83,16 @@ def test_nvidia_unbound_client_is_not_wrapped_when_already_on_nim(monkeypatch):
     assert captured["model"] == "meta/llama-3.2-11b-vision-instruct"
 
 
-def test_open_ai_unbound_client_wraps_nvidia_nim_credit_fallback_in_dev(monkeypatch):
+def test_open_ai_unbound_client_is_bare_chat_openai_in_dev(monkeypatch):
     monkeypatch.setenv("DEV", "TRUE")
     monkeypatch.setenv("MODEL_PROVIDER", "OPEN_AI")
     monkeypatch.setenv("MODEL", "gpt-5.6-luna")
     monkeypatch.setenv("LLM_PROVIDER_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_PROVIDER_BASE_URL", "https://api.openai.com/v1")
-    monkeypatch.setenv("NVIDIA_NIM_API_KEY", "nvapi-test")
-    monkeypatch.setenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    monkeypatch.setenv("NVIDIA_NIM_MODEL", "meta/llama-3.2-90b-vision-instruct")
     monkeypatch.setattr("langchain_openai.ChatOpenAI", _FakeChatOpenAI)
 
     client = model_module.init_chat_model_unbound()
-    assert isinstance(client, model_module.NvidiaNimCreditFallbackChatModel)
-
-
-def test_credit_exhaustion_retries_on_nvidia_nim(monkeypatch):
-    from langchain_core.messages import AIMessage
-
-    monkeypatch.setenv("DEV", "TRUE")
-    monkeypatch.setenv("MODEL_PROVIDER", "OPEN_AI")
-    monkeypatch.setenv("MODEL", "gpt-5.6-luna")
-    monkeypatch.setenv("NVIDIA_NIM_API_KEY", "nvapi-test")
-    monkeypatch.setenv("NVIDIA_NIM_MODEL", "meta/llama-3.2-90b-vision-instruct")
-    from src.anubis.utils.context import GlobalContext
-
-    class ExhaustedPrimary:
-        def invoke(self, *_arguments, **_keyword_arguments):
-            raise RuntimeError("Error code: 429 - insufficient_quota")
-
-        def bind_tools(self, *_arguments, **_keyword_arguments):
-            return self
-
-    class NvidiaNimFallback:
-        def invoke(self, *_arguments, **_keyword_arguments):
-            return AIMessage(content="from nvidia nim")
-
-        def bind_tools(self, *_arguments, **_keyword_arguments):
-            return self
-
-    context = GlobalContext()
-    wrapped = model_module.NvidiaNimCreditFallbackChatModel(
-        primary=ExhaustedPrimary(),
-        fallback=NvidiaNimFallback(),
-        context=context,
-    )
-    reply = wrapped.invoke([{"role": "user", "content": "hello"}])
-    assert reply.content == "from nvidia nim"
-    record = model_module.text_inference_record(context)
-    assert record["text_model"] == "meta/llama-3.2-90b-vision-instruct"
-    assert record["text_model_provider"] == "NVIDIA"
-    assert record["text_model_credit_fallback"] is True
+    assert isinstance(client, _FakeChatOpenAI)
 
 
 def test_vendor_credit_is_exhausted_matches_known_refusals():
@@ -154,21 +113,9 @@ def test_vendor_key_is_refused_is_not_empty_funds():
     assert not model_module.vendor_key_is_refused(quota_error)
 
 
-def test_nvidia_90b_hosted_input_limit_is_32768_even_when_model_token_limit_is_larger(
-    monkeypatch,
-):
+def test_hosted_inference_input_token_limit_follows_model_token_limit(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
     monkeypatch.setenv("MODEL", "meta/llama-3.2-90b-vision-instruct")
-    monkeypatch.setenv("MODEL_TOKEN_LIMIT", "400000")
-    from src.anubis.utils.context import GlobalContext
-
-    context = GlobalContext()
-    assert model_module.hosted_inference_input_token_limit(context) == 32768
-
-
-def test_nvidia_11b_keeps_configured_model_token_limit(monkeypatch):
-    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
-    monkeypatch.setenv("MODEL", "meta/llama-3.2-11b-vision-instruct")
     monkeypatch.setenv("MODEL_TOKEN_LIMIT", "400000")
     from src.anubis.utils.context import GlobalContext
 
@@ -176,7 +123,17 @@ def test_nvidia_11b_keeps_configured_model_token_limit(monkeypatch):
     assert model_module.hosted_inference_input_token_limit(context) == 400000
 
 
-def test_extra_tools_are_kept_on_the_nvidia_90b_window():
+def test_hosted_inference_input_token_limit_reads_configured_ceiling(monkeypatch):
+    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
+    monkeypatch.setenv("MODEL", "meta/llama-3.2-11b-vision-instruct")
+    monkeypatch.setenv("MODEL_TOKEN_LIMIT", "32768")
+    from src.anubis.utils.context import GlobalContext
+
+    context = GlobalContext()
+    assert model_module.hosted_inference_input_token_limit(context) == 32768
+
+
+def test_extra_tools_are_kept_on_a_small_inference_window():
     from types import SimpleNamespace
 
     from src.anubis.utils.context_compression import extra_tools_within_inference_window
@@ -193,7 +150,7 @@ def test_extra_tools_are_kept_on_the_nvidia_90b_window():
     assert kept == [huge]
 
 
-def test_extra_tools_are_kept_when_the_inference_window_is_larger_than_the_nvidia_90b_cap():
+def test_extra_tools_are_kept_when_the_inference_window_is_large():
     from types import SimpleNamespace
 
     from src.anubis.utils.context_compression import extra_tools_within_inference_window

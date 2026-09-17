@@ -107,19 +107,15 @@ def extra_tools_within_inference_window(
     messages: list[Any] | None,
     window: int,
 ) -> list[Any]:
-    """Drop optional tools only when the hosted input ceiling is the 32k NIM window.
+    """Keep optional tools on every hosted window.
 
-    NVIDIA Integrate serves Llama 3.2 90B Vision at 32768 tokens. A 400000
-    ``MODEL_TOKEN_LIMIT`` (OpenAI / Llama 11B) must not drop mailbox or look
-    tools because a tiktoken estimate of tool JSON schemas looked large.
+    Fitting the turn is the system prompt's job (DynamicConsciousnessPrompt),
+    not silently removing mailbox, look, or connect tools because a tiktoken
+    estimate of tool JSON schemas looked large.
     """
     extras = list(extra_tools or [])
     if not extras:
         return extras
-    # Keep mailbox, look, and connect tools on every hosted window, including
-    # NVIDIA 90B at 32768. Fitting the turn is the system prompt's job
-    # (DynamicConsciousnessPrompt), not silently removing the tools the
-    # person asked to use.
     return extras
 
 

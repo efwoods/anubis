@@ -37,6 +37,7 @@ from src.anubis.utils.prompts.first_person_rewriter_prompt import (
     FIRST_PERSON_REWRITER_SYSTEM_PROMPT,
 )
 
+
 class FirstPersonStatement(BaseModel):
     """Single first-person rewrite of one input statement — model output.
 
@@ -84,6 +85,7 @@ class FirstPersonStatement(BaseModel):
             "fact, no additions, no omissions."
         )
     )
+
 
 class FirstPersonStatementWithProvenance(BaseModel):
     """One first-person statement paired in code with its original input."""
@@ -152,9 +154,18 @@ class FirstPersonRewriterClass:
         # were added to the prompt, keeping the same chars-per-token ratio
         # the original estimate was calibrated at.
         self.system_prompt_tokens = 3100
-        self.model_name = "gpt-5.4-nano"
-        self.model_input_token_cost_per_million = 0.00000005
-        self.model_output_token_cost_per_million = 0.0000004
+        # The model and its prices come from GlobalContext, never from a name
+        # written here: this class calls whatever ``CLASSIFICATION_MODEL`` names,
+        # so a hard-coded name mislabels every row it writes and a hard-coded
+        # price stops matching the invoice the day the vendor changes a rate.
+        rewriter_context = GlobalContext()
+        self.model_name = rewriter_context.classification_model
+        self.model_input_token_cost_per_million = float(
+            rewriter_context.classification_model_prompt_cost or 0.0
+        )
+        self.model_output_token_cost_per_million = float(
+            rewriter_context.classification_model_completion_cost or 0.0
+        )
         self.model_inference_type = "first_person_rewriter_structured_output"
 
     def _build_system_message(
@@ -231,9 +242,7 @@ class FirstPersonRewriterClass:
             concise_context_summary, target_name
         )
 
-        cleaned_statements: List[str] = [
-            (s or "").strip() for s in (statements or [])
-        ]
+        cleaned_statements: List[str] = [(s or "").strip() for s in (statements or [])]
         cleaned_statements = [s for s in cleaned_statements if s]
 
         if not cleaned_statements:
@@ -250,10 +259,7 @@ class FirstPersonRewriterClass:
             }
 
         model_outputs: List[FirstPersonStatement] = await asyncio.gather(
-            *[
-                self._rewrite_one(s, system_message)
-                for s in cleaned_statements
-            ]
+            *[self._rewrite_one(s, system_message) for s in cleaned_statements]
         )
 
         provenanced_statements: List[FirstPersonStatementWithProvenance] = []
@@ -266,12 +272,8 @@ class FirstPersonRewriterClass:
                     original_statement=original,
                 )
             )
-            per_call_input_tokens += (
-                count_tokens(original) + self.system_prompt_tokens
-            )
-            per_call_output_tokens += count_tokens(
-                json.dumps(model_stmt.model_dump())
-            )
+            per_call_input_tokens += count_tokens(original) + self.system_prompt_tokens
+            per_call_output_tokens += count_tokens(json.dumps(model_stmt.model_dump()))
 
         provenanced = FirstPersonStatementsWithProvenance(
             statements=provenanced_statements

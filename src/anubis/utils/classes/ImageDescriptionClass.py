@@ -19,9 +19,18 @@ class ImageDescriptionClass:
         self.system_message = SystemMessage(
             content=system_prompt or DESCRIBE_IMAGE_PROMPT
         )
-        self.model_name = "gpt-5.4-nano"
-        self.model_input_token_cost = 0.0000002
-        self.model_output_token_cost = 0.00000125
+        # The model and its prices come from GlobalContext, never from a name
+        # written here: this class calls whatever ``IMAGE_MODEL`` names, so a
+        # hard-coded name mislabels every row it writes and a hard-coded price
+        # stops matching the invoice the day the vendor changes a rate.
+        image_description_context = GlobalContext()
+        self.model_name = image_description_context.image_model
+        self.model_input_token_cost = float(
+            image_description_context.image_model_prompt_cost or 0.0
+        )
+        self.model_output_token_cost = float(
+            image_description_context.image_model_completion_cost or 0.0
+        )
         self.model_inference_type = "image_description"
 
     async def describe(self, image_data: str, filename: str) -> dict:

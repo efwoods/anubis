@@ -333,6 +333,13 @@ async def run_single_item_job(
             **config.get("configurable", {}),
             "item_job_id": child.job_id,
             "master_job_id": master.job_id,
+            # Every model call the graph makes for this item is recorded in
+            # ``api_metrics`` stamped with this id (the recorder attached in
+            # ``init_model`` reads it off the run's metadata), which is what makes
+            # the upload's recorded cost match the vendor invoice and lets the
+            # upload's real token consumption — not the pre-upload estimate —
+            # reach the Stripe meter the billing portal reads.
+            "media_job_id": child.job_id,
         },
     }
     try:

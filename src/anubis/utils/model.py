@@ -28,6 +28,39 @@ from src.anubis.utils.tokenizer import count_tokens
 # their raw structured output leaks into the chat (e.g. interleaved fact-correction JSON).
 STRUCTURED_OUTPUT_STREAM_TAG = "structured_output_no_user_stream"
 
+# One handler instance per process is enough: it holds only the in-flight runs'
+# metadata, keyed by run id, and every model this module builds reports through
+# it. Built on first use so ``langchain_core``'s callback module is not imported
+# at module scope.
+_api_metrics_callback_handler: Any = None
+
+
+def attach_api_metrics_recorder(model: Any) -> Any:
+    """Return ``model`` with the api_metrics recorder attached to its callbacks.
+
+    Every model built here reports its token usage through one handler, which is
+    what lets a media upload's real cost reach ``api_metrics`` and, through it,
+    the Stripe meter the billing portal reads. A model that cannot take a config
+    is returned unchanged rather than failing the call: accounting must never
+    break inference.
+    """
+    global _api_metrics_callback_handler
+    try:
+        if _api_metrics_callback_handler is None:
+            from src.anubis.utils.billing.metering import (
+                build_api_metrics_callback_handler,
+            )
+
+            _api_metrics_callback_handler = build_api_metrics_callback_handler()
+        return model.with_config(callbacks=[_api_metrics_callback_handler])
+    except Exception as attach_error:  # noqa: BLE001 - accounting is never fatal
+        logger.warning(
+            "Could not attach the api_metrics recorder to a model; this call's "
+            "usage will not be recorded: %s",
+            attach_error,
+        )
+        return model
+
 def hosted_inference_input_token_limit(context: GlobalContext | None = None) -> int:
     """The input-token ceiling from ``MODEL_TOKEN_LIMIT`` (default 400000)."""
     context = context or GlobalContext()
@@ -222,7 +255,9 @@ def init_model(
         model = model.with_structured_output(schema=response_format)
         # Tag so the streaming layer never forwards this call's tokens to the user as
         # ``assistant_token`` — structured output is internal JSON, not a reply.
-        return model.with_config(tags=[STRUCTURED_OUTPUT_STREAM_TAG])
+        return attach_api_metrics_recorder(
+            model.with_config(tags=[STRUCTURED_OUTPUT_STREAM_TAG])
+        )
 
     if model_provider == "OPEN_AI":
         from langchain_openai import ChatOpenAI
@@ -331,7 +366,7 @@ def init_model(
         model_provider=context.model_provider,
         model=context.model,
     )
-    return model
+    return attach_api_metrics_recorder(model)
 
 
 def init_chat_model_unbound(context: Optional[GlobalContext] = None):

@@ -90,6 +90,7 @@ from src.anubis.utils.billing import (
     current_stripe_billing_config,
     initialize_stripe_billing_config,
     persist_api_metrics_row,
+    read_recorded_media_job_usage,
     plan_resubscribe_usage_window,
     plan_subscribe_action,
     plan_tier_change,
@@ -16144,30 +16145,14 @@ async def _start_media_batch(
         estimated_request_tokens=estimated_tokens_total,
     )
 
-    # Report the estimate against the document-upload meter (Stripe +
-    # local api_metrics). Billing WRITES stay fail-open — only estimation
-    # is fail-closed. The admin testing account is never metered; a dev
-    # enforcement-only bypass still is.
+    # The estimate above is what the allotment and rate limit are enforced
+    # against, because a refusal has to happen before anything is spent. It is
+    # NOT what the customer is billed for: the meter event is reported once the
+    # batch finishes, carrying the tokens the upload really consumed (see
+    # ``_meter_upload_when_the_batch_finishes``). An estimate billed up front
+    # charges for work that a failed, cancelled or already-indexed upload never
+    # did, and misses the work a heavier one did do.
     upload_metering_bypass = resolve_metering_bypass(current_user)
-    if not upload_metering_bypass.skips_metering_writes and estimated_tokens_total > 0:
-        try:
-            await report_meter_event(
-                app.state.stripe,
-                UsageMeter.DOCUMENT_UPLOAD_TOKENS,
-                resolve_stripe_customer_id(current_user),
-                estimated_tokens_total,
-            )
-            await persist_api_metrics_row(
-                getattr(app.state, "pool", None),
-                inference_type="document_upload",
-                total_tokens=estimated_tokens_total,
-                user_id=resolve_metering_user_id(current_user),
-                stripe_customer_id=resolve_stripe_customer_id(current_user),
-                assistant_id=assistant_id,
-                meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
-            )
-        except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
-            logger.error("Failed to meter upload usage: %s", upload_metering_error)
 
     store = app.state.store
 
@@ -16280,20 +16265,86 @@ async def _start_media_batch(
             judged_text=str(verdict.get("excerpt") or verdict.get("source") or ""),
         )
 
-    master.task = asyncio.create_task(
-        run_batch_media_job(
-            master,
-            items,
-            config,
-            store,
-            app.state.context,
-            concurrency=max(1, app.state.context.media_processing_concurrency),
-            existing_namespaces=sorted(existing_namespaces),
-            registry=registry,
-            deferred_expanders=deferred_expanders,
-            on_moderation_violation=_ban_uploader_for_violation,
-        )
-    )
+    async def _meter_upload_when_the_batch_finishes() -> None:
+        """Run the batch, then bill the upload for what it actually consumed.
+
+        Every paid call the batch makes writes its own ``api_metrics`` row
+        stamped with the media job that made it, so summing those rows gives the
+        upload's real consumption — the number reported to the document-upload
+        meter and shown to the customer in the billing portal, in place of the
+        pre-upload estimate that used to be billed before any work happened.
+
+        Billing WRITES stay fail-open: a metering failure is logged and never
+        propagated, and the batch's own outcome is already recorded on the jobs.
+        The admin testing account is never metered; a dev enforcement-only
+        bypass still is.
+        """
+        try:
+            await run_batch_media_job(
+                master,
+                items,
+                config,
+                store,
+                app.state.context,
+                concurrency=max(1, app.state.context.media_processing_concurrency),
+                existing_namespaces=sorted(existing_namespaces),
+                registry=registry,
+                deferred_expanders=deferred_expanders,
+                on_moderation_violation=_ban_uploader_for_violation,
+            )
+        finally:
+            if upload_metering_bypass.skips_metering_writes:
+                return
+            try:
+                pool = getattr(app.state, "pool", None)
+                # Playlists and link trees expand into further children while the
+                # batch runs, and each expanded child paid for its own work, so
+                # the master's full child list is what gets summed.
+                recorded_usage = await read_recorded_media_job_usage(
+                    pool, list(master.child_ids) or [master.job_id]
+                )
+                billable_tokens = int(recorded_usage.get("total_tokens") or 0)
+                if billable_tokens <= 0:
+                    # Nothing was processed (every item was already indexed, or
+                    # the batch was cancelled before any vendor call), so there
+                    # is nothing to bill.
+                    logger.info(
+                        "Upload batch %s consumed no vendor tokens; nothing metered.",
+                        master.job_id,
+                    )
+                    return
+                await report_meter_event(
+                    app.state.stripe,
+                    UsageMeter.DOCUMENT_UPLOAD_TOKENS,
+                    resolve_stripe_customer_id(current_user),
+                    billable_tokens,
+                )
+                await persist_api_metrics_row(
+                    pool,
+                    inference_type="document_upload",
+                    prompt_tokens=int(recorded_usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(recorded_usage.get("completion_tokens") or 0),
+                    total_tokens=billable_tokens,
+                    cost_usd=float(recorded_usage.get("cost_usd") or 0.0),
+                    user_id=resolve_metering_user_id(current_user),
+                    stripe_customer_id=resolve_stripe_customer_id(current_user),
+                    assistant_id=assistant_id,
+                    meter_event_name=UsageMeter.DOCUMENT_UPLOAD_TOKENS.value,
+                    media_job_id=master.job_id,
+                )
+                logger.info(
+                    "Upload batch %s billed %d tokens costing $%.6f across %d vendor "
+                    "calls (pre-upload estimate was %d tokens).",
+                    master.job_id,
+                    billable_tokens,
+                    float(recorded_usage.get("cost_usd") or 0.0),
+                    int(recorded_usage.get("call_count") or 0),
+                    estimated_tokens_total,
+                )
+            except Exception as upload_metering_error:  # noqa: BLE001 - non-fatal
+                logger.error("Failed to meter upload usage: %s", upload_metering_error)
+
+    master.task = asyncio.create_task(_meter_upload_when_the_batch_finishes())
 
     # Media now runs as a background job, so per-file indexing failures can
     # no longer be reported synchronously here. The failed-file logic that

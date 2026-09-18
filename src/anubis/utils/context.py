@@ -156,6 +156,11 @@ class GlobalContext:
     model_completion_cost: float = 0.0
     # metadata={"description": "Completion token cost."},
 
+    model_cached_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of one input token served from the prompt cache."},
+
+    model_cache_write_cost: float = 0.0
+    # metadata={"description": "Cost of one input token written into the prompt cache."},
 
     """ </Inference Model> """
 
@@ -188,6 +193,9 @@ class GlobalContext:
     image_model_completion_cost: float = 0.0
     # metadata={"description": "Completion token cost."},
 
+    image_model_cached_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of one image-model input token served from the prompt cache."},
+
     """ </Image Model> """
 
     """ <Llama Model> """
@@ -219,6 +227,12 @@ class GlobalContext:
 
     classification_model_completion_cost: float = 0.0
     # metadata={"description": "Completion token cost."},
+
+    classification_model_cached_prompt_cost: float = 0.0
+    # metadata={"description": "Cost of one classification input token served from the prompt cache."},
+
+    classification_model_cache_write_cost: float = 0.0
+    # metadata={"description": "Cost of one classification input token written into the prompt cache."},
 
     classification_model_base_url: str = field(
         default=None,

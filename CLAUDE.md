@@ -210,7 +210,7 @@ FastAPI app with SSE streaming on `POST /message/{assistant_id}`. The stream ope
 
 ### Model initialization (`src/anubis/utils/model.py`)
 
-`init_model()` dispatches to provider-specific SDK imports lazily based on the `MODEL_PROVIDER` env var — accepted values are `OPEN_AI`, `TOGETHER`, `NVIDIA`, `META` (Llama, via the OpenAI-compatible endpoint). All model providers must be configured via `GlobalContext` fields. Note speech (transcription/diarization) bypasses this and always uses OpenAI directly.
+`init_model()` dispatches to provider-specific SDK imports lazily based on the `MODEL_PROVIDER` env var — accepted values are `OPEN_AI`, `TOGETHER`, `META` (Llama, via the OpenAI-compatible endpoint). All model providers must be configured via `GlobalContext` fields. Note speech (transcription/diarization) bypasses this and always uses OpenAI directly.
 
 ### Observability
 

@@ -15,7 +15,6 @@
 - `langchain-core >= 1.2.16` — messages, runnables, documents
 - `langchain-openai >= 1.1.10` — OpenAI LLM integration
 - `langchain-together >= 0.4.0` — Together AI models
-- `langchain-nvidia-ai-endpoints >= 1.2.1` — NVIDIA NIM endpoints
 - `langchain-huggingface >= 1.2.0` — HuggingFace embeddings
 - `langchain-community >= 0.4.1` — community integrations
 - `langchain-unstructured >= 1.0.1` — document loading

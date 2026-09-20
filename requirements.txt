@@ -9,7 +9,6 @@ langchain-huggingface
 langchain-core
 langchain-openai
 langchain-together
-langchain-nvidia-ai-endpoints
 
 
 llama-api-client

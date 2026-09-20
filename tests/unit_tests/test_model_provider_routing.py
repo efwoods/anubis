@@ -2,7 +2,7 @@
 
 Text inference reads MODEL / LLM_PROVIDER_API_KEY / LLM_PROVIDER_BASE_URL.
 Image description reads IMAGE_MODEL / IMAGE_MODEL_API_KEY / IMAGE_MODEL_BASE_URL.
-NVIDIA's hosted catalog is OpenAI-compatible, so both text and image clients
+META's Llama endpoint is OpenAI-compatible, so both text and image clients
 are ChatOpenAI pointed at LLM_PROVIDER_* / IMAGE_MODEL_*.
 """
 
@@ -14,7 +14,7 @@ class _FakeChatOpenAI:
         self.keyword_arguments = keyword_arguments
 
 
-def test_nvidia_unbound_client_uses_llm_provider_base_url_and_model(monkeypatch):
+def test_meta_unbound_client_uses_llm_provider_base_url_and_model(monkeypatch):
     captured = {}
 
     class CapturingChatOpenAI(_FakeChatOpenAI):
@@ -22,18 +22,18 @@ def test_nvidia_unbound_client_uses_llm_provider_base_url_and_model(monkeypatch)
             captured.update(keyword_arguments)
             super().__init__(**keyword_arguments)
 
-    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
-    monkeypatch.setenv("MODEL", "meta/llama-3.2-11b-vision-instruct")
-    monkeypatch.setenv("LLM_PROVIDER_API_KEY", "nvapi-test")
+    monkeypatch.setenv("MODEL_PROVIDER", "META")
+    monkeypatch.setenv("MODEL", "Llama-4-Maverick-17B-128E-Instruct-FP8")
+    monkeypatch.setenv("LLM_PROVIDER_API_KEY", "llama-test")
     monkeypatch.setenv(
-        "LLM_PROVIDER_BASE_URL", "https://integrate.api.nvidia.com/v1"
+        "LLM_PROVIDER_BASE_URL", "https://api.llama.com/compat/v1/"
     )
     monkeypatch.setattr("langchain_openai.ChatOpenAI", CapturingChatOpenAI)
 
     client = model_module.init_chat_model_unbound()
-    assert captured["model"] == "meta/llama-3.2-11b-vision-instruct"
-    assert captured["api_key"] == "nvapi-test"
-    assert captured["base_url"] == "https://integrate.api.nvidia.com/v1"
+    assert captured["model"] == "Llama-4-Maverick-17B-128E-Instruct-FP8"
+    assert captured["api_key"] == "llama-test"
+    assert captured["base_url"] == "https://api.llama.com/compat/v1/"
     assert captured["stream_usage"] is False
     assert client.keyword_arguments == captured
 
@@ -46,22 +46,20 @@ def test_image_description_client_uses_image_model_knobs(monkeypatch):
             captured.update(keyword_arguments)
             super().__init__(**keyword_arguments)
 
-    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
-    monkeypatch.setenv("IMAGE_MODEL", "meta/llama-3.2-11b-vision-instruct")
-    monkeypatch.setenv("IMAGE_MODEL_API_KEY", "nvapi-test")
-    monkeypatch.setenv(
-        "IMAGE_MODEL_BASE_URL", "https://integrate.api.nvidia.com/v1"
-    )
+    monkeypatch.setenv("MODEL_PROVIDER", "OPEN_AI")
+    monkeypatch.setenv("IMAGE_MODEL", "gpt-5-nano")
+    monkeypatch.setenv("IMAGE_MODEL_API_KEY", "sk-image-test")
+    monkeypatch.setenv("IMAGE_MODEL_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setattr("langchain_openai.ChatOpenAI", CapturingChatOpenAI)
 
     client = model_module.init_image_description_model()
-    assert captured["model"] == "meta/llama-3.2-11b-vision-instruct"
-    assert captured["api_key"] == "nvapi-test"
-    assert captured["base_url"] == "https://integrate.api.nvidia.com/v1"
+    assert captured["model"] == "gpt-5-nano"
+    assert captured["api_key"] == "sk-image-test"
+    assert captured["base_url"] == "https://api.openai.com/v1"
     assert client.keyword_arguments == captured
 
 
-def test_nvidia_unbound_client_is_bare_chat_openai(monkeypatch):
+def test_meta_unbound_client_is_bare_chat_openai(monkeypatch):
     captured = {}
 
     class CapturingChatOpenAI(_FakeChatOpenAI):
@@ -70,17 +68,17 @@ def test_nvidia_unbound_client_is_bare_chat_openai(monkeypatch):
             super().__init__(**keyword_arguments)
 
     monkeypatch.setenv("DEV", "TRUE")
-    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
-    monkeypatch.setenv("MODEL", "meta/llama-3.2-11b-vision-instruct")
-    monkeypatch.setenv("LLM_PROVIDER_API_KEY", "nvapi-test")
+    monkeypatch.setenv("MODEL_PROVIDER", "META")
+    monkeypatch.setenv("MODEL", "Llama-4-Maverick-17B-128E-Instruct-FP8")
+    monkeypatch.setenv("LLM_PROVIDER_API_KEY", "llama-test")
     monkeypatch.setenv(
-        "LLM_PROVIDER_BASE_URL", "https://integrate.api.nvidia.com/v1"
+        "LLM_PROVIDER_BASE_URL", "https://api.llama.com/compat/v1/"
     )
     monkeypatch.setattr("langchain_openai.ChatOpenAI", CapturingChatOpenAI)
 
     client = model_module.init_chat_model_unbound()
     assert isinstance(client, CapturingChatOpenAI)
-    assert captured["model"] == "meta/llama-3.2-11b-vision-instruct"
+    assert captured["model"] == "Llama-4-Maverick-17B-128E-Instruct-FP8"
 
 
 def test_open_ai_unbound_client_is_bare_chat_openai_in_dev(monkeypatch):
@@ -114,8 +112,8 @@ def test_vendor_key_is_refused_is_not_empty_funds():
 
 
 def test_hosted_inference_input_token_limit_follows_model_token_limit(monkeypatch):
-    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
-    monkeypatch.setenv("MODEL", "meta/llama-3.2-90b-vision-instruct")
+    monkeypatch.setenv("MODEL_PROVIDER", "OPEN_AI")
+    monkeypatch.setenv("MODEL", "gpt-5.6-luna")
     monkeypatch.setenv("MODEL_TOKEN_LIMIT", "400000")
     from src.anubis.utils.context import GlobalContext
 
@@ -124,8 +122,8 @@ def test_hosted_inference_input_token_limit_follows_model_token_limit(monkeypatc
 
 
 def test_hosted_inference_input_token_limit_reads_configured_ceiling(monkeypatch):
-    monkeypatch.setenv("MODEL_PROVIDER", "NVIDIA")
-    monkeypatch.setenv("MODEL", "meta/llama-3.2-11b-vision-instruct")
+    monkeypatch.setenv("MODEL_PROVIDER", "OPEN_AI")
+    monkeypatch.setenv("MODEL", "gpt-5.6-luna")
     monkeypatch.setenv("MODEL_TOKEN_LIMIT", "32768")
     from src.anubis.utils.context import GlobalContext
 

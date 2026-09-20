@@ -6,12 +6,12 @@ logger = logging.getLogger(__name__)
 
 import json
 
-# NOTE: ``ChatTogether``, ``ChatNVIDIA``, ``ChatOpenAI``, and ``AsyncLlamaAPIClient``
-# are imported lazily inside the branches that use them.  Eagerly importing all four
-# at module scope adds ~3-4 s to every cold start of any module that transitively
-# imports model.py (notably retrieval_graph.py and graph.py).  Each provider's SDK
-# is only needed for its own ``model_provider`` branch, so the chosen provider pays
-# its import cost on the first model call; the other three SDKs are never loaded.
+# NOTE: ``ChatTogether``, ``ChatOpenAI``, and ``AsyncLlamaAPIClient`` are imported
+# lazily inside the branches that use them.  Eagerly importing all three at module
+# scope adds ~3-4 s to every cold start of any module that transitively imports
+# model.py (notably retrieval_graph.py and graph.py).  Each provider's SDK is only
+# needed for its own ``model_provider`` branch, so the chosen provider pays its
+# import cost on the first model call; the other SDKs are never loaded.
 from contextvars import ContextVar
 from typing import Any, List, Literal, Optional, TypedDict
 
@@ -277,31 +277,6 @@ def init_model(
                 api_key=api_key,
             )
             model = model.with_structured_output(schema=response_format)
-    elif model_provider == "NVIDIA":
-        from langchain_openai import ChatOpenAI
-
-        # OpenAI-compatible endpoint at LLM_PROVIDER_BASE_URL (same pattern as META).
-        if response_format is None:
-            model = ChatOpenAI(
-                model=model_name,
-                base_url=base_url,
-                **openai_sampling_parameters(model_name),
-                api_key=api_key,
-            ).bind_tools(
-                # method='json_schema',
-                tools=tools,
-                tool_choice=tool_choice,  # auto: zero or more tools
-                # strict=True, # model output will be guaranteed to match the schema
-                # include_raw=True # model response (JSON e.g.) and the parsed response (Pydantic e.g.) will be returned
-            )
-        else:
-            model = ChatOpenAI(
-                model=model_name,
-                base_url=base_url,
-                **openai_sampling_parameters(model_name),
-                api_key=api_key,
-            )
-            model = model.with_structured_output(schema=response_format)
     elif model_provider == "META":
         from langchain_openai import ChatOpenAI
 
@@ -386,22 +361,6 @@ def init_chat_model_unbound(context: Optional[GlobalContext] = None):
             model_provider=model_provider, model=model_name
         )
         return together_model
-
-    if model_provider == "NVIDIA":
-        from langchain_openai import ChatOpenAI
-
-        # OpenAI-compatible endpoint at LLM_PROVIDER_BASE_URL (same pattern as META).
-        nvidia_model = ChatOpenAI(
-            model=model_name,
-            base_url=base_url,
-            **openai_sampling_parameters(model_name),
-            api_key=api_key,
-            stream_usage=False,
-        )
-        record_text_inference(
-            model_provider=model_provider, model=model_name
-        )
-        return nvidia_model
 
     msg = f"Unsupported MODEL_PROVIDER for unbound chat model: {model_provider!r}"
     raise ValueError(msg)

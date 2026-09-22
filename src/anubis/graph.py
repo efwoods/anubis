@@ -170,6 +170,11 @@ def _attach_token_usage_metadata(
     prompt_tokens = 0
     completion_tokens = 0
     total_tokens = 0
+    # The part of ``prompt_tokens`` the provider served from its prompt cache,
+    # and the part it wrote into the prompt cache. Both are a breakdown of
+    # ``prompt_tokens``, never an addition to it.
+    cached_prompt_tokens = 0
+    cache_write_tokens = 0
     for message in turn_messages:
         usage = getattr(message, "usage_metadata", None)
         if not usage:
@@ -177,6 +182,9 @@ def _attach_token_usage_metadata(
         prompt_tokens += usage.get("input_tokens") or 0
         completion_tokens += usage.get("output_tokens") or 0
         total_tokens += usage.get("total_tokens") or 0
+        input_token_details = usage.get("input_token_details") or {}
+        cached_prompt_tokens += input_token_details.get("cache_read") or 0
+        cache_write_tokens += input_token_details.get("cache_creation") or 0
     if total_tokens == 0:
         total_tokens = prompt_tokens + completion_tokens
     if total_tokens <= 0:
@@ -186,11 +194,24 @@ def _attach_token_usage_metadata(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "cached_prompt_tokens": cached_prompt_tokens,
+        "cache_write_tokens": cache_write_tokens,
     }
     if context is not None:
-        avatar_response.response_metadata["total_cost"] = (
-            prompt_tokens * float(context.model_prompt_cost or 0.0)
-            + completion_tokens * float(context.model_completion_cost or 0.0)
+        # Priced by ``price_model_token_usage``, the same function every other
+        # model call is priced by, so a token served from the prompt cache is
+        # charged at ``MODEL_CACHED_PROMPT_COST``. Pricing every prompt token at
+        # ``MODEL_PROMPT_COST`` recorded a cached reply at roughly ten times
+        # what the provider billed for the cached stretch.
+        from src.anubis.utils.billing.metering import price_model_token_usage
+
+        avatar_response.response_metadata["total_cost"] = price_model_token_usage(
+            getattr(context, "model", None),
+            context,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
 
@@ -725,6 +746,11 @@ MODERATION_REFUSAL_TEXT = (
 # The node names of the inline moderation branch and the refusal it can route to.
 MODERATE_CONTENT_NODE = "moderate_content_fast"
 REFUSE_FOR_VIOLATION_NODE = "refuse_for_violation"
+# Set in ``configurable`` by a caller that screens the latest human message
+# itself, concurrently with the run (the streaming message endpoint does, so
+# the moderation round trip never delays the first reply token). The inline
+# branch then returns a clean verdict at once instead of screening a second time.
+CONTENT_MODERATION_SCREENED_BY_CALLER_KEY = "content_moderation_screened_by_caller"
 
 
 def moderation_is_skipped(config: RunnableConfig | None) -> bool:
@@ -739,6 +765,76 @@ def moderation_is_skipped(config: RunnableConfig | None) -> bool:
     return bool((config or {}).get("configurable", {}).get("skip_content_moderation"))
 
 
+def moderation_is_screened_by_caller(config: RunnableConfig | None) -> bool:
+    """Whether the caller screens the latest human message concurrently with this run."""
+    return bool(
+        (config or {}).get("configurable", {}).get(
+            CONTENT_MODERATION_SCREENED_BY_CALLER_KEY
+        )
+    )
+
+
+async def screen_message_for_hard_block(
+    message_text: str, context: GlobalContext
+) -> dict | None:
+    """Run the cheap moderation screen and return the ban verdict on a hard block, else ``None``.
+
+    The same screen ``moderate_content_fast`` runs inline, packaged for a caller
+    that runs the screen concurrently with the reply. Fail-open: a screening
+    outage, a disabled flag, or empty text returns ``None``. A "suspect" screen
+    also returns ``None``; the background terms-of-service judge settles it.
+    """
+    from src.anubis.utils.moderation.content_moderation import moderation_flag_enabled
+    from src.anubis.utils.moderation.fast_screen import (
+        FAST_SCREEN_BLOCK,
+        screen_to_verdict,
+    )
+    from src.subgraphs.moderation_graph.graph import (
+        MODERATION_MODE_MESSAGE,
+        moderate_text_with_graph,
+    )
+
+    if not moderation_flag_enabled(
+        getattr(context, "content_moderation_enabled", "TRUE")
+    ):
+        return None
+    if not (message_text or "").strip():
+        return None
+    try:
+        result = await moderate_text_with_graph(
+            message_text, mode=MODERATION_MODE_MESSAGE, context=context
+        )
+    except Exception as moderation_error:  # noqa: BLE001 - fail open, never cost a reply
+        logger.error(
+            "Concurrent content moderation failed (treating as clean): %s",
+            moderation_error,
+        )
+        return None
+    screen = result.get("screen") or {}
+    if screen.get("outcome") != FAST_SCREEN_BLOCK:
+        return None
+    return screen_to_verdict(screen)
+
+
+def build_moderation_refusal_message(verdict: dict, context: GlobalContext) -> AIMessage:
+    """The avatar turn that refuses a message the moderation screen blocked.
+
+    Shared by ``refuse_for_violation`` (the inline gate) and the streaming
+    endpoint's concurrent screen, so both paths say the same thing and stamp
+    the verdict on ``response_metadata`` the same way.
+    """
+    from src.anubis.utils.inbox.appeals import appeal_contact_phrase
+
+    refusal_text = MODERATION_REFUSAL_TEXT.format(
+        appeal_contact=appeal_contact_phrase(context)
+    )
+    return AIMessage(
+        content=refusal_text,
+        id=str(uuid.uuid4()),
+        response_metadata={"moderation_violation": dict(verdict)},
+    )
+
+
 async def moderate_content_fast(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
@@ -748,6 +844,12 @@ async def moderate_content_fast(
     observation, and only the CHEAP screen runs here — one OpenAI moderation call
     that answers in roughly a tenth of a second, underneath two branches that
     already take longer. The turn's critical path is therefore unchanged.
+
+    The streaming message endpoint does not use this branch: the endpoint runs
+    ``screen_message_for_hard_block`` concurrently with the whole run and sets
+    ``CONTENT_MODERATION_SCREENED_BY_CALLER_KEY``, so this branch returns clean at
+    once and the round trip never sits on the join in front of the avatar. The
+    non-streaming path and the bot callers keep this inline gate.
 
     The deep terms-of-service judge deliberately does NOT run here. It reads the
     same message after the reply has streamed (``schedule_background`` in
@@ -779,6 +881,8 @@ async def moderate_content_fast(
     ):
         return {"moderation_response": clean}
     if moderation_is_skipped(config):
+        return {"moderation_response": clean}
+    if moderation_is_screened_by_caller(config):
         return {"moderation_response": clean}
     messages = state.get("messages") or []
     if not messages or not isinstance(messages[-1], HumanMessage):
@@ -835,21 +939,13 @@ async def refuse_for_violation(
     """
     context = runtime.context or GlobalContext()
     verdict = dict((state.get("moderation_response") or {}).get("verdict") or {})
-    from src.anubis.utils.inbox.appeals import appeal_contact_phrase
-
-    appeal_contact = appeal_contact_phrase(context)
-    refusal_text = MODERATION_REFUSAL_TEXT.format(appeal_contact=appeal_contact)
+    refusal = build_moderation_refusal_message(verdict, context)
     try:
         writer = get_stream_writer()
         writer({"type": "moderation_violation", **verdict})
-        writer({"type": "assistant_token", "text": refusal_text})
+        writer({"type": "assistant_token", "text": refusal.content})
     except Exception:  # noqa: BLE001 - outside a graph run there is no stream writer
         pass
-    refusal = AIMessage(
-        content=refusal_text,
-        id=str(uuid.uuid4()),
-        response_metadata={"moderation_violation": verdict},
-    )
     return {"messages": [refusal], "internal_thoughts": [refusal]}
 
 
@@ -1485,9 +1581,24 @@ async def think(
         is_ambient_observation,
         is_speech_observation,
     )
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        minecraft_body_is_enabled,
+        minecraft_body_is_live,
+    )
     from src.anubis.utils.tools.vision.look_tools import (
         build_look_tools,
         should_offer_look_now,
+    )
+
+    # A Mineflayer body can always render the body's own first-person view, so
+    # the view is live for the whole turn no matter what the companion put in
+    # live_shares. The Minecraft companion runs no ambient capture loop
+    # (AMBIENT_CAPTURE_INTERVAL_SECONDS=-1), so look_now is the only way the
+    # avatar sees the world and the avatar decides when seeing matters.
+    minecraft_body_can_peek = minecraft_body_is_enabled(
+        runtime.context
+    ) and minecraft_body_is_live(
+        (config.get("configurable", {}) or {}).get("minecraft_body")
     )
 
     # An ambient observation IS a fresh look — the frame that started this turn
@@ -1526,6 +1637,7 @@ async def think(
             peekable_shares=(config.get("configurable", {}) or {}).get(
                 "peekable_shares"
             ),
+            minecraft_body_can_peek=minecraft_body_can_peek,
         )
     )
 
@@ -1632,12 +1744,22 @@ async def think(
         messages=state.get("messages") or [],
         window=window,
     )
+    # One cache per avatar and audience. The fixed opening stretch of the
+    # prompt is the avatar's, and the creator and the public are given
+    # different learn-information text early in that stretch, so the two
+    # audiences have no prefix to share and are kept in separate caches.
+    from src.anubis.utils.model import prompt_cache_key_for
+
     deep_agent = build_avatar_deep_agent(
         runtime.context,
         checkpointer=checkpointer,
         store=runtime.store,
         extra_tools=extra_tools or None,
         backend=analysis_bundle.backend if analysis_bundle is not None else None,
+        prompt_cache_key=prompt_cache_key_for(
+            state["assistant_state"]["assistant_id"],
+            bool(state.get("user_is_creator")),
+        ),
     )
     # Charts made with ``make_chart`` during this turn are collected on a
     # context variable and attached to the reply after the run.
@@ -1647,6 +1769,11 @@ async def think(
         TurnChartCollector.begin_turn()
     except ImportError:
         pass
+    # Facts announced after a successful new store this turn — never older
+    # learn ToolMessages still sitting in the deep agent's message list.
+    from src.anubis.utils.learning.fact_learned import TurnLearnedFactsCollector
+
+    TurnLearnedFactsCollector.begin_turn()
     try:
         return await _run_avatar_deep_agent_turn(
             state,
@@ -1719,8 +1846,10 @@ async def _attach_post_reply_analysis(
 ) -> None:
     """Attach every token-less enrichment the terminal ``done`` frame reports.
 
-    Go Emotions sentiment, token-usage accounting, and — when the caller asked
-    for ``include_quality_metrics`` — the authenticity comparison against the
+    Go Emotions sentiment, token-usage accounting, learned facts announced
+    this turn after a successful new store (``TurnLearnedFactsCollector``,
+    not a scan of older learn ToolMessages), and — when the caller asked for
+    ``include_quality_metrics`` — the authenticity comparison against the
     target author and the ChatGPT baseline. All of it mutates
     ``final_message.response_metadata`` in place.
 
@@ -1769,7 +1898,10 @@ async def _attach_post_reply_analysis(
     if isinstance(final_message, AIMessage):
         from src.anubis.utils.learning.fact_learned import attach_learned_facts_metadata
 
-        attach_learned_facts_metadata(final_message, state.get("messages") or [])
+        # Facts reach the badge only via ``announce_fact_learned`` (a successful
+        # new store this turn). Parsing ``new_messages`` alone would re-show
+        # older learn ToolMessages still present in the deep agent's list.
+        attach_learned_facts_metadata(final_message, new_messages)
     # Authenticity metrics: score the (already-streamed) reply against the
     # target author + ChatGPT baseline and attach to response_metadata.
     if config.get("configurable", {}).get("include_quality_metrics", False):

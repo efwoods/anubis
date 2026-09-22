@@ -382,8 +382,13 @@ async def test_observe_user_node_records_signals(monkeypatch):
 
     update = await nodes_module.observe_user(state, config, runtime)
 
+    # Only the immediate reading returns inline; the summary, the engagement
+    # counters and the pending marker are recorded on a detached task.
     assert "curiosity" in update["current_user_emotions"]
-    assert "The user is curious." in update["current_conversation_sentiment"]
+    assert "current_conversation_sentiment" not in update
+    from src.anubis.utils.background_tasks import drain_detached_tasks
+
+    await drain_detached_tasks()
     engagement = await load_engagement_record(store, USER, AVATAR)
     assert engagement["message_count"] == 1
     pending = await store.aget(learning_pending_namespace(USER), THREAD)

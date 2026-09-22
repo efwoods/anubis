@@ -230,9 +230,9 @@ def emotion_media_cost_estimate(
         The counts, the unit costs, and the totals, so the settings screen can
         show the owner the arithmetic before spending anything.
     """
-    image_cost = float(getattr(context, "xai_image_cost_per_image_usd", None) or 0.04)
+    image_cost = float(getattr(context, "xai_image_cost_per_image_usd", None) or 0.06)
     video_cost_per_second = float(
-        getattr(context, "xai_video_cost_per_second_usd", None) or 0.08
+        getattr(context, "xai_video_cost_per_second_usd", None) or 0.14
     )
     idle_loop_seconds = int(getattr(context, "xai_idle_loop_duration_seconds", None) or 6)
     stills_usd = still_count * image_cost
@@ -414,9 +414,9 @@ async def generate_emotion_media_for_avatar(
     existing = await repository.list_emotion_assets(assistant_id)
     have = {(asset["emotion"], asset["asset_kind"]) for asset in existing}
 
-    image_cost = float(getattr(context, "xai_image_cost_per_image_usd", None) or 0.04)
+    image_cost = float(getattr(context, "xai_image_cost_per_image_usd", None) or 0.06)
     video_cost_per_second = float(
-        getattr(context, "xai_video_cost_per_second_usd", None) or 0.08
+        getattr(context, "xai_video_cost_per_second_usd", None) or 0.14
     )
 
     still_uris: dict[str, str] = {NEUTRAL_EMOTION: reference_image_data_uri}

@@ -1000,7 +1000,12 @@ def _transcribe_one_segment_path(
     start = time_ns()
     with AudioFileClip(path) as clip:
         duration_seconds = float(clip.duration or 0.0)
-    transcription_cost = duration_seconds * context.audio_transcription_price_per_minute
+    # The configured price is per MINUTE and the clip duration is in SECONDS, so
+    # the duration must be converted before the price applies. Without the
+    # conversion this segment's cost read sixty times the real charge.
+    transcription_cost = (
+        duration_seconds / 60.0
+    ) * context.audio_transcription_price_per_minute
     model = context.audio_transcription_model or "whisper-1"
     optional_arguments: dict = {}
     if language:
@@ -1192,7 +1197,9 @@ async def transcribe_audio(
         ):
             return {
                 "text": "",
-                "file_duration_s": float(preprocessed_audio.get("duration_seconds") or 0.0),
+                "file_duration_s": float(
+                    preprocessed_audio.get("duration_seconds") or 0.0
+                ),
                 "total_cost": 0.0,
                 "latency_ms": 0.0,
                 "model": context.audio_transcription_model or "whisper-1",
@@ -1221,7 +1228,6 @@ async def transcribe_audio(
             os.unlink(path)
         except OSError:
             pass
-
 
 
 def live_voice_transcription_language(context: GlobalContext) -> str | None:
@@ -1542,6 +1548,15 @@ def _diarize_usage_tokens_dict(u: object) -> dict:
 
 
 def _diarize_token_cost(usage_dict: dict, context: GlobalContext) -> float:
+    """Return what one diarization call cost, from the tokens it was billed on.
+
+    ``gpt-4o-transcribe-diarize`` bills audio input tokens and text output
+    tokens — $2.50 and $10.00 per million respectively, which is what
+    ``AUDIO_DIARIZATION_PRICE_PER_MILLION_TOKENS_INPUT`` and ``..._OUTPUT`` hold.
+    Diarizing the audio is the largest charge a media upload makes, so this is
+    the number that decides whether an upload's recorded cost matches the
+    invoice.
+    """
     u = usage_dict or {}
     inp = int(u.get("input_tokens") or 0)
     out = int(u.get("output_tokens") or 0)
@@ -2240,8 +2255,12 @@ async def transcribe_audio_diarize(
             usage_d = _diarize_usage_tokens_dict(usage)
         response_dict["total_cost"] = _diarize_token_cost(usage_d, context)
         if response_dict["total_cost"] == 0 and response_dict.get("duration"):
+            # The fallback estimate applies only when the diarizer reported no
+            # token usage at all. ``duration`` is in SECONDS and the configured
+            # estimate is per MINUTE, so the duration must be converted first.
             response_dict["total_cost"] = (
                 float(response_dict["duration"])
+                / 60.0
                 * context.audio_diarization_estimated_price_per_minute
             )
 
@@ -2321,12 +2340,16 @@ async def load_baseline_features_explainer_model(store: BaseStore):
 
     # Attempt to pull stored model and data from store
     baseline_features_namespace = ("baseline_features_arr_list_str",)
-    baseline_features_model_namespace = ("baseline_features_model_b64_pkl", )
+    baseline_features_model_namespace = ("baseline_features_model_b64_pkl",)
     baseline_features_explainer_namespace = ("baseline_features_explainer_b64_pkl",)
     # basline_features_keyword_namespace = ("basline_features_keyword_namespace", )
-    
-    baseline_features_arr_list_str_ITEM = await store.aget(baseline_features_namespace, key="baseline_features_arr_list_str")
-    baseline_features_arr_list_str = (getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}).get("value", None)
+
+    baseline_features_arr_list_str_ITEM = await store.aget(
+        baseline_features_namespace, key="baseline_features_arr_list_str"
+    )
+    baseline_features_arr_list_str = (
+        getattr(baseline_features_arr_list_str_ITEM, "value", None) or {}
+    ).get("value", None)
 
     baseline_features_model_b64_pkl_ITEM = await store.aget(
         baseline_features_model_namespace, key="baseline_features_model_b64_pkl"
@@ -2337,13 +2360,14 @@ async def load_baseline_features_explainer_model(store: BaseStore):
 
     async def _load_bundled_model_b64() -> str:
         """Read the bundled base64 model pickle from disk and cache it in the store."""
-        async with aiofiles.open(BASELINE_FEATURES_MODEL_PATH, 'rb') as fp:
+        async with aiofiles.open(BASELINE_FEATURES_MODEL_PATH, "rb") as fp:
             model_bytes = await fp.read()
-        model_b64_str = model_bytes.decode('utf-8')
+        model_b64_str = model_bytes.decode("utf-8")
         await store.aput(
             baseline_features_model_namespace,
             key="baseline_features_model_b64_pkl",
-            value={"value": model_b64_str})
+            value={"value": model_b64_str},
+        )
         return model_b64_str
 
     # If the baseline_features_model has not yet been stored, load from disk and store the model:
@@ -2366,7 +2390,11 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     if not baseline_features_arr_list_str:
         baseline_features_arr = load_bundled_baseline_features_arr()
         baseline_features_arr_list_str = json.dumps(baseline_features_arr.tolist())
-        await store.aput(baseline_features_namespace, key="baseline_features_arr_list_str", value={"value":baseline_features_arr_list_str})
+        await store.aput(
+            baseline_features_namespace,
+            key="baseline_features_arr_list_str",
+            value={"value": baseline_features_arr_list_str},
+        )
 
     # Convert from str to np.array
     baseline_features_arr = np.array(json.loads(baseline_features_arr_list_str))
@@ -2378,7 +2406,8 @@ async def load_baseline_features_explainer_model(store: BaseStore):
         await store.aput(
             baseline_features_namespace,
             key="baseline_features_arr_list_str",
-            value={"value": json.dumps(baseline_features_arr.tolist())})
+            value={"value": json.dumps(baseline_features_arr.tolist())},
+        )
 
     # Load the pre-built SHAP explainer (base64 pickle) rather than rebuilding a
     # KernelExplainer (kmeans + repeated model.predict) on every call. Cached in
@@ -2386,18 +2415,22 @@ async def load_baseline_features_explainer_model(store: BaseStore):
     # explainer is missing, unreadable, or predates the current feature vector, we
     # self-heal to a runtime rebuild so inference never breaks.
     baseline_features_explainer_b64_pkl_ITEM = await store.aget(
-        baseline_features_explainer_namespace, key="baseline_features_explainer_b64_pkl")
-    baseline_features_explainer_b64_pkl = (getattr(baseline_features_explainer_b64_pkl_ITEM, "value", None) or {}).get("value", None)
+        baseline_features_explainer_namespace, key="baseline_features_explainer_b64_pkl"
+    )
+    baseline_features_explainer_b64_pkl = (
+        getattr(baseline_features_explainer_b64_pkl_ITEM, "value", None) or {}
+    ).get("value", None)
 
     async def _load_bundled_explainer_b64() -> str:
         """Read the bundled base64 explainer pickle from disk and cache it in the store."""
-        async with aiofiles.open(BASELINE_FEATURES_EXPLAINER_PATH, 'rb') as fp:
+        async with aiofiles.open(BASELINE_FEATURES_EXPLAINER_PATH, "rb") as fp:
             explainer_bytes = await fp.read()
-        explainer_b64_str = explainer_bytes.decode('utf-8')
+        explainer_b64_str = explainer_bytes.decode("utf-8")
         await store.aput(
             baseline_features_explainer_namespace,
             key="baseline_features_explainer_b64_pkl",
-            value={"value": explainer_b64_str})
+            value={"value": explainer_b64_str},
+        )
         return explainer_b64_str
 
     explainer = None
@@ -2410,17 +2443,25 @@ async def load_baseline_features_explainer_model(store: BaseStore):
         # carries a stale-width background/model. Its SHAP background lives at
         # explainer.data.data as an (n_background, F) array; reload the bundled
         # explainer when F no longer matches the current vector.
-        explainer_background = np.asarray(getattr(getattr(explainer, "data", None), "data", np.empty((0, 0))))
-        if explainer_background.ndim != 2 or explainer_background.shape[1] != len(FEATURE_NAMES):
+        explainer_background = np.asarray(
+            getattr(getattr(explainer, "data", None), "data", np.empty((0, 0)))
+        )
+        if explainer_background.ndim != 2 or explainer_background.shape[1] != len(
+            FEATURE_NAMES
+        ):
             baseline_features_explainer_b64_pkl = await _load_bundled_explainer_b64()
-            explainer = pickle.loads(base64.b64decode(baseline_features_explainer_b64_pkl))
+            explainer = pickle.loads(
+                base64.b64decode(baseline_features_explainer_b64_pkl)
+            )
     except Exception:
         # Missing/corrupt/incompatible persisted explainer — rebuild from the
         # current-width model + background so the caller always gets a usable one.
         explainer = None
 
     if explainer is None:
-        explainer = shap.KernelExplainer(model.predict, shap.kmeans(baseline_features_arr, 100))
+        explainer = shap.KernelExplainer(
+            model.predict, shap.kmeans(baseline_features_arr, 100)
+        )
 
     return explainer, model
 

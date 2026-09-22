@@ -53,7 +53,9 @@ def _monthly_boundary_for(year: int, month: int, anchor: datetime) -> datetime:
     or 29) — the same clamping Stripe applies to ``billing_cycle_anchor``.
     """
     last_day_of_month = calendar.monthrange(year, month)[1]
-    return anchor.replace(year=year, month=month, day=min(anchor.day, last_day_of_month))
+    return anchor.replace(
+        year=year, month=month, day=min(anchor.day, last_day_of_month)
+    )
 
 
 def resolve_usage_period_start(
@@ -116,9 +118,12 @@ def resolve_usage_period_end(
     period_start = _coerce_to_utc(period_start)
     if usage_period_days > 0:
         return period_start + timedelta(days=usage_period_days)
-    next_month_year = period_start.year if period_start.month < 12 else period_start.year + 1
+    next_month_year = (
+        period_start.year if period_start.month < 12 else period_start.year + 1
+    )
     next_month = period_start.month + 1 if period_start.month < 12 else 1
     return _monthly_boundary_for(next_month_year, next_month, period_start)
+
 
 async def report_meter_event(
     stripe_client: Any,
@@ -217,16 +222,59 @@ CREATE TABLE IF NOT EXISTS {API_METRICS_TABLE_NAME} (
     total_tokens BIGINT NOT NULL DEFAULT 0,
     cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    meter_event_name TEXT
+    meter_event_name TEXT,
+    media_job_id TEXT,
+    cached_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens BIGINT NOT NULL DEFAULT 0
 );
+"""
+
+# ``media_job_id`` was added after the table shipped, so an existing deployment
+# needs the column added rather than the table created. It names the media job
+# whose processing made the call, which is what lets one upload's real token
+# consumption be summed and reported to Stripe in place of the pre-upload
+# estimate.
+_ADD_API_METRICS_MEDIA_JOB_COLUMN_SQL = f"""
+ALTER TABLE {API_METRICS_TABLE_NAME} ADD COLUMN IF NOT EXISTS media_job_id TEXT;
+"""
+
+# ``cached_prompt_tokens`` and ``cache_write_tokens`` were added after the table
+# shipped. Both are a BREAKDOWN of ``prompt_tokens``, never an addition to it:
+# the provider's prompt count already includes the tokens it served from the
+# prompt cache and the tokens it wrote into the cache. Recording the breakdown
+# is what makes the prompt-cache hit rate readable from the ledger at all —
+# before these columns the counts were read, priced into ``cost_usd`` and then
+# discarded.
+_ADD_API_METRICS_CACHE_COLUMNS_SQL = f"""
+ALTER TABLE {API_METRICS_TABLE_NAME}
+    ADD COLUMN IF NOT EXISTS cached_prompt_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE {API_METRICS_TABLE_NAME}
+    ADD COLUMN IF NOT EXISTS cache_write_tokens BIGINT NOT NULL DEFAULT 0;
+"""
+
+_CREATE_API_METRICS_MEDIA_JOB_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS api_metrics_media_job_idx
+    ON {API_METRICS_TABLE_NAME} (media_job_id);
 """
 
 _INSERT_API_METRICS_SQL = f"""
 INSERT INTO {API_METRICS_TABLE_NAME}
     (id, user_id, stripe_customer_id, assistant_id, thread_id, inference_type,
      model_name, prompt_tokens, completion_tokens, total_tokens, cost_usd,
-     latency_ms, meter_event_name)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+     latency_ms, meter_event_name, media_job_id, cached_prompt_tokens,
+     cache_write_tokens)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+"""
+
+# What one media job actually consumed, summed from the rows its own calls wrote.
+_SUM_API_METRICS_FOR_MEDIA_JOBS_SQL = f"""
+SELECT COALESCE(SUM(prompt_tokens), 0),
+       COALESCE(SUM(completion_tokens), 0),
+       COALESCE(SUM(total_tokens), 0),
+       COALESCE(SUM(cost_usd), 0.0),
+       COUNT(*)
+FROM {API_METRICS_TABLE_NAME}
+WHERE media_job_id = ANY(%s);
 """
 
 
@@ -241,6 +289,9 @@ async def ensure_api_metrics_table(pool: Any) -> None:
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(_CREATE_API_METRICS_TABLE_SQL)
+                await cursor.execute(_ADD_API_METRICS_MEDIA_JOB_COLUMN_SQL)
+                await cursor.execute(_ADD_API_METRICS_CACHE_COLUMNS_SQL)
+                await cursor.execute(_CREATE_API_METRICS_MEDIA_JOB_INDEX_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure api_metrics table exists: %s", table_error)
 
@@ -581,8 +632,15 @@ async def persist_api_metrics_row(
     thread_id: str | None = None,
     model_name: str | None = None,
     meter_event_name: str | None = None,
+    media_job_id: str | None = None,
+    cached_prompt_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> bool:
     """Insert one row into ``api_metrics`` describing a single billed operation.
+
+    ``cached_prompt_tokens`` and ``cache_write_tokens`` are the part of
+    ``prompt_tokens`` the provider served from its prompt cache and wrote into
+    the prompt cache; both default to 0 for an operation with no prompt cache.
 
     Best-effort persistence for observability and invoice reconciliation; returns
     whether the row was written and never raises into the request path.
@@ -594,6 +652,13 @@ async def persist_api_metrics_row(
     mismatch, and usage reads treat Stripe as authoritative precisely because
     this write is the one that can vanish.
     """
+    if pool is None:
+        # Graph-side callers (the media pipeline, the speech helpers, the model
+        # callback) cannot import the web application to reach ``app.state.pool``,
+        # so they pass no pool and the shared one the lifespan published is used.
+        from src.anubis.utils.runtime_handles import get_postgres_pool
+
+        pool = get_postgres_pool()
     if pool is None:
         logger.warning(
             "No database pool available to record an api_metrics row for a %s "
@@ -621,12 +686,326 @@ async def persist_api_metrics_row(
                         float(cost_usd),
                         float(latency_ms),
                         meter_event_name,
+                        media_job_id,
+                        int(cached_prompt_tokens or 0),
+                        int(cache_write_tokens or 0),
                     ),
                 )
         return True
     except Exception as insert_error:  # noqa: BLE001 - non-fatal metering
         logger.error("Could not persist api_metrics row: %s", insert_error)
         return False
+
+
+# Which ``api_metrics.inference_type`` a media-processing model call is recorded
+# as, chosen by the graph node that made the call. A node with no entry here is
+# recorded under its own name, so a new analysis node shows up in the ledger as
+# itself rather than disappearing into a catch-all.
+MEDIA_PROCESSING_INFERENCE_TYPES = {
+    "convert_media_list_to_text_document": "media_conversion",
+    "index_docs": "document_indexing",
+    "deep_judge": "moderation",
+    "fast_screen": "moderation",
+    "process_adapter_documents": "adapter_dataset",
+}
+
+
+def media_processing_inference_type(node_name: str | None) -> str:
+    """Return the ``inference_type`` for a model call made by a media graph node."""
+    node = str(node_name or "").strip()
+    if not node:
+        return "media_processing"
+    if node in MEDIA_PROCESSING_INFERENCE_TYPES:
+        return MEDIA_PROCESSING_INFERENCE_TYPES[node]
+    if node.startswith("analyze_"):
+        return "psychological_analysis"
+    return node
+
+
+def build_api_metrics_callback_handler() -> Any:
+    """Return a LangChain callback handler that records model calls in ``api_metrics``.
+
+    This is the one place every model call in the application passes through
+    (``init_model`` attaches the handler to each model it builds), which is what
+    makes the recorded cost of a media upload match the vendor's invoice. Before
+    it, an upload's model calls — classification, dialogue segmentation,
+    first-person rewriting, characteristic extraction, the twelve
+    psycho-analysis dimensions, the moderation judgement — were paid for and
+    recorded nowhere: on 2026-09-17 one account's uploads cost about $9 at the
+    vendors while ``api_metrics`` recorded $0.38.
+
+    A call is recorded when its run carries ``media_job_id``, which the media job
+    stamps on the graph's configurable. A chat reply is deliberately left alone:
+    the message endpoint already writes that row together with its Stripe meter
+    event, and recording the reply twice would overstate every per-message cost
+    the billing portal and the unit-economics tools report.
+
+    The handler is built lazily because importing ``langchain_core`` at module
+    scope costs seconds of cold start (see the import rule in ``CLAUDE.md``).
+    """
+    from langchain_core.callbacks.base import AsyncCallbackHandler
+
+    class ApiMetricsCallbackHandler(AsyncCallbackHandler):
+        """Write one ``api_metrics`` row per model call made for a media job."""
+
+        raise_error = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            # Run metadata arrives on the start event and the token usage on the
+            # end event, so the start event's metadata is held by run id until
+            # its end event arrives.
+            self._metadata_by_run: dict[str, dict[str, Any]] = {}
+
+        async def on_chat_model_start(
+            self, serialized: Any, messages: Any, **kwargs: Any
+        ) -> None:
+            self._remember_run(kwargs)
+
+        async def on_llm_start(
+            self, serialized: Any, prompts: Any, **kwargs: Any
+        ) -> None:
+            self._remember_run(kwargs)
+
+        def _remember_run(self, kwargs: dict[str, Any]) -> None:
+            run_id = str(kwargs.get("run_id") or "")
+            if not run_id:
+                return
+            metadata = kwargs.get("metadata") or {}
+            if metadata.get("media_job_id"):
+                self._metadata_by_run[run_id] = dict(metadata)
+
+        async def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+            self._metadata_by_run.pop(str(kwargs.get("run_id") or ""), None)
+
+        async def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+            metadata = self._metadata_by_run.pop(str(kwargs.get("run_id") or ""), None)
+            if not metadata:
+                return
+            try:
+                from src.anubis.utils.context import GlobalContext
+
+                context = GlobalContext()
+                for reading in _model_call_token_readings(response):
+                    cost_usd = price_model_token_usage(
+                        reading["model_name"],
+                        context,
+                        prompt_tokens=reading["prompt_tokens"],
+                        completion_tokens=reading["completion_tokens"],
+                        cached_prompt_tokens=reading["cached_prompt_tokens"],
+                        cache_write_tokens=reading["cache_write_tokens"],
+                    )
+                    await persist_api_metrics_row(
+                        None,
+                        inference_type=media_processing_inference_type(
+                            metadata.get("langgraph_node")
+                        ),
+                        prompt_tokens=reading["prompt_tokens"],
+                        completion_tokens=reading["completion_tokens"],
+                        total_tokens=reading["prompt_tokens"]
+                        + reading["completion_tokens"],
+                        cost_usd=cost_usd,
+                        user_id=metadata.get("user_id"),
+                        assistant_id=metadata.get("assistant_id"),
+                        model_name=reading["model_name"],
+                        media_job_id=str(metadata.get("media_job_id")),
+                        cached_prompt_tokens=reading["cached_prompt_tokens"],
+                        cache_write_tokens=reading["cache_write_tokens"],
+                    )
+            except Exception as recording_error:  # noqa: BLE001 - never break a run
+                logger.warning(
+                    "Could not record a media-processing model call: %s",
+                    recording_error,
+                )
+
+    return ApiMetricsCallbackHandler()
+
+
+def _model_call_token_readings(result: Any) -> list[dict[str, Any]]:
+    """Pull per-generation token counts and the model name out of an LLMResult.
+
+    LangChain reports usage in two places and neither is universal:
+    ``usage_metadata`` on the generation's message (provider-independent, and the
+    only place the cached-token detail appears) and ``llm_output["token_usage"]``
+    (only some OpenAI client paths). The per-generation reading is preferred and
+    the aggregate is the fallback.
+    """
+    llm_output = getattr(result, "llm_output", None) or {}
+    fallback_model = llm_output.get("model_name") or llm_output.get("model")
+    readings: list[dict[str, Any]] = []
+    for generation_list in getattr(result, "generations", None) or []:
+        for generation in generation_list or []:
+            message = getattr(generation, "message", None)
+            usage_metadata = getattr(message, "usage_metadata", None) or {}
+            if not usage_metadata:
+                continue
+            input_details = usage_metadata.get("input_token_details") or {}
+            response_metadata = getattr(message, "response_metadata", None) or {}
+            readings.append(
+                {
+                    "model_name": response_metadata.get("model_name")
+                    or response_metadata.get("model")
+                    or fallback_model,
+                    "prompt_tokens": int(usage_metadata.get("input_tokens") or 0),
+                    "completion_tokens": int(usage_metadata.get("output_tokens") or 0),
+                    "cached_prompt_tokens": int(input_details.get("cache_read") or 0),
+                    "cache_write_tokens": int(input_details.get("cache_creation") or 0),
+                }
+            )
+    if readings:
+        return readings
+    aggregate_usage = llm_output.get("token_usage") or {}
+    if not aggregate_usage:
+        return []
+    cached_tokens = (aggregate_usage.get("prompt_tokens_details") or {}).get(
+        "cached_tokens"
+    ) or 0
+    return [
+        {
+            "model_name": fallback_model,
+            "prompt_tokens": int(aggregate_usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(aggregate_usage.get("completion_tokens") or 0),
+            "cached_prompt_tokens": int(cached_tokens),
+            "cache_write_tokens": 0,
+        }
+    ]
+
+
+def resolve_model_token_prices(
+    model_name: str | None, context: Any
+) -> tuple[float, float, float, float]:
+    """Return ``(prompt, completion, cached prompt, cache write)`` prices per token.
+
+    Prices come from ``GlobalContext`` — never a hard-coded rate — so a vendor
+    price change is an env edit. The comparison is case-insensitive and
+    prefix-based because a provider reports a dated model name
+    (``gpt-5.4-nano-2026-03-17``) for a model configured without the date. An
+    unrecognized model name falls back to the inference model's prices, which
+    keeps an unknown model's spend visible: a wrong rate is recoverable
+    arithmetic, a silent zero is not.
+    """
+    requested = str(model_name or "").casefold()
+
+    def names_match(configured: Any) -> bool:
+        configured_name = str(configured or "").casefold()
+        if not configured_name or not requested:
+            return False
+        return requested.startswith(configured_name) or configured_name.startswith(
+            requested
+        )
+
+    def price(field_name: str) -> float:
+        return float(getattr(context, field_name, 0.0) or 0.0)
+
+    if names_match(getattr(context, "image_model", None)):
+        return (
+            price("image_model_prompt_cost"),
+            price("image_model_completion_cost"),
+            price("image_model_cached_prompt_cost"),
+            0.0,
+        )
+    if names_match(getattr(context, "classification_model", None)):
+        return (
+            price("classification_model_prompt_cost"),
+            price("classification_model_completion_cost"),
+            price("classification_model_cached_prompt_cost"),
+            price("classification_model_cache_write_cost"),
+        )
+    if names_match(getattr(context, "llama_model", None)):
+        return (
+            price("llama_model_prompt_cost"),
+            price("llama_model_completion_cost"),
+            0.0,
+            0.0,
+        )
+    return (
+        price("model_prompt_cost"),
+        price("model_completion_cost"),
+        price("model_cached_prompt_cost"),
+        price("model_cache_write_cost"),
+    )
+
+
+def price_model_token_usage(
+    model_name: str | None,
+    context: Any,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cached_prompt_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
+    """Return what one model call cost, in United States dollars.
+
+    ``prompt_tokens`` is the provider's total input count, which already
+    *includes* the cached and cache-written tokens, so those two are subtracted
+    before the uncached rate applies and then billed at their own rates. Prompt
+    caching is not a rounding error: on 2026-09-17 cache writes were the largest
+    single line of the inference model's invoice, and pricing every input token
+    at the uncached rate is how a recorded cost drifts from the invoice.
+    """
+    prompt_price, completion_price, cached_price, cache_write_price = (
+        resolve_model_token_prices(model_name, context)
+    )
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
+    cached_prompt_tokens = max(0, int(cached_prompt_tokens or 0))
+    cache_write_tokens = max(0, int(cache_write_tokens or 0))
+    uncached_prompt_tokens = max(
+        0, prompt_tokens - cached_prompt_tokens - cache_write_tokens
+    )
+    return (
+        uncached_prompt_tokens * prompt_price
+        + cached_prompt_tokens * cached_price
+        + cache_write_tokens * cache_write_price
+        + completion_tokens * completion_price
+    )
+
+
+async def read_recorded_media_job_usage(
+    pool: Any, media_job_ids: Sequence[str]
+) -> dict[str, Any]:
+    """Return what the named media jobs actually consumed, summed from their rows.
+
+    Every paid call a media job makes writes its own ``api_metrics`` row stamped
+    with the job's id, so the sum of those rows is the upload's real consumption
+    — the number reported to the Stripe meter in place of the pre-upload
+    estimate, and the number the billing portal then shows the customer.
+    Best-effort: an unreadable sum returns zeros, and the caller falls back to
+    the estimate rather than billing nothing.
+    """
+    empty_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "call_count": 0,
+    }
+    job_ids = [str(job_id) for job_id in media_job_ids if job_id]
+    if not job_ids:
+        return empty_usage
+    if pool is None:
+        from src.anubis.utils.runtime_handles import get_postgres_pool
+
+        pool = get_postgres_pool()
+    if pool is None:
+        return empty_usage
+    try:
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(_SUM_API_METRICS_FOR_MEDIA_JOBS_SQL, (job_ids,))
+                row = await cursor.fetchone()
+    except Exception as sum_error:  # noqa: BLE001 - non-fatal accounting read
+        logger.error("Could not sum api_metrics rows for a media job: %s", sum_error)
+        return empty_usage
+    if not row:
+        return empty_usage
+    return {
+        "prompt_tokens": int(row[0] or 0),
+        "completion_tokens": int(row[1] or 0),
+        "total_tokens": int(row[2] or 0),
+        "cost_usd": float(row[3] or 0.0),
+        "call_count": int(row[4] or 0),
+    }
 
 
 async def report_adapter_training_usage(

@@ -275,6 +275,7 @@ def build_look_tools(
     conversation_has_scene_observations: bool = False,
     may_control_shares: bool = False,
     peekable_shares: Any = None,
+    minecraft_body_can_peek: bool = False,
 ) -> list[Any]:
     """Build the ``look_now`` tool for a turn where looking could matter.
 
@@ -307,9 +308,23 @@ def build_look_tools(
         the desktop when the owner granted a desktop peek and the browser is
         holding that grant. Absent from a client that does not report it, which
         is read as "the camera, when the avatar may control shares".
+    :param minecraft_body_can_peek: Whether a Mineflayer body reported standing
+        in the world on this turn. A Minecraft body has no browser and no
+        conversation partner deciding what to share: the companion can always
+        render the body's own first-person view on demand, so the view counts
+        as live for the whole turn and ``look_now`` attaches whatever the
+        ``live_shares`` field says. The Minecraft companion runs no ambient
+        capture loop, so this tool is the only way the avatar sees the world,
+        and the avatar decides when seeing the world matters.
     :returns: The tools for this turn, or ``[]`` when looking could never matter.
     """
     live = normalize_live_shares(live_shares)
+    # The Minecraft first-person view rides the ``screen`` source, the source
+    # name the companion attaches the raycast JPEG under. Adding the source
+    # here rather than trusting the companion's ``live_shares`` field keeps the
+    # tool attached on a turn that reports no field at all.
+    if minecraft_body_can_peek and SOURCE_SCREEN not in live:
+        live = normalize_live_shares(list(live) + [SOURCE_SCREEN])
     # What can be opened for a single look and closed again. The camera rides a
     # standing browser permission, so a granted camera reopens without asking.
     # The desktop cannot: no browser lets a page call getDisplayMedia without a
@@ -335,7 +350,11 @@ def build_look_tools(
     async def look_now(sources: list[str] | None = None, reason: str = "") -> dict:
         """Take one fresh look at what the conversation partner is sharing right now.
 
-        {sharing_line} Ambient vision describes a shared webcam or screen on an
+        The LIVE_SHARES section of the system prompt names what is being
+        shared at this moment, what can be opened for a single look and closed
+        again, and what cannot be seen at all; read that section rather than
+        assuming a source is in view, and call this tool to find out when the
+        LIVE_SHARES section is not there. Ambient vision describes a shared webcam or screen on an
         interval, but an ambient description can be minutes old and a scene
         changes; this takes a new look this instant and reports what is not
         being shared as not being shared.
@@ -536,46 +555,16 @@ def build_look_tools(
             ),
         }
 
-    # The docstring is what the model reads to decide whether to call the tool,
-    # so the sources that are actually live are named in it rather than left as
-    # a general description of the capability.
-    # What the model reads to decide whether to call the tool has to say, per
-    # source, whether that view can be had at all — shared already, openable
-    # for one look, or out of reach. A single sentence about "what is being
-    # shared" left the avatar unable to tell a desktop it may glance at from a
-    # desktop it cannot see.
-    availability = []
-    for source in LOOKABLE_SOURCES:
-        purpose = SOURCE_PURPOSE[source]
-        if source in live:
-            availability.append(f"{source} ({purpose}) is being shared right now")
-        elif source in openable:
-            availability.append(
-                f"{source} ({purpose}) is not being shared, but the conversation "
-                "partner has allowed this avatar to open it for a single look "
-                "and close it again, which is what asking for it does"
-            )
-        elif source == SOURCE_SCREEN:
-            availability.append(
-                f"{source} ({purpose}) cannot be seen — asking for it puts a "
-                "button in front of the conversation partner instead of taking "
-                "a look"
-            )
-        else:
-            availability.append(f"{source} ({purpose}) cannot be seen at all")
-    if live or openable:
-        sharing_line = "Right now: " + "; ".join(availability) + "."
-    else:
-        sharing_line = (
-            "Right now the conversation partner is sharing NOTHING — no camera "
-            "and no desktop — and neither can be opened for a look. This "
-            "conversation holds descriptions of a camera or a desktop from "
-            "earlier, and calling this is how to confirm that none of them is "
-            "what is in view now."
-        )
-    look_now.description = (look_now.description or "").replace(
-        "{sharing_line}", sharing_line
-    )
+    # The tool description is deliberately the SAME TEXT on every turn. What is
+    # live, what is openable and what is out of reach is per-turn state, and a
+    # tool description is the first thing in an OpenAI request: rewriting the
+    # description each turn moved the request's first tokens and threw away the
+    # cached prefix for the whole system prompt behind the description. The
+    # per-turn state is in the LIVE_SHARES section of the system prompt (see
+    # ``build_live_shares_block``), which names each source, whether that source
+    # is shared, openable or out of reach, and what asking for an unshared
+    # desktop does. The tool answers with the same facts when the tool runs.
+
     if not may_control_shares:
         return [look_now]
 

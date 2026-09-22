@@ -40,21 +40,35 @@ def test_the_tool_is_attached_when_the_body_is_live():
     assert [tool.name for tool in tools] == [ACT_IN_MINECRAFT_TOOL_NAME]
 
 
-def test_the_tool_description_carries_the_snapshot_and_the_closed_list():
+def test_the_tool_description_carries_the_closed_list_but_not_the_snapshot():
+    """The closed command list is fixed; the world snapshot is not.
+
+    A tool description opens an OpenAI request, and the cached rate applies
+    only to the longest identical opening stretch. Interpolating a snapshot
+    that changes every play tick moved those opening tokens every turn and
+    discarded the cached prefix for the whole system prompt behind them, so
+    the snapshot reaches the model through the MINECRAFT_BODY prompt section
+    instead and the description reads the same on every turn.
+    """
+    world = "position: 26.5, 73.0, -120.5\nheld: dark_oak_log"
     description = build_minecraft_body_tools(
-        None,
-        minecraft_body=True,
-        minecraft_world="position: 26.5, 73.0, -120.5\nheld: dark_oak_log",
+        None, minecraft_body=True, minecraft_world=world
     )[0].description
-    assert "position: 26.5, 73.0, -120.5" in description
-    assert "held: dark_oak_log" in description
-    assert "<MINECRAFT_WORLD>" in description
     for name in MINECRAFT_PLAY_COMMAND_NAMES:
         assert f"!{name}(" in description
     assert "Mineflayer" not in description
     assert "JSON" not in description
     assert "{minecraft_world}" not in description
     assert "{command_list}" not in description
+    assert "position: 26.5, 73.0, -120.5" not in description
+    assert description == build_minecraft_body_tools(
+        None, minecraft_body=True, minecraft_world="position: 0, 64, 0"
+    )[0].description
+    # The snapshot still reaches the model, in the section rebuilt each turn.
+    block = build_minecraft_body_block(world_snapshot=world, tool_is_attached=True)
+    assert "position: 26.5, 73.0, -120.5" in block
+    assert "held: dark_oak_log" in block
+    assert "<MINECRAFT_WORLD>" in block
 
 
 def test_the_consciousness_block_holds_the_snapshot_not_a_human_message():

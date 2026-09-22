@@ -51,7 +51,13 @@ def think_app(monkeypatch):
     )
 
     def fake_builder(
-        context, *, checkpointer=None, store=None, extra_tools=None, backend=None
+        context,
+        *,
+        checkpointer=None,
+        store=None,
+        extra_tools=None,
+        backend=None,
+        prompt_cache_key=None,
     ):
         return _build_fake_agent(checkpointer)
 

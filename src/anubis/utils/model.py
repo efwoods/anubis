@@ -28,6 +28,39 @@ from src.anubis.utils.tokenizer import count_tokens
 # their raw structured output leaks into the chat (e.g. interleaved fact-correction JSON).
 STRUCTURED_OUTPUT_STREAM_TAG = "structured_output_no_user_stream"
 
+# One handler instance per process is enough: it holds only the in-flight runs'
+# metadata, keyed by run id, and every model this module builds reports through
+# it. Built on first use so ``langchain_core``'s callback module is not imported
+# at module scope.
+_api_metrics_callback_handler: Any = None
+
+
+def attach_api_metrics_recorder(model: Any) -> Any:
+    """Return ``model`` with the api_metrics recorder attached to its callbacks.
+
+    Every model built here reports its token usage through one handler, which is
+    what lets a media upload's real cost reach ``api_metrics`` and, through it,
+    the Stripe meter the billing portal reads. A model that cannot take a config
+    is returned unchanged rather than failing the call: accounting must never
+    break inference.
+    """
+    global _api_metrics_callback_handler
+    try:
+        if _api_metrics_callback_handler is None:
+            from src.anubis.utils.billing.metering import (
+                build_api_metrics_callback_handler,
+            )
+
+            _api_metrics_callback_handler = build_api_metrics_callback_handler()
+        return model.with_config(callbacks=[_api_metrics_callback_handler])
+    except Exception as attach_error:  # noqa: BLE001 - accounting is never fatal
+        logger.warning(
+            "Could not attach the api_metrics recorder to a model; this call's "
+            "usage will not be recorded: %s",
+            attach_error,
+        )
+        return model
+
 def hosted_inference_input_token_limit(context: GlobalContext | None = None) -> int:
     """The input-token ceiling from ``MODEL_TOKEN_LIMIT`` (default 400000)."""
     context = context or GlobalContext()
@@ -188,7 +221,19 @@ def init_model(
     tool_choice: str = "auto",
     response_format=None,
     model_without_tools: Optional[bool] = False,
+    *,
+    structured_output_on_inference_model: bool = False,
 ):
+    """Build the chat model for one call.
+
+    ``structured_output_on_inference_model`` routes a structured-output call to
+    the text inference model (``MODEL``, gpt-5.6-luna) instead of the
+    classification model (``CLASSIFICATION_MODEL``, gpt-5-nano, meant for image
+    classification). Text summaries set the flag: the inference model answers
+    with ``reasoning_effort="none"`` (see ``openai_sampling_parameters``), while
+    the classification model spends its default reasoning effort before
+    answering, which cost seconds per conversation sentiment summary.
+    """
 
     context = GlobalContext()
     model_name = context.model
@@ -213,16 +258,26 @@ def init_model(
     if response_format is not None:
         from langchain_openai import ChatOpenAI
 
-        model = ChatOpenAI(
-            model=context.classification_model,
-            base_url=context.classification_model_base_url,
-            temperature=0.1,
-            api_key=context.classification_model_api_key,
-        )
+        if structured_output_on_inference_model:
+            model = ChatOpenAI(
+                model=model_name,
+                base_url=base_url,
+                **openai_sampling_parameters(model_name),
+                api_key=api_key,
+            )
+        else:
+            model = ChatOpenAI(
+                model=context.classification_model,
+                base_url=context.classification_model_base_url,
+                temperature=0.1,
+                api_key=context.classification_model_api_key,
+            )
         model = model.with_structured_output(schema=response_format)
         # Tag so the streaming layer never forwards this call's tokens to the user as
         # ``assistant_token`` — structured output is internal JSON, not a reply.
-        return model.with_config(tags=[STRUCTURED_OUTPUT_STREAM_TAG])
+        return attach_api_metrics_recorder(
+            model.with_config(tags=[STRUCTURED_OUTPUT_STREAM_TAG])
+        )
 
     if model_provider == "OPEN_AI":
         from langchain_openai import ChatOpenAI
@@ -306,10 +361,49 @@ def init_model(
         model_provider=context.model_provider,
         model=context.model,
     )
-    return model
+    return attach_api_metrics_recorder(model)
 
 
-def init_chat_model_unbound(context: Optional[GlobalContext] = None):
+#: Values of ``PROMPT_CACHE_KEY_ENABLED`` that switch the cache key on.
+PROMPT_CACHE_KEY_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def prompt_cache_key_is_enabled(context: GlobalContext | None = None) -> bool:
+    """Whether requests may carry a ``prompt_cache_key``.
+
+    OpenAI caches the longest identical opening stretch of a request and
+    charges that stretch at the cached rate. A ``prompt_cache_key`` routes
+    every request carrying the same key to the same cache, which is what keeps
+    one avatar's long fixed prefix warm across the conversations of different
+    people talking to that avatar. The switch exists so a deployment on a
+    provider that rejects the field can turn the field off without a code
+    change; the default is on.
+    """
+    context = context or GlobalContext()
+    raw = getattr(context, "prompt_cache_key_enabled", None)
+    if raw is None or str(raw).strip() == "":
+        return True
+    return str(raw).strip().lower() in PROMPT_CACHE_KEY_ENABLED_VALUES
+
+
+def prompt_cache_key_for(assistant_id: Any, user_is_creator: bool) -> str:
+    """Name the cache an avatar's requests should share.
+
+    The avatar decides almost all of the fixed prefix, so the avatar's own
+    identifier is the key. Whether the person talking is the avatar's creator
+    is part of the key because the creator and the public are given different
+    learn-information text, high up in the prompt, which makes the two
+    prefixes diverge early and gives them no cache to share.
+    """
+    audience = "creator" if user_is_creator else "public"
+    return f"anubis:{assistant_id or 'unknown'}:{audience}"
+
+
+def init_chat_model_unbound(
+    context: GlobalContext | None = None,
+    *,
+    prompt_cache_key: str | None = None,
+):
     """Return a raw `BaseChatModel` instance for the configured provider, with no tools bound.
 
     The deep agent (`create_deep_agent`) needs an unbound chat model so it can
@@ -329,10 +423,23 @@ def init_chat_model_unbound(context: Optional[GlobalContext] = None):
     if model_provider == "OPEN_AI" or model_provider == "META":
         from langchain_openai import ChatOpenAI
 
+        sampling_parameters = openai_sampling_parameters(model_name)
+        # Sent to the real OpenAI endpoint only: an OpenAI-compatible provider
+        # may refuse a parameter the provider does not implement, and a refused
+        # parameter fails the whole call rather than being ignored.
+        if (
+            model_provider == "OPEN_AI"
+            and prompt_cache_key
+            and prompt_cache_key_is_enabled(context)
+        ):
+            sampling_parameters["model_kwargs"] = {
+                "prompt_cache_key": prompt_cache_key
+            }
+
         openai_model = ChatOpenAI(
             model=model_name,
             base_url=base_url,
-            **openai_sampling_parameters(model_name),
+            **sampling_parameters,
             api_key=api_key,
             # Include token usage on the final streamed chunk so per-turn
             # usage_metadata reaches the metering layer (Stripe billing meters,

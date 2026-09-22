@@ -148,6 +148,7 @@ def build_avatar_deep_agent(
     checkpointer: Any | None = None,
     store: Any | None = None,
     backend: Any | None = None,
+    prompt_cache_key: str | None = None,
 ):
     """Construct the avatar's deep agent.
 
@@ -175,13 +176,18 @@ def build_avatar_deep_agent(
             capability passes a ``CompositeBackend`` (local-shell workspace
             + per-user-per-avatar ``StoreBackend`` routes) built by
             ``src.anubis.utils.tools.data_analysis.backend.build_analysis_backend``.
+        prompt_cache_key: Optional name of the OpenAI prompt cache this
+            avatar's requests share, from ``prompt_cache_key_for``. Requests
+            carrying one key are routed to one cache, which keeps the
+            avatar's long fixed prompt prefix warm across the conversations
+            of different people talking to that avatar.
 
     Returns:
         A compiled deep-agent graph.
     """
     context = context or GlobalContext()
 
-    model = init_chat_model_unbound(context)
+    model = init_chat_model_unbound(context, prompt_cache_key=prompt_cache_key)
 
     # ``create_deep_agent`` installs its own ``SummarizationMiddleware`` (via
     # ``deepagents.middleware.summarization.create_summarization_middleware``).

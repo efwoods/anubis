@@ -177,10 +177,17 @@ def render_immediate_sentiment(sentiment: dict[str, Any] | None) -> str:
 
 
 async def invoke_structured(response_format: type[BaseModel], system_prompt: str, human_text: str):
-    """Run one structured-output model call. Isolated so tests can replace this."""
+    """Run one structured-output model call on the text inference model.
+
+    Isolated so tests can replace the call. Summaries of conversation text run
+    on the inference model (gpt-5.6-luna), not the classification model, which
+    is reserved for image classification.
+    """
     from src.anubis.utils.model import init_model
 
-    model = init_model(response_format=response_format)
+    model = init_model(
+        response_format=response_format, structured_output_on_inference_model=True
+    )
     return await model.ainvoke(
         [SystemMessage(content=system_prompt), HumanMessage(content=human_text)]
     )

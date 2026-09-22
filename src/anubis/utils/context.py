@@ -162,6 +162,9 @@ class GlobalContext:
     model_cache_write_cost: float = 0.0
     # metadata={"description": "Cost of one input token written into the prompt cache."},
 
+    prompt_cache_key_enabled: str = None
+    # metadata={"description": "TRUE to send a per-avatar prompt_cache_key so one avatar's requests share one OpenAI prompt cache. Empty or unset means TRUE; set FALSE for a provider that rejects the field."},
+
     """ </Inference Model> """
 
     """ <Image Model> """
@@ -2241,7 +2244,14 @@ class GlobalContext:
     conversation_sentiment_per_turn_enabled: str = field(
         default="TRUE",
         metadata={
-            "description": "TRUE to refresh the structured sentiment summary of the current conversation on every user turn (one classification-model call per turn). Env CONVERSATION_SENTIMENT_PER_TURN_ENABLED."
+            "description": "TRUE to refresh the structured sentiment summary of the current conversation on every user turn (one inference-model call per turn, run on a detached task after the observation node returns, so the reply never waits for the call). Env CONVERSATION_SENTIMENT_PER_TURN_ENABLED."
+        },
+    )
+
+    observe_user_inline_emotion_budget_milliseconds: int = field(
+        default=150,
+        metadata={
+            "description": "How long the observe_user node waits for the Go Emotions reading of the latest message before the avatar starts, in milliseconds. A reading that misses the budget is left out of this turn's prompt; every other observation signal is recorded on a detached task and never delays the reply. Env OBSERVE_USER_INLINE_EMOTION_BUDGET_MILLISECONDS."
         },
     )
 
@@ -2943,7 +2953,7 @@ class GlobalContext:
     )
 
     baseline_response_threshold: float = field(
-        default=43.04826020370271,
+        default=50.28996962457905,
         metadata={
             "description": "Pre-calculated IQR threshold for the empirical representation of the squared mahalanobis distances of the features presented from the unmodified chatgpt responses using a leave-one-out method. Recalibrated and written back by scripts/retrain_chatgpt_baseline.py whenever the inference model is upgraded, and by data/build_baseline_features_arr.py whenever the feature vector changes (current: 28-wide v4 vector)."
         }

@@ -58,7 +58,7 @@ def think_app(monkeypatch):
     monkeypatch.setattr(
         graph_mod,
         "build_avatar_deep_agent",
-        lambda context, *, checkpointer=None, store=None, extra_tools=None, backend=None: _build_fake_agent(
+        lambda context, *, checkpointer=None, store=None, extra_tools=None, backend=None, prompt_cache_key=None: _build_fake_agent(
             checkpointer
         ),
     )
@@ -152,7 +152,7 @@ async def test_think_parallel_interrupts_then_resume_cancel(think_app, monkeypat
     monkeypatch.setattr(
         graph_mod,
         "build_avatar_deep_agent",
-        lambda context, *, checkpointer=None, store=None, extra_tools=None, backend=None: _build_parallel(
+        lambda context, *, checkpointer=None, store=None, extra_tools=None, backend=None, prompt_cache_key=None: _build_parallel(
             checkpointer
         ),
     )

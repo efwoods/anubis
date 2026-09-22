@@ -223,7 +223,9 @@ CREATE TABLE IF NOT EXISTS {API_METRICS_TABLE_NAME} (
     cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     meter_event_name TEXT,
-    media_job_id TEXT
+    media_job_id TEXT,
+    cached_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens BIGINT NOT NULL DEFAULT 0
 );
 """
 
@@ -236,6 +238,20 @@ _ADD_API_METRICS_MEDIA_JOB_COLUMN_SQL = f"""
 ALTER TABLE {API_METRICS_TABLE_NAME} ADD COLUMN IF NOT EXISTS media_job_id TEXT;
 """
 
+# ``cached_prompt_tokens`` and ``cache_write_tokens`` were added after the table
+# shipped. Both are a BREAKDOWN of ``prompt_tokens``, never an addition to it:
+# the provider's prompt count already includes the tokens it served from the
+# prompt cache and the tokens it wrote into the cache. Recording the breakdown
+# is what makes the prompt-cache hit rate readable from the ledger at all —
+# before these columns the counts were read, priced into ``cost_usd`` and then
+# discarded.
+_ADD_API_METRICS_CACHE_COLUMNS_SQL = f"""
+ALTER TABLE {API_METRICS_TABLE_NAME}
+    ADD COLUMN IF NOT EXISTS cached_prompt_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE {API_METRICS_TABLE_NAME}
+    ADD COLUMN IF NOT EXISTS cache_write_tokens BIGINT NOT NULL DEFAULT 0;
+"""
+
 _CREATE_API_METRICS_MEDIA_JOB_INDEX_SQL = f"""
 CREATE INDEX IF NOT EXISTS api_metrics_media_job_idx
     ON {API_METRICS_TABLE_NAME} (media_job_id);
@@ -245,8 +261,9 @@ _INSERT_API_METRICS_SQL = f"""
 INSERT INTO {API_METRICS_TABLE_NAME}
     (id, user_id, stripe_customer_id, assistant_id, thread_id, inference_type,
      model_name, prompt_tokens, completion_tokens, total_tokens, cost_usd,
-     latency_ms, meter_event_name, media_job_id)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+     latency_ms, meter_event_name, media_job_id, cached_prompt_tokens,
+     cache_write_tokens)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
 """
 
 # What one media job actually consumed, summed from the rows its own calls wrote.
@@ -273,6 +290,7 @@ async def ensure_api_metrics_table(pool: Any) -> None:
             async with connection.cursor() as cursor:
                 await cursor.execute(_CREATE_API_METRICS_TABLE_SQL)
                 await cursor.execute(_ADD_API_METRICS_MEDIA_JOB_COLUMN_SQL)
+                await cursor.execute(_ADD_API_METRICS_CACHE_COLUMNS_SQL)
                 await cursor.execute(_CREATE_API_METRICS_MEDIA_JOB_INDEX_SQL)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure api_metrics table exists: %s", table_error)
@@ -615,8 +633,14 @@ async def persist_api_metrics_row(
     model_name: str | None = None,
     meter_event_name: str | None = None,
     media_job_id: str | None = None,
+    cached_prompt_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> bool:
     """Insert one row into ``api_metrics`` describing a single billed operation.
+
+    ``cached_prompt_tokens`` and ``cache_write_tokens`` are the part of
+    ``prompt_tokens`` the provider served from its prompt cache and wrote into
+    the prompt cache; both default to 0 for an operation with no prompt cache.
 
     Best-effort persistence for observability and invoice reconciliation; returns
     whether the row was written and never raises into the request path.
@@ -663,6 +687,8 @@ async def persist_api_metrics_row(
                         float(latency_ms),
                         meter_event_name,
                         media_job_id,
+                        int(cached_prompt_tokens or 0),
+                        int(cache_write_tokens or 0),
                     ),
                 )
         return True
@@ -783,6 +809,8 @@ def build_api_metrics_callback_handler() -> Any:
                         assistant_id=metadata.get("assistant_id"),
                         model_name=reading["model_name"],
                         media_job_id=str(metadata.get("media_job_id")),
+                        cached_prompt_tokens=reading["cached_prompt_tokens"],
+                        cache_write_tokens=reading["cache_write_tokens"],
                     )
             except Exception as recording_error:  # noqa: BLE001 - never break a run
                 logger.warning(

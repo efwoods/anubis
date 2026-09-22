@@ -90,11 +90,23 @@ def test_a_browser_that_can_narrate_gets_the_tool_either_way(state):
     assert [tool.name for tool in tools] == [SET_SCENE_NARRATION_TOOL_NAME]
 
 
-def test_the_tool_tells_the_avatar_which_way_the_switch_is_set():
+def test_the_prompt_section_tells_the_avatar_which_way_the_switch_is_set():
+    # Which way the switch is set is per-turn state, so the state is in the
+    # prompt section rather than in the tool description: a description is the
+    # first thing in an OpenAI request, and one that changes per turn throws
+    # away the cached prefix for everything behind it.
+    from src.anubis.utils.tools.vision.accessibility_tools import (
+        build_scene_narration_block,
+    )
+
+    assert "Scene narration is ON right now" in build_scene_narration_block("on")
+    assert "Scene narration is OFF right now" in build_scene_narration_block("off")
+    # A client that cannot narrate at all is told nothing about narration.
+    assert build_scene_narration_block("") == ""
+
     on = build_scene_narration_tools(None, scene_narration="on")[0].description
     off = build_scene_narration_tools(None, scene_narration="off")[0].description
-    assert "Scene narration is ON right now" in on
-    assert "Scene narration is OFF right now" in off
+    assert on == off
     assert "{state_line}" not in on and "{state_line}" not in off
 
 
@@ -599,11 +611,20 @@ def test_the_tool_tells_the_model_the_pace_it_is_changing_from():
     class _Context:
         scene_narration_min_interval_seconds = 3.0
 
+    from src.anubis.utils.tools.vision.accessibility_tools import (
+        build_scene_narration_block,
+    )
+
     tool = build_scene_narration_tools(
         _Context(), scene_narration="on", scene_narration_seconds=8
     )[0]
-    # 8 is not one of the five, so the avatar is told the one it is actually on.
-    assert "every 10 seconds" in tool.description
+    # 8 is not one of the five, so the avatar is told the one it is actually
+    # on. The current pace moves from turn to turn, so the pace is in the
+    # prompt section; the five choices never move, so the five stay in the
+    # description the model reads when it decides what to ask for.
+    block = build_scene_narration_block("on", 8)
+    assert "every 10 seconds" in block
+    assert "every 5, 10, 15, 30 or 60 seconds" in block
     assert "every 5, 10, 15, 30 or 60 seconds" in tool.description
     # Faster means shorter as well as more often, and the model has to know
     # that or "more often" produces readings that overrun their own gap.

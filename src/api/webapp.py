@@ -163,6 +163,7 @@ from src.api.look_context import LookContext, LookContextRegistry
 from src.api.message_stops import (
     AMBIENT_BUSY_RETRY_AFTER_SECONDS,
     STOP_REQUESTED,
+    STOPPED_REPLY_GRAPH_NODE,
     STREAM_ENDED,
     ActiveMessageTurnRegistry,
     GraphStreamPump,
@@ -593,23 +594,24 @@ async def _measure_system_prompt_tokens_for_request(
     """Return the MEASURED token estimate of this request's real system prompt.
 
     Reads the process-wide estimate cache first (populated every time
-    ``load_consciousness`` builds the prompt); on a miss or stale entry the
-    REAL prompt is built through ``build_system_prompt_text_for_estimation``
-    (store reads only — no model call, and the build records a fresh cache
-    entry as a side effect) and measured with the same word-ratio arithmetic.
-    Raises on any failure — the caller treats estimation as fail-closed.
+    ``load_consciousness`` builds the prompt). An entry of ANY age is used: a
+    stale entry is still a measurement of this pair's real prompt, and this
+    turn's own ``load_consciousness`` records a fresh one moments later.
+    Rebuilding the prompt here on a stale entry put the whole
+    ``load_consciousness`` store fan-out in front of the reply a second time,
+    on the first message after every pause. Only when nothing was ever
+    measured for this (user, avatar) pair is the REAL prompt built through
+    ``build_system_prompt_text_for_estimation`` (store reads only — no model
+    call, and the build records a fresh cache entry as a side effect) and
+    measured with the same word-ratio arithmetic. Raises on any failure of that
+    build — the caller treats estimation as fail-closed.
     """
-    context = GlobalContext()
     configurable = (estimation_config or {}).get("configurable") or {}
     user_id = configurable.get("user_id")
     assistant_id = configurable.get("assistant_id")
     if user_id and assistant_id:
         cached_estimate = fetch_system_prompt_token_estimate(
-            user_id,
-            assistant_id,
-            max_age_seconds=float(
-                context.system_prompt_token_estimate_cache_ttl_seconds or 0
-            ),
+            user_id, assistant_id, max_age_seconds=float("inf")
         )
         if cached_estimate is not None:
             return cached_estimate
@@ -740,6 +742,10 @@ async def _meter_message_usage(
         token_usage = (response_metadata or {}).get("token_usage") or {}
         prompt_tokens = int(token_usage.get("prompt_tokens") or 0)
         completion_tokens = int(token_usage.get("completion_tokens") or 0)
+        # The part of prompt_tokens served from, and written into, the
+        # provider's prompt cache (see ``_attach_token_usage_metadata``).
+        cached_prompt_tokens = int(token_usage.get("cached_prompt_tokens") or 0)
+        cache_write_tokens = int(token_usage.get("cache_write_tokens") or 0)
         total_tokens = billable_tokens_from_metadata(response_metadata)
         # langchain_openai stamps model_name on the streamed reply; other providers
         # may not, so fall back to the configured model rather than dropping the
@@ -748,6 +754,24 @@ async def _meter_message_usage(
             getattr(app_state, "context", None), "model", None
         )
         cost_usd = float((response_metadata or {}).get("total_cost") or 0.0)
+        if cost_usd <= 0.0 and total_tokens > 0:
+            # A stopped or disconnected reply carries estimated token counts but
+            # no ``total_cost``, and the provider still billed the prompt. Price
+            # the estimate through ``price_model_token_usage``, the same function
+            # ``_attach_token_usage_metadata`` (graph.py) prices a finished reply
+            # with, so the spend ledger does not record a paid turn as $0.00. An
+            # estimate carries no cache breakdown, so every prompt token is
+            # priced at the uncached rate.
+            from src.anubis.utils.billing.metering import price_model_token_usage
+
+            cost_usd = price_model_token_usage(
+                model_name,
+                getattr(app_state, "context", None),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_prompt_tokens=cached_prompt_tokens,
+                cache_write_tokens=cache_write_tokens,
+            )
 
         stripe_customer_id = resolve_stripe_customer_id(current_user)
         tier = resolve_tier(current_user)
@@ -812,6 +836,8 @@ async def _meter_message_usage(
                 thread_id=thread_id,
                 model_name=model_name,
                 meter_event_name=meter.value,
+                cached_prompt_tokens=cached_prompt_tokens,
+                cache_write_tokens=cache_write_tokens,
             )
             # Stripe accepted the usage but the local ledger did not record it:
             # the two ledgers have just diverged for this customer, permanently
@@ -1404,6 +1430,170 @@ async def _finalize_stopped_turn(
     return done
 
 
+# Graph nodes whose completion is reported in a turn's ``latency_breakdown_ms``:
+# every node that runs before the avatar's first token.
+LATENCY_TRACKED_GRAPH_NODES = frozenset(
+    {
+        "chat",
+        "resolve_human_message_images",
+        "observe_user",
+        "moderate_content_fast",
+        "join_user_observation",
+        "ambient_triage",
+        "mcp_auto_adopt",
+        "load_consciousness",
+    }
+)
+
+# How long a finished reply waits for a concurrent moderation screen that has
+# not answered yet before the message is treated as clean (fail-open). The
+# screen normally answers in about a tenth of a second, well before the reply
+# finishes, so this bound is reached only when the moderation endpoint stalls.
+CONTENT_MODERATION_CONCURRENT_SCREEN_WAIT_SECONDS = 5.0
+
+
+async def _concurrent_screen_hard_block_verdict(
+    concurrent_screen_task: "asyncio.Task | None", *, wait: bool
+) -> dict | None:
+    """Return the concurrent moderation screen's hard-block verdict, or ``None``.
+
+    With ``wait`` false only a finished screen is read (the stream loop woke on
+    a stop and needs to know whether moderation caused the stop). With ``wait``
+    true the screen is awaited, bounded by ``CONTENT_MODERATION_CONCURRENT_SCREEN_WAIT_SECONDS``:
+    the reply has finished, and the refusal must still replace the reply if the
+    screen blocks. The screen almost always finished long before, because the
+    moderation endpoint answers in about a tenth of a second and the avatar's
+    first token takes longer. Never raises; a screen that failed or timed out
+    is treated as clean (fail-open, like the inline screen).
+    """
+    if concurrent_screen_task is None:
+        return None
+    if not concurrent_screen_task.done():
+        if not wait:
+            return None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(concurrent_screen_task),
+                timeout=CONTENT_MODERATION_CONCURRENT_SCREEN_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Concurrent moderation screen did not answer within %.0f s; "
+                "treating the message as clean",
+                CONTENT_MODERATION_CONCURRENT_SCREEN_WAIT_SECONDS,
+            )
+            return None
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise
+            return None
+        except Exception:  # noqa: BLE001 - fail open, see docstring
+            return None
+    if concurrent_screen_task.cancelled() or concurrent_screen_task.exception():
+        return None
+    screen_verdict = concurrent_screen_task.result()
+    return screen_verdict if isinstance(screen_verdict, dict) else None
+
+
+async def _finalize_refused_turn(
+    moderation_verdict: dict,
+    *,
+    partial_text: str,
+    replaced_reply: AIMessage | None,
+    graph,
+    config: dict,
+    app_state,
+    current_user: Optional[dict],
+    thread_id: str,
+    assistant_id: str,
+    user_id: str,
+    conversation_title_value: str | None,
+    request_id: str,
+    langgraph_client_headers: dict,
+    estimated_prompt_tokens: int,
+    start_time_ns: int,
+) -> tuple[dict, dict]:
+    """Close out a turn the concurrent moderation screen blocked.
+
+    The refusal replaces whatever the avatar produced: a reply stopped
+    mid-stream is discarded (never kept, unlike a person's Stop), and a reply
+    that finished before the screen answered (``replaced_reply``) is removed
+    from the thread. The refusal is written as the ``anubis`` node's output,
+    exactly where the inline gate's ``refuse_for_violation`` leaves the refusal.
+    Returns the ``done`` frame and the ``response_metadata`` to meter: the
+    finished reply's actual usage when one exists, otherwise the estimate for
+    the partial reply, because the model still ran. The ban itself is recorded
+    by the screen's completion callback, so the ban lands even when the client
+    has already disconnected.
+    """
+    from langchain_core.messages import RemoveMessage
+
+    from src.anubis.graph import build_moderation_refusal_message
+
+    refusal = build_moderation_refusal_message(
+        moderation_verdict, getattr(app_state, "context", None) or GlobalContext()
+    )
+    thread_messages_update: list[Any] = []
+    if replaced_reply is not None and getattr(replaced_reply, "id", None):
+        thread_messages_update.append(RemoveMessage(id=replaced_reply.id))
+    thread_messages_update.append(refusal)
+    try:
+        await graph.aupdate_state(
+            config, {"messages": thread_messages_update}, as_node=STOPPED_REPLY_GRAPH_NODE
+        )
+    except Exception:  # noqa: BLE001 - the refusal frame must still reach the client
+        logger.warning(
+            "Could not record the moderation refusal on thread %s",
+            thread_id,
+            exc_info=True,
+        )
+    try:
+        langgraph_client = get_client(headers=langgraph_client_headers)
+        await _write_thread_metadata(
+            langgraph_client,
+            thread_id,
+            _thread_metadata_updates(
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                conversation_title_value=conversation_title_value,
+            ),
+        )
+    except Exception:  # noqa: BLE001 - metadata is a convenience, the refusal is not
+        logger.warning(
+            "Could not update thread %s metadata after a moderation refusal",
+            thread_id,
+            exc_info=True,
+        )
+
+    replaced_reply_metadata = (
+        getattr(replaced_reply, "response_metadata", None) or {}
+        if replaced_reply is not None
+        else {}
+    )
+    if replaced_reply_metadata.get("token_usage"):
+        metering_metadata = dict(replaced_reply_metadata)
+    else:
+        metering_metadata = build_stopped_reply_metadata(
+            partial_text,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            model_name=getattr(getattr(app_state, "context", None), "model", None),
+            stopped_by="moderation",
+        )
+    done: dict = {
+        "type": "done",
+        "content": refusal.content,
+        "thread_id": thread_id,
+        "request_id": request_id,
+        "message_id": refusal.id,
+        "total_response_time_ms": (time_ns() - start_time_ns) // 1_000_000,
+        "response_metadata": dict(refusal.response_metadata),
+        "moderation": {"banned": True, **moderation_verdict},
+    }
+    return done, metering_metadata
+
+
 async def _finalize_disconnected_turn(
     pump: GraphStreamPump,
     partial_text: str,
@@ -1660,6 +1850,17 @@ async def message_graph_sse(
     last_ai: AIMessage | None = None
     ambient_decision: dict | None = None
     moderation_verdict: dict | None = None
+    # Milliseconds from the request's arrival to each stage of the turn, so the
+    # stage that delays the first token is named instead of guessed. Each stage
+    # is recorded the first time the stage is reached and reported on ``done``
+    # as ``latency_breakdown_ms``.
+    latency_milestones_ms: dict[str, int] = {}
+
+    def record_latency_milestone(milestone_name: str) -> None:
+        if milestone_name not in latency_milestones_ms:
+            latency_milestones_ms[milestone_name] = (
+                time_ns() - start_time_ns
+            ) // 1_000_000
 
     # The turn is registered before anything is sent so that
     # ``POST /message/{assistant_id}/stop`` can find it from the moment the
@@ -1734,6 +1935,39 @@ async def message_graph_sse(
                 turn_registry.unregister(request_id)
             raise
 
+    # AI monitoring, stage one, runs BESIDE the reply rather than in front of it.
+    # The moderation round trip used to sit on the graph's join before the
+    # avatar started, so every turn paid for the round trip before the first
+    # token. Now the screen starts at the same moment as the graph run and the
+    # graph's own inline screen is told to stand down. A hard block stops the
+    # run (the same wake the Stop button uses), the refusal replaces whatever
+    # was streamed, and the screen's completion callback records the ban. A
+    # resume carries no new words and an ambient observation carries no typed
+    # words, so neither is screened here; callers re-entering with words that
+    # are not the account holder's own set ``skip_content_moderation``.
+    concurrent_screen_task: asyncio.Task | None = None
+    moderation_hard_block_verdict: dict | None = None
+    if resume_command is None and not ambient and human_message is not None:
+        from src.anubis.graph import (
+            CONTENT_MODERATION_SCREENED_BY_CALLER_KEY,
+            moderation_is_skipped,
+            screen_message_for_hard_block,
+        )
+
+        if not moderation_is_skipped(config):
+            concurrent_screen_task = asyncio.create_task(
+                screen_message_for_hard_block(
+                    _message_text_for_moderation(human_message), context
+                )
+            )
+            config = {
+                **config,
+                "configurable": {
+                    **(config.get("configurable") or {}),
+                    CONTENT_MODERATION_SCREENED_BY_CALLER_KEY: True,
+                },
+            }
+
     # The graph is drained on the pump's own task and consumed here through a
     # queue, so a stop request can wake this generator between frames and the
     # graph run can be cancelled from outside it (see ``message_stops``).
@@ -1754,8 +1988,34 @@ async def message_graph_sse(
             subgraphs=True,
         )
     )
+    record_latency_milestone("graph_started")
     if active_turn is not None:
         active_turn.attach_wake(pump.request_stop)
+    if concurrent_screen_task is not None:
+
+        def _on_concurrent_screen_finished(finished_screen_task: asyncio.Task) -> None:
+            """Stop the run and record the ban when the concurrent screen hard-blocked."""
+            record_latency_milestone("moderation_screen_finished")
+            if finished_screen_task.cancelled() or finished_screen_task.exception():
+                return
+            screen_verdict = finished_screen_task.result()
+            if not isinstance(screen_verdict, dict):
+                return
+            pump.request_stop()
+            # The ban runs on its own task: the stream must not wait on the
+            # Stripe refund, and the ban must land even if the client left.
+            if app_state is not None and current_user is not None:
+                schedule_background(
+                    complete_and_record_moderation_verdict(
+                        app_state,
+                        ban_subject_from_user(current_user, request_hashed_ip),
+                        screen_verdict,
+                        source="message",
+                        judged_text=_message_text_for_moderation(human_message),
+                    )
+                )
+
+        concurrent_screen_task.add_done_callback(_on_concurrent_screen_finished)
     stopped_by_user = False
     disconnected = False
     stopped_turn_arguments = dict(
@@ -1783,13 +2043,22 @@ async def message_graph_sse(
             if item is STREAM_ENDED:
                 break
             if item is STOP_REQUESTED:
-                stopped_by_user = True
+                # A stop is either the person's (the stop route) or the
+                # concurrent moderation screen's hard block; the block wins.
+                moderation_hard_block_verdict = (
+                    await _concurrent_screen_hard_block_verdict(
+                        concurrent_screen_task, wait=False
+                    )
+                )
+                if moderation_hard_block_verdict is None:
+                    stopped_by_user = True
                 break
             if not isinstance(item, tuple) or len(item) != 3:
                 continue
             _ns, mode, payload = item
             if mode == "custom" and isinstance(payload, dict):
                 if payload.get("type") == "assistant_token":
+                    record_latency_milestone("first_token")
                     accumulated_chunks.append(payload.get("text") or "")
                     yield f"data: {json.dumps(payload)}\n\n"
                 elif payload.get("type") == "status":
@@ -1862,9 +2131,18 @@ async def message_graph_sse(
                             request_id=request_id,
                         )
             elif mode == "updates" and isinstance(payload, dict):
+                for updated_node_name in payload:
+                    if updated_node_name in LATENCY_TRACKED_GRAPH_NODES:
+                        record_latency_milestone(f"{updated_node_name}_finished")
                 ai = _latest_ai_from_stream_update(payload)
                 if ai is not None:
                     last_ai = ai
+        if not stopped_by_user and moderation_hard_block_verdict is None:
+            # The reply finished before the screen answered: a hard block now
+            # still replaces the finished reply with the refusal.
+            moderation_hard_block_verdict = await _concurrent_screen_hard_block_verdict(
+                concurrent_screen_task, wait=True
+            )
     except (asyncio.CancelledError, GeneratorExit):
         # The client went away mid-reply (tab closed, network dropped, or the
         # browser aborted the fetch because the stop route was unreachable).
@@ -1906,8 +2184,46 @@ async def message_graph_sse(
         # A run that ended on its own (or failed) is over now; a stopped run is
         # marked once the pump has been closed and the record written, and a
         # disconnected one by the background finalizer.
-        if active_turn is not None and not disconnected and not stopped_by_user:
+        if (
+            active_turn is not None
+            and not disconnected
+            and not stopped_by_user
+            and moderation_hard_block_verdict is None
+        ):
             active_turn.mark_finished()
+
+    if moderation_hard_block_verdict is not None:
+        # The concurrent screen blocked this message. Wind the run down, put
+        # the refusal on the thread in place of the reply, and end the stream
+        # with the refusal as ``done.content`` (the client adopts ``done.content``
+        # as the record, replacing any streamed preview). Metering runs after
+        # the frame, as for a stopped turn.
+        await pump.aclose()
+        try:
+            refused_done, refused_metering_metadata = await _finalize_refused_turn(
+                moderation_hard_block_verdict,
+                partial_text="".join(accumulated_chunks),
+                replaced_reply=last_ai,
+                **stopped_turn_arguments,
+            )
+        finally:
+            if active_turn is not None:
+                active_turn.mark_finished()
+        refused_done["run_id"] = langsmith_run_id
+        yield f"data: {json.dumps({'type': 'moderation_violation', **moderation_hard_block_verdict}, default=str)}\n\n"
+        yield f"data: {json.dumps(refused_done, default=str)}\n\n"
+        schedule_background(
+            _meter_stopped_turn(
+                refused_metering_metadata,
+                app_state=app_state,
+                current_user=current_user,
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                request_id=request_id,
+                start_time_ns=start_time_ns,
+            )
+        )
+        return
 
     if stopped_by_user:
         # The person pressed Stop. Cancel the graph run, keep whatever the
@@ -1998,6 +2314,13 @@ async def message_graph_sse(
         done["ambient"] = ambient_decision
     if moderation_verdict is not None:
         done["moderation"] = {"banned": True, **moderation_verdict}
+    record_latency_milestone("done")
+    done["latency_breakdown_ms"] = dict(latency_milestones_ms)
+    logger.info(
+        "Message turn %s latency breakdown (ms since request): %s",
+        request_id,
+        latency_milestones_ms,
+    )
 
     # Always accrue actual model API usage BEFORE the terminal frame. Reporting
     # the usage block on ``done`` is optional (``include_usage_metrics``);
@@ -2675,6 +2998,14 @@ async def lifespan(app: FastAPI):
 
     app.state.browser_session_keepalive = asyncio.create_task(
         browser_sessions_module.keepalive_forever(app.state.context, None)
+    )
+    # Load the Go Emotions pipeline on a worker thread now, so the first reply
+    # after a restart finds the pipeline in memory instead of paying seconds of
+    # model loading inside observe_user's inline budget and post-reply analysis.
+    from src.anubis.utils.emotion_classifier import warm_go_emotions_classifier
+
+    app.state.go_emotions_warm_up_task = asyncio.create_task(
+        asyncio.to_thread(warm_go_emotions_classifier)
     )
     try:
         from src.anubis.utils import analytics as analytics_package
@@ -14053,6 +14384,7 @@ async def transcribe_recording(
         await persist_api_metrics_row(
             app.state.pool,
             inference_type="transcription",
+            cost_usd=float(result.get("total_cost") or 0.0),
             latency_ms=(time.perf_counter() - started) * 1000.0,
             user_id=current_user["identities"][0]["user_id"],
             assistant_id=assistant_id,

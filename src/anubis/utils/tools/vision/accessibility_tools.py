@@ -145,6 +145,49 @@ def _tell_the_browser(payload: dict) -> None:
         logger.debug("%s frame not delivered", payload.get("type"), exc_info=True)
 
 
+def build_scene_narration_block(
+    scene_narration: Any, scene_narration_seconds: Any = None
+) -> str:
+    """Build the ``<SCENE_NARRATION>`` section of the system prompt.
+
+    Which way the accessibility switch is set right now, and how often a
+    reading currently arrives, are what the avatar has to know before it
+    answers a request to start narrating, to stop, or to change the pace —
+    without them the avatar switches on a mode that is already on, or
+    announces a change the avatar did not make. Both facts live in this
+    section rather than in the ``set_scene_narration`` description, because a
+    tool description opens an OpenAI request and a description rewritten every
+    turn costs the request its cached prefix.
+
+    :param scene_narration: The ``scene_narration`` field the browser reported
+        this turn — ``on`` or ``off``; anything else means the client cannot
+        narrate at all.
+    :param scene_narration_seconds: How often the browser is reading the scene
+        out right now, when the browser reported a pace.
+    :returns: The section, or ``""`` for a client that cannot narrate.
+    """
+    state = normalize_scene_narration_state(scene_narration)
+    if state == NARRATION_UNSUPPORTED:
+        return ""
+    pace_seconds = normalize_narration_seconds(scene_narration_seconds)
+    lines = [
+        "Scene narration is ON right now: the scene is being described to the "
+        "conversation partner continuously."
+        if state == NARRATION_ON
+        else "Scene narration is OFF right now."
+    ]
+    if pace_seconds is not None:
+        lines.append(f"A reading arrives every {pace_seconds:g} seconds.")
+    lines.append(
+        "The paces available are every "
+        + ", ".join(f"{option:g}" for option in NARRATION_PACE_OPTIONS[:-1])
+        + f" or {SLOWEST_NARRATION_SECONDS:g} seconds, and nothing in between. "
+        "Call set_scene_narration to start narrating, to stop, or to change "
+        "the pace; do not announce a change without calling it."
+    )
+    return "\n<SCENE_NARRATION>\n" + "\n".join(lines) + "\n</SCENE_NARRATION>\n"
+
+
 def build_scene_narration_tools(
     context: Any, *, scene_narration: Any, scene_narration_seconds: Any = None
 ) -> list[Any]:
@@ -171,7 +214,11 @@ def build_scene_narration_tools(
     ) -> dict:
         """Switch continuous scene narration on or off.
 
-        {state_line} Scene narration is the accessibility mode: while it is on, the
+        Whether narration is on right now, and how often a reading arrives,
+        is in the SCENE_NARRATION section of the system prompt; read that
+        section before answering a request to start, stop or change the pace,
+        so the mode is never announced as changed when the mode already reads
+        that way. Scene narration is the accessibility mode: while it is on, the
         conversation partner's camera is pointed at whatever is in front of
         them, the scene is described every few seconds, and each description is
         read aloud to them. It is built for a conversation partner who cannot
@@ -194,7 +241,13 @@ def build_scene_narration_tools(
         tell them the mode changed.
 
         Also call this, with enabled=true, to change HOW OFTEN the
-        conversation partner is told what is in view. {pace_line} Asking for
+        conversation partner is told what is in view. The paces available are
+        every 5, 10, 15, 30 or 60 seconds, and nothing in between — a value
+        between two of them is taken as the nearer one. A faster pace also
+        makes each reading SHORTER, down to a single clause about the one thing
+        that matters most, so ask for faster when the conversation partner
+        needs to keep up with somewhere they are moving through and slower when
+        they want the fuller picture. Asking for
         more often, faster, more detail as they move, or saying the gaps are
         too long means a SMALLER every_seconds; less often, slower, quieter,
         too much talking, or wanting room to think means a LARGER one. Change
@@ -282,33 +335,11 @@ def build_scene_narration_tools(
             ),
         }
 
-    # What the model reads has to say which way the switch is currently set:
-    # without it the avatar answers "please start describing" by calling the
-    # tool that is already on, or announces a change it did not make.
-    state_line = (
-        "Scene narration is ON right now: the scene is being described to the "
-        "conversation partner continuously."
-        if narrating_now
-        else "Scene narration is OFF right now."
-    )
-    pace_line = (
-        (
-            f"Right now a reading arrives every {pace_seconds:g} seconds. "
-            if pace_seconds is not None
-            else ""
-        )
-        + "The paces available are every "
-        + ", ".join(f"{option:g}" for option in NARRATION_PACE_OPTIONS[:-1])
-        + f" or {SLOWEST_NARRATION_SECONDS:g} seconds, and nothing in between — "
-        "a value between two of them is taken as the nearer one. A faster pace "
-        "also makes each reading SHORTER, down to a single clause about the one "
-        "thing that matters most, so ask for faster when the conversation "
-        "partner needs to keep up with somewhere they are moving through and "
-        "slower when they want the fuller picture."
-    )
-    set_scene_narration.description = (
-        (set_scene_narration.description or "")
-        .replace("{state_line}", state_line)
-        .replace("{pace_line}", pace_line)
-    )
+    # The description is deliberately the SAME TEXT on every turn. Which way
+    # the switch is set and how fast the readings arrive are per-turn state,
+    # and a tool description opens an OpenAI request: rewriting the description
+    # each turn moves the request's first tokens and throws away the cached
+    # prefix for the whole system prompt behind the description. The per-turn
+    # state reaches the model in the ``<SCENE_NARRATION>`` prompt section
+    # instead (see ``build_scene_narration_block``).
     return [set_scene_narration]

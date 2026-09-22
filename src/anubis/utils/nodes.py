@@ -34,7 +34,6 @@ from src.anubis.utils.learning.feedback import (
 from src.anubis.utils.learning.sentiment import (
     classify_user_message_sentiment,
     message_text,
-    render_conversation_sentiment,
     render_immediate_sentiment,
     update_current_conversation_sentiment,
 )
@@ -348,22 +347,160 @@ def _flag_enabled(value: object, default: bool = True) -> bool:
     return str(value).strip().upper() == "TRUE"
 
 
+# Summary updates for one conversation are serialized in-process, so two turns
+# sent in quick succession do not both read the same previous summary and have
+# the slower of the two overwrite the faster one's result. Keyed by thread id,
+# each entry holds the lock and the number of updates using the lock; the entry
+# is dropped when the last update for that thread finishes.
+_conversation_sentiment_summary_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+
+
+async def _update_conversation_sentiment_one_at_a_time(
+    store, user_id: str, assistant_id: str, thread_id: str, messages: list
+):
+    """Refresh the running conversation sentiment summary, one update per thread at a time."""
+    summary_lock, update_count = _conversation_sentiment_summary_locks.get(
+        thread_id, (asyncio.Lock(), 0)
+    )
+    _conversation_sentiment_summary_locks[thread_id] = (summary_lock, update_count + 1)
+    try:
+        async with summary_lock:
+            return await update_current_conversation_sentiment(
+                store, user_id, assistant_id, thread_id, messages
+            )
+    finally:
+        summary_lock, update_count = _conversation_sentiment_summary_locks[thread_id]
+        if update_count <= 1:
+            del _conversation_sentiment_summary_locks[thread_id]
+        else:
+            _conversation_sentiment_summary_locks[thread_id] = (
+                summary_lock,
+                update_count - 1,
+            )
+
+
+async def _observe_user_in_background(
+    *,
+    store,
+    context: GlobalContext,
+    user_id: str | None,
+    assistant_id: str | None,
+    thread_id: str | None,
+    creator_id: str | None,
+    messages: list,
+    latest_text: str,
+    immediate_sentiment_task: "asyncio.Task",
+) -> None:
+    """Record every slow observation signal after ``observe_user`` has returned.
+
+    Runs detached from the turn (``schedule_detached``), so the avatar's reply
+    never waits for a store write or for the conversation sentiment summary's
+    model call. The results reach the system prompt through the store on the
+    next turn: ``load_consciousness`` reads the stored running summary and the
+    stored emotional state. Best effort throughout — every failure is logged
+    and dropped, exactly as when the signals were gathered inline.
+    """
+
+    async def _no_signal():
+        return None
+
+    engagement_coroutine = None
+    sentiment_summary_coroutine = None
+    pending_coroutine = None
+    if store is not None and user_id and assistant_id:
+        engagement_coroutine = record_engagement(store, user_id, assistant_id, thread_id)
+        if thread_id and _flag_enabled(
+            getattr(context, "conversation_sentiment_per_turn_enabled", "TRUE")
+        ):
+            sentiment_summary_coroutine = _update_conversation_sentiment_one_at_a_time(
+                store, user_id, assistant_id, thread_id, messages
+            )
+        if thread_id:
+            pending_coroutine = mark_thread_pending(
+                store,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                creator_id=creator_id,
+            )
+
+    engagement_signal, conversation_sentiment_signal, pending_signal = (
+        await asyncio.gather(
+            engagement_coroutine or _no_signal(),
+            sentiment_summary_coroutine or _no_signal(),
+            pending_coroutine or _no_signal(),
+            return_exceptions=True,
+        )
+    )
+    for signal_name, signal in (
+        ("engagement", engagement_signal),
+        ("conversation sentiment", conversation_sentiment_signal),
+        ("pending marker", pending_signal),
+    ):
+        if isinstance(signal, Exception):
+            logger.warning("observe_user: %s failed: %s", signal_name, signal)
+
+    # The avatar's own emotional state is moved by this turn. The state reuses
+    # the Go Emotions reading ``observe_user`` started (the same task, so the
+    # message is classified once) and adds no model call. An avatar with no
+    # emotional baseline yet simply has no state to move.
+    if not (
+        store is not None
+        and creator_id
+        and assistant_id
+        and _flag_enabled(getattr(context, "current_emotion_enabled", "TRUE"))
+    ):
+        return
+    try:
+        immediate_sentiment = await immediate_sentiment_task
+    except Exception as sentiment_error:  # noqa: BLE001 - best effort
+        logger.warning("observe_user: immediate sentiment failed: %s", sentiment_error)
+        immediate_sentiment = None
+    try:
+        await refresh_current_emotion(
+            store,
+            creator_id,
+            assistant_id,
+            incoming_message_text=latest_text,
+            incoming_message_base_emotion=(
+                immediate_sentiment.get("base_emotion")
+                if isinstance(immediate_sentiment, dict)
+                else None
+            ),
+            half_life_hours=float(
+                getattr(context, "current_emotion_decay_hours", 6.0) or 6.0
+            ),
+        )
+    except Exception as emotion_error:  # noqa: BLE001 - never cost the user a reply
+        logger.warning("observe_user: emotional state failed: %s", emotion_error)
+
+
 async def observe_user(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
     """Read the user's latest message and record engagement, sentiment, and pending learning.
 
     Runs in the outer workflow in parallel with ``resolve_human_message_images``
-    so the observation costs the turn only the slowest of the two branches.
-    Everything here is best effort: a failed classifier or store write must never
-    cost the user the reply, so every signal is gathered with
-    ``return_exceptions=True`` and a failure simply leaves that section empty.
+    and the moderation branch, and the join waits for every branch before the
+    avatar runs — so anything this node awaits is time the person spends
+    waiting for the first word of the reply. The node therefore awaits only
+    one thing, and only briefly: the Go Emotions reading of the latest message,
+    bounded by ``OBSERVE_USER_INLINE_EMOTION_BUDGET_MILLISECONDS``. Every other
+    signal (engagement counters, the pending-sweep marker, the running
+    conversation sentiment summary — a model call — and the avatar's emotional
+    state) is recorded by ``_observe_user_in_background`` on a detached task.
 
     Writes:
-      - ``current_user_emotions``: the immediate Go Emotions reading, rendered.
-      - ``current_conversation_sentiment``: the refreshed running summary, rendered.
-    Side effects on the store: the engagement record, the running conversation
-    sentiment record, and the pending-sweep marker for the background learning.
+      - ``current_user_emotions``: the immediate Go Emotions reading, rendered,
+        or an empty string when the reading missed the budget (so the prompt
+        never shows the previous message's reading as this message's).
+    Side effects on the store, after the node has returned: the engagement
+    record, the running conversation sentiment record, the pending-sweep
+    marker, and the avatar's current emotional state. ``load_consciousness``
+    reads the stored summary, so the prompt carries the newest summary that
+    has finished — at most one turn old. A process restart can lose an
+    in-flight update; the learning sweep re-runs the summary once the account
+    goes idle.
 
     Hidden ambient observations (webcam or screen snapshots the conversation
     partner never typed) are not the person's own words and are skipped.
@@ -384,6 +521,8 @@ async def observe_user(
     if not latest_text:
         return {}
 
+    from src.anubis.utils.background_tasks import schedule_detached
+
     context = _global_context_from_runtime(runtime)
     user_id = (state.get("user_state") or {}).get("user_id")
     assistant_id = (state.get("assistant_state") or {}).get("assistant_id")
@@ -394,86 +533,59 @@ async def observe_user(
     ).get("user_id")
     store = getattr(runtime, "store", None)
 
-    async def _no_signal():
-        return None
-
-    engagement_coroutine = None
-    sentiment_summary_coroutine = None
-    pending_coroutine = None
-    if store is not None and user_id and assistant_id:
-        engagement_coroutine = record_engagement(store, user_id, assistant_id, thread_id)
-        if thread_id and _flag_enabled(
-            getattr(context, "conversation_sentiment_per_turn_enabled", "TRUE")
-        ):
-            sentiment_summary_coroutine = update_current_conversation_sentiment(
-                store, user_id, assistant_id, thread_id, list(messages)
-            )
-        if thread_id:
-            pending_coroutine = mark_thread_pending(
-                store,
-                user_id=user_id,
-                assistant_id=assistant_id,
-                thread_id=thread_id,
-                creator_id=creator_id,
-            )
-
-    immediate_sentiment, _engagement, conversation_sentiment, _pending = (
-        await asyncio.gather(
-            classify_user_message_sentiment(latest_text),
-            engagement_coroutine or _no_signal(),
-            sentiment_summary_coroutine or _no_signal(),
-            pending_coroutine or _no_signal(),
-            return_exceptions=True,
-        )
+    # One classification task serves both the inline reading and the detached
+    # emotional-state update, so the message is classified exactly once.
+    immediate_sentiment_task = asyncio.ensure_future(
+        classify_user_message_sentiment(latest_text)
     )
-    for signal_name, signal in (
-        ("immediate sentiment", immediate_sentiment),
-        ("engagement", _engagement),
-        ("conversation sentiment", conversation_sentiment),
-        ("pending marker", _pending),
-    ):
-        if isinstance(signal, Exception):
-            logger.warning("observe_user: %s failed: %s", signal_name, signal)
+    schedule_detached(
+        _observe_user_in_background(
+            store=store,
+            context=context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            thread_id=thread_id,
+            creator_id=creator_id,
+            messages=list(messages),
+            latest_text=latest_text,
+            immediate_sentiment_task=immediate_sentiment_task,
+        ),
+        task_name=f"observe_user:{thread_id}",
+    )
 
-    update: dict = {}
-    if isinstance(immediate_sentiment, dict):
-        update["current_user_emotions"] = render_immediate_sentiment(immediate_sentiment)
-    if isinstance(conversation_sentiment, dict):
-        update["current_conversation_sentiment"] = render_conversation_sentiment(
-            conversation_sentiment
+    inline_budget_seconds = (
+        max(
+            0.0,
+            float(
+                getattr(context, "observe_user_inline_emotion_budget_milliseconds", 150)
+                or 0
+            ),
         )
+        / 1000.0
+    )
+    immediate_sentiment = None
+    try:
+        # ``shield`` keeps the classification running for the detached task
+        # when the inline wait gives up.
+        immediate_sentiment = await asyncio.wait_for(
+            asyncio.shield(immediate_sentiment_task), timeout=inline_budget_seconds
+        )
+    except asyncio.TimeoutError:
+        logger.info(
+            "observe_user: Go Emotions reading missed the %.0f ms budget; "
+            "the prompt omits the reading this turn",
+            inline_budget_seconds * 1000,
+        )
+    except Exception as sentiment_error:  # noqa: BLE001 - never cost the user a reply
+        logger.warning("observe_user: immediate sentiment failed: %s", sentiment_error)
 
-    # The avatar's own emotional state is moved by this turn. It reuses the Go
-    # Emotions reading gathered above and adds no model call, which is what lets
-    # it live in this branch: the whole node runs in parallel with the reply's
-    # other preparation, so the state costs the turn nothing it was not already
-    # spending. Best effort throughout — an avatar with no emotional baseline yet
-    # simply has no state to move.
-    if store is not None and creator_id and assistant_id and _flag_enabled(
-        getattr(context, "current_emotion_enabled", "TRUE")
-    ):
-        try:
-            advanced_emotion = await refresh_current_emotion(
-                store,
-                creator_id,
-                assistant_id,
-                incoming_message_text=latest_text,
-                incoming_message_base_emotion=(
-                    immediate_sentiment.get("base_emotion")
-                    if isinstance(immediate_sentiment, dict)
-                    else None
-                ),
-                half_life_hours=float(
-                    getattr(context, "current_emotion_decay_hours", 6.0) or 6.0
-                ),
-            )
-            if advanced_emotion:
-                update["current_assistant_emotions"] = advanced_emotion.get(
-                    "rendered", ""
-                )
-        except Exception as emotion_error:  # noqa: BLE001 - never cost the user a reply
-            logger.warning("observe_user: emotional state failed: %s", emotion_error)
-    return update
+    return {
+        "current_user_emotions": (
+            render_immediate_sentiment(immediate_sentiment)
+            if isinstance(immediate_sentiment, dict)
+            else ""
+        )
+    }
 
 
 async def join_user_observation(state: GlobalState):
@@ -1069,9 +1181,12 @@ async def _build_consciousness_system_message_update(
         user_feedback_messages=learning_sections.user_feedback_messages,
         positively_rated_messages=learning_sections.positively_rated_messages,
         negatively_rated_messages=learning_sections.negatively_rated_messages,
+        # The stored summary comes first: ``observe_user`` refreshes the summary
+        # on a detached task and writes only to the store, so the state key holds
+        # whatever an older turn checkpointed and would otherwise win forever.
         current_conversation_sentiment=(
-            state.get("current_conversation_sentiment")
-            or learning_sections.current_conversation_sentiment
+            learning_sections.current_conversation_sentiment
+            or state.get("current_conversation_sentiment")
         ),
         conversation_sentiment_history=learning_sections.conversation_sentiment_history,
         what_feels_real=learning_sections.what_feels_real,
@@ -1088,7 +1203,37 @@ async def _build_consciousness_system_message_update(
     # prepend system message
     logger.info(f"state['messages']: {state['messages']}")
 
-    system_message_str = populated_identity_template.messages[0].content
+    # The rendered template is split into the half that repeats unchanged on
+    # every turn of a conversation and the per-turn ROLE half. OpenAI prompt
+    # caching charges the longest identical PREFIX of a request at the cached
+    # rate, so every capability section appended below — all of them fixed
+    # text — is appended to the repeating half, and the ROLE half is put back
+    # at the end of this function. Without the split, one per-turn ROLE in the
+    # middle of the prompt pushed every capability section out of the cached
+    # prefix and each turn paid the full rate for text that never changed.
+    from src.anubis.utils.prompts.system_prompts import (
+        PER_TURN_SECTION_START_KEY,
+        ROLE_SECTION_OPENING_TAG,
+    )
+
+    rendered_identity_prompt = populated_identity_template.messages[0].content
+    if ROLE_SECTION_OPENING_TAG in rendered_identity_prompt:
+        system_message_str, role_after_opening_tag = rendered_identity_prompt.split(
+            ROLE_SECTION_OPENING_TAG, 1
+        )
+        role_section_str = ROLE_SECTION_OPENING_TAG + role_after_opening_tag
+    else:
+        # A template edit that drops the tag must not drop the identity facts:
+        # keep the rendered prompt whole and lose only the caching benefit.
+        system_message_str = rendered_identity_prompt
+        role_section_str = ""
+
+    # What is true of THIS turn only — which machine is reachable, what is
+    # waiting in the inbox, which files this message carries, what the
+    # conversation partner is sharing right now. Kept apart from the fixed
+    # capability sections below so the fixed sections stay contiguous, and
+    # placed after all of them when the prompt is assembled.
+    turn_status_str = ""
 
     # Data-analysis capability guidance, mirroring the ``think`` node's tool
     # gates exactly so the prompt never advertises tools the deep agent was
@@ -1168,7 +1313,7 @@ async def _build_consciousness_system_message_update(
                 "asked, say plainly that those machines are offline; never "
                 "invent results for an offline machine. "
             )
-        system_message_str += (
+        turn_status_str += (
             "\n<MCP_CONNECTION_STATUS>\n"
             + presence_sentence
             + "Confirm this plainly when asked, naming the machines. Never reveal "
@@ -1223,7 +1368,7 @@ async def _build_consciousness_system_message_update(
                 )
                 for account in bound_mailboxes
             )
-            system_message_str += (
+            turn_status_str += (
                 "\n<MAILBOX_STATUS>\n"
                 "The following mailboxes are connected for this avatar: "
                 f"{mailbox_descriptions}. Confirm this plainly when asked, "
@@ -1261,7 +1406,7 @@ async def _build_consciousness_system_message_update(
                 for account in bound_phone
             )
             system_message_str = system_message_str + PHONE_SIP_CAPABILITY_PROMPT
-            system_message_str += (
+            turn_status_str += (
                 "\n<PHONE_STATUS>\n"
                 f"Phone is connected. Verified mobile: {mobiles}. "
                 f"Inbound: the conversation partner calls {shared_number} from that mobile. "
@@ -1294,7 +1439,7 @@ async def _build_consciousness_system_message_update(
                     f"{provider_name}: {account.get('display_label') or ''} "
                     f"(provider name \"{account.get('provider')}\")"
                 )
-            system_message_str += (
+            turn_status_str += (
                 "\n<CONNECTED_ACCOUNTS>\n"
                 + (
                     "Connected for this avatar: " + "; ".join(connected_lines) + "."
@@ -1356,7 +1501,7 @@ async def _build_consciousness_system_message_update(
                 f"({len((account.get('transport') or {}).get('tool_names') or [])} tools)"
                 for account in bound_connectors
             )
-            system_message_str += (
+            turn_status_str += (
                 "\n<CONNECTOR_STATUS>\n"
                 "The following custom connectors are connected for this avatar: "
                 f"{connector_descriptions}. Confirm this plainly when asked, naming "
@@ -1425,7 +1570,7 @@ async def _build_consciousness_system_message_update(
                     context=runtime.context,
                 ):
                     system_message_str += CONNECT_MAILBOX_PROMPT
-                system_message_str += (
+                turn_status_str += (
                     "\n<CONNECTED_ACCOUNTS>\n"
                     + (
                         "Connected for the conversation partner: "
@@ -1479,7 +1624,7 @@ async def _build_consciousness_system_message_update(
                         f"[{item.get('decision') or 'notify'}]"
                         for item in pending_items
                     )
-                    system_message_str += (
+                    turn_status_str += (
                         "\n<INBOX_NOTIFICATIONS>\n"
                         f"{pending_count} item(s) are waiting for the conversation "
                         f"partner in the agent inbox: {headlines}. Mention them briefly "
@@ -1487,7 +1632,7 @@ async def _build_consciousness_system_message_update(
                         "</INBOX_NOTIFICATIONS>\n"
                     )
                 else:
-                    system_message_str += (
+                    turn_status_str += (
                         "\n<INBOX_NOTIFICATIONS>\nNo items are waiting in the agent "
                         "inbox right now.\n</INBOX_NOTIFICATIONS>\n"
                     )
@@ -1527,7 +1672,7 @@ async def _build_consciousness_system_message_update(
                             f"[{entry.get('action') or 'notify'}]"
                             for entry in waiting[:5]
                         )
-                        system_message_str += (
+                        turn_status_str += (
                             "\n<GROUP_CONVERSATIONS>\n"
                             f"The conversation partner's avatar takes part in these rooms: {rooms}. "
                             f"{len(waiting)} message(s) from those rooms are waiting for a "
@@ -1536,7 +1681,7 @@ async def _build_consciousness_system_message_update(
                             "</GROUP_CONVERSATIONS>\n"
                         )
                     else:
-                        system_message_str += (
+                        turn_status_str += (
                             "\n<GROUP_CONVERSATIONS>\n"
                             f"The conversation partner's avatar takes part in these rooms: {rooms}. "
                             "Nothing from those rooms is waiting right now.\n"
@@ -1574,13 +1719,13 @@ async def _build_consciousness_system_message_update(
                         f"{item['filename']} ({item['mime_type']}, {item['size_bytes']} bytes)"
                         for item in attached
                     )
-                    system_message_str += (
+                    turn_status_str += (
                         "\n<ATTACHED_MEDIA>\n"
                         f"Files attached to this turn: {attachment_lines}.\n"
                         "</ATTACHED_MEDIA>\n"
                     )
                 else:
-                    system_message_str += (
+                    turn_status_str += (
                         "\n<ATTACHED_MEDIA>\nNo files are attached to this turn.\n"
                         "</ATTACHED_MEDIA>\n"
                     )
@@ -1616,11 +1761,10 @@ async def _build_consciousness_system_message_update(
             for message in thread_messages
         )
         heard_speech = any(spoken_turn_of(message) for message in thread_messages)
-        # The accessibility switch, as the browser reported it this turn. Only
-        # ON changes the prompt: a browser that could narrate but is not, and a
-        # client that never could, both read as the conversation always did.
+        # The accessibility switch, as the browser reported it this turn.
         from src.anubis.utils.tools.vision.accessibility_tools import (
             NARRATION_ON,
+            build_scene_narration_block,
             normalize_scene_narration_state,
         )
 
@@ -1629,6 +1773,15 @@ async def _build_consciousness_system_message_update(
                 (config or {}).get("configurable", {}).get("scene_narration")
             )
             == NARRATION_ON
+        )
+        # Which way the switch is set and how often a reading arrives. Said
+        # here, on every turn a browser reports the field, because the
+        # set_scene_narration description has to read the same on every turn
+        # for the request's cached prefix to survive, and the avatar still has
+        # to know the current setting before answering a request to change it.
+        turn_status_str = turn_status_str + build_scene_narration_block(
+            (config or {}).get("configurable", {}).get("scene_narration"),
+            (config or {}).get("configurable", {}).get("scene_narration_seconds"),
         )
         # Narration switched on ahead of the first observation still needs the
         # capability block: the observations are seconds away, and the first
@@ -1689,7 +1842,7 @@ async def _build_consciousness_system_message_update(
                 or bool(peekable)
             )
         )
-        system_message_str = system_message_str + build_live_shares_block(
+        turn_status_str = turn_status_str + build_live_shares_block(
             live_sources,
             thread_messages,
             can_look_now=look_is_attached,
@@ -1716,7 +1869,7 @@ async def _build_consciousness_system_message_update(
             answering_an_observation = bool(
                 thread_messages and is_ambient_observation(thread_messages[-1])
             )
-            system_message_str = system_message_str + build_minecraft_body_block(
+            turn_status_str = turn_status_str + build_minecraft_body_block(
                 world_snapshot=str(
                     minecraft_configurable.get("minecraft_world") or ""
                 ),
@@ -1729,7 +1882,15 @@ async def _build_consciousness_system_message_update(
         last_message_text
     )
     if harvest_instruction:
-        system_message_str = system_message_str + harvest_instruction
+        turn_status_str = turn_status_str + harvest_instruction
+
+    # Assemble in order of how often each part changes: the fixed instructions
+    # and capability sections, then this turn's status blocks, then the ROLE
+    # half carrying identity facts, retrieved memories, quotes and the system
+    # time. That order is what makes the long stretch above cacheable from one
+    # turn to the next.
+    per_turn_section_start = len(system_message_str)
+    system_message_str = system_message_str + turn_status_str + role_section_str
 
     # Token usage is estimated when token usage occurs: the FINAL system prompt
     # is now assembled (including any data-analysis capability guidance appended
@@ -1753,7 +1914,12 @@ async def _build_consciousness_system_message_update(
         "recalled_memory_documents": {"op": "replace", "docs": retrieved_memories},
         "system_message": [
             SystemMessage(
-                content=system_message_str, id="00000000-0000-0000-0000-0000000000000"
+                content=system_message_str,
+                id="00000000-0000-0000-0000-0000000000000",
+                # Where the per-turn sections begin, so the deep agent can send
+                # the fixed text and the per-turn text as two messages (see
+                # ``PER_TURN_SECTION_START_KEY``).
+                additional_kwargs={PER_TURN_SECTION_START_KEY: per_turn_section_start},
             )
         ],
     }

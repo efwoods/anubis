@@ -1313,6 +1313,58 @@ async def convert_media_list_to_text_document(
     }
 
 
+async def record_speech_api_usage(
+    speech_response: Optional[Dict[str, Any]],
+    config: Optional[RunnableConfig],
+    user_id: Optional[str],
+    assistant_id: Optional[str],
+) -> None:
+    """Record what one transcription or diarization call cost.
+
+    The speech endpoints call the OpenAI client directly rather than through a
+    LangChain model, so the recorder attached in ``init_model`` never sees them
+    and they have to report themselves. They are worth reporting: diarizing the
+    audio is the single largest charge a media upload makes — $5.79 of one
+    account's $9.05 day on 2026-09-17, against the $0 the upload recorded.
+
+    ``transcribe_audio`` and ``transcribe_audio_diarize`` both return the cost
+    and, for diarization, the token counts they were billed on. Best-effort: a
+    failure here must never fail the upload.
+    """
+    if not speech_response:
+        return
+    try:
+        from src.anubis.utils.billing.metering import persist_api_metrics_row
+
+        configurable = (config or {}).get("configurable", {}) or {}
+        prompt_tokens = int(speech_response.get("input_tokens") or 0)
+        completion_tokens = int(speech_response.get("output_tokens") or 0)
+        await persist_api_metrics_row(
+            None,
+            inference_type=str(
+                speech_response.get("inference_type") or "transcription"
+            ),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=int(
+                speech_response.get("total_tokens")
+                or (prompt_tokens + completion_tokens)
+            ),
+            cost_usd=float(speech_response.get("total_cost") or 0.0),
+            latency_ms=float(speech_response.get("latency_ms") or 0.0),
+            user_id=user_id,
+            assistant_id=assistant_id,
+            model_name=speech_response.get("model"),
+            media_job_id=configurable.get("media_job_id"),
+        )
+    except Exception as recording_error:  # noqa: BLE001 - accounting is never fatal
+        logger.warning(
+            "Could not record a speech call's usage for %s: %s",
+            assistant_id,
+            recording_error,
+        )
+
+
 async def process_media_item_task(
     media_item: Dict[str, Any],
     runtime: Runtime[GlobalContext],
@@ -2061,6 +2113,7 @@ async def process_media_item_task(
                         context=runtime.context,
                         filename=filename,
                     )
+                    await record_speech_api_usage(plain, config, user_id, assistant_id)
                     plain_text = (plain.get("text") or "").strip()
                 except Exception as transcription_error:
                     logger.exception(
@@ -2390,6 +2443,9 @@ async def process_media_item_task(
                     filename=filename,
                     content_type=content_type,
                 )
+                await record_speech_api_usage(
+                    diar_response, config, user_id, assistant_id
+                )
             except Exception as e:
                 logger.exception(
                     "transcribe_audio_diarize failed for %s: %s; falling back to plain transcribe",
@@ -2462,6 +2518,9 @@ async def process_media_item_task(
                             audio_base64=payload_uri,
                             context=runtime.context,
                             filename=filename,
+                        )
+                        await record_speech_api_usage(
+                            plain, config, user_id, assistant_id
                         )
                         plain_text = (plain.get("text") or "").strip()
                     except Exception as e:
@@ -2880,6 +2939,9 @@ async def process_media_item_task(
                     audio_base64=payload_uri,
                     context=runtime.context,
                     filename=filename,
+                )
+                await record_speech_api_usage(
+                    fallback, config, user_id, assistant_id
                 )
                 fallback_text = (fallback.get("text") or "").strip()
             except Exception as e:

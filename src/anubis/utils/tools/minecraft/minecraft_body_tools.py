@@ -116,8 +116,10 @@ def build_minecraft_body_block(
     """Build the ``<MINECRAFT_BODY>`` section of the system prompt.
 
     Added only when a body is live this turn, so an ordinary conversation
-    keeps the prompt it already had. The snapshot lives here — and on the
-    tool description — never on the human message.
+    keeps the prompt it already had. This section is the ONLY place the world
+    snapshot reaches the model: never the human message, and never the
+    ``act_in_minecraft`` description, which has to read the same on every turn
+    for the request's cached prefix to survive.
     """
     world = str(world_snapshot or "").strip() or "unavailable"
     if tool_is_attached:
@@ -126,7 +128,21 @@ def build_minecraft_body_block(
             "walk, gather, craft, build, fight, follow, and use the world. "
             "Spoken words are only what this person would say aloud. Never "
             "read commands aloud. Never mention the body or this tool unless "
-            "the person asked about the world."
+            "the person asked about the world.\n"
+            # Said here rather than in the look_now description: a tool
+            # description that changes per turn moves the first tokens of the
+            # request and costs the cached prefix for the whole prompt.
+            "The body's own first-person view is reached by calling look_now "
+            "for the screen source, which turns the body's eyes on the world "
+            "and returns what the body sees at that instant. Nothing is "
+            "captured on an interval and no earlier description of the world "
+            "is kept, so calling look_now is the only way the assistant sees "
+            "the Minecraft world at all. Call look_now whenever what is in "
+            "the world decides the answer or the next action — before going "
+            "somewhere, before mining, placing or collecting, when asked what "
+            "is around or ahead, and when a job just finished and whether the "
+            "job worked is visible. Do not call look_now for identity, memory "
+            "or small talk that the world has no bearing on."
         )
     else:
         guidance = (
@@ -167,9 +183,10 @@ def build_minecraft_body_tools(
         ``minecraft_body_enabled`` is read from here.
     :param minecraft_body: What the companion reported this turn — truthy when
         a Mineflayer player is standing in the world.
-    :param minecraft_world: The current world snapshot text. Interpolated into
-        the tool description so the model chooses commands from the present,
-        not from a prompt stuffed into the human message.
+    :param minecraft_world: The current world snapshot text. Accepted so the
+        caller reports the world in one place; the snapshot reaches the model
+        through the ``<MINECRAFT_BODY>`` prompt section built by
+        ``build_minecraft_body_block``, never through this tool's description.
     :returns: The tool, or ``[]`` when the body is not live or the gate is off.
     """
     if not minecraft_body_is_enabled(context):
@@ -177,7 +194,6 @@ def build_minecraft_body_tools(
     if not minecraft_body_is_live(minecraft_body):
         return []
 
-    world = str(minecraft_world or "").strip() or "unavailable"
     command_list = " ".join(f"!{name}(...)" for name in MINECRAFT_PLAY_COMMAND_NAMES)
 
     @tool(ACT_IN_MINECRAFT_TOOL_NAME)
@@ -213,8 +229,10 @@ def build_minecraft_body_tools(
         body unchanged. It is not speech. Leave it empty unless there is a
         detail the body must have that is not a command.
 
-        Current world:
-        <MINECRAFT_WORLD>{minecraft_world}</MINECRAFT_WORLD>
+        What the world looks like at this moment is in the MINECRAFT_BODY
+        section of the system prompt, under MINECRAFT_WORLD. Choose commands
+        from that snapshot, and call look_now for the screen source when the
+        snapshot does not settle what to do next.
         """
         accepted = normalize_minecraft_commands(commands)
         as_is_text = additional_as_is_text_of(additional_as_is_text)
@@ -236,7 +254,13 @@ def build_minecraft_body_tools(
             ),
         }
 
+    # Only the closed command list is interpolated, and that list is the same
+    # text on every turn. The world snapshot is deliberately NOT interpolated:
+    # a tool description opens an OpenAI request, so a snapshot that changes
+    # every turn would move the request's first tokens and cost the cached
+    # prefix for the whole system prompt. The snapshot reaches the model in the
+    # MINECRAFT_BODY section instead (see ``build_minecraft_body_block``).
     act_in_minecraft.description = (act_in_minecraft.description or "").replace(
         "{command_list}", command_list
-    ).replace("{minecraft_world}", world)
+    )
     return [act_in_minecraft]

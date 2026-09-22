@@ -88,16 +88,86 @@ def test_the_look_tool_is_attached_when_something_is_shared():
     assert [tool.name for tool in tools] == [LOOK_NOW_TOOL_NAME]
 
 
-def test_the_tool_description_names_what_is_actually_live():
-    # The model decides whether to call the tool from this text, so what is
-    # live is named in it rather than described in general.
-    description = build_look_tools(None, live_shares="webcam,screen")[0].description
-    # Named one by one, with what each one shows, because the avatar has to
-    # choose between them rather than ask for "whatever can be seen".
-    assert "webcam (the camera" in description
-    assert "screen (the desktop" in description
-    assert "is being shared right now" in description
-    assert "{live}" not in description
+def test_a_live_minecraft_body_attaches_the_look_tool_with_nothing_shared():
+    # A Mineflayer body has no browser and nobody choosing what to share, and
+    # the Minecraft companion runs no ambient capture loop. The body's own
+    # first-person view can always be rendered on demand, so look_now attaches
+    # whatever the live_shares field says and the avatar decides when seeing
+    # the Minecraft world matters.
+    tools = build_look_tools(None, live_shares="", minecraft_body_can_peek=True)
+    assert [tool.name for tool in tools] == [LOOK_NOW_TOOL_NAME]
+
+
+@pytest.mark.asyncio
+async def test_the_minecraft_first_person_view_is_live_rather_than_not_shared():
+    # The companion attaches the raycast JPEG as the screen source, so asking
+    # for the screen has to reach the pause that collects the frame rather than
+    # answering that nothing is being shared.
+    tool = build_look_tools(None, live_shares="", minecraft_body_can_peek=True)[0]
+    assert "screen" in tool.description
+    answer = await tool.ainvoke({"sources": ["webcam"]})
+    assert answer["status"] == "not_shared"
+    assert answer["live_sources"] == ["screen"]
+
+
+def test_the_minecraft_body_is_told_to_look_rather_than_the_tool_description():
+    # Naming a camera, a desktop or a conversation partner's share would
+    # describe a scene that does not exist and would send the avatar after the
+    # wrong source. The Minecraft guidance therefore lives in the prompt
+    # section, which is rebuilt every turn, rather than in the look_now
+    # description, which has to read the same on every turn for the request's
+    # cached prefix to survive.
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        build_minecraft_body_block,
+    )
+
+    block = build_minecraft_body_block(world_snapshot="position: 0, 64, 0")
+    assert "Minecraft world" in block
+    assert "look_now" in block
+
+    description = build_look_tools(
+        None, live_shares="", minecraft_body_can_peek=True
+    )[0].description
+    assert "{sharing_line}" not in description
+    assert "conversation partner is sharing NOTHING" not in description
+
+
+def test_the_live_shares_section_names_what_is_actually_live():
+    # What is live is named one source at a time, because the avatar has to
+    # choose between them rather than ask for "whatever can be seen". The
+    # naming is in the prompt section rather than the tool description: a
+    # description is the first thing in an OpenAI request, and rewriting it per
+    # turn moves the request's opening tokens and discards the cached prefix
+    # for the whole system prompt behind it.
+    block = build_live_shares_block(
+        ["webcam", "screen"], [_observation("webcam", 1)], can_look_now=True
+    )
+    assert "Being shared at this moment: webcam and screen." in block
+    assert "The camera shows the conversation partner" in block
+    assert "The desktop shows what is on their screen" in block
+
+
+def test_the_tool_description_is_the_same_text_whatever_is_being_shared():
+    """The description must not move with the turn, or nothing stays cached.
+
+    OpenAI charges the longest identical opening stretch of a request at the
+    cached rate, and tool definitions come first in that stretch. A
+    description that names today's live sources changes on the turn a share
+    starts or stops, which throws away the cached prefix for every token
+    behind it — the whole identity prompt included.
+    """
+    nothing_shared = build_look_tools(
+        None, live_shares="", conversation_has_scene_observations=True
+    )[0].description
+    both_shared = build_look_tools(None, live_shares="webcam,screen")[0].description
+    peekable = build_look_tools(
+        None,
+        live_shares="",
+        may_control_shares=True,
+        peekable_shares='["webcam"]',
+    )[0].description
+    assert nothing_shared == both_shared == peekable
+    assert "{sharing_line}" not in nothing_shared
 
 
 @pytest.mark.asyncio
@@ -585,12 +655,14 @@ async def test_checking_with_no_source_named_and_nothing_live_also_answers_plain
     assert answer["status"] == "not_shared"
 
 
-def test_the_tool_description_says_nothing_is_shared_when_nothing_is():
-    description = build_look_tools(
-        None, live_shares="", conversation_has_scene_observations=True
-    )[0].description
-    assert "sharing NOTHING" in description
-    assert "{sharing_line}" not in description
+def test_the_live_shares_section_says_nothing_is_shared_when_nothing_is():
+    block = build_live_shares_block(
+        [], [_observation("webcam", 30)], can_look_now=True
+    )
+    assert "Nothing is being shared at this moment." in block
+    # And the avatar is told to call the tool rather than read an observation
+    # of a share that has since ended back as though the share were current.
+    assert "look_now" in block
 
 
 @pytest.mark.asyncio
@@ -922,7 +994,16 @@ def test_the_tool_says_which_view_answers_which_question():
     )[0].description
     assert "not interchangeable" in description.lower()
     assert "what is on my screen" in description
-    assert "open it for a single look" in description
+    # That a source can be opened for one look and closed again is per-turn
+    # state, so the fact is in the prompt section beside what is live.
+    block = build_live_shares_block(
+        [],
+        [],
+        can_look_now=True,
+        may_control_shares=True,
+        peekable_sources=["webcam", "screen"],
+    )
+    assert "open to a single look right now" in block
 
 
 @pytest.mark.asyncio

@@ -38,15 +38,17 @@ from src.anubis.utils.prompts.fact_rewriter_prompt import (
 )
 
 
-
-class ConciseContextOfTheSourceOfFacts(BaseModel): 
-    """        
-    Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct. 
+class ConciseContextOfTheSourceOfFacts(BaseModel):
+    """
+    Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct.
     """
 
     concise_context_summary: str = Field(
-        description=("Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct.")
+        description=(
+            "Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct."
+        )
     )
+
 
 class ExtractedFact(BaseModel):
     """One atomic fact extracted from biographical source text — model output.
@@ -61,14 +63,13 @@ class ExtractedFact(BaseModel):
     )
 
 
-
 class ExtractedAndRewrittenFacts(BaseModel):
     """Structured-output schema the LLM is constrained to return.
 
     What it represents
         The complete shape of one model reply: a list of
         :class:`ExtractedFact` items, each with only a
-        ``rewritten_statement``. 
+        ``rewritten_statement``.
 
     How it is used
         * Passed to :func:`init_model` as ``response_format`` in
@@ -90,6 +91,7 @@ class ExtractedAndRewrittenFacts(BaseModel):
         ),
     )
 
+
 class RewrittenFactsWithProvenance(BaseModel):
     """Post-call container produced by :class:`FactRewriterClass`.
 
@@ -110,7 +112,7 @@ class RewrittenFactsWithProvenance(BaseModel):
         ),
     )
     concise_context_summary: str = Field(
-        description = (
+        description=(
             "Create the a single clear, concise, succinct, complete context of the entire original statement. Facts have been extracted from this body of text. The facts need contextual grounding from which they were derived. Create a succinct summary that presents the bigger picture of the context behind the facts. Do not create any new information. Do not change the meaning of the statement. Preserves the context of the original statement. Provide one single summary for the entire statement that is clear, concise, and succinct. "
         )
     )
@@ -121,6 +123,8 @@ class RewrittenFactsWithProvenance(BaseModel):
             "after the model call from the caller-supplied hint."
         ),
     )
+
+
 class FactRewriterClass:
     """Extract atomic facts and produce lawsuit-safer rewrites of source text."""
 
@@ -128,14 +132,21 @@ class FactRewriterClass:
         self.model = init_model(response_format=ExtractedAndRewrittenFacts)
         self.system_prompt = FACT_REWRITER_SYSTEM_PROMPT
         self.system_prompt_tokens = 846
-        self.model_name = "gpt-5.4-nano"
-        self.model_input_token_cost_per_million = 0.00000005
-        self.model_output_token_cost_per_million =0.0000004
+        # The model and its prices come from GlobalContext, never from a name
+        # written here: this class calls whatever ``CLASSIFICATION_MODEL`` names,
+        # so a hard-coded name mislabels every row it writes and a hard-coded
+        # price stops matching the invoice the day the vendor changes a rate.
+        rewriter_context = GlobalContext()
+        self.model_name = rewriter_context.classification_model
+        self.model_input_token_cost_per_million = float(
+            rewriter_context.classification_model_prompt_cost or 0.0
+        )
+        self.model_output_token_cost_per_million = float(
+            rewriter_context.classification_model_completion_cost or 0.0
+        )
         self.model_inference_type = "fact_rewriter_structured_output"
 
-    async def extract(
-        self, input_str: str, target_name: Optional[str] = None
-    ) -> dict:
+    async def extract(self, input_str: str, target_name: Optional[str] = None) -> dict:
         """Extract atomic facts about ``target_name`` from ``input_str``.
 
         Returns the dump of a :class:`RewrittenFactsWithProvenance` (built in
@@ -146,14 +157,17 @@ class FactRewriterClass:
         """
         start_time = time_ns()
 
-        if target_name: 
-            target_name_tokens = count_tokens(target_name) 
-        else: 
+        if target_name:
+            target_name_tokens = count_tokens(target_name)
+        else:
             target_name_tokens = 0
         input_tokens = (
-            count_tokens(input_str) + self.system_prompt_tokens + 3*target_name_tokens
+            count_tokens(input_str) + self.system_prompt_tokens + 3 * target_name_tokens
         )
-        messages = [SystemMessage(content=self.system_prompt.format(target_name=target_name)), HumanMessage(content=input_str)]
+        messages = [
+            SystemMessage(content=self.system_prompt.format(target_name=target_name)),
+            HumanMessage(content=input_str),
+        ]
 
         response = await self.model.ainvoke(messages)
 
@@ -162,23 +176,22 @@ class FactRewriterClass:
         # fidelity (dream vs. memory vs. hypothetical) is the critical
         # property — see CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT for the
         # anti-pattern guardrails.
-        summary_model = init_model(
-            response_format=ConciseContextOfTheSourceOfFacts
-        )
+        summary_model = init_model(response_format=ConciseContextOfTheSourceOfFacts)
         summary_messages = [
-            SystemMessage(content=CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT.format(target_name=target_name)),
+            SystemMessage(
+                content=CONCISE_CONTEXT_SUMMARY_SYSTEM_PROMPT.format(
+                    target_name=target_name
+                )
+            ),
             HumanMessage(content=input_str),
         ]
-        concise_context_summary_response = await summary_model.ainvoke(
-            summary_messages
-        )
-
+        concise_context_summary_response = await summary_model.ainvoke(summary_messages)
 
         provenanced = RewrittenFactsWithProvenance(
             facts=list(response.facts or []),
             original_statement=input_str,
             target_name=target_name,
-            concise_context_summary = concise_context_summary_response.concise_context_summary
+            concise_context_summary=concise_context_summary_response.concise_context_summary,
         )
         response_dict = provenanced.model_dump()
 

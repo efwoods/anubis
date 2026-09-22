@@ -33,7 +33,15 @@ def test_total_cost_is_prompt_and_completion_tokens_at_their_rates():
     final = _message(100, 50)
     _attach_token_usage_metadata(final, [_message(300, 10), final], context=_context())
     token_usage = final.response_metadata["token_usage"]
-    assert token_usage == {"prompt_tokens": 400, "completion_tokens": 60, "total_tokens": 460}
+    # A turn with no prompt cache records zero cached and zero written tokens,
+    # and is then priced exactly as before: every prompt token at the full rate.
+    assert token_usage == {
+        "prompt_tokens": 400,
+        "completion_tokens": 60,
+        "total_tokens": 460,
+        "cached_prompt_tokens": 0,
+        "cache_write_tokens": 0,
+    }
     assert final.response_metadata["total_cost"] == pytest.approx(
         400 * 0.000001 + 60 * 0.000002
     )

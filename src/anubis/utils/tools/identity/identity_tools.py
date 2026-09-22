@@ -1522,11 +1522,14 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
         )
     from src.anubis.utils.learning.fact_learned import announce_fact_learned
 
-    announce_fact_learned(user_fact, kind="identity")
+    announce_fact_learned(user_fact, kind="user")
     update = {
         "user_identity_documents": [user_identity_document],
         "messages": [
-            ToolMessage(content=f"Learned: {user_fact}", tool_call_id=tool_call_id)
+            ToolMessage(
+                content=f"Learned about the user: {user_fact}",
+                tool_call_id=tool_call_id,
+            )
         ],
     }
 

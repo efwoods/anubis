@@ -3970,11 +3970,20 @@ async def ban_status(
         ban_refusal_detail,
         ban_subject_from_user,
         find_active_ban,
+        is_ban_immune_account,
     )
 
     subject = ban_subject_from_user(
         current_user, resolve_request_hashed_ip(request)
     )
+    # A ban-immune account is never refused, so the account is never reported
+    # as banned either, even when an older ban row still names the account.
+    if is_ban_immune_account(
+        user_id=subject.user_id,
+        email=subject.email,
+        context=getattr(request.app.state, "context", None),
+    ):
+        return {"banned": False}
     ban = await find_active_ban(
         getattr(request.app.state, "pool", None),
         user_id=subject.user_id,

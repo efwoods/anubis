@@ -2568,6 +2568,18 @@ class GlobalContext:
         },
     )
 
+    ban_immune_account_identifiers: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Comma-separated email addresses or bare Auth0 user ids of accounts "
+                "a ban is never enforced against, in addition to the administrator. "
+                "A listed account gains ban immunity only, never administrator "
+                "powers. Env BAN_IMMUNE_ACCOUNT_IDENTIFIERS."
+            )
+        },
+    )
+
     admin_metering_bypass_identifiers: str = field(
         default=None,
         metadata={

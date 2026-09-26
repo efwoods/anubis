@@ -233,6 +233,44 @@ def is_unbannable_administrator(
     return False
 
 
+def ban_immune_account_identifiers(context: Any | None) -> frozenset[str]:
+    """The casefolded entries of ``BAN_IMMUNE_ACCOUNT_IDENTIFIERS``."""
+    configured = str(
+        getattr(context, "ban_immune_account_identifiers", None) or ""
+    )
+    return frozenset(
+        entry.strip().casefold()
+        for entry in configured.split(",")
+        if entry.strip() and not entry.strip().startswith("#")
+    )
+
+
+def is_ban_immune_account(
+    *,
+    user_id: str | None = None,
+    email: str | None = None,
+    context: Any | None = None,
+) -> bool:
+    """Return whether a ban may never be enforced against this identity.
+
+    True for the unbannable administrator and for every account listed in
+    ``BAN_IMMUNE_ACCOUNT_IDENTIFIERS`` (an email address or a bare Auth0 user
+    id). A listed account gains ban immunity ONLY: every administrator power
+    stays keyed on ``is_unbannable_administrator``, so ban-enforcement sites call
+    this function and administrator-power sites never do.
+    """
+    if is_unbannable_administrator(user_id=user_id, email=email, context=context):
+        return True
+    immune_identifiers = ban_immune_account_identifiers(context)
+    if not immune_identifiers:
+        return False
+    return any(
+        str(candidate).strip().casefold() in immune_identifiers
+        for candidate in (user_id, email)
+        if candidate and str(candidate).strip()
+    )
+
+
 def supporting_evidence_quotes(verdict: Mapping[str, Any] | None) -> list[str]:
     """The verbatim content quotes the judge named as the bannable lines."""
     raw = (verdict or {}).get("supporting_evidence")
@@ -511,12 +549,12 @@ async def ban_account(
         return existing
 
     context = getattr(app_state, "context", None)
-    unbannable = is_unbannable_administrator(
+    unbannable = is_ban_immune_account(
         user_id=subject.user_id, email=subject.email, context=context
     )
     enforced = not unbannable
     skipped_reason = (
-        "unbannable administrator; recorded for audit only" if unbannable else None
+        "ban-immune account; recorded for audit only" if unbannable else None
     )
 
     ban_id = str(uuid.uuid4())
@@ -793,6 +831,8 @@ __all__ = [
     "ban_subject_from_user",
     "ensure_banned_accounts_table",
     "find_active_ban",
+    "ban_immune_account_identifiers",
+    "is_ban_immune_account",
     "is_banned",
     "is_unbannable_administrator",
     "lift_ban",

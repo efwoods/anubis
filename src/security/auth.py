@@ -123,7 +123,7 @@ async def refuse_if_banned(
     from src.security.bans import (
         ban_refusal_detail,
         find_active_ban,
-        is_unbannable_administrator,
+        is_ban_immune_account,
     )
 
     application_state = getattr(getattr(request, "app", None), "state", None)
@@ -131,7 +131,7 @@ async def refuse_if_banned(
     if pool is None:
         return
     context = getattr(application_state, "context", None)
-    if is_unbannable_administrator(user_id=user_id, email=email, context=context):
+    if is_ban_immune_account(user_id=user_id, email=email, context=context):
         return
     ban = await find_active_ban(pool, user_id=user_id, hashed_ip=hashed_ip, email=email)
     if ban is None:

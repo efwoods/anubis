@@ -775,7 +775,7 @@ def moderation_is_screened_by_caller(config: RunnableConfig | None) -> bool:
 
 
 async def screen_message_for_hard_block(
-    message_text: str, context: GlobalContext
+    message_text: str, context: GlobalContext, setting: str | None = None
 ) -> dict | None:
     """Run the cheap moderation screen and return the ban verdict on a hard block, else ``None``.
 
@@ -802,7 +802,10 @@ async def screen_message_for_hard_block(
         return None
     try:
         result = await moderate_text_with_graph(
-            message_text, mode=MODERATION_MODE_MESSAGE, context=context
+            message_text,
+            mode=MODERATION_MODE_MESSAGE,
+            context=context,
+            setting=setting,
         )
     except Exception as moderation_error:  # noqa: BLE001 - fail open, never cost a reply
         logger.error(
@@ -892,8 +895,18 @@ async def moderate_content_fast(
         return {"moderation_response": clean}
 
     try:
+        from src.anubis.utils.moderation.content_moderation import (
+            moderation_setting_for_configurable,
+        )
+
         result = await moderate_text_with_graph(
-            latest_text, mode=MODERATION_MODE_MESSAGE, context=context
+            latest_text,
+            mode=MODERATION_MODE_MESSAGE,
+            context=context,
+            # A Minecraft turn is read as gameplay: "kill him" beside a mob.
+            setting=moderation_setting_for_configurable(
+                (config or {}).get("configurable") or {}
+            ),
         )
     except Exception as moderation_error:  # noqa: BLE001 - fail open, never cost a reply
         logger.error(
@@ -1587,6 +1600,7 @@ async def think(
     )
     from src.anubis.utils.tools.vision.look_tools import (
         build_look_tools,
+        minecraft_turn_asks_to_see,
         should_offer_look_now,
     )
 
@@ -1617,6 +1631,13 @@ async def think(
         if answering_an_observation
         or checkpointer is None
         or not should_offer_look_now(state.get("messages") or [])
+        # A Minecraft body carries out commands from the world snapshot, the
+        # way Mindcraft does; a look is offered only for a sight question, so
+        # "gather wood" is never answered with a screenshot description.
+        or (
+            minecraft_body_can_peek
+            and not minecraft_turn_asks_to_see(state.get("messages") or [])
+        )
         else build_look_tools(
             runtime.context,
             live_shares=(config.get("configurable", {}) or {}).get("live_shares"),

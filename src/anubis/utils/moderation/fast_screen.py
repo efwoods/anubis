@@ -96,7 +96,21 @@ def _threshold_from_context(context: Any) -> float:
     return min(max(threshold, 0.0), 1.0)
 
 
-def _result_to_screen(result: Any, threshold: float) -> dict[str, Any]:
+#: Categories the screen scores on the words alone, which inside a game
+#: describe gameplay as often as a threat: "kill him" said beside a zombie
+#: scores as violence. In the game setting these categories never block on the
+#: screen; a flagged message still goes to the deep judge, which reads the
+#: setting and decides.
+GAME_AMBIGUOUS_CATEGORIES = frozenset(
+    {"violence", "violence/graphic", "harassment", "harassment/threatening"}
+)
+
+
+def _result_to_screen(
+    result: Any,
+    threshold: float,
+    non_blocking_categories: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Turn one moderation result into the screen shape, with the outcome decided."""
     categories = getattr(result, "categories", None)
     scores = getattr(result, "category_scores", None)
@@ -125,9 +139,15 @@ def _result_to_screen(result: Any, threshold: float) -> dict[str, Any]:
         highest_category, highest_score = max(
             numeric_scores.items(), key=lambda item: item[1]
         )
+    blocking_scores = [
+        score
+        for name, score in numeric_scores.items()
+        if name not in non_blocking_categories
+    ]
+    highest_blocking_score = max(blocking_scores, default=0.0)
 
     flagged = bool(getattr(result, "flagged", False)) or bool(flagged_categories)
-    if highest_score >= threshold:
+    if highest_blocking_score >= threshold:
         outcome = FAST_SCREEN_BLOCK
     elif flagged:
         outcome = FAST_SCREEN_SUSPECT
@@ -144,8 +164,17 @@ def _result_to_screen(result: Any, threshold: float) -> dict[str, Any]:
     }
 
 
-async def fast_screen_text(text: str, context: Any) -> dict[str, Any]:
-    """Screen one text; returns the screen shape described in the module docstring."""
+async def fast_screen_text(
+    text: str, context: Any, setting: str | None = None
+) -> dict[str, Any]:
+    """Screen one text; returns the screen shape described in the module docstring.
+
+    In the game setting the categories in ``GAME_AMBIGUOUS_CATEGORIES`` never
+    block; a flag in one of those categories leaves the message suspect, for
+    the deep judge to read with the setting.
+    """
+    from src.anubis.utils.moderation.content_moderation import MODERATION_SETTING_GAME
+
     text = (text or "").strip()
     if not text:
         return clean_screen()
@@ -163,7 +192,11 @@ async def fast_screen_text(text: str, context: Any) -> dict[str, Any]:
     results = getattr(response, "results", None) or []
     if not results:
         return clean_screen()
-    return _result_to_screen(results[0], _threshold_from_context(context))
+    return _result_to_screen(
+        results[0],
+        _threshold_from_context(context),
+        GAME_AMBIGUOUS_CATEGORIES if setting == MODERATION_SETTING_GAME else frozenset(),
+    )
 
 
 def screen_to_verdict(screen: dict[str, Any]) -> dict[str, Any]:

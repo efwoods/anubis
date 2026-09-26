@@ -84,7 +84,6 @@ class DynamicPromptBuilder:
         conversation_sentiment_history: str | None = None,
         what_feels_real: str | None = None,
         user_preferences: str | None = None,
-        ask_what_feels_real: bool = False,
     ) -> ChatPromptTemplate:
         """
         Build a ChatPromptTemplate with optional components.
@@ -201,14 +200,6 @@ class DynamicPromptBuilder:
 
         # Continuous-learning sections: every one is plain prose already
         # rendered by ``retrieve_learning_sections``; an empty section is empty.
-        if ask_what_feels_real:
-            from src.anubis.utils.prompts.system_prompts import (
-                WHAT_FEELS_REAL_REQUEST_PROMPT,
-            )
-
-            what_feels_real_request_str = WHAT_FEELS_REAL_REQUEST_PROMPT
-        else:
-            what_feels_real_request_str = ""
 
         # Signature key phrases (the avatar's auto-discovered characteristic
         # phrasings). Injected as its own section; empty string when none exist.
@@ -261,7 +252,6 @@ class DynamicPromptBuilder:
             "conversation_sentiment_history": conversation_sentiment_history or "",
             "what_feels_real": what_feels_real or "",
             "user_preferences": user_preferences or "",
-            "what_feels_real_request": what_feels_real_request_str,
             "system_time": system_time,
             "learn_information_prompt_str": learn_information_prompt_str,
         }

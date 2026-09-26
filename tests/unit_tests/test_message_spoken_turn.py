@@ -442,3 +442,55 @@ async def test_recent_avatar_reply_texts_reads_the_last_ai_turns_newest_first():
             raise RuntimeError("down")
 
     assert await webapp_module._recent_avatar_reply_texts(SimpleNamespace(threads=_Broken()), "t1") == []
+
+
+def test_the_speaker_is_named_by_their_personal_avatar_before_the_account_profile():
+    """Renaming the personal avatar is how a person says what they are called.
+
+    The companion's account ("Marshal" on the Auth0 profile) talks to somebody
+    else's avatar, so the avatar does not portray the speaker; the speaker is
+    then named from the caller's own personal avatar ("Marshall").
+    """
+    import asyncio
+
+    from src.api import webapp
+
+    avatars = {
+        "evan-avatar": {
+            "assistant_id": "evan-avatar",
+            "name": "Evan Woods",
+            "metadata": {"is_personal_avatar_of_creator": True, "user_id": "evan"},
+        },
+        "marshall-avatar": {
+            "assistant_id": "marshall-avatar",
+            "name": "Marshall",
+            "metadata": {"is_personal_avatar_of_creator": True, "user_id": "marshall"},
+        },
+    }
+
+    class _Assistants:
+        async def get(self, assistant_id):
+            return avatars[assistant_id]
+
+        async def search(self, metadata=None, limit=10, offset=0, **_ignored):
+            user_id = (metadata or {}).get("user_id")
+            found = [a for a in avatars.values() if a["metadata"]["user_id"] == user_id]
+            return found[offset : offset + limit]
+
+    class _Client:
+        assistants = _Assistants()
+
+    caller = {"name": "Marshal", "identities": [{"user_id": "marshall"}]}
+    speaker, avatar, portrays = asyncio.run(
+        webapp._resolve_spoken_turn_labels(
+            _Client(), caller, assistant_id="evan-avatar", your_name=None
+        )
+    )
+    assert (speaker, avatar, portrays) == ("Marshall", "Evan Woods", False)
+
+    speaker, _avatar, _portrays = asyncio.run(
+        webapp._resolve_spoken_turn_labels(
+            _Client(), caller, assistant_id="evan-avatar", your_name="Marsh"
+        )
+    )
+    assert speaker == "Marsh"

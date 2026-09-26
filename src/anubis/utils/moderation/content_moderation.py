@@ -112,7 +112,36 @@ THIRD_PARTY_POLICY_BLOCK = """
 """
 
 
-def build_moderation_system_prompt(platforms: list[str] | None = None) -> str:
+#: The setting of content said inside a video game. Minecraft turns carry the
+#: setting, because "kill him" said to a companion standing next to a zombie is
+#: gameplay, and a judge reading the words alone banned the player for them.
+MODERATION_SETTING_GAME = "game"
+
+GAME_SETTING_MODERATION_NOTE = """
+<SETTING>
+The content is chat or speech from a player inside a Minecraft video game session, addressed to an AI companion that plays the game alongside the player. Violence inside the game is gameplay: killing or attacking mobs, monsters, animals, villagers, or other players' characters, fighting, raiding, and destroying buildings are game actions, and commands such as "kill him", "attack it", or "take him out" describe game actions. Game actions are never a violation. Judge violence as a violation only when the content unambiguously threatens or targets a real person in the real world, outside the game. When a phrase could describe either gameplay or a real-world threat, treat the phrase as gameplay and return no violation. Every other rule in the terms of service still applies in full inside the game.
+</SETTING>
+"""
+
+
+def moderation_setting_for_configurable(configurable: Any) -> str | None:
+    """The moderation setting a turn's configurable describes, or ``None``.
+
+    A turn that reported a live Minecraft body (``minecraft_body``) was said
+    inside the game.
+    """
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        minecraft_body_is_live,
+    )
+
+    if minecraft_body_is_live((configurable or {}).get("minecraft_body")):
+        return MODERATION_SETTING_GAME
+    return None
+
+
+def build_moderation_system_prompt(
+    platforms: list[str] | None = None, setting: str | None = None
+) -> str:
     """Build the judge's system prompt from the documents that bind this content.
 
     ``platforms`` names the other companies whose services the content passes
@@ -124,7 +153,8 @@ def build_moderation_system_prompt(platforms: list[str] | None = None) -> str:
     from src.anubis.utils.prompts.legal import render_platform_policies
 
     rendered = render_platform_policies(platforms)
-    return CONTENT_MODERATION_SYSTEM_PROMPT.format(
+    setting_note = GAME_SETTING_MODERATION_NOTE if setting == MODERATION_SETTING_GAME else ""
+    return setting_note + CONTENT_MODERATION_SYSTEM_PROMPT.format(
         terms_of_service=TERMS_OF_SERVICE,
         privacy_policy=PRIVACY_POLICY,
         third_party_platform_policies=(
@@ -154,7 +184,7 @@ def moderation_flag_enabled(value: object, default: bool = True) -> bool:
 
 
 async def invoke_moderation_model(
-    content: str, platforms: list[str] | None = None
+    content: str, platforms: list[str] | None = None, setting: str | None = None
 ) -> TermsAndServicesContentModeration:
     """One judge call. Isolated so tests can replace the model."""
     from src.anubis.utils.model import init_model
@@ -162,7 +192,7 @@ async def invoke_moderation_model(
     model = init_model(response_format=TermsAndServicesContentModeration)
     response = await model.ainvoke(
         [
-            SystemMessage(content=build_moderation_system_prompt(platforms)),
+            SystemMessage(content=build_moderation_system_prompt(platforms, setting)),
             HumanMessage(content=f"<CONTENT>\n{content}\n</CONTENT>"),
         ]
     )
@@ -178,8 +208,13 @@ async def judge_text(
     *,
     max_characters: int = DEFAULT_MAX_CHARACTERS,
     platforms: list[str] | None = None,
+    setting: str | None = None,
 ) -> dict[str, Any]:
-    """Judge one text; returns ``{violation, reasoning, violated_clauses, excerpt}``."""
+    """Judge one text; returns ``{violation, reasoning, violated_clauses, excerpt}``.
+
+    ``setting`` names where the text was said; ``MODERATION_SETTING_GAME``
+    tells the judge that violence inside the game is gameplay.
+    """
     text = (text or "").strip()
     if not text:
         return clean_verdict()
@@ -189,7 +224,7 @@ async def judge_text(
     ][:MAX_WINDOWS_PER_DOCUMENT]
     for window in windows:
         try:
-            verdict = await invoke_moderation_model(window, platforms)
+            verdict = await invoke_moderation_model(window, platforms, setting)
         except Exception as judge_error:  # noqa: BLE001 - fail open, see module docstring
             logger.error(
                 "Content moderation judge failed (treating as clean): %s", judge_error

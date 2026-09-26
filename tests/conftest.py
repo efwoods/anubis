@@ -27,7 +27,7 @@ def clean_concurrent_moderation_screen(monkeypatch):
     """
     import src.anubis.graph as graph_module
 
-    async def clean_screen(message_text, context):
+    async def clean_screen(message_text, context, setting=None):
         return None
 
     monkeypatch.setattr(graph_module, "screen_message_for_hard_block", clean_screen)

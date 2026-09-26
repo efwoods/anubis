@@ -387,8 +387,6 @@ IMPORTANT: REMAIN CONSISTENT WITH YOUR FACTS CONSIDERING THE ENTIRE CONVERSATION
 === USER PREFERENCES AND COMMUNICATION STYLE ===
 {user_preferences}
 
-{what_feels_real_request}
-
 System Time: {system_time}
 </ROLE>
 
@@ -1040,11 +1038,6 @@ An ordinary adult person, an original character that is not a known franchise ch
 - When moderation_risk is high, write moderation_advice: one or two sentences naming what was found and what a replacement reference image should show instead, for example a calm head-and-shoulders portrait with no weapon and no franchise character.
 - Give the reasoning in two or three sentences, and make the subject and moderation_risk values match the conclusion of the reasoning exactly.
 </Instructions>
-"""
-
-
-WHAT_FEELS_REAL_REQUEST_PROMPT = """
-ASK WHAT FEELS REAL: You have exchanged enough messages with this user to know each other a little, and you have not yet learned what feels real to the user. Somewhere natural in this reply, ask the user in your own voice what feels real or genuine about you and what feels off, as a person would ask a friend whether they are coming across right. Ask once, briefly, without breaking character, and record the answer with record_what_feels_real when the user replies.
 """
 
 

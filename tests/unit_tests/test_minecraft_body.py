@@ -212,3 +212,62 @@ def test_a_look_resume_keeps_the_remembered_minecraft_body():
     assert context.minecraft_body == "true"
     assert context.minecraft_world == "position: 1, 2, 3"
     assert context.live_shares == '["webcam","screen"]'
+
+
+def test_command_keys_the_model_guesses_are_still_read():
+    # With an untyped dict the model sometimes wrote "command" / "args"; every
+    # such item used to be dropped while the avatar announced the job anyway.
+    assert normalize_minecraft_commands(
+        [{"command": "collectBlocks", "args": ["oak_log", 8]}]
+    ) == [{"name": "collectBlocks", "arguments": ["oak_log", 8]}]
+    assert normalize_minecraft_commands([{"name": "!stop"}]) == [
+        {"name": "stop", "arguments": []}
+    ]
+
+
+def test_the_tool_schema_names_the_command_keys():
+    tool = build_minecraft_body_tools(None, minecraft_body=True)[0]
+    schema_text = str(tool.tool_call_schema.model_json_schema())
+    assert "name" in schema_text
+    assert "arguments" in schema_text
+
+
+@pytest.mark.asyncio
+async def test_a_call_with_only_invented_commands_is_rejected(_companion_frames):
+    tool = build_minecraft_body_tools(None, minecraft_body=True)[0]
+    answer = await tool.ainvoke(
+        {"commands": [{"name": "gatherWood", "arguments": []}]}
+    )
+    assert answer["status"] == "rejected"
+    assert answer["rejected_names"] == ["gatherWood"]
+    assert "again" in answer["message"]
+
+
+@pytest.mark.asyncio
+async def test_typed_command_objects_reach_the_companion(_companion_frames):
+    tool = build_minecraft_body_tools(None, minecraft_body=True)[0]
+    answer = await tool.ainvoke(
+        {"commands": [{"name": "collectBlocks", "arguments": ["dark_oak_log", 8]}]}
+    )
+    assert answer["status"] == "sent"
+    assert _companion_frames[-1]["commands"] == [
+        {"name": "collectBlocks", "arguments": ["dark_oak_log", 8]}
+    ]
+
+
+def test_the_body_block_acts_first_instead_of_looking_first():
+    block = build_minecraft_body_block(
+        world_snapshot="position: 0, 64, 0", tool_is_attached=True
+    )
+    assert "before mining" not in block
+    assert "Do not look before acting" in block
+    assert "collectBlocks" in block
+
+
+def test_look_now_is_offered_to_a_minecraft_body_only_for_sight_questions():
+    from src.anubis.utils.tools.vision.look_tools import minecraft_turn_asks_to_see
+
+    for command in ("gather wood", "dig", "look at me", "wait here", "stop following"):
+        assert not minecraft_turn_asks_to_see([HumanMessage(content=command)])
+    for question in ("what do you see?", "What’s around us", "look around"):
+        assert minecraft_turn_asks_to_see([HumanMessage(content=question)])

@@ -222,7 +222,7 @@ async def _stream_frames(graph, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_hard_block_mid_stream_replaces_the_reply_with_the_refusal(monkeypatch):
-    async def blocking_screen(message_text, context):
+    async def blocking_screen(message_text, context, setting=None):
         await asyncio.sleep(0.05)
         return {"violation": True, "reasoning": "blocked"}
 
@@ -251,7 +251,7 @@ async def test_a_hard_block_mid_stream_replaces_the_reply_with_the_refusal(monke
 async def test_a_hard_block_after_the_reply_finished_removes_the_finished_reply(monkeypatch):
     screen_may_answer = asyncio.Event()
 
-    async def late_blocking_screen(message_text, context):
+    async def late_blocking_screen(message_text, context, setting=None):
         await screen_may_answer.wait()
         return {"violation": True, "reasoning": "blocked"}
 

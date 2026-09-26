@@ -27,10 +27,7 @@ from src.anubis.utils.organization_links import (
 )
 from src.anubis.utils.learning.bulk_learning import mark_thread_pending
 from src.anubis.utils.learning.engagement import record_engagement
-from src.anubis.utils.learning.feedback import (
-    retrieve_learning_sections,
-    should_ask_what_feels_real,
-)
+from src.anubis.utils.learning.feedback import retrieve_learning_sections
 from src.anubis.utils.learning.sentiment import (
     classify_user_message_sentiment,
     message_text,
@@ -1191,10 +1188,6 @@ async def _build_consciousness_system_message_update(
         conversation_sentiment_history=learning_sections.conversation_sentiment_history,
         what_feels_real=learning_sections.what_feels_real,
         user_preferences=learning_sections.user_preferences,
-        ask_what_feels_real=should_ask_what_feels_real(
-            learning_sections,
-            int(getattr(learning_context, "ask_what_feels_real_after_messages", 5) or 0),
-        ),
     )
 
     if getattr(runtime.context, "debug_system_prompt", None) == "TRUE":
@@ -1832,8 +1825,24 @@ async def _build_consciousness_system_message_update(
             (config or {}).get("configurable", {}).get("peekable_shares"),
             may_control_shares=may_control_shares,
         )
+        from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+            minecraft_body_is_enabled as minecraft_body_gate_is_enabled,
+            minecraft_body_is_live as minecraft_body_reported_live,
+        )
+        from src.anubis.utils.tools.vision.look_tools import (
+            minecraft_turn_asks_to_see,
+        )
+
+        minecraft_body_withholds_look = (
+            minecraft_body_gate_is_enabled(runtime.context)
+            and minecraft_body_reported_live(
+                (config or {}).get("configurable", {}).get("minecraft_body")
+            )
+            and not minecraft_turn_asks_to_see(thread_messages)
+        )
         look_is_attached = (
             not answering_an_observation
+            and not minecraft_body_withholds_look
             and get_deep_agent_checkpointer() is not None
             and (
                 bool(live_sources)

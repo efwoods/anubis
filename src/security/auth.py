@@ -123,7 +123,7 @@ async def refuse_if_banned(
     from src.security.bans import (
         ban_refusal_detail,
         find_active_ban,
-        is_unbannable_administrator,
+        is_ban_exempt_account,
     )
 
     application_state = getattr(getattr(request, "app", None), "state", None)
@@ -131,7 +131,7 @@ async def refuse_if_banned(
     if pool is None:
         return
     context = getattr(application_state, "context", None)
-    if is_unbannable_administrator(user_id=user_id, email=email, context=context):
+    if is_ban_exempt_account(user_id=user_id, email=email, context=context):
         return
     ban = await find_active_ban(pool, user_id=user_id, hashed_ip=hashed_ip, email=email)
     if ban is None:
@@ -2654,6 +2654,61 @@ async def update_user_app_metadata_fields(
         logger.error(
             "Could not patch app_metadata fields %s for %s: %s",
             list(fields),
+            auth0_user_id,
+            patch_error,
+        )
+        return False
+
+    await _evict_api_key_cache_for_user(auth0_user_id)
+    return True
+
+
+def auth0_profile_name_fields(full_name: str) -> dict[str, str]:
+    """The Auth0 root profile fields that carry a person's name.
+
+    ``name`` holds the whole name. ``given_name`` is the first word and
+    ``family_name`` the remaining words, left out for a one-word name so an
+    earlier family name is not overwritten with an empty string.
+    """
+    cleaned_name = " ".join(str(full_name or "").split())
+    if not cleaned_name:
+        return {}
+    name_words = cleaned_name.split(" ")
+    profile_fields = {"name": cleaned_name, "given_name": name_words[0]}
+    if len(name_words) > 1:
+        profile_fields["family_name"] = " ".join(name_words[1:])
+    return profile_fields
+
+
+async def update_user_profile_name(
+    request: Request, auth0_user_id: str, full_name: str
+) -> bool:
+    """Write the personal avatar's name onto the Auth0 profile.
+
+    The personal avatar is the account holder's own portrait, so renaming the
+    personal avatar is renaming the person: the Auth0 ``name``, ``given_name``
+    and ``family_name`` follow, and every place that reads the account's name
+    (speaker labels, greetings, receipts) agrees with the avatar. The user's
+    cached API-key entries are evicted so the next request sees the new name
+    instead of waiting out the five-minute cache. Best-effort: logs and returns
+    ``False`` on failure, because the avatar rename has already succeeded.
+    """
+    profile_fields = auth0_profile_name_fields(full_name)
+    if not auth0_user_id or not profile_fields:
+        return False
+    try:
+        headers = await _mgmt_headers(request)
+        provider_encoded_user_id = quote(auth0_user_id, safe="")
+        response = await retry_async_httpx_request(
+            method="PATCH",
+            url=f"{BASE_AUTH_URL}/api/v2/users/{provider_encoded_user_id}",
+            headers=headers,
+            json=profile_fields,
+        )
+        response.raise_for_status()
+    except Exception as patch_error:
+        logger.error(
+            "Could not write the personal avatar name to the Auth0 profile of %s: %s",
             auth0_user_id,
             patch_error,
         )

@@ -167,6 +167,58 @@ def should_offer_look_now(messages: list[Any] | None) -> bool:
         return False
     return True
 
+
+#: Phrases that ask a Minecraft body what the body sees. On a Minecraft turn
+#: look_now is offered only when the latest human message holds one of these
+#: phrases. "look at me" is deliberately absent: in the game "look at me" is a
+#: body command (turn and face the player), carried out by act_in_minecraft,
+#: and answering the command with a screenshot description is the mistake the
+#: gate exists to prevent.
+_MINECRAFT_SIGHT_MARKERS = (
+    "what do you see",
+    "what can you see",
+    "do you see",
+    "can you see",
+    "what are you looking at",
+    "what's around",
+    "what is around",
+    "whats around",
+    "what's ahead",
+    "what is ahead",
+    "what's in front",
+    "what is in front",
+    "what's over there",
+    "what is over there",
+    "what does it look like",
+    "how does it look",
+    "look around",
+    "take a look",
+    "have a look",
+    "look now",
+    "describe",
+    "screenshot",
+)
+
+
+def minecraft_turn_asks_to_see(messages: list[Any] | None) -> bool:
+    """Whether the latest human message on a Minecraft turn asks what the body sees.
+
+    Mindcraft-style play carries out a command from the world snapshot the
+    companion already reports on every turn. A look is a pause, a screenshot
+    and a vision call, so a look spent on "gather wood" or "dig" delays the
+    command and, worse, turns the command into a description of the screen.
+    The look is therefore offered only when the person asked a sight question.
+    """
+    last_human: HumanMessage | None = None
+    for message in reversed(messages or []):
+        if isinstance(message, HumanMessage):
+            last_human = message
+            break
+    if last_human is None:
+        return False
+    lowered = _human_message_text(last_human).lower().replace("’", "'")
+    return any(marker in lowered for marker in _MINECRAFT_SIGHT_MARKERS)
+
 _SOURCE_ALIASES = {
     "webcam": SOURCE_WEBCAM,
     "camera": SOURCE_WEBCAM,

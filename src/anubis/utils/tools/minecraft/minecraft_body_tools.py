@@ -19,6 +19,7 @@ import logging
 from typing import Any
 
 from langchain.tools import tool
+from pydantic import AliasChoices, BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ MINECRAFT_PLAY_COMMAND_NAMES: tuple[str, ...] = (
     "smelt",
     "equip",
     "toss",
+    "giveCollected",
     "useOn",
     "attack",
     "sleep",
@@ -48,6 +50,37 @@ MINECRAFT_PLAY_COMMAND_NAMES: tuple[str, ...] = (
     "jump",
     "sneak",
     "say_chat",
+    "stfu",
+    "followPlayer",
+    "goToCoordinates",
+    "searchForBlock",
+    "searchForEntity",
+    "moveAway",
+    "goToSurface",
+    "digDown",
+    "stay",
+    "rememberHere",
+    "goToRememberedPlace",
+    "givePlayer",
+    "consume",
+    "discard",
+    "putInChest",
+    "takeFromChest",
+    "viewChest",
+    "smeltItem",
+    "clearFurnace",
+    "placeHere",
+    "attackPlayer",
+    "goToBed",
+    "lookAtPlayer",
+    "lookAtPosition",
+    "showVillagerTrades",
+    "tradeWithVillager",
+    "goal",
+    "endGoal",
+    "setMode",
+    "startConversation",
+    "endConversation",
 )
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -73,29 +106,87 @@ def minecraft_body_is_live(minecraft_body: Any) -> bool:
     return str(minecraft_body).strip().lower() in _LIVE_VALUES
 
 
-def normalize_minecraft_commands(commands: Any) -> list[dict[str, Any]]:
-    """Keep only closed-list commands. Invented names are dropped."""
+class MinecraftCommand(BaseModel):
+    """One body command from the closed command list.
+
+    A typed schema, rather than a bare ``dict``, is what tells the model the
+    exact keys. With ``list[dict]`` the model could guess keys such as
+    ``command`` and ``args``, every item was silently dropped, and the avatar
+    announced "I'm gathering dark oak wood now" while the body stood still.
+    """
+
+    name: str = Field(
+        validation_alias=AliasChoices("name", "command", "command_name"),
+        description=(
+            "One name from the closed command list, for example collectBlocks, "
+            "follow, stop, goto, lookAt."
+        ),
+    )
+    arguments: list[str | int | float] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("arguments", "args", "parameters"),
+        description=(
+            'Positional arguments in order, for example ["oak_log", 8] for '
+            "collectBlocks or [100, 64, -20] for goto. Empty for follow and stop."
+        ),
+    )
+
+
+def _command_item_as_dict(item: Any) -> dict[str, Any] | None:
+    """Read one command item from a model instance or a plain mapping."""
+    if isinstance(item, BaseModel):
+        return item.model_dump()
+    if isinstance(item, dict):
+        return {
+            "name": item.get("name", item.get("command", item.get("command_name"))),
+            "arguments": item.get(
+                "arguments", item.get("args", item.get("parameters"))
+            ),
+        }
+    return None
+
+
+def split_minecraft_commands(
+    commands: Any,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Split command items into closed-list commands and rejected names.
+
+    :returns: The accepted commands as ``{"name", "arguments"}`` mappings, and
+        the name of every rejected item (an empty string for an item with no
+        readable name), so the tool can tell the model which commands never
+        reached the body.
+    """
     if commands is None or commands == "":
-        return []
-    if isinstance(commands, dict):
+        return [], []
+    if isinstance(commands, (dict, BaseModel)):
         items = [commands]
     elif isinstance(commands, list):
         items = commands
     else:
-        return []
+        return [], [str(commands)]
     accepted: list[dict[str, Any]] = []
+    rejected: list[str] = []
     for item in items:
-        if not isinstance(item, dict):
+        command_mapping = _command_item_as_dict(item)
+        if command_mapping is None:
+            rejected.append(str(item))
             continue
-        name = str(item.get("name") or "").strip()
+        name = str(command_mapping.get("name") or "").strip().lstrip("!")
         if name not in MINECRAFT_PLAY_COMMAND_NAMES:
+            rejected.append(name)
             continue
-        arguments = item.get("arguments")
+        arguments = command_mapping.get("arguments")
         if arguments is None:
             arguments = []
         if not isinstance(arguments, list):
             arguments = [arguments]
         accepted.append({"name": name, "arguments": arguments})
+    return accepted, rejected
+
+
+def normalize_minecraft_commands(commands: Any) -> list[dict[str, Any]]:
+    """Keep only closed-list commands. Invented names are dropped."""
+    accepted, _rejected = split_minecraft_commands(commands)
     return accepted
 
 
@@ -129,20 +220,37 @@ def build_minecraft_body_block(
             "Spoken words are only what this person would say aloud. Never "
             "read commands aloud. Never mention the body or this tool unless "
             "the person asked about the world.\n"
-            # Said here rather than in the look_now description: a tool
-            # description that changes per turn moves the first tokens of the
-            # request and costs the cached prefix for the whole prompt.
-            "The body's own first-person view is reached by calling look_now "
-            "for the screen source, which turns the body's eyes on the world "
-            "and returns what the body sees at that instant. Nothing is "
-            "captured on an interval and no earlier description of the world "
-            "is kept, so calling look_now is the only way the assistant sees "
-            "the Minecraft world at all. Call look_now whenever what is in "
-            "the world decides the answer or the next action — before going "
-            "somewhere, before mining, placing or collecting, when asked what "
-            "is around or ahead, and when a job just finished and whether the "
-            "job worked is visible. Do not call look_now for identity, memory "
-            "or small talk that the world has no bearing on."
+            # Mindcraft-style play: a command is carried out, not researched.
+            # Said here rather than in the tool descriptions: a description
+            # that changes per turn moves the first tokens of the request and
+            # costs the cached prefix for the whole prompt.
+            "When the person asks the body to do something, call "
+            "act_in_minecraft in this same turn, choosing the command and the "
+            "block names from MINECRAFT_WORLD below. Never say the body is "
+            "doing, has started, or will do something unless act_in_minecraft "
+            "was called for that job in this turn and returned status sent. "
+            "The body carries out commands after the spoken words are said, "
+            "so speak of a job as starting, never as finished: 'I'll make a "
+            "pickaxe', 'Getting wood now', not 'I made a pickaxe' or 'I gave "
+            "you everything'. "
+            "When act_in_minecraft returns status rejected, call "
+            "act_in_minecraft again with corrected commands before replying. "
+            "Do not look before acting: MINECRAFT_WORLD already holds what the "
+            "body needs, and the body's skills find the nearest matching block "
+            "on their own.\n"
+            "Common requests: gather wood or get logs is collectBlocks with the "
+            "nearest log type listed in MINECRAFT_WORLD (oak_log when none is "
+            "listed) and a count such as 8; dig or mine is collectBlocks with "
+            "the named block, or dirt when no block is named; wait here, stay, "
+            "or stop following is stop; come here or follow me is follow; look "
+            "at me is lookAt with the argument player; go to x y z is goto.\n"
+            "Answer questions about the weather, the time of day, where the "
+            "body is, and what the body carries from the weather, time, "
+            "position, and inventory lines of MINECRAFT_WORLD; never guess "
+            "them.\n"
+            "look_now is attached only when the person asks what the body "
+            "sees; when attached, look_now for the screen source returns the "
+            "body's first-person view at that instant."
         )
     else:
         guidance = (
@@ -198,7 +306,7 @@ def build_minecraft_body_tools(
 
     @tool(ACT_IN_MINECRAFT_TOOL_NAME)
     async def act_in_minecraft(
-        commands: list[dict] | None = None,
+        commands: list[MinecraftCommand] | None = None,
         additional_as_is_text: str = "",
     ) -> dict:
         """Move the live Minecraft Java Edition body.
@@ -213,17 +321,61 @@ def build_minecraft_body_tools(
         this closed list. Invented command names are forbidden.
         Closed command list: {command_list}
 
-        Examples:
-        goToPlayer with arguments Steve
-        collectBlocks with arguments oak_log and 8
-        craftRecipe with arguments wooden_pickaxe and 1
-        follow with no arguments
-        stop with no arguments
-        goto with arguments 100, 64, -20
+        Each command is an object with the keys name and arguments, such as:
+        {"name": "goToPlayer", "arguments": ["Steve"]}
+        {"name": "collectBlocks", "arguments": ["oak_log", 8]}
+        {"name": "collectBlocks", "arguments": ["dirt", 4]}
+        {"name": "craftRecipe", "arguments": ["wooden_pickaxe", 1]}
+        {"name": "follow", "arguments": []}
+        {"name": "stop", "arguments": []}
+        {"name": "lookAt", "arguments": ["player"]}
+        {"name": "goto", "arguments": [100, 64, -20]}
 
-        An empty command list is allowed when talking is enough.
-        If a requested job has no matching command, use follow or lookAt the
-        player rather than freezing.
+        Arguments of each command, in order (square brackets mark optional):
+        Movement: goToPlayer: player name, [closeness]. followPlayer or
+        follow: [player name], [distance]. goToCoordinates or goto: x, y, z.
+        searchForBlock: block name, [range]. searchForEntity: entity type,
+        [range]. moveAway: distance. goToSurface: none. digDown: distance.
+        stop: none. stay: seconds, or -1 to stay until told otherwise.
+        lookAt or lookAtPlayer: player name or "player", [at or with].
+        lookAtPosition: x, y, z.
+        Places: rememberHere: name. goToRememberedPlace: name.
+        Gathering and building: collectBlocks: block name, count. mineBlock:
+        block name. placeBlock: block name, then x, y, z of the spot to fill,
+        or only the block name to place beside the body. placeHere: block name.
+        digDown: distance.
+        Crafting: craftRecipe: item name, count. smelt or smeltItem: item name,
+        [count]. clearFurnace: none.
+        Items: equip: item name. eat: none. consume: item name. toss or
+        discard: item name, [count]. givePlayer: player name, item name,
+        count. giveCollected: player name.
+        Chests: putInChest: item name, [count]. takeFromChest: item name,
+        [count]. viewChest: none.
+        Combat: attack: mob type (fights until the mob is gone). attackPlayer:
+        player name, only when the person asks for a fight in the game.
+        Life: sleep or goToBed: none. jump, sneak: none.
+        Use: useOn: tool name or "hand", then target name (an entity or a
+        block), or "nothing" to use the held item.
+        Villagers: showVillagerTrades: villager id. tradeWithVillager:
+        villager id, trade index, count.
+        Autonomy: goal: a sentence describing a longer job, worked on over
+        several turns. endGoal: none, once the goal is done. setMode: mode
+        name, true or false. stfu: none, to stop unprompted talk.
+        Talking: say_chat: text. startConversation: player name, message.
+        endConversation: player name.
+        Coordinates are whole numbers read from MINECRAFT_WORLD; never guess a
+        coordinate that is not there.
+        Commands run one after another in the order given, so a plan that
+        places or uses an item missing from the inventory in MINECRAFT_WORLD
+        includes the gathering and the craftRecipe steps first, for example
+        collectBlocks birch_log, then craftRecipe birch_planks, then
+        placeBlock birch_planks.
+
+        When the person asks the body to do a job, this tool must be called in
+        the same turn; saying the job is under way without calling this tool
+        leaves the body standing still. An empty command list is allowed only
+        when talking is enough. If a requested job has no matching command,
+        use follow or lookAt the player rather than freezing.
 
         additional_as_is_text is optional extra body notes forwarded to the
         body unchanged. It is not speech. Leave it empty unless there is a
@@ -231,10 +383,9 @@ def build_minecraft_body_tools(
 
         What the world looks like at this moment is in the MINECRAFT_BODY
         section of the system prompt, under MINECRAFT_WORLD. Choose commands
-        from that snapshot, and call look_now for the screen source when the
-        snapshot does not settle what to do next.
+        and block names from that snapshot and act at once; do not look first.
         """
-        accepted = normalize_minecraft_commands(commands)
+        accepted, rejected = split_minecraft_commands(commands)
         as_is_text = additional_as_is_text_of(additional_as_is_text)
         _tell_the_companion(
             {
@@ -243,15 +394,37 @@ def build_minecraft_body_tools(
                 "additional_as_is_text": as_is_text,
             }
         )
+        # Every command rejected: the body received nothing, so the avatar must
+        # not announce the job. The message tells the model to try again.
+        if rejected and not accepted:
+            return {
+                "status": "rejected",
+                "commands": [],
+                "rejected_names": rejected,
+                "additional_as_is_text": as_is_text,
+                "message": (
+                    "No command reached the body. These names are not on the "
+                    f"closed command list: {', '.join(rejected) or 'unnamed'}. "
+                    "Call act_in_minecraft again with names from the closed "
+                    "command list before telling the person the job started."
+                ),
+            }
+        message = (
+            f"Sent {len(accepted)} body command(s) to the Minecraft body."
+            if accepted
+            else "No body commands. The body stays as it is."
+        )
+        if rejected:
+            message += (
+                " Dropped names not on the closed command list: "
+                f"{', '.join(rejected) or 'unnamed'}."
+            )
         return {
             "status": "sent",
             "commands": accepted,
+            "rejected_names": rejected,
             "additional_as_is_text": as_is_text,
-            "message": (
-                f"Sent {len(accepted)} body command(s) to the Minecraft body."
-                if accepted
-                else "No body commands. The body stays as it is."
-            ),
+            "message": message,
         }
 
     # Only the closed command list is interpolated, and that list is the same

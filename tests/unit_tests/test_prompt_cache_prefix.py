@@ -123,10 +123,6 @@ def test_the_per_turn_values_are_all_inside_the_role_block():
         "{user_emotions}",
         "{current_conversation_sentiment}",
         "{system_time}",
-        # The what-feels-real request flips on and off with the message count,
-        # and used to sit in CONTINUOUS_LEARNING near the top, where the flip
-        # invalidated every cached token behind it.
-        "{what_feels_real_request}",
     ):
         assert placeholder not in fixed_half, placeholder
 

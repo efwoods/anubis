@@ -122,7 +122,7 @@ def test_the_minecraft_body_is_told_to_look_rather_than_the_tool_description():
     )
 
     block = build_minecraft_body_block(world_snapshot="position: 0, 64, 0")
-    assert "Minecraft world" in block
+    assert "first-person view" in block
     assert "look_now" in block
 
     description = build_look_tools(

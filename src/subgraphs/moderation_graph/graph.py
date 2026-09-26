@@ -75,6 +75,8 @@ class ModerationState(TypedDict, total=False):
     text: str
     documents: Sequence[Document]
     mode: str
+    #: Where the text was said; ``MODERATION_SETTING_GAME`` for a Minecraft turn.
+    setting: str
     screen: dict
     verdict: dict
 
@@ -115,7 +117,9 @@ async def fast_screen(state: ModerationState, runtime: Any = None) -> dict:
     text = _screen_input_text(state)
     if not text:
         return {"screen": clean_screen()}
-    return {"screen": await fast_screen_text(text, context)}
+    return {
+        "screen": await fast_screen_text(text, context, setting=state.get("setting"))
+    }
 
 
 def route_after_fast_screen(
@@ -158,7 +162,9 @@ async def deep_judge(state: ModerationState, runtime: Any = None) -> dict:
         )
     else:
         verdict = await judge_text(
-            state.get("text") or "", max_characters=max_characters
+            state.get("text") or "",
+            max_characters=max_characters,
+            setting=state.get("setting"),
         )
     return {"verdict": verdict}
 
@@ -187,6 +193,7 @@ async def moderate_text_with_graph(
     *,
     mode: str = MODERATION_MODE_MESSAGE,
     context: Any | None = None,
+    setting: str | None = None,
 ) -> dict:
     """Run the graph over one text and return ``{screen, verdict}``.
 
@@ -194,7 +201,7 @@ async def moderate_text_with_graph(
     ended early because the screen was clean" from "the judge found nothing".
     """
     result = await moderation_graph.ainvoke(
-        {"text": text or "", "mode": mode},
+        {"text": text or "", "mode": mode, "setting": setting or ""},
         context=_context_or_default(context),
     )
     return {

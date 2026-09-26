@@ -231,7 +231,7 @@ def _clear_ban_cache():
 def clean_screen_everywhere(monkeypatch):
     """Screen every text as clean unless a test says otherwise."""
 
-    async def _clean(text, context):
+    async def _clean(text, context, setting=None):
         return _screen_response(False, {}, {"violence": 0.01})
 
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", _clean)
@@ -259,7 +259,7 @@ def _verdict(
 async def test_judge_text_windows_long_content_and_reports_first_violation(monkeypatch):
     seen: list[str] = []
 
-    async def fake_model(content, platforms=None):
+    async def fake_model(content, platforms=None, setting=None):
         seen.append(content)
         return _verdict(
             "BAD" in content,
@@ -280,7 +280,7 @@ async def test_judge_text_windows_long_content_and_reports_first_violation(monke
 async def test_judge_fails_open_on_model_error(monkeypatch):
     """A judge outage must let the turn through. Refusing here would be wrong."""
 
-    async def broken(content, platforms=None):
+    async def broken(content, platforms=None, setting=None):
         raise RuntimeError("model down")
 
     monkeypatch.setattr(moderation, "invoke_moderation_model", broken)
@@ -290,7 +290,7 @@ async def test_judge_fails_open_on_model_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_judge_documents_returns_the_violating_source(monkeypatch):
-    async def fake_model(content, platforms=None):
+    async def fake_model(content, platforms=None, setting=None):
         return _verdict(
             "pirated" in content,
             "pirated material" if "pirated" in content else "",
@@ -319,7 +319,7 @@ async def test_judge_documents_returns_the_violating_source(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_screen_outcome_is_decided_by_the_threshold(monkeypatch):
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         if "hateful" in text:
             return _screen_response(True, {"hate": True}, {"hate": 0.97})
         if "borderline" in text:
@@ -346,7 +346,7 @@ async def test_screen_outcome_is_decided_by_the_threshold(monkeypatch):
 async def test_screen_fails_open_on_endpoint_error(monkeypatch):
     """A screening outage must not refuse a turn either."""
 
-    async def broken(text, context):
+    async def broken(text, context, setting=None):
         raise RuntimeError("screen down")
 
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", broken)
@@ -362,10 +362,10 @@ async def test_screen_fails_open_on_endpoint_error(monkeypatch):
 async def test_a_clean_message_ends_without_paying_for_the_judge(monkeypatch):
     judged: list[str] = []
 
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         return _screen_response(False, {}, {"hate": 0.01})
 
-    async def fake_judge(content, platforms=None):
+    async def fake_judge(content, platforms=None, setting=None):
         judged.append(content)
         return _verdict(False)
 
@@ -387,10 +387,10 @@ async def test_a_clean_upload_is_judged_anyway(monkeypatch):
     """Nothing violating may reach the index, and no person waits on an upload."""
     judged: list[str] = []
 
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         return _screen_response(False, {}, {"hate": 0.01})
 
-    async def fake_judge(content, platforms=None):
+    async def fake_judge(content, platforms=None, setting=None):
         judged.append(content)
         return _verdict(
             "pirated" in content,
@@ -412,10 +412,10 @@ async def test_a_clean_upload_is_judged_anyway(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_suspect_screen_is_settled_by_the_judge(monkeypatch):
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         return _screen_response(True, {"harassment": True}, {"harassment": 0.42})
 
-    async def fake_judge(content, platforms=None):
+    async def fake_judge(content, platforms=None, setting=None):
         return _verdict(True, "harassment", ["borderline"])
 
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", fake_screen)
@@ -434,10 +434,10 @@ async def test_a_suspect_screen_is_settled_by_the_judge(monkeypatch):
 async def test_a_blocking_screen_refuses_without_calling_the_judge(monkeypatch):
     judged: list[str] = []
 
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         return _screen_response(True, {"hate": True}, {"hate": 0.97})
 
-    async def fake_judge(content, platforms=None):
+    async def fake_judge(content, platforms=None, setting=None):
         judged.append(content)
         return _verdict(False)
 
@@ -471,7 +471,7 @@ def test_route_after_moderation_refuses_only_a_confirmed_violation():
 
 @pytest.mark.asyncio
 async def test_moderate_content_fast_screens_the_latest_human_message(monkeypatch):
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         if "hateful" in text:
             return _screen_response(True, {"hate": True}, {"hate": 0.97})
         return _screen_response(False, {}, {"hate": 0.01})
@@ -498,7 +498,7 @@ async def test_moderate_content_fast_screens_the_latest_human_message(monkeypatc
 
 @pytest.mark.asyncio
 async def test_moderate_content_fast_respects_the_flag_and_the_skip(monkeypatch):
-    async def fake_screen(text, context):
+    async def fake_screen(text, context, setting=None):
         return _screen_response(True, {"hate": True}, {"hate": 0.97})
 
     monkeypatch.setattr(fast_screen_module, "invoke_fast_screen_model", fake_screen)
@@ -520,7 +520,7 @@ async def test_moderate_content_fast_respects_the_flag_and_the_skip(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_moderate_content_fast_fails_open_when_the_graph_raises(monkeypatch):
-    async def broken(text, *, mode, context):
+    async def broken(text, *, mode, context, setting=None):
         raise RuntimeError("graph down")
 
     monkeypatch.setattr(
@@ -592,7 +592,7 @@ def test_route_media_moderation_gates_every_consumer():
 async def test_moderate_documents_records_the_verdict_on_a_violation(
     monkeypatch, clean_screen_everywhere
 ):
-    async def fake_judge(content, platforms=None):
+    async def fake_judge(content, platforms=None, setting=None):
         return _verdict(
             "pirated" in content,
             "pirated material" if "pirated" in content else "",
@@ -625,7 +625,7 @@ async def test_moderate_documents_records_the_verdict_on_a_violation(
 async def test_moderate_documents_respects_the_flag_and_the_skip(
     monkeypatch, clean_screen_everywhere
 ):
-    async def fake_judge(content, platforms=None):
+    async def fake_judge(content, platforms=None, setting=None):
         return _verdict(True)
 
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_judge)
@@ -879,7 +879,7 @@ async def test_refuse_if_banned_skips_the_administrator():
 
 @pytest.mark.asyncio
 async def test_judge_text_discards_a_violation_without_quoted_evidence(monkeypatch):
-    async def fake_model(content, platforms=None):
+    async def fake_model(content, platforms=None, setting=None):
         return _verdict(True, "no quotes from the content")
 
     monkeypatch.setattr(moderation, "invoke_moderation_model", fake_model)
@@ -1133,7 +1133,7 @@ async def test_platform_rules_reach_the_judge_and_stay_out_of_violated_clauses(
 
     seen: dict = {}
 
-    async def fake_model(content, platforms=None):
+    async def fake_model(content, platforms=None, setting=None):
         seen["platforms"] = platforms
 
         class Verdict:
@@ -1165,7 +1165,7 @@ async def test_the_judge_is_always_called_with_both_arguments(monkeypatch):
 
     calls: list = []
 
-    async def fake_model(content, platforms=None):
+    async def fake_model(content, platforms=None, setting=None):
         calls.append((content, platforms))
 
         class Verdict:
@@ -1191,3 +1191,82 @@ def test_a_named_platforms_rules_are_rendered_into_the_prompt():
     with_twitch = build_moderation_system_prompt(["twitch"])
     assert len(with_twitch) > len(without)
     assert "THIRD_PARTY_PLATFORM_POLICIES" in with_twitch
+
+
+def test_an_unrestricted_demonstration_account_is_exempt_from_bans():
+    """A demonstration account is driven through the product on purpose.
+
+    The Minecraft companion's account was banned for a spoken "Kill him." aimed
+    at a mob; accounts on UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS are recorded
+    for audit only, and the exemption grants no administrator powers.
+    """
+    from types import SimpleNamespace
+
+    from src.security.bans import is_ban_exempt_account, is_unbannable_administrator
+
+    context = SimpleNamespace(
+        unrestricted_metered_account_identifiers="free_key@neuralnexus.site",
+        admin_user_id="the-administrator",
+        admin_account_email="admin@example.com",
+    )
+    assert is_ban_exempt_account(
+        user_id="6ab6daff0f5dfbfd6c8f65e6",
+        email="free_key@neuralnexus.site",
+        context=context,
+    )
+    assert not is_unbannable_administrator(
+        user_id="6ab6daff0f5dfbfd6c8f65e6",
+        email="free_key@neuralnexus.site",
+        context=context,
+    )
+    assert not is_ban_exempt_account(
+        user_id="stranger", email="stranger@example.com", context=context
+    )
+    assert not is_ban_exempt_account(user_id=None, email=None, context=context)
+
+
+def test_a_minecraft_turn_is_moderated_as_gameplay():
+    """ "Kill him." said beside a mob is gameplay, and was banned as a threat."""
+    from types import SimpleNamespace
+
+    from src.anubis.utils.moderation.content_moderation import (
+        MODERATION_SETTING_GAME,
+        build_moderation_system_prompt,
+        moderation_setting_for_configurable,
+    )
+    from src.anubis.utils.moderation.fast_screen import (
+        FAST_SCREEN_BLOCK,
+        FAST_SCREEN_SUSPECT,
+        GAME_AMBIGUOUS_CATEGORIES,
+        _result_to_screen,
+    )
+
+    assert moderation_setting_for_configurable({"minecraft_body": "true"}) == (
+        MODERATION_SETTING_GAME
+    )
+    assert moderation_setting_for_configurable({}) is None
+
+    game_prompt = build_moderation_system_prompt(None, MODERATION_SETTING_GAME)
+    assert "Minecraft" in game_prompt
+    assert "treat the phrase as gameplay" in game_prompt
+    assert "Minecraft" not in build_moderation_system_prompt(None)
+
+    violent_words = SimpleNamespace(
+        flagged=True,
+        categories={"violence": True, "sexual/minors": False},
+        category_scores={"violence": 0.97, "sexual/minors": 0.0},
+    )
+    assert _result_to_screen(violent_words, 0.9)["outcome"] == FAST_SCREEN_BLOCK
+    in_game = _result_to_screen(violent_words, 0.9, GAME_AMBIGUOUS_CATEGORIES)
+    assert in_game["outcome"] == FAST_SCREEN_SUSPECT
+
+    # Outside the ambiguous categories the game setting changes nothing.
+    abuse = SimpleNamespace(
+        flagged=True,
+        categories={"sexual/minors": True},
+        category_scores={"sexual/minors": 0.99},
+    )
+    assert (
+        _result_to_screen(abuse, 0.9, GAME_AMBIGUOUS_CATEGORIES)["outcome"]
+        == FAST_SCREEN_BLOCK
+    )

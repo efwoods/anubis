@@ -2234,13 +2234,6 @@ class GlobalContext:
         },
     )
 
-    ask_what_feels_real_after_messages: int = field(
-        default=5,
-        metadata={
-            "description": "Once the user has sent this many messages to an avatar and nothing is recorded about what feels real to the user, the avatar naturally asks. Zero disables the question. Env ASK_WHAT_FEELS_REAL_AFTER_MESSAGES."
-        },
-    )
-
     conversation_sentiment_per_turn_enabled: str = field(
         default="TRUE",
         metadata={
@@ -2564,6 +2557,18 @@ class GlobalContext:
                 "Email address of the unbannable administrator, the same account "
                 "admin_user_id names. A ban is never enforced against this address. "
                 "Env ADMIN_ACCOUNT_EMAIL."
+            )
+        },
+    )
+
+    ban_immune_account_identifiers: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "Comma-separated email addresses or bare Auth0 user ids of accounts "
+                "a ban is never enforced against, in addition to the administrator. "
+                "A listed account gains ban immunity only, never administrator "
+                "powers. Env BAN_IMMUNE_ACCOUNT_IDENTIFIERS."
             )
         },
     )

@@ -42,7 +42,6 @@ from src.anubis.utils.learning.engagement import (
 from src.anubis.utils.learning.feedback import (
     list_thread_ratings,
     retrieve_learning_sections,
-    should_ask_what_feels_real,
     store_feedback_message,
     store_message_rating,
     store_user_preference,
@@ -223,24 +222,6 @@ async def test_retrieve_learning_sections_fills_every_section():
     assert "wistful about sailing" in sections.conversation_sentiment_history
     assert "sailing jokes feel real" in sections.what_feels_real
     assert "short sailing replies" in sections.user_preferences
-    assert sections.what_feels_real_recorded is True
-    assert should_ask_what_feels_real(sections, 2) is False
-
-
-@pytest.mark.asyncio
-async def test_should_ask_what_feels_real_after_threshold_when_nothing_recorded():
-    store = _make_store()
-    from src.anubis.utils.learning.engagement import record_engagement
-
-    for _ in range(5):
-        await record_engagement(store, USER, AVATAR, THREAD)
-    sections = await retrieve_learning_sections(
-        store, USER, AVATAR, thread_id=THREAD, query="hello", limit=5
-    )
-    assert sections.what_feels_real_recorded is False
-    assert should_ask_what_feels_real(sections, 5) is True
-    assert should_ask_what_feels_real(sections, 6) is False
-    assert should_ask_what_feels_real(sections, 0) is False
 
 
 @pytest.mark.asyncio
@@ -436,3 +417,19 @@ def test_find_avatar_message_and_prompt_prefers_named_message_and_skips_tool_tur
         None,
         None,
     )
+
+
+def test_learn_user_preference_schema_defaults_omitted_category():
+    """Model tool calls often omit category; validation must not refuse the call.
+
+    Observed 2026-09-25: learn_user_preference failed with
+    ``category Field required`` so nothing was stored and no Learned badge
+    was announced, while the avatar still verbally acknowledged the preference.
+    """
+    from src.anubis.utils.tools.identity.learning_tools import UserPreferenceAndContext
+
+    parsed = UserPreferenceAndContext(
+        preference="The user wants me to stop asking for feedback.",
+        preference_context="The user instructed me to stop asking for feedback.",
+    )
+    assert parsed.category == "other"

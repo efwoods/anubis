@@ -233,6 +233,54 @@ def is_unbannable_administrator(
     return False
 
 
+def is_ban_exempt_account(
+    *,
+    user_id: str | None = None,
+    email: str | None = None,
+    context: Any | None = None,
+) -> bool:
+    """Return whether a ban on this identity is recorded for audit only.
+
+    Two kinds of account are never refused for a ban: the administrator
+    (``is_unbannable_administrator``), and every account on
+    ``UNRESTRICTED_METERED_ACCOUNT_IDENTIFIERS``, the accounts set aside for
+    demonstrating and testing the product. A demonstration account is driven
+    through every edge of the product on purpose, including a Minecraft body
+    told to "kill" a zombie, and a false-positive ban there locks the
+    demonstration out of every surface at once.
+
+    Kept apart from ``is_unbannable_administrator`` because that function also
+    grants administrator powers (appeal handling, the admin view of bans), and
+    a demonstration account must not gain those.
+
+    Both identifiers here come from an authenticated account or from the ban
+    record written for one, so the email address is treated as verified, which
+    is the condition ``is_unrestricted_metered_account`` places on an email
+    entry.
+    """
+    if is_unbannable_administrator(user_id=user_id, email=email, context=context):
+        return True
+    configured_identifiers = getattr(
+        context, "unrestricted_metered_account_identifiers", None
+    )
+    if not configured_identifiers:
+        return False
+    from src.anubis.utils.billing.gating import is_unrestricted_metered_account
+
+    bare_user_id = str(user_id or "").split("|")[-1] or None
+    account = {
+        "user_id": f"auth0|{bare_user_id}" if bare_user_id else None,
+        "identities": [{"user_id": bare_user_id}] if bare_user_id else [],
+        "email": email,
+        "email_verified": bool(email),
+    }
+    try:
+        return is_unrestricted_metered_account(account, configured_identifiers)
+    except Exception:  # noqa: BLE001 - an unreadable list exempts nobody
+        logger.debug("Could not read the unrestricted account list", exc_info=True)
+        return False
+
+
 def supporting_evidence_quotes(verdict: Mapping[str, Any] | None) -> list[str]:
     """The verbatim content quotes the judge named as the bannable lines."""
     raw = (verdict or {}).get("supporting_evidence")
@@ -511,13 +559,19 @@ async def ban_account(
         return existing
 
     context = getattr(app_state, "context", None)
-    unbannable = is_unbannable_administrator(
+    unbannable = is_ban_exempt_account(
         user_id=subject.user_id, email=subject.email, context=context
     )
     enforced = not unbannable
-    skipped_reason = (
-        "unbannable administrator; recorded for audit only" if unbannable else None
-    )
+    skipped_reason = None
+    if unbannable:
+        skipped_reason = (
+            "unbannable administrator; recorded for audit only"
+            if is_unbannable_administrator(
+                user_id=subject.user_id, email=subject.email, context=context
+            )
+            else "unrestricted demonstration account; recorded for audit only"
+        )
 
     ban_id = str(uuid.uuid4())
     clauses_text = "\n".join(violated_clauses or []) or None

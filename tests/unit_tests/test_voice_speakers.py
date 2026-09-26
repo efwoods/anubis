@@ -428,6 +428,67 @@ def test_diarize_spoken_turn_does_not_keep_a_remembered_lone_voice_as_someone_el
     assert turn.script == "to pay your wall, you know."
 
 
+def _avatar_voice_matched_turn(monkeypatch, *, avatar_playback_reaches_microphone):
+    """A caller who is not the avatar's creator, speaking in the avatar's voice.
+
+    The shape the Minecraft companion produced: the companion's account was not
+    the account that created the personal avatar, the avatar's voice is the
+    player's own voice, and the diarizer matched the player to the avatar's
+    reference clip.
+    """
+    monkeypatch.setattr(speakers_module, "_diarize_token_cost", lambda usage, context: 0.0, raising=False)
+    repository = InMemoryMediaAssetRepository()
+    asyncio.run(
+        repository.add_voice_clip(
+            {
+                "user_id": "u1",
+                "assistant_id": "a1",
+                "source": "recording",
+                "mime_type": "audio/mpeg",
+                "bytes": _sine_mp3(4.0),
+                "duration_seconds": 4.0,
+            }
+        )
+    )
+    diarizer = _FakeDiarizer([[_segment("Evan Woods", "Gather some wood for me.", 0.0, 1.8)]])
+    return asyncio.run(
+        diarize_spoken_turn(
+            _sine_webm(2.0),
+            mime_type="audio/webm",
+            filename="utterance.webm",
+            context=_context(),
+            repository=repository,
+            user_id="u1",
+            assistant_id="a1",
+            thread_id="t1",
+            owner_label="Marshal",
+            avatar_label="Evan Woods",
+            avatar_portrays_the_speaker=False,
+            diarizer=diarizer,
+            avatar_playback_reaches_microphone=avatar_playback_reaches_microphone,
+        )
+    )
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg is not available")
+def test_a_voice_matching_the_avatar_clip_is_an_echo_where_playback_can_be_heard(monkeypatch):
+    turn = _avatar_voice_matched_turn(monkeypatch, avatar_playback_reaches_microphone=True)
+    assert turn.avatar_spoke and not turn.owner_spoke
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg is not available")
+def test_a_minecraft_voice_stream_is_never_dismissed_as_the_avatar_echo(monkeypatch):
+    # Simple Voice Chat hands the companion one stream per player and the
+    # companion drops the avatar body's packets, so the avatar's playback can
+    # never be on the recording: the matched voice is the player talking.
+    turn = _avatar_voice_matched_turn(monkeypatch, avatar_playback_reaches_microphone=False)
+    assert turn.owner_spoke and not turn.avatar_spoke
+    assert turn.script == "Gather some wood for me."
+    # Relabelling is not a reference match of the caller's own voice, so the
+    # caller's voice corpus never accrues from the avatar's clip.
+    assert turn.owner_matched_reference is False
+
+
 # --- the avatar's own voice heard through a speaker --------------------------------
 
 from src.anubis.utils.voice.speakers import (  # noqa: E402

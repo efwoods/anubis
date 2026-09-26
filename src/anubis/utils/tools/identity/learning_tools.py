@@ -47,12 +47,16 @@ class UserPreferenceAndContext(BaseModel):
             "preference, so the stored preference carries enough context to apply."
         )
     )
+    # Default matches the tool function. The model often omits category; without
+    # a Field default, Pydantic refuses the call before any preference is stored
+    # and before the Learned badge can be announced (observed 2026-09-25).
     category: Literal["communication_style", "address", "topic", "format", "other"] = Field(
+        default="other",
         description=(
             "communication_style for tone, humor, directness, or length; address for "
             "names and titles; topic for subjects the user wants or avoids; format for "
-            "lists, paragraphs, or emoji; other for anything else."
-        )
+            "lists, paragraphs, or emoji; other for anything else. When unsure, other."
+        ),
     )
 
 

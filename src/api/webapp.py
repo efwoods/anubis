@@ -205,6 +205,7 @@ from src.security.auth import (
     resolve_request_hashed_ip,
     security_route,
     update_user_app_metadata_fields,
+    update_user_profile_name,
     update_user_subscription_status,
 )
 
@@ -1726,6 +1727,17 @@ def _message_text_for_moderation(human_message: Any) -> str:
         return ""
 
 
+def _moderation_setting_of(config: Any) -> str | None:
+    """The moderation setting of a turn's run config (the game for Minecraft)."""
+    from src.anubis.utils.moderation.content_moderation import (
+        moderation_setting_for_configurable,
+    )
+
+    return moderation_setting_for_configurable(
+        ((config or {}).get("configurable") or {}) if isinstance(config, dict) else {}
+    )
+
+
 async def _judge_message_after_reply(
     app_state: Any,
     current_user: dict | None,
@@ -1733,8 +1745,12 @@ async def _judge_message_after_reply(
     message_text: str,
     request_hashed_ip: str | None,
     already_refused: bool = False,
+    setting: str | None = None,
 ) -> None:
     """Run the deep terms-of-service judge on a message AFTER its reply was sent.
+
+    ``setting`` names where the message was said; a Minecraft turn passes the
+    game setting so the judge reads violence inside the game as gameplay.
 
     This is the half of AI monitoring that must not touch the critical path of a
     reply. The inline screen (``moderate_content_fast`` in the graph) is one free
@@ -1781,6 +1797,7 @@ async def _judge_message_after_reply(
                 getattr(context, "content_moderation_max_characters", DEFAULT_MAX_CHARACTERS)
                 or DEFAULT_MAX_CHARACTERS
             ),
+            setting=setting,
         )
         if not verdict.get("violation"):
             return
@@ -1955,9 +1972,17 @@ async def message_graph_sse(
         )
 
         if not moderation_is_skipped(config):
+            from src.anubis.utils.moderation.content_moderation import (
+                moderation_setting_for_configurable,
+            )
+
             concurrent_screen_task = asyncio.create_task(
                 screen_message_for_hard_block(
-                    _message_text_for_moderation(human_message), context
+                    _message_text_for_moderation(human_message),
+                    context,
+                    setting=moderation_setting_for_configurable(
+                        config.get("configurable") or {}
+                    ),
                 )
             )
             config = {
@@ -2357,6 +2382,7 @@ async def message_graph_sse(
             message_text=_message_text_for_moderation(human_message),
             request_hashed_ip=request_hashed_ip,
             already_refused=moderation_verdict is not None,
+            setting=_moderation_setting_of(config),
         )
     )
 
@@ -8065,6 +8091,25 @@ async def modify_avatar(
 
         await record_personal_avatar_pointer(client, user_id, assistant_id)
 
+    # The personal avatar is the account holder's own portrait, so its name is
+    # the account holder's name: a rename, or flagging a differently named
+    # avatar as the personal avatar, is written to the Auth0 profile as well.
+    # After the avatar update on purpose, so a failed profile write never
+    # undoes a rename that already succeeded.
+    if new_avatar_name or (update_personal_avatar_flag and is_personal_avatar_of_creator):
+        updated_avatar_metadata = (result or {}).get("metadata") or {}
+        personal_avatar_name = str(
+            (result or {}).get("name") or new_avatar_name or ""
+        ).strip()
+        if (
+            personal_avatar_name
+            and updated_avatar_metadata.get("is_personal_avatar_of_creator") is True
+            and updated_avatar_metadata.get("user_id") == caller_user_id
+        ):
+            await update_user_profile_name(
+                request, current_user.get("user_id") or "", personal_avatar_name
+            )
+
     # Naming the personal avatar is the moment research becomes safe to run.
     #
     # ``create_personal_avatar`` deliberately does NOT research the avatar it
@@ -9210,14 +9255,59 @@ def _account_display_name(current_user: dict) -> str:
     return local_part
 
 
+async def _personal_avatar_name_of_caller(
+    langgraph_client, current_user: dict, *, store: Any = None
+) -> str:
+    """The name on the caller's own personal avatar, or ``""`` when unreadable.
+
+    The store pointer costs one read; the full avatar scan runs only for an
+    account whose pointer has not been written yet.
+    """
+    from src.anubis.utils.personal_avatar import (
+        bare_user_identifier,
+        find_personal_avatar,
+        is_personal_avatar,
+        read_personal_avatar_id,
+    )
+
+    user_id = bare_user_identifier(current_user)
+    if not user_id:
+        return ""
+    try:
+        personal_avatar = None
+        personal_avatar_id = await read_personal_avatar_id(store, user_id)
+        if personal_avatar_id:
+            personal_avatar = await langgraph_client.assistants.get(
+                assistant_id=personal_avatar_id
+            )
+        if not personal_avatar or not is_personal_avatar(personal_avatar):
+            personal_avatar = await find_personal_avatar(langgraph_client, user_id)
+        if not personal_avatar:
+            return ""
+        if str((personal_avatar.get("metadata") or {}).get("user_id") or "") != user_id:
+            return ""
+        return str(personal_avatar.get("name") or "").strip()
+    except Exception:  # noqa: BLE001 - a lookup failure falls back to the profile
+        logger.debug("Could not read the caller's personal avatar name", exc_info=True)
+        return ""
+
+
 async def _resolve_spoken_turn_labels(
     langgraph_client,
     current_user: dict,
     *,
     assistant_id: str,
     your_name: Optional[str],
+    store: Any = None,
 ) -> tuple[str, str, bool]:
     """Who is at the microphone, who the avatar is, and whether they are one person.
+
+    The speaker is named, in order, by the ``your_name`` the client sent, by
+    the avatar itself when the avatar is the speaker's own portrait, by the
+    name on the speaker's own personal avatar, and only then by the account
+    profile. The personal avatar comes before the profile because renaming the
+    personal avatar is how a person tells Neural Nexus what they are called;
+    the Auth0 profile name is whatever the sign-up flow captured.
 
     The reference clip the diarizer matches voices against is the AVATAR's
     voice. On a personal avatar — the one flagged as a portrait of its own
@@ -9254,6 +9344,10 @@ async def _resolve_spoken_turn_labels(
         # The avatar IS this person, so the avatar's name is theirs.
         spoken_for = avatar_name
     if not spoken_for:
+        spoken_for = await _personal_avatar_name_of_caller(
+            langgraph_client, current_user, store=store
+        )
+    if not spoken_for:
         spoken_for = _account_display_name(current_user)
     return (
         spoken_for or DEFAULT_OWNER_LABEL,
@@ -9272,8 +9366,13 @@ async def label_spoken_turn_files(
     thread_id: Optional[str],
     your_name: Optional[str],
     request_id: Optional[str],
+    avatar_playback_reaches_microphone: bool = True,
 ) -> tuple[list, str, dict | None, dict | None]:
     """Turn a ``diarize=true`` turn's audio attachment into a speaker-labelled script.
+
+    ``avatar_playback_reaches_microphone=False`` is passed for the Minecraft
+    companion, whose per-player voice streams never carry the avatar's own
+    playback, so no heard voice is dismissed as the avatar's echo.
 
     Returns the remaining (non-audio) files, the message text (the script when
     the turn carried audio), the ``additional_kwargs`` for the human message and
@@ -9326,6 +9425,7 @@ async def label_spoken_turn_files(
         current_user,
         assistant_id=assistant_id,
         your_name=your_name,
+        store=getattr(app_state, "store", None),
     )
     recent_avatar_replies = await _recent_avatar_reply_texts(langgraph_client, thread_id)
     user_id = current_user["identities"][0]["user_id"]
@@ -9359,6 +9459,7 @@ async def label_spoken_turn_files(
                 avatar_portrays_the_speaker=avatar_portrays_the_speaker,
                 recent_avatar_replies=recent_avatar_replies,
                 store=getattr(app_state, "store", None),
+                avatar_playback_reaches_microphone=avatar_playback_reaches_microphone,
             )
         except Exception as diarization_error:  # noqa: BLE001
             logger.exception("Speaker labelling failed")
@@ -9983,6 +10084,10 @@ async def message_avatar(
             thread_id=thread_id,
             your_name=your_name,
             request_id=request.state.request_id,
+            # Simple Voice Chat delivers each player's own stream and the
+            # companion drops the avatar body's packets, so a Minecraft
+            # recording never holds the avatar's playback.
+            avatar_playback_reaches_microphone=not minecraft_body,
         )
     (
         file_text_content,
@@ -10100,6 +10205,27 @@ async def message_avatar(
             assistant = await langgraph_client.assistants.get(assistant_id=assistant_id)
         except Exception as e:
             raise HTTPException(status_code=500, detail="Error selecting avatar.")
+        if not (user_name or "").strip():
+            # A client that sends no your_name (the Minecraft companion, the
+            # bots) still talks for a signed-in account, and the account has a
+            # name. Without one the prompt carried no name for the conversation
+            # partner and the model guessed from context: talking to the Evan
+            # Woods avatar from the "Marshall" account, with a Minecraft player
+            # called UncleEvan1337 in the world snapshot, every reply said
+            # "Evan". The account name is kept equal to the personal avatar's
+            # name (update_user_profile_name), so it is read first and costs
+            # nothing; the personal avatar is read only for an account whose
+            # profile carries no real name.
+            user_name = _account_display_name(current_user)
+            if not user_name or user_name == str(current_user.get("email") or "").split("@", 1)[0]:
+                user_name = (
+                    await _personal_avatar_name_of_caller(
+                        langgraph_client,
+                        current_user,
+                        store=getattr(request.app.state, "store", None),
+                    )
+                    or user_name
+                )
 
         config_update = {
             "configurable": {
@@ -10478,6 +10604,7 @@ async def message_avatar(
             current_user,
             message_text=_message_text_for_moderation(human_message),
             request_hashed_ip=request_hashed_ip,
+            setting=_moderation_setting_of(config),
         )
     )
 

@@ -438,7 +438,6 @@ class LearningSections:
     what_feels_real: str = ""
     user_preferences: str = ""
     engagement_record: dict[str, Any] = field(default_factory=dict)
-    what_feels_real_recorded: bool = False
 
 
 def _join_documents(documents: list[Document]) -> str:
@@ -530,25 +529,4 @@ async def retrieve_learning_sections(
     sections.conversation_sentiment_history = _join_documents(history_documents)
     sections.what_feels_real = _join_documents(what_feels_real_documents)
     sections.user_preferences = _join_documents(preference_documents)
-    sections.what_feels_real_recorded = bool(what_feels_real_documents)
-    if not sections.what_feels_real_recorded:
-        # A similarity search against an unrelated query can miss the few
-        # records that exist; an unqualified listing settles whether any exist.
-        any_records = await _search_documents(
-            store,
-            what_feels_real_namespace(user_id, assistant_id),
-            query=None,
-            limit=1,
-        )
-        sections.what_feels_real_recorded = bool(any_records)
     return sections
-
-
-def should_ask_what_feels_real(
-    sections: LearningSections, ask_after_messages: int
-) -> bool:
-    """Whether the avatar should naturally ask the user what feels real this turn."""
-    if ask_after_messages <= 0 or sections.what_feels_real_recorded:
-        return False
-    message_count = int((sections.engagement_record or {}).get("message_count") or 0)
-    return message_count >= ask_after_messages

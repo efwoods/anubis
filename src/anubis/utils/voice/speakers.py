@@ -665,8 +665,16 @@ async def diarize_spoken_turn(
     diarizer: Any = None,
     recent_avatar_replies: list[str] | None = None,
     store: Any = None,
+    avatar_playback_reaches_microphone: bool = True,
 ) -> SpokenTurn:
     """Transcribe one utterance and label every line by speaker.
+
+    ``avatar_playback_reaches_microphone=False`` says the recording cannot
+    contain the avatar's own playback — the Minecraft companion receives one
+    Simple Voice Chat stream per player and discards the avatar body's own
+    packets. On such a recording a voice matching the avatar's reference clip
+    is a person talking (the avatar's own person, when the avatar's voice is
+    that person's voice), never an echo, so no line is labelled as the avatar.
 
     ``owner_label`` is the person AT THE MICROPHONE — the one the avatar is
     talking to. ``avatar_label`` is the avatar. On a personal avatar the two
@@ -809,16 +817,35 @@ async def diarize_spoken_turn(
             avatar_reference_given=bool(owner_reference)
             and not avatar_portrays_the_speaker,
         )
-        segments = mark_avatar_echo(
-            segments,
-            avatar_label=avatar_label,
-            recent_avatar_replies=list(recent_avatar_replies or []),
-        )
+        if avatar_playback_reaches_microphone:
+            segments = mark_avatar_echo(
+                segments,
+                avatar_label=avatar_label,
+                recent_avatar_replies=list(recent_avatar_replies or []),
+            )
         # Whether the diarizer matched the owner against a reference, read
         # before ``claim_lone_speaker_as_owner`` relabels a lone voice. Voice
         # accrual trusts only a real match: the lone voice in the room may be
         # background chatter, and an instant clone built from it is permanent.
         owner_matched_reference = any(segment.is_owner for segment in segments)
+        if not avatar_playback_reaches_microphone:
+            # No playback can be on this recording, so a voice matched to the
+            # avatar's reference clip is the person at the microphone. Read
+            # after ``owner_matched_reference`` on purpose: this relabelling is
+            # not a reference match of the caller's own voice, and voice
+            # accrual must not treat the relabelled lines as one.
+            segments = [
+                LabelledSegment(
+                    owner_label,
+                    segment.text,
+                    segment.start,
+                    segment.end,
+                    is_owner=True,
+                )
+                if segment.is_avatar
+                else segment
+                for segment in segments
+            ]
         segments, new_label_by_raw_name = claim_lone_speaker_as_owner(
             segments,
             owner_label=owner_label,

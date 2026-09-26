@@ -2234,13 +2234,6 @@ class GlobalContext:
         },
     )
 
-    ask_what_feels_real_after_messages: int = field(
-        default=5,
-        metadata={
-            "description": "Once the user has sent this many messages to an avatar and nothing is recorded about what feels real to the user, the avatar naturally asks. Zero disables the question. Env ASK_WHAT_FEELS_REAL_AFTER_MESSAGES."
-        },
-    )
-
     conversation_sentiment_per_turn_enabled: str = field(
         default="TRUE",
         metadata={

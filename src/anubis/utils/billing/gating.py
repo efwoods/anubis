@@ -67,6 +67,13 @@ def resolve_stripe_customer_id(
     if not user:
         return None
     app_metadata = user.get("app_metadata") or {}
+    # The customer recorded for the configured key's Stripe mode wins over the
+    # mode-less legacy fields (see src/anubis/utils/billing/stripe_mode.py).
+    from src.anubis.utils.billing.stripe_mode import customer_id_for_current_mode
+
+    current_mode_customer_id = customer_id_for_current_mode(app_metadata)
+    if current_mode_customer_id:
+        return current_mode_customer_id
     canonical = app_metadata.get("stripe_customer_id")
     if canonical:
         return str(canonical)

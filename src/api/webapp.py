@@ -923,8 +923,18 @@ from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
 
 from src.anubis.utils import runtime_handles
+from src.anubis.utils.store_pipeline_guard import (
+    install_store_embedding_before_pipeline,
+)
 
 load_dotenv()
+
+# Store search embeddings must finish before a store batch opens a Postgres
+# pipeline, for the platform store and ``app.state.store`` alike; see
+# src/anubis/utils/store_pipeline_guard.py.
+install_store_embedding_before_pipeline(
+    GlobalContext().store_search_embedding_timeout_seconds
+)
 
 
 logger = logging.getLogger(__name__)
@@ -15242,6 +15252,23 @@ async def start_lip_sync_clip(
             status_code=409,
             detail="This avatar has no cloned voice yet; record one in settings.",
         )
+    async def _record_lip_sync_speech_spend(
+        *, characters: int, cost_usd: float, model_name: str, provider_name: str
+    ) -> None:
+        # Recorded in the ledger only: the customer is billed for the clip on
+        # the video-seconds meter when the clip completes, so reporting the
+        # speech-characters meter here would bill the same clip twice.
+        await persist_api_metrics_row(
+            app.state.pool,
+            inference_type="speech_synthesis",
+            total_tokens=characters,
+            cost_usd=cost_usd,
+            latency_ms=0.0,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            model_name=f"{provider_name.lower()}:{model_name}:lip_sync",
+        )
+
     try:
         result = await start_lip_sync(
             app.state.context,
@@ -15253,6 +15280,7 @@ async def start_lip_sync_clip(
             voice_id=clone_voice.voice_id,
             voice_provider_name=clone_voice.provider_name,
             motion_prompt=await _motion_block_for(assistant_id, emotion),
+            on_speech_synthesized=_record_lip_sync_speech_spend,
         )
     except VoiceProviderError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))

@@ -30,6 +30,18 @@ apply_barrier_channel_checkpoint_compatibility_patch()
 
 load_dotenv()
 
+# Store search embeddings must finish before a store batch opens a Postgres
+# pipeline; see src/anubis/utils/store_pipeline_guard.py.
+from src.anubis.utils.store_pipeline_guard import (  # noqa: E402
+    install_store_embedding_before_pipeline,
+)
+
+from src.anubis.utils.context import GlobalContext  # noqa: E402
+
+install_store_embedding_before_pipeline(
+    GlobalContext().store_search_embedding_timeout_seconds
+)
+
 import logging
 import uuid
 from datetime import datetime, timezone

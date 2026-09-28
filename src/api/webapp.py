@@ -14023,13 +14023,20 @@ async def list_avatar_standard_voices(
     gender: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """The vendor's stock voices of one gender an avatar may speak with.
+    """Return the active voice provider's stock voices of one gender an avatar may speak with.
 
     Query: ``gender`` (``female`` or ``male``). Each entry carries ``voice_id``,
-    ``name``, ``accent``, ``age``, ``description`` and a public ``preview_url``
-    the Voice panel plays so the owner can choose by ear.
+    ``name``, ``accent``, ``age``, ``description``, a ``preview_url`` the Voice
+    panel plays so the owner can choose by ear, and ``preview_requires_auth``:
+    when true the vendor's sample needs the API key, and the panel plays
+    ``GET /avatar_voice/standard_voices/{voice_id}/preview`` instead.
+    ``voice_provider`` names the provider the catalogue came from.
     """
-    from src.anubis.utils.voice import elevenlabs_client
+    from src.anubis.utils.voice.provider_errors import (
+        VoiceProviderError,
+        VoiceProviderNotConfiguredError,
+    )
+    from src.anubis.utils.voice.providers import active_voice_provider_name
     from src.anubis.utils.voice.standard_voices import (
         STANDARD_VOICE_GENDERS,
         list_standard_voices,
@@ -14043,11 +14050,96 @@ async def list_avatar_standard_voices(
         )
     try:
         voices = await list_standard_voices(app.state.context, gender=gender)
-    except elevenlabs_client.ElevenLabsNotConfiguredError as missing_key:
+    except VoiceProviderNotConfiguredError as missing_key:
         raise HTTPException(status_code=503, detail=str(missing_key))
-    except elevenlabs_client.ElevenLabsError as vendor_error:
+    except VoiceProviderError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
-    return JSONResponse({"gender": normalize_gender(gender), "voices": voices})
+    return JSONResponse(
+        {
+            "gender": normalize_gender(gender),
+            "voice_provider": active_voice_provider_name(app.state.context),
+            "voices": voices,
+        }
+    )
+
+
+@app.get("/avatar_voice/standard_voices/{voice_id}/preview")
+async def get_standard_voice_preview(
+    voice_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Play a stock voice's sample whose vendor address needs the API key.
+
+    Used for entries of ``GET /avatar_voice/standard_voices`` that carry
+    ``preview_requires_auth`` (Cartesia). Answers 404 when the active provider
+    has no sample for the voice, or serves samples from a public address itself.
+    """
+    from src.anubis.utils.voice.provider_errors import (
+        VoiceProviderError,
+        VoiceProviderNotConfiguredError,
+    )
+    from src.anubis.utils.voice.providers import get_voice_provider
+
+    try:
+        preview = await get_voice_provider(app.state.context).stock_voice_preview(
+            app.state.context, voice_id=str(voice_id or "").strip()
+        )
+    except VoiceProviderNotConfiguredError as missing_key:
+        raise HTTPException(status_code=503, detail=str(missing_key))
+    except VoiceProviderError as vendor_error:
+        raise HTTPException(status_code=502, detail=str(vendor_error))
+    if preview is None:
+        raise HTTPException(status_code=404, detail="No sample is available.")
+    preview_bytes, preview_mime_type = preview
+    return Response(
+        content=preview_bytes,
+        media_type=preview_mime_type or "audio/mpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@app.post("/avatar_voice/voice_choice")
+async def set_avatar_voice_choice(
+    assistant_id: str = Form(...),
+    choice: str = Form(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Choose which voice the avatar speaks with: ``custom`` or ``standard``.
+
+    Form: ``assistant_id``, ``choice``. ``custom`` is the avatar's cloned voice
+    whenever the clone is usable (the stock voice stands in otherwise);
+    ``standard`` is the chosen stock voice even when a clone exists, and needs a
+    stock voice picked first (``POST /avatar_voice/standard_voice``). The stock
+    voice stays stored either way, so switching back and forth needs no second
+    pick. Returns the updated voice status.
+    """
+    from src.anubis.utils.voice.corpus import voice_status_for
+    from src.anubis.utils.voice.standard_voices import set_voice_choice
+
+    repository = _voice_repository_or_503()
+    _assistant, is_personal = await _owned_assistant_for_voice(
+        assistant_id, current_user, "choose the voice of that avatar"
+    )
+    user_id = current_user["identities"][0]["user_id"]
+    try:
+        await set_voice_choice(
+            repository,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            choice=choice,
+            context=app.state.context,
+        )
+    except ValueError as choice_error:
+        raise HTTPException(status_code=400, detail=str(choice_error))
+    status = await voice_status_for(
+        repository,
+        app.state.context,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        is_personal_avatar=is_personal,
+        store=app.state.store,
+    )
+    return JSONResponse(status.as_dict())
 
 
 @app.post("/avatar_voice/standard_voice")
@@ -14056,15 +14148,20 @@ async def set_avatar_standard_voice(
     voice_id: str = Form(""),
     current_user: dict = Depends(get_current_user),
 ):
-    """Choose the stock voice the avatar speaks with while it has no usable clone.
+    """Choose the stock voice the avatar speaks with.
 
     Form: ``assistant_id``, ``voice_id`` (a voice from
-    ``GET /avatar_voice/standard_voices``; empty clears the choice). The pick is
-    a fallback only: once a clone is usable, the clone speaks. Returns the
-    updated voice status.
+    ``GET /avatar_voice/standard_voices``; empty clears the choice). Picking a
+    voice also sets the voice choice to ``standard``, so the stock voice speaks
+    even when a clone exists; ``POST /avatar_voice/voice_choice`` with
+    ``custom`` switches back to the clone. Clearing the stock voice returns the
+    choice to ``custom``. Returns the updated voice status.
     """
-    from src.anubis.utils.voice import elevenlabs_client
     from src.anubis.utils.voice.corpus import voice_status_for
+    from src.anubis.utils.voice.provider_errors import (
+        VoiceProviderError,
+        VoiceProviderNotConfiguredError,
+    )
     from src.anubis.utils.voice.standard_voices import (
         find_standard_voice,
         set_standard_voice,
@@ -14082,9 +14179,9 @@ async def set_avatar_standard_voice(
             voice = await find_standard_voice(
                 app.state.context, voice_id=chosen_voice_id
             )
-        except elevenlabs_client.ElevenLabsNotConfiguredError as missing_key:
+        except VoiceProviderNotConfiguredError as missing_key:
             raise HTTPException(status_code=503, detail=str(missing_key))
-        except elevenlabs_client.ElevenLabsError as vendor_error:
+        except VoiceProviderError as vendor_error:
             raise HTTPException(status_code=502, detail=str(vendor_error))
         if voice is None:
             raise HTTPException(
@@ -14092,7 +14189,11 @@ async def set_avatar_standard_voice(
                 detail="That voice is not one of the standard voices.",
             )
     await set_standard_voice(
-        repository, user_id=user_id, assistant_id=assistant_id, voice=voice
+        repository,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        voice=voice,
+        context=app.state.context,
     )
     await note_standard_voice_on_avatar(
         assistant_id, current_user, voice["voice_id"] if voice else None
@@ -14560,25 +14661,43 @@ async def speak_text(
 
     Body: ``assistant_id``, ``text``. Uses the professional clone once it is
     fine-tuned, otherwise the instant clone; with neither usable, the standard
-    voice the owner chose (``POST /avatar_voice/standard_voice``); with none of
+    voice the owner chose (``POST /avatar_voice/standard_voice``). When the
+    owner's voice choice is ``standard`` (``POST /avatar_voice/voice_choice``),
+    the standard voice speaks even when a clone is usable. With none of
     the three, answers 409 ``voice_not_ready`` and the collected seconds so the
-    client can prompt the owner to record or pick a voice. A clone ElevenLabs
-    has banned, with no standard voice to stand in, answers 409
+    client can prompt the owner to record or pick a voice. A clone the vendor
+    has banned, with no other voice to stand in, answers 409
     ``voice_blocked`` — a distinct condition from having no clone, and one no
     amount of further recording fixes. ``X-Voice-Kind`` names which voice
-    spoke. Characters spoken are recorded in ``api_metrics`` and, when the
-    meter exists, reported to Stripe.
+    spoke and ``X-Voice-Provider`` which provider synthesized the voice: the
+    active provider (``VOICE_PROVIDER``) for a voice minted there, or the
+    provider that minted an older voice still standing in. Characters spoken
+    are recorded in ``api_metrics`` and, when the meter exists, reported to
+    Stripe.
     """
-    from src.anubis.utils.voice import elevenlabs_client
     from src.anubis.utils.voice.corpus import (
         BLOCKED_VOICE_MESSAGE,
         mark_voice_blocked,
-        resolve_active_voice_id,
+        speaking_voice_of,
         voice_record_blocked,
         voice_record_blocked_reason,
         voice_status_for,
     )
-    from src.anubis.utils.voice.standard_voices import standard_voice_of
+    from src.anubis.utils.voice.provider_errors import (
+        VoiceBlockedError,
+        VoiceProviderCreditsExhaustedError,
+        VoiceProviderError,
+        VoiceProviderKeyRefusedError,
+    )
+    from src.anubis.utils.voice.providers import (
+        active_voice_provider_name,
+        get_voice_provider,
+    )
+    from src.anubis.utils.voice.standard_voices import (
+        VOICE_CHOICE_STANDARD,
+        voice_choice_of,
+    )
+    from src.anubis.utils.voice.voice_slots import voice_slot
 
     repository = _voice_repository_or_503()
     body = await request.json()
@@ -14594,6 +14713,7 @@ async def speak_text(
     enforce_tier_capability(current_user, TierCapability.AUDIO_RESPONSES)
 
     user_id = current_user["identities"][0]["user_id"]
+    context = app.state.context
 
     def _blocked_voice_response(reason: str | None) -> JSONResponse:
         """Build the one answer every blocked-voice path returns."""
@@ -14605,24 +14725,26 @@ async def speak_text(
             },
         )
 
-    kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
     stored_voice = await repository.get_voice(assistant_id) or {}
-    standard_voice = standard_voice_of(stored_voice)
-    # A voice already known to be banned is refused without calling the vendor:
-    # the answer cannot change, and the call would be billed for a 403. With a
-    # standard voice chosen, the avatar speaks with that instead.
-    if voice_id is not None and voice_record_blocked(stored_voice):
-        reason = voice_record_blocked_reason(stored_voice)
+    speaking_voice = speaking_voice_of(stored_voice, context)
+    active_slot = voice_slot(dict(stored_voice), active_voice_provider_name(context))
+    # A clone already known to be banned is never sent to the vendor: the answer
+    # cannot change, and the call would be billed for a 403. ``speaking_voice_of``
+    # already passes over a banned clone to any voice that can stand in; the ban
+    # is still noted on the avatar unless the owner chose the stock voice, which
+    # leaves the clone (and any ban on the clone) out of the answer.
+    if (
+        voice_record_blocked(active_slot)
+        and voice_choice_of(stored_voice, context) != VOICE_CHOICE_STANDARD
+    ):
+        reason = voice_record_blocked_reason(active_slot)
         await note_blocked_voice_on_avatar(assistant_id, current_user, reason)
-        if standard_voice is None:
+        if speaking_voice.voice_id is None:
             return _blocked_voice_response(reason)
-        kind, voice_id = "standard", standard_voice["voice_id"]
-    if voice_id is None and standard_voice is not None:
-        kind, voice_id = "standard", standard_voice["voice_id"]
-    if voice_id is None:
+    if speaking_voice.voice_id is None or speaking_voice.provider_name is None:
         status = await voice_status_for(
             repository,
-            app.state.context,
+            context,
             user_id=user_id,
             assistant_id=assistant_id,
             is_personal_avatar=False,
@@ -14641,16 +14763,15 @@ async def speak_text(
             },
         )
 
-    model_id = str(
-        getattr(app.state.context, "elevenlabs_text_to_speech_model", None)
-        or "eleven_flash_v2_5"
-    )
+    kind = speaking_voice.kind
+    voice_provider = get_voice_provider(context, speaking_voice.provider_name)
+    model_id = voice_provider.speech_model_name(context)
     started = time.perf_counter()
     try:
-        audio_bytes = await elevenlabs_client.synthesize_speech(
-            app.state.context, voice_id=voice_id, text=text, model_id=model_id
+        audio_bytes = await voice_provider.synthesize_speech(
+            context, voice_id=speaking_voice.voice_id, text=text
         )
-    except elevenlabs_client.ElevenLabsVoiceBlockedError as blocked_error:
+    except VoiceBlockedError as blocked_error:
         if kind == "standard":
             # A stock voice the vendor refuses is the vendor's problem, not a
             # ban on the avatar's clone; do not mark the clone as blocked.
@@ -14659,27 +14780,24 @@ async def speak_text(
         # Record it so the settings Voice panel stops advertising the voice and
         # later speak attempts are refused without a vendor round trip.
         await mark_voice_blocked(
-            repository, user_id, assistant_id, reason=str(blocked_error)
+            repository,
+            user_id,
+            assistant_id,
+            reason=str(blocked_error),
+            provider_name=speaking_voice.provider_name,
         )
         await note_blocked_voice_on_avatar(
             assistant_id, current_user, str(blocked_error)
         )
         return _blocked_voice_response(str(blocked_error))
-    except elevenlabs_client.ElevenLabsKeyRefusedError:
+    except VoiceProviderKeyRefusedError:
         return _vendor_key_refused_response()
-    except elevenlabs_client.ElevenLabsCreditsExhaustedError:
+    except VoiceProviderCreditsExhaustedError:
         return _vendor_speech_credit_exhausted_response()
-    except elevenlabs_client.ElevenLabsError as vendor_error:
+    except VoiceProviderError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
 
-    cost_per_thousand = float(
-        getattr(
-            app.state.context,
-            "elevenlabs_text_to_speech_cost_per_1000_characters_usd",
-            None,
-        )
-        or 0.05
-    )
+    cost_per_thousand = voice_provider.speech_cost_per_1000_characters_usd(context)
     await _meter_speech_characters(
         current_user,
         assistant_id=assistant_id,
@@ -14693,7 +14811,8 @@ async def speak_text(
         media_type="audio/mpeg",
         headers={
             "X-Voice-Kind": kind,
-            "Access-Control-Expose-Headers": "X-Voice-Kind",
+            "X-Voice-Provider": speaking_voice.provider_name,
+            "Access-Control-Expose-Headers": "X-Voice-Kind, X-Voice-Provider",
             "Cache-Control": "no-store",
         },
     )
@@ -15096,8 +15215,8 @@ async def start_lip_sync_clip(
         lip_sync_enabled,
         start_lip_sync,
     )
-    from src.anubis.utils.voice import elevenlabs_client
-    from src.anubis.utils.voice.corpus import resolve_active_voice_id
+    from src.anubis.utils.voice.corpus import usable_clone_of
+    from src.anubis.utils.voice.provider_errors import VoiceProviderError
 
     repository = _voice_repository_or_503()
     if not lip_sync_enabled(app.state.context):
@@ -15113,8 +15232,12 @@ async def start_lip_sync_clip(
         )
     enforce_tier_capability(current_user, TierCapability.VIDEO_RESPONSES)
 
-    _kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
-    if voice_id is None:
+    # Lip sync speaks with the clone only; the speech is synthesized by the
+    # provider that minted the clone and then animated on ElevenLabs.
+    clone_voice = usable_clone_of(
+        await repository.get_voice(assistant_id) or {}, app.state.context
+    )
+    if clone_voice is None or clone_voice.voice_id is None:
         raise HTTPException(
             status_code=409,
             detail="This avatar has no cloned voice yet; record one in settings.",
@@ -15127,10 +15250,11 @@ async def start_lip_sync_clip(
             assistant_id=assistant_id,
             text=text,
             emotion=emotion,
-            voice_id=voice_id,
+            voice_id=clone_voice.voice_id,
+            voice_provider_name=clone_voice.provider_name,
             motion_prompt=await _motion_block_for(assistant_id, emotion),
         )
-    except elevenlabs_client.ElevenLabsError as vendor_error:
+    except VoiceProviderError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
     if result["status"] == "completed":
         return JSONResponse(
@@ -16518,8 +16642,15 @@ async def _start_media_batch(
     current_user: dict,
     create_reference_media_from_playlist: bool = False,
     reference_media: bool = False,
+    voice_upload: bool = False,
 ) -> dict:
     """Estimate, enforce, meter, and start one media batch; return the 202 body.
+
+    With ``voice_upload`` (media added from the Voice section) an item the
+    avatar already holds is not skipped: the avatar's speech is cut from the
+    diarization stored when the item was first processed, and the instant
+    clone is rebuilt once the batch settles so the audible voice includes the
+    new speech (``src/anubis/utils/voice/voice_upload.py``).
 
     Shared by ``POST /update_avatar_identity_with_media`` and the in-chat
     ``update_avatar_identity_with_media`` tool (``start_identity_media_job_from_chat``)
@@ -16649,7 +16780,13 @@ async def _start_media_batch(
     already_indexed = sorted(
         {name for name in incoming_filenames if name in existing_namespaces}
     )
-    if already_indexed:
+    if already_indexed and voice_upload:
+        logger.info(
+            "Reusing the stored diarization of %d already-indexed voice upload(s): %s",
+            len(already_indexed),
+            already_indexed,
+        )
+    elif already_indexed:
         logger.info(
             "Skipping %d top-level item(s) already indexed for this avatar: %s",
             len(already_indexed),
@@ -16668,6 +16805,49 @@ async def _start_media_batch(
     # items and the children that expand from playlists/linktrees.
     registry = app.state.media_jobs
     master = create_master_job(registry, user_id, assistant_id)
+
+    on_voice_upload_settled = None
+    if voice_upload:
+        from src.anubis.utils.voice.corpus import active_instant_voice_id
+        from src.anubis.utils.voice.voice_upload import (
+            finish_voice_upload_batch,
+            instant_voice_before_batch,
+        )
+
+        for media_file in media_files:
+            media_file["voice_upload"] = True
+        try:
+            instant_voice_id_before = await instant_voice_before_batch(
+                assistant_id, context=app.state.context
+            )
+        except Exception as voice_read_error:  # noqa: BLE001 - the upload still runs
+            logger.warning(
+                "Could not read the voice of %s before a voice upload: %s",
+                assistant_id,
+                voice_read_error,
+            )
+            instant_voice_id_before = None
+        voice_avatar_name = str(
+            (config.get("configurable", {}).get("assistant_ctx", {}) or {}).get("name")
+            or ""
+        )
+
+        async def on_voice_upload_settled(settled_master: MediaJob) -> dict:
+            rebuilt_record = await finish_voice_upload_batch(
+                app.state.context,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                avatar_name=voice_avatar_name,
+                seconds_added=settled_master.voice_seconds_collected,
+                instant_voice_id_before=instant_voice_id_before,
+            )
+            return {
+                "seconds_added": settled_master.voice_seconds_collected,
+                "rebuilt": rebuilt_record is not None,
+                "instant_voice_id": active_instant_voice_id(
+                    rebuilt_record, app.state.context
+                ),
+            }
 
     items: list = []
     item_descriptors: list = []
@@ -16759,6 +16939,7 @@ async def _start_media_batch(
                 registry=registry,
                 deferred_expanders=deferred_expanders,
                 on_moderation_violation=_ban_uploader_for_violation,
+                on_voice_upload_settled=on_voice_upload_settled,
             )
         finally:
             if upload_metering_bypass.skips_metering_writes:
@@ -17029,6 +17210,7 @@ async def update_avatar_identity_with_media(
     reference_image: Annotated[bool, Form()] = False,
     create_reference_media_from_playlist: Annotated[bool, Form()] = False,
     reference_media: Annotated[bool, Form()] = False,
+    voice_upload: Annotated[bool, Form()] = False,
     current_user: dict = Depends(get_current_user),
 ):
     # Context user_id, assistant_id
@@ -17091,6 +17273,16 @@ async def update_avatar_identity_with_media(
     administrator (``ADMIN_USER_ID``); any other avatar is refused with ``403``.
     It is mutually exclusive with ``reference_image``, ``reference_audio``, and
     ``create_reference_media_from_playlist``.
+
+    With **voice_upload=true** (media added from the Voice section) the batch
+    feeds the avatar's audible voice. A new item is processed as usual, which
+    diarizes the recording once and adds the avatar's turns to the voice
+    corpus. An item the avatar already holds is **not** skipped: the avatar's
+    turns are read from the diarization stored when the item was first
+    processed, the audio is fetched again and cut, and no diarizer call is made
+    and nothing is re-indexed. Once the batch settles, an existing instant clone
+    is rebuilt from the newest clips; the master job's result carries
+    ``voice_seconds_collected`` and ``voice``.
     """
     try:
         # Gate: only pro/premium tiers may update avatar identity with media.
@@ -17381,6 +17573,7 @@ async def update_avatar_identity_with_media(
                 current_user=current_user,
                 create_reference_media_from_playlist=create_reference_media_from_playlist,
                 reference_media=reference_media,
+                voice_upload=voice_upload,
             ),
         )
 

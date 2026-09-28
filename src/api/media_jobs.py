@@ -100,6 +100,11 @@ class MediaJob:
     # Identity documents this job indexed. Fact verification runs after the
     # batch only when the batch actually taught the avatar something.
     indexed_identity_document_count: int = 0
+    # Seconds of the avatar's speech this job added to the voice corpus, summed
+    # from the ``voice_clip_collected`` progress events onto the child and the
+    # master. A Voice-section batch reads the master's total to decide whether
+    # the instant clone is rebuilt, and to tell the owner what changed.
+    voice_seconds_collected: float = 0.0
     # AI monitoring: the terms-of-service verdict that stopped this item (or, on
     # the master, the first child's verdict). Set from the graph's
     # ``moderation_violation`` progress event; the batch runner then bans the
@@ -308,6 +313,99 @@ def _cleanup(registry: Dict[str, MediaJob]) -> None:
             registry.pop(job.job_id, None)
 
 
+def _record_voice_seconds(
+    child: MediaJob, master: MediaJob, payload: Dict[str, Any]
+) -> None:
+    """Add a ``voice_clip_collected`` event's seconds to the child and the master."""
+    try:
+        clip_seconds = float(payload.get("seconds") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if clip_seconds > 0:
+        child.voice_seconds_collected += clip_seconds
+        master.voice_seconds_collected += clip_seconds
+
+
+async def run_voice_upload_item_job(
+    child: MediaJob,
+    master: MediaJob,
+    media_file: Dict[str, Any],
+    config: Dict[str, Any],
+    store: Any,
+    context: Any,
+) -> None:
+    """Add an already-indexed Voice-section item's speech to the voice corpus.
+
+    Runs instead of the ``process_media`` graph, which would skip the item as
+    already indexed. The avatar's turns are read from the diarization stored
+    when the item was first processed, so no diarizer call is made and nothing
+    is written to the store. Never raises: the outcome lands on the child job.
+    """
+    from src.anubis.utils.voice.voice_upload import (
+        VoiceUploadError,
+        collect_voice_from_indexed_item,
+    )
+
+    assistant_context = config.get("configurable", {}).get("assistant_ctx", {}) or {}
+    assistant_metadata = assistant_context.get("metadata") or {}
+
+    def _emit(payload: Dict[str, Any]) -> None:
+        progress_payload = {"type": "media_progress", **payload}
+        add_event(child, progress_payload)
+        add_event(
+            master,
+            {
+                **progress_payload,
+                "item_job_id": child.job_id,
+                "item_filename": child.filename,
+            },
+        )
+        if payload.get("stage") == "voice_clip_collected":
+            _record_voice_seconds(child, master, payload)
+
+    try:
+        child.started_at = time.time()
+        child.status = "running"
+        clip_seconds = await collect_voice_from_indexed_item(
+            store,
+            context,
+            user_id=child.user_id,
+            assistant_id=str(child.assistant_id or ""),
+            media_file=media_file,
+            avatar_name=str(assistant_context.get("name") or ""),
+            is_personal_avatar=assistant_metadata.get("is_personal_avatar_of_creator")
+            is True,
+            emit=_emit,
+        )
+        finish_job(
+            child,
+            result={
+                "items_processed": 1,
+                "indexed": 0,
+                "skipped": 1,
+                "filename": child.filename,
+                "namespace_filename": child.namespace_filename,
+                "voice_seconds_collected": clip_seconds,
+                "message": (
+                    f"Added {clip_seconds:.0f}s of speech to the voice from the "
+                    "earlier processing of this item"
+                ),
+            },
+        )
+    except asyncio.CancelledError:
+        finish_job(
+            child,
+            cancelled=True,
+            result={"message": "Item processing cancelled", "filename": child.filename},
+        )
+        raise
+    except VoiceUploadError as voice_upload_error:
+        finish_job(child, error=str(voice_upload_error))
+    except Exception as exc:  # noqa: BLE001 - surface every failure via the child job
+        logger.exception("Voice upload job %s failed: %s", child.job_id, exc)
+        finish_job(child, error=str(exc))
+
+
 async def run_single_item_job(
     child: MediaJob,
     master: MediaJob,
@@ -408,6 +506,8 @@ async def run_single_item_job(
                         master.moderation_violation = dict(child.moderation_violation)
                 elif stage == "converting_complete":
                     last_complete = payload
+                elif stage == "voice_clip_collected":
+                    _record_voice_seconds(child, master, payload)
                 elif stage == "indexed_namespace_counts":
                     # Accumulated onto the master as well as the child: the
                     # once-per-upload recalibration decision is made at the batch
@@ -717,8 +817,19 @@ async def run_batch_media_job(
     on_moderation_violation: Optional[
         Callable[[Dict[str, Any]], Awaitable[None]]
     ] = None,
+    on_voice_upload_settled: Optional[
+        Callable[[MediaJob], Awaitable[Optional[Dict[str, Any]]]]
+    ] = None,
 ) -> None:
     """Orchestrate a batch: one child task per item, one shared concurrency pool.
+
+    An item flagged ``voice_upload`` (added from the Voice section) whose key is
+    already indexed runs ``run_voice_upload_item_job`` instead of the graph, so
+    the avatar's speech is reused from the stored diarization.
+    ``on_voice_upload_settled`` is awaited once every item has settled and
+    before the master finishes; the upload endpoint passes the callback that
+    rebuilds the instant clone, and the callback's return value is reported on
+    the master's result as ``voice``.
 
     ``on_moderation_violation`` is awaited once, with the first child's verdict,
     when any item in the batch violated the terms of service; the upload endpoint
@@ -797,6 +908,7 @@ async def run_batch_media_job(
                         },
                     )
 
+        already_indexed_namespaces = set(existing_namespaces or [])
         child_tasks: List[asyncio.Task] = []
         for spec in items:
             child: MediaJob = spec["child"]
@@ -813,8 +925,14 @@ async def run_batch_media_job(
                     },
                 )
                 continue
-            task = asyncio.create_task(
-                run_single_item_job(
+            if media_file.get("voice_upload") and (
+                media_file.get("namespace_filename") in already_indexed_namespaces
+            ):
+                item_coroutine = run_voice_upload_item_job(
+                    child, master, media_file, config, store, context
+                )
+            else:
+                item_coroutine = run_single_item_job(
                     child,
                     master,
                     media_file,
@@ -823,7 +941,7 @@ async def run_batch_media_job(
                     context,
                     existing_namespaces=existing_namespaces,
                 )
-            )
+            task = asyncio.create_task(item_coroutine)
             child.task = task
             child_tasks.append(task)
 
@@ -831,6 +949,20 @@ async def run_batch_media_job(
         # failed item from aborting the gather (each child already recorded its own
         # outcome via run_single_item_job).
         await asyncio.gather(*child_tasks, return_exceptions=True)
+
+        # A Voice-section batch changes the audible voice before the batch is
+        # reported finished, so the owner's next speak request already uses the
+        # voice that includes the new speech.
+        voice_outcome: Optional[Dict[str, Any]] = None
+        if on_voice_upload_settled is not None and not master.cancelled:
+            try:
+                voice_outcome = await on_voice_upload_settled(master)
+            except Exception as voice_error:  # noqa: BLE001 - the clips are stored
+                logger.exception(
+                    "Voice update after upload batch %s failed: %s",
+                    master.job_id,
+                    voice_error,
+                )
 
         # AI monitoring: a violating upload bans the uploader. Awaited here, once
         # per batch, so the ban is recorded before the batch reports finished and
@@ -886,6 +1018,8 @@ async def run_batch_media_job(
                     "items_cancelled": statuses.count("cancelled"),
                     "items": _summarize_children(children),
                     "moderation_violation": master.moderation_violation,
+                    "voice_seconds_collected": master.voice_seconds_collected,
+                    "voice": voice_outcome,
                     "message": (
                         "Upload refused: content violates the terms of service"
                         if master.moderation_violation is not None
@@ -911,6 +1045,7 @@ def _summarize_children(children: List[MediaJob]) -> List[Dict[str, Any]]:
             "estimated_tokens": c.estimated_tokens,
             "estimated_media_seconds": c.estimated_media_seconds,
             "estimated_processing_seconds": c.estimated_processing_seconds,
+            "voice_seconds_collected": c.voice_seconds_collected,
             "error": c.error,
         }
         for c in children

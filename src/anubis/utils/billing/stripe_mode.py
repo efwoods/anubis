@@ -201,10 +201,14 @@ async def reconcile_stripe_customer_for_current_mode(request: Any, user: dict) -
         try:
             from src.security.auth import update_user_app_metadata_fields
 
+            # The request's user object (the same object the credential caches
+            # hold) is updated in place below, so the caches stay correct and
+            # are not evicted.
             await update_user_app_metadata_fields(
                 request,
                 str(auth0_user_id),
                 {STRIPE_CUSTOMER_IDS_METADATA_KEY: dict(customer_ids_by_mode)},
+                evict_cached_credentials=False,
             )
         except Exception as auth0_error:  # noqa: BLE001 - the process cache still holds the id
             logger.error(

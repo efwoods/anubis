@@ -56,7 +56,9 @@ def live_mode(monkeypatch):
     monkeypatch.setitem(stripe_mode._current_stripe_mode_cache, "mode", stripe_mode.STRIPE_MODE_LIVE)
     auth0_patches: list[tuple[str, dict]] = []
 
-    async def _record_patch(request, auth0_user_id, fields):
+    async def _record_patch(request, auth0_user_id, fields, *, evict_cached_credentials=True):
+        # Evicting would drop the session's ephemeral API key mid-request.
+        assert evict_cached_credentials is False
         auth0_patches.append((auth0_user_id, fields))
         return True
 

@@ -2648,7 +2648,11 @@ async def update_user_subscription_status(
 
 
 async def update_user_app_metadata_fields(
-    request: Request, auth0_user_id: str, fields: dict
+    request: Request,
+    auth0_user_id: str,
+    fields: dict,
+    *,
+    evict_cached_credentials: bool = True,
 ) -> bool:
     """Patch top-level ``app_metadata`` keys for one Auth0 user and drop stale cache.
 
@@ -2680,7 +2684,13 @@ async def update_user_app_metadata_fields(
         )
         return False
 
-    await _evict_api_key_cache_for_user(auth0_user_id)
+    # A caller that already updated the cached user object in place passes
+    # ``evict_cached_credentials=False``: eviction also drops the session's
+    # ephemeral API key, and the next nested LangGraph call of that session
+    # then fails with 401 (``GET /inbox/count`` answered 500 on prod at
+    # 2026-09-28 15:00:06 UTC for exactly this reason).
+    if evict_cached_credentials:
+        await _evict_api_key_cache_for_user(auth0_user_id)
     return True
 
 

@@ -27,20 +27,28 @@ import asyncio
 import logging
 from typing import Any
 
+from src.anubis.utils.voice.provider_errors import (
+    VoiceBlockedError,
+    VoiceProviderCreditsExhaustedError,
+    VoiceProviderError,
+    VoiceProviderKeyRefusedError,
+    VoiceProviderNotConfiguredError,
+)
+
 logger = logging.getLogger(__name__)
 
 ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 
 
-class ElevenLabsNotConfiguredError(RuntimeError):
+class ElevenLabsNotConfiguredError(VoiceProviderNotConfiguredError):
     """No ElevenLabs key is configured."""
 
 
-class ElevenLabsError(RuntimeError):
+class ElevenLabsError(VoiceProviderError):
     """The vendor refused or failed a request."""
 
 
-class ElevenLabsVoiceBlockedError(ElevenLabsError):
+class ElevenLabsVoiceBlockedError(ElevenLabsError, VoiceBlockedError):
     """ElevenLabs has blocked this cloned voice; it can never speak again.
 
     Raised for the vendor's 403 ``voice_access_denied`` /
@@ -53,7 +61,7 @@ class ElevenLabsVoiceBlockedError(ElevenLabsError):
     """
 
 
-class ElevenLabsKeyRefusedError(ElevenLabsError):
+class ElevenLabsKeyRefusedError(ElevenLabsError, VoiceProviderKeyRefusedError):
     """The configured ElevenLabs key was rejected.
 
     Raised for 401 ``invalid_api_key`` / ``unauthorized``. That is a credential
@@ -62,7 +70,9 @@ class ElevenLabsKeyRefusedError(ElevenLabsError):
     """
 
 
-class ElevenLabsCreditsExhaustedError(ElevenLabsError):
+class ElevenLabsCreditsExhaustedError(
+    ElevenLabsError, VoiceProviderCreditsExhaustedError
+):
     """The ElevenLabs account has no remaining credits or quota."""
 
 

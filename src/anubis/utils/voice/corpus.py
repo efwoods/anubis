@@ -37,6 +37,15 @@ from src.anubis.utils.media_assets.repository import (
     VOICE_STATE_TRAINING,
 )
 from src.anubis.utils.voice import elevenlabs_client
+from src.anubis.utils.voice.provider_errors import VoiceBlockedError, VoiceProviderError
+from src.anubis.utils.voice.providers import (
+    ELEVENLABS_PROVIDER_NAME,
+    active_voice_provider_name,
+    get_voice_provider,
+    speaking_provider_order,
+    voice_provider_configured,
+)
+from src.anubis.utils.voice.voice_slots import store_voice_slot, voice_slot
 
 # A failed instant clone (a vendor 400, a plan limit) is retried when the Voice
 # panel next reads the status, but no more often than this, so a persistent
@@ -147,6 +156,22 @@ class VoiceStatus:
     # ``None``. Reported whether or not a clone exists, so the panel can show
     # the pick without a second read.
     standard_voice: dict[str, Any] | None = None
+    # Which voice the owner chose to hear: ``"custom"`` (the clone whenever the
+    # clone is usable) or ``"standard"`` (the stock voice even when a clone
+    # exists). ``custom_voice_available`` says whether a usable clone exists to
+    # switch back to.
+    voice_choice: str = "custom"
+    custom_voice_available: bool = False
+    # The voice ``/speak`` uses right now: ``"professional"``, ``"instant"``,
+    # ``"standard"`` or ``"none"``. ``active_voice`` stays the clone alone.
+    speaking_voice: str = "none"
+    # The active voice provider (``VOICE_PROVIDER``), which lists the stock
+    # voices and builds new clones, and the provider that minted the voice
+    # ``/speak`` uses right now (another provider's voice keeps speaking until
+    # the active provider has one).
+    voice_provider: str = ELEVENLABS_PROVIDER_NAME
+    voice_provider_display_name: str = "ElevenLabs"
+    speaking_voice_provider: str | None = None
     detail: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -163,14 +188,24 @@ def _decode_data_uri(data_uri: str) -> tuple[bytes, str]:
 
 
 def voice_configured(context: Any) -> bool:
-    """Whether an ElevenLabs key is present."""
-    return bool(
-        str(
-            getattr(context, "elevenlabs_api_key", None)
-            or getattr(context, "nn_elevenlabs_api_key", None)
-            or ""
-        ).strip()
-    )
+    """Whether the active voice provider (``VOICE_PROVIDER``) has a key.
+
+    This is the switch for collecting clips and for every voice route: the
+    active provider is the one that builds new clones and lists stock voices.
+    """
+    return voice_provider_configured(context)
+
+
+def active_instant_voice_id(record: dict[str, Any] | None, context: Any = None) -> str | None:
+    """Return the instant clone id the active provider holds for the avatar, or ``None``."""
+    slot = voice_slot(dict(record or {}), active_voice_provider_name(context))
+    voice_id = slot.get("instant_voice_id")
+    return str(voice_id) if voice_id else None
+
+
+def professional_voice_configured(context: Any) -> bool:
+    """Whether an ElevenLabs key is present; professional clones stay on ElevenLabs."""
+    return voice_provider_configured(context, ELEVENLABS_PROVIDER_NAME)
 
 
 async def _voice_record(
@@ -222,21 +257,29 @@ def _mark_record_blocked(record: dict[str, Any], reason: str | None = None) -> N
 
 
 async def mark_voice_blocked(
-    repository: Any, user_id: str, assistant_id: str, *, reason: str | None = None
+    repository: Any,
+    user_id: str,
+    assistant_id: str,
+    *,
+    reason: str | None = None,
+    provider_name: str = ELEVENLABS_PROVIDER_NAME,
 ) -> dict[str, Any]:
-    """Persist that ElevenLabs has banned this avatar's cloned voice.
+    """Persist that the provider has banned this avatar's cloned voice.
 
     Called both by the pre-emptive safety check and by ``POST /speak`` when the
     ban is met at synthesis time, so the settings Voice panel stops advertising
-    a voice model that cannot speak.
+    a voice model that cannot speak. Only the named provider's slot is marked.
     """
     record = await _voice_record(repository, user_id, assistant_id)
-    _mark_record_blocked(record, reason)
+    slot = voice_slot(record, provider_name)
+    _mark_record_blocked(slot, reason)
+    store_voice_slot(record, provider_name, slot)
     await repository.upsert_voice(record)
     logger.warning(
-        "Voice %s for %s is blocked by ElevenLabs",
-        record.get("instant_voice_id"),
+        "Voice %s for %s is blocked by %s",
+        slot.get("instant_voice_id"),
         assistant_id,
+        provider_name,
     )
     return record
 
@@ -248,7 +291,7 @@ async def _refresh_voice_safety(
     *,
     assistant_id: str,
 ) -> dict[str, Any]:
-    """Ask ElevenLabs whether the instant clone is still allowed to speak.
+    """Ask the active provider whether the instant clone is still allowed to speak.
 
     The point of asking here rather than at synthesis time is that the settings
     Voice panel is where someone finds out: without this, a banned clone still
@@ -256,33 +299,65 @@ async def _refresh_voice_safety(
     a speak button that does nothing. Skipped when the answer is already known
     or was asked for recently — see VOICE_SAFETY_RECHECK_SECONDS.
     """
-    voice_id = record.get("instant_voice_id")
+    provider_name = active_voice_provider_name(context)
+    slot = voice_slot(record, provider_name)
+    voice_id = slot.get("instant_voice_id")
     if not voice_id or not voice_configured(context):
         return record
-    if voice_record_blocked(record):
+    if voice_record_blocked(slot):
         return record
-    detail = record.get("detail") or {}
-    checked_at = float(detail.get("instant_safety_checked_at") or 0.0)
+    slot_detail = slot.get("detail") or {}
+    checked_at = float(slot_detail.get("instant_safety_checked_at") or 0.0)
     now = datetime.now(tz=UTC).timestamp()
     if now - checked_at < VOICE_SAFETY_RECHECK_SECONDS:
         return record
-    blocked = await elevenlabs_client.voice_is_blocked(context, voice_id=str(voice_id))
+    blocked = await get_voice_provider(context).voice_is_blocked(
+        context, voice_id=str(voice_id)
+    )
     if blocked:
-        _mark_record_blocked(record)
+        _mark_record_blocked(slot)
         logger.warning(
-            "Voice %s for %s is blocked by ElevenLabs", voice_id, assistant_id
+            "Voice %s for %s is blocked by %s", voice_id, assistant_id, provider_name
         )
     else:
-        record["detail"] = {**detail, "instant_safety_checked_at": now}
+        slot["detail"] = {**slot_detail, "instant_safety_checked_at": now}
+    store_voice_slot(record, provider_name, slot)
     await repository.upsert_voice(record)
     return record
 
 
+def instant_clone_seconds(context: Any) -> float:
+    """Return the seconds of the corpus an instant clone is built from on the active provider.
+
+    The corpus target (``ELEVENLABS_INSTANT_VOICE_CLONE_TARGET_SECONDS``), lowered
+    to the active provider's own cap where the provider has one (Cartesia uses
+    about the first minute of a single clip).
+    """
+    target_seconds = VoiceThresholds.from_context(context).instant_target
+    provider_cap_seconds = get_voice_provider(context).instant_clone_max_seconds(
+        context
+    )
+    if provider_cap_seconds is None:
+        return target_seconds
+    return min(target_seconds, float(provider_cap_seconds))
+
+
 async def _clips_for_clone(
-    repository: Any, assistant_id: str, *, max_seconds: float
+    repository: Any,
+    assistant_id: str,
+    *,
+    max_seconds: float,
+    newest_first: bool = False,
 ) -> tuple[list[tuple[str, bytes, str]], float]:
-    """Return the oldest clips up to ``max_seconds`` total, as SDK file tuples."""
+    """Return clips up to ``max_seconds`` total, as SDK file tuples.
+
+    The oldest clips come first by default. ``newest_first`` reverses the order
+    so a clone rebuilt after a Voice-section upload is trained on the speech the
+    owner just added.
+    """
     clips = await repository.list_voice_clips(assistant_id, include_bytes=True)
+    if newest_first:
+        clips = list(reversed(clips))
     files: list[tuple[str, bytes, str]] = []
     total = 0.0
     for index, clip in enumerate(clips):
@@ -303,12 +378,17 @@ async def ensure_instant_voice(
     user_id: str,
     assistant_id: str,
     avatar_name: str = "",
+    newest_first: bool = False,
 ) -> dict[str, Any]:
     """Create the instant clone once the corpus reaches the minimum.
 
     Idempotent: nothing happens below the minimum, and a clone that exists is
     never rebuilt — the first instant voice is final. Later clips only grow
     the corpus (toward the personal avatar's professional clone).
+
+    The clone is built by the active provider (``VOICE_PROVIDER``) and stored in
+    that provider's slot, so a clone another provider built earlier is kept, not
+    replaced, and speaks again when ``VOICE_PROVIDER`` is switched back.
     """
     thresholds = VoiceThresholds.from_context(context)
     record = await _voice_record(repository, user_id, assistant_id)
@@ -319,54 +399,70 @@ async def ensure_instant_voice(
         await repository.upsert_voice(record)
         return record
 
-    if record.get("instant_voice_id"):
+    provider_name = active_voice_provider_name(context)
+    voice_provider = get_voice_provider(context)
+    slot = voice_slot(record, provider_name)
+    if slot.get("instant_voice_id"):
         await repository.upsert_voice(record)
         return record
 
+    clone_seconds = instant_clone_seconds(context)
     files, used_seconds = await _clips_for_clone(
-        repository, assistant_id, max_seconds=thresholds.instant_target
+        repository,
+        assistant_id,
+        max_seconds=clone_seconds,
+        newest_first=newest_first,
     )
     if not files:
         await repository.upsert_voice(record)
         return record
     label = avatar_name or assistant_id
     try:
-        voice_id = await elevenlabs_client.create_instant_voice(
+        voice_id = await voice_provider.create_instant_voice(
             context,
             name=f"{label} (instant)"[:80],
             clips=files,
             description="Neural Nexus instant voice clone",
         )
-    except elevenlabs_client.ElevenLabsVoiceBlockedError as blocked_error:
+    except VoiceBlockedError as blocked_error:
         # A ban is permanent and belongs to the recording, so this must not be
         # written as ``instant_error``: that key marks a transient failure the
         # status read retries every few minutes, and retrying a banned clone
         # only repeats the refusal.
         logger.warning(
-            "Instant clone for %s was blocked by ElevenLabs: %s",
+            "Instant clone for %s was blocked by %s: %s",
             assistant_id,
+            provider_name,
             blocked_error,
         )
-        _mark_record_blocked(record, str(blocked_error))
+        _mark_record_blocked(slot, str(blocked_error))
+        store_voice_slot(record, provider_name, slot)
         await repository.upsert_voice(record)
         return record
-    except elevenlabs_client.ElevenLabsError as clone_error:
-        logger.warning("Instant clone failed for %s: %s", assistant_id, clone_error)
-        record["detail"] = {
-            **record.get("detail", {}),
+    except VoiceProviderError as clone_error:
+        logger.warning(
+            "Instant clone failed for %s on %s: %s",
+            assistant_id,
+            provider_name,
+            clone_error,
+        )
+        slot["detail"] = {
+            **(slot.get("detail") or {}),
             "instant_error": str(clone_error),
             "instant_error_at": datetime.now(tz=UTC).timestamp(),
         }
+        store_voice_slot(record, provider_name, slot)
         await repository.upsert_voice(record)
         return record
 
-    record["instant_voice_id"] = voice_id
-    record["instant_voice_seconds"] = used_seconds
-    record["detail"] = {
-        k: v
-        for k, v in record.get("detail", {}).items()
-        if k not in ("instant_error", "instant_error_at")
+    slot["instant_voice_id"] = voice_id
+    slot["instant_voice_seconds"] = min(used_seconds, clone_seconds)
+    slot["detail"] = {
+        key: value
+        for key, value in (slot.get("detail") or {}).items()
+        if key not in ("instant_error", "instant_error_at")
     }
+    store_voice_slot(record, provider_name, slot)
     await repository.upsert_voice(record)
     logger.info(
         "Instant voice %s created for %s from %.0fs",
@@ -390,6 +486,7 @@ async def rebuild_instant_voice(
     user_id: str,
     assistant_id: str,
     avatar_name: str = "",
+    newest_first: bool = False,
 ) -> dict[str, Any]:
     """Delete the avatar's instant clone and train a new one from the corpus as it stands.
 
@@ -408,22 +505,25 @@ async def rebuild_instant_voice(
     the ordinary retry on the next status read builds one.
 
     The professional clone, its verification, and the collected clips are all
-    left exactly as they are.
+    left exactly as they are. Only the active provider's clone is rebuilt; a
+    clone another provider built stays in that provider's slot, untouched.
 
     Returns:
         The stored voice record after the rebuild attempt.
     """
+    provider_name = active_voice_provider_name(context)
     record = await _voice_record(repository, user_id, assistant_id)
-    previous_voice_id = record.get("instant_voice_id")
+    slot = voice_slot(record, provider_name)
+    previous_voice_id = slot.get("instant_voice_id")
     if previous_voice_id and voice_configured(context):
         try:
-            await elevenlabs_client.delete_voice(context, previous_voice_id)
+            await get_voice_provider(context).delete_voice(context, previous_voice_id)
             logger.info(
                 "Deleted instant voice %s for %s before rebuilding",
                 previous_voice_id,
                 assistant_id,
             )
-        except elevenlabs_client.ElevenLabsError as delete_error:
+        except VoiceProviderError as delete_error:
             # A voice already gone at the vendor, or a vendor outage, must not
             # strand the avatar with a stored id that no longer speaks. The
             # stored clone is cleared either way and a new one is trained.
@@ -434,11 +534,11 @@ async def rebuild_instant_voice(
                 delete_error,
             )
 
-    record["instant_voice_id"] = None
-    record["instant_voice_seconds"] = 0.0
-    record["detail"] = {
+    slot["instant_voice_id"] = None
+    slot["instant_voice_seconds"] = 0.0
+    slot["detail"] = {
         key: value
-        for key, value in (record.get("detail") or {}).items()
+        for key, value in (slot.get("detail") or {}).items()
         # Every one of these described the clone being deleted: a transient
         # failure to build it, and the vendor's ban on the voice it produced.
         # Carrying them onto the next clone would either suppress the rebuild
@@ -454,8 +554,9 @@ async def rebuild_instant_voice(
         )
     }
     if previous_voice_id:
-        record["detail"]["instant_replaced_voice_id"] = previous_voice_id
-    record["detail"]["instant_rebuilt_at"] = datetime.now(tz=UTC).timestamp()
+        slot["detail"]["instant_replaced_voice_id"] = previous_voice_id
+    slot["detail"]["instant_rebuilt_at"] = datetime.now(tz=UTC).timestamp()
+    store_voice_slot(record, provider_name, slot)
     await repository.upsert_voice(record)
 
     # ``ensure_instant_voice`` re-reads the record, so the cleared row above is
@@ -466,6 +567,7 @@ async def rebuild_instant_voice(
         user_id=user_id,
         assistant_id=assistant_id,
         avatar_name=avatar_name,
+        newest_first=newest_first,
     )
 
 
@@ -509,32 +611,37 @@ async def refresh_instant_voice_at_target(
     record = record or await _voice_record(repository, user_id, assistant_id)
     if not instant_refresh_enabled(context) or not voice_configured(context):
         return record
-    detail = record.get("detail") or {}
-    if detail.get(INSTANT_REFRESHED_DETAIL_KEY) or voice_record_blocked(record):
+    provider_name = active_voice_provider_name(context)
+    slot = voice_slot(record, provider_name)
+    slot_detail = slot.get("detail") or {}
+    if slot_detail.get(INSTANT_REFRESHED_DETAIL_KEY) or voice_record_blocked(slot):
         return record
-    if not record.get("instant_voice_id"):
+    if not slot.get("instant_voice_id"):
         return record
 
-    thresholds = VoiceThresholds.from_context(context)
-    if float(record.get("instant_voice_seconds") or 0.0) >= thresholds.instant_target:
+    # A provider that uses less than the corpus target (Cartesia takes about a
+    # minute) is already at its best once built from its own cap.
+    target_seconds = instant_clone_seconds(context)
+    if float(slot.get("instant_voice_seconds") or 0.0) >= target_seconds:
         return record
     collected = float(await repository.total_voice_seconds(assistant_id))
-    if collected < thresholds.instant_target:
+    if collected < target_seconds:
         return record
 
     # Marked before the rebuild, not after: a rebuild that fails leaves the
     # avatar with no instant voice and the ordinary retry on the next status
     # read builds one, and marking afterwards would let a failing vendor be
     # asked to rebuild on every later clip.
-    record["detail"] = {
-        **detail,
+    slot["detail"] = {
+        **slot_detail,
         INSTANT_REFRESHED_DETAIL_KEY: datetime.now(tz=UTC).timestamp(),
     }
+    store_voice_slot(record, provider_name, slot)
     await repository.upsert_voice(record)
     logger.info(
         "Refreshing the instant voice for %s: clone built from %.0fs, corpus now %.0fs",
         assistant_id,
-        float(record.get("instant_voice_seconds") or 0.0),
+        float(slot.get("instant_voice_seconds") or 0.0),
         collected,
     )
     return await rebuild_instant_voice(
@@ -568,7 +675,7 @@ async def prepare_professional_voice(
         record.get("professional_state")
         not in (VOICE_STATE_NOT_STARTED, VOICE_STATE_COLLECTING, VOICE_STATE_FAILED)
         or collected < thresholds.professional_minimum
-        or not voice_configured(context)
+        or not professional_voice_configured(context)
     ):
         if (
             collected < thresholds.professional_minimum
@@ -805,39 +912,136 @@ async def add_voice_clip(
     return record
 
 
-async def resolve_active_voice_id(
-    repository: Any, assistant_id: str
-) -> tuple[str, str | None]:
-    """Which cloned voice speaks for the avatar: ``("professional"|"instant"|"none", id)``."""
-    record = await repository.get_voice(assistant_id) or {}
-    if record.get("professional_state") == VOICE_STATE_FINE_TUNED and record.get(
-        "professional_voice_id"
+@dataclass(frozen=True)
+class SpeakingVoice:
+    """One voice that can speak for an avatar, and the provider that minted the voice.
+
+    ``kind`` is ``"professional"``, ``"instant"``, ``"standard"`` or ``"none"``;
+    ``provider_name`` is ``None`` only for ``"none"``.
+    """
+
+    kind: str
+    voice_id: str | None
+    provider_name: str | None
+
+
+NO_SPEAKING_VOICE = SpeakingVoice(kind="none", voice_id=None, provider_name=None)
+
+
+def _clone_voice_of(
+    record: dict[str, Any], context: Any, *, usable_only: bool
+) -> SpeakingVoice | None:
+    """Return the avatar's clone: professional first, then an instant clone per provider.
+
+    Instant clones are tried in ``speaking_provider_order``: the active
+    provider's clone first, then a clone another provider minted before
+    ``VOICE_PROVIDER`` was switched, which keeps speaking until the active
+    provider has a clone of the avatar's own. A banned clone never counts from
+    another provider; from the active provider the banned clone is still
+    reported unless ``usable_only`` is set, so the caller can say the voice is
+    blocked.
+    """
+    if (
+        record.get("professional_state") == VOICE_STATE_FINE_TUNED
+        and record.get("professional_voice_id")
+        and (context is None or professional_voice_configured(context))
     ):
-        return "professional", record["professional_voice_id"]
-    if record.get("instant_voice_id"):
-        return "instant", record["instant_voice_id"]
-    return "none", None
+        return SpeakingVoice(
+            kind="professional",
+            voice_id=str(record["professional_voice_id"]),
+            provider_name=ELEVENLABS_PROVIDER_NAME,
+        )
+    for provider_index, provider_name in enumerate(speaking_provider_order(context)):
+        slot = voice_slot(dict(record), provider_name)
+        voice_id = slot.get("instant_voice_id")
+        if not voice_id:
+            continue
+        if voice_record_blocked(slot) and (usable_only or provider_index > 0):
+            continue
+        return SpeakingVoice(
+            kind="instant", voice_id=str(voice_id), provider_name=provider_name
+        )
+    return None
+
+
+def _standard_voice_of(record: dict[str, Any], context: Any) -> SpeakingVoice | None:
+    """Return the chosen stock voice, the active provider's pick first."""
+    from src.anubis.utils.voice.standard_voices import standard_voice_of
+
+    for provider_name in speaking_provider_order(context):
+        standard_voice = standard_voice_of(voice_slot(dict(record), provider_name))
+        if standard_voice is not None:
+            return SpeakingVoice(
+                kind="standard",
+                voice_id=standard_voice["voice_id"],
+                provider_name=provider_name,
+            )
+    return None
+
+
+def speaking_voice_of(record: dict[str, Any], context: Any = None) -> SpeakingVoice:
+    """Which voice speaks for the avatar, following the owner's voice choice.
+
+    With the choice ``"standard"`` the stock voice speaks even when a usable
+    clone exists. Otherwise a usable clone speaks first and the stock voice
+    stands in. A clone the vendor has banned does not count as usable.
+    """
+    from src.anubis.utils.voice.standard_voices import (
+        VOICE_CHOICE_DETAIL_KEY,
+        VOICE_CHOICE_STANDARD,
+    )
+
+    if (record.get("detail") or {}).get(VOICE_CHOICE_DETAIL_KEY) == VOICE_CHOICE_STANDARD:
+        chosen_standard_voice = _standard_voice_of(record, context)
+        if chosen_standard_voice is not None:
+            return chosen_standard_voice
+    return (
+        _clone_voice_of(record, context, usable_only=True)
+        or _standard_voice_of(record, context)
+        or NO_SPEAKING_VOICE
+    )
+
+
+def usable_clone_of(record: dict[str, Any], context: Any = None) -> SpeakingVoice | None:
+    """Return the clone that would speak if the owner chose the custom voice, or ``None``."""
+    return _clone_voice_of(record, context, usable_only=True)
+
+
+async def resolve_active_voice_id(
+    repository: Any, assistant_id: str, context: Any = None
+) -> tuple[str, str | None]:
+    """Which cloned voice speaks for the avatar: ``("professional"|"instant"|"none", id)``.
+
+    The active provider's instant clone is reported even when banned, so the
+    caller can tell a blocked voice from a missing one.
+    """
+    record = await repository.get_voice(assistant_id) or {}
+    clone_voice = _clone_voice_of(record, context, usable_only=False)
+    if clone_voice is None:
+        return "none", None
+    return clone_voice.kind, clone_voice.voice_id
 
 
 async def resolve_speaking_voice(
-    repository: Any, assistant_id: str
+    repository: Any, assistant_id: str, context: Any = None
 ) -> tuple[str, str | None]:
-    """Which voice actually speaks: a usable clone first, else the standard voice.
+    """Which voice actually speaks: ``("professional"|"instant"|"standard"|"none", id)``.
 
-    ``("professional"|"instant"|"standard"|"none", id)``. A clone the vendor
-    has banned does not count as usable, so an avatar with a banned clone and
-    a standard voice speaks with the standard voice.
+    See ``speaking_voice_of``; ``resolve_speaking_voice_and_provider`` also
+    names the provider that must synthesize the voice.
     """
-    from src.anubis.utils.voice.standard_voices import standard_voice_of
+    speaking_voice = await resolve_speaking_voice_and_provider(
+        repository, assistant_id, context
+    )
+    return speaking_voice.kind, speaking_voice.voice_id
 
+
+async def resolve_speaking_voice_and_provider(
+    repository: Any, assistant_id: str, context: Any = None
+) -> SpeakingVoice:
+    """Return the voice that speaks for the avatar and the provider that synthesizes the voice."""
     record = await repository.get_voice(assistant_id) or {}
-    kind, voice_id = await resolve_active_voice_id(repository, assistant_id)
-    if voice_id is not None and not voice_record_blocked(record):
-        return kind, voice_id
-    standard = standard_voice_of(record)
-    if standard is not None:
-        return "standard", standard["voice_id"]
-    return "none", None
+    return speaking_voice_of(record, context)
 
 
 def voice_seconds_by_document(clips: list[dict[str, Any]]) -> dict[str, float]:
@@ -905,15 +1109,26 @@ def _instant_clone_retry_due(
     thresholds: VoiceThresholds,
     context: Any,
 ) -> bool:
-    """Whether a status read should retry a failed instant clone now."""
-    if record.get("instant_voice_id") or not voice_configured(context):
+    """Whether a status read should build or retry the active provider's instant clone now.
+
+    Two situations are due. A failed clone is retried once
+    ``INSTANT_CLONE_RETRY_SECONDS`` have passed. A corpus that already holds the
+    minimum but has no clone on the active provider, and no failure either, is
+    built at once: that is an avatar whose clone was made by another provider
+    before ``VOICE_PROVIDER`` was switched (or whose clips arrived while no key
+    was configured), and the active provider's clone is built lazily here.
+    """
+    slot = voice_slot(record, active_voice_provider_name(context))
+    if slot.get("instant_voice_id") or not voice_configured(context):
         return False
     if collected_seconds < thresholds.instant_minimum:
         return False
-    detail = record.get("detail") or {}
-    if not detail.get("instant_error"):
+    slot_detail = slot.get("detail") or {}
+    if voice_record_blocked(slot):
         return False
-    failed_at = float(detail.get("instant_error_at") or 0.0)
+    if not slot_detail.get("instant_error"):
+        return True
+    failed_at = float(slot_detail.get("instant_error_at") or 0.0)
     return datetime.now(tz=UTC).timestamp() - failed_at >= INSTANT_CLONE_RETRY_SECONDS
 
 
@@ -932,19 +1147,30 @@ async def voice_readiness(
     the corpus total only. It is what tells a live conversation that the voice
     has just become usable, so the avatar starts speaking without a reload.
     """
-    from src.anubis.utils.voice.standard_voices import standard_voice_of
+    from src.anubis.utils.voice.standard_voices import (
+        standard_voice_of,
+        voice_choice_of,
+    )
 
     record = await _voice_record(repository, user_id, assistant_id)
     thresholds = VoiceThresholds.from_context(context)
-    active, active_id = await resolve_speaking_voice(repository, assistant_id)
-    standard_voice = standard_voice_of(record)
+    speaking_voice = speaking_voice_of(record, context)
+    active_provider_name = active_voice_provider_name(context)
+    active_slot = voice_slot(dict(record), active_provider_name)
     readiness = {
-        "active_voice": active,
-        "has_voice": active_id is not None,
-        # A banned clone silences the avatar only while no standard voice
-        # stands in for it; the client latches ``blocked`` into text-only replies.
-        "blocked": voice_record_blocked(record) and standard_voice is None,
-        "standard_voice": standard_voice,
+        "active_voice": speaking_voice.kind,
+        "has_voice": speaking_voice.voice_id is not None,
+        # A banned clone silences the avatar only while no other voice stands
+        # in for it; the client latches ``blocked`` into text-only replies.
+        "blocked": voice_record_blocked(active_slot)
+        and speaking_voice.voice_id is None,
+        "standard_voice": standard_voice_of(active_slot),
+        "voice_choice": voice_choice_of(record, context),
+        # Whether a usable clone exists, whichever voice was chosen, so a client
+        # never reads a chosen stock voice as a missing clone.
+        "custom_voice_available": usable_clone_of(record, context) is not None,
+        "voice_provider": active_provider_name,
+        "speaking_voice_provider": speaking_voice.provider_name,
     }
     # Whether an avatar can speak is plain to anyone who presses speak, so it is
     # reported to whoever is talking. How much speech it holds is the owner's
@@ -999,9 +1225,18 @@ async def voice_status_for(
         repository, context, record, assistant_id=assistant_id
     )
     clips = await repository.list_voice_clips(assistant_id)
-    active, active_id = await resolve_active_voice_id(repository, assistant_id)
+    active, active_id = await resolve_active_voice_id(
+        repository, assistant_id, context
+    )
+    speaking_voice = speaking_voice_of(record, context)
+    active_provider_name = active_voice_provider_name(context)
+    active_provider = get_voice_provider(context)
+    active_slot = voice_slot(dict(record), active_provider_name)
     from src.anubis.utils.voice.capture import accrual_blocked_reason, consent_state
-    from src.anubis.utils.voice.standard_voices import standard_voice_of
+    from src.anubis.utils.voice.standard_voices import (
+        standard_voice_of,
+        voice_choice_of,
+    )
 
     accrual_consent = consent_state(record)
     accrual_blocked = await accrual_blocked_reason(
@@ -1036,10 +1271,10 @@ async def voice_status_for(
     return VoiceStatus(
         assistant_id=assistant_id,
         collected_seconds=collected,
-        instant_voice_id=record.get("instant_voice_id"),
-        instant_voice_seconds=float(record.get("instant_voice_seconds") or 0.0),
-        instant_voice_blocked=voice_record_blocked(record),
-        instant_voice_blocked_reason=voice_record_blocked_reason(record),
+        instant_voice_id=active_slot.get("instant_voice_id"),
+        instant_voice_seconds=float(active_slot.get("instant_voice_seconds") or 0.0),
+        instant_voice_blocked=voice_record_blocked(active_slot),
+        instant_voice_blocked_reason=voice_record_blocked_reason(active_slot),
         professional_voice_id=record.get("professional_voice_id"),
         professional_state=str(
             record.get("professional_state") or VOICE_STATE_NOT_STARTED
@@ -1070,20 +1305,31 @@ async def voice_status_for(
         accrual_enabled=accrual_blocked is None,
         accrual_blocked_reason=accrual_blocked,
         accrual_consent=accrual_consent,
-        standard_voice=standard_voice_of(record),
+        standard_voice=standard_voice_of(active_slot),
+        voice_choice=voice_choice_of(record, context),
+        speaking_voice=speaking_voice.kind,
+        custom_voice_available=usable_clone_of(record, context) is not None,
+        voice_provider=active_provider_name,
+        voice_provider_display_name=active_provider.display_name,
+        speaking_voice_provider=speaking_voice.provider_name,
         detail={
-            k: v
-            for k, v in (record.get("detail") or {}).items()
-            if k
-            in (
-                "instant_error",
-                "instant_blocked",
-                "instant_blocked_reason",
-                "professional_error",
-                "professional_error_kind",
-                "professional_help_url",
-                "vendor_state",
-                "training_model",
-            )
+            **{
+                key: value
+                for key, value in (record.get("detail") or {}).items()
+                if key
+                in (
+                    "professional_error",
+                    "professional_error_kind",
+                    "professional_help_url",
+                    "vendor_state",
+                    "training_model",
+                )
+            },
+            # The instant clone's state belongs to the active provider's slot.
+            **{
+                key: value
+                for key, value in (active_slot.get("detail") or {}).items()
+                if key in ("instant_error", "instant_blocked", "instant_blocked_reason")
+            },
         },
     )

@@ -1647,6 +1647,57 @@ class GlobalContext:
 
     """ </Deep research with web-based fact verification> """
 
+    """ <Voice provider (stock voices, instant clones, speech)> """
+
+    voice_provider: str = field(
+        default="ELEVENLABS",
+        metadata={
+            "description": "Which vendor supplies the standard (stock) voice catalogue, builds instant voice clones, and speaks with them: ELEVENLABS or CARTESIA. Every stored voice id records the vendor that minted the voice, so switching back restores the earlier voices without rebuilding anything; a voice minted by the other vendor keeps speaking through that vendor until the active vendor has one. Professional clones and lip-sync video stay on ElevenLabs whatever this says. Env VOICE_PROVIDER."
+        },
+    )
+
+    cartesia_api_key: str = field(
+        default=None,
+        metadata={
+            "description": "Cartesia key for stock voices, instant voice cloning, and speech when VOICE_PROVIDER=CARTESIA. Instant cloning needs the Cartesia Pro plan or above, and the Free plan forbids commercial use. Env CARTESIA_API_KEY."
+        },
+    )
+
+    cartesia_api_version: str = field(
+        default="2026-08-14",
+        metadata={
+            "description": "Value of the Cartesia-Version header sent with every Cartesia request. Env CARTESIA_API_VERSION."
+        },
+    )
+
+    cartesia_text_to_speech_model: str = field(
+        default="sonic-3.6",
+        metadata={
+            "description": "Cartesia text-to-speech model (sonic-3.6, sonic-3.5, sonic-latest). Env CARTESIA_TEXT_TO_SPEECH_MODEL."
+        },
+    )
+
+    cartesia_text_to_speech_cost_per_1000_characters_usd: float = field(
+        default=0.04,
+        metadata={
+            "description": "Vendor cost per 1,000 characters of Cartesia speech, recorded in api_metrics (one credit per character; the Startup plan is $49 for 1.25 M credits). Env CARTESIA_TEXT_TO_SPEECH_COST_PER_1000_CHARACTERS_USD."
+        },
+    )
+
+    cartesia_voice_language: str = field(
+        default="en",
+        metadata={
+            "description": "ISO 639-1 language Cartesia instant clones are built in, the stock catalogue is filtered to, and speech is rendered in. Env CARTESIA_VOICE_LANGUAGE."
+        },
+    )
+
+    cartesia_instant_voice_clone_maximum_seconds: float = field(
+        default=60.0,
+        metadata={
+            "description": "Seconds of the voice corpus joined into the single clip a Cartesia instant clone is built from (Cartesia accepts one clip of up to 16 MB and uses about the first minute). Env CARTESIA_INSTANT_VOICE_CLONE_MAXIMUM_SECONDS."
+        },
+    )
+
     """ <Voice cloning and speech (ElevenLabs)> """
 
     elevenlabs_api_key: str = field(

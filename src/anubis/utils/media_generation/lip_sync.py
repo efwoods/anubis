@@ -157,11 +157,15 @@ async def start_lip_sync(
     emotion: str,
     voice_id: str,
     motion_prompt: str | None = None,
+    voice_provider_name: str | None = None,
 ) -> dict[str, Any]:
     """Begin (or short-circuit) a lip-sync clip for one reply.
 
     ``motion_prompt`` is the person's measured motion block for this emotion;
     it becomes the behavioural layer of the generation prompt.
+    ``voice_provider_name`` is the provider that minted ``voice_id`` and
+    therefore synthesizes the speech (ElevenLabs when omitted); the video is
+    always animated on ElevenLabs.
 
     Returns ``{"status": "completed", "asset_id"}`` when a cached clip exists,
     otherwise ``{"status": "pending", "job_id", "generation_id"}``.
@@ -180,12 +184,14 @@ async def start_lip_sync(
         raise elevenlabs_client.ElevenLabsError(
             "The avatar has no emotion still to animate; generate emotion media first."
         )
-    model_id = str(
-        getattr(context, "elevenlabs_text_to_speech_model", None) or "eleven_flash_v2_5"
+    from src.anubis.utils.voice.providers import (
+        ELEVENLABS_PROVIDER_NAME,
+        get_voice_provider,
     )
-    speech_bytes = await elevenlabs_client.synthesize_speech(
-        context, voice_id=voice_id, text=text, model_id=model_id
-    )
+
+    speech_bytes = await get_voice_provider(
+        context, voice_provider_name or ELEVENLABS_PROVIDER_NAME
+    ).synthesize_speech(context, voice_id=voice_id, text=text)
     audio_asset_id = await elevenlabs_client.upload_asset(
         context,
         payload=speech_bytes,

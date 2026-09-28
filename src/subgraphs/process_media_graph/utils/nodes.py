@@ -153,14 +153,23 @@ async def _collect_voice_clip_from_isolated_audio(
     audio_uri: str,
     filename: str | None,
     source_document_name: str | None,
-) -> None:
-    """Isolate the dominant speaker across a reference recording and store it as a clip."""
+) -> float:
+    """Isolate the dominant speaker across a reference recording and store it as a clip.
+
+    Returns the seconds stored, which is zero when the isolation found no single
+    speaker or anything failed, so the caller can fall back to cutting the
+    diarized target turns instead.
+    """
     from src.anubis.utils.media_assets import get_media_asset_repository
-    from src.anubis.utils.voice.corpus import add_voice_clip, voice_configured
+    from src.anubis.utils.voice.corpus import (
+        active_instant_voice_id,
+        add_voice_clip,
+        voice_configured,
+    )
 
     repository = get_media_asset_repository()
     if repository is None or not voice_configured(context):
-        return
+        return 0.0
     try:
         # A voice sample is usually one person talking. Without
         # ``allow_single_speaker`` the isolation passes such audio through
@@ -173,13 +182,23 @@ async def _collect_voice_clip_from_isolated_audio(
             reference_audio=False,
             allow_single_speaker=True,
         )
+        isolated_seconds = float(isolated.get("duration") or 0.0)
+        isolated_audio = isolated.get("audio_base64_preprocessed") or ""
+        if isolated_seconds <= 0 or not isolated_audio:
+            logger.info(
+                "Voice isolation of %s found no single speaker for %s; "
+                "falling back to the diarized target turns",
+                filename,
+                assistant_id,
+            )
+            return 0.0
         record = await add_voice_clip(
             repository,
             context,
             user_id=user_id,
             assistant_id=assistant_id,
-            audio_data_uri=isolated.get("audio_base64_preprocessed") or "",
-            duration_seconds=float(isolated.get("duration") or 0.0),
+            audio_data_uri=isolated_audio,
+            duration_seconds=isolated_seconds,
             source="reference_upload",
             source_document_name=source_document_name,
             is_personal_avatar=_assistant_is_personal_avatar(config),
@@ -187,15 +206,17 @@ async def _collect_voice_clip_from_isolated_audio(
         )
         _emit_media_progress(
             "voice_clip_collected",
-            seconds=float(isolated.get("duration") or 0.0),
+            seconds=isolated_seconds,
             collected_seconds=float(record.get("collected_seconds") or 0.0),
         )
-        if record.get("instant_voice_id"):
+        if active_instant_voice_id(record, context):
             _emit_media_progress("instant_clone_created")
+        return isolated_seconds
     except Exception as clip_error:  # noqa: BLE001 - never fail the upload
         logger.warning(
             "Voice clip collection skipped for %s: %s", assistant_id, clip_error
         )
+        return 0.0
 
 
 async def _learn_motion_from_video(
@@ -314,7 +335,11 @@ async def _collect_voice_clips_from_target_turns(
         return
     from src.anubis.utils.media_assets import get_media_asset_repository
     from src.anubis.utils.voice.clips import cut_target_turns_to_mp3_data_uri
-    from src.anubis.utils.voice.corpus import add_voice_clip, voice_configured
+    from src.anubis.utils.voice.corpus import (
+        active_instant_voice_id,
+        add_voice_clip,
+        voice_configured,
+    )
 
     repository = get_media_asset_repository()
     if repository is None or not voice_configured(context):
@@ -348,7 +373,7 @@ async def _collect_voice_clips_from_target_turns(
             seconds=seconds,
             collected_seconds=float(record.get("collected_seconds") or 0.0),
         )
-        if record.get("instant_voice_id"):
+        if active_instant_voice_id(record, context):
             _emit_media_progress("instant_clone_created")
     except Exception as clip_error:  # noqa: BLE001 - never fail the upload
         logger.warning(
@@ -2320,7 +2345,7 @@ async def process_media_item_task(
                     # every second of the avatar speaking, so the same isolation
                     # runs once more without the reference cap and the whole
                     # target-only track is added to the corpus.
-                    await _collect_voice_clip_from_isolated_audio(
+                    isolated_voice_seconds = await _collect_voice_clip_from_isolated_audio(
                         runtime.context,
                         config,
                         user_id=user_id,
@@ -2329,7 +2354,10 @@ async def process_media_item_task(
                         filename=audio_name,
                         source_document_name=filename,
                     )
-                    voice_clip_collected_for_item = True
+                    # Only a clip that was actually stored replaces the
+                    # target-turn cut below; an isolation that stored nothing
+                    # leaves the cut as the fallback.
+                    voice_clip_collected_for_item = isolated_voice_seconds > 0
 
                     # Compare the reference transcript to the calibration
                     # sentence. Run the synchronous SentenceTransformer load +

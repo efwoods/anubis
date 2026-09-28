@@ -635,7 +635,112 @@ async def test_speak_falls_back_to_the_standard_voice_without_a_clone(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_the_clone_speaks_ahead_of_the_standard_voice(monkeypatch):
+async def test_the_owner_chooses_between_the_standard_voice_and_the_clone(monkeypatch):
+    """Picking a standard voice speaks with that voice; ``custom`` brings the clone back.
+
+    The clone used to win whenever the clone was usable, so an owner who picked
+    a stock voice for an avatar with a clone heard no change, and an owner who
+    had a stock voice could not choose the clone deliberately either.
+    """
+    from src.anubis.utils.voice.standard_voices import (
+        set_standard_voice,
+        set_voice_choice,
+    )
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-9"}
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _meter(current_user, **kwargs):
+        return None
+
+    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _meter)
+
+    async def _speak():
+        return await webapp_module.speak_text(
+            request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hi"}),
+            current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+        )
+
+    async def _status():
+        return await corpus.voice_status_for(
+            repository,
+            _context(),
+            user_id=USER_ID,
+            assistant_id=ASSISTANT_ID,
+            is_personal_avatar=False,
+        )
+
+    # A row written before the choice existed keeps the clone speaking.
+    response = await _speak()
+    assert response.headers["x-voice-kind"] == "instant"
+
+    await set_standard_voice(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        voice={"voice_id": "std-adam", "name": "Adam", "gender": "male"},
+    )
+    response = await _speak()
+    assert response.body == b"audio:std-adam:hi"
+    assert response.headers["x-voice-kind"] == "standard"
+    status = await _status()
+    assert status.voice_choice == "standard"
+    assert status.speaking_voice == "standard"
+    # The clone is still there to switch back to, and still reads as a clone.
+    assert status.active_voice == "instant"
+    assert status.custom_voice_available is True
+
+    await set_voice_choice(
+        repository, user_id=USER_ID, assistant_id=ASSISTANT_ID, choice="custom"
+    )
+    response = await _speak()
+    assert response.body == b"audio:ivc-9:hi"
+    assert response.headers["x-voice-kind"] == "instant"
+    status = await _status()
+    assert status.voice_choice == "custom"
+    assert status.speaking_voice == "instant"
+    # The stock voice stays picked, so switching back needs no second pick.
+    assert status.standard_voice == {
+        "voice_id": "std-adam",
+        "name": "Adam",
+        "gender": "male",
+    }
+
+    await set_voice_choice(
+        repository, user_id=USER_ID, assistant_id=ASSISTANT_ID, choice="standard"
+    )
+    response = await _speak()
+    assert response.headers["x-voice-kind"] == "standard"
+
+
+@pytest.mark.asyncio
+async def test_the_standard_choice_needs_a_standard_voice(monkeypatch):
+    from src.anubis.utils.voice.standard_voices import set_voice_choice
+
+    repository = InMemoryMediaAssetRepository()
+    with pytest.raises(ValueError, match="Pick a standard voice"):
+        await set_voice_choice(
+            repository, user_id=USER_ID, assistant_id=ASSISTANT_ID, choice="standard"
+        )
+    with pytest.raises(ValueError, match="choice must be one of"):
+        await set_voice_choice(
+            repository, user_id=USER_ID, assistant_id=ASSISTANT_ID, choice="robot"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_voice_choice_route_switches_back_to_the_clone(monkeypatch):
     from src.anubis.utils.voice.standard_voices import set_standard_voice
     from src.api import webapp as webapp_module
 
@@ -654,36 +759,27 @@ async def test_the_clone_speaks_ahead_of_the_standard_voice(monkeypatch):
     monkeypatch.setattr(
         webapp_module.app,
         "state",
-        SimpleNamespace(context=_context(), pool=None, stripe=None),
+        SimpleNamespace(context=_context(), pool=None, stripe=None, store=None),
     )
-    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
 
-    async def _meter(current_user, **kwargs):
-        return None
+    async def _owned(assistant_id, current_user, action_description):
+        return {}, False
 
-    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _meter)
+    monkeypatch.setattr(webapp_module, "_owned_assistant_for_voice", _owned)
+    current_user = {"API_KEY": "k", "identities": [{"user_id": USER_ID}]}
 
-    response = await webapp_module.speak_text(
-        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hi"}),
-        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    switched = await webapp_module.set_avatar_voice_choice(
+        assistant_id=ASSISTANT_ID, choice="custom", current_user=current_user
     )
-    assert response.body == b"audio:ivc-9:hi"
-    assert response.headers["x-voice-kind"] == "instant"
-    # The clone still holds the record's instant id; the standard voice is
-    # reported alongside so the panel can show both.
-    status = await corpus.voice_status_for(
-        repository,
-        _context(),
-        user_id=USER_ID,
-        assistant_id=ASSISTANT_ID,
-        is_personal_avatar=False,
-    )
-    assert status.active_voice == "instant"
-    assert status.standard_voice == {
-        "voice_id": "std-adam",
-        "name": "Adam",
-        "gender": "male",
-    }
+    body = __import__("json").loads(switched.body)
+    assert body["voice_choice"] == "custom"
+    assert body["speaking_voice"] == "instant"
+
+    with pytest.raises(webapp_module.HTTPException) as refused:
+        await webapp_module.set_avatar_voice_choice(
+            assistant_id=ASSISTANT_ID, choice="robot", current_user=current_user
+        )
+    assert refused.value.status_code == 400
 
 
 @pytest.mark.asyncio

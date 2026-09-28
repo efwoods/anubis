@@ -22,9 +22,11 @@ false. Professional clones are not offered through this provider.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
+from collections.abc import AsyncIterator
 from typing import Any
 
 from src.anubis.utils.voice.provider_errors import (
@@ -96,10 +98,25 @@ def _raise_for_cartesia_response(response: Any, action_description: str) -> None
     raise VoiceProviderError(message)
 
 
-def _http_client(timeout_seconds: float) -> Any:
+@contextlib.asynccontextmanager
+async def _http_client(timeout_seconds: float) -> AsyncIterator[Any]:
+    """Yield a Cartesia HTTP client; a timeout or dropped connection becomes ``VoiceProviderError``.
+
+    The routes answer ``VoiceProviderError`` with 502, so an ``httpx``
+    transport error raised anywhere inside the ``async with`` block is
+    converted rather than left to surface as a 500.
+    """
     import httpx
 
-    return httpx.AsyncClient(base_url=CARTESIA_BASE_URL, timeout=timeout_seconds)
+    try:
+        async with httpx.AsyncClient(
+            base_url=CARTESIA_BASE_URL, timeout=timeout_seconds
+        ) as http_client:
+            yield http_client
+    except httpx.HTTPError as network_error:
+        raise VoiceProviderError(
+            f"Cartesia could not be reached: {type(network_error).__name__}"
+        ) from network_error
 
 
 def join_clips_to_mp3(

@@ -360,6 +360,26 @@ async def test_cartesia_failures_map_to_shared_errors(
 
 
 @pytest.mark.asyncio
+async def test_a_cartesia_timeout_is_a_vendor_error(monkeypatch):
+    real_async_client = httpx.AsyncClient
+
+    def _timing_out_handler(request):
+        raise httpx.ReadTimeout("no response", request=request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **client_arguments: real_async_client(
+            transport=httpx.MockTransport(_timing_out_handler), **client_arguments
+        ),
+    )
+    with pytest.raises(VoiceProviderError, match="could not be reached"):
+        await cartesia_module.PROVIDER.synthesize_speech(
+            _cartesia_context(), voice_id="voice-1", text="hello"
+        )
+
+
+@pytest.mark.asyncio
 async def test_cartesia_without_a_key_is_not_configured():
     with pytest.raises(VoiceProviderNotConfiguredError):
         await cartesia_module.PROVIDER.synthesize_speech(

@@ -200,6 +200,7 @@ from src.security.auth import (
     check_subscription_status,
     get_current_user,
     get_current_user_or_anonymous_user,
+    get_current_user_or_anonymous_viewer,
     get_current_user_or_anonymous_user_id,
     get_optional_signed_in_user,
     get_user,
@@ -9057,17 +9058,27 @@ async def list_geo_avatars(
     min_longitude: Optional[float] = None,
     max_latitude: Optional[float] = None,
     max_longitude: Optional[float] = None,
-    current_user: dict = Depends(get_current_user_or_anonymous_user),
+    assistant_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user_or_anonymous_viewer),
 ):
     """Every public avatar pinned to a place, optionally inside a map viewport.
 
     This is what the world globe and the local map draw. Omitting the bounding
     box returns every public pin on Earth; supplying part of the box leaves the
     remaining sides open, and a box whose minimum longitude exceeds the maximum
-    wraps across the antimeridian the way a map viewport does.
+    wraps across the antimeridian the way a map viewport does. ``assistant_id``
+    narrows the listing to that one avatar's pin (the globe hydrating the pin
+    of the selected avatar); an avatar that is not public simply has no pin
+    here, and the answer is an empty listing rather than a refusal.
     """
+    requested_assistant_id = (assistant_id or "").strip()
     avatars = []
     for assistant in await _public_geo_candidates(current_user):
+        if (
+            requested_assistant_id
+            and str(assistant.get("assistant_id")) != requested_assistant_id
+        ):
+            continue
         pin = geo_location_of(assistant)
         if pin is None:
             continue

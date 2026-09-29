@@ -458,3 +458,88 @@ def test_the_geo_limits_come_from_the_environment(monkeypatch):
     configured = GlobalContext()
     assert configured.geo_nearby_default_radius_meters == 750
     assert configured.geo_notify_cooldown_seconds == 60
+
+
+""" The map listing never binds an anonymous visitor to an avatar """
+
+
+def _route(path, method):
+    for route in webapp_module.app.routes:
+        if getattr(route, "path", None) == path and method in getattr(route, "methods", ()):
+            return route
+    raise AssertionError(f"route not registered: {method} {path}")
+
+
+def test_the_map_listing_auth_dependency_does_not_read_assistant_id():
+    """Regression: the globe asked /avatars/geo?assistant_id=<private avatar>
+    before the login loaded, the anonymous dependency read assistant_id as the
+    avatar to chat with, and every such request answered 401 (prod,
+    2026-09-28 14:19:29, 15:02:10, 15:36:48, 18:00:43 UTC)."""
+    geo_route = _route("/avatars/geo", "GET")
+    assert _query_parameter_names("/avatars/geo", "GET").get("assistant_id") is False
+    auth_dependencies = [
+        dependency for dependency in geo_route.dependant.dependencies if dependency.name == "current_user"
+    ]
+    assert len(auth_dependencies) == 1
+    assert auth_dependencies[0].call is webapp_module.get_current_user_or_anonymous_viewer
+    assert "assistant_id" not in {
+        parameter.name for parameter in auth_dependencies[0].query_params
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_viewer_dependency_never_selects_an_avatar(monkeypatch):
+    import src.security.auth as auth_module
+
+    received = {}
+
+    async def _record(request, assistant_id, api_key, bearer_credentials):
+        received["assistant_id"] = assistant_id
+        return {"user_id": "viewer"}
+
+    monkeypatch.setattr(auth_module, "get_current_user_or_anonymous_user", _record)
+    user = await auth_module.get_current_user_or_anonymous_viewer(
+        SimpleNamespace(), api_key=None, bearer_credentials=None
+    )
+    assert user == {"user_id": "viewer"}
+    assert received == {"assistant_id": ""}
+
+
+@pytest.mark.asyncio
+async def test_the_map_listing_narrows_to_the_requested_avatar(monkeypatch):
+    pinned = {"latitude": BRIDGE[0], "longitude": BRIDGE[1]}
+
+    async def _candidates(current_user):
+        return [
+            {"assistant_id": "assistant-alpha", "name": "Alpha", "metadata": {"geo_location": pinned}},
+            {"assistant_id": "assistant-beta", "name": "Beta", "metadata": {"geo_location": pinned}},
+        ]
+
+    monkeypatch.setattr(webapp_module, "_public_geo_candidates", _candidates)
+    monkeypatch.setattr(webapp_module, "geo_location_of", lambda assistant: pinned)
+    everything = await webapp_module.list_geo_avatars(current_user={})
+    assert everything["count"] == 2
+    only_beta = await webapp_module.list_geo_avatars(assistant_id="assistant-beta", current_user={})
+    assert [avatar["assistant_id"] for avatar in only_beta["avatars"]] == ["assistant-beta"]
+    private_avatar = await webapp_module.list_geo_avatars(assistant_id="private-avatar", current_user={})
+    assert private_avatar == {"avatars": [], "count": 0}
+
+
+def test_a_request_without_forwarded_for_hashes_the_socket_peer():
+    import hashlib
+
+    from src.security.auth import resolve_request_hashed_ip
+
+    def _request(headers, client_host):
+        return SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(context=SimpleNamespace(dev="FALSE"))),
+            headers=headers,
+            client=SimpleNamespace(host=client_host) if client_host else None,
+        )
+
+    def _sha(text):
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    assert resolve_request_hashed_ip(_request({"x-forwarded-for": "203.0.113.7"}, "10.0.0.2")) == _sha("203.0.113.7")
+    assert resolve_request_hashed_ip(_request({}, "10.0.0.2")) == _sha("10.0.0.2")
+    assert resolve_request_hashed_ip(_request({}, None)) == _sha("unknown-client")

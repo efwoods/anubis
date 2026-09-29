@@ -104,7 +104,16 @@ def resolve_request_hashed_ip(request: Request) -> str:
     """
     if getattr(request.app.state.context, "dev", None) == "TRUE":
         return _hash_key(DEVELOPMENT_MODE_CLIENT_IP)
-    return _hash_key(request.headers.get("x-forwarded-for"))
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        # Unchanged derivation: every existing anonymous identity keys on the
+        # raw header value.
+        return _hash_key(forwarded_for)
+    # A request that reached the API without the proxy (a direct call on the
+    # host) carries no X-Forwarded-For; hashing None raised AttributeError and
+    # answered 500. The socket peer is the only address left.
+    client_address = getattr(getattr(request, "client", None), "host", None)
+    return _hash_key(client_address or "unknown-client")
 
 
 async def refuse_if_banned(
@@ -1824,6 +1833,27 @@ async def get_current_user_or_anonymous_user(
             raise _invalid_credential_error(bearer_credentials)
 
     return user
+
+
+async def get_current_user_or_anonymous_viewer(
+    request: Request,
+    api_key: str | None = Depends(optional_api_key_scheme),
+    bearer_credentials: HTTPAuthorizationCredentials | None = Depends(
+        optional_bearer_scheme
+    ),
+) -> dict:
+    """Signed-in user, or an anonymous visitor NOT bound to any avatar.
+
+    ``get_current_user_or_anonymous_user`` reads an ``assistant_id`` query
+    parameter as the avatar an anonymous visitor is about to chat with, and
+    refuses a private avatar with 401. A listing route that merely filters by
+    ``assistant_id`` (``GET /avatars/geo``) must not trigger that refusal: the
+    world globe asks for the selected avatar's pin before the login has loaded,
+    and every such request for a private avatar answered 401.
+    """
+    return await get_current_user_or_anonymous_user(
+        request, "", api_key, bearer_credentials
+    )
 
 
 async def get_current_user_or_anonymous_user_id(

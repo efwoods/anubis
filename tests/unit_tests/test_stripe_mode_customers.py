@@ -181,3 +181,101 @@ async def test_anonymous_and_unconfigured_requests_are_left_alone(live_mode, mon
     signed_in_user = {"user_id": "auth0|e", "app_metadata": {"stripe_customer_id": "cus_e"}}
     assert await stripe_mode.reconcile_stripe_customer_for_current_mode(_request_with(customer_api), signed_in_user) is None
     assert customer_api.created_customers == []
+
+
+@pytest.fixture
+def administrator_configured(monkeypatch):
+    monkeypatch.setitem(
+        stripe_mode._administrator_identity_cache,
+        "administrator",
+        ("6a64d1ef4e063740350632ae", "admin@example.com"),
+    )
+    stripe_mode._never_charged_customer_ids.clear()
+    yield
+    stripe_mode._administrator_identity_cache.clear()
+    stripe_mode._never_charged_customer_ids.clear()
+
+
+@pytest.mark.parametrize(
+    "administrator_user",
+    [
+        {"user_id": "auth0|6a64d1ef4e063740350632ae"},
+        {"user_id": "6a64d1ef4e063740350632ae"},
+        {"identities": [{"user_id": "6a64d1ef4e063740350632ae"}]},
+        {"user_id": "auth0|someone-else", "email": "ADMIN@example.com"},
+    ],
+)
+def test_the_administrator_is_recognized_by_either_id_spelling_or_email(
+    administrator_configured, administrator_user
+):
+    assert stripe_mode.is_never_charged_account(administrator_user) is True
+
+
+def test_other_accounts_are_not_the_administrator(administrator_configured):
+    assert stripe_mode.is_never_charged_account({"user_id": "auth0|6a64d2b3ab68d652e91a8ca4", "email": "x@example.com"}) is False
+    assert stripe_mode.is_never_charged_account(None) is False
+
+
+@pytest.mark.asyncio
+async def test_the_administrator_gets_no_live_customer_and_a_recorded_one_is_dropped(
+    live_mode, administrator_configured
+):
+    class _RefusingCustomerApi:
+        def __getattr__(self, name):
+            raise AssertionError("Stripe must never be called for the administrator in live mode")
+
+    user = {
+        "user_id": "auth0|6a64d1ef4e063740350632ae",
+        "email": "admin@example.com",
+        "app_metadata": {
+            "stripe_customer_id": "cus_Ux1G8zxlKL1GFV",
+            "stripe_customer_ids": {"test": "cus_Ux1G8zxlKL1GFV", "live": "cus_VLMlrLprDgnBE2"},
+            "subscription_status": {"customer_id": "cus_Ux1G8zxlKL1GFV", "tier": "free"},
+        },
+    }
+    assert (
+        await stripe_mode.reconcile_stripe_customer_for_current_mode(
+            _request_with(_RefusingCustomerApi()), user
+        )
+        is None
+    )
+    assert user["app_metadata"]["stripe_customer_id"] is None
+    assert user["app_metadata"]["subscription_status"]["customer_id"] is None
+    assert live_mode == [
+        ("auth0|6a64d1ef4e063740350632ae", {"stripe_customer_ids": {"test": "cus_Ux1G8zxlKL1GFV"}})
+    ]
+    assert resolve_stripe_customer_id(user) is None
+    assert stripe_mode.is_never_charged_customer("cus_VLMlrLprDgnBE2") is True
+    assert stripe_mode.is_never_charged_customer("cus_Ux1G8zxlKL1GFV") is True
+
+
+@pytest.mark.asyncio
+async def test_meter_reports_to_an_administrator_customer_are_refused(administrator_configured):
+    from src.anubis.utils.billing.metering import report_meter_event
+    from src.anubis.utils.billing.tiers import UsageMeter
+
+    stripe_mode._never_charged_customer_ids.add("cus_VLMlrLprDgnBE2")
+
+    class _RefusingStripe:
+        def __getattr__(self, name):
+            raise AssertionError("no meter event may reach Stripe for the administrator")
+
+    meter = next(iter(UsageMeter))
+    assert await report_meter_event(_RefusingStripe(), meter, "cus_VLMlrLprDgnBE2", 10) is False
+
+
+@pytest.mark.asyncio
+async def test_the_administrator_keeps_the_test_customer_in_test_mode(
+    live_mode, administrator_configured, monkeypatch
+):
+    monkeypatch.setitem(stripe_mode._current_stripe_mode_cache, "mode", stripe_mode.STRIPE_MODE_TEST)
+    customer_api = _FakeCustomerApi(customers_in_mode={"cus_Ux1G8zxlKL1GFV": {}}, customers_by_email={})
+    user = {
+        "user_id": "auth0|6a64d1ef4e063740350632ae",
+        "email": "admin@example.com",
+        "app_metadata": {"stripe_customer_id": "cus_Ux1G8zxlKL1GFV"},
+    }
+    assert (
+        await stripe_mode.reconcile_stripe_customer_for_current_mode(_request_with(customer_api), user)
+        == "cus_Ux1G8zxlKL1GFV"
+    )

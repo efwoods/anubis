@@ -69,8 +69,17 @@ def resolve_stripe_customer_id(
     app_metadata = user.get("app_metadata") or {}
     # The customer recorded for the configured key's Stripe mode wins over the
     # mode-less legacy fields (see src/anubis/utils/billing/stripe_mode.py).
-    from src.anubis.utils.billing.stripe_mode import customer_id_for_current_mode
+    from src.anubis.utils.billing.stripe_mode import (
+        STRIPE_MODE_LIVE,
+        customer_id_for_current_mode,
+        current_stripe_mode,
+        is_never_charged_account,
+    )
 
+    # The administrator account is never charged: in live mode the
+    # administrator has no customer, so every meter report is a no-op.
+    if current_stripe_mode() == STRIPE_MODE_LIVE and is_never_charged_account(user):
+        return None
     current_mode_customer_id = customer_id_for_current_mode(app_metadata)
     if current_mode_customer_id:
         return current_mode_customer_id

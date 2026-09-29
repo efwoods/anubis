@@ -55,6 +55,27 @@ VOICE_STATE_FAILED = "failed"
 # itself from this state; the owner upgrades and asks for a retry.
 VOICE_STATE_PLAN_REQUIRED = "plan_required"
 
+# Generated media belongs to one face. When the owner switches the avatar's
+# portrait, the media generated from the previous portrait is parked rather
+# than deleted: the ``variant_key`` of every active row gains the prefix
+# ``portrait:<portrait_key>|``, and switching back to that portrait strips the
+# prefix again. Parked rows never appear in ``list_emotion_assets``, so the
+# stills, idle loops and lip-sync clips of the previous face stop showing
+# against the new portrait without being lost. Only an explicit delete by the
+# owner removes generated media.
+PARKED_PORTRAIT_VARIANT_PREFIX = "portrait:"
+
+
+def parked_portrait_variant_prefix(portrait_key: str) -> str:
+    """Return the ``variant_key`` prefix that parks media under a portrait key."""
+    return f"{PARKED_PORTRAIT_VARIANT_PREFIX}{portrait_key}|"
+
+
+def is_parked_portrait_variant(variant_key: str | None) -> bool:
+    """Whether a ``variant_key`` belongs to a parked (inactive) portrait."""
+    return str(variant_key or "").startswith(PARKED_PORTRAIT_VARIANT_PREFIX)
+
+
 JOB_STATE_PENDING = "pending"
 JOB_STATE_RUNNING = "running"
 JOB_STATE_COMPLETED = "completed"
@@ -189,11 +210,15 @@ class InMemoryMediaAssetRepository:
     async def list_emotion_assets(
         self, assistant_id: str, include_bytes: bool = False
     ) -> list[dict[str, Any]]:
-        """Return every asset for an avatar, without bytes unless asked."""
+        """Return every active asset for an avatar, without bytes unless asked.
+
+        Media parked under a previous portrait is left out.
+        """
         rows = [
             asset
             for asset in self.assets.values()
             if asset["assistant_id"] == assistant_id
+            and not is_parked_portrait_variant(asset.get("variant_key"))
         ]
         if include_bytes:
             return [dict(row) for row in rows]
@@ -221,6 +246,75 @@ class InMemoryMediaAssetRepository:
             del self.assets[asset_id]
             removed += 1
         return removed
+
+    async def switch_portrait_media(
+        self, assistant_id: str, parked_portrait_key: str, restored_portrait_key: str
+    ) -> dict[str, int]:
+        """Park the active media under one portrait key; restore another's.
+
+        Nothing is deleted. A parked row whose parked ``variant_key`` is
+        already taken, or a restored row whose active ``variant_key`` is
+        already taken, stays where the row is.
+        """
+        if parked_portrait_key == restored_portrait_key:
+            return {"parked": 0, "restored": 0}
+        parked_prefix = parked_portrait_variant_prefix(parked_portrait_key)
+        restored_prefix = parked_portrait_variant_prefix(restored_portrait_key)
+
+        def occupied_keys() -> set[tuple[str, str, str]]:
+            return {
+                (
+                    asset["emotion"],
+                    asset["asset_kind"],
+                    asset.get("variant_key") or "",
+                )
+                for asset in self.assets.values()
+                if asset["assistant_id"] == assistant_id
+            }
+
+        parked_count = 0
+        occupied = occupied_keys()
+        for asset in self.assets.values():
+            variant_key = asset.get("variant_key") or ""
+            if asset["assistant_id"] != assistant_id:
+                continue
+            if is_parked_portrait_variant(variant_key):
+                continue
+            parked_variant_key = parked_prefix + variant_key
+            if (asset["emotion"], asset["asset_kind"], parked_variant_key) in occupied:
+                continue
+            asset["variant_key"] = parked_variant_key
+            parked_count += 1
+
+        restored_count = 0
+        occupied = occupied_keys()
+        for asset in self.assets.values():
+            variant_key = asset.get("variant_key") or ""
+            if asset["assistant_id"] != assistant_id:
+                continue
+            if not variant_key.startswith(restored_prefix):
+                continue
+            active_variant_key = variant_key[len(restored_prefix) :]
+            if (asset["emotion"], asset["asset_kind"], active_variant_key) in occupied:
+                continue
+            asset["variant_key"] = active_variant_key
+            restored_count += 1
+        return {"parked": parked_count, "restored": restored_count}
+
+    async def count_parked_portrait_media(self, assistant_id: str) -> dict[str, int]:
+        """Return how many parked assets each portrait key holds."""
+        counts: dict[str, int] = {}
+        for asset in self.assets.values():
+            variant_key = asset.get("variant_key") or ""
+            if asset["assistant_id"] != assistant_id:
+                continue
+            if not is_parked_portrait_variant(variant_key):
+                continue
+            portrait_key = variant_key[len(PARKED_PORTRAIT_VARIANT_PREFIX) :].split(
+                "|", 1
+            )[0]
+            counts[portrait_key] = counts.get(portrait_key, 0) + 1
+        return counts
 
     # -- voice clips ---------------------------------------------------------
 
@@ -502,12 +596,16 @@ class PostgresMediaAssetRepository:
     async def list_emotion_assets(
         self, assistant_id: str, include_bytes: bool = False
     ) -> list[dict[str, Any]]:
-        """Return every asset for an avatar, without bytes unless asked."""
+        """Return every active asset for an avatar, without bytes unless asked.
+
+        Media parked under a previous portrait is left out.
+        """
         columns = self._ASSET_COLUMNS + (", bytes" if include_bytes else "")
         rows = await self._fetchall(
             f"SELECT {columns} FROM avatar_emotion_media WHERE assistant_id = %s "
+            "AND variant_key NOT LIKE %s "
             "ORDER BY asset_kind, emotion;",
-            (assistant_id,),
+            (assistant_id, PARKED_PORTRAIT_VARIANT_PREFIX + "%"),
         )
         return [self._asset_row(row, include_bytes) for row in rows]
 
@@ -549,6 +647,88 @@ class PostgresMediaAssetRepository:
             )
             or 0
         )
+
+    async def switch_portrait_media(
+        self, assistant_id: str, parked_portrait_key: str, restored_portrait_key: str
+    ) -> dict[str, int]:
+        """Park the active media under one portrait key; restore another's.
+
+        Nothing is deleted. Both updates run in one transaction. A row whose
+        target ``variant_key`` is already taken stays where the row is, so the
+        unique constraint on (assistant_id, emotion, asset_kind, variant_key)
+        is never violated.
+        """
+        if parked_portrait_key == restored_portrait_key:
+            return {"parked": 0, "restored": 0}
+        parked_prefix = parked_portrait_variant_prefix(parked_portrait_key)
+        restored_prefix = parked_portrait_variant_prefix(restored_portrait_key)
+        like_parked = PARKED_PORTRAIT_VARIANT_PREFIX + "%"
+        like_restored = (
+            restored_prefix.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+            + "%"
+        )
+        async with self.pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE avatar_emotion_media AS active_media
+                        SET variant_key = %s || active_media.variant_key
+                        WHERE active_media.assistant_id = %s
+                          AND active_media.variant_key NOT LIKE %s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM avatar_emotion_media AS taken_media
+                              WHERE taken_media.assistant_id = active_media.assistant_id
+                                AND taken_media.emotion = active_media.emotion
+                                AND taken_media.asset_kind = active_media.asset_kind
+                                AND taken_media.variant_key
+                                    = %s || active_media.variant_key
+                          );
+                        """,
+                        (parked_prefix, assistant_id, like_parked, parked_prefix),
+                    )
+                    parked_count = int(cursor.rowcount or 0)
+                    await cursor.execute(
+                        """
+                        UPDATE avatar_emotion_media AS parked_media
+                        SET variant_key = substr(parked_media.variant_key, %s)
+                        WHERE parked_media.assistant_id = %s
+                          AND parked_media.variant_key LIKE %s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM avatar_emotion_media AS taken_media
+                              WHERE taken_media.assistant_id = parked_media.assistant_id
+                                AND taken_media.emotion = parked_media.emotion
+                                AND taken_media.asset_kind = parked_media.asset_kind
+                                AND taken_media.variant_key
+                                    = substr(parked_media.variant_key, %s)
+                          );
+                        """,
+                        (
+                            len(restored_prefix) + 1,
+                            assistant_id,
+                            like_restored,
+                            len(restored_prefix) + 1,
+                        ),
+                    )
+                    restored_count = int(cursor.rowcount or 0)
+        return {"parked": parked_count, "restored": restored_count}
+
+    async def count_parked_portrait_media(self, assistant_id: str) -> dict[str, int]:
+        """Return how many parked assets each portrait key holds."""
+        rows = await self._fetchall(
+            "SELECT split_part(substr(variant_key, %s), '|', 1) AS portrait_key, "
+            "count(*) FROM avatar_emotion_media "
+            "WHERE assistant_id = %s AND variant_key LIKE %s "
+            "GROUP BY portrait_key;",
+            (
+                len(PARKED_PORTRAIT_VARIANT_PREFIX) + 1,
+                assistant_id,
+                PARKED_PORTRAIT_VARIANT_PREFIX + "%",
+            ),
+        )
+        return {str(row[0]): int(row[1]) for row in rows}
 
     # -- voice clips ---------------------------------------------------------
 

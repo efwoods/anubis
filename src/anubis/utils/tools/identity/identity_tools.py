@@ -40,6 +40,24 @@ QUOTES ARE DIRECTLY FROM THE ASSITANT HISTORICALLY AND ARE USED FOR CONTENT AND 
 """
 
 
+# A fact about the user names the user: the user speaks in the first person
+# ("I", "my", "we") or the fact is rephrased with "user" as the subject. A
+# sentence with neither ("Terafab should complete in 2029") is a remark about
+# the world the user made in conversation, not a fact about the user's
+# identity, and storing the remark labelled "Learned about you" misrepresents
+# the user.
+_USER_SUBJECT_MARKER = re.compile(
+    r"\b(i|i'm|i've|i'd|i'll|me|my|mine|myself|we|we're|we've|us|our|ours|ourselves|user|user's)\b",
+    re.IGNORECASE,
+)
+
+
+def fact_names_the_user(user_fact: str) -> bool:
+    """Whether ``user_fact`` has the user as the subject (first person or "user")."""
+    normalized_fact = str(user_fact or "").replace("’", "'")
+    return bool(_USER_SUBJECT_MARKER.search(normalized_fact))
+
+
 def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     """Wrap a single atomic fact with its ENTIRE original background context.
 
@@ -1326,12 +1344,24 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     The user is the primary source of truth about themselves, so use this tool
     whenever the user reveals something about their own IDENTITY — their name,
     description, appearance, history, an experience or story they lived, a
-    relationship, a feeling, a preference, an opinion, a value, a belief, or a goal.
+    relationship, a feeling, a preference, an opinion, a value, a belief, or a
+    goal — stated outright or clearly inferred from what the user said.
 
-    Decompose the user's message into EVERY distinct, atomic fact and call this
-    tool ONCE FOR EACH distinct fact. A single message — especially a story — usually
-    contains MANY separate facts; make as many calls as there are facts. Do not stop
-    after the first fact. The facts must be clearly distinct facts.
+    A COMMENT IS NOT ITSELF A FACT ABOUT THE USER, BUT A COMMENT CAN REVEAL ONE.
+    When the user remarks on the world — news, a prediction, a timeline, a
+    company, a product, a technology, an event, or another person — never store
+    the remark verbatim as a fact about the user, and never turn the remark's
+    claim into a belief the user holds unless the user presents the claim as the
+    user's own view ("I think ...", "I believe ..."). Instead, infer what the
+    remark clearly reveals about the user — an interest, a topic the user
+    follows, knowledge the user has, a concern — and store that inference with
+    the user as the subject. Every stored fact must have the user as the subject
+    ("I ..." or "User ..."); a sentence about something else is refused.
+
+    Decompose the user's message into EVERY distinct, atomic fact about the user
+    and call this tool ONCE FOR EACH distinct fact. A single story about the
+    user's life usually contains MANY separate facts; make as many calls as there
+    are facts about the user. The facts must be clearly distinct facts.
 
     Do NOT summarize, merge, generalize, or omit any fact. Preserve the exact
     specifics — names, places, titles, dates, quoted words, and concrete details —
@@ -1375,7 +1405,17 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     or clearly inferred).
 
     COUNTER EXAMPLE:
-    DO NOT call this when the user types 'asdf' — that is not part of the user's identity.
+    DO NOT call this when the user types 'asdf' — 'asdf' is not part of the user's identity.
+
+    EXAMPLE (a remark that reveals an interest):
+    Input: "[A company]'s new factory should be finished by [a year]."
+    WRONG: user_fact "[A company]'s new factory should be finished by [a year]." —
+    the remark is about the company, not the user.
+    WRONG: user_fact "User believes [a company]'s new factory will be finished by
+    [a year]." — the user reported a timeline and did not claim the timeline as
+    the user's own belief.
+    RIGHT: user_fact "User follows [a company]'s factory construction timeline."
+    — the inference the remark clearly supports, with the user as the subject.
     </EXAMPLE>
 
     <EXAMPLE>
@@ -1429,6 +1469,30 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     </INSTRUCTIONS>
     """
     logger.info(f"breakpoint")
+
+    if not fact_names_the_user(user_fact):
+        # Refuse before touching the store. "Not learned:" keeps the refusal
+        # off the "Learned about you" chip (``parse_learned_fact_from_tool_content``).
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{user_fact}" is not about the user. '
+                            "A comment, prediction, or claim about the world, a company, "
+                            "a product, an event, or another person is not itself a fact "
+                            "about the user. When the comment clearly reveals something "
+                            "about the user (an interest, a topic the user follows, "
+                            "knowledge, a concern, or a view the user claimed as the user's "
+                            "own), call again with that inference and the user as the "
+                            'subject ("User follows ..."). Otherwise store nothing and '
+                            "reply to the comment."
+                        ),
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
 
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
         runtime.config

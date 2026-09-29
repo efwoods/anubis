@@ -1352,7 +1352,8 @@ async def test_a_reference_image_upload_does_not_generate_stills(
     monkeypatch,
 ):
     """Portrait upload stores the reference only. Generated stills and loops
-    from the previous face are dropped; new ones wait for an explicit regenerate."""
+    from the previous face are parked, never deleted; new ones wait for an
+    explicit regenerate."""
     from src.subgraphs.process_media_graph.utils.nodes import (
         _generate_emotion_media_after_reference_image,
     )
@@ -1400,14 +1401,17 @@ async def test_a_reference_image_upload_does_not_generate_stills(
     assert calls["edits"] == []
     assert calls["videos"] == []
     assert kinds == set()
+    # The previous face's media is parked, not deleted.
+    assert len(repository.assets) == 2
 
 
 @pytest.mark.asyncio
-async def test_a_lower_tier_upload_drops_stale_loops_and_generates_nothing(
+async def test_a_lower_tier_upload_parks_stale_loops_and_generates_nothing(
     monkeypatch,
 ):
     """A portrait upload must not spend on stills or videos, and must not
-    keep generated media from a previous face."""
+    show generated media from a previous face — the media is parked, not
+    deleted."""
     from src.subgraphs.process_media_graph.utils.nodes import (
         _generate_emotion_media_after_reference_image,
     )
@@ -1442,4 +1446,5 @@ async def test_a_lower_tier_upload_drops_stale_loops_and_generates_nothing(
     assert calls["edits"] == []
     assert calls["videos"] == []
     assert assets == []
+    assert len(repository.assets) == 1
 

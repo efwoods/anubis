@@ -2578,6 +2578,34 @@ class GlobalContext:
 
     langsmith_api_key: str = field(default=None, metadata={"description": "api key"})
 
+    langsmith_tracing: str = field(
+        default=None,
+        metadata={
+            "description": "TRUE when LangSmith records a trace for every graph run."
+        },
+    )
+
+    langsmith_project: str = field(
+        default=None,
+        metadata={
+            "description": "Name of the LangSmith project that receives this process's traces (anubis in production, anubis-local-testing in development)."
+        },
+    )
+
+    langsmith_workspace_id: str = field(
+        default=None,
+        metadata={
+            "description": "LangSmith workspace (tenant) id that owns LANGSMITH_PROJECT; the /o/<workspace id>/ segment of a smith.langchain.com URL. Each reply records the workspace id so the client's trace link opens the workspace the reply was traced to."
+        },
+    )
+
+    langsmith_project_id: str = field(
+        default=None,
+        metadata={
+            "description": "LangSmith project id of LANGSMITH_PROJECT; the /projects/p/<project id> segment of a smith.langchain.com URL. Must name the same project as LANGSMITH_PROJECT."
+        },
+    )
+
     deployment: str = field(
         default=None,
         metadata={

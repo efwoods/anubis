@@ -1919,6 +1919,21 @@ async def _attach_post_reply_analysis(
         if config.get("configurable", {}).get("use_adapter_inference"):
             final_message.response_metadata = dict(final_message.response_metadata or {})
             final_message.response_metadata["is_adapter_inference"] = True
+        from src.anubis.utils.message_record import (
+            LANGSMITH_RUN_ID_CONFIGURABLE_KEY,
+            langsmith_trace_record,
+        )
+
+        # The LangSmith workspace, project, and run of this reply, checkpointed
+        # with the reply so the client's trace link opens the project the reply
+        # was traced to, even after a reload from a different deployment.
+        langsmith_record = langsmith_trace_record(
+            (config.get("configurable") or {}).get(LANGSMITH_RUN_ID_CONFIGURABLE_KEY),
+            runtime.context or GlobalContext(),
+        )
+        if langsmith_record is not None:
+            final_message.response_metadata = dict(final_message.response_metadata or {})
+            final_message.response_metadata["langsmith"] = langsmith_record
     # A reply to an ambient observation (a hidden webcam/screen turn the
     # conversation partner never typed) carries the observation's triage record
     # so the client can render a ``notify`` reply as a notification card — on

@@ -77,28 +77,30 @@ async def _generate_emotion_media_after_reference_image(
     assessment: dict[str, Any] | None = None,
     subscription_tier: str | None = None,
     minimum_tier: str | None = None,
+    previous_reference_image_data_uri: str | None = None,
 ) -> None:
-    """Drop generated stills and idle loops from a previous face.
+    """Park generated media from the previous face; restore the new face's media.
 
     Stills and idle loops wait for an explicit regenerate from settings
     ("Create generative reference videos"). A portrait upload stores the
     reference image only — generating the other six stills without that
     trigger spent at the vendor and left faces voice mode would not use.
 
-    Generated media from the previous portrait belongs to a different face.
-    Drop it even when this upload generates nothing so the old stills and
-    videos cannot keep showing against the new reference.
+    Generated media from the previous portrait belongs to a different face, so
+    the previous portrait's media must stop showing against the new reference.
+    The media is parked under the previous portrait's fingerprint, never
+    deleted: generation was paid for, and choosing the previous portrait again
+    restores the media. Media parked earlier under the new portrait's
+    fingerprint (the owner switching back to an earlier portrait) is restored.
     """
     from src.anubis.utils.media_assets import get_media_asset_repository
-    from src.anubis.utils.media_assets.repository import (
-        ASSET_KIND_IDLE_LOOP,
-        ASSET_KIND_STILL,
+    from src.anubis.utils.media_generation.portrait_candidates import (
+        switch_portrait_media,
     )
 
     del (
         context,
         user_id,
-        reference_image_data_uri,
         subject,
         assessment,
         subscription_tier,
@@ -108,22 +110,17 @@ async def _generate_emotion_media_after_reference_image(
     repository = get_media_asset_repository()
     if repository is None:
         logger.info(
-            "Emotion media cleanup skipped for %s (no repository)",
+            "Emotion media parking skipped for %s (no repository)",
             assistant_id,
         )
         return
 
-    try:
-        await repository.delete_emotion_assets_for_avatar(
-            assistant_id,
-            asset_kinds=(ASSET_KIND_STILL, ASSET_KIND_IDLE_LOOP),
-        )
-    except Exception:  # noqa: BLE001 - stale media must not fail the upload
-        logger.debug(
-            "Could not drop stale emotion media for %s",
-            assistant_id,
-            exc_info=True,
-        )
+    await switch_portrait_media(
+        repository,
+        assistant_id=assistant_id,
+        previous_image_data_uri=previous_reference_image_data_uri,
+        next_image_data_uri=reference_image_data_uri,
+    )
 
 
 def _assistant_is_personal_avatar(config: Any) -> bool:
@@ -1632,34 +1629,73 @@ async def process_media_item_task(
                     moderation_reasons=reference_assessment.get("moderation_reasons"),
                 )
 
+                from src.anubis.utils.media_generation.portrait_candidates import (
+                    store_portrait_candidate,
+                )
+                from src.anubis.utils.media_generation.reference_image import (
+                    read_reference_image,
+                    reference_image_lock,
+                )
+
+                reference_assessment_fields = assessment_store_fields(
+                    reference_assessment
+                )
+                # Keep the uploaded portrait, with the analysis just paid for,
+                # as a portrait candidate: switching away from this portrait
+                # and back again later then costs no model call.
+                try:
+                    await store_portrait_candidate(
+                        store,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        namespace_filename=namespace_filename or "",
+                        filename=filename,
+                        image_data_uri=full_uri,
+                        reference_document_json=doc_json,
+                        assessment_fields=reference_assessment_fields,
+                    )
+                except Exception:  # noqa: BLE001 - the candidate is optional
+                    logger.warning(
+                        "Could not keep %s as a portrait candidate",
+                        filename,
+                        exc_info=True,
+                    )
+
                 # store_reference_image invalidates the process-wide store
                 # cache load_consciousness reads through, so the new portrait
-                # is picked up on the next message.
-                portrait_was_written = await store_reference_image(
-                    store,
-                    user_id=user_id,
-                    assistant_id=assistant_id,
-                    image_data_uri=full_uri,
-                    document_json=doc_json,
-                    assessment_fields=assessment_store_fields(reference_assessment),
-                    source_url=metadata.get("reference_source_url") or None,
-                    replace=not bootstrap_reference,
-                )
+                # is picked up on the next message. The previous portrait is
+                # read under the same lock, so the generated media parked
+                # below is parked under the portrait actually replaced.
+                async with reference_image_lock(user_id, assistant_id):
+                    previous_reference = await read_reference_image(
+                        store, user_id, assistant_id
+                    )
+                    portrait_was_written = await store_reference_image(
+                        store,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        image_data_uri=full_uri,
+                        document_json=doc_json,
+                        assessment_fields=reference_assessment_fields,
+                        source_url=metadata.get("reference_source_url") or None,
+                        replace=not bootstrap_reference,
+                        lock_already_held=True,
+                    )
                 if not portrait_was_written:
-                    # The creator's own portrait is already stored. Leave it,
-                    # and leave the emotion media generated from it alone —
-                    # _generate_emotion_media_after_reference_image deletes
-                    # every still and idle loop of the previous face, so
-                    # calling it here would destroy media the creator paid for.
+                    # The creator's own portrait is already stored. Leave the
+                    # creator's portrait and the emotion media generated from
+                    # the creator's portrait exactly as stored.
                     _emit_media_progress(
                         "reference_image_skipped",
                         reason="This avatar already has a portrait; the researched one was discarded.",
                     )
                 else:
-                    # A new portrait drops stills and idle loops from the
-                    # previous face. New stills and loops wait for Create
-                    # generative reference videos — uploading the reference
-                    # must not spend at the vendor.
+                    # A new portrait parks the stills, idle loops and lip-sync
+                    # clips of the previous face (never deletes them) and
+                    # restores media parked earlier for the new face. New
+                    # stills and loops wait for Create generative reference
+                    # videos — uploading the reference must not spend at the
+                    # vendor.
                     configurable = (config or {}).get("configurable") or {}
                     await _generate_emotion_media_after_reference_image(
                         runtime.context,
@@ -1670,6 +1706,11 @@ async def process_media_item_task(
                         assessment=reference_assessment,
                         subscription_tier=configurable.get("subscription_tier"),
                         minimum_tier=configurable.get("emotion_media_minimum_tier"),
+                        previous_reference_image_data_uri=str(
+                            (previous_reference or {}).get("reference_image_data")
+                            or ""
+                        )
+                        or None,
                     )
                 doc.metadata.update(
                     {
@@ -1680,6 +1721,31 @@ async def process_media_item_task(
                     }
                 )
                 return [doc]
+
+            # Keep the image bytes so the owner can promote this upload to the
+            # portrait later without uploading the image again. No model call:
+            # the portrait analysis runs only if and when the owner chooses
+            # this image.
+            if _is_full_image_data_uri(full_uri) and namespace_filename:
+                from src.anubis.utils.media_generation.portrait_candidates import (
+                    store_portrait_candidate,
+                )
+
+                try:
+                    await store_portrait_candidate(
+                        store,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        namespace_filename=namespace_filename,
+                        filename=filename,
+                        image_data_uri=full_uri,
+                    )
+                except Exception:  # noqa: BLE001 - the candidate is optional
+                    logger.warning(
+                        "Could not keep %s as a portrait candidate",
+                        filename,
+                        exc_info=True,
+                    )
 
             description_text = (doc.page_content or "").strip()
             if not description_text:

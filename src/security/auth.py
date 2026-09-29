@@ -343,8 +343,19 @@ async def _provision_stripe_customer_and_default_tier(
         return None
 
     customer_id = customer["id"]
+    from src.anubis.utils.billing.stripe_mode import (
+        STRIPE_CUSTOMER_IDS_METADATA_KEY,
+        current_stripe_mode,
+    )
+
+    stripe_mode = current_stripe_mode()
     app_metadata_update = {
         "stripe_customer_id": customer_id,
+        **(
+            {STRIPE_CUSTOMER_IDS_METADATA_KEY: {stripe_mode: customer_id}}
+            if stripe_mode
+            else {}
+        ),
         "subscription_status": {
             "status": None,
             "tier": "free",
@@ -1456,17 +1467,27 @@ async def _resolve_authenticated_user(
     The precedence matters only when a client sends both, which no client does; the
     API key is tried first because it is the cheaper lookup.
     """
+    user = None
     if api_key:
-        return await get_user_with_api_key(
+        user = await get_user_with_api_key(
             api_key, request, require_verified_email=require_verified_email
         )
-    if bearer_credentials is not None:
-        return await get_user_with_refresh_token(
+    elif bearer_credentials is not None:
+        user = await get_user_with_refresh_token(
             bearer_credentials.credentials,
             request,
             require_verified_email=require_verified_email,
         )
-    return None
+    if user:
+        # Dev (test key) and prod (live key) share one Auth0 tenant; point the
+        # request's user at the customer that exists in this process's Stripe
+        # mode before any meter event or usage read runs.
+        from src.anubis.utils.billing.stripe_mode import (
+            reconcile_stripe_customer_for_current_mode,
+        )
+
+        await reconcile_stripe_customer_for_current_mode(request, user)
+    return user
 
 
 def bearer_credentials_from_request(
@@ -2627,7 +2648,11 @@ async def update_user_subscription_status(
 
 
 async def update_user_app_metadata_fields(
-    request: Request, auth0_user_id: str, fields: dict
+    request: Request,
+    auth0_user_id: str,
+    fields: dict,
+    *,
+    evict_cached_credentials: bool = True,
 ) -> bool:
     """Patch top-level ``app_metadata`` keys for one Auth0 user and drop stale cache.
 
@@ -2659,7 +2684,13 @@ async def update_user_app_metadata_fields(
         )
         return False
 
-    await _evict_api_key_cache_for_user(auth0_user_id)
+    # A caller that already updated the cached user object in place passes
+    # ``evict_cached_credentials=False``: eviction also drops the session's
+    # ephemeral API key, and the next nested LangGraph call of that session
+    # then fails with 401 (``GET /inbox/count`` answered 500 on prod at
+    # 2026-09-28 15:00:06 UTC for exactly this reason).
+    if evict_cached_credentials:
+        await _evict_api_key_cache_for_user(auth0_user_id)
     return True
 
 

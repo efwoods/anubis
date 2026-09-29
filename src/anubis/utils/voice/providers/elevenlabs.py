@@ -112,12 +112,12 @@ class ElevenLabsVoiceProvider:
 
     def speech_cost_per_1000_characters_usd(self, context: Any) -> float:
         """Return the vendor cost per 1,000 characters of speech."""
-        return float(
-            getattr(
-                context, "elevenlabs_text_to_speech_cost_per_1000_characters_usd", None
-            )
-            or 0.05
-        )
+        # Only an unset price falls back: a configured 0 (a plan whose
+        # included credits cover the speech) is a real price and is kept.
+        configured_price = getattr(context, "elevenlabs_text_to_speech_cost_per_1000_characters_usd", None)
+        if configured_price is None or str(configured_price).strip() == "":
+            return 0.05
+        return float(configured_price)
 
     def instant_clone_max_seconds(self, context: Any) -> float | None:
         """Return the most corpus seconds an instant clone can use, or None for no cap."""

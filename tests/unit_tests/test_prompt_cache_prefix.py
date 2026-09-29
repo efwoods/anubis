@@ -258,7 +258,7 @@ class _RecordingCursor:
     async def __aexit__(self, *exception_details):
         return False
 
-    async def execute(self, statement, parameters=None):
+    async def execute(self, statement, parameters=None, *, prepare=None):
         self.executed.append((statement, parameters))
 
 

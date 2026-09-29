@@ -86,3 +86,63 @@ async def test_the_three_ensure_helpers_use_the_splitter():
     expected = sum(len(split_sql_statements(script)) for script in SCRIPTS.values())
     assert len(pool.calls) == expected
     assert all(prepare is False for _statement, prepare in pool.calls)
+
+
+@pytest.mark.asyncio
+async def test_api_metrics_boot_adds_both_cache_columns_unprepared():
+    """Regression: the two cache-column ``ALTER TABLE`` commands once rode one
+    prepared ``execute``, failed on every boot from 2026-09-22, and every
+    ``api_metrics`` insert then failed on the missing ``cached_prompt_tokens``
+    column."""
+    from src.anubis.utils.billing import metering
+
+    pool = _FakePool()
+    await metering.ensure_api_metrics_table(pool)
+    sent_statements = [statement for statement, _prepare in pool.calls]
+    assert all(prepare is False for _statement, prepare in pool.calls)
+    assert all(";" not in statement for statement in sent_statements)
+    assert any("cached_prompt_tokens" in statement for statement in sent_statements)
+    assert any("cache_write_tokens" in statement for statement in sent_statements)
+
+
+def test_no_module_passes_a_multi_command_constant_straight_to_execute():
+    """Any ``<cursor>.execute(<CONSTANT>)`` whose constant holds more than one
+    command fails under ``prepare_threshold: 0``; such a constant must go
+    through ``execute_ddl_script`` instead."""
+    import ast
+    import pathlib
+
+    offending_calls = []
+    for source_path in pathlib.Path("src").rglob("*.py"):
+        module_tree = ast.parse(source_path.read_text())
+        multi_command_constants = {}
+        for node in ast.walk(module_tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                sql_text = node.value.value
+            elif isinstance(node.value, ast.JoinedStr):
+                sql_text = "".join(
+                    part.value
+                    for part in node.value.values
+                    if isinstance(part, ast.Constant)
+                )
+            else:
+                continue
+            if len(split_sql_statements(sql_text)) > 1:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        multi_command_constants[target.id] = node.lineno
+        for node in ast.walk(module_tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in multi_command_constants
+            ):
+                offending_calls.append(
+                    f"{source_path}:{node.lineno} executes {node.args[0].id}"
+                )
+    assert offending_calls == []

@@ -285,13 +285,22 @@ async def ensure_api_metrics_table(pool: Any) -> None:
     (for example, a read-replica connection) must not prevent the app from
     serving, so it logs and returns rather than raising.
     """
+    # Every script runs through ``execute_ddl_script``: the pool prepares every
+    # ``execute`` (``prepare_threshold: 0``), and Postgres refuses a prepared
+    # statement holding two commands. ``_ADD_API_METRICS_CACHE_COLUMNS_SQL``
+    # holds two ``ALTER TABLE`` commands, so a direct ``cursor.execute`` failed
+    # on every boot from 2026-09-22 and every ``api_metrics`` insert after that
+    # failed on the missing ``cached_prompt_tokens`` column.
+    from src.anubis.utils.postgres_ddl import execute_ddl_script
+
     try:
-        async with pool.connection() as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(_CREATE_API_METRICS_TABLE_SQL)
-                await cursor.execute(_ADD_API_METRICS_MEDIA_JOB_COLUMN_SQL)
-                await cursor.execute(_ADD_API_METRICS_CACHE_COLUMNS_SQL)
-                await cursor.execute(_CREATE_API_METRICS_MEDIA_JOB_INDEX_SQL)
+        for api_metrics_ddl_script in (
+            _CREATE_API_METRICS_TABLE_SQL,
+            _ADD_API_METRICS_MEDIA_JOB_COLUMN_SQL,
+            _ADD_API_METRICS_CACHE_COLUMNS_SQL,
+            _CREATE_API_METRICS_MEDIA_JOB_INDEX_SQL,
+        ):
+            await execute_ddl_script(pool, api_metrics_ddl_script)
     except Exception as table_error:  # noqa: BLE001 - non-fatal at startup
         logger.error("Could not ensure api_metrics table exists: %s", table_error)
 

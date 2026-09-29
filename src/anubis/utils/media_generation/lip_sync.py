@@ -158,8 +158,14 @@ async def start_lip_sync(
     voice_id: str,
     motion_prompt: str | None = None,
     voice_provider_name: str | None = None,
+    on_speech_synthesized: Any = None,
 ) -> dict[str, Any]:
     """Begin (or short-circuit) a lip-sync clip for one reply.
+
+    ``on_speech_synthesized`` is awaited with ``characters``, ``cost_usd``,
+    ``model_name`` and ``provider_name`` the moment the speech exists, before
+    the video request: the speech is paid for even when the video request
+    fails afterwards, so the speech is recorded at the moment of spend.
 
     ``motion_prompt`` is the person's measured motion block for this emotion;
     it becomes the behavioural layer of the generation prompt.
@@ -189,9 +195,24 @@ async def start_lip_sync(
         get_voice_provider,
     )
 
-    speech_bytes = await get_voice_provider(
+    speaking_provider = get_voice_provider(
         context, voice_provider_name or ELEVENLABS_PROVIDER_NAME
-    ).synthesize_speech(context, voice_id=voice_id, text=text)
+    )
+    speech_bytes = await speaking_provider.synthesize_speech(
+        context, voice_id=voice_id, text=text
+    )
+    if on_speech_synthesized is not None:
+        try:
+            await on_speech_synthesized(
+                characters=len(text),
+                cost_usd=speaking_provider.speech_cost_per_1000_characters_usd(context)
+                * len(text)
+                / 1000.0,
+                model_name=speaking_provider.speech_model_name(context),
+                provider_name=voice_provider_name or ELEVENLABS_PROVIDER_NAME,
+            )
+        except Exception:  # noqa: BLE001 - recording spend never blocks the clip
+            logger.warning("Could not record lip-sync speech spend", exc_info=True)
     audio_asset_id = await elevenlabs_client.upload_asset(
         context,
         payload=speech_bytes,

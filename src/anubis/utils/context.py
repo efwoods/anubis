@@ -1680,7 +1680,7 @@ class GlobalContext:
     cartesia_text_to_speech_cost_per_1000_characters_usd: float = field(
         default=0.04,
         metadata={
-            "description": "Vendor cost per 1,000 characters of Cartesia speech, recorded in api_metrics (one credit per character; the Startup plan is $49 for 1.25 M credits). Env CARTESIA_TEXT_TO_SPEECH_COST_PER_1000_CHARACTERS_USD."
+            "description": "Vendor cost per 1,000 characters of Cartesia speech, recorded in api_metrics. Cartesia bills 1 credit per character of Sonic speech (cartesia.ai/pricing, verified 2026-09-28). Set the value for the account's plan: Pro $5 for 100,000 credits = 0.05 (overage $65 per 1,000,000 credits = 0.065); Startup $49 for 1,250,000 credits = 0.0392 (overage $45 per 1,000,000 = 0.045); Scale $299 for 8,000,000 credits = 0.037375 (overage $38 per 1,000,000 = 0.038); Free = 0 (20,000 credits, no overage, no commercial-use license). A configured 0 is kept; only an unset value falls back to the default. Env CARTESIA_TEXT_TO_SPEECH_COST_PER_1000_CHARACTERS_USD."
         },
     )
 
@@ -1933,6 +1933,17 @@ class GlobalContext:
     )
 
     """ </Group conversations (Slack, Discord, Twitch)> """
+
+    """ <Store reliability> """
+
+    store_search_embedding_timeout_seconds: float = field(
+        default=30.0,
+        metadata={
+            "description": "Time limit, in seconds, for embedding the search queries of one LangGraph store batch. The embedding runs before the batch takes a Postgres connection (src/anubis/utils/store_pipeline_guard.py); a batch whose embedding exceeds the limit fails with StoreSearchEmbeddingTimeout instead of holding a pipelined connection open. Env STORE_SEARCH_EMBEDDING_TIMEOUT_SECONDS."
+        },
+    )
+
+    """ </Store reliability> """
 
     """ <Ambient vision (webcam / screen snapshots as hidden conversation context)> """
 
@@ -2566,6 +2577,34 @@ class GlobalContext:
     )
 
     langsmith_api_key: str = field(default=None, metadata={"description": "api key"})
+
+    langsmith_tracing: str = field(
+        default=None,
+        metadata={
+            "description": "TRUE when LangSmith records a trace for every graph run."
+        },
+    )
+
+    langsmith_project: str = field(
+        default=None,
+        metadata={
+            "description": "Name of the LangSmith project that receives this process's traces (anubis in production, anubis-local-testing in development)."
+        },
+    )
+
+    langsmith_workspace_id: str = field(
+        default=None,
+        metadata={
+            "description": "LangSmith workspace (tenant) id that owns LANGSMITH_PROJECT; the /o/<workspace id>/ segment of a smith.langchain.com URL. Each reply records the workspace id so the client's trace link opens the workspace the reply was traced to."
+        },
+    )
+
+    langsmith_project_id: str = field(
+        default=None,
+        metadata={
+            "description": "LangSmith project id of LANGSMITH_PROJECT; the /projects/p/<project id> segment of a smith.langchain.com URL. Must name the same project as LANGSMITH_PROJECT."
+        },
+    )
 
     deployment: str = field(
         default=None,

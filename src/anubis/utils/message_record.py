@@ -25,6 +25,45 @@ def additional_kwargs_with_created_at(
     return stamped
 
 
+# ``configurable`` key under which ``/message`` hands the graph the root run id
+# the request pinned for LangSmith (``config["run_id"]`` names only the root
+# run and is not visible inside a node).
+LANGSMITH_RUN_ID_CONFIGURABLE_KEY = "langsmith_run_id"
+
+
+def langsmith_trace_record(
+    run_id: Any, context: Any | None = None
+) -> dict[str, str] | None:
+    """Where LangSmith keeps the trace of the reply produced by ``run_id``.
+
+    Stored as ``response_metadata["langsmith"]`` so the client's trace link
+    opens the workspace and project the reply was actually traced to. A
+    production reply opened from a development client therefore still links to
+    the production project, and a reload keeps the link because the record is
+    checkpointed with the reply. Returns ``None`` when tracing is off or the
+    workspace id or project id is not configured, so the client shows no link
+    rather than a link to the wrong project.
+    """
+    if context is None:
+        from src.anubis.utils.context import GlobalContext
+
+        context = GlobalContext()
+    tracing_enabled = (
+        str(getattr(context, "langsmith_tracing", None) or "").strip().upper()
+        == "TRUE"
+    )
+    workspace_id = str(getattr(context, "langsmith_workspace_id", None) or "").strip()
+    project_id = str(getattr(context, "langsmith_project_id", None) or "").strip()
+    if not (tracing_enabled and run_id and workspace_id and project_id):
+        return None
+    return {
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "project_name": str(getattr(context, "langsmith_project", None) or "").strip(),
+        "run_id": str(run_id),
+    }
+
+
 def attach_visible_reply_metadata(message: Any, context: Any | None = None) -> None:
     """Write ``created_at`` and, in development, the text model onto a reply.
 

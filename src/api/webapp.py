@@ -160,6 +160,10 @@ from src.anubis.utils.tools.vision.look_tools import (
     SHARE_STOP_EVENT,
 )
 from src.api.look_context import LookContext, LookContextRegistry
+from src.anubis.utils.message_record import (
+    LANGSMITH_RUN_ID_CONFIGURABLE_KEY,
+    langsmith_trace_record,
+)
 from src.api.message_stops import (
     AMBIENT_BUSY_RETRY_AFTER_SECONDS,
     STOP_REQUESTED,
@@ -923,8 +927,18 @@ from langgraph_sdk.schema import Assistant
 from psycopg.rows import class_row
 
 from src.anubis.utils import runtime_handles
+from src.anubis.utils.store_pipeline_guard import (
+    install_store_embedding_before_pipeline,
+)
 
 load_dotenv()
+
+# Store search embeddings must finish before a store batch opens a Postgres
+# pipeline, for the platform store and ``app.state.store`` alike; see
+# src/anubis/utils/store_pipeline_guard.py.
+install_store_embedding_before_pipeline(
+    GlobalContext().store_search_embedding_timeout_seconds
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1379,6 +1393,13 @@ async def _finalize_stopped_turn(
         model_name=getattr(getattr(app_state, "context", None), "model", None),
         stopped_by=stopped_by,
     )
+    # A cut-short reply never reaches the graph's metadata step, so the
+    # reply's LangSmith location is recorded here instead.
+    langsmith_record = langsmith_trace_record(
+        config.get("run_id"), getattr(app_state, "context", None)
+    )
+    if langsmith_record is not None:
+        response_metadata["langsmith"] = langsmith_record
     if discard_observation_id:
         await discard_ambient_observation(graph, config, discard_observation_id)
     await persist_stopped_reply(
@@ -2001,8 +2022,17 @@ async def message_graph_sse(
     # link that opens THIS message's run inside the conversation's thread —
     # without it the client can only link to the thread and the reader has to
     # hunt for the turn.
+    # The run id also rides in ``configurable`` so the graph can checkpoint the
+    # reply's LangSmith location (``langsmith_trace_record``) with the reply.
     langsmith_run_id = str(uuid4())
-    config = {**config, "run_id": langsmith_run_id}
+    config = {
+        **config,
+        "run_id": langsmith_run_id,
+        "configurable": {
+            **(config.get("configurable") or {}),
+            LANGSMITH_RUN_ID_CONFIGURABLE_KEY: langsmith_run_id,
+        },
+    }
 
     pump = GraphStreamPump(
         graph.astream(
@@ -15242,6 +15272,23 @@ async def start_lip_sync_clip(
             status_code=409,
             detail="This avatar has no cloned voice yet; record one in settings.",
         )
+    async def _record_lip_sync_speech_spend(
+        *, characters: int, cost_usd: float, model_name: str, provider_name: str
+    ) -> None:
+        # Recorded in the ledger only: the customer is billed for the clip on
+        # the video-seconds meter when the clip completes, so reporting the
+        # speech-characters meter here would bill the same clip twice.
+        await persist_api_metrics_row(
+            app.state.pool,
+            inference_type="speech_synthesis",
+            total_tokens=characters,
+            cost_usd=cost_usd,
+            latency_ms=0.0,
+            user_id=current_user["identities"][0]["user_id"],
+            assistant_id=assistant_id,
+            model_name=f"{provider_name.lower()}:{model_name}:lip_sync",
+        )
+
     try:
         result = await start_lip_sync(
             app.state.context,
@@ -15253,6 +15300,7 @@ async def start_lip_sync_clip(
             voice_id=clone_voice.voice_id,
             voice_provider_name=clone_voice.provider_name,
             motion_prompt=await _motion_block_for(assistant_id, emotion),
+            on_speech_synthesized=_record_lip_sync_speech_spend,
         )
     except VoiceProviderError as vendor_error:
         raise HTTPException(status_code=502, detail=str(vendor_error))
@@ -15514,6 +15562,304 @@ async def get_avatar_reference_image(
     else:
         value = getattr(item, "value", None) or {}
     return JSONResponse({"reference_image_data": value.get("reference_image_data")})
+
+
+def _stored_document_metadata(document_json: Any) -> dict:
+    """Return ``kwargs.metadata`` of a serialized LangChain Document, or ``{}``."""
+    if not isinstance(document_json, dict):
+        return {}
+    kwargs_blob = document_json.get("kwargs")
+    if not isinstance(kwargs_blob, dict):
+        return {}
+    metadata = kwargs_blob.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+@app.post("/avatar_reference_image/select")
+async def select_avatar_reference_image(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Make an image the owner already uploaded the avatar's portrait.
+
+    Body: ``assistant_id``, ``source_document_name`` (a label from
+    ``/list_avatar_documents`` whose ``portrait_selectable`` is true, or the
+    URL of an image uploaded by URL).
+
+    Cost: the portrait analysis — a first-person description of the image plus
+    the subject and moderation assessment, two vision calls — runs only when
+    the chosen image has never been analysed as a portrait. The analysis is
+    kept with the image, so switching back to an earlier portrait costs no
+    model call. No emotion media is generated.
+
+    Nothing is deleted. The stills, idle loops and lip-sync clips generated
+    from the previous portrait are parked under the previous portrait's
+    fingerprint and restored when the previous portrait is chosen again; media
+    parked earlier for the chosen image is restored now. The previous portrait
+    stays selectable.
+    """
+    from src.anubis.utils.media_assets import get_media_asset_repository
+    from src.anubis.utils.media_generation.portrait_candidates import (
+        candidate_reference_analysis,
+        portrait_key_for_image,
+        read_portrait_candidate,
+        store_portrait_candidate,
+        switch_portrait_media,
+    )
+    from src.anubis.utils.media_generation.reference_image import (
+        read_reference_image,
+        reference_image_lock,
+        store_reference_image,
+    )
+    from src.anubis.utils.media_generation.reference_subject import (
+        assessment_from_store_value,
+        assessment_store_fields,
+        classify_reference_subject,
+    )
+    from src.subgraphs.process_media_graph.utils.utility import (
+        extract_personality_from_image,
+    )
+
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    assistant_id = str(body.get("assistant_id") or "").strip()
+    source_document_name = str(body.get("source_document_name") or "").strip()
+    if not assistant_id or not source_document_name:
+        raise HTTPException(
+            status_code=400,
+            detail="assistant_id and source_document_name are required.",
+        )
+    enforce_tier_capability(current_user, TierCapability.UPLOAD)
+    _assistant, user_id = await resolve_assistant_for_creator(
+        assistant_id,
+        current_user,
+        action_description="change that avatar's portrait",
+    )
+    store = app.state.store
+
+    # Resolve the listed label back to the upload's namespace_filename, the
+    # same round trip /delete_avatar_document performs.
+    try:
+        existing_items = await store.asearch(
+            (user_id, assistant_id), limit=1_000_000
+        )
+        label_to_key = {
+            label: key
+            for label, key, _reference_role, _is_reference_media in _iter_document_labels(
+                existing_items
+            )
+            if key
+        }
+    except Exception:  # noqa: BLE001 - fall back to hashing the label
+        label_to_key = {}
+    namespace_filename = label_to_key.get(source_document_name) or (
+        _namespace_safe_formatted_filename(source_document_name)
+        if "." in source_document_name
+        else source_document_name
+    )
+
+    candidate = await read_portrait_candidate(
+        store,
+        user_id=user_id,
+        assistant_id=assistant_id,
+        namespace_filename=namespace_filename,
+    )
+    if candidate is None and source_document_name.lower().startswith(
+        ("http://", "https://")
+    ):
+        # An image uploaded by URL before uploads were kept as candidates can
+        # be fetched again at no model cost.
+        try:
+            image_bytes, header_content_type = await fetch_remote_url_bytes(
+                source_document_name
+            )
+            image_mime_type, image_bytes = prepare_still_image_upload(
+                header_content_type, image_bytes
+            )
+        except HTTPException:
+            raise
+        except Exception as fetch_error:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"{source_document_name} could not be fetched as an image: {fetch_error}",
+            ) from fetch_error
+        if not str(image_mime_type or "").startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{source_document_name} is not an image.",
+            )
+        await store_portrait_candidate(
+            store,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            namespace_filename=namespace_filename,
+            filename=source_document_name,
+            image_data_uri=make_data_uri(image_mime_type, image_bytes),
+        )
+        candidate = await read_portrait_candidate(
+            store,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            namespace_filename=namespace_filename,
+        )
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"The image of {source_document_name} was not kept: the image was "
+                "uploaded before uploaded images could become the portrait. Upload "
+                "the image again, and the image can then be chosen as the portrait."
+            ),
+        )
+
+    image_data_uri = str(candidate["image_data"])
+    candidate_filename = str(candidate.get("filename") or source_document_name)
+    current_reference = await read_reference_image(store, user_id, assistant_id)
+    if current_reference and portrait_key_for_image(
+        str(current_reference.get("reference_image_data") or "")
+    ) == portrait_key_for_image(image_data_uri):
+        return JSONResponse(
+            {
+                "reference_image_data": image_data_uri,
+                "source_document_name": source_document_name,
+                "changed": False,
+                "analysis_reused": True,
+                "generated_media_parked": 0,
+                "generated_media_restored": 0,
+            }
+        )
+
+    # The portrait analysis runs outside the lock: the vision calls take
+    # seconds, and the lock only has to cover the read-and-replace below.
+    cached_analysis = candidate_reference_analysis(candidate)
+    analysis_reused = cached_analysis is not None
+    if cached_analysis is not None:
+        reference_document_json, reference_assessment_fields = cached_analysis
+    else:
+        reference_document = await extract_personality_from_image(
+            image_data=image_data_uri,
+            filename=candidate_filename,
+            store=store,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            context=app.state.context,
+            reference_image=True,
+        )
+        await _meter_image_description_usage(
+            app.state,
+            current_user,
+            {**reference_document.metadata, "source": candidate_filename},
+            assistant_id=assistant_id,
+            thread_id=None,
+            request_id=None,
+        )
+        reference_document.metadata.update(
+            {
+                "user_id": user_id,
+                "assistant_id": assistant_id,
+                "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                "processing_task_id": str(uuid4()),
+                "reference_image": True,
+                "filename": candidate_filename,
+                "analysis_acceptable": True,
+                "namespace_filename": namespace_filename,
+            }
+        )
+        reference_document_json = reference_document.to_json()
+        reference_assessment_fields = assessment_store_fields(
+            await classify_reference_subject(image_data_uri, app.state.context)
+        )
+        await store_portrait_candidate(
+            store,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            namespace_filename=namespace_filename,
+            filename=candidate_filename,
+            image_data_uri=image_data_uri,
+            reference_document_json=reference_document_json,
+            assessment_fields=reference_assessment_fields,
+        )
+
+    async with reference_image_lock(user_id, assistant_id):
+        previous_reference = await read_reference_image(store, user_id, assistant_id)
+        previous_image_data_uri = str(
+            (previous_reference or {}).get("reference_image_data") or ""
+        )
+        # A portrait stored before uploads were kept as candidates has no
+        # candidate row; keep the outgoing portrait, with the analysis already
+        # paid for, so the owner can switch back to the outgoing portrait.
+        if previous_reference and previous_image_data_uri:
+            previous_metadata = _stored_document_metadata(
+                previous_reference.get("document")
+            )
+            previous_namespace_filename = str(
+                previous_metadata.get("namespace_filename") or ""
+            )
+            if previous_namespace_filename and (
+                await read_portrait_candidate(
+                    store,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                    namespace_filename=previous_namespace_filename,
+                )
+                is None
+            ):
+                previous_assessment = assessment_from_store_value(previous_reference)
+                try:
+                    await store_portrait_candidate(
+                        store,
+                        user_id=user_id,
+                        assistant_id=assistant_id,
+                        namespace_filename=previous_namespace_filename,
+                        filename=str(
+                            previous_metadata.get("filename")
+                            or previous_namespace_filename
+                        ),
+                        image_data_uri=previous_image_data_uri,
+                        reference_document_json=previous_reference.get("document")
+                        if previous_assessment
+                        else None,
+                        assessment_fields=assessment_store_fields(previous_assessment)
+                        if previous_assessment
+                        else None,
+                    )
+                except Exception:  # noqa: BLE001 - keeping the outgoing portrait is best-effort
+                    logger.warning(
+                        "Could not keep the outgoing portrait of %s as a candidate",
+                        assistant_id,
+                        exc_info=True,
+                    )
+        await store_reference_image(
+            store,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            image_data_uri=image_data_uri,
+            document_json=reference_document_json,
+            assessment_fields=reference_assessment_fields,
+            replace=True,
+            lock_already_held=True,
+        )
+
+    media_switch_counts = await switch_portrait_media(
+        get_media_asset_repository(),
+        assistant_id=assistant_id,
+        previous_image_data_uri=previous_image_data_uri or None,
+        next_image_data_uri=image_data_uri,
+    )
+    return JSONResponse(
+        {
+            "reference_image_data": image_data_uri,
+            "source_document_name": source_document_name,
+            "changed": True,
+            "analysis_reused": analysis_reused,
+            "generated_media_parked": media_switch_counts.get("parked", 0),
+            "generated_media_restored": media_switch_counts.get("restored", 0),
+            "reference_subject": reference_assessment_fields.get("reference_subject"),
+            "reference_moderation_risk": reference_assessment_fields.get(
+                "reference_moderation_risk"
+            ),
+        }
+    )
 
 
 from typing import Optional
@@ -17964,6 +18310,55 @@ async def list_avatar_documents(
 
     uploaded_document_labels = sorted(reference_role_by_document_label)
 
+    # Several uploads can carry the reference_image role: every portrait the
+    # owner ever uploaded left an indexed copy flagged as a reference. Only the
+    # upload named by the active portrait row — (user_id, assistant_id,
+    # "reference_image") keyed by assistant_id — is the portrait now; every
+    # other flagged upload is an earlier portrait the owner can switch back to.
+    from src.anubis.utils.media_generation.portrait_candidates import (
+        PORTRAIT_CANDIDATE_KEY,
+        portrait_candidate_filenames,
+    )
+
+    active_portrait_label: str | None = None
+    active_portrait_row_found = False
+    namespace_filename_by_label: dict[str, str] = {}
+    portrait_key_by_namespace_filename: dict[str, str] = {}
+    for label, key, _reference_role, _is_reference_media in _iter_document_labels(
+        all_document_items
+    ):
+        if key and label not in namespace_filename_by_label:
+            namespace_filename_by_label[label] = key
+    for item in all_document_items or []:
+        item_namespace = tuple(getattr(item, "namespace", None) or ())
+        item_key = getattr(item, "key", None)
+        item_value = getattr(item, "value", None) or {}
+        if item_namespace == (user_id, assistant_id, "reference_image") and (
+            item_key == assistant_id
+        ):
+            active_portrait_row_found = True
+            active_portrait_label, _active_key = _document_label_and_key(
+                _stored_document_metadata(item_value.get("document"))
+            )
+        elif (
+            len(item_namespace) >= 4
+            and item_namespace[2] == "portrait_candidate"
+            and item_key == PORTRAIT_CANDIDATE_KEY
+            and isinstance(item_value, dict)
+        ):
+            portrait_key_by_namespace_filename[str(item_namespace[3])] = str(
+                item_value.get("portrait_key") or ""
+            )
+    if active_portrait_label is not None or not active_portrait_row_found:
+        for label, reference_role in reference_role_by_document_label.items():
+            if reference_role == "reference_image" and label != active_portrait_label:
+                reference_role_by_document_label[label] = None
+    selectable_namespace_filenames = portrait_candidate_filenames(all_document_items)
+
+    # Generated media parked under each earlier portrait, so the list can say
+    # the media comes back when that portrait is chosen again.
+    parked_media_count_by_portrait_key: dict[str, int] = {}
+
     # Seconds of the avatar's speech stored per upload, so the client can show
     # which uploads feed the voice model. Best-effort: no repository or a read
     # failure leaves every document at zero.
@@ -17982,6 +18377,23 @@ async def list_avatar_documents(
             logger.debug(
                 "Voice seconds unavailable for %s: %s", assistant_id, voice_error
             )
+        try:
+            parked_media_count_by_portrait_key = (
+                await voice_repository.count_parked_portrait_media(assistant_id)
+            )
+        except Exception as parked_media_error:  # noqa: BLE001
+            logger.debug(
+                "Parked portrait media unavailable for %s: %s",
+                assistant_id,
+                parked_media_error,
+            )
+
+    def parked_media_count_for(label: str) -> int:
+        namespace_filename = namespace_filename_by_label.get(label)
+        portrait_key = portrait_key_by_namespace_filename.get(namespace_filename or "")
+        if not portrait_key:
+            return 0
+        return int(parked_media_count_by_portrait_key.get(portrait_key, 0))
 
     return {
         # Unchanged shape: the plain label list every existing caller reads, and
@@ -18003,6 +18415,12 @@ async def list_avatar_documents(
                 ),
                 "voice_seconds": round(voice_seconds_by_label.get(label, 0.0), 1),
                 "in_voice_corpus": label in voice_seconds_by_label,
+                # True when the upload's image was kept, so
+                # POST /avatar_reference_image/select can make the upload the
+                # portrait without the image being uploaded again.
+                "portrait_selectable": namespace_filename_by_label.get(label)
+                in selectable_namespace_filenames,
+                "parked_generated_media": parked_media_count_for(label),
             }
             for label in uploaded_document_labels
         ],

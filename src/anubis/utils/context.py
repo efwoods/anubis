@@ -2606,6 +2606,13 @@ class GlobalContext:
         },
     )
 
+    langsmith_trace_lookup_project_ids: str = field(
+        default=None,
+        metadata={
+            "description": "Comma-separated LangSmith project ids (in LANGSMITH_WORKSPACE_ID) searched in development when a transcript reply carries no LangSmith trace record, so a production reply opened from development still links to the production trace. Development (DEV=TRUE) and the administrator only."
+        },
+    )
+
     deployment: str = field(
         default=None,
         metadata={

@@ -11488,6 +11488,19 @@ async def get_thread_messages(
     try:
         state = await langgraph_client.threads.get_state(thread_id=thread_id)
         messages = state.get("values", {}).get("messages", []) if state else []
+        # Production and development share one database, so development opens
+        # production replies stored without a LangSmith trace record. Each such
+        # reply is marked with the human turn the reply answers, which
+        # ``/conversations/{thread_id}/langsmith_trace`` resolves on click.
+        # Marked before hidden turns are dropped: a reply to a hidden ambient
+        # turn names that hidden human turn.
+        from src.anubis.utils.langsmith_trace_lookup import (
+            lookup_enabled,
+            mark_replies_for_lookup,
+        )
+
+        if lookup_enabled(getattr(request.app.state, "context", None), user_id):
+            mark_replies_for_lookup(messages)
         if not include_hidden:
             from src.anubis.utils.ambient.observations import is_hidden_message
             from src.anubis.utils.client_harvest_turns import (
@@ -11515,6 +11528,55 @@ async def get_thread_messages(
         # failure raised inside the platform's own state read is invisible here.
         logger.exception("Could not load the messages of thread %s", thread_id)
         raise HTTPException(status_code=500, detail=f"Error loading messages: {exc}")
+
+
+@app.get("/conversations/{thread_id}/langsmith_trace")
+async def find_langsmith_trace_route(
+    request: Request,
+    thread_id: str,
+    human_message_id: str,
+    human_created_at: str | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Find the LangSmith workspace, project, and run of a reply stored without one.
+
+    The administrator's development client calls this route when the LangSmith
+    link under a reply marked ``response_metadata.langsmith_lookup`` is clicked.
+    Only a development process answers, and only for the administrator; every
+    other caller receives 404, as does a turn with no matching root run.
+    Response: ``{"langsmith": {workspace_id, project_id, project_name, run_id}}``.
+    """
+    from src.anubis.utils.langsmith_trace_lookup import (
+        find_langsmith_record_for_human_turn,
+        lookup_enabled,
+    )
+
+    application_context = getattr(request.app.state, "context", None)
+    user_id = current_user["identities"][0]["user_id"]
+    if not lookup_enabled(application_context, user_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        langsmith_record = await find_langsmith_record_for_human_turn(
+            thread_id=thread_id,
+            human_message_id=human_message_id,
+            human_created_at=human_created_at,
+            context=application_context,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported to the administrator
+        logger.warning(
+            "Could not look up the LangSmith run of turn %s on thread %s",
+            human_message_id,
+            thread_id,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=502, detail=f"LangSmith lookup failed: {exc}"
+        )
+    if langsmith_record is None:
+        raise HTTPException(
+            status_code=404, detail="No LangSmith run was found for that turn."
+        )
+    return JSONResponse({"langsmith": langsmith_record})
 
 
 @app.post("/conversations/{thread_id}/title")

@@ -108,13 +108,14 @@ def test_the_search_window_brackets_the_human_turn():
     )
 
 
-def test_lookup_runs_only_for_the_administrator_in_development():
+def test_lookup_runs_for_every_signed_in_account_in_development_only():
     assert lookup_project_ids(_development_context()) == [
         LOCAL_TESTING_PROJECT_ID,
         PRODUCTION_PROJECT_ID,
     ]
     assert lookup_enabled(_development_context(), ADMINISTRATOR_USER_ID) is True
-    assert lookup_enabled(_development_context(), "someone-else") is False
+    assert lookup_enabled(_development_context(), "someone-else") is True
+    assert lookup_enabled(_development_context(), "") is False
     assert lookup_enabled(_development_context(dev="FALSE"), ADMINISTRATOR_USER_ID) is False
     assert (
         lookup_enabled(

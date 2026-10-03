@@ -269,5 +269,53 @@ def test_look_now_is_offered_to_a_minecraft_body_only_for_sight_questions():
 
     for command in ("gather wood", "dig", "look at me", "wait here", "stop following"):
         assert not minecraft_turn_asks_to_see([HumanMessage(content=command)])
-    for question in ("what do you see?", "What’s around us", "look around"):
+    for question in (
+        "what do you see?",
+        "What’s around us",
+        "look around",
+        # The person's own player: the body turns to the player character,
+        # then looks (LangSmith run 5056dbf7, 2026-10-02).
+        "What do I look like?",
+        "how do I look",
+        "what am I wearing",
+        "can you see me",
+    ):
         assert minecraft_turn_asks_to_see([HumanMessage(content=question)])
+
+
+def test_the_body_block_says_how_the_person_looks_is_the_player_character():
+    block = build_minecraft_body_block(
+        world_snapshot="position: 0, 64, 0", tool_is_attached=True
+    )
+    assert "player character" in block
+    assert "Never answer that question from your own appearance" in block
+    assert "minecraft_view.jpg" in block
+    assert "call neither look_now nor act_in_minecraft to look again" in block
+    assert "Describe the player character the picture shows" in block
+
+
+def test_a_message_carrying_the_body_view_is_not_offered_a_second_look():
+    """The companion attaches the view to a sight question; a look would repeat the picture."""
+    from src.anubis.utils.tools.vision.look_tools import minecraft_turn_asks_to_see
+
+    message_with_view = HumanMessage(
+        content=(
+            "What do I look like?\n\n---\nImage descriptions:\n"
+            "[minecraft_view.jpg]\nA blocky figure with a tan head and a blue torso."
+        )
+    )
+    assert not minecraft_turn_asks_to_see([message_with_view])
+    assert minecraft_turn_asks_to_see([HumanMessage(content="What do I look like?")])
+
+
+def test_the_system_prompt_never_gives_the_user_the_avatar_appearance():
+    """An appearance question is answered from a look in a game, otherwise from user facts.
+
+    LangSmith run 58c18df7-dc60-46a3-a2c8-d5c7d4347667 (2026-10-02) answered
+    "What do I look like?" with the avatar's own reference-image description.
+    """
+    from src.anubis.utils.prompts.system_prompts import IDENTITY_SYSTEM_PROMPT_TEMPLATE
+
+    assert "How to answer what the user looks like" in IDENTITY_SYSTEM_PROMPT_TEMPLATE
+    assert "never the user's appearance" in IDENTITY_SYSTEM_PROMPT_TEMPLATE
+    assert "ask the user to describe the user's appearance" in IDENTITY_SYSTEM_PROMPT_TEMPLATE

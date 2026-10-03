@@ -1189,7 +1189,37 @@ async def _meter_image_description_usage(
     """Record one image-description call from the graph (``api_metrics`` + Stripe).
 
     Emitted by ``resolve_human_message_images`` as an ``image_description_usage``
-    stream event. Best-effort like every other metering write; the admin
+    stream event. See ``_meter_graph_model_call_usage``.
+    """
+    await _meter_graph_model_call_usage(
+        app_state,
+        current_user,
+        payload,
+        inference_type="image_description",
+        assistant_id=assistant_id,
+        thread_id=thread_id,
+        request_id=request_id,
+    )
+
+
+async def _meter_graph_model_call_usage(
+    app_state,
+    current_user: dict,
+    payload: dict,
+    *,
+    inference_type: str,
+    assistant_id: Optional[str],
+    thread_id: Optional[str],
+    request_id: Optional[str],
+) -> None:
+    """Record one model call a graph node reported on a stream event.
+
+    Writes one ``api_metrics`` row with ``inference_type`` and reports the
+    call's tokens to the Stripe messaging meter, the same meter the turn's reply
+    is billed on, so a turn's vision and ambient triage calls count toward the
+    message metrics. Used for ``image_description_usage`` (from
+    ``resolve_human_message_images``) and ``ambient_triage_usage`` (from
+    ``ambient_triage``). Best-effort like every other metering write; the admin
     testing account and the dev enforcement-only bypass skip the writes the
     same way the messaging meter does.
     """
@@ -1208,14 +1238,14 @@ async def _meter_image_description_usage(
                 stripe_customer_id,
                 total_tokens,
                 idempotency_identifier=(
-                    f"{request_id}:image_description:{payload.get('source') or ''}"
+                    f"{request_id}:{inference_type}:{payload.get('source') or ''}"
                     if request_id
                     else None
                 ),
             )
         await persist_api_metrics_row(
             getattr(app_state, "pool", None),
-            inference_type="image_description",
+            inference_type=inference_type,
             prompt_tokens=int(payload.get("input_tokens") or 0),
             completion_tokens=int(payload.get("output_tokens") or 0),
             total_tokens=total_tokens,
@@ -1227,9 +1257,11 @@ async def _meter_image_description_usage(
             thread_id=thread_id,
             model_name=payload.get("model_name"),
             meter_event_name=UsageMeter.MESSAGING_TOKENS.value,
+            cached_prompt_tokens=int(payload.get("cached_prompt_tokens") or 0),
+            cache_write_tokens=int(payload.get("cache_write_tokens") or 0),
         )
     except Exception:  # noqa: BLE001 - metering never fails the stream
-        logger.debug("Could not meter an image description", exc_info=True)
+        logger.debug("Could not meter a %s model call", inference_type, exc_info=True)
 
 
 async def _meter_stopped_turn(
@@ -2182,6 +2214,20 @@ async def message_graph_sse(
                             app_state,
                             current_user,
                             payload,
+                            assistant_id=assistant_id,
+                            thread_id=thread_id,
+                            request_id=request_id,
+                        )
+                elif payload.get("type") == "ambient_triage_usage":
+                    # The ambient triage classifier decided what to do with an
+                    # observation. Metered beside the turn's reply on the
+                    # messaging meter; never surfaced as a frame.
+                    if app_state is not None and current_user is not None:
+                        await _meter_graph_model_call_usage(
+                            app_state,
+                            current_user,
+                            payload,
+                            inference_type="ambient_triage",
                             assistant_id=assistant_id,
                             thread_id=thread_id,
                             request_id=request_id,
@@ -11540,10 +11586,10 @@ async def find_langsmith_trace_route(
 ):
     """Find the LangSmith workspace, project, and run of a reply stored without one.
 
-    The administrator's development client calls this route when the LangSmith
-    link under a reply marked ``response_metadata.langsmith_lookup`` is clicked.
-    Only a development process answers, and only for the administrator; every
-    other caller receives 404, as does a turn with no matching root run.
+    The development client calls this route when the LangSmith link under a
+    reply marked ``response_metadata.langsmith_lookup`` is clicked. Only a
+    development process answers, for any signed-in account; a production
+    process answers 404, as does a turn with no matching root run.
     Response: ``{"langsmith": {workspace_id, project_id, project_name, run_id}}``.
     """
     from src.anubis.utils.langsmith_trace_lookup import (
@@ -11562,7 +11608,7 @@ async def find_langsmith_trace_route(
             human_created_at=human_created_at,
             context=application_context,
         )
-    except Exception as exc:  # noqa: BLE001 - reported to the administrator
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
         logger.warning(
             "Could not look up the LangSmith run of turn %s on thread %s",
             human_message_id,
@@ -14771,8 +14817,13 @@ async def speak_text(
     client can prompt the owner to record or pick a voice. A clone the vendor
     has banned, with no other voice to stand in, answers 409
     ``voice_blocked`` — a distinct condition from having no clone, and one no
-    amount of further recording fixes. ``X-Voice-Kind`` names which voice
-    spoke and ``X-Voice-Provider`` which provider synthesized the voice: the
+    amount of further recording fixes. The optional body field ``voice`` set
+    to ``"trained"`` lets the avatar's owner hear the trained (cloned) voice
+    whatever the voice choice is, so the Voice panel can play a sample of the
+    trained voice while the standard voice speaks the replies; with no usable
+    trained voice that request answers 409 ``voice_not_ready``. ``X-Voice-Kind``
+    names which voice spoke and ``X-Voice-Provider`` which provider synthesized
+    the voice: the
     active provider (``VOICE_PROVIDER``) for a voice minted there, or the
     provider that minted an older voice still standing in. Characters spoken
     are recorded in ``api_metrics`` and, when the meter exists, reported to
@@ -14780,8 +14831,10 @@ async def speak_text(
     """
     from src.anubis.utils.voice.corpus import (
         BLOCKED_VOICE_MESSAGE,
+        NO_SPEAKING_VOICE,
         mark_voice_blocked,
         speaking_voice_of,
+        usable_clone_of,
         voice_record_blocked,
         voice_record_blocked_reason,
         voice_status_for,
@@ -14798,6 +14851,7 @@ async def speak_text(
     )
     from src.anubis.utils.voice.standard_voices import (
         VOICE_CHOICE_STANDARD,
+        carry_standard_voice_to_active_provider,
         voice_choice_of,
     )
     from src.anubis.utils.voice.voice_slots import voice_slot
@@ -14813,7 +14867,17 @@ async def speak_text(
         )
     if len(text) > 5000:
         text = text[:5000]
+    requested_voice = str(body.get("voice") or "").strip().lower()
+    if requested_voice not in ("", "trained"):
+        raise HTTPException(
+            status_code=400, detail='voice must be "trained" or left out.'
+        )
     enforce_tier_capability(current_user, TierCapability.AUDIO_RESPONSES)
+    if requested_voice == "trained":
+        # Only the owner may pass over the owner's own voice choice.
+        await _owned_assistant_for_voice(
+            assistant_id, current_user, "play the trained voice of that avatar"
+        )
 
     user_id = current_user["identities"][0]["user_id"]
     context = app.state.context
@@ -14829,16 +14893,23 @@ async def speak_text(
         )
 
     stored_voice = await repository.get_voice(assistant_id) or {}
-    speaking_voice = speaking_voice_of(stored_voice, context)
+    stored_voice = await carry_standard_voice_to_active_provider(
+        repository, stored_voice, context
+    )
+    speaking_voice = (
+        usable_clone_of(stored_voice, context) or NO_SPEAKING_VOICE
+        if requested_voice == "trained"
+        else speaking_voice_of(stored_voice, context)
+    )
     active_slot = voice_slot(dict(stored_voice), active_voice_provider_name(context))
     # A clone already known to be banned is never sent to the vendor: the answer
     # cannot change, and the call would be billed for a 403. ``speaking_voice_of``
     # already passes over a banned clone to any voice that can stand in; the ban
     # is still noted on the avatar unless the owner chose the stock voice, which
     # leaves the clone (and any ban on the clone) out of the answer.
-    if (
-        voice_record_blocked(active_slot)
-        and voice_choice_of(stored_voice, context) != VOICE_CHOICE_STANDARD
+    if voice_record_blocked(active_slot) and (
+        requested_voice == "trained"
+        or voice_choice_of(stored_voice, context) != VOICE_CHOICE_STANDARD
     ):
         reason = voice_record_blocked_reason(active_slot)
         await note_blocked_voice_on_avatar(assistant_id, current_user, reason)
@@ -14857,9 +14928,11 @@ async def speak_text(
             content={
                 "error": "voice_not_ready",
                 "detail": (
-                    "This avatar has no voice yet. Record about two minutes of "
-                    "the avatar speaking in settings to clone one, or choose a "
-                    "standard voice there."
+                    "This avatar has no trained voice yet."
+                    if requested_voice == "trained"
+                    else "This avatar has no voice yet. Record about two minutes "
+                    "of the avatar speaking in settings to clone one, or choose "
+                    "a standard voice there."
                 ),
                 "collected_seconds": status.collected_seconds,
                 "instant_minimum_seconds": status.instant_minimum_seconds,

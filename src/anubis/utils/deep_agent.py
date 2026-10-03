@@ -38,6 +38,10 @@ from src.anubis.utils.middleware.consciousness_refresh_gate import (
     ConsciousnessRefreshGate,
 )
 from src.anubis.utils.middleware.identity_media_once import IdentityMediaOnceMiddleware
+from src.anubis.utils.middleware.step_budget_guard import (
+    StepBudgetGuard,
+    deep_agent_graph_recursion_limit,
+)
 from src.anubis.utils.middleware.avatar_summarization import (
     build_avatar_summarization_middleware,
 )
@@ -234,6 +238,10 @@ def build_avatar_deep_agent(
             dynamic_prompt,
             summarization,
             IdentityMediaOnceMiddleware(),
+            # Innermost model wrapper: learning rounds do not spend
+            # DEEP_AGENT_RECURSION_LIMIT, and tools are removed once a budget
+            # is spent, so every fact is learned and the turn ends in a reply.
+            StepBudgetGuard(work_superstep_budget=context.deep_agent_recursion_limit),
         ],
         state_schema=AvatarDeepAgentState,
         checkpointer=checkpointer,
@@ -241,7 +249,7 @@ def build_avatar_deep_agent(
         backend=backend,
     ).with_config(
         {
-            "recursion_limit": context.deep_agent_recursion_limit,
+            "recursion_limit": deep_agent_graph_recursion_limit(context),
         }
     )
 

@@ -101,6 +101,10 @@ class VoiceProvider(Protocol):
         """Most seconds of the corpus an instant clone can use, or ``None`` for no provider cap."""
         ...
 
+    def default_stock_voice_id(self, context: Any, *, gender: str) -> str | None:
+        """Return the configured standard stock voice of one gender, or ``None`` when none is configured."""
+        ...
+
 
 def normalize_voice_provider_name(value: Any) -> str | None:
     """``"elevenlabs"`` / ``"cartesia"`` for a known provider name, any case; else ``None``."""
@@ -171,4 +175,3 @@ def speaking_provider_order(context: Any = None) -> list[str]:
         for provider_name in other_voice_provider_names(context)
         if voice_provider_configured(context, provider_name)
     ]
-

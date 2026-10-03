@@ -29,6 +29,32 @@ ACT_IN_MINECRAFT_TOOL_NAME = "act_in_minecraft"
 #: pauses the run and nothing is answered.
 MINECRAFT_ACT_EVENT = "minecraft_act"
 
+# The body's first-person view picture the companion attaches to a typed sight
+# question (MINECRAFT_VIEW_FILE_NAME in the companion's bot/lookIntent.js). The
+# picture rides the first request, so the question is answered in one model
+# call instead of a look_now pause, a vision call and a second model call.
+MINECRAFT_VIEW_FILE_NAME = "minecraft_view.jpg"
+
+# How the body's view picture is described. The companion draws the view
+# itself: flat block colours, with player characters drawn as head, torso,
+# arms and legs in the player's skin and armor colours. Short, because the
+# description is on the reply path.
+DESCRIBE_MINECRAFT_VIEW_PROMPT = (
+    "The image is the first-person view of a player body in Minecraft Java "
+    "Edition, drawn in flat colours at low resolution: each block is one flat "
+    "colour, and a player character is drawn as a blocky figure with a head, "
+    "a torso, two arms and two legs. Describe the image in at most 50 words. "
+    "When a player character is in view, describe the player character first: "
+    "the colour of the head, the torso, the arms, and the legs, and where the "
+    "figure stands. Then name the main blocks in view. Left and right are as "
+    "the viewer sees the image. Write only the description."
+)
+
+
+def human_message_carries_minecraft_view(message_text: str) -> bool:
+    """Whether a resolved human message already holds the body's view picture."""
+    return f"[{MINECRAFT_VIEW_FILE_NAME}]" in str(message_text or "")
+
 MINECRAFT_PLAY_COMMAND_NAMES: tuple[str, ...] = (
     "goToPlayer",
     "goto",
@@ -249,8 +275,26 @@ def build_minecraft_body_block(
             "position, and inventory lines of MINECRAFT_WORLD; never guess "
             "them.\n"
             "look_now is attached only when the person asks what the body "
-            "sees; when attached, look_now for the screen source returns the "
-            "body's first-person view at that instant."
+            "sees or how something in the world looks; when attached, "
+            "look_now for the screen source returns the body's first-person "
+            "view at that instant, with blocks and nearby player characters.\n"
+            # Latency first: the companion turns the body to the person and
+            # attaches the view picture to the first request, so the question
+            # is answered from that picture in one model call (2026-10-02:
+            # turn, look and answer as three model calls cost 5,811 ms).
+            "When the person's message carries the body's view picture "
+            f"({MINECRAFT_VIEW_FILE_NAME} under Image descriptions), the body "
+            "has already looked: answer from that picture description alone, "
+            "and call neither look_now nor act_in_minecraft to look again.\n"
+            "In the game, a question about how the person looks ('what do I "
+            "look like', 'how do I look', 'what am I wearing') is about the "
+            "person's player character. Describe the player character the "
+            "picture shows, in one or two short sentences, and nothing else. "
+            "When the picture does not show a player character, say in one "
+            "sentence that the player character is not in view. Without a "
+            "picture, call look_now for the screen source and describe what "
+            "the look shows. Never answer that question from your own "
+            "appearance or from any description of a real person."
         )
     else:
         guidance = (

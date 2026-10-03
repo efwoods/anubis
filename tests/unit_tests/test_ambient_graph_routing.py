@@ -69,6 +69,9 @@ def workflow(monkeypatch):
 
     async def fake_classify(context, **kwargs):
         decisions["calls"].append(kwargs)
+        usage_reading = decisions.get("usage_reading")
+        if usage_reading is not None and kwargs.get("usage_readings") is not None:
+            kwargs["usage_readings"].append(dict(usage_reading))
         return AmbientTriageClassification(
             decision=decisions["next"],
             needs_owner_action=decisions["next"] == "notify",
@@ -379,3 +382,147 @@ async def test_the_classifier_is_told_which_way_the_camera_points(workflow):
         "facing-thread",
     )
     assert decisions["calls"][0]["camera_facing"] == "world"
+
+
+@pytest.mark.asyncio
+async def test_the_triage_call_usage_is_emitted_for_metering(workflow):
+    from src.anubis.utils.billing.metering import price_model_token_usage
+
+    app, decisions, _avatar_runs = workflow
+    decisions["next"] = "ignore"
+    decisions["usage_reading"] = {
+        "model_name": "gpt-5.6-luna",
+        "prompt_tokens": 3000,
+        "completion_tokens": 200,
+        "cached_prompt_tokens": 1000,
+        "cache_write_tokens": 0,
+        "latency_ms": 812.5,
+    }
+    _messages, custom = await _run(app, _ambient_turn(), "triage-usage-thread")
+
+    triage_usage_events = [
+        payload for payload in custom if payload["type"] == "ambient_triage_usage"
+    ]
+    assert len(triage_usage_events) == 1
+    triage_usage_event = triage_usage_events[0]
+    assert triage_usage_event["input_tokens"] == 3000
+    assert triage_usage_event["output_tokens"] == 200
+    assert triage_usage_event["total_tokens"] == 3200
+    assert triage_usage_event["cached_prompt_tokens"] == 1000
+    assert triage_usage_event["latency_ms"] == 812.5
+    assert triage_usage_event["model_name"] == "gpt-5.6-luna"
+    assert triage_usage_event["total_cost"] == price_model_token_usage(
+        "gpt-5.6-luna",
+        GlobalContext(),
+        prompt_tokens=3000,
+        completion_tokens=200,
+        cached_prompt_tokens=1000,
+    )
+    assert custom[-1]["type"] == "ambient_decision"
+
+
+TRIAGE_USAGE_READING = {
+    "model_name": "gpt-5.6-luna",
+    "prompt_tokens": 3000,
+    "completion_tokens": 200,
+    "cached_prompt_tokens": 1000,
+    "cache_write_tokens": 0,
+    "latency_ms": 812.5,
+}
+
+
+@pytest.mark.asyncio
+async def test_an_ignored_observation_leaves_its_costs_pending(workflow):
+    app, decisions, avatar_runs = workflow
+    decisions["next"] = "ignore"
+    decisions["usage_reading"] = TRIAGE_USAGE_READING
+    await _run(app, _ambient_turn(), "pending-cost-thread")
+
+    assert avatar_runs == []
+    state = await app.aget_state({"configurable": {"thread_id": "pending-cost-thread"}})
+    pending_items = state.values["pending_turn_cost_items"]
+    assert [item["inference_type"] for item in pending_items] == [
+        "image_description",
+        "image_description",
+        "ambient_triage",
+    ]
+    assert [item["source"] for item in pending_items] == [
+        "webcam",
+        "screen",
+        "ambient_triage",
+    ]
+    assert {item["observation_id"] for item in pending_items} == {"obs-1"}
+
+
+@pytest.mark.asyncio
+async def test_the_next_reply_absorbs_the_pending_costs_and_empties_the_list(
+    workflow, monkeypatch
+):
+    """The reply subgraph returns the emptied list through ``AnubisOutputState``."""
+    from src.anubis.utils.billing.turn_cost import attach_turn_cost_breakdown
+    from src.anubis.utils.state import AnubisOutputState
+
+    _app, decisions, _avatar_runs = workflow
+    decisions["usage_reading"] = TRIAGE_USAGE_READING
+
+    async def reply_node(state):
+        reply = AIMessage(
+            content="avatar reply",
+            response_metadata={
+                "token_usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 50,
+                    "total_tokens": 1050,
+                },
+                "total_cost": 0.004,
+            },
+        )
+        attach_turn_cost_breakdown(reply, state.get("pending_turn_cost_items"))
+        return {"messages": [reply], "pending_turn_cost_items": []}
+
+    reply_builder = StateGraph(
+        state_schema=GlobalState,
+        input_schema=GlobalState,
+        output_schema=AnubisOutputState,
+        context_schema=GlobalContext,
+    )
+    reply_builder.add_node("think", reply_node)
+    reply_builder.add_edge(START, "think")
+    reply_builder.add_edge("think", END)
+
+    builder = StateGraph(GlobalState, context_schema=GlobalContext)
+    builder.add_node(
+        "resolve_human_message_images", nodes_module.resolve_human_message_images
+    )
+    builder.add_node(AMBIENT_TRIAGE_NODE, ambient_triage)
+    builder.add_node("anubis", reply_builder.compile())
+    builder.add_edge(START, "resolve_human_message_images")
+    builder.add_conditional_edges(
+        "resolve_human_message_images",
+        route_after_image_resolution,
+        {AMBIENT_TRIAGE_NODE: AMBIENT_TRIAGE_NODE, "anubis": "anubis"},
+    )
+    builder.add_conditional_edges(
+        AMBIENT_TRIAGE_NODE, route_after_ambient_triage, {END: END, "anubis": "anubis"}
+    )
+    builder.add_edge("anubis", END)
+    app = builder.compile(checkpointer=MemorySaver())
+
+    decisions["next"] = "ignore"
+    await _run(app, _ambient_turn("first"), "carry-thread")
+    decisions["next"] = "respond"
+    messages, _custom = await _run(app, _ambient_turn("second"), "carry-thread")
+
+    reply = messages[-1]
+    assert isinstance(reply, AIMessage)
+    turn_cost = reply.response_metadata["turn_cost"]
+    # Two observations, each with two described pictures and one triage call.
+    assert turn_cost["image_descriptions"]["count"] == 4
+    assert turn_cost["ambient_triage"]["count"] == 2
+    assert turn_cost["image_descriptions"]["cost_usd"] == pytest.approx(4 * 0.0001)
+    assert turn_cost["total_cost_usd"] == pytest.approx(
+        0.004 + 4 * 0.0001 + turn_cost["ambient_triage"]["cost_usd"]
+    )
+    assert reply.response_metadata["total_cost"] == 0.004
+    state = await app.aget_state({"configurable": {"thread_id": "carry-thread"}})
+    assert state.values["pending_turn_cost_items"] == []

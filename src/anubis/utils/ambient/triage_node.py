@@ -168,6 +168,76 @@ def _writer():
         return lambda _payload: None
 
 
+#: The stream event carrying one triage classifier call's token usage. The
+#: message endpoint meters the event into ``api_metrics`` and the Stripe
+#: messaging meter beside the turn's reply, and never forwards the event to the
+#: browser.
+AMBIENT_TRIAGE_USAGE_EVENT = "ambient_triage_usage"
+
+
+def _emit_triage_usage(
+    usage_readings: list[dict[str, Any]],
+    context: GlobalContext,
+    observation_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Emit one ``ambient_triage_usage`` stream event per classifier call reading.
+
+    :returns: One pending cost item per reading, for the
+        ``pending_turn_cost_items`` channel the next avatar reply absorbs.
+    """
+    from src.anubis.utils.billing.metering import price_model_token_usage
+    from src.anubis.utils.billing.turn_cost import (
+        INFERENCE_TYPE_AMBIENT_TRIAGE,
+        pending_turn_cost_item,
+    )
+
+    writer = _writer()
+    triage_cost_items: list[dict[str, Any]] = []
+    for reading in usage_readings:
+        prompt_tokens = int(reading.get("prompt_tokens") or 0)
+        completion_tokens = int(reading.get("completion_tokens") or 0)
+        cached_prompt_tokens = int(reading.get("cached_prompt_tokens") or 0)
+        cache_write_tokens = int(reading.get("cache_write_tokens") or 0)
+        cost_usd = price_model_token_usage(
+            reading.get("model_name"),
+            context,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+        latency_ms = float(reading.get("latency_ms") or 0.0)
+        writer(
+            {
+                "type": AMBIENT_TRIAGE_USAGE_EVENT,
+                "source": AMBIENT_TRIAGE_NODE,
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "cached_prompt_tokens": cached_prompt_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "total_cost": cost_usd,
+                "latency_ms": latency_ms,
+                "model_name": reading.get("model_name"),
+            }
+        )
+        triage_cost_items.append(
+            pending_turn_cost_item(
+                INFERENCE_TYPE_AMBIENT_TRIAGE,
+                model_name=reading.get("model_name"),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_prompt_tokens=cached_prompt_tokens,
+                cache_write_tokens=cache_write_tokens,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                observation_id=observation_id,
+                source=AMBIENT_TRIAGE_NODE,
+            )
+        )
+    return triage_cost_items
+
+
 def _gate_by_salience_and_cooldown(
     *,
     decision: str,
@@ -309,6 +379,7 @@ async def ambient_triage(
         messages[:-1], RECENT_VISIBLE_TURNS_FOR_TRIAGE
     )
 
+    triage_usage_readings: list[dict[str, Any]] = []
     try:
         classification = await classify_observation(
             context,
@@ -320,6 +391,7 @@ async def ambient_triage(
             voice_mode=bool(ambient.get("voice_mode")),
             sources=[str(source) for source in (ambient.get("sources") or [])],
             camera_facing=ambient.get("camera_facing"),
+            usage_readings=triage_usage_readings,
         )
         decision_fields = {
             "decision": classification.decision,
@@ -345,6 +417,11 @@ async def ambient_triage(
             "proposed_action": "none",
             "action_description": "",
         }
+    # A classifier call that returned an unparseable answer was still billed by
+    # the vendor, so the usage is emitted whether or not classification succeeded.
+    triage_cost_items = _emit_triage_usage(
+        triage_usage_readings, context, observation_id=ambient.get("observation_id")
+    )
 
     thread_id = (config.get("configurable") or {}).get("thread_id")
     classified_salience = decision_fields["salience"]
@@ -395,7 +472,13 @@ async def ambient_triage(
         additional_kwargs,
         message_id=last.id,
     )
-    return {
+    triage_update: dict[str, Any] = {
         "messages": [RemoveMessage(id=last.id), rewritten],
         "route_decision": updated_ambient["decision"],
     }
+    if triage_cost_items:
+        triage_update["pending_turn_cost_items"] = [
+            *(state.get("pending_turn_cost_items") or []),
+            *triage_cost_items,
+        ]
+    return triage_update

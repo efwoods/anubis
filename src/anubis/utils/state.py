@@ -337,3 +337,22 @@ class GlobalState(TypedDict):
     inference_model_total_cost: float = 0.0
     inference_model_latency_list_ms: Annotated[Sequence[float], operator.add]
     inference_model_average_latency_ms: float = 0.0
+
+    # One entry per image-description or ambient-triage model call made since
+    # the avatar's last reply (``pending_turn_cost_item`` shape in
+    # ``src/anubis/utils/billing/turn_cost.py``). An observation judged
+    # ``ignore`` produces no reply, so the observation's entries wait here and
+    # are folded into the next reply's ``response_metadata["turn_cost"]``,
+    # which then empties the list.
+    pending_turn_cost_items: List[Dict[str, Any]]
+
+
+class AnubisOutputState(TypedDict):
+    """What the inner ``anubis`` graph hands back to the outer message workflow.
+
+    ``messages`` carries the reply; ``pending_turn_cost_items`` carries the
+    emptied pending-cost list after the reply has absorbed the pending costs.
+    """
+
+    messages: Annotated[list[AnyMessage], add_messages]
+    pending_turn_cost_items: List[Dict[str, Any]]

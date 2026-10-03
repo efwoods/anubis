@@ -1,9 +1,47 @@
+import re
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.anubis.utils.prompts.system_prompts import IDENTITY_SYSTEM_PROMPT_TEMPLATE
+
+# A portrait analysis sometimes comes back as a refusal followed by a
+# third-person description ("I can't describe this person in the first-person
+# voice as if I were them, but here is a neutral description of their
+# appearance: He appears to be a young man ..."). Rendered bare, the avatar read
+# that description as somebody else's appearance: asked "What do I look like?"
+# the avatar described the user with the avatar's own portrait, and asked
+# "What do you look like?" the avatar answered that no description of the
+# avatar's appearance was available (avatar 47cfdaa2, thread 5ef656fc,
+# 2026-10-02). The refusal preamble is dropped up to the colon that introduces
+# the description, and the portrait text is labelled as the avatar's own
+# appearance whatever grammatical person the portrait text uses.
+_PORTRAIT_REFUSAL_PREAMBLE = re.compile(
+    r"^\s*(?:sorry,?\s*)?(?:i\s+can(?:'|’)?t|i\s+cannot|i\s+am\s+unable|i(?:'|’)m\s+unable|i(?:'|’)m\s+sorry)"
+    r"[^:]{0,300}:\s*",
+    re.IGNORECASE,
+)
+
+PORTRAIT_APPEARANCE_LABEL = (
+    "MY OWN APPEARANCE (read from my portrait; this is how I, the avatar, look, "
+    "even where the portrait description says he, she, they, or this person):"
+)
+
+
+def render_identity_document(identity_document: Document) -> str:
+    """Return the prompt text of one identity document.
+
+    The portrait document (``metadata["reference_image"]``) is labelled as the
+    avatar's own appearance, with any refusal preamble removed; every other
+    identity document renders as the document's ``page_content`` unchanged.
+    """
+    page_content = identity_document.page_content
+    metadata = getattr(identity_document, "metadata", None) or {}
+    if not metadata.get("reference_image"):
+        return page_content
+    portrait_description = _PORTRAIT_REFUSAL_PREAMBLE.sub("", page_content, count=1)
+    return f"{PORTRAIT_APPEARANCE_LABEL}\n{portrait_description.strip()}"
 
 
 class DynamicPromptBuilder:
@@ -115,7 +153,7 @@ class DynamicPromptBuilder:
             # assistant_identity_distinct = list(set(assistant_identity))
 
             assistant_identity_str = "\n\n".join(
-                [doc.page_content for doc in assistant_identity]
+                [render_identity_document(doc) for doc in assistant_identity]
             )
             if assistant_description is not None:
                 assistant_identity_str = (

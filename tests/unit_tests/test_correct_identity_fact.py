@@ -1048,3 +1048,63 @@ async def test_accept_with_empty_window_leaves_document_unchanged(monkeypatch):
     meta = (await _read_doc(store, (CREATOR, ASSISTANT, "identity"), key))["metadata"]
     assert meta["fact"] == WRONG_FACT
     assert "unchanged" in cmd.update["messages"][0].content.lower()
+
+
+# --------------------------------------------------------------------------------------
+# Correcting a fact stored about the user
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tool_corrects_fact_stored_about_the_user(monkeypatch):
+    """A correction reaches ``(assistant_id, user_id, "identity")`` and badges the change.
+
+    On thread 618f0fd0 (2026-09-29) the owner corrected a quote the avatar had stored
+    as a fact about the user; the correction tools could not see that namespace, so
+    the old quote could never be replaced.
+    """
+    from src.anubis.utils.learning.fact_learned import TurnLearnedFactsCollector
+
+    store = _make_store()
+    user_identity_namespace = (ASSISTANT, CREATOR, "identity")
+    stored_quote = "You would say write small when I was writing too large in Toronto."
+    corrected_quote = (
+        "You would say you're going to run out of space when I was writing too large "
+        "in Toronto."
+    )
+    key = await _seed(store, user_identity_namespace, stored_quote)
+    monkeypatch.setattr(
+        identity_tools,
+        "interrupt",
+        lambda payload: {
+            "type": "apply",
+            "items": [{"index": m["index"], "action": "accept"} for m in payload["matches"]],
+        },
+    )
+
+    TurnLearnedFactsCollector.begin_turn()
+    try:
+        command = await _edit_coroutine()(
+            inaccurate_information=stored_quote,
+            corrected_information=corrected_quote,
+            correction_context="I was told what I would actually say.",
+            runtime=_FakeRuntime(store),
+        )
+        announced = TurnLearnedFactsCollector.collect()
+    finally:
+        TurnLearnedFactsCollector.end_turn()
+
+    rewritten = await _read_doc(store, user_identity_namespace, key)
+    assert rewritten["metadata"]["fact"] == corrected_quote
+    # The stale copy is pruned from the user channel, not from the avatar's channel.
+    assert key in command.update["user_identity_documents"]["keys"]
+    assert "assistant_identity_documents" not in command.update
+    assert announced == [
+        {
+            "fact": corrected_quote,
+            "kind": "user",
+            "source": "conversation",
+            "status": "updated",
+            "previous_fact": stored_quote,
+        }
+    ]

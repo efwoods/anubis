@@ -286,8 +286,18 @@ async def classify_observation(
     voice_mode: bool,
     sources: list[str] | None = None,
     camera_facing: str | None = None,
+    usage_readings: list[dict[str, Any]] | None = None,
 ) -> AmbientTriageClassification:
-    """Classify one ambient observation with the owner's preferences as precedent."""
+    """Classify one ambient observation with the owner's preferences as precedent.
+
+    :param usage_readings: When given, the classifier call's token readings
+        (``model_name``, ``prompt_tokens``, ``completion_tokens``,
+        ``cached_prompt_tokens``, ``cache_write_tokens``, ``latency_ms``) are
+        appended to ``usage_readings`` so the message endpoint can meter the
+        classifier call.
+    """
+    import time
+
     from langchain_core.messages import HumanMessage, SystemMessage
 
     from src.anubis.utils.model import init_model
@@ -305,10 +315,30 @@ async def classify_observation(
         sources=sources,
         camera_facing=camera_facing,
     )
-    response = await model.ainvoke(
-        input=[
-            SystemMessage(content=AMBIENT_CLASSIFY_SYSTEM_PROMPT),
-            HumanMessage(content=human),
-        ]
+    classifier_input = [
+        SystemMessage(content=AMBIENT_CLASSIFY_SYSTEM_PROMPT),
+        HumanMessage(content=human),
+    ]
+    if usage_readings is None:
+        response = await model.ainvoke(input=classifier_input)
+        return normalize_classification(response)
+
+    from langchain_core.runnables.config import ensure_config, merge_configs
+
+    from src.anubis.utils.billing.metering import build_model_usage_capture_handler
+
+    call_readings: list[dict[str, Any]] = []
+    # Merged onto the graph node's own run configuration, so the tracing and
+    # stream callbacks the node already carries still see the classifier call.
+    invoke_config = merge_configs(
+        ensure_config(),
+        {"callbacks": [build_model_usage_capture_handler(call_readings)]},
     )
+    started_at = time.perf_counter()
+    try:
+        response = await model.ainvoke(input=classifier_input, config=invoke_config)
+    finally:
+        latency_ms = (time.perf_counter() - started_at) * 1000.0
+        for reading in call_readings:
+            usage_readings.append({**reading, "latency_ms": latency_ms})
     return normalize_classification(response)

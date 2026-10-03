@@ -890,6 +890,28 @@ def _model_call_token_readings(result: Any) -> list[dict[str, Any]]:
     ]
 
 
+def build_model_usage_capture_handler(readings: list[dict[str, Any]]) -> Any:
+    """Return a callback handler that appends each model call's token readings.
+
+    For a model call made inside a chat turn that the message endpoint meters
+    itself (the ambient triage classifier): the graph node collects the
+    readings and hands the readings to the endpoint on a stream event, because
+    only the endpoint holds the request context the Stripe meter event needs.
+    Each reading has the shape ``_model_call_token_readings`` returns.
+    """
+    from langchain_core.callbacks.base import AsyncCallbackHandler
+
+    class ModelUsageCaptureHandler(AsyncCallbackHandler):
+        """Append the token readings of every model call to ``readings``."""
+
+        raise_error = False
+
+        async def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+            readings.extend(_model_call_token_readings(response))
+
+    return ModelUsageCaptureHandler()
+
+
 def resolve_model_token_prices(
     model_name: str | None, context: Any
 ) -> tuple[float, float, float, float]:

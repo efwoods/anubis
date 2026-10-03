@@ -155,9 +155,14 @@ async def learn_user_preference(
         category=category,
         source="dictated",
     )
+    from src.anubis.utils.learning.fact_learned import (
+        STATUS_KNOWN,
+        announce_fact_learned,
+    )
+
     if document is None:
+        announce_fact_learned(preference, kind="preference", status=STATUS_KNOWN)
         return _tool_message(f"Preference previously learned: {preference}", runtime)
-    from src.anubis.utils.learning.fact_learned import announce_fact_learned
 
     announce_fact_learned(preference, kind="preference")
     return _tool_message(f"Learned preference: {preference}", runtime)

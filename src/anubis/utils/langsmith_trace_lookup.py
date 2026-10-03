@@ -15,7 +15,7 @@ inputs). The lookup is therefore split in two:
    which costs no network call: every reply without a record receives
    ``response_metadata["langsmith_lookup"]`` naming the human turn the reply
    answers (id and ``created_at``).
-2. When the administrator clicks the reply's LangSmith link, the client calls
+2. When a development user clicks the reply's LangSmith link, the client calls
    ``/conversations/{thread_id}/langsmith_trace``, which runs
    ``find_langsmith_record_for_human_turn``: the thread's root runs that
    started in a window around the human turn's ``created_at`` are read from
@@ -63,17 +63,16 @@ def lookup_project_ids(context: Any) -> list[str]:
 def lookup_enabled(context: Any, user_id: str | None) -> bool:
     """Whether trace records may be looked up for this caller.
 
-    Only a development process (``DEV=TRUE``), only for the administrator (the
-    only account the client shows the LangSmith link to), and only with a
+    Only a development process (``DEV=TRUE``), for any signed-in account (the
+    development client shows the LangSmith link to every account, so a test
+    account sees the same trace link as the administrator), and only with a
     workspace id and at least one lookup project configured.
     """
     development_mode = str(getattr(context, "dev", None) or "").strip().upper() == "TRUE"
-    administrator_user_id = str(getattr(context, "admin_user_id", None) or "").strip()
     workspace_id = str(getattr(context, "langsmith_workspace_id", None) or "").strip()
     return bool(
         development_mode
-        and administrator_user_id
-        and str(user_id or "").strip() == administrator_user_id
+        and str(user_id or "").strip()
         and workspace_id
         and lookup_project_ids(context)
     )

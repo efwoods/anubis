@@ -143,6 +143,31 @@ def _stream_writer_or_noop():
         return lambda _payload: None
 
 
+IMAGE_DESCRIPTIONS_SECTION_MARKER = "\n\n---\nImage descriptions:\n"
+
+
+def retrieval_query_without_image_descriptions(message_content: object) -> object:
+    """Return the message content with the ``Image descriptions`` section removed.
+
+    ``resolve_human_message_images`` appends the description of every attached
+    image to the person's words. The store embeds the retrieval query once per
+    search, so the description lengthened every embedding: measured
+    2026-10-02 on one thread, ``load_consciousness`` took 715 ms for "What do I
+    look like?" and 2,910 ms for the same words followed by a 64-word picture
+    description. A picture description also retrieves nothing about who the
+    avatar is, so the query keeps only the person's own words. A message that
+    is only an image keeps the descriptions, so the query is never empty.
+    """
+    if not isinstance(message_content, str):
+        return message_content
+    person_words, marker, _image_descriptions = message_content.partition(
+        IMAGE_DESCRIPTIONS_SECTION_MARKER
+    )
+    if marker and person_words.strip():
+        return person_words
+    return message_content
+
+
 async def resolve_human_message_images(
     state: GlobalState, config: RunnableConfig, runtime: Runtime[GlobalContext]
 ):
@@ -195,6 +220,11 @@ async def resolve_human_message_images(
         )
         return {}
 
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        DESCRIBE_MINECRAFT_VIEW_PROMPT,
+        MINECRAFT_VIEW_FILE_NAME,
+    )
+
     additional_kwargs = dict(last.additional_kwargs or {})
     filenames = additional_kwargs.pop("image_filenames", None) or []
     ambient = ambient_details(last) if is_ambient_observation(last) else None
@@ -223,6 +253,12 @@ async def resolve_human_message_images(
         from src.anubis.utils.schema import DESCRIBE_AMBIENT_IMAGE_PROMPT
 
         descriptor = ImageDescriptionClass(system_prompt=DESCRIBE_AMBIENT_IMAGE_PROMPT)
+    elif filenames and all(
+        str(filename) == MINECRAFT_VIEW_FILE_NAME for filename in filenames
+    ):
+        # The Minecraft body's own view, attached by the companion to a sight
+        # question: a short description of a flat-coloured game view.
+        descriptor = ImageDescriptionClass(system_prompt=DESCRIBE_MINECRAFT_VIEW_PROMPT)
     else:
         descriptor = ImageDescriptionClass()
     writer = _stream_writer_or_noop()
@@ -234,6 +270,14 @@ async def resolve_human_message_images(
     usage_completion_tokens = 0
     usage_total_cost = 0.0
     usage_latencies: list[float] = []
+    # One pending cost item per described picture, folded into the next
+    # avatar reply's ``turn_cost`` (see ``src/anubis/utils/billing/turn_cost.py``).
+    from src.anubis.utils.billing.turn_cost import (
+        INFERENCE_TYPE_IMAGE_DESCRIPTION,
+        pending_turn_cost_item,
+    )
+
+    image_description_cost_items: list[dict] = []
 
     for block in content:
         if not isinstance(block, dict):
@@ -270,6 +314,18 @@ async def resolve_human_message_images(
                         "latency_ms": float(meta.get("latency_ms") or 0.0),
                         "model_name": meta.get("model_name"),
                     }
+                )
+                image_description_cost_items.append(
+                    pending_turn_cost_item(
+                        INFERENCE_TYPE_IMAGE_DESCRIPTION,
+                        model_name=meta.get("model_name"),
+                        prompt_tokens=int(meta.get("input_tokens") or 0),
+                        completion_tokens=int(meta.get("output_tokens") or 0),
+                        cost_usd=float(meta.get("total_cost") or 0.0),
+                        latency_ms=float(meta.get("latency_ms") or 0.0),
+                        observation_id=(ambient or {}).get("observation_id"),
+                        source=label,
+                    )
                 )
             except Exception as exc:
                 logger.exception("Image describe failed for %s: %s", fname, exc)
@@ -335,6 +391,11 @@ async def resolve_human_message_images(
                 ),
             }
         )
+    if image_description_cost_items:
+        update["pending_turn_cost_items"] = [
+            *(state.get("pending_turn_cost_items") or []),
+            *image_description_cost_items,
+        ]
     return update
 
 
@@ -658,6 +719,27 @@ async def _build_consciousness_system_message_update(
         user_name = config.get("user_ctx", {}).get("name", None)
         user_description = config.get("user_ctx", {}).get("description", None)
 
+    # The API hands every run the one shared ``app.state.context``, whose
+    # ``assistant_ctx`` and ``user_ctx`` are empty defaults. The avatar row's
+    # real name and description ride in ``config["configurable"]`` instead, so
+    # reading only ``runtime.context`` always missed the avatar's name and fell
+    # through to the vector-search fallback below. Fill every missing identity
+    # field from ``config["configurable"]`` before falling back.
+    configurable_assistant_context = (
+        config.get("configurable", {}).get("assistant_ctx") or {}
+    )
+    configurable_user_context = config.get("configurable", {}).get("user_ctx") or {}
+    if isinstance(configurable_assistant_context, dict):
+        if assistant_name is None:
+            assistant_name = configurable_assistant_context.get("name")
+        if assistant_description is None:
+            assistant_description = configurable_assistant_context.get("description")
+    if isinstance(configurable_user_context, dict):
+        if user_name is None:
+            user_name = configurable_user_context.get("name")
+        if user_description is None:
+            user_description = configurable_user_context.get("description")
+
     # A blank name is as absent as ``None``. The fallback name lookups below
     # are gated on ``is None``, so an avatar row carrying an empty-string name
     # skipped the lookup entirely and rendered ``=== YOUR NAME ===`` empty —
@@ -703,7 +785,7 @@ async def _build_consciousness_system_message_update(
             assistant_description=assistant_description,
         )
     else:
-        query = last_message_content
+        query = retrieval_query_without_image_descriptions(last_message_content)
         if isinstance(query, list):
             _TASK_DESCRIPTION = "Given the query, retrieve information that is salient to the conversation and semantically similar to the query text."
             query = f"Instruct: {_TASK_DESCRIPTION}\nQuery: {query[0]['text']}"
@@ -861,8 +943,15 @@ async def _build_consciousness_system_message_update(
     # assembled — so a name recovered by the fallback lookup has to be written
     # into ``state`` here as well. Assigning only the local variable left the
     # recovered name behind and rendered the prompt section empty.
+    # The fallback name search always returns the nearest identity fact, even
+    # when no identity fact holds a name. Taking the nearest fact without a
+    # score floor rendered "I do not swear or curse." as the avatar's name.
+    # The assistant name search uses the same score floor as the user name
+    # search, so an avatar without a stored name gets an empty name section.
     if assistant_name is None:
-        if len(assistant_possible_name) > 0:
+        if len(assistant_possible_name) > 0 and (
+            getattr(assistant_possible_name[0], "score", 0) > _FILTER_SCORE
+        ):
             assistant_name = (
                 getattr(assistant_possible_name[0], "value")
                 .get("document", {})
@@ -1193,8 +1282,8 @@ async def _build_consciousness_system_message_update(
     if getattr(runtime.context, "debug_system_prompt", None) == "TRUE":
         logger.info(f"populated_template: {populated_identity_template}")
 
-    # prepend system message
-    logger.info(f"state['messages']: {state['messages']}")
+    if getattr(runtime.context, "verbose", None) == "TRUE":
+        logger.info(f"state['messages']: {state['messages']}")
 
     # The rendered template is split into the half that repeats unchanged on
     # every turn of a conversation and the per-turn ROLE half. OpenAI prompt

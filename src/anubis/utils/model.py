@@ -487,11 +487,21 @@ def init_image_description_model():
     logger.info(f"base_url: {base_url}")
     logger.info(f"model_name: {model_name}")
 
+    # A reasoning image model (gpt-5-nano) spends most of a description call
+    # reasoning at the vendor default effort; IMAGE_MODEL_REASONING_EFFORT
+    # caps that reasoning. Empty sends no effort and keeps the vendor default.
+    reasoning_effort = str(context.image_model_reasoning_effort or "").strip()
+    reasoning_keyword_arguments = (
+        {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
+    )
+    logger.info(f"reasoning_effort: {reasoning_effort or 'vendor default'}")
+
     model = ChatOpenAI(
         model=model_name,
         base_url=base_url,
         temperature=0.1,
         api_key=api_key,
+        **reasoning_keyword_arguments,
     )
     return model
 

@@ -14,6 +14,14 @@ request carrying ``Authorization: Bearer <CARTESIA_API_KEY>`` and
   voices the account does not own. A Cartesia preview file needs the API key,
   so the Voice panel plays a stock sample through
   ``GET /avatar_voice/standard_voices/{voice_id}/preview`` (``stock_voice_preview``).
+  Most public Cartesia voices have no preview file at all, so for those voices
+  the sample is ``STOCK_VOICE_SAMPLE_TEXT`` spoken in the voice, synthesized
+  once per voice and kept in this process. Cartesia publishes one voice
+  several times — an emotion variant per tagline ("Angry Broadway Voice",
+  "Sad Broadway Voice") under the same name and description — so the catalogue
+  keeps one entry per name, gender and description (``_deduplicate_stock_voices``).
+  ``CARTESIA_STANDARD_FEMALE_VOICE_ID`` / ``CARTESIA_STANDARD_MALE_VOICE_ID``
+  name the standard voice of each gender (``default_stock_voice_id``).
 
 Cartesia has no moderation ban on a voice, so ``voice_is_blocked`` is always
 false. Professional clones are not offered through this provider.
@@ -25,6 +33,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import tempfile
 from collections.abc import AsyncIterator
 from typing import Any
@@ -43,6 +52,11 @@ CARTESIA_CLONE_CLIP_MAXIMUM_BYTES = 16 * 1024 * 1024
 _STOCK_VOICE_PAGE_SIZE = 100
 _STOCK_VOICE_MAXIMUM_PAGES = 20
 _CREDIT_EXHAUSTED_MARKERS = ("credit", "quota", "insufficient", "payment required")
+STOCK_VOICE_SAMPLE_TEXT = (
+    "Hello there. This is how I sound when I read a reply out loud for you."
+)
+_STOCK_VOICE_SAMPLE_CACHE_MAXIMUM_ENTRIES = 256
+_synthesized_stock_voice_samples: dict[str, bytes] = {}
 
 # Cartesia reports gender presentation as ``feminine`` / ``masculine``; the
 # Voice panel's picker speaks ``female`` / ``male``.
@@ -193,9 +207,61 @@ def _normalize_stock_voice(cartesia_voice: dict[str, Any]) -> dict[str, Any] | N
         "description": cartesia_voice.get("description")
         or cartesia_voice.get("tagline"),
         "preview_url": None,
-        # The Cartesia preview file needs the API key, so the API serves the sample.
-        "preview_requires_auth": bool(cartesia_voice.get("preview_file_url")),
+        # A Cartesia preview file needs the API key, and most public voices have
+        # no preview file, so the API serves (or synthesizes) every sample.
+        "preview_requires_auth": True,
     }
+
+
+def _normalized_description(cartesia_voice: dict[str, Any]) -> str:
+    """Return the voice description lowercased with punctuation and spacing removed."""
+    description = str(cartesia_voice.get("description") or "").lower()
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", description).split())
+
+
+def _plain_variant_rank(cartesia_voice: dict[str, Any]) -> tuple[int, int, str]:
+    """Rank one copy of a voice: the plain variant first, then the single-accent copy, then the oldest.
+
+    An emotion variant's tagline is the plain tagline with the emotion in front
+    ("Angry Broadway Voice" beside "Broadway Voice"), so the shortest tagline is
+    the plain variant. A copy listing a single accent is the voice in the
+    catalogue language only, rather than the multilingual copy.
+    """
+    return (
+        len(str(cartesia_voice.get("tagline") or "")),
+        len(cartesia_voice.get("accents") or []),
+        str(cartesia_voice.get("created_at") or ""),
+    )
+
+
+def _deduplicate_stock_voices(
+    cartesia_voices: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one Cartesia voice per name, gender and description, in catalogue order.
+
+    Voices that only share a name (a British Benedict and a narrator Benedict)
+    have different descriptions and are both kept.
+    """
+    best_voice_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for cartesia_voice in cartesia_voices:
+        voice_identity = (
+            str(cartesia_voice.get("name") or "").strip().lower(),
+            str(cartesia_voice.get("gender") or "").strip().lower(),
+            _normalized_description(cartesia_voice),
+        )
+        kept_voice = best_voice_by_identity.get(voice_identity)
+        if kept_voice is None or _plain_variant_rank(cartesia_voice) < (
+            _plain_variant_rank(kept_voice)
+        ):
+            best_voice_by_identity[voice_identity] = cartesia_voice
+    kept_voice_ids = {
+        id(cartesia_voice) for cartesia_voice in best_voice_by_identity.values()
+    }
+    return [
+        cartesia_voice
+        for cartesia_voice in cartesia_voices
+        if id(cartesia_voice) in kept_voice_ids
+    ]
 
 
 def _is_stock_voice(cartesia_voice: dict[str, Any]) -> bool:
@@ -351,9 +417,12 @@ class CartesiaVoiceProvider:
     ) -> list[dict[str, Any]]:
         """Return the vendor's stock voices of one gender, normalized."""
         stock_voices: list[dict[str, Any]] = []
-        for cartesia_voice in await self._list_all_stock_voices(context):
-            if not _is_stock_voice(cartesia_voice):
-                continue
+        public_voices = [
+            cartesia_voice
+            for cartesia_voice in await self._list_all_stock_voices(context)
+            if _is_stock_voice(cartesia_voice)
+        ]
+        for cartesia_voice in _deduplicate_stock_voices(public_voices):
             stock_voice = _normalize_stock_voice(cartesia_voice)
             if stock_voice is not None and stock_voice["gender"] == gender:
                 stock_voices.append(stock_voice)
@@ -362,7 +431,12 @@ class CartesiaVoiceProvider:
     async def stock_voice_preview(
         self, context: Any, *, voice_id: str
     ) -> tuple[bytes, str] | None:
-        """Return a stock voice sample the browser cannot fetch itself, or None."""
+        """Return a stock voice sample the browser cannot fetch itself.
+
+        The voice's Cartesia preview file when the voice has one; otherwise
+        ``STOCK_VOICE_SAMPLE_TEXT`` synthesized in the voice, cached per voice
+        so each voice is synthesized once per process.
+        """
         headers = _headers(context)
         async with _http_client(60.0) as http_client:
             response = await http_client.get(
@@ -375,7 +449,12 @@ class CartesiaVoiceProvider:
                 (response.json() or {}).get("preview_file_url") or ""
             ).strip()
             if not preview_file_url:
-                return None
+                return (
+                    await self._synthesized_stock_voice_sample(
+                        context, voice_id=voice_id
+                    ),
+                    "audio/mpeg",
+                )
             preview_response = await http_client.get(
                 preview_file_url, headers=headers, follow_redirects=True
             )
@@ -384,6 +463,36 @@ class CartesiaVoiceProvider:
             preview_response.headers.get("content-type", "") or "audio/mpeg"
         ).split(";", 1)[0]
         return bytes(preview_response.content), mime_type
+
+    async def _synthesized_stock_voice_sample(
+        self, context: Any, *, voice_id: str
+    ) -> bytes:
+        """Speak ``STOCK_VOICE_SAMPLE_TEXT`` in the voice, once per voice per process."""
+        cached_sample = _synthesized_stock_voice_samples.get(voice_id)
+        if cached_sample is not None:
+            return cached_sample
+        sample = await self.synthesize_speech(
+            context, voice_id=voice_id, text=STOCK_VOICE_SAMPLE_TEXT
+        )
+        if (
+            len(_synthesized_stock_voice_samples)
+            >= _STOCK_VOICE_SAMPLE_CACHE_MAXIMUM_ENTRIES
+        ):
+            _synthesized_stock_voice_samples.pop(
+                next(iter(_synthesized_stock_voice_samples))
+            )
+        _synthesized_stock_voice_samples[voice_id] = sample
+        return sample
+
+    def default_stock_voice_id(self, context: Any, *, gender: str) -> str | None:
+        """Return the configured standard Cartesia voice of one gender, or ``None``."""
+        setting_name = {
+            "female": "cartesia_standard_female_voice_id",
+            "male": "cartesia_standard_male_voice_id",
+        }.get(gender)
+        if setting_name is None:
+            return None
+        return str(getattr(context, setting_name, None) or "").strip() or None
 
     def speech_model_name(self, context: Any) -> str:
         """Return the text-to-speech model the provider speaks with."""
@@ -395,7 +504,9 @@ class CartesiaVoiceProvider:
         """Return the vendor cost per 1,000 characters of speech."""
         # Only an unset price falls back: a configured 0 (a plan whose
         # included credits cover the speech) is a real price and is kept.
-        configured_price = getattr(context, "cartesia_text_to_speech_cost_per_1000_characters_usd", None)
+        configured_price = getattr(
+            context, "cartesia_text_to_speech_cost_per_1000_characters_usd", None
+        )
         if configured_price is None or str(configured_price).strip() == "":
             return 0.04
         return float(configured_price)

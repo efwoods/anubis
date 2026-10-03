@@ -331,10 +331,37 @@ async def test_cartesia_stock_voices_page_and_keep_only_public_voices(monkeypatc
         _cartesia_context(), gender="female"
     )
     assert [voice["voice_id"] for voice in female] == ["v1", "v5"]
+    # Every Cartesia sample is served by the API, with or without a preview file.
     assert female[1]["preview_requires_auth"] is True
-    assert female[0]["preview_requires_auth"] is False
+    assert female[0]["preview_requires_auth"] is True
     assert len(requests) == 2
     assert requests[0].url.params["language"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_a_cartesia_voice_without_a_preview_file_gets_a_synthesized_sample(
+    monkeypatch,
+):
+    monkeypatch.setattr(cartesia_module, "_synthesized_stock_voice_samples", {})
+
+    def handler(request):
+        if request.url.path == "/tts/bytes":
+            return httpx.Response(200, content=b"synthesized-sample")
+        return httpx.Response(200, json={"id": "v1", "preview_file_url": None})
+
+    requests = _install_transport(monkeypatch, handler)
+    for _ in range(2):
+        preview = await cartesia_module.PROVIDER.stock_voice_preview(
+            _cartesia_context(), voice_id="v1"
+        )
+        assert preview == (b"synthesized-sample", "audio/mpeg")
+    speech_requests = [
+        request for request in requests if request.url.path == "/tts/bytes"
+    ]
+    assert len(speech_requests) == 1
+    body = json.loads(speech_requests[0].content)
+    assert body["transcript"] == cartesia_module.STOCK_VOICE_SAMPLE_TEXT
+    assert body["voice"] == {"mode": "id", "id": "v1"}
 
 
 @pytest.mark.asyncio
@@ -563,6 +590,73 @@ async def test_a_cartesia_stock_pick_leaves_the_elevenlabs_pick_in_place(
 
 
 @pytest.mark.asyncio
+async def test_a_clone_less_avatar_speaks_a_cartesia_stock_voice_after_the_switch(
+    fake_providers,
+):
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "detail": {
+                "standard_voice": {
+                    "voice_id": "el-std",
+                    "name": "Alice",
+                    "gender": "female",
+                }
+            },
+        }
+    )
+
+    speaking = await corpus.resolve_speaking_voice_and_provider(
+        repository, ASSISTANT_ID, _cartesia_context()
+    )
+    assert (speaking.kind, speaking.voice_id, speaking.provider_name) == (
+        "standard",
+        "cartesia-stock-f",
+        "cartesia",
+    )
+    stored = await repository.get_voice(ASSISTANT_ID)
+    assert stored["detail"]["standard_voice"]["voice_id"] == "el-std"
+    assert "voice_choice" not in stored["detail"]
+    assert standard_voices.standard_voice_of(stored, "cartesia") == {
+        "voice_id": "cartesia-stock-f",
+        "name": "Stock F",
+        "gender": "female",
+    }
+
+    # Switching back speaks the ElevenLabs pick again.
+    speaking = await corpus.resolve_speaking_voice_and_provider(
+        repository, ASSISTANT_ID, _context()
+    )
+    assert (speaking.voice_id, speaking.provider_name) == ("el-std", "elevenlabs")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_catalogue_read_keeps_the_earlier_stock_voice(
+    fake_providers, monkeypatch
+):
+    async def _refuse(context, *, gender):
+        raise RuntimeError("catalogue unavailable")
+
+    monkeypatch.setattr(fake_providers.cartesia, "list_stock_voices", _refuse)
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "detail": {"standard_voice": {"voice_id": "el-std", "gender": "female"}},
+        }
+    )
+    speaking = await corpus.resolve_speaking_voice_and_provider(
+        repository, ASSISTANT_ID, _cartesia_context()
+    )
+    assert (speaking.voice_id, speaking.provider_name) == ("el-std", "elevenlabs")
+    stored = await repository.get_voice(ASSISTANT_ID)
+    assert standard_voices.standard_voice_of(stored, "cartesia") is None
+
+
+@pytest.mark.asyncio
 async def test_the_catalogue_cache_is_kept_per_provider(fake_providers):
     eleven_catalogue = await standard_voices.list_standard_voices(
         _context(), gender="female"
@@ -642,3 +736,125 @@ async def test_the_preview_route_serves_a_sample_that_needs_the_key(
     assert response.status_code == 200
     assert response.body == b"sample"
     assert response.media_type == "audio/mpeg"
+
+
+# --------------------------------------------------------------------------
+# Cartesia catalogue duplicates and the configured standard voices
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cartesia_emotion_variants_collapse_to_the_plain_voice(monkeypatch):
+    luke_description = "Seasoned male voice for casual, authentic conversations"
+    carson_description = "Friendly young adult male for customer support conversations"
+    page = {
+        "data": [
+            {
+                "id": "luke-angry",
+                "name": "Luke",
+                "gender": "masculine",
+                "tagline": "Angry Broadway Voice",
+                "description": luke_description,
+                "created_at": "2026-01-09T00:00:00Z",
+                "accents": [{"locale": "en-US"}],
+            },
+            {
+                "id": "luke-plain-newer",
+                "name": "Luke",
+                "gender": "masculine",
+                "tagline": "Broadway Voice",
+                "description": luke_description,
+                "created_at": "2026-01-09T00:00:00Z",
+                "accents": [{"locale": "en-US"}],
+            },
+            {
+                "id": "luke-plain-oldest",
+                "name": "Luke",
+                "gender": "masculine",
+                "tagline": "Broadway Voice",
+                "description": luke_description,
+                "created_at": "2026-01-05T00:00:00Z",
+                "accents": [{"locale": "en-US"}],
+            },
+            {
+                "id": "carson-multilingual",
+                "name": "Carson",
+                "gender": "masculine",
+                "tagline": "Friendly Support",
+                "description": "Friendly, young adult male for customer support conversations",
+                "created_at": "2025-05-05T00:00:00Z",
+                "accents": [{"locale": "en-US"}, {"locale": "en-GB"}],
+            },
+            {
+                "id": "carson-american",
+                "name": "Carson",
+                "gender": "masculine",
+                "tagline": "Friendly Support",
+                "description": carson_description,
+                "created_at": "2025-05-05T00:00:00Z",
+                "accents": [{"locale": "en-US"}],
+            },
+            {
+                "id": "benedict-royal",
+                "name": "Benedict",
+                "gender": "masculine",
+                "tagline": "Royal Narrator",
+                "description": "Confident, firm male for narrations",
+            },
+            {
+                "id": "benedict-mediator",
+                "name": "Benedict",
+                "gender": "masculine",
+                "tagline": "Measured Mediator",
+                "description": "Polished, and formal British male.",
+            },
+        ],
+        "has_more": False,
+    }
+    _install_transport(monkeypatch, lambda request: httpx.Response(200, json=page))
+    male = await cartesia_module.PROVIDER.list_stock_voices(
+        _cartesia_context(), gender="male"
+    )
+    assert [voice["voice_id"] for voice in male] == [
+        "luke-plain-oldest",
+        "carson-american",
+        "benedict-royal",
+        "benedict-mediator",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_configured_standard_voice_leads_the_catalogue(
+    fake_providers, monkeypatch
+):
+    fake_providers.cartesia.stock["female"] = [
+        {"voice_id": "aila", "name": "Aila", "gender": "female"},
+        {"voice_id": "ailsa", "name": "Ailsa", "gender": "female"},
+    ]
+    monkeypatch.setattr(
+        fake_providers.cartesia,
+        "default_stock_voice_id",
+        cartesia_module.CartesiaVoiceProvider().default_stock_voice_id,
+        raising=False,
+    )
+    cartesia_context = _cartesia_context(cartesia_standard_female_voice_id="ailsa")
+    catalogue = await standard_voices.list_standard_voices(
+        cartesia_context, gender="female"
+    )
+    assert [(voice["voice_id"], voice["is_default"]) for voice in catalogue] == [
+        ("ailsa", True),
+        ("aila", False),
+    ]
+
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "detail": {"standard_voice": {"voice_id": "el-std", "gender": "female"}},
+        }
+    )
+    speaking = await corpus.resolve_speaking_voice_and_provider(
+        repository, ASSISTANT_ID, cartesia_context
+    )
+    assert (speaking.voice_id, speaking.provider_name) == ("ailsa", "cartesia")

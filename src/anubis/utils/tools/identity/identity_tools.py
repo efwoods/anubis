@@ -58,6 +58,49 @@ def fact_names_the_user(user_fact: str) -> bool:
     return bool(_USER_SUBJECT_MARKER.search(normalized_fact))
 
 
+# A fact in which the avatar ("you") is the one acting or being described is a
+# fact about the avatar, even when the user appears in the same sentence ("You
+# taught me to write.", "I read a book while you drove."). The user tool stores
+# a fact verbatim under the user, so such a fact was filed as "Learned about
+# you" in the second person, never reached the avatar's own identity, and the
+# avatar then recounted the story from the user's point of view (thread
+# 618f0fd0, 2026-09-29: "You played French Horn." stored as a user fact).
+#
+# "You" counts as the acting subject when "you" / "your" opens a clause — the
+# start of the fact, after punctuation or an opening quote, or after a clause
+# conjunction — or when "you" is followed by a habitual or past-tense verb
+# ("you would say", "you used to"). "You" as an object ("I love you", "User
+# prefers you do not ...", "I want you to ...") stays a fact about the user.
+_AVATAR_CLAUSE_SUBJECT = re.compile(
+    r"(?:^|[.,;:!?\"“(]\s*|\b(?:and|but|when|whenever|while|as|because|then|so|if|where|until|after|before|since)\s+)"
+    r"(?:you|your)\b(?!\s+(?:know|see)\b)",
+    re.IGNORECASE,
+)
+_AVATAR_HABITUAL_OR_PAST_ACTION = re.compile(
+    r"\byou(?:'d|\s+(?:would|used\s+to|were|was|did|had|always|never|once|taught|said|told|played|gave|made|showed|drove|sat|read|corrected|helped|came|took|called|sang|listened))\b",
+    re.IGNORECASE,
+)
+
+
+def fact_is_about_the_avatar(user_fact: str) -> bool:
+    """Whether ``user_fact`` has the avatar ("you") as the acting subject of a clause."""
+    normalized_fact = str(user_fact or "").replace("’", "'").strip()
+    return bool(
+        _AVATAR_CLAUSE_SUBJECT.search(normalized_fact)
+        or _AVATAR_HABITUAL_OR_PAST_ACTION.search(normalized_fact)
+    )
+
+
+def _announce_known_fact(fact: str, *, kind: str) -> None:
+    """Show the person a fact they shared that was already stored ("Already knew")."""
+    from src.anubis.utils.learning.fact_learned import (
+        STATUS_KNOWN,
+        announce_fact_learned,
+    )
+
+    announce_fact_learned(fact, kind=kind, status=STATUS_KNOWN)
+
+
 def wrap_fact_with_context(fact: str, fact_context: str) -> str:
     """Wrap a single atomic fact with its ENTIRE original background context.
 
@@ -117,7 +160,7 @@ async def create_episodic_memory(  # EPISODIC MEMORY CREATION IN NAMESPACE (USER
 
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
 
-    THERE MAY BE MORE THAN ONE FACT and IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    THERE MAY BE MORE THAN ONE FACT. In that case, call create_episodic_memory once for each distinct fact, and put EVERY create_episodic_memory call in ONE response as parallel tool calls. NEVER save one fact, wait for the tool response, and then save the next fact: each extra round trip delays the reply, and a message carrying many facts runs out of steps before the reply is written.
 
     ALWAYS use this tool when a significant EVENT OCCURS that is SALIENT to the assistant or user's goals, beliefs, values, or perspective or is otherwise IMPORTANT, SURPRISING, EVENTFUL, UNUSUAL or EXTRAORDINARY.
 
@@ -168,7 +211,7 @@ async def create_episodic_memory(  # EPISODIC MEMORY CREATION IN NAMESPACE (USER
 
     An example memory is the user telling the assistant to remember something or the user reveals information about any significant event or a fact or event occurs that is found significant given your specific role and context.
 
-    THERE MAY BE MORE THAN ONE FACT and IN THAT CASE, CALL THIS TOOL MULTIPLE TIMES WITH EACH DISTINCT FACT.
+    THERE MAY BE MORE THAN ONE FACT. In that case, call create_episodic_memory once for each distinct fact, and put EVERY create_episodic_memory call in ONE response as parallel tool calls. NEVER save one fact, wait for the tool response, and then save the next fact: each extra round trip delays the reply, and a message carrying many facts runs out of steps before the reply is written.
 
     ALWAYS use this tool when a significant EVENT OCCURS that is SALIENT to the assistant or user's goals, beliefs, values, or perspective or is otherwise IMPORTANT, SURPRISING, EVENTFUL, UNUSUAL or EXTRAORDINARY.
 
@@ -853,6 +896,26 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
 
     DO NOT LEARN INFORMATION THAT IS ALREADY KNOWN.
 
+    <SHARED MEMORIES BELONG TO YOU>
+    When the user tells you a memory the user shares with you — what you did, said,
+    taught, or were while the user was with you — every fact in which you act or are
+    described is a fact about YOU, the avatar, and goes to THIS tool, never to
+    ``learn_information_about_the_user``. The user remains in the third person by name.
+    - "You played French horn." -> "I played French horn."
+    - "You taught me to write." -> "I taught [user name] to write."
+    - "I read a book in the van while you drove." -> "I drove the van while [user name] read a book."
+    - "You would say 'write small' when I wrote too large." -> "I would say 'write small' when [user name] wrote too large."
+    </SHARED MEMORIES BELONG TO YOU>
+
+    <NEW DETAIL IS NEW INFORMATION>
+    A new quote, a new wording of what you said, or a new detail about a stored memory
+    is information you do not hold yet, even when the topic is already stored. Learn
+    the new detail. When the user says a stored detail was wrong ("I meant ...",
+    "actually you would say ..."), treat the message as a correction and call
+    ``edit_identity_fact``. Replying "I remember" without calling a tool is correct
+    ONLY when every detail in the user's most recent message is already stored.
+    </NEW DETAIL IS NEW INFORMATION>
+
     <TOOL ROUTING - CREATE vs EDIT vs DELETE>
     This tool CREATES a fact that is not yet stored. Route by whether the fact already
     exists in your stored identity (the vectorstore), never by surface words alone:
@@ -1072,6 +1135,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     ):
         # Verbatim copy already loaded in state this turn (media identity or prior
         # conversation learning) — refuse without any model call.
+        _announce_known_fact(fact_shared_about_the_assistant_from_the_user, kind="identity")
         return Command(
             update={
                 "messages": [
@@ -1094,6 +1158,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
         assistant_content_store_query_results,
         fact_shared_about_the_assistant_from_the_user,
     ):
+        _announce_known_fact(fact_shared_about_the_assistant_from_the_user, kind="identity")
         return Command(
             update={
                 "messages": [
@@ -1151,6 +1216,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
             # tool used before: a very strong clean-fact hit is treated as a duplicate, so
             # a model outage never floods the namespace with near-copies.
             if any(score > 0.8 for score in candidate_scores):
+                _announce_known_fact(fact_shared_about_the_assistant_from_the_user, kind="identity")
                 return Command(
                     update={
                         "messages": [
@@ -1162,6 +1228,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
                     }
                 )
         elif relationship_result.relationship == "already_stored":
+            _announce_known_fact(fact_shared_about_the_assistant_from_the_user, kind="identity")
             return Command(
                 update={
                     "messages": [
@@ -1225,6 +1292,7 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     if _store_items_contain_fact(
         recheck_store_results, fact_shared_about_the_assistant_from_the_user
     ):
+        _announce_known_fact(fact_shared_about_the_assistant_from_the_user, kind="identity")
         return Command(
             update={
                 "messages": [
@@ -1382,6 +1450,14 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
 
     <RESTRICTIONS>
     Only use this for FACTS about the IDENTITY of the user.
+    NEVER use this tool for a fact in which YOU, the avatar, act or are described
+      ("You played French horn.", "You taught me to write.", "I read while you
+      drove."). A memory the user shares about you is a fact about you: call
+      ``update_self_identity_mem_from_user_txt`` with the fact rewritten in the first
+      person instead. This tool refuses such a fact.
+    NEVER use this tool when the user's most recent message changes a fact already stored
+      about the user ("actually ...", "I meant ...", a different quote or detail for a
+      stored moment): call ``edit_identity_fact`` for the stored fact instead.
     NEVER call this tool twice with the same fact.
     NEVER call this tool to extract information that is not part of the user's identity.
     NEVER LEARN INFORMATION THAT IS ALREADY KNOWN.
@@ -1470,6 +1546,28 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     """
     logger.info(f"breakpoint")
 
+    if fact_is_about_the_avatar(user_fact):
+        # Refuse before touching the store and name the avatar tool, so the
+        # model re-files the fact under the avatar in the first person.
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f'Not learned: "{user_fact}" is about you, the avatar — '
+                            '"you" is the one acting in the fact. Call '
+                            "update_self_identity_mem_from_user_txt with the fact "
+                            "rewritten in the first person: only the words that refer "
+                            'to you become "I / my / me", and the user stays in the '
+                            'third person by name (for example "You taught me to '
+                            'write." becomes "I taught [user name] to write.").'
+                        ),
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
     if not fact_names_the_user(user_fact):
         # Refuse before touching the store. "Not learned:" keeps the refusal
         # off the "Learned about you" chip (``parse_learned_fact_from_tool_content``).
@@ -1518,6 +1616,7 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
         # Fact already exists:
 
         tool_call_id = runtime.tool_call_id
+        _announce_known_fact(user_fact, kind="user")
 
         update = {
             "messages": [
@@ -1553,6 +1652,7 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     )
     if _store_items_contain_fact(recheck_store_results, user_fact):
         tool_call_id = runtime.tool_call_id
+        _announce_known_fact(user_fact, kind="user")
         return Command(
             update={
                 "messages": [
@@ -2067,13 +2167,19 @@ def _match_preview(
 def _correction_namespaces(
     creator_id: str, assistant_id: str, user_id: str
 ) -> list[tuple]:
-    """Assistant-side namespaces a correction sweeps.
+    """Namespaces a correction sweeps.
 
     ``(creator_id, assistant_id, "identity")`` is a *prefix* search — it also covers
     the media/URL sub-namespaces ``(creator_id, assistant_id, "identity", <uuid5>)``.
     ``analysis`` holds derived psycho-analysis traits (beliefs/relationships/OCEAN) that
-    can also ground a response. User-identity is intentionally excluded (this tool
-    corrects facts about the AVATAR, not the user).
+    can also ground a response.
+
+    ``_user_identity_namespace`` holds what the calling user told the avatar about the
+    calling user (``learn_information_about_the_user``). A user correcting a detail of
+    a shared memory ("'You're going to run out of space' is what you would say") often
+    corrects a fact stored there, and no other tool can edit that namespace, so the
+    correction tools sweep the namespace too. Only the calling user's own namespace is
+    swept, and the owner guard in ``_run_identity_fact_mutation`` still applies.
     """
     return [
         (user_id, assistant_id, "memory"),
@@ -2082,7 +2188,13 @@ def _correction_namespaces(
         (creator_id, assistant_id, "document"),
         (creator_id, assistant_id, "quote"),
         (creator_id, assistant_id, "analysis"),
+        _user_identity_namespace(assistant_id, user_id),
     ]
+
+
+def _user_identity_namespace(assistant_id: str, user_id: str) -> tuple:
+    """Return the namespace holding what ``user_id`` told ``assistant_id`` about ``user_id``."""
+    return (assistant_id, user_id, "identity")
 
 
 _STOPWORDS = frozenset(
@@ -2479,7 +2591,25 @@ _NAMESPACE_KIND_TO_STATE_CHANNEL = {
 }
 
 
-def _state_prune_updates(resolved: list["ResolvedCorrection"]) -> dict[str, dict]:
+def _state_channel_for_namespace(namespace: tuple, user_identity_namespace: tuple | None) -> str | None:
+    """Return the persisted state channel holding copies of documents from ``namespace``.
+
+    The user namespace ``(assistant_id, user_id, "identity")`` shares the third element
+    ``"identity"`` with the avatar's own identity namespaces, so the user namespace is
+    recognized by the whole tuple before falling back to the third element.
+    """
+    if user_identity_namespace is not None and tuple(namespace[:3]) == tuple(
+        user_identity_namespace
+    ):
+        return "user_identity_documents"
+    kind = str(namespace[2]) if len(namespace) >= 3 else ""
+    return _NAMESPACE_KIND_TO_STATE_CHANNEL.get(kind)
+
+
+def _state_prune_updates(
+    resolved: list["ResolvedCorrection"],
+    user_identity_namespace: tuple | None = None,
+) -> dict[str, dict]:
     """Per-channel ``{"op": "remove", "keys": [...]}`` updates for applied corrections.
 
     The edit/delete tools run BEFORE the middleware-driven consciousness refresh, so the
@@ -2494,8 +2624,7 @@ def _state_prune_updates(resolved: list["ResolvedCorrection"]) -> dict[str, dict
         if not resolved_edit.include:
             continue
         namespace = resolved_edit.match.namespace or ()
-        kind = str(namespace[2]) if len(namespace) >= 3 else ""
-        channel = _NAMESPACE_KIND_TO_STATE_CHANNEL.get(kind)
+        channel = _state_channel_for_namespace(namespace, user_identity_namespace)
         if channel is None:
             continue
         kwargs = _item_document_kwargs(resolved_edit.match.item)
@@ -2606,6 +2735,33 @@ class FactDeletion(BaseModel):
         description="A concise context summary for the removal, same convention as "
         "``fact_context`` (indicate you were told the fact never happened)."
     )
+
+
+def _announce_applied_corrections(
+    changes: list[CorrectionChange], user_identity_namespace: tuple
+) -> None:
+    """Show the person every approved correction as an "Updated" or "Removed" badge."""
+    from src.anubis.utils.learning.fact_learned import (
+        STATUS_REMOVED,
+        STATUS_UPDATED,
+        announce_fact_learned,
+    )
+
+    for change in changes:
+        kind = (
+            "user"
+            if tuple((change.namespace or ())[:3]) == tuple(user_identity_namespace)
+            else "identity"
+        )
+        if change.new_text and change.action != "delete":
+            announce_fact_learned(
+                change.new_text,
+                kind=kind,
+                status=STATUS_UPDATED,
+                previous_fact=change.old_text,
+            )
+        elif change.old_text:
+            announce_fact_learned(change.old_text, kind=kind, status=STATUS_REMOVED)
 
 
 async def _run_identity_fact_mutation(
@@ -2833,7 +2989,11 @@ async def _run_identity_fact_mutation(
     # prune, a just-deleted document would be re-added from prior state and an edited
     # document would keep its old content (the append reducer dedups by id, so a fresh
     # copy of the same document never replaces a stale one).
-    update: dict[str, object] = dict(_state_prune_updates(resolved))
+    user_identity_namespace = _user_identity_namespace(assistant_id, user_id)
+    update: dict[str, object] = dict(
+        _state_prune_updates(resolved, user_identity_namespace)
+    )
+    _announce_applied_corrections(changes, user_identity_namespace)
     update["messages"] = [
         ToolMessage(
             content=f"Applied {len(changes)} change(s): {summary}",
@@ -2879,10 +3039,31 @@ async def edit_identity_fact(
 
     </INSTRUCTIONS>
 
+    <WHEN THE USER IS CORRECTING A STORED DETAIL>
+    A correction does not always say "wrong". Call this tool when the user's most recent
+    message replaces a detail of something already stored: "actually ...", "I meant ...",
+    "what you would say is ...", or a different quote, time, place, or name for a moment
+    you already hold. Replying "I remember" without calling this tool leaves the old
+    detail stored.
+    </WHEN THE USER IS CORRECTING A STORED DETAIL>
+
+    <EXAMPLE correction of a quote>
+    Stored: "I would say 'write small' when [user name] was writing too large on the page."
+    User: "'You're going to run out of space' is what you would say when I was writing too large on the line."
+      inaccurate_information: "I would say 'write small' when [user name] was writing too large on the page."
+      corrected_information:  "I would say 'You're going to run out of space' when [user name] was writing too large on the line."
+      correction_context:     "I was told that what I would say was 'You're going to run out of space', not 'write small'."
+    </EXAMPLE correction of a quote>
+
+    <FACTS STORED ABOUT THE USER>
+    This tool also finds a fact stored about the user (a fact the user told you about the
+    user, in the user's own words). When the matched fact is about the user, keep the
+    corrected fact in the user's words; the owner approves every change either way.
+    </FACTS STORED ABOUT THE USER>
+
     <RESTRICTIONS>
     Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
     Do NOT use this to remove a fact with no replacement — use ``delete_identity_fact``.
-    Do NOT use this for facts about the USER.
     Only the avatar's creator may correct its identity (enforced server-side).
     </RESTRICTIONS>
 
@@ -2946,8 +3127,8 @@ async def delete_identity_fact(
     <RESTRICTIONS>
     Do NOT use this to add a brand-new fact — use ``update_self_identity_mem_from_user_txt``.
     Do NOT use this to replace a fact with a correction — use ``edit_identity_fact``.
-    Do NOT use this for facts about the USER.
     Only the avatar's creator may correct its identity (enforced server-side).
+    A fact stored about the user (in the user's own words) can be deleted the same way.
     </RESTRICTIONS>
 
     <EXAMPLE delete>

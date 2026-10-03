@@ -197,6 +197,13 @@ _MINECRAFT_SIGHT_MARKERS = (
     "look now",
     "describe",
     "screenshot",
+    # How the person's own player looks: answered by turning to the player
+    # character, then looking (the MINECRAFT_BODY section's three steps).
+    "look like",
+    "how do i look",
+    "what am i wearing",
+    "what am i holding",
+    "see me",
 )
 
 
@@ -216,7 +223,16 @@ def minecraft_turn_asks_to_see(messages: list[Any] | None) -> bool:
             break
     if last_human is None:
         return False
-    lowered = _human_message_text(last_human).lower().replace("’", "'")
+    human_text = _human_message_text(last_human)
+    # The companion already attached the body's view to this message, so a
+    # look would repeat the picture and add a pause and a second model call.
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        human_message_carries_minecraft_view,
+    )
+
+    if human_message_carries_minecraft_view(human_text):
+        return False
+    lowered = human_text.lower().replace("’", "'")
     return any(marker in lowered for marker in _MINECRAFT_SIGHT_MARKERS)
 
 _SOURCE_ALIASES = {

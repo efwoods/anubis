@@ -6,11 +6,17 @@ visible half: a ``fact_learned`` stream frame so the browser can paint a
 badge mid-turn, and a ``learned_facts`` list on the reply's
 ``response_metadata`` so the badge is still there after a reload.
 
-Only facts announced this turn (``announce_fact_learned``, which runs only
-after a successful new store) reach the badge. A ToolMessage that says the
-fact was previously learned never announces, so the badge never re-shows an
-already-known fact — even when older learn ToolMessages still sit in the
-deep agent's message list.
+Only facts announced this turn (``announce_fact_learned``) reach the badge,
+never facts parsed out of older learn ToolMessages that may still sit in the
+deep agent's message list. Every announcement carries a ``status``:
+
+- ``learned``: a new fact was stored.
+- ``known``: the fact the person shared was already stored; announced by the
+  learn tools' duplicate branches, so the person sees every fact of a message
+  accounted for rather than only the new ones.
+- ``updated``: an approved correction rewrote a stored fact; the payload also
+  carries ``previous_fact``.
+- ``removed``: an approved correction deleted or redacted a stored fact.
 """
 
 from __future__ import annotations
@@ -35,6 +41,12 @@ _KIND_PREFERENCE = "preference"
 _KIND_MEMORY = "memory"
 _KIND_USER = "user"
 _KNOWN_KINDS = {_KIND_IDENTITY, _KIND_PREFERENCE, _KIND_MEMORY, _KIND_USER}
+
+STATUS_LEARNED = "learned"
+STATUS_KNOWN = "known"
+STATUS_UPDATED = "updated"
+STATUS_REMOVED = "removed"
+_KNOWN_STATUSES = {STATUS_LEARNED, STATUS_KNOWN, STATUS_UPDATED, STATUS_REMOVED}
 
 # ToolMessages the learn tools build themselves often omit ``name``. When
 # LangGraph does set the name, it is the more reliable kind than the
@@ -74,8 +86,14 @@ class TurnLearnedFactsCollector:
         facts = _turn_learned_facts.get()
         if facts is None:
             return
-        key = entry["fact"].casefold()
-        if any(existing["fact"].casefold() == key for existing in facts):
+        # One badge per fact and status: the same fact may be both removed and
+        # learned in one turn (a correction), and both entries must show.
+        key = (entry["fact"].casefold(), entry.get("status", STATUS_LEARNED))
+        if any(
+            (existing["fact"].casefold(), existing.get("status", STATUS_LEARNED))
+            == key
+            for existing in facts
+        ):
             return
         facts.append(dict(entry))
 
@@ -115,7 +133,12 @@ def _resolved_kind(kind: str | None, tool_name: str | None) -> str:
 def parse_learned_fact_from_tool_content(
     content: Any, *, kind: str | None = None, tool_name: str | None = None
 ) -> dict[str, str] | None:
-    """Read one successful learn ToolMessage. Failures and duplicates return None."""
+    """Read one successful learn ToolMessage. Failures and duplicates return None.
+
+    Only a newly stored fact parses. ``StepBudgetGuard`` relies on the parse to
+    tell a learning round from a round of duplicates, and the ``known`` badge is
+    announced by the learn tools themselves, never parsed.
+    """
     text = content if isinstance(content, str) else str(content or "")
     stripped = text.strip()
     if not stripped or stripped.startswith("Not learned:"):
@@ -132,6 +155,7 @@ def parse_learned_fact_from_tool_content(
             "fact": fact,
             "kind": _resolved_kind(kind or _KIND_PREFERENCE, tool_name),
             "source": "conversation",
+            "status": STATUS_LEARNED,
         }
     # Check before ``Learned:`` — ToolMessages built by hand often omit
     # ``name``, so the prefix is the reliable signal for a user fact.
@@ -144,6 +168,7 @@ def parse_learned_fact_from_tool_content(
             "fact": fact,
             "kind": _resolved_kind(kind or _KIND_USER, tool_name),
             "source": "conversation",
+            "status": STATUS_LEARNED,
         }
     identity = _LEARNED_IDENTITY.match(stripped)
     if identity:
@@ -154,6 +179,7 @@ def parse_learned_fact_from_tool_content(
             "fact": fact,
             "kind": _resolved_kind(kind, tool_name),
             "source": "conversation",
+            "status": STATUS_LEARNED,
         }
     return None
 
@@ -198,8 +224,14 @@ def announce_fact_learned(
     *,
     kind: str = _KIND_IDENTITY,
     source: str = "conversation",
+    status: str = STATUS_LEARNED,
+    previous_fact: str | None = None,
 ) -> dict[str, str] | None:
-    """Emit a ``fact_learned`` frame. Returns the payload, or None when empty."""
+    """Emit a ``fact_learned`` frame. Returns the payload, or None when empty.
+
+    ``status`` says what happened to the fact (see the module docstring);
+    ``previous_fact`` is the stored text an ``updated`` fact replaced.
+    """
     trimmed = _trim_fact(fact)
     if not trimmed:
         return None
@@ -208,13 +240,13 @@ def announce_fact_learned(
         "fact": trimmed,
         "kind": kind if kind in _KNOWN_KINDS else _KIND_IDENTITY,
         "source": source or "conversation",
+        "status": status if status in _KNOWN_STATUSES else STATUS_LEARNED,
     }
+    trimmed_previous_fact = _trim_fact(previous_fact or "")
+    if trimmed_previous_fact:
+        payload["previous_fact"] = trimmed_previous_fact
     TurnLearnedFactsCollector.add(
-        {
-            "fact": payload["fact"],
-            "kind": payload["kind"],
-            "source": payload["source"],
-        }
+        {key: value for key, value in payload.items() if key != "type"}
     )
     try:
         from langgraph.config import get_stream_writer
@@ -228,10 +260,10 @@ def announce_fact_learned(
 def attach_learned_facts_metadata(
     avatar_response: Any, messages: list[Any] | None
 ) -> None:
-    """Copy this turn's newly stored facts onto the reply the person sees.
+    """Copy this turn's announced facts onto the reply the person sees.
 
     When a turn collector is active, only facts ``announce_fact_learned``
-    recorded (successful new stores) are attached — never older learn
+    recorded (learned, known, updated, and removed facts) are attached — never older learn
     ToolMessages that may still appear in ``messages``. Outside a turn
     (unit tests), fall back to parsing ``messages``.
     """

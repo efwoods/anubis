@@ -93,6 +93,9 @@ from src.anubis.utils.ambient.triage_node import (
 )
 from src.anubis.utils.context import GlobalContext
 from src.anubis.utils.deep_agent import build_avatar_deep_agent
+from src.anubis.utils.middleware.step_budget_guard import (
+    deep_agent_graph_recursion_limit,
+)
 from src.anubis.utils.middleware.avatar_summarization import (
     CONVERSATION_SUMMARY_EVENT_KEY,
     CONVERSATION_SUMMARY_SESSION_ID_KEY,
@@ -119,7 +122,7 @@ from src.anubis.utils.nodes import (
     resolve_human_message_images,
 )
 from src.anubis.utils.runtime_handles import get_deep_agent_checkpointer
-from src.anubis.utils.state import GlobalState
+from src.anubis.utils.state import AnubisOutputState, GlobalState
 from src.anubis.utils.tools.browser import (
     get_browser_toolkit_tools,
     release_conversation_browser,
@@ -1275,8 +1278,10 @@ async def think(
     # regardless of DEEP_AGENT_RECURSION_LIMIT, which multi-step analysis turns
     # (discover → ingest → execute → persist) routinely exceed.
     deep_agent_run_context = runtime.context or GlobalContext()
-    deep_agent_config["recursion_limit"] = (
-        deep_agent_run_context.deep_agent_recursion_limit
+    # Learning rounds get room on top of DEEP_AGENT_RECURSION_LIMIT;
+    # ``StepBudgetGuard`` still ends non-learning work at DEEP_AGENT_RECURSION_LIMIT.
+    deep_agent_config["recursion_limit"] = deep_agent_graph_recursion_limit(
+        deep_agent_run_context
     )
 
     # Data-analysis capability gate: the SOLE condition is one or more saved MCP
@@ -2182,9 +2187,25 @@ async def _run_avatar_deep_agent_turn(
     except Exception:
         logger.exception("Could not attach this turn's charts.")
 
+    # The reply absorbs every image-description and triage call made since the
+    # previous reply (observations judged ``ignore`` included) into
+    # ``response_metadata["turn_cost"]``, then the pending list is emptied. Done
+    # outside the post-reply analysis deadline so a slow analysis never drops it.
+    pending_turn_cost_items = list(state.get("pending_turn_cost_items") or [])
+    if isinstance(final_message, AIMessage):
+        from src.anubis.utils.billing.turn_cost import attach_turn_cost_breakdown
+
+        attach_turn_cost_breakdown(
+            final_message,
+            pending_turn_cost_items,
+            reply_model_name=getattr(runtime.context or GlobalContext(), "model", None),
+        )
+        pending_turn_cost_items = []
+
     update: dict[str, Any] = {
         "messages": [final_message],
         "internal_thoughts": [*intermediate, final_message],
+        "pending_turn_cost_items": pending_turn_cost_items,
     }
 
     # Carry the summarizer's event across turns. The deep agent saw the outer
@@ -2329,7 +2350,9 @@ async def mcp_auto_adopt(
 anubis_workflow = StateGraph(
     state_schema=GlobalState,
     input_schema=GlobalState,
-    output_schema=MessagesState,
+    # ``pending_turn_cost_items`` is handed back beside ``messages`` so the
+    # outer workflow sees the pending-cost list the reply just emptied.
+    output_schema=AnubisOutputState,
     context_schema=GlobalContext,
 )
 

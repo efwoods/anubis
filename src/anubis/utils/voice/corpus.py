@@ -1040,7 +1040,12 @@ async def resolve_speaking_voice_and_provider(
     repository: Any, assistant_id: str, context: Any = None
 ) -> SpeakingVoice:
     """Return the voice that speaks for the avatar and the provider that synthesizes the voice."""
+    from src.anubis.utils.voice.standard_voices import (
+        carry_standard_voice_to_active_provider,
+    )
+
     record = await repository.get_voice(assistant_id) or {}
+    record = await carry_standard_voice_to_active_provider(repository, record, context)
     return speaking_voice_of(record, context)
 
 
@@ -1148,11 +1153,13 @@ async def voice_readiness(
     has just become usable, so the avatar starts speaking without a reload.
     """
     from src.anubis.utils.voice.standard_voices import (
+        carry_standard_voice_to_active_provider,
         standard_voice_of,
         voice_choice_of,
     )
 
     record = await _voice_record(repository, user_id, assistant_id)
+    record = await carry_standard_voice_to_active_provider(repository, record, context)
     thresholds = VoiceThresholds.from_context(context)
     speaking_voice = speaking_voice_of(record, context)
     active_provider_name = active_voice_provider_name(context)
@@ -1207,8 +1214,13 @@ async def voice_status_for(
     With ``store`` given, the status also names the document the reference
     clip was cut from.
     """
+    from src.anubis.utils.voice.standard_voices import (
+        carry_standard_voice_to_active_provider,
+    )
+
     thresholds = VoiceThresholds.from_context(context)
     record = await _voice_record(repository, user_id, assistant_id)
+    record = await carry_standard_voice_to_active_provider(repository, record, context)
     collected = float(await repository.total_voice_seconds(assistant_id))
     # The clone is normally built when the clip that crosses the minimum is
     # stored. When that attempt failed (the panel shows ``instant_error``) the

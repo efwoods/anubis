@@ -30,6 +30,7 @@ def test_parse_learned_about_the_user_returns_user_kind():
         "fact": "I am very lucky.",
         "kind": "user",
         "source": "conversation",
+        "status": "learned",
     }
 
 
@@ -42,6 +43,7 @@ def test_parse_plain_learned_still_returns_identity():
         "fact": "I was born in Chicago.",
         "kind": "identity",
         "source": "conversation",
+        "status": "learned",
     }
 
 
@@ -85,6 +87,7 @@ def test_attach_uses_announced_facts_not_stale_tool_messages():
                 "fact": "I am very lucky.",
                 "kind": "user",
                 "source": "conversation",
+                "status": "learned",
             }
         ]
     finally:
@@ -158,7 +161,78 @@ async def test_attach_post_reply_analysis_uses_announced_facts(monkeypatch):
                 "fact": "I am very lucky.",
                 "kind": "user",
                 "source": "conversation",
+                "status": "learned",
             }
         ]
     finally:
         TurnLearnedFactsCollector.end_turn()
+
+
+def test_known_updated_and_removed_facts_all_reach_the_badge():
+    """Every fact of a message is shown: new, already known, corrected, and removed."""
+    TurnLearnedFactsCollector.begin_turn()
+    try:
+        announce_fact_learned("I played French horn.", kind="identity")
+        announce_fact_learned("I taught Evan to write.", kind="identity", status="known")
+        announce_fact_learned(
+            "I would say 'You're going to run out of space'.",
+            kind="user",
+            status="updated",
+            previous_fact="I would say 'write small'.",
+        )
+        announce_fact_learned("I wore braces.", kind="identity", status="removed")
+        final_message = AIMessage(content="I remember all of that.")
+
+        attach_learned_facts_metadata(final_message, [final_message])
+
+        assert final_message.response_metadata["learned_facts"] == [
+            {
+                "fact": "I played French horn.",
+                "kind": "identity",
+                "source": "conversation",
+                "status": "learned",
+            },
+            {
+                "fact": "I taught Evan to write.",
+                "kind": "identity",
+                "source": "conversation",
+                "status": "known",
+            },
+            {
+                "fact": "I would say 'You're going to run out of space'.",
+                "kind": "user",
+                "source": "conversation",
+                "status": "updated",
+                "previous_fact": "I would say 'write small'.",
+            },
+            {
+                "fact": "I wore braces.",
+                "kind": "identity",
+                "source": "conversation",
+                "status": "removed",
+            },
+        ]
+    finally:
+        TurnLearnedFactsCollector.end_turn()
+
+
+def test_same_fact_with_two_statuses_keeps_both_badges():
+    """A fact removed and learned again in one turn shows both entries once each."""
+    TurnLearnedFactsCollector.begin_turn()
+    try:
+        announce_fact_learned("I sang baritone.", status="removed")
+        announce_fact_learned("I sang baritone.", status="learned")
+        announce_fact_learned("I sang baritone.", status="learned")
+
+        statuses = [entry["status"] for entry in TurnLearnedFactsCollector.collect()]
+
+        assert statuses == ["removed", "learned"]
+    finally:
+        TurnLearnedFactsCollector.end_turn()
+
+
+def test_unknown_status_falls_back_to_learned():
+    payload = announce_fact_learned("I sang baritone.", status="invented")
+    assert payload is not None
+    assert payload["status"] == "learned"
+    assert "previous_fact" not in payload

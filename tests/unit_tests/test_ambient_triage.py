@@ -247,3 +247,58 @@ def test_modules_expose_the_agent_inbox_decisions():
     assert observations_module.AMBIENT_DECISIONS == ("ignore", "respond", "notify")
     assert triage_module.AMBIENT_CLASSIFY_SYSTEM_PROMPT.startswith("<TASK>")
     assert "playful_performance" in triage_module.AMBIENT_CLASSIFY_SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_classify_observation_reports_the_classifier_call_usage(monkeypatch):
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, LLMResult
+
+    class _FakeModel:
+        async def ainvoke(self, input, config=None):
+            generation_message = AIMessage(
+                content="",
+                usage_metadata={
+                    "input_tokens": 3000,
+                    "output_tokens": 200,
+                    "total_tokens": 3200,
+                    "input_token_details": {"cache_read": 1000},
+                },
+                response_metadata={"model_name": "gpt-5.6-luna"},
+            )
+            model_result = LLMResult(
+                generations=[[ChatGeneration(message=generation_message)]]
+            )
+            for callback_handler in config["callbacks"]:
+                await callback_handler.on_llm_end(model_result)
+            return AmbientTriageClassification(
+                decision="ignore",
+                needs_owner_action=False,
+                observation_kind="other",
+                summary="A person reads.",
+                salience=0.1,
+                reason="routine",
+            )
+
+    monkeypatch.setattr(
+        "src.anubis.utils.model.init_model", lambda **kwargs: _FakeModel()
+    )
+    usage_readings: list = []
+    classification = await classify_observation(
+        SimpleNamespace(),
+        assistant_name="Ada",
+        observation_text="screen: a document",
+        recent_messages=[],
+        previous_observations=[],
+        preferences=[],
+        voice_mode=False,
+        usage_readings=usage_readings,
+    )
+    assert classification.decision == "ignore"
+    assert len(usage_readings) == 1
+    usage_reading = usage_readings[0]
+    assert usage_reading["model_name"] == "gpt-5.6-luna"
+    assert usage_reading["prompt_tokens"] == 3000
+    assert usage_reading["completion_tokens"] == 200
+    assert usage_reading["cached_prompt_tokens"] == 1000
+    assert usage_reading["latency_ms"] >= 0.0

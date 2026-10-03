@@ -120,6 +120,15 @@ class GlobalContext:
             )
         },
     )
+    verbose: str = field(
+        default=None,
+        metadata={
+            "description": (
+                "When set to TRUE, log verbose runtime state such as the full "
+                "state['messages'] list on every load_consciousness pass. Env VERBOSE."
+            )
+        },
+    )
 
     """ <Inference Model> """
 
@@ -198,6 +207,13 @@ class GlobalContext:
 
     image_model_cached_prompt_cost: float = 0.0
     # metadata={"description": "Cost of one image-model input token served from the prompt cache."},
+
+    image_model_reasoning_effort: str = field(
+        default="minimal",
+        metadata={
+            "description": "Reasoning effort sent with every IMAGE_MODEL call (minimal, low, medium, high; empty sends none and the vendor default applies). Measured 2026-10-02 on gpt-5-nano with one 234,156-byte image, three calls each: vendor default 3,582-4,939 ms with 320-576 reasoning tokens; minimal 1,113-1,269 ms with 0 reasoning tokens. Every look, ambient snapshot and attached image waits on this call. Env IMAGE_MODEL_REASONING_EFFORT."
+        },
+    )
 
     """ </Image Model> """
 
@@ -702,6 +718,13 @@ class GlobalContext:
         default=50,
         metadata={
             "description": "LangGraph recursion limit for the deep agent's inner tool-call loop invoked by the think node. Env DEEP_AGENT_RECURSION_LIMIT."
+        },
+    )
+
+    deep_agent_maximum_learning_rounds: int = field(
+        default=60,
+        metadata={
+            "description": "Tool rounds that save a newly learned fact which the deep agent may run on top of DEEP_AGENT_RECURSION_LIMIT. A learning round does not spend DEEP_AGENT_RECURSION_LIMIT, so a message carrying many facts is learned in full; the graph's recursion limit becomes DEEP_AGENT_RECURSION_LIMIT + 5 x this value as the backstop. Env DEEP_AGENT_MAXIMUM_LEARNING_ROUNDS."
         },
     )
 
@@ -1688,6 +1711,20 @@ class GlobalContext:
         default="en",
         metadata={
             "description": "ISO 639-1 language Cartesia instant clones are built in, the stock catalogue is filtered to, and speech is rendered in. Env CARTESIA_VOICE_LANGUAGE."
+        },
+    )
+
+    cartesia_standard_female_voice_id: str | None = field(
+        default=None,
+        metadata={
+            "description": "Cartesia voice id of the standard female stock voice: listed first in the Voice panel picker and assigned to a new or clone-less female avatar. Env CARTESIA_STANDARD_FEMALE_VOICE_ID."
+        },
+    )
+
+    cartesia_standard_male_voice_id: str | None = field(
+        default=None,
+        metadata={
+            "description": "Cartesia voice id of the standard male stock voice: listed first in the Voice panel picker and assigned to a new or clone-less male avatar. Env CARTESIA_STANDARD_MALE_VOICE_ID."
         },
     )
 

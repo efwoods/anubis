@@ -151,3 +151,42 @@ async def test_a_reply_to_an_observation_streams_tokens_after_the_decision(harne
     assert frames[-1]["ambient"]["decision"] == "respond"
     assert frames[-1]["response_metadata"]["ambient"]["decision"] == "respond"
     assert len(message_meterings) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_triage_call_is_metered_beside_the_messages(harness, monkeypatch):
+    _updates, _image_meterings, message_meterings = harness
+    graph_model_call_meterings = []
+
+    async def fake_graph_model_call_meter(app_state, current_user, payload, **kwargs):
+        graph_model_call_meterings.append((payload, kwargs))
+
+    monkeypatch.setattr(
+        webapp_module, "_meter_graph_model_call_usage", fake_graph_model_call_meter
+    )
+    triage_usage = {
+        "type": "ambient_triage_usage",
+        "source": "ambient_triage",
+        "input_tokens": 3000,
+        "output_tokens": 200,
+        "total_tokens": 3200,
+        "cached_prompt_tokens": 1000,
+        "cache_write_tokens": 0,
+        "total_cost": 0.00084,
+        "latency_ms": 812.5,
+        "model_name": "gpt-5.6-luna",
+    }
+    frames = await _frames([((), "custom", triage_usage), ((), "custom", DECISION)])
+
+    assert [frame["type"] for frame in frames] == [
+        "turn_started",
+        "ambient_decision",
+        "done",
+    ]
+    assert len(graph_model_call_meterings) == 1
+    metered_payload, metered_keywords = graph_model_call_meterings[0]
+    assert metered_payload["total_tokens"] == 3200
+    assert metered_keywords["inference_type"] == "ambient_triage"
+    assert metered_keywords["thread_id"] == "t1"
+    assert metered_keywords["request_id"] == "r1"
+    assert message_meterings == []

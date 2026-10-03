@@ -59,16 +59,23 @@ class _RecordingStore:
         return None
 
 
-def _name_item(fact: str):
+def _name_item(fact: str, score: float = 0.9):
     """A store item shaped the way the name lookup reads it."""
     return SimpleNamespace(
         value={"document": {"kwargs": {"metadata": {"fact": fact}}}},
-        score=0.9,
+        score=score,
     )
 
 
-async def _build_prompt(store, *, assistant_name, user_id=VISITOR_ID):
-    """Drive the real consciousness builder and return the rendered system prompt."""
+async def _build_prompt(
+    store, *, assistant_name, user_id=VISITOR_ID, runtime_assistant_ctx=None
+):
+    """Drive the real consciousness builder and return the rendered system prompt.
+
+    ``runtime_assistant_ctx`` overrides the assistant context on
+    ``runtime.context`` alone, leaving ``config["configurable"]`` holding the
+    avatar row's name — the arrangement the API produces.
+    """
     assistant_ctx = {
         "name": assistant_name,
         "metadata": {"user_id": CREATOR_ID},
@@ -89,7 +96,14 @@ async def _build_prompt(store, *, assistant_name, user_id=VISITOR_ID):
     }
     runtime = SimpleNamespace(
         store=store,
-        context=SimpleNamespace(assistant_ctx=assistant_ctx, user_ctx={}),
+        context=SimpleNamespace(
+            assistant_ctx=(
+                assistant_ctx
+                if runtime_assistant_ctx is None
+                else runtime_assistant_ctx
+            ),
+            user_ctx={},
+        ),
     )
     update = await nodes._build_consciousness_system_message_update(
         state, config, runtime
@@ -180,3 +194,43 @@ async def test_whitespace_only_name_is_treated_as_blank():
     system_prompt = await _build_prompt(store, assistant_name="   ")
 
     assert "Grant Imahara" in _rendered_name_section(system_prompt)
+
+
+@pytest.mark.asyncio
+async def test_avatar_row_name_in_configurable_wins_over_empty_runtime_context():
+    """The API passes the shared ``app.state.context``, whose assistant context
+    carries no name; the avatar row's name rides in ``config["configurable"]``.
+
+    Reading only ``runtime.context`` skipped the avatar row's name and rendered
+    the nearest identity fact ("I do not swear or curse.") as the name.
+    """
+    store = _RecordingStore(
+        {ASSISTANT_IDENTITY_NAMESPACE: [_name_item("I do not swear or curse.")]}
+    )
+
+    system_prompt = await _build_prompt(
+        store,
+        assistant_name="Evan Woods",
+        runtime_assistant_ctx={"name": None, "metadata": {"user_id": CREATOR_ID}},
+    )
+
+    assert _rendered_name_section(system_prompt) == "Evan Woods"
+    identity_searches = store.searched_namespaces.count(ASSISTANT_IDENTITY_NAMESPACE)
+    assert identity_searches == 1, store.searched_namespaces
+
+
+@pytest.mark.asyncio
+async def test_fallback_ignores_a_nearest_fact_below_the_score_floor():
+    """An avatar with no stored name gets an empty name section, never the
+    nearest unrelated identity fact."""
+    store = _RecordingStore(
+        {
+            ASSISTANT_IDENTITY_NAMESPACE: [
+                _name_item("I do not swear or curse.", score=0.31)
+            ]
+        }
+    )
+
+    system_prompt = await _build_prompt(store, assistant_name=None)
+
+    assert _rendered_name_section(system_prompt) == ""

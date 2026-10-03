@@ -635,6 +635,103 @@ async def test_speak_falls_back_to_the_standard_voice_without_a_clone(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_the_owner_hears_the_trained_voice_while_the_standard_voice_speaks(
+    monkeypatch,
+):
+    """``voice: "trained"`` plays the clone for the owner without changing the choice."""
+    from fastapi import HTTPException
+
+    from src.anubis.utils.voice.standard_voices import set_standard_voice
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-9"}
+    )
+    await set_standard_voice(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        voice={"voice_id": "std-adam", "name": "Adam", "gender": "male"},
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _meter(current_user, **kwargs):
+        return None
+
+    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _meter)
+    owner_checks = []
+
+    async def _owned(assistant_id, current_user, action):
+        owner_checks.append(assistant_id)
+        return {"metadata": {}}, False
+
+    monkeypatch.setattr(webapp_module, "_owned_assistant_for_voice", _owned)
+
+    async def _speak(payload):
+        return await webapp_module.speak_text(
+            request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hi", **payload}),
+            current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+        )
+
+    trained_response = await _speak({"voice": "trained"})
+    assert trained_response.body == b"audio:ivc-9:hi"
+    assert trained_response.headers["x-voice-kind"] == "instant"
+    assert owner_checks == [ASSISTANT_ID]
+    # The replies still speak with the standard voice the owner chose.
+    reply_response = await _speak({})
+    assert reply_response.body == b"audio:std-adam:hi"
+
+    with pytest.raises(HTTPException) as unknown_voice_error:
+        await _speak({"voice": "someone-else"})
+    assert unknown_voice_error.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_the_trained_voice_sample_is_refused_without_a_trained_voice(monkeypatch):
+    """A standard voice never stands in when the owner asked for the trained voice."""
+    from src.anubis.utils.voice.standard_voices import set_standard_voice
+    from src.api import webapp as webapp_module
+
+    _FakeVendor().install(monkeypatch)
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await set_standard_voice(
+        repository,
+        user_id=USER_ID,
+        assistant_id=ASSISTANT_ID,
+        voice={"voice_id": "std-adam", "name": "Adam", "gender": "male"},
+    )
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _owned(assistant_id, current_user, action):
+        return {"metadata": {}}, False
+
+    monkeypatch.setattr(webapp_module, "_owned_assistant_for_voice", _owned)
+
+    response = await webapp_module.speak_text(
+        request=_json_request(
+            {"assistant_id": ASSISTANT_ID, "text": "hi", "voice": "trained"}
+        ),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+    assert response.status_code == 409
+    assert "voice_not_ready" in response.body.decode("utf-8")
+
+
+@pytest.mark.asyncio
 async def test_the_owner_chooses_between_the_standard_voice_and_the_clone(monkeypatch):
     """Picking a standard voice speaks with that voice; ``custom`` brings the clone back.
 

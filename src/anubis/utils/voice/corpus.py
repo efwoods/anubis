@@ -933,18 +933,25 @@ def _clone_voice_of(
 ) -> SpeakingVoice | None:
     """Return the avatar's clone: professional first, then an instant clone per provider.
 
-    Instant clones are tried in ``speaking_provider_order``: the active
-    provider's clone first, then a clone another provider minted before
-    ``VOICE_PROVIDER`` was switched, which keeps speaking until the active
-    provider has a clone of the avatar's own. A banned clone never counts from
-    another provider; from the active provider the banned clone is still
+    Only the active provider's clones speak (see ``speaking_provider_order``).
+    The professional clone lives on ElevenLabs, so the professional clone
+    speaks only while ElevenLabs is the active provider. A clone another
+    provider minted before ``VOICE_PROVIDER`` was switched stays stored but is
+    passed over; ``build_active_provider_clone_when_due`` builds the active
+    provider's clone from the same stored speech. A banned clone is still
     reported unless ``usable_only`` is set, so the caller can say the voice is
     blocked.
     """
     if (
         record.get("professional_state") == VOICE_STATE_FINE_TUNED
         and record.get("professional_voice_id")
-        and (context is None or professional_voice_configured(context))
+        and (
+            context is None
+            or (
+                active_voice_provider_name(context) == ELEVENLABS_PROVIDER_NAME
+                and professional_voice_configured(context)
+            )
+        )
     ):
         return SpeakingVoice(
             kind="professional",
@@ -965,7 +972,7 @@ def _clone_voice_of(
 
 
 def _standard_voice_of(record: dict[str, Any], context: Any) -> SpeakingVoice | None:
-    """Return the chosen stock voice, the active provider's pick first."""
+    """Return the active provider's stock voice pick, or ``None``."""
     from src.anubis.utils.voice.standard_voices import standard_voice_of
 
     for provider_name in speaking_provider_order(context):
@@ -1046,6 +1053,7 @@ async def resolve_speaking_voice_and_provider(
 
     record = await repository.get_voice(assistant_id) or {}
     record = await carry_standard_voice_to_active_provider(repository, record, context)
+    record = await build_active_provider_clone_when_due(repository, record, context)
     return speaking_voice_of(record, context)
 
 
@@ -1137,6 +1145,55 @@ def _instant_clone_retry_due(
     return datetime.now(tz=UTC).timestamp() - failed_at >= INSTANT_CLONE_RETRY_SECONDS
 
 
+async def build_active_provider_clone_when_due(
+    repository: Any, record: dict[str, Any], context: Any
+) -> dict[str, Any]:
+    """Build the active provider's instant clone from the stored speech when one is due.
+
+    After ``VOICE_PROVIDER`` is switched, an avatar whose clone another
+    provider minted has no voice of the avatar's own on the active provider.
+    The stored speech that built the earlier clone builds the active provider's
+    clone here, on the first speak or readiness read, instead of waiting for the
+    owner to open the Voice panel. ``_instant_clone_retry_due`` decides when a
+    build is due, so a failed build waits ``INSTANT_CLONE_RETRY_SECONDS``.
+
+    Returns the record, reloaded after a build. An unexpected failure leaves
+    the record unchanged.
+    """
+    if not record or context is None:
+        return record
+    assistant_id = str(record.get("assistant_id") or "")
+    if not assistant_id or voice_slot(
+        dict(record), active_voice_provider_name(context)
+    ).get("instant_voice_id"):
+        return record
+    thresholds = VoiceThresholds.from_context(context)
+    try:
+        # The clone belongs to the stored row's owner. A record with no stored
+        # row was only defaulted for the caller and holds no speech to clone.
+        stored_record = await repository.get_voice(assistant_id)
+        user_id = str((stored_record or {}).get("user_id") or "")
+        if not user_id:
+            return record
+        collected = float(await repository.total_voice_seconds(assistant_id))
+        if not _instant_clone_retry_due(record, collected, thresholds, context):
+            return record
+        return await ensure_instant_voice(
+            repository,
+            context,
+            user_id=user_id,
+            assistant_id=assistant_id,
+        )
+    except Exception:  # noqa: BLE001 - speaking must not fail on a clone build
+        logger.warning(
+            "Building the %s instant clone for %s failed.",
+            active_voice_provider_name(context),
+            assistant_id,
+            exc_info=True,
+        )
+        return record
+
+
 async def voice_readiness(
     repository: Any,
     context: Any,
@@ -1160,6 +1217,7 @@ async def voice_readiness(
 
     record = await _voice_record(repository, user_id, assistant_id)
     record = await carry_standard_voice_to_active_provider(repository, record, context)
+    record = await build_active_provider_clone_when_due(repository, record, context)
     thresholds = VoiceThresholds.from_context(context)
     speaking_voice = speaking_voice_of(record, context)
     active_provider_name = active_voice_provider_name(context)

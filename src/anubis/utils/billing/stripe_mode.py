@@ -19,6 +19,14 @@ other mode keeps working. The in-memory ``app_metadata.stripe_customer_id`` of
 the request's user is pointed at the current-mode customer, so every existing
 reader of the customer id (``resolve_stripe_customer_id`` and 20 call sites)
 receives the right customer without change.
+
+The administrator account (``ADMIN_USER_ID`` / ``ADMIN_ACCOUNT_EMAIL``) is
+never charged: in live mode the administrator gets no customer at all, any
+live customer recorded for the administrator is dropped from Auth0, and
+``report_meter_event`` refuses every customer id ever recorded for the
+administrator. Usage still reaches the ``api_metrics`` ledger, so cost
+analysis keeps working; only Stripe never hears about the administrator in
+live mode.
 """
 
 from __future__ import annotations
@@ -64,6 +72,67 @@ def current_stripe_mode() -> str | None:
 def other_stripe_mode(stripe_mode: str) -> str:
     """Return the Stripe mode opposite to ``stripe_mode``."""
     return STRIPE_MODE_TEST if stripe_mode == STRIPE_MODE_LIVE else STRIPE_MODE_LIVE
+
+
+_never_charged_customer_ids: set[str] = set()
+_administrator_identity_cache: dict[str, tuple[str, str]] = {}
+
+
+def _bare_user_id(user_id: Any) -> str:
+    """Drop an identity-provider prefix: ``auth0|6a64…`` and ``6a64…`` are one account."""
+    return str(user_id or "").strip().split("|")[-1].casefold()
+
+
+def _administrator_identity() -> tuple[str, str]:
+    """Return the configured administrator (bare user id, email), read once per process."""
+    if "administrator" not in _administrator_identity_cache:
+        from src.anubis.utils.context import GlobalContext
+
+        context = GlobalContext()
+        _administrator_identity_cache["administrator"] = (
+            _bare_user_id(getattr(context, "admin_user_id", None)),
+            str(getattr(context, "admin_account_email", None) or "").strip().casefold(),
+        )
+    return _administrator_identity_cache["administrator"]
+
+
+def is_never_charged_account(user: Mapping[str, Any] | None) -> bool:
+    """Report whether ``user`` is the administrator account, which Stripe never charges."""
+    if not user:
+        return False
+    administrator_user_id, administrator_email = _administrator_identity()
+    user_identifiers = {_bare_user_id(user.get("user_id")), _bare_user_id(user.get("id"))}
+    identities = user.get("identities") or []
+    if identities and isinstance(identities[0], Mapping):
+        user_identifiers.add(_bare_user_id(identities[0].get("user_id")))
+    user_identifiers.discard("")
+    if administrator_user_id and administrator_user_id in user_identifiers:
+        return True
+    user_email = str(user.get("email") or "").strip().casefold()
+    return bool(administrator_email and user_email == administrator_email)
+
+
+def is_never_charged_customer(stripe_customer_id: str | None) -> bool:
+    """Report whether ``stripe_customer_id`` was ever recorded for the administrator."""
+    return bool(stripe_customer_id) and stripe_customer_id in _never_charged_customer_ids
+
+
+def _withhold_live_customer_from_administrator(app_metadata: dict) -> dict:
+    """Clear every customer reference the request's administrator user carries in live mode."""
+    customer_ids_by_mode = dict(app_metadata.get(STRIPE_CUSTOMER_IDS_METADATA_KEY) or {})
+    for customer_id in (
+        customer_ids_by_mode.get(STRIPE_MODE_LIVE),
+        _legacy_customer_id(app_metadata),
+    ):
+        if customer_id:
+            _never_charged_customer_ids.add(str(customer_id))
+    app_metadata["stripe_customer_id"] = None
+    app_metadata.pop("customer_dict", None)
+    app_metadata.pop("customer", None)
+    subscription_status = app_metadata.get("subscription_status")
+    if isinstance(subscription_status, dict):
+        subscription_status["customer_id"] = None
+    return customer_ids_by_mode
 
 
 def customer_id_for_current_mode(app_metadata: Mapping[str, Any] | None) -> str | None:
@@ -154,6 +223,36 @@ async def reconcile_stripe_customer_for_current_mode(request: Any, user: dict) -
     if user.get("is_anonymous") is True:
         return None
     app_metadata = user.setdefault("app_metadata", {})
+    if stripe_mode == STRIPE_MODE_LIVE and is_never_charged_account(user):
+        customer_ids_by_mode = _withhold_live_customer_from_administrator(app_metadata)
+        live_customer_id = customer_ids_by_mode.pop(STRIPE_MODE_LIVE, None)
+        app_metadata[STRIPE_CUSTOMER_IDS_METADATA_KEY] = customer_ids_by_mode
+        if live_customer_id:
+            # A live customer was recorded for the administrator before this
+            # rule existed (2026-09-28 15:00:06 UTC); drop the live customer
+            # from Auth0 so no process ever reads the live customer again.
+            try:
+                from src.security.auth import update_user_app_metadata_fields
+
+                await update_user_app_metadata_fields(
+                    request,
+                    str(auth0_user_id),
+                    {STRIPE_CUSTOMER_IDS_METADATA_KEY: dict(customer_ids_by_mode)},
+                    evict_cached_credentials=False,
+                )
+                logger.info(
+                    "Dropped live Stripe customer %s from the administrator %s; "
+                    "the administrator is never charged",
+                    live_customer_id,
+                    auth0_user_id,
+                )
+            except Exception as auth0_error:  # noqa: BLE001 - the refusal set still guards
+                logger.error(
+                    "Could not drop live customer %s from the administrator: %s",
+                    live_customer_id,
+                    auth0_error,
+                )
+        return None
     customer_ids_by_mode = dict(app_metadata.get(STRIPE_CUSTOMER_IDS_METADATA_KEY) or {})
 
     recorded_customer_id = customer_ids_by_mode.get(stripe_mode) or _reconciled_customer_ids.get(

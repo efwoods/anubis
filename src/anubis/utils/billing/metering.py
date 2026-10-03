@@ -150,6 +150,16 @@ async def report_meter_event(
         return False
     if value <= 0:
         return False
+    from src.anubis.utils.billing.stripe_mode import is_never_charged_customer
+
+    if is_never_charged_customer(stripe_customer_id):
+        # The administrator account is never charged (stripe_mode.py).
+        logger.info(
+            "Skipping %s meter report: customer %s belongs to the administrator.",
+            meter.value,
+            stripe_customer_id,
+        )
+        return False
 
     payload: dict[str, str] = {
         "stripe_customer_id": stripe_customer_id,

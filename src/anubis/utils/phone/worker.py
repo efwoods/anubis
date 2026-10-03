@@ -71,8 +71,12 @@ async def run_worker() -> None:
     credentials are present. Tests call ``finish_outbound_call`` directly.
     """
     from src.anubis.utils.context import GlobalContext
+    from src.anubis.utils.trace_tally import run_trace_tally
 
     context = GlobalContext()
+    # The phone worker sends LangSmith traces too, so the phone worker counts
+    # traces in the same shared trace tally as the API process.
+    _trace_tally_task = asyncio.create_task(run_trace_tally(context))
     livekit_url = str(getattr(context, "livekit_url", None) or "").strip()
     if not livekit_url:
         logger.warning(

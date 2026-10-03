@@ -3022,6 +3022,15 @@ async def lifespan(app: FastAPI):
 
     # Initialize context / context
     app.state.context = GlobalContext()
+    # LangSmith bills every trace past the plan's included traces. The trace
+    # tally counts each trace as the trace is sent and drops traces past
+    # LANGSMITH_MONTHLY_TRACE_LIMIT until LangSmith's billing period resets;
+    # conversations continue untraced.
+    from src.anubis.utils.trace_tally import run_trace_tally
+
+    app.state.trace_tally_task = asyncio.create_task(
+        run_trace_tally(app.state.context)
+    )
     # Group-conversation routes must not re-import this module. Publish the
     # helpers they need on app.state so a request can call them in-process.
     app.state.enforce_remaining_allotment = enforce_remaining_allotment
@@ -3184,6 +3193,13 @@ async def lifespan(app: FastAPI):
     inbox_package.set_inbox_repository(
         inbox_package.PostgresInboxRepository(app.state.pool)
     )
+    # The avatars each account took off the selection carousel, so a hide
+    # follows the account into every browser.
+    from src.anubis.utils.hidden_carousel_avatars import (
+        ensure_hidden_carousel_avatar_table,
+    )
+
+    await ensure_hidden_carousel_avatar_table(app.state.pool)
     from src.anubis.utils.phone import repository as phone_repository
 
     await phone_repository.ensure_phone_tables(app.state.pool)
@@ -3366,6 +3382,9 @@ async def lifespan(app: FastAPI):
         purge_task = getattr(app.state, "usage_analytics_purge_task", None)
         if purge_task is not None:
             purge_task.cancel()
+        trace_tally_task = getattr(app.state, "trace_tally_task", None)
+        if trace_tally_task is not None:
+            trace_tally_task.cancel()
         renewer_task = getattr(app.state, "subscription_renewer", None)
         if renewer_task is not None:
             renewer_task.cancel()
@@ -11961,6 +11980,54 @@ async def record_message_feedback_route(
     )
 
 
+@app.get("/hidden_carousel_avatars")
+async def get_hidden_carousel_avatars_route(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the assistant ids this account took off the avatar-selection carousel."""
+    from src.anubis.utils.hidden_carousel_avatars import (
+        list_hidden_carousel_avatar_ids,
+    )
+
+    user_id = current_user["identities"][0]["user_id"]
+    return JSONResponse(
+        {"assistant_ids": await list_hidden_carousel_avatar_ids(app.state.pool, user_id)}
+    )
+
+
+@app.put("/hidden_carousel_avatars")
+async def replace_hidden_carousel_avatars_route(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Replace the account's hidden carousel avatars with the JSON body's ``assistant_ids``."""
+    from src.anubis.utils.hidden_carousel_avatars import (
+        normalize_hidden_assistant_ids,
+        replace_hidden_carousel_avatar_ids,
+    )
+
+    try:
+        request_body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="The body must be JSON.")
+    try:
+        assistant_ids = normalize_hidden_assistant_ids(
+            (request_body or {}).get("assistant_ids")
+            if isinstance(request_body, dict)
+            else None
+        )
+    except ValueError as validation_error:
+        raise HTTPException(status_code=400, detail=str(validation_error))
+    user_id = current_user["identities"][0]["user_id"]
+    return JSONResponse(
+        {
+            "assistant_ids": await replace_hidden_carousel_avatar_ids(
+                app.state.pool, user_id, assistant_ids
+            )
+        }
+    )
+
+
 @app.get("/avatar_preferences/{assistant_id}")
 async def get_avatar_preferences_route(
     assistant_id: str,
@@ -14832,6 +14899,7 @@ async def speak_text(
     from src.anubis.utils.voice.corpus import (
         BLOCKED_VOICE_MESSAGE,
         NO_SPEAKING_VOICE,
+        build_active_provider_clone_when_due,
         mark_voice_blocked,
         speaking_voice_of,
         usable_clone_of,
@@ -14894,6 +14962,9 @@ async def speak_text(
 
     stored_voice = await repository.get_voice(assistant_id) or {}
     stored_voice = await carry_standard_voice_to_active_provider(
+        repository, stored_voice, context
+    )
+    stored_voice = await build_active_provider_clone_when_due(
         repository, stored_voice, context
     )
     speaking_voice = (
@@ -15391,7 +15462,10 @@ async def start_lip_sync_clip(
         lip_sync_enabled,
         start_lip_sync,
     )
-    from src.anubis.utils.voice.corpus import usable_clone_of
+    from src.anubis.utils.voice.corpus import (
+        build_active_provider_clone_when_due,
+        usable_clone_of,
+    )
     from src.anubis.utils.voice.provider_errors import VoiceProviderError
 
     repository = _voice_repository_or_503()
@@ -15411,7 +15485,12 @@ async def start_lip_sync_clip(
     # Lip sync speaks with the clone only; the speech is synthesized by the
     # provider that minted the clone and then animated on ElevenLabs.
     clone_voice = usable_clone_of(
-        await repository.get_voice(assistant_id) or {}, app.state.context
+        await build_active_provider_clone_when_due(
+            repository,
+            await repository.get_voice(assistant_id) or {},
+            app.state.context,
+        ),
+        app.state.context,
     )
     if clone_voice is None or clone_voice.voice_id is None:
         raise HTTPException(

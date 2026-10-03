@@ -2650,6 +2650,20 @@ class GlobalContext:
         },
     )
 
+    langsmith_monthly_trace_limit: int = field(
+        default=None,
+        metadata={
+            "description": "Billable LangSmith traces allowed per LangSmith billing period, counted across the whole LangSmith organization by the trace tally (src/anubis/utils/trace_tally.py). Every trace takes one slot from a shared Postgres tally as the trace is sent; once the tally reaches LANGSMITH_MONTHLY_TRACE_LIMIT, traces are dropped until LangSmith's billing period resets, and conversations continue untraced. Set LANGSMITH_MONTHLY_TRACE_LIMIT at or below the plan's included traces (Developer 5,000, Plus 10,000) so no trace is billed. Empty means no limit."
+        },
+    )
+
+    langsmith_trace_tally_block_size: int = field(
+        default=10,
+        metadata={
+            "description": "Trace slots one process reserves from the shared Postgres trace tally per reservation. Larger blocks mean fewer Postgres round trips; unused slots in a block still count against LANGSMITH_MONTHLY_TRACE_LIMIT. Env LANGSMITH_TRACE_TALLY_BLOCK_SIZE."
+        },
+    )
+
     deployment: str = field(
         default=None,
         metadata={

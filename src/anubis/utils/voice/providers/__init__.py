@@ -160,18 +160,15 @@ def other_voice_provider_names(context: Any = None) -> list[str]:
 
 
 def speaking_provider_order(context: Any = None) -> list[str]:
-    """Return the providers whose stored voices may speak, the active provider first.
+    """Return the providers whose stored voices may speak: the active provider only.
 
-    Another provider follows only while that provider still has a key, so a
-    voice minted by a provider that has been switched off entirely is skipped
-    rather than failing at synthesis. Without a context only the default
-    provider is listed, which is how every row behaved before a second provider
-    existed.
+    After ``VOICE_PROVIDER`` is switched, speech goes through the active
+    provider alone. A voice another provider minted stays stored in that
+    provider's slot and speaks again when ``VOICE_PROVIDER`` is switched back,
+    but the voice never speaks through the switched-off provider, whose key may
+    be refused. Without a context only the default provider is listed, which is
+    how every row behaved before a second provider existed.
     """
     if context is None:
         return [DEFAULT_VOICE_PROVIDER_NAME]
-    return [active_voice_provider_name(context)] + [
-        provider_name
-        for provider_name in other_voice_provider_names(context)
-        if voice_provider_configured(context, provider_name)
-    ]
+    return [active_voice_provider_name(context)]

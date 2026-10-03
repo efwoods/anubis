@@ -194,14 +194,16 @@ def test_voice_configured_follows_the_active_provider():
     )
 
 
-def test_speaking_order_skips_another_provider_without_a_key():
+def test_speaking_order_is_only_the_active_provider():
+    # A switched-off provider never speaks, even while that provider's key is
+    # still set: the key may be refused.
     assert voice_providers.speaking_provider_order(_cartesia_context()) == [
-        "cartesia",
-        "elevenlabs",
+        "cartesia"
     ]
     assert voice_providers.speaking_provider_order(
         _cartesia_context(elevenlabs_api_key=None)
     ) == ["cartesia"]
+    assert voice_providers.speaking_provider_order(_context()) == ["elevenlabs"]
     assert voice_providers.speaking_provider_order(None) == ["elevenlabs"]
 
 
@@ -486,18 +488,19 @@ async def test_switching_providers_is_revertible(fake_providers):
     eleven_context = _context()
     cartesia_context = _cartesia_context()
 
-    # Switched to Cartesia before a Cartesia clone exists: the ElevenLabs clone
-    # keeps speaking through ElevenLabs.
+    # Switched to Cartesia before a Cartesia clone exists: the first speak
+    # builds the Cartesia clone from the stored speech and speaks through
+    # Cartesia, never through ElevenLabs.
     speaking = await corpus.resolve_speaking_voice_and_provider(
         repository, ASSISTANT_ID, cartesia_context
     )
     assert (speaking.kind, speaking.voice_id, speaking.provider_name) == (
         "instant",
-        "ivc-el",
-        "elevenlabs",
+        "cartesia-clone-1",
+        "cartesia",
     )
 
-    # A status read builds the Cartesia clone lazily.
+    # A status read reports the Cartesia clone without building another.
     status = await corpus.voice_status_for(
         repository,
         cartesia_context,
@@ -633,7 +636,7 @@ async def test_a_clone_less_avatar_speaks_a_cartesia_stock_voice_after_the_switc
 
 
 @pytest.mark.asyncio
-async def test_a_failed_catalogue_read_keeps_the_earlier_stock_voice(
+async def test_a_failed_catalogue_read_never_speaks_through_the_earlier_provider(
     fake_providers, monkeypatch
 ):
     async def _refuse(context, *, gender):
@@ -651,9 +654,48 @@ async def test_a_failed_catalogue_read_keeps_the_earlier_stock_voice(
     speaking = await corpus.resolve_speaking_voice_and_provider(
         repository, ASSISTANT_ID, _cartesia_context()
     )
-    assert (speaking.voice_id, speaking.provider_name) == ("el-std", "elevenlabs")
+    assert speaking.kind == "none"
     stored = await repository.get_voice(ASSISTANT_ID)
     assert standard_voices.standard_voice_of(stored, "cartesia") is None
+    # The ElevenLabs pick stays stored for a switch back.
+    assert standard_voices.standard_voice_of(stored, "elevenlabs")["voice_id"] == (
+        "el-std"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_professional_clone_does_not_speak_after_switching_to_cartesia(
+    fake_providers,
+):
+    repository = InMemoryMediaAssetRepository()
+    await repository.upsert_voice(
+        {
+            "assistant_id": ASSISTANT_ID,
+            "user_id": USER_ID,
+            "professional_state": corpus.VOICE_STATE_FINE_TUNED,
+            "professional_voice_id": "pvc-el",
+        }
+    )
+    for _ in range(3):
+        await _add_clip(repository, 40)
+
+    speaking = await corpus.resolve_speaking_voice_and_provider(
+        repository, ASSISTANT_ID, _cartesia_context()
+    )
+    assert (speaking.kind, speaking.voice_id, speaking.provider_name) == (
+        "instant",
+        "cartesia-clone-1",
+        "cartesia",
+    )
+
+    speaking = await corpus.resolve_speaking_voice_and_provider(
+        repository, ASSISTANT_ID, _context()
+    )
+    assert (speaking.kind, speaking.voice_id, speaking.provider_name) == (
+        "professional",
+        "pvc-el",
+        "elevenlabs",
+    )
 
 
 @pytest.mark.asyncio
@@ -716,6 +758,42 @@ async def test_speak_synthesizes_with_the_provider_that_minted_the_voice(
     assert response.headers["x-voice-provider"] == "cartesia"
     assert recorded["model_name"] == "cartesia-model"
     assert recorded["cost_usd"] == pytest.approx(0.04 * 5 / 1000)
+
+
+@pytest.mark.asyncio
+async def test_speak_builds_and_speaks_the_cartesia_clone_of_an_elevenlabs_only_avatar(
+    monkeypatch, fake_providers
+):
+    from src.api import webapp as webapp_module
+
+    repository = InMemoryMediaAssetRepository()
+    media_repository.set_media_asset_repository(repository)
+    await repository.upsert_voice(
+        {"assistant_id": ASSISTANT_ID, "user_id": USER_ID, "instant_voice_id": "ivc-el"}
+    )
+    for _ in range(3):
+        await _add_clip(repository, 40)
+    monkeypatch.setattr(
+        webapp_module.app,
+        "state",
+        SimpleNamespace(context=_cartesia_context(), pool=None, stripe=None),
+    )
+    monkeypatch.setattr(webapp_module, "enforce_tier_capability", lambda *a, **k: None)
+
+    async def _meter(current_user, **kwargs):
+        return None
+
+    monkeypatch.setattr(webapp_module, "_meter_speech_characters", _meter)
+
+    response = await webapp_module.speak_text(
+        request=_json_request({"assistant_id": ASSISTANT_ID, "text": "hello"}),
+        current_user={"API_KEY": "k", "identities": [{"user_id": USER_ID}]},
+    )
+    assert response.status_code == 200
+    assert response.body == b"cartesia:cartesia-clone-1:hello"
+    assert response.headers["x-voice-provider"] == "cartesia"
+    stored = await repository.get_voice(ASSISTANT_ID)
+    assert stored["instant_voice_id"] == "ivc-el"
 
 
 @pytest.mark.asyncio

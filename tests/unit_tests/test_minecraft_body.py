@@ -319,3 +319,131 @@ def test_the_system_prompt_never_gives_the_user_the_avatar_appearance():
     assert "How to answer what the user looks like" in IDENTITY_SYSTEM_PROMPT_TEMPLATE
     assert "never the user's appearance" in IDENTITY_SYSTEM_PROMPT_TEMPLATE
     assert "ask the user to describe the user's appearance" in IDENTITY_SYSTEM_PROMPT_TEMPLATE
+
+
+# An act_in_minecraft argument object written into the reply text. The dev API
+# streamed this reply at 2026-10-04T01:50:03Z (gpt-5.6-luna); the JSON reached
+# Minecraft chat as speech.
+INLINE_ACT_REPLY = '{"commands":[{"name":"follow","arguments":[]}]} I’m coming, Marshall.'
+
+
+def _feed_one_character_at_a_time(act_filter, reply_text):
+    visible_text = "".join(act_filter.feed(character) for character in reply_text)
+    return visible_text + act_filter.finish()
+
+
+def test_an_inline_act_object_becomes_a_minecraft_act_frame_and_leaves_the_reply():
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        InlineMinecraftActFilter,
+    )
+
+    sent_frames = []
+    act_filter = InlineMinecraftActFilter(on_act=sent_frames.append)
+    visible_text = _feed_one_character_at_a_time(act_filter, INLINE_ACT_REPLY)
+    assert visible_text.strip() == "I’m coming, Marshall."
+    assert sent_frames == [
+        {
+            "type": MINECRAFT_ACT_EVENT,
+            "commands": [{"name": "follow", "arguments": []}],
+            "additional_as_is_text": "",
+        }
+    ]
+
+
+def test_braces_in_speech_and_in_act_strings_are_handled():
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        InlineMinecraftActFilter,
+    )
+
+    sent_frames = []
+    act_filter = InlineMinecraftActFilter(on_act=sent_frames.append)
+    reply_text = (
+        'A set {a, b} and {"note": 1}. '
+        '{"commands": [{"name": "say_chat", "arguments": ["a } b"]}, '
+        '{"name": "explodeWorld", "arguments": []}]} Done.'
+    )
+    visible_text = _feed_one_character_at_a_time(act_filter, reply_text)
+    assert visible_text == 'A set {a, b} and {"note": 1}.  Done.'
+    assert [frame["commands"] for frame in sent_frames] == [
+        [{"name": "say_chat", "arguments": ["a } b"]}]
+    ]
+
+
+def test_an_unclosed_inline_act_object_is_dropped_at_the_end_of_the_reply():
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        InlineMinecraftActFilter,
+    )
+
+    act_filter = InlineMinecraftActFilter()
+    assert _feed_one_character_at_a_time(
+        act_filter, 'On it. {"commands": [{"name": "follow"'
+    ) == "On it. "
+    assert act_filter.acts == []
+
+
+def test_the_saved_reply_has_no_inline_act_object():
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        strip_inline_minecraft_acts,
+    )
+
+    assert strip_inline_minecraft_acts(INLINE_ACT_REPLY) == "I’m coming, Marshall."
+    assert strip_inline_minecraft_acts("Plain {speech}.") == "Plain {speech}."
+
+
+class _ReplyStreamingDeepAgent:
+    """A deep agent stand-in that streams one reply, one character per token."""
+
+    def __init__(self, reply_text):
+        self.reply_text = reply_text
+
+    async def astream_events(self, agent_input, **keyword_arguments):
+        from langchain_core.messages import AIMessageChunk
+
+        for character in self.reply_text:
+            yield {
+                "event": "on_chat_model_stream",
+                "run_id": "model-run",
+                "data": {"chunk": AIMessageChunk(content=character)},
+            }
+        yield {"event": "on_chat_model_end", "run_id": "model-run", "data": {}}
+
+
+@pytest.mark.asyncio
+async def test_the_stream_sends_the_act_as_a_frame_while_a_body_is_live():
+    from src.anubis.graph import _stream_deep_agent
+
+    written_frames = []
+    await _stream_deep_agent(
+        _ReplyStreamingDeepAgent(INLINE_ACT_REPLY),
+        {},
+        {},
+        None,
+        written_frames.append,
+        minecraft_body_is_live_this_turn=True,
+    )
+    streamed_text = "".join(
+        frame["text"] for frame in written_frames if frame["type"] == "assistant_token"
+    )
+    assert streamed_text.strip() == "I’m coming, Marshall."
+    assert [frame for frame in written_frames if frame["type"] == MINECRAFT_ACT_EVENT] == [
+        {
+            "type": MINECRAFT_ACT_EVENT,
+            "commands": [{"name": "follow", "arguments": []}],
+            "additional_as_is_text": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_stream_is_untouched_without_a_live_body():
+    from src.anubis.graph import _stream_deep_agent
+
+    written_frames = []
+    await _stream_deep_agent(
+        _ReplyStreamingDeepAgent(INLINE_ACT_REPLY),
+        {},
+        {},
+        None,
+        written_frames.append,
+    )
+    assert "".join(frame["text"] for frame in written_frames) == INLINE_ACT_REPLY

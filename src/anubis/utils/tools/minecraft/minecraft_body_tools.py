@@ -15,7 +15,9 @@ and the next play tick brings a fresh snapshot.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from langchain.tools import tool
@@ -223,6 +225,148 @@ def additional_as_is_text_of(value: Any) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+#: The opening of an act_in_minecraft argument object, with whitespace removed.
+#: A reply that holds this object as text instead of a tool call puts raw JSON
+#: into chat and speech (2026-10-04, gpt-5.6-luna replied
+#: '{"commands":[{"name":"follow","arguments":[]}]} I'm coming, Marshall.').
+_INLINE_ACT_OPENING = '{"commands":'
+
+
+def _closing_brace_index(text: str) -> int:
+    """Index of the brace closing the JSON object that opens at index 0.
+
+    Braces inside JSON strings are skipped. Returns -1 when the object has not
+    closed yet.
+    """
+    depth = 0
+    inside_string = False
+    escaped = False
+    for index, character in enumerate(text):
+        if inside_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                inside_string = False
+            continue
+        if character == '"':
+            inside_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _compact_prefix(text: str) -> str:
+    """Remove whitespace from the text and cut the text to the act opening length."""
+    return "".join(text.split())[: len(_INLINE_ACT_OPENING)]
+
+
+class InlineMinecraftActFilter:
+    """Cut act_in_minecraft argument objects out of streamed reply text.
+
+    The reply text is fed one token delta at a time. Text that cannot start an
+    inline act object is returned at once. Text that may start an inline act
+    object is held until the object closes or turns out to be speech. A closed
+    inline act object is never returned: the object's accepted commands are
+    handed to ``on_act`` as a ``minecraft_act`` frame, so the body still moves
+    and the JSON never reaches chat, speech, or the saved conversation.
+    """
+
+    def __init__(self, on_act: Any = None) -> None:
+        """Start with no held text; ``on_act`` receives each act frame."""
+        self._held_text = ""
+        self._on_act = on_act
+        self.acts: list[dict[str, Any]] = []
+
+    def feed(self, text_delta: str) -> str:
+        """Add one token delta; return the text that is safe to show now."""
+        self._held_text += text_delta
+        visible_parts: list[str] = []
+        while self._held_text:
+            brace_index = self._held_text.find("{")
+            if brace_index == -1:
+                visible_parts.append(self._held_text)
+                self._held_text = ""
+                break
+            visible_parts.append(self._held_text[:brace_index])
+            self._held_text = self._held_text[brace_index:]
+            compact_prefix = _compact_prefix(self._held_text)
+            if compact_prefix == _INLINE_ACT_OPENING:
+                closing_index = _closing_brace_index(self._held_text)
+                if closing_index == -1:
+                    break
+                self._take_act(self._held_text[: closing_index + 1])
+                self._held_text = self._held_text[closing_index + 1 :]
+                continue
+            if _INLINE_ACT_OPENING.startswith(compact_prefix):
+                # Too short to tell yet: '{' alone, or '{"comm'.
+                break
+            visible_parts.append("{")
+            self._held_text = self._held_text[1:]
+        return "".join(visible_parts)
+
+    def finish(self) -> str:
+        """Return the held text at the end of the reply.
+
+        An inline act object that never closed is dropped, not shown.
+        """
+        held_text = self._held_text
+        self._held_text = ""
+        if _compact_prefix(held_text) == _INLINE_ACT_OPENING:
+            logger.warning(
+                "Reply text ended inside an unclosed act_in_minecraft object; "
+                "dropped %d characters.",
+                len(held_text),
+            )
+            return ""
+        return held_text
+
+    def _take_act(self, object_text: str) -> None:
+        """Turn one closed inline act object into a ``minecraft_act`` frame."""
+        try:
+            act_arguments = json.loads(object_text)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Reply text held an unparseable act_in_minecraft object; "
+                "dropped %d characters.",
+                len(object_text),
+            )
+            return
+        accepted, rejected = split_minecraft_commands(act_arguments.get("commands"))
+        logger.warning(
+            "Reply text carried act_in_minecraft arguments instead of a tool "
+            "call; accepted=%s rejected=%s.",
+            [command["name"] for command in accepted],
+            rejected,
+        )
+        if not accepted:
+            return
+        act_frame = {
+            "type": MINECRAFT_ACT_EVENT,
+            "commands": accepted,
+            "additional_as_is_text": additional_as_is_text_of(
+                act_arguments.get("additional_as_is_text")
+            ),
+        }
+        self.acts.append(act_frame)
+        if self._on_act is not None:
+            self._on_act(act_frame)
+
+
+def strip_inline_minecraft_acts(reply_text: str) -> str:
+    """Remove every inline act_in_minecraft object from a finished reply text."""
+    act_filter = InlineMinecraftActFilter()
+    visible_text = act_filter.feed(reply_text) + act_filter.finish()
+    if visible_text == reply_text:
+        return reply_text
+    return re.sub(r"[ \t]{2,}", " ", visible_text).strip()
 
 
 def build_minecraft_body_block(

@@ -1137,7 +1137,13 @@ def _describe_tool_activity(tool_name: str, tool_input: Any) -> str:
 
 
 async def _stream_deep_agent(
-    deep_agent, agent_input, deep_agent_config, context, writer
+    deep_agent,
+    agent_input,
+    deep_agent_config,
+    context,
+    writer,
+    *,
+    minecraft_body_is_live_this_turn: bool = False,
 ):
     """Run the deep agent (fresh input or ``Command(resume=...)``), streaming only
     the final user-visible reply's tokens. Returns the deep agent's terminal state
@@ -1147,7 +1153,15 @@ async def _stream_deep_agent(
     Same streaming heuristic as the legacy ``think`` body: tokens are emitted per
     LLM call only while the running merged chunk shows no ``tool_calls``; once a tool
     call appears, that call is a tool-planning turn and its tokens are dropped.
+
+    While a Minecraft body is live, an act_in_minecraft argument object the
+    model wrote into the reply text is cut out of the streamed tokens and sent
+    as a ``minecraft_act`` frame instead (see ``InlineMinecraftActFilter``).
     """
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        InlineMinecraftActFilter,
+    )
+
     stream_buffers: dict[str, dict[str, Any]] = {}
     final_output: dict[str, Any] | None = None
 
@@ -1169,17 +1183,40 @@ async def _stream_deep_agent(
                 if chunk is None or run_id is None:
                     continue
                 buf = stream_buffers.setdefault(
-                    run_id, {"merged": None, "streamed_text": False}
+                    run_id,
+                    {
+                        "merged": None,
+                        "streamed_text": False,
+                        "minecraft_act_filter": (
+                            InlineMinecraftActFilter(on_act=writer)
+                            if minecraft_body_is_live_this_turn
+                            else None
+                        ),
+                    },
                 )
                 merged_prev = buf["merged"]
                 buf["merged"] = chunk if merged_prev is None else merged_prev + chunk
                 if not (getattr(buf["merged"], "tool_calls", None) or []):
                     delta = chunk.content
                     if isinstance(delta, str) and delta:
-                        writer({"type": "assistant_token", "text": delta})
-                        buf["streamed_text"] = True
+                        minecraft_act_filter = buf["minecraft_act_filter"]
+                        if minecraft_act_filter is not None:
+                            delta = minecraft_act_filter.feed(delta)
+                        if delta:
+                            writer({"type": "assistant_token", "text": delta})
+                            buf["streamed_text"] = True
             elif ev_name == "on_chat_model_end":
-                stream_buffers.pop(event.get("run_id"), None)
+                buf = stream_buffers.pop(event.get("run_id"), None)
+                # Text the Minecraft act filter held back to tell speech from an
+                # act object is released once the model call ends.
+                minecraft_act_filter = (buf or {}).get("minecraft_act_filter")
+                if minecraft_act_filter is not None and not (
+                    getattr(buf["merged"], "tool_calls", None) or []
+                ):
+                    held_text = minecraft_act_filter.finish()
+                    if held_text:
+                        writer({"type": "assistant_token", "text": held_text})
+                        buf["streamed_text"] = True
             elif ev_name == "on_tool_start":
                 # Say what the avatar is doing. A data-analysis turn spends most of
                 # its wall-clock time inside tools and streams no reply token until
@@ -1995,6 +2032,18 @@ async def _run_avatar_deep_agent_turn(
     created artifacts must be attached to the final message before the caller's
     ``finally`` wipes the workspace they were produced in.
     """
+    from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+        minecraft_body_is_enabled,
+        minecraft_body_is_live,
+    )
+
+    # A live Mineflayer body: the reply stream and the saved reply are cut free
+    # of any act_in_minecraft object the model wrote as text.
+    minecraft_body_is_live_this_turn = minecraft_body_is_enabled(
+        runtime.context
+    ) and minecraft_body_is_live(
+        (config.get("configurable", {}) or {}).get("minecraft_body")
+    )
     # The model reads the conversation without past browser harvest turns (the
     # ``[neural-nexus:...]`` requests for follow-up chips or a description) and
     # without the JSON lists those produced: a thread that kept one from an
@@ -2057,7 +2106,12 @@ async def _run_avatar_deep_agent_turn(
     final_output: dict[str, Any] | None = None
     if not already_paused:
         final_output = await _stream_deep_agent(
-            deep_agent, deep_agent_input, deep_agent_config, runtime.context, writer
+            deep_agent,
+            deep_agent_input,
+            deep_agent_config,
+            runtime.context,
+            writer,
+            minecraft_body_is_live_this_turn=minecraft_body_is_live_this_turn,
         )
 
     # If the deep agent paused on an interrupt, surface it through the OUTER graph so
@@ -2078,6 +2132,7 @@ async def _run_avatar_deep_agent_turn(
                 deep_agent_config,
                 runtime.context,
                 writer,
+                minecraft_body_is_live_this_turn=minecraft_body_is_live_this_turn,
             )
 
     if final_output is None:
@@ -2096,6 +2151,20 @@ async def _run_avatar_deep_agent_turn(
 
     final_message = new_messages[-1]
     intermediate = new_messages[:-1]
+
+    # The stream already cut any act_in_minecraft object out of the reply
+    # tokens; the saved reply is cut the same way, so the ``done`` frame and the
+    # conversation history never hold the JSON for the model to copy next turn.
+    if (
+        minecraft_body_is_live_this_turn
+        and isinstance(final_message, AIMessage)
+        and isinstance(final_message.content, str)
+    ):
+        from src.anubis.utils.tools.minecraft.minecraft_body_tools import (
+            strip_inline_minecraft_acts,
+        )
+
+        final_message.content = strip_inline_minecraft_acts(final_message.content)
 
     # The reply is already fully streamed to the client by this point; what
     # follows (Go Emotions sentiment + SHAP style comparison) only enriches the

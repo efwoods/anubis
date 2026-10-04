@@ -72,21 +72,24 @@ services:
             # default search path, so no NLTK_DATA environment variable is needed.
             - ~/.cache/nltk_data:/root/nltk_data
 
-    phone_worker:
-        image: evdev3/anubis-langgraph-api:latest
-        pull_policy: never
-        env_file:
-            - .env
-        environment:
-            PYTHONPATH: /deps/anubis
-        working_dir: /deps/anubis
-        entrypoint: ["python", "-m", "src.anubis.utils.phone.worker"]
-        depends_on:
-            langgraph-api-prod:
-                condition: service_healthy
-        volumes:
-            - .:/deps/anubis
-        restart: unless-stopped
+    # The phone worker is disabled (2026-10-04): the phone worker idles without
+    # LIVEKIT_URL and cannot reach Postgres (no host.docker.internal mapping).
+    # Uncomment the phone_worker service to run the phone worker again.
+    # phone_worker:
+    #     image: evdev3/anubis-langgraph-api:latest
+    #     pull_policy: never
+    #     env_file:
+    #         - .env
+    #     environment:
+    #         PYTHONPATH: /deps/anubis
+    #     working_dir: /deps/anubis
+    #     entrypoint: ["python", "-m", "src.anubis.utils.phone.worker"]
+    #     depends_on:
+    #         langgraph-api-prod:
+    #             condition: service_healthy
+    #     volumes:
+    #         - .:/deps/anubis
+    #     restart: unless-stopped
 
     # One-shot: creates/reuses the Stripe meters, products, prices, and billing-portal
     # configuration for every tier, then writes the resulting id map to the shared

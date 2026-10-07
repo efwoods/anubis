@@ -17096,6 +17096,33 @@ async def _estimate_tokens_for_media_entry(entry: dict) -> int:
                 )
             return _estimate_for_duration("video", duration_seconds)
 
+        async def _recorded_video_estimate(page_content_type: str) -> int | None:
+            """Estimate a page hosting a recorded video as video, else ``None``.
+
+            ``URLDocumentLoaderClass`` processes an x.com post or an Instagram
+            reel that carries a video as video, through the same
+            ``resolve_remote_recorded_video`` probe, so the page is billed as
+            the video the pipeline will actually transcribe.
+            """
+            from src.anubis.utils.classes.URLDocumentLoaderClass import (
+                _URL_PAGE_CONTENT_TYPES,
+                mediawiki_article_api_target,
+            )
+            from src.anubis.utils.utility import resolve_remote_recorded_video
+
+            if page_content_type not in _URL_PAGE_CONTENT_TYPES:
+                return None
+            if mediawiki_article_api_target(page_url) is not None:
+                return None
+            recorded_video_metadata = await resolve_remote_recorded_video(
+                page_url, context
+            )
+            if recorded_video_metadata is None:
+                return None
+            return _estimate_for_duration(
+                "video", float(recorded_video_metadata.get("duration") or 0.0)
+            )
+
         # Rich single-URL entries downloaded the page body into the data URI;
         # bulk lightweight entries carry nothing yet — probe the content type
         # and estimate the real media behind the URL.
@@ -17138,7 +17165,14 @@ async def _estimate_tokens_for_media_entry(entry: dict) -> int:
                 except Exception:  # noqa: BLE001 - sanctioned fallback
                     pass
                 return _estimate_for_duration("video", duration_seconds)
+            recorded_video_tokens = await _recorded_video_estimate(probed_content_type)
+            if recorded_video_tokens is not None:
+                return recorded_video_tokens
             page_bytes, _header = await fetch_remote_url_bytes(page_url)
+        else:
+            recorded_video_tokens = await _recorded_video_estimate(content_type)
+            if recorded_video_tokens is not None:
+                return recorded_video_tokens
         page_text = _extract_text_from_html_bytes(page_bytes)
         return estimate_media_item_tokens(
             "text",

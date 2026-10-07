@@ -33,6 +33,16 @@ streamlit run frontend/studio_chat_app.py
 ./dcrp.sh                              # docker compose -f docker-compose-prod.yml down && up
 ```
 
+### Standard release flow (f-anubis → dev → test → production)
+
+This is the standard flow for every change; follow every step in order.
+
+1. **Build in `wt/f-anubis`** (branch `f-anubis`). Run the changed tests with `.venv/bin/python -m pytest <files> -q -p no:cacheprovider` (the `python` on PATH is broken), then compare the full suite (`--ignore=tests/unit_tests/test_think_interrupt_flow.py`) against a clean `git archive HEAD` export. Commit on `f-anubis`.
+2. **Restart the dev API** so :9600 runs the new code: `docker restart anubis-dev-langgraph-api-dev-1`. Media jobs live in an in-memory registry, so first confirm no upload batch is still running (every `POST /update_avatar_identity_with_media` in `docker logs anubis-dev-langgraph-api-dev-1` has a later `Upload batch <id> billed …` or `Upload batch <id> consumed no vendor tokens` line).
+3. **Merge into the integration branch:** in `/home/user/gh/anubis-project/anubis` (branch `test`), run `git merge f-anubis`.
+4. **Promote with the `merge-deploy` alias** from `/home/user/gh/anubis-project/anubis`. The alias runs `git checkout dev && git merge test && git push && git checkout main && git merge dev && git push && git checkout test`.
+5. **Reload production.** The prod API bind-mounts the `anubis` checkout but does not reload code, so recreate the prod API from `/home/user/gh/anubis-project/anubis` with `docker compose -f docker-compose-prod.yml up -d --no-deps --force-recreate langgraph-api-prod`. Production reads only `anubis/.env`, so copy every new env var line there before recreating. Run the same in-flight upload check against `anubis-langgraph-api-prod-1` first.
+
 Dependencies are managed with **uv** (`uv.lock` is the lockfile; Docker installs via `uv pip install --system`). The runtime base image is `langchain/langgraph-api:3.11-wolfi` — Python **3.11**. The audio stack (librosa, soundfile, moviepy, torch/torchaudio) dlopens native system libs that the base layer installs via `apk`: `ffmpeg-7`, `libsndfile`, `libgomp`. Any new native-dependent package must have a wheel compatible with Python 3.11/wolfi.
 
 ### Testing & Linting

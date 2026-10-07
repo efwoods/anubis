@@ -335,6 +335,21 @@ class GlobalContext:
         },
     )
 
+    url_media_max_bytes: int = field(
+        default=26214400,
+        metadata={
+            "description": (
+                "Largest video or audio file, in bytes, downloaded from a URL that "
+                "serves media: a page hosting a recorded video (an x.com post, an "
+                "Instagram reel, a Twitch clip) or a direct .mp4 / .mp3 link. The "
+                "default 26214400 (25 MiB) matches MAX_REMOTE_URL_DOWNLOAD_BYTES for "
+                "every other remote download. Media larger than this ceiling is not "
+                "downloaded and the URL is read as a web page instead. YouTube keeps "
+                "the separate audio-only path. Env URL_MEDIA_MAX_BYTES."
+            )
+        },
+    )
+
     enable_target_speaker_attribution: str = field(
         default="TRUE",
         metadata={

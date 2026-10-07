@@ -954,6 +954,43 @@ async def get_remote_video_duration_seconds(url: str) -> float:
     return float(metadata.get("duration") or 0.0)
 
 
+async def resolve_remote_recorded_video(
+    url: str, context: GlobalContext
+) -> dict | None:
+    """Return the video metadata when a web page hosts a recorded video, else ``None``.
+
+    An x.com post, an Instagram reel or a Twitch clip reports
+    ``Content-Type: text/html`` while the page actually carries a video. The
+    upload estimate and ``URLDocumentLoaderClass`` both call this one helper, so
+    the media type that is billed always matches the media type that is
+    processed. A page counts as a recorded video when the yt_dlp metadata probe
+    reports a positive duration and the page is not a live stream in progress
+    (a live stream has no fixed recording to transcribe). A probe that fails or
+    exceeds ``remote_duration_probe_timeout_seconds`` returns ``None`` and the
+    caller reads the page as text. Nothing is downloaded.
+    """
+    probe_timeout_seconds = float(
+        context.remote_duration_probe_timeout_seconds or 30.0
+    )
+    try:
+        video_metadata = await asyncio.wait_for(
+            get_remote_video_metadata(url), timeout=probe_timeout_seconds
+        )
+    except Exception as probe_error:  # noqa: BLE001 - a page without video is normal
+        logger.info(
+            "No recorded video found at %s (%s: %s)",
+            url,
+            type(probe_error).__name__,
+            probe_error,
+        )
+        return None
+    if float(video_metadata.get("duration") or 0.0) <= 0.0:
+        return None
+    if video_metadata.get("live_status") == "is_live":
+        return None
+    return video_metadata
+
+
 async def get_remote_playlist_video_durations(url: str) -> list[float]:
     """Return per-video durations for a playlist URL from flat metadata only.
 

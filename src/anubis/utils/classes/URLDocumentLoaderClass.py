@@ -357,28 +357,15 @@ class URLDocumentLoaderClass:
                 return await self._load_linktree(
                     url, user_id, assistant_id
                 )
-            if kind == "twitter":
-                return await self._load_article(
-                    url,
-                    user_id,
-                    assistant_id,
-                    quotes_per_line=True,
-                    url_kind="twitter",
-                )
-            if kind in ("instagram", "twitch"):
-                return await self._load_article(
-                    url,
-                    user_id,
-                    assistant_id,
-                    quotes_per_line=False,
-                    url_kind=kind,
-                )
-            return await self._load_article(
+            # Every other URL is routed by what the URL serves, not by the host
+            # name: an x.com post that carries a video is processed as a video,
+            # and only a URL serving no media is read as a web page.
+            return await self._load_content_aware_url(
                 url,
                 user_id,
                 assistant_id,
-                quotes_per_line=False,
-                url_kind="article",
+                url_kind=kind,
+                quotes_per_line=kind == "twitter",
             )
         except Exception as exc:  # pragma: no cover - logged for the operator
             logger.exception("URLDocumentLoaderClass.load failed for %s: %s", url, exc)
@@ -396,6 +383,194 @@ class URLDocumentLoaderClass:
                     },
                 }
             ]
+
+    async def _load_content_aware_url(
+        self,
+        url: str,
+        user_id: str | None,
+        assistant_id: str | None,
+        *,
+        url_kind: str,
+        quotes_per_line: bool,
+    ) -> List[Dict[str, Any]]:
+        """Process a URL as the media type the URL serves, else read the URL as a page.
+
+        ``_load_remote_media`` returns a video, audio or image media item when the
+        URL serves one; an empty list means the URL serves no media and the
+        existing ``_load_article`` reader handles the page exactly as before.
+        """
+        remote_media_items = await self._load_remote_media(
+            url, user_id, assistant_id, url_kind=url_kind
+        )
+        if remote_media_items:
+            return remote_media_items
+        return await self._load_article(
+            url,
+            user_id,
+            assistant_id,
+            quotes_per_line=quotes_per_line,
+            url_kind=url_kind,
+        )
+
+    async def _load_remote_media(
+        self,
+        url: str,
+        user_id: str | None,
+        assistant_id: str | None,
+        *,
+        url_kind: str,
+    ) -> List[Dict[str, Any]]:
+        """Return one media item when ``url`` serves a video, audio or image, else ``[]``.
+
+        Two checks, in order of cost:
+
+        1. The Content-Type of the URL itself. A direct ``.mp4`` / ``.mp3`` /
+           ``.jpg`` link names the media type in the response header.
+        2. For a web page, the yt_dlp metadata probe shared with the upload
+           estimate (``resolve_remote_recorded_video``). An x.com post, an
+           Instagram reel or a Twitch clip reports ``text/html`` while the page
+           hosts a recorded video; the probe finds the video and yt_dlp
+           downloads the video.
+
+        Every failure returns ``[]`` so the URL falls back to the page reader:
+        a URL that cannot be read as media is never lost.
+        """
+        from src.anubis.utils.net.url_safety import UnsafeUrlError, assert_public_host
+        from src.anubis.utils.utility import resolve_remote_recorded_video
+
+        # A MediaWiki article never hosts a recording, and the article HTML
+        # skin is often behind a bot challenge that would fail every probe.
+        if mediawiki_article_api_target(url) is not None:
+            return []
+        allow_private_hosts = _url_fetch_allows_private_hosts(self.context)
+        try:
+            await assert_public_host(url, allow_private=allow_private_hosts)
+        except UnsafeUrlError as unsafe_url_error:
+            logger.warning(
+                "Media probe skipped for %s: %s", url, unsafe_url_error
+            )
+            return []
+        media_max_bytes = int(self.context.url_media_max_bytes or 0)
+
+        try:
+            content_type, content_length = await _probe_remote_content_type(
+                url, allow_private_hosts=allow_private_hosts
+            )
+        except Exception as probe_error:  # noqa: BLE001 - fall through to the page probe
+            logger.info(
+                "Content-Type probe failed for %s (%s: %s)",
+                url,
+                type(probe_error).__name__,
+                probe_error,
+            )
+            content_type, content_length = "", None
+
+        media_metadata: Dict[str, Any] = {
+            "filename": url,
+            "source": url,
+            "user_id": user_id,
+            "assistant_id": assistant_id,
+        }
+
+        if content_type in _URL_STILL_IMAGE_MIMES:
+            return [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                    "metadata": {
+                        **media_metadata,
+                        "content_type": content_type,
+                        "url_kind": f"{url_kind}_image",
+                    },
+                }
+            ]
+
+        if content_type.startswith("audio/") or content_type.startswith("video/"):
+            media_type = "video" if content_type.startswith("video/") else "audio"
+            if content_length is not None and content_length > media_max_bytes:
+                logger.warning(
+                    "Direct %s at %s is %d bytes, above URL_MEDIA_MAX_BYTES %d; reading the URL as a page",
+                    media_type,
+                    url,
+                    content_length,
+                    media_max_bytes,
+                )
+                return []
+            try:
+                media_data_uri = await _fetch_direct_media_data_uri(
+                    url,
+                    content_type,
+                    media_max_bytes=media_max_bytes,
+                    allow_private_hosts=allow_private_hosts,
+                )
+            except Exception as download_error:  # noqa: BLE001 - fall back to the page reader
+                logger.warning(
+                    "Direct %s download failed for %s (%s: %s)",
+                    media_type,
+                    url,
+                    type(download_error).__name__,
+                    download_error,
+                )
+                return []
+            if not media_data_uri:
+                return []
+            return [
+                {
+                    "type": media_type,
+                    "base64_encoded_str": media_data_uri,
+                    "metadata": {
+                        **media_metadata,
+                        "content_type": content_type,
+                        "url_kind": f"{url_kind}_{media_type}",
+                    },
+                }
+            ]
+
+        # A header that names any other concrete type (PDF, plain text, JSON)
+        # is not a page that could host a video; the page reader handles the URL.
+        if content_type and content_type not in _URL_PAGE_CONTENT_TYPES:
+            return []
+
+        recorded_video_metadata = await resolve_remote_recorded_video(
+            url, self.context
+        )
+        if recorded_video_metadata is None:
+            return []
+        try:
+            video_data_uri, video_content_type = await _download_recorded_video_b64(
+                url, media_max_bytes=media_max_bytes
+            )
+        except Exception as download_error:  # noqa: BLE001 - fall back to the page reader
+            logger.warning(
+                "Recorded video download failed for %s (%s: %s); reading the URL as a page",
+                url,
+                type(download_error).__name__,
+                download_error,
+            )
+            return []
+        if not video_data_uri:
+            logger.warning(
+                "No video under URL_MEDIA_MAX_BYTES %d was downloaded for %s; reading the URL as a page",
+                media_max_bytes,
+                url,
+            )
+            return []
+        logger.info(
+            "URL %s hosts a recorded video (%.3f s); processing the URL as video",
+            url,
+            float(recorded_video_metadata.get("duration") or 0.0),
+        )
+        return [
+            {
+                "type": "video",
+                "base64_encoded_str": video_data_uri,
+                "metadata": {
+                    **media_metadata,
+                    "content_type": video_content_type,
+                    "url_kind": f"{url_kind}_video",
+                },
+            }
+        ]
 
     async def _load_article(
         self,
@@ -766,3 +941,189 @@ def _download_youtube_audio_b64_sync(url: str) -> tuple[str, str]:
             audio_b64 = base64.b64encode(fh.read()).decode("ascii")
 
         return f"data:audio/mp3;base64,{audio_b64}", Path(mp3_path).suffix
+
+
+# The still-image types the media graph describes (mirrors
+# ``_ALLOWED_STILL_IMAGE_MIMES`` in ``process_media_graph/utils/nodes.py``,
+# which imports this module and so cannot be imported from here).
+_URL_STILL_IMAGE_MIMES = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
+
+# Content-Types under which a URL may be a web page hosting a recorded video.
+# ``application/octet-stream`` is included because some hosts label every
+# response that way; yt_dlp then decides from the page itself.
+_URL_PAGE_CONTENT_TYPES = frozenset(
+    {"text/html", "application/xhtml+xml", "application/octet-stream"}
+)
+
+# Container extension produced by yt_dlp → MIME type of the media item.
+_RECORDED_VIDEO_EXTENSION_MIMES = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+}
+
+
+def _url_fetch_allows_private_hosts(context: GlobalContext) -> bool:
+    """Whether ``URL_FETCH_ALLOW_PRIVATE_HOSTS`` lets a URL resolve inside this network."""
+    flag = str(getattr(context, "url_fetch_allow_private_hosts", None) or "false")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _content_type_without_parameters(content_type_header: str | None) -> str:
+    return (content_type_header or "").split(";")[0].strip().lower()
+
+
+async def _probe_remote_content_type(
+    url: str, *, allow_private_hosts: bool
+) -> tuple[str, int | None]:
+    """Return ``(content_type, content_length)`` for ``url`` without downloading the body.
+
+    HEAD first, then a ranged GET of the first 512 bytes when HEAD fails or
+    names no useful type (the same order as ``probe_remote_url_content_type``
+    in ``webapp.py``). Redirects are followed only through
+    ``get_with_public_host_guard``, which re-checks every hop.
+    ``content_length`` is ``None`` when the server does not report a size.
+    """
+    from src.anubis.utils.net.url_safety import get_with_public_host_guard
+
+    request_headers = {"User-Agent": ARTICLE_FETCH_USER_AGENT}
+    async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
+        try:
+            head_response = await client.head(url, headers=request_headers)
+        except httpx.HTTPError:
+            head_response = None
+        if head_response is not None and head_response.status_code < 300:
+            head_content_type = _content_type_without_parameters(
+                head_response.headers.get("content-type")
+            )
+            if head_content_type and head_content_type != "application/octet-stream":
+                head_content_length = head_response.headers.get("content-length")
+                return head_content_type, (
+                    int(head_content_length)
+                    if head_content_length and head_content_length.isdigit()
+                    else None
+                )
+        ranged_response = await get_with_public_host_guard(
+            client,
+            url,
+            headers={**request_headers, "Range": "bytes=0-511"},
+            allow_private=allow_private_hosts,
+        )
+        ranged_response.raise_for_status()
+        ranged_content_type = _content_type_without_parameters(
+            ranged_response.headers.get("content-type")
+        )
+        # ``Content-Range: bytes 0-511/1048576`` carries the full size after the slash.
+        content_range = ranged_response.headers.get("content-range") or ""
+        total_size_text = content_range.rpartition("/")[2]
+        return ranged_content_type, (
+            int(total_size_text) if total_size_text.isdigit() else None
+        )
+
+
+async def _fetch_direct_media_data_uri(
+    url: str,
+    content_type: str,
+    *,
+    media_max_bytes: int,
+    allow_private_hosts: bool,
+) -> str:
+    """Download a direct audio / video URL into a data URI, or ``""`` above the byte cap."""
+    from src.anubis.utils.net.url_safety import get_with_public_host_guard
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=120.0) as client:
+        media_response = await get_with_public_host_guard(
+            client,
+            url,
+            headers={"User-Agent": ARTICLE_FETCH_USER_AGENT},
+            allow_private=allow_private_hosts,
+        )
+        media_response.raise_for_status()
+        media_bytes = media_response.content
+    if len(media_bytes) > media_max_bytes:
+        logger.warning(
+            "Direct media at %s is %d bytes, above URL_MEDIA_MAX_BYTES %d",
+            url,
+            len(media_bytes),
+            media_max_bytes,
+        )
+        return ""
+    media_base64 = base64.b64encode(media_bytes).decode("ascii")
+    return f"data:{content_type};base64,{media_base64}"
+
+
+async def _download_recorded_video_b64(
+    url: str, *, media_max_bytes: int
+) -> tuple[str, str]:
+    """Download the recorded video a web page hosts; return ``(data_uri, content_type)``."""
+    return await asyncio.to_thread(
+        _download_recorded_video_b64_sync, url, media_max_bytes
+    )
+
+
+def _download_recorded_video_b64_sync(url: str, media_max_bytes: int) -> tuple[str, str]:
+    """Sync helper for the yt_dlp video download + base64 encode.
+
+    Prefers a single-file mp4 under ``media_max_bytes`` (``<?`` also accepts a
+    format whose size the host does not report), and ``max_filesize`` stops any
+    download that turns out larger. Returns ``("", "")`` when no file under the
+    cap was produced.
+    """
+    import yt_dlp  # local import: heavy module
+
+    with tempfile.TemporaryDirectory() as download_directory:
+        download_options = {
+            "format": (
+                f"best[ext=mp4][filesize<?{media_max_bytes}]"
+                f"/best[filesize<?{media_max_bytes}]"
+            ),
+            "outtmpl": os.path.join(download_directory, "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            # One recording, never a whole playlist or channel.
+            "noplaylist": True,
+            "max_filesize": media_max_bytes,
+        }
+        with yt_dlp.YoutubeDL(download_options) as downloader:
+            video_information = downloader.extract_info(url, download=True)
+
+        # A post holding several videos comes back as a playlist; the first
+        # entry is the recording that the post leads with.
+        if (video_information or {}).get("entries"):
+            first_entries = [
+                entry for entry in video_information["entries"] if isinstance(entry, dict)
+            ]
+            video_information = first_entries[0] if first_entries else {}
+        requested_video_id = str((video_information or {}).get("id") or "")
+
+        produced_video_names = sorted(
+            name
+            for name in os.listdir(download_directory)
+            if Path(name).suffix.lower() in _RECORDED_VIDEO_EXTENSION_MIMES
+        )
+        if not produced_video_names:
+            return "", ""
+        # The file is chosen by the id of the recording that was asked for, so
+        # directory order decides nothing.
+        chosen_video_name = next(
+            (
+                name
+                for name in produced_video_names
+                if requested_video_id and Path(name).stem == requested_video_id
+            ),
+            produced_video_names[0],
+        )
+        chosen_video_path = os.path.join(download_directory, chosen_video_name)
+        if os.path.getsize(chosen_video_path) > media_max_bytes:
+            return "", ""
+        video_content_type = _RECORDED_VIDEO_EXTENSION_MIMES[
+            Path(chosen_video_name).suffix.lower()
+        ]
+        with open(chosen_video_path, "rb") as video_file:
+            video_base64 = base64.b64encode(video_file.read()).decode("ascii")
+        return f"data:{video_content_type};base64,{video_base64}", video_content_type

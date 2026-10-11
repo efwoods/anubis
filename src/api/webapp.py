@@ -12722,16 +12722,17 @@ def _unsafe_url_refusal(error: UnsafeUrlError) -> HTTPException:
 async def probe_remote_url_content_type(url: str) -> str:
     """Best-effort Content-Type for a remote URL (HEAD, then ranged GET + sniff).
 
-    Known MediaWiki article URLs (Fandom, Wikipedia, wiki.gg) are ``text/html``
-    even when the HTML skin is Cloudflare-challenged: the parse API on the
-    same host is what ``fetch_remote_url_bytes`` will actually download.
+    Known MediaWiki article URLs (Fandom, Wikipedia, wiki.gg) and Medium
+    article URLs are ``text/html`` even when the HTML page is
+    Cloudflare-challenged: the MediaWiki parse API or the Medium RSS feed is
+    what ``fetch_remote_url_bytes`` will actually download.
     A failed HEAD (403 challenge page) must not be treated as the type.
     """
     from src.anubis.utils.classes.URLDocumentLoaderClass import (
-        mediawiki_article_api_target,
+        bot_challenged_article_target,
     )
 
-    if mediawiki_article_api_target(url):
+    if bot_challenged_article_target(url):
         return "text/html"
     allow_private = url_fetch_allows_private_hosts()
     try:
@@ -12806,7 +12807,9 @@ async def fetch_remote_url_bytes(
     """Download a URL and return (body, Content-Type without parameters).
 
     MediaWiki article URLs are fetched through the parse API so Fandom
-    ``/wiki/…`` pages (Cloudflare-challenged HTML skins) still ingest.
+    ``/wiki/…`` pages (Cloudflare-challenged HTML skins) still ingest, and
+    Medium article URLs through the author's RSS feed, because every Medium
+    article page answers an automated fetch with a 403 challenge.
 
     Every download passes through here, so this is where the host guard lives:
     the URL's host must resolve to a public address, and each redirect hop is
@@ -12817,7 +12820,9 @@ async def fetch_remote_url_bytes(
     """
     from src.anubis.utils.classes.URLDocumentLoaderClass import (
         ARTICLE_FETCH_USER_AGENT,
-        fetch_mediawiki_article_html,
+        MEDIUM_ARTICLE_NOT_IN_FEED_REASON,
+        fetch_bot_challenged_article_html,
+        is_medium_url,
     )
 
     if allow_private is None:
@@ -12827,9 +12832,9 @@ async def fetch_remote_url_bytes(
     except UnsafeUrlError as unsafe_url:
         raise _unsafe_url_refusal(unsafe_url) from unsafe_url
 
-    mediawiki = await fetch_mediawiki_article_html(url)
-    if mediawiki is not None:
-        body, header_ct = mediawiki
+    challenged_article = await fetch_bot_challenged_article_html(url)
+    if challenged_article is not None:
+        body, header_ct = challenged_article
         if len(body) > max_bytes:
             raise HTTPException(
                 status_code=400,
@@ -12838,6 +12843,11 @@ async def fetch_remote_url_bytes(
                 ),
             )
         return body, header_ct
+    if is_medium_url(url):
+        # The Medium article page is a 403 challenge for every automated
+        # fetcher, so fetching the page would only replace this reason with
+        # a bare "HTTP 403".
+        raise HTTPException(status_code=400, detail=MEDIUM_ARTICLE_NOT_IN_FEED_REASON)
     async with httpx.AsyncClient(follow_redirects=False, timeout=120.0) as client:
         try:
             r = await get_with_public_host_guard(

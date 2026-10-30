@@ -2638,6 +2638,16 @@ async def find_fact_matches(
                 ):
                     continue
                 for sentence in _split_into_sentences(page_content):
+                    # Splitting a scraped page at tags yields short fragments ("Evan Woods",
+                    # "efwoods") that score above the gate against a URL claim while sharing
+                    # no content word with the claim; each one cost a suggestion call and an
+                    # approval card (measured on avatar 47cfdaa2, 2026-10-29).
+                    if (
+                        query_tokens
+                        and not _text_names_a_query_url(sentence)
+                        and not (query_tokens & _salient_tokens(sentence))
+                    ):
+                        continue
                     batched_sentences.append(sentence)
                     sentence_meta.append((item, sentence))
 

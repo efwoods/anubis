@@ -2058,6 +2058,11 @@ async def message_graph_sse(
     # The run id also rides in ``configurable`` so the graph can checkpoint the
     # reply's LangSmith location (``langsmith_trace_record``) with the reply.
     langsmith_run_id = str(uuid4())
+    # Only message traces reach LangSmith; registering the root run id is what
+    # lets this message's trace pass the trace tally filter.
+    from src.anubis.utils.trace_tally import allow_message_trace
+
+    allow_message_trace(langsmith_run_id)
     config = {
         **config,
         "run_id": langsmith_run_id,

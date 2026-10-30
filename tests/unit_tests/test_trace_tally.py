@@ -128,6 +128,8 @@ def test_the_installed_filter_drops_every_run_of_a_dropped_trace(monkeypatch):
     fake_tally = FakeSharedTally(trace_limit=1)
     trace_tally = tally_with(fake_tally, block_size=1)
     assert trace_tally_module.install_trace_tally_filter(trace_tally) is True
+    trace_tally_module.allow_message_trace("trace-1")
+    trace_tally_module.allow_message_trace("trace-2")
     client = FakeClient()
     sent_runs = client._filter_for_sampling(
         [
@@ -138,6 +140,32 @@ def test_the_installed_filter_drops_every_run_of_a_dropped_trace(monkeypatch):
         ]
     )
     assert [run["id"] for run in sent_runs] == ["root-1", "child-1"]
+
+
+def test_only_message_traces_are_sent_and_other_traces_take_no_slot(monkeypatch):
+    import langsmith
+
+    class FakeClient:
+        def _filter_for_sampling(self, runs):
+            return list(runs)
+
+    monkeypatch.setattr(langsmith, "Client", FakeClient)
+    fake_tally = FakeSharedTally(trace_limit=1)
+    trace_tally = tally_with(fake_tally, block_size=1)
+    assert trace_tally_module.install_trace_tally_filter(trace_tally) is True
+    trace_tally_module.allow_message_trace("message-trace")
+    client = FakeClient()
+    sent_runs = client._filter_for_sampling(
+        [
+            {"id": "inbox-root", "trace_id": "inbox-poller-trace"},
+            {"id": "inbox-child", "trace_id": "inbox-poller-trace"},
+            {"id": "no-trace-id"},
+            {"id": "message-root", "trace_id": "message-trace"},
+            {"id": "message-child", "trace_id": "message-trace"},
+        ]
+    )
+    assert [run["id"] for run in sent_runs] == ["message-root", "message-child"]
+    assert fake_tally.reserved_traces == 1
 
 
 def test_a_langsmith_release_without_the_filter_turns_tracing_off(monkeypatch):

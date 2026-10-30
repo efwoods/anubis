@@ -244,6 +244,153 @@ async def fetch_mediawiki_article_html(url: str) -> tuple[bytes, str] | None:
     return html_text.encode("utf-8"), "text/html"
 
 
+# Medium serves every article page behind a Cloudflare challenge (HTTP 403 for
+# every User-Agent, including browser and search-engine agents), but the
+# author's or publication's RSS feed is served openly and carries the full
+# article body in ``content:encoded``. The feed lists only the most recent
+# posts, so an older article is not reachable through the feed.
+_MEDIUM_HOST = "medium.com"
+_MEDIUM_POST_ID_PATTERN = re.compile(r"(?:^|-)([0-9a-f]{8,16})$")
+_RSS_CONTENT_NAMESPACE = "{http://purl.org/rss/1.0/modules/content/}"
+MEDIUM_ARTICLE_NOT_IN_FEED_REASON = (
+    "Medium blocks automated reading of this article, and the article is not "
+    "among the author's recent posts in the author's Medium feed. Save the "
+    "article as a PDF or text file and upload that file instead."
+)
+
+
+def is_medium_url(url: str) -> bool:
+    """Report whether a URL is hosted on ``medium.com`` or a ``*.medium.com`` subdomain."""
+    try:
+        host = (urlparse((url or "").strip()).hostname or "").lower()
+    except Exception:
+        return False
+    return host == _MEDIUM_HOST or host.endswith("." + _MEDIUM_HOST)
+
+
+def medium_article_feed_target(url: str) -> tuple[str, str] | None:
+    """Return ``(feed URL, post id)`` for a Medium article URL.
+
+    Handled article URL shapes:
+
+    * ``medium.com/@author/slug-<post id>`` → ``medium.com/feed/@author``
+    * ``medium.com/<publication>/slug-<post id>`` → ``medium.com/feed/<publication>``
+    * ``<author>.medium.com/slug-<post id>`` → ``<author>.medium.com/feed``
+
+    ``None`` when the URL is not a Medium article (so callers fall through to a
+    normal HTTP fetch). ``medium.com/p/<post id>`` names no author or
+    publication, so no feed can be chosen and the URL returns ``None``.
+    """
+    if not is_medium_url(url):
+        return None
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    path_segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    if not path_segments:
+        return None
+    post_id_match = _MEDIUM_POST_ID_PATTERN.search(path_segments[-1].lower())
+    if post_id_match is None:
+        return None
+    post_id = post_id_match.group(1)
+    if host == _MEDIUM_HOST:
+        if len(path_segments) < 2 or path_segments[0].lower() in {"p", "feed"}:
+            return None
+        return f"https://{_MEDIUM_HOST}/feed/{path_segments[0]}", post_id
+    return f"https://{host}/feed", post_id
+
+
+def html_document_from_medium_feed(feed_xml: bytes, post_id: str) -> str:
+    """Return the article HTML for ``post_id`` from a Medium RSS feed body.
+
+    The matching ``<item>`` is the one whose ``guid`` or ``link`` contains the
+    post id. The ``content:encoded`` body is wrapped in a small document with
+    a ``<title>`` because structured extraction reads ``<title>``. An empty
+    string means the feed does not hold the post.
+    """
+    import xml.etree.ElementTree as element_tree
+
+    try:
+        feed_root = element_tree.fromstring(feed_xml)
+    except element_tree.ParseError:
+        return ""
+    for feed_item in feed_root.iter("item"):
+        item_identifiers = " ".join(
+            (feed_item.findtext("guid") or "", feed_item.findtext("link") or "")
+        ).lower()
+        if post_id not in item_identifiers:
+            continue
+        article_body = feed_item.findtext(f"{_RSS_CONTENT_NAMESPACE}encoded") or ""
+        if not article_body.strip():
+            return ""
+        escaped_title = html_lib.escape(
+            (feed_item.findtext("title") or "").strip(), quote=True
+        )
+        return (
+            '<!DOCTYPE html><html><head><meta charset="utf-8">'
+            f"<title>{escaped_title}</title></head><body>{article_body}</body></html>"
+        )
+    return ""
+
+
+async def fetch_medium_article_html(url: str) -> tuple[bytes, str] | None:
+    """Fetch a Medium article body from the author's or publication's RSS feed.
+
+    Returns ``(html_bytes, 'text/html')`` on success, or ``None`` when the URL
+    is not a Medium article, the feed cannot be fetched, or the feed does not
+    hold the article (the feed lists only the most recent posts).
+    """
+    target = medium_article_feed_target(url)
+    if target is None:
+        return None
+    feed_url, post_id = target
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            response = await client.get(
+                feed_url, headers={"User-Agent": ARTICLE_FETCH_USER_AGENT}
+            )
+            response.raise_for_status()
+            feed_xml = response.content
+    except Exception as fetch_error:
+        logger.warning(
+            "Medium feed fetch failed for %s via %s: %s", url, feed_url, fetch_error
+        )
+        return None
+    html_text = html_document_from_medium_feed(feed_xml, post_id)
+    if not html_text:
+        logger.warning(
+            "Medium feed %s does not hold post %s (requested %s)",
+            feed_url,
+            post_id,
+            url,
+        )
+        return None
+    return html_text.encode("utf-8"), "text/html"
+
+
+def bot_challenged_article_target(url: str) -> bool:
+    """Report whether a URL is an article whose HTML page sits behind a bot challenge.
+
+    Those article pages are read through a side channel (the MediaWiki parse
+    API, or the Medium RSS feed) instead of the challenged page, so content-type
+    probes and media probes must skip the challenged page.
+    """
+    return (
+        mediawiki_article_api_target(url) is not None
+        or medium_article_feed_target(url) is not None
+    )
+
+
+async def fetch_bot_challenged_article_html(url: str) -> tuple[bytes, str] | None:
+    """Fetch article HTML through the MediaWiki parse API, else the Medium feed.
+
+    ``None`` when neither side channel applies to the URL or yields the article.
+    """
+    mediawiki_article = await fetch_mediawiki_article_html(url)
+    if mediawiki_article is not None:
+        return mediawiki_article
+    return await fetch_medium_article_html(url)
+
+
 def _is_youtube_playlist_url(parsed) -> bool:
     """A pure playlist (``/playlist?list=...``) or any YouTube URL carrying a
     ``list=`` query param but no single ``v=`` video — those enumerate. A
@@ -438,9 +585,9 @@ class URLDocumentLoaderClass:
         from src.anubis.utils.net.url_safety import UnsafeUrlError, assert_public_host
         from src.anubis.utils.utility import resolve_remote_recorded_video
 
-        # A MediaWiki article never hosts a recording, and the article HTML
-        # skin is often behind a bot challenge that would fail every probe.
-        if mediawiki_article_api_target(url) is not None:
+        # A MediaWiki or Medium article never hosts a recording, and the
+        # article HTML page sits behind a bot challenge that fails every probe.
+        if bot_challenged_article_target(url):
             return []
         allow_private_hosts = _url_fetch_allows_private_hosts(self.context)
         try:
@@ -581,21 +728,22 @@ class URLDocumentLoaderClass:
         quotes_per_line: bool,
         url_kind: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch a generic article URL via MediaWiki parse, else ``WebBaseLoader``.
+        """Fetch a generic article URL via MediaWiki parse or the Medium feed, else ``WebBaseLoader``.
 
         ``url_kind`` lets the caller tag the produced media item with the
         original routing label (``twitter``, ``instagram``, ``twitch``,
         ``article``). When omitted, falls back to the legacy behavior of
         ``twitter`` for ``quotes_per_line=True`` and ``article`` otherwise.
 
-        Fandom ``/wiki/…`` skins are Cloudflare-challenged; the parse API on
-        the same host is not, so MediaWiki articles skip ``WebBaseLoader``.
+        Fandom ``/wiki/…`` skins and Medium article pages are
+        Cloudflare-challenged; the MediaWiki parse API and the Medium RSS feed
+        are not, so those articles skip ``WebBaseLoader``.
         """
         raw_html = ""
         content = ""
-        mediawiki = await fetch_mediawiki_article_html(url)
-        if mediawiki is not None:
-            raw_html = mediawiki[0].decode("utf-8", errors="replace")
+        challenged_article = await fetch_bot_challenged_article_html(url)
+        if challenged_article is not None:
+            raw_html = challenged_article[0].decode("utf-8", errors="replace")
             content = _visible_text_from_html(raw_html).strip()
         else:
             try:
@@ -807,12 +955,13 @@ def _load_webdocs_sync(url: str):
 async def _httpx_fallback_text(url: str, *, return_html: bool = False) -> str:
     """Last-resort plain-text or HTML fetch via httpx.
 
-    MediaWiki article URLs go through the parse API first so Fandom pages
-    (Cloudflare-challenged HTML skins) still yield the article body.
+    MediaWiki article URLs go through the parse API and Medium article URLs
+    through the RSS feed first, so Cloudflare-challenged Fandom and Medium
+    pages still yield the article body.
     """
-    mediawiki = await fetch_mediawiki_article_html(url)
-    if mediawiki is not None:
-        html_text = mediawiki[0].decode("utf-8", errors="replace")
+    challenged_article = await fetch_bot_challenged_article_html(url)
+    if challenged_article is not None:
+        html_text = challenged_article[0].decode("utf-8", errors="replace")
         return html_text if return_html else _visible_text_from_html(html_text)
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=30.0

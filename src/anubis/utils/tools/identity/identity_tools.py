@@ -14,6 +14,7 @@ from langchain_core.tools import InjectedToolArg
 from langgraph.types import Command, interrupt
 
 from src.anubis.utils.model import init_model
+from src.anubis.utils.organization_links import DOCUMENT_URL_METADATA_KEYS
 from src.anubis.utils.state import GlobalState
 from src.anubis.utils.utility import extract_user_id_assistant_id
 
@@ -89,6 +90,163 @@ def fact_is_about_the_avatar(user_fact: str) -> bool:
         _AVATAR_CLAUSE_SUBJECT.search(normalized_fact)
         or _AVATAR_HABITUAL_OR_PAST_ACTION.search(normalized_fact)
     )
+
+
+# A message in which the owner CORRECTS a fact about the avatar must rewrite the
+# avatar's stored facts, which every viewer reads. Observed 2026-10-22 (avatar
+# 47cfdaa2): "I need you to learn that you do NOT use ROUGE and BERT scores" was
+# rewritten by the model as "The user prefers authenticity to be determined
+# without ROUGE or BERT scores" and stored by ``learn_user_preference`` under the
+# owner's own user id, so an anonymous visitor never read the correction and the
+# avatar repeated the stored bio. The rewritten tool argument hides who the subject
+# is, so the check reads the owner's own message instead.
+#
+# Inside ONE clause, three signals must all hold (the clause runs from the
+# avatar-subject word to the next sentence-final mark, so a passage the owner
+# pastes after a colon is judged on its own):
+# 1. The avatar is the subject: "you" / "your" opens the clause (the
+#    clause-subject pattern above, plus "that you") or follows a teaching verb
+#    ("learn your linked in site is ...", "know that you ...").
+# 2. The clause states a fact, not a behaviour request: "you should / must /
+#    need to ..." is how the person wants the avatar to act, which is a preference.
+# 3. The clause carries a correction marker ("NOT", "instead of", "is wrong").
+_AVATAR_SUBJECT_AFTER_TEACHING_VERB = re.compile(
+    r"\b(?:learn|know|remember|understand|note|realize|realise)\s+(?:that\s+)?(?:you|your)\b"
+    r"(?!\s+to\b)",
+    re.IGNORECASE,
+)
+_AVATAR_SUBJECT_AFTER_THAT = re.compile(r"\bthat\s+(?:you|your)\b(?!\s+to\b)", re.IGNORECASE)
+# A sentence ends at a mark followed by whitespace or the end of the message, so
+# the dots inside "linkedin.com/in/name" do not end the clause.
+_CLAUSE_END = re.compile(r"[.;:!?\n](?=\s|$)")
+_BEHAVIOUR_REQUEST_AFTER_AVATAR_SUBJECT = re.compile(
+    r"\byou(?:'ll|\s+(?:should|must|shall|ought|need\s+to|have\s+to|will|can|could|"
+    r"might|may|to|stop|start|try))\b",
+    re.IGNORECASE,
+)
+_CORRECTION_MARKER = re.compile(
+    r"\b(?:not|never|instead\s+of|rather\s+than|is\s+wrong|are\s+wrong|incorrect|"
+    r"isn't|aren't|don't|doesn't|didn't|wasn't|weren't)\b",
+    re.IGNORECASE,
+)
+
+
+def message_corrects_a_fact_about_the_avatar(message_text: str) -> bool:
+    """Whether ``message_text`` corrects a stated fact in which the avatar is the subject."""
+    normalized_message_text = str(message_text or "").replace("’", "'").strip()
+    if not normalized_message_text:
+        return False
+    for subject_pattern in (
+        _AVATAR_SUBJECT_AFTER_TEACHING_VERB,
+        _AVATAR_SUBJECT_AFTER_THAT,
+        _AVATAR_CLAUSE_SUBJECT,
+        _AVATAR_HABITUAL_OR_PAST_ACTION,
+    ):
+        for subject_match in subject_pattern.finditer(normalized_message_text):
+            clause_start = subject_match.start()
+            clause_end_match = _CLAUSE_END.search(normalized_message_text, subject_match.end())
+            clause_end = clause_end_match.start() if clause_end_match else len(normalized_message_text)
+            clause_text = normalized_message_text[clause_start:clause_end]
+            if _BEHAVIOUR_REQUEST_AFTER_AVATAR_SUBJECT.search(clause_text):
+                continue
+            if _CORRECTION_MARKER.search(clause_text):
+                return True
+    return False
+
+
+def _caller_is_avatar_owner(runtime: ToolRuntime) -> bool:
+    """Whether the signed-in caller created the avatar this turn speaks as."""
+    configurable = (getattr(runtime, "config", None) or {}).get("configurable") or {}
+    assistant_ctx = configurable.get("assistant_ctx") or {}
+    metadata = assistant_ctx.get("metadata") if isinstance(assistant_ctx, dict) else None
+    assistant_owner_user_id = (metadata or {}).get("user_id")
+    caller_user_id = configurable.get("user_id")
+    return bool(assistant_owner_user_id) and assistant_owner_user_id == caller_user_id
+
+
+def avatar_fact_correction_redirect(stored_text: str) -> str:
+    """ToolMessage text that sends an owner's correction of the avatar to ``edit_identity_fact``."""
+    return (
+        f'Not learned: "{stored_text}" is the owner of the avatar correcting a fact about '
+        "the avatar, so the correction must change the avatar's stored facts, which every "
+        "person who talks to the avatar reads. A user preference or a fact about the user "
+        "is read only by this one user. Call edit_identity_fact with inaccurate_information "
+        "set to the claim the owner says is wrong, written as the avatar's stored fact in the "
+        "first person (for example \"I use ROUGE and BERT scores to evaluate authenticity.\" "
+        'or "My LinkedIn profile is linkedin.com/in/old-name."), corrected_information set '
+        "to the owner's correction in the first person, and correction_context summarizing "
+        "the owner's most recent message."
+    )
+
+
+# URL comparison for corrections. A person types a URL without a scheme
+# ("linkedin.com/in/evanwoods") while research stores the full address
+# ("https://www.linkedin.com/in/evanwoods"), so both are reduced to host plus path
+# before comparing. A bare word with a dot ("Node.js") is not a URL: a match needs
+# a scheme or a path.
+_URL_IN_TEXT = re.compile(
+    r"(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s<>\"'`,;)\]]*)?",
+    re.IGNORECASE,
+)
+_NEGATED_URL_IN_TEXT = re.compile(
+    r"\b(?:not|instead\s+of|rather\s+than)\s+(?:the\s+)?(?:url\s+|link\s+|site\s+)?"
+    r"((?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s<>\"'`,;)\]]*)",
+    re.IGNORECASE,
+)
+
+
+def _strip_url_punctuation(url: str) -> str:
+    return str(url or "").strip().rstrip(".,;:!?)]}'\"")
+
+
+def url_identity(url: str | None) -> str:
+    """Host without ``www.`` plus path, lowercased, for comparing two spellings of one URL."""
+    stripped_url = _strip_url_punctuation(url or "").lower()
+    stripped_url = re.sub(r"^https?://", "", stripped_url)
+    stripped_url = stripped_url.removeprefix("www.")
+    return stripped_url.rstrip("/")
+
+
+def urls_in_text(text: str | None) -> list[str]:
+    """URL spellings in ``text`` that carry a scheme or a path, in appearance order."""
+    found_urls: list[str] = []
+    for url_match in _URL_IN_TEXT.finditer(str(text or "")):
+        url = _strip_url_punctuation(url_match.group(0))
+        if "://" not in url and "/" not in url:
+            continue
+        found_urls.append(url)
+    return found_urls
+
+
+def negated_urls_in_text(text: str | None) -> list[str]:
+    """URLs the text says are wrong: "... NOT linkedin.com/in/old-name"."""
+    return [
+        _strip_url_punctuation(url_match.group(1))
+        for url_match in _NEGATED_URL_IN_TEXT.finditer(str(text or ""))
+    ]
+
+
+def _replacement_url(stored_url: str, corrected_url: str) -> str:
+    """Spell the corrected URL the way the stored URL was spelled.
+
+    The stored scheme and ``www.`` are kept when both URLs name the same host, so
+    ``https://www.linkedin.com/in/old-name`` corrected by ``linkedin.com/in/new-name``
+    becomes ``https://www.linkedin.com/in/new-name``. A corrected URL with no scheme
+    gains ``https://`` so ``organization_links_from_text`` lifts the URL into the prompt.
+    """
+    corrected_url = _strip_url_punctuation(corrected_url)
+    corrected_identity = url_identity(corrected_url)
+    stored_identity = url_identity(stored_url)
+    stored_host = stored_identity.split("/", 1)[0]
+    corrected_host = corrected_identity.split("/", 1)[0]
+    if stored_host and stored_host == corrected_host:
+        stored_prefix_match = re.match(r"^(https?://(?:www\.)?)", _strip_url_punctuation(stored_url), re.IGNORECASE)
+        if stored_prefix_match:
+            corrected_path = corrected_identity[len(corrected_host):]
+            return f"{stored_prefix_match.group(1)}{corrected_host}{corrected_path}"
+    if re.match(r"^https?://", corrected_url, re.IGNORECASE):
+        return corrected_url
+    return f"https://{corrected_url}"
 
 
 def _announce_known_fact(fact: str, *, kind: str) -> None:
@@ -929,6 +1087,11 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     - The user says a stored fact never happened or must be forgotten, with no
       replacement -> call ``delete_identity_fact``.
     - No stored fact covers the information -> call THIS tool.
+    - The owner of the avatar says a detail of the avatar is A and NOT B ("your site is
+      linkedin.com/in/new-name NOT linkedin.com/in/old-name", "you do NOT use X") -> the
+      owner is changing the avatar: call ``edit_identity_fact`` with B, the wrong detail,
+      as ``inaccurate_information``. Storing A beside B leaves B in place, and the avatar
+      repeats B. The change is never a user preference and never a fact about the user.
     This tool verifies the vectorstore before storing. When the proposed fact conflicts
     with a stored fact, the tool refuses and replies with a redirect naming the exact
     ``edit_identity_fact`` arguments to use — follow that redirect.
@@ -1101,6 +1264,40 @@ async def update_self_identity_mem_from_user_txt(  # pseudo identity update usin
     # Post-guard, user_id is the assistant's owner, so writes land in the same
     # namespace the consciousness loader reads from.
     assistant_memory_namespace = (user_id, assistant_id, "identity_memory")
+
+    # A correction of the form "A, NOT B" where B is a stored URL must rewrite B, never
+    # sit beside B. Observed 2026-10-22 (avatar 47cfdaa2): "your linked in site is
+    # linkedin.com/in/evanfwoods NOT linkedin.com/in/evanwoods" was stored as a new fact,
+    # because the wrong URL lived only in the ``source_urls`` metadata of research facts
+    # that the fact-text conflict check below never reads, and the wrong URL kept
+    # reaching the YOUR ORGANIZATION LINKS section of the prompt.
+    for negated_url in negated_urls_in_text(latest_user_message_text):
+        negated_url_matches = await find_fact_matches(
+            runtime.store,
+            creator_id=user_id,
+            assistant_id=assistant_id,
+            user_id=user_id,
+            query=negated_url,
+        )
+        if negated_url_matches:
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=(
+                                f'Not learned: the owner says "{negated_url}" is wrong, and '
+                                f"{len(negated_url_matches)} stored document(s) still carry "
+                                f'"{negated_url}". Call edit_identity_fact with '
+                                f'inaccurate_information="{negated_url}", '
+                                f'corrected_information="{fact_shared_about_the_assistant_from_the_user}", '
+                                "and a correction_context summarizing the owner's most recent "
+                                "message, so every stored copy of the wrong URL is replaced."
+                            ),
+                            tool_call_id=runtime.tool_call_id,
+                        )
+                    ]
+                }
+            )
 
     # VERIFY HOW THE PROPOSED FACT RELATES TO WHAT IS ALREADY STORED.
     # Compare against (a) the identity docs already loaded into state this turn and
@@ -1458,6 +1655,9 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
     NEVER use this tool when the user's most recent message changes a fact already stored
       about the user ("actually ...", "I meant ...", a different quote or detail for a
       stored moment): call ``edit_identity_fact`` for the stored fact instead.
+    NEVER use this tool when the owner of the avatar corrects a fact about you, the avatar
+      ("learn that you do NOT use X", "your site is A, NOT B"): the owner is changing the
+      avatar, so call ``edit_identity_fact``. This tool refuses the correction.
     NEVER call this tool twice with the same fact.
     NEVER call this tool to extract information that is not part of the user's identity.
     NEVER LEARN INFORMATION THAT IS ALREADY KNOWN.
@@ -1562,6 +1762,24 @@ async def learn_information_about_the_user(  # UPDATE IDENTITY INFORMATION ABOUT
                             'third person by name (for example "You taught me to '
                             'write." becomes "I taught [user name] to write.").'
                         ),
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    # The owner correcting a fact about the avatar ("learn that you do NOT use ROUGE")
+    # is changing the avatar. The model rewrote that correction in the first person
+    # ("I do not use ROUGE or BERT scores") and filed the correction here, under the
+    # owner as a user, where no other viewer reads it (avatar 47cfdaa2, 2026-10-14).
+    if _caller_is_avatar_owner(runtime) and message_corrects_a_fact_about_the_avatar(
+        _latest_user_message_text((runtime.state or {}).get("messages"))
+    ):
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=avatar_fact_correction_redirect(user_fact),
                         tool_call_id=runtime.tool_call_id,
                     )
                 ]
@@ -1740,8 +1958,13 @@ def _namespace_is_long_text(namespace: tuple) -> bool:
 
 # Cheap sentence splitter (mirrors ``dataset.stylistic_profile._split_sentences``;
 # inlined to avoid importing that module's heavy numpy/burrows-delta dependency chain at
-# tool-call time). Splits on sentence-final punctuation followed by whitespace.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# tool-call time). Splits on sentence-final punctuation followed by whitespace, and also at
+# HTML tags and line breaks: a scraped page stores list items as
+# "dataset.</li>\n<li>Creating ...", with no whitespace after the period, so without the
+# tag split a whole page of list items is one "sentence" whose score never clears the match
+# gate. Every piece stays an exact substring of the page, so ``_redact_sentences`` can still
+# replace the piece in place.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\s*<[^<>]{1,200}>\s*|\n+")
 
 
 def _split_into_sentences(text: str) -> list[str]:
@@ -1889,13 +2112,20 @@ class FactMatch:
     the entire stored fact is rewritten or the document deleted.
     ``kind == "sentence"`` → one offending sentence inside a long verbatim document
     (quote/document/analysis); only that sentence is redacted/replaced in place.
+    ``kind == "context_sentence"`` → one offending sentence inside the ``fact_context`` of an
+    atomic fact (a pasted biography shared by many facts); the sentence is replaced in both
+    ``metadata.fact_context`` and the wrapped ``page_content``, and the fact itself is kept.
+    ``kind == "source_url"`` → a URL inside the document's URL metadata (``source_urls``,
+    ``url``, ...); only that URL changes. A research fact can be true while the profile
+    URL the research read is wrong, and ``organization_links_from_documents`` lifts that
+    URL into the prompt as a link the avatar shares.
     """
 
     item: object
     namespace: tuple
     key: str
-    kind: str  # "fact" | "sentence"
-    matched_text: str | None  # the atomic fact, or the specific offending sentence
+    kind: str  # "fact" | "sentence" | "context_sentence" | "source_url"
+    matched_text: str | None  # the atomic fact, the offending sentence, or the stored URL
     score: float
 
 
@@ -2093,6 +2323,73 @@ async def _suggest_correction(
         return fallback
 
 
+async def _suggest_source_url_correction(
+    match: FactMatch,
+    *,
+    inaccurate_information: str,
+    corrected_information: str,
+    correction_context: str,
+    is_deletion: bool,
+) -> tuple[str, str, bool]:
+    """Suggest the replacement for one stored URL → ``(replacement_url, context, asserts)``.
+
+    No model call: the stored URL matched the wrong URL by host and path, so the
+    replacement is the first URL in ``corrected_information`` that is not the wrong URL.
+    A correction carrying no other URL has nothing to put in place of the stored URL, so
+    the panel recommends leaving the document unchanged; a deletion recommends removing
+    the URL.
+    """
+    original_context = (
+        (_item_document_kwargs(match.item).get("metadata") or {}).get("fact_context")
+        or correction_context
+    )
+    if is_deletion:
+        return "", original_context, True
+    wrong_url_identities = {url_identity(url) for url in urls_in_text(inaccurate_information)}
+    wrong_url_identities.add(url_identity(match.matched_text))
+    for corrected_url in urls_in_text(corrected_information):
+        if url_identity(corrected_url) in wrong_url_identities:
+            continue
+        return _replacement_url(match.matched_text or "", corrected_url), original_context, True
+    return "", original_context, False
+
+
+def _suggest_restated_url_correction(
+    match: FactMatch,
+    *,
+    inaccurate_information: str,
+    corrected_information: str,
+    correction_context: str,
+    is_deletion: bool,
+) -> tuple[str, str, bool] | None:
+    """Suggestion for a stored text that already restates a URL correction, else ``None``.
+
+    "My LinkedIn site is linkedin.com/in/new-name, not linkedin.com/in/old-name." names
+    both the corrected URL and the wrong URL. Measured on production row ``4a0745f2``
+    (2026-10-29): the per-match model swapped the wrong side and suggested "…new-name, not
+    https://www.linkedin.com/in/new-name." Such a text is replaced by the corrected fact
+    itself, so the wrong URL leaves the store instead of being repeated in a negation.
+    """
+    if is_deletion or match.kind == "source_url":
+        return None
+    wrong_url_identities = {url_identity(url) for url in urls_in_text(inaccurate_information)}
+    corrected_url_identities = {
+        url_identity(url) for url in urls_in_text(corrected_information)
+    } - wrong_url_identities
+    if not wrong_url_identities or not corrected_url_identities:
+        return None
+    text_url_identities = {url_identity(url) for url in urls_in_text(match.matched_text)}
+    if not (text_url_identities & wrong_url_identities and text_url_identities & corrected_url_identities):
+        return None
+    context_names_wrong_url = any(
+        url_identity(url) in wrong_url_identities for url in urls_in_text(correction_context)
+    )
+    replacement_context = corrected_information if context_names_wrong_url else correction_context
+    if match.kind == "context_sentence":
+        return replacement_context, replacement_context, True
+    return corrected_information, replacement_context, True
+
+
 def _match_preview(
     index: int,
     match: FactMatch,
@@ -2264,8 +2561,48 @@ async def find_fact_matches(
 
     """
     query_tokens = _salient_tokens(query)
+    # A URL in the correction is compared as host plus path, never by embedding: two
+    # profile URLs differing by one letter embed almost identically, and the stored URL
+    # often sits only in metadata the store index never embeds.
+    query_url_identities = {
+        url_identity(query_url) for query_url in urls_in_text(query) if url_identity(query_url)
+    }
     fact_matches: dict[tuple, FactMatch] = {}
     sentence_matches: dict[tuple, FactMatch] = {}
+
+    def _text_names_a_query_url(text: str) -> bool:
+        return bool(query_url_identities) and any(
+            url_identity(text_url) in query_url_identities for text_url in urls_in_text(text)
+        )
+
+    def _source_url_matches(item) -> dict[tuple, FactMatch]:
+        url_matches: dict[tuple, FactMatch] = {}
+        if not query_url_identities:
+            return url_matches
+        metadata = _item_document_kwargs(item).get("metadata") or {}
+        for metadata_key in DOCUMENT_URL_METADATA_KEYS:
+            metadata_value = metadata.get(metadata_key)
+            if isinstance(metadata_value, str):
+                stored_urls = [metadata_value]
+            elif isinstance(metadata_value, list):
+                stored_urls = metadata_value
+            else:
+                stored_urls = []
+            for stored_url in stored_urls:
+                if not isinstance(stored_url, str):
+                    continue
+                if url_identity(stored_url) not in query_url_identities:
+                    continue
+                dedup_key = (tuple(item.namespace), item.key, "source_url", stored_url)
+                url_matches[dedup_key] = FactMatch(
+                    item=item,
+                    namespace=tuple(item.namespace),
+                    key=item.key,
+                    kind="source_url",
+                    matched_text=stored_url,
+                    score=1.0,
+                )
+        return url_matches
 
     namespaces = _correction_namespaces(creator_id, assistant_id, user_id)
 
@@ -2285,12 +2622,20 @@ async def find_fact_matches(
         namespace_fact_matches: dict[tuple, FactMatch] = {}
         namespace_sentence_matches: dict[tuple, FactMatch] = {}
 
+        for item in items:
+            namespace_sentence_matches.update(_source_url_matches(item))
+
         if _namespace_is_long_text(namespace):
             batched_sentences: list[str] = []
             sentence_meta: list[tuple[object, str]] = []
             for item in items:
                 page_content = _item_document_kwargs(item).get("page_content") or ""
-                if query_tokens and not (query_tokens & _salient_tokens(page_content)):
+                page_names_a_query_url = _text_names_a_query_url(page_content)
+                if (
+                    query_tokens
+                    and not page_names_a_query_url
+                    and not (query_tokens & _salient_tokens(page_content))
+                ):
                     continue
                 for sentence in _split_into_sentences(page_content):
                     batched_sentences.append(sentence)
@@ -2299,6 +2644,8 @@ async def find_fact_matches(
             if batched_sentences:
                 scores = await _score_sentences(query, batched_sentences)
                 for (item, sentence), score in zip(sentence_meta, scores):
+                    if _text_names_a_query_url(sentence):
+                        score = 1.0
                     if score <= _SENTENCE_MATCH_THRESHOLD:
                         continue
                     dedup_key = (tuple(item.namespace), item.key, sentence)
@@ -2316,20 +2663,58 @@ async def find_fact_matches(
 
         atomic_candidates: list = []
         atomic_facts: list[str] = []
+        context_sentence_meta: list[tuple[object, str]] = []
         for item in items:
             clean_fact = _extract_clean_fact(item)
             if not clean_fact:
                 continue
-            if query_tokens and not (query_tokens & _salient_tokens(clean_fact)):
+            # A claim can live in the shared background of many facts instead of in any
+            # one fact: eight facts of avatar 47cfdaa2 carried one 3,081-character pasted
+            # biography as ``fact_context``, and the biography still said "rouge and BERT
+            # scores" after the owner corrected the claim. Each context sentence sharing a
+            # content word (or a URL) with the claim is scored on its own.
+            fact_context = (_item_document_kwargs(item).get("metadata") or {}).get("fact_context")
+            if isinstance(fact_context, str) and fact_context.strip() != clean_fact:
+                for context_sentence in _split_into_sentences(fact_context):
+                    if _text_names_a_query_url(context_sentence) or (
+                        query_tokens and query_tokens & _salient_tokens(context_sentence)
+                    ):
+                        context_sentence_meta.append((item, context_sentence))
+            if (
+                query_tokens
+                and not _text_names_a_query_url(clean_fact)
+                and not (query_tokens & _salient_tokens(clean_fact))
+            ):
                 continue
             atomic_candidates.append(item)
             atomic_facts.append(clean_fact)
+
+        if context_sentence_meta:
+            context_scores = await _score_sentences(
+                query, [context_sentence for _item, context_sentence in context_sentence_meta]
+            )
+            for (item, context_sentence), score in zip(context_sentence_meta, context_scores):
+                if _text_names_a_query_url(context_sentence):
+                    score = 1.0
+                if score <= _SENTENCE_MATCH_THRESHOLD:
+                    continue
+                dedup_key = (tuple(item.namespace), item.key, "context_sentence", context_sentence)
+                namespace_sentence_matches[dedup_key] = FactMatch(
+                    item=item,
+                    namespace=tuple(item.namespace),
+                    key=item.key,
+                    kind="context_sentence",
+                    matched_text=context_sentence,
+                    score=float(score),
+                )
 
         if atomic_facts:
             atomic_scores = await _score_sentences(query, atomic_facts)
             for item, clean_fact, score in zip(
                 atomic_candidates, atomic_facts, atomic_scores
             ):
+                if _text_names_a_query_url(clean_fact):
+                    score = 1.0
                 if score <= _CORRECTION_MATCH_THRESHOLD:
                     continue
                 dedup_key = (tuple(item.namespace), item.key)
@@ -2503,6 +2888,134 @@ async def _apply_sentence_redaction(
     )
 
 
+async def _current_document_kwargs(store, namespace: tuple, key: str, fallback_item) -> dict:
+    """Read the document as stored NOW, so a second edit of one document keeps the first edit."""
+    try:
+        current_item = await store.aget(namespace, key)
+    except Exception:
+        logger.exception("identity fact correction: re-read of %s/%s failed", namespace, key)
+        current_item = None
+    return _item_document_kwargs(current_item or fallback_item)
+
+
+async def _apply_context_sentence_edits(
+    store,
+    namespace: tuple,
+    key: str,
+    item,
+    resolved_group: list["ResolvedCorrection"],
+) -> CorrectionChange:
+    """Replace (or remove) offending sentences inside one atomic fact's ``fact_context``.
+
+    The fact itself is kept. The wrapped ``page_content`` embeds the same context, so the
+    same substitution runs on both and the stored context the prompt reads and the text
+    the store index embeds stay identical.
+    """
+    kwargs = await _current_document_kwargs(store, namespace, key, item)
+    metadata = dict(kwargs.get("metadata") or {})
+    changed = {
+        resolved.match.matched_text: ((resolved.corrected_text or "").strip() or None)
+        for resolved in resolved_group
+        if resolved.match.matched_text
+    }
+    new_page_content = _redact_sentences(kwargs.get("page_content") or "", changed)
+    if isinstance(metadata.get("fact_context"), str):
+        metadata["fact_context"] = _redact_sentences(metadata["fact_context"], changed)
+    redacted = list(metadata.get("redacted_sentences") or [])
+    redacted.extend(changed.keys())
+    metadata["redacted_sentences"] = redacted
+    metadata["correction_origin"] = (
+        "user"
+        if any(resolved.user_modified for resolved in resolved_group)
+        else "suggestion"
+    )
+    corrected_document = Document(page_content=new_page_content, metadata=metadata)
+    await store.aput(namespace, key=key, value={"document": corrected_document.to_json()})
+    replacements = "; ".join(replacement for replacement in changed.values() if replacement)
+    return CorrectionChange(
+        action="redact",
+        namespace=namespace,
+        key=key,
+        old_text="; ".join(changed.keys()),
+        new_text=replacements or None,
+        document=corrected_document,
+    )
+
+
+async def _apply_source_url_edits(
+    store,
+    namespace: tuple,
+    key: str,
+    item,
+    resolved_group: list["ResolvedCorrection"],
+) -> CorrectionChange:
+    """Replace (or remove) stored URLs inside one document's URL metadata fields.
+
+    The fact text is untouched: the research fact can be true while the URL the research
+    read is wrong. Each replaced URL is recorded in ``metadata.corrected_source_urls``.
+    """
+    kwargs = await _current_document_kwargs(store, namespace, key, item)
+    metadata = dict(kwargs.get("metadata") or {})
+    replacement_by_identity = {
+        url_identity(resolved.match.matched_text): (resolved.corrected_text or "").strip()
+        for resolved in resolved_group
+        if resolved.match.matched_text
+    }
+
+    def _replace_url(stored_url: str) -> str | None:
+        if url_identity(stored_url) not in replacement_by_identity:
+            return stored_url
+        return replacement_by_identity[url_identity(stored_url)] or None
+
+    for metadata_key in DOCUMENT_URL_METADATA_KEYS:
+        metadata_value = metadata.get(metadata_key)
+        if isinstance(metadata_value, str) and urls_in_text(metadata_value):
+            replaced_url = _replace_url(metadata_value)
+            if replaced_url is None:
+                metadata.pop(metadata_key, None)
+            else:
+                metadata[metadata_key] = replaced_url
+        elif isinstance(metadata_value, list):
+            replaced_urls: list = []
+            for stored_url in metadata_value:
+                replaced_url = _replace_url(stored_url) if isinstance(stored_url, str) else stored_url
+                if replaced_url is not None and replaced_url not in replaced_urls:
+                    replaced_urls.append(replaced_url)
+            metadata[metadata_key] = replaced_urls
+
+    corrected_source_urls = list(metadata.get("corrected_source_urls") or [])
+    corrected_source_urls.extend(
+        {"from": resolved.match.matched_text, "to": (resolved.corrected_text or "").strip()}
+        for resolved in resolved_group
+        if resolved.match.matched_text
+    )
+    metadata["corrected_source_urls"] = corrected_source_urls
+    metadata["correction_origin"] = (
+        "user"
+        if any(resolved.user_modified for resolved in resolved_group)
+        else "suggestion"
+    )
+    corrected_document = Document(
+        page_content=kwargs.get("page_content") or "", metadata=metadata
+    )
+    await store.aput(namespace, key=key, value={"document": corrected_document.to_json()})
+    replacements = "; ".join(
+        (resolved.corrected_text or "").strip()
+        for resolved in resolved_group
+        if (resolved.corrected_text or "").strip()
+    )
+    return CorrectionChange(
+        action="rewrite" if replacements else "redact",
+        namespace=namespace,
+        key=key,
+        old_text="; ".join(
+            resolved.match.matched_text for resolved in resolved_group if resolved.match.matched_text
+        ),
+        new_text=replacements or None,
+        document=corrected_document,
+    )
+
+
 async def apply_resolved_corrections(
     store, resolved: list["ResolvedCorrection"]
 ) -> list[CorrectionChange]:
@@ -2551,6 +3064,22 @@ async def apply_resolved_corrections(
                 store, namespace, key, group[0].match.item, group
             )
         )
+
+    # Context sentences and URLs run after whole-fact rewrites and re-read each document,
+    # so one document matched both as a fact and as a URL keeps both edits.
+    for match_kind, apply_group in (
+        ("context_sentence", _apply_context_sentence_edits),
+        ("source_url", _apply_source_url_edits),
+    ):
+        kind_by_document: dict[tuple, list[ResolvedCorrection]] = {}
+        for resolved_edit in (edit for edit in included if edit.match.kind == match_kind):
+            kind_by_document.setdefault(
+                (resolved_edit.match.namespace, resolved_edit.match.key), []
+            ).append(resolved_edit)
+        for (namespace, key), group in kind_by_document.items():
+            changes.append(
+                await apply_group(store, namespace, key, group[0].match.item, group)
+            )
 
     return changes
 
@@ -2823,7 +3352,11 @@ async def _run_identity_fact_mutation(
                     ToolMessage(
                         content=(
                             f"No stored fact matched '{inaccurate_information}'. "
-                            "Ask the user to restate the inaccurate fact."
+                            "When the avatar holds no version of the claim at all, the "
+                            "correction is new information: call "
+                            "update_self_identity_mem_from_user_txt with the corrected fact "
+                            "in the first person. Otherwise ask the user to restate the "
+                            "inaccurate fact as the avatar would have said it."
                         ),
                         tool_call_id=runtime.tool_call_id,
                     )
@@ -2833,18 +3366,30 @@ async def _run_identity_fact_mutation(
 
     # Suggest a minimal, in-place edit for EACH matched document independently, so the owner
     # reviews one editable item per document rather than a single global replacement.
-    suggestions = await asyncio.gather(
-        *(
-            _suggest_correction(
-                match,
-                inaccurate_information=inaccurate_information,
-                corrected_information=corrected_information,
-                correction_context=correction_context,
-                is_deletion=is_deletion,
-            )
-            for match in matches
+    async def _suggest_for_match(match: FactMatch) -> tuple[str, str, bool]:
+        restated_url_suggestion = _suggest_restated_url_correction(
+            match,
+            inaccurate_information=inaccurate_information,
+            corrected_information=corrected_information,
+            correction_context=correction_context,
+            is_deletion=is_deletion,
         )
-    )
+        if restated_url_suggestion is not None:
+            return restated_url_suggestion
+        suggest = (
+            _suggest_source_url_correction
+            if match.kind == "source_url"
+            else _suggest_correction
+        )
+        return await suggest(
+            match,
+            inaccurate_information=inaccurate_information,
+            corrected_information=corrected_information,
+            correction_context=correction_context,
+            is_deletion=is_deletion,
+        )
+
+    suggestions = await asyncio.gather(*(_suggest_for_match(match) for match in matches))
 
     # Human-in-the-loop: pause and let the owner decide each matched document independently.
     # Everything above is a pure read, so it is safe to re-run on resume.
@@ -3046,6 +3591,31 @@ async def edit_identity_fact(
     you already hold. Replying "I remember" without calling this tool leaves the old
     detail stored.
     </WHEN THE USER IS CORRECTING A STORED DETAIL>
+
+    <WHEN THE OWNER CORRECTS THE AVATAR>
+    When the owner of the avatar says the avatar does not do something, or that a detail
+    of the avatar is A and NOT B ("learn that you do NOT use X", "your site is A, NOT B"),
+    the owner is changing the avatar. Call THIS tool with B, the wrong detail, as
+    ``inaccurate_information``. The change is never a user preference and never a fact
+    about the user: a preference or a user fact is read only by the owner, while the
+    avatar's stored facts are read by every person who talks to the avatar.
+    A wrong URL is found wherever the URL is stored, including the source links of
+    researched facts, so pass the wrong URL itself as ``inaccurate_information``.
+    </WHEN THE OWNER CORRECTS THE AVATAR>
+
+    <EXAMPLE correction of a URL>
+    User: "Learn your linked in site is linkedin.com/in/new-name NOT linkedin.com/in/old-name"
+      inaccurate_information: "linkedin.com/in/old-name"
+      corrected_information:  "My LinkedIn profile is https://www.linkedin.com/in/new-name."
+      correction_context:     "I was told my LinkedIn profile is linkedin.com/in/new-name, not linkedin.com/in/old-name."
+    </EXAMPLE correction of a URL>
+
+    <EXAMPLE correction of a method>
+    User: "Learn that you do NOT use ROUGE and BERT scores; you use stylometric indicators."
+      inaccurate_information: "I use ROUGE and BERT scores to measure the authenticity of responses."
+      corrected_information:  "I measure the authenticity of responses with stylometric indicators, not ROUGE or BERT scores."
+      correction_context:     "I was told I do not use ROUGE or BERT scores and use stylometric indicators instead."
+    </EXAMPLE correction of a method>
 
     <EXAMPLE correction of a quote>
     Stored: "I would say 'write small' when [user name] was writing too large on the page."

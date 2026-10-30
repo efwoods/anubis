@@ -138,9 +138,30 @@ async def learn_user_preference(
     <RESTRICTIONS>
     NEVER call this tool for facts about the user's identity (name, history, relationships); use learn_information_about_the_user for those.
     NEVER call this tool for facts about your own identity.
+    NEVER call this tool when the owner of the avatar corrects a fact about you, the avatar
+      ("learn that you do NOT use X", "your site is A, NOT B"). The owner is changing the
+      avatar, so call ``edit_identity_fact``. A correction stored as a preference is read
+      only by the owner and never by anybody else who talks to the avatar, and this tool
+      refuses the correction.
     NEVER call this tool twice with the same preference.
     </RESTRICTIONS>
     """
+    from src.anubis.utils.tools.identity.identity_tools import (
+        _caller_is_avatar_owner,
+        _latest_user_message_text,
+        avatar_fact_correction_redirect,
+        message_corrects_a_fact_about_the_avatar,
+    )
+
+    # The owner correcting a fact about the avatar is changing the avatar, which every
+    # viewer reads; a preference lives under the owner's own user id and never reaches
+    # anybody else (avatar 47cfdaa2, 2026-10-22). The owner's own message is checked,
+    # because the model's rewritten argument ("The user prefers ...") hides the subject.
+    if _caller_is_avatar_owner(runtime) and message_corrects_a_fact_about_the_avatar(
+        _latest_user_message_text((runtime.state or {}).get("messages"))
+    ):
+        return _tool_message(avatar_fact_correction_redirect(preference), runtime)
+
     updated_user_state, updated_assistant_state = await extract_user_id_assistant_id(
         runtime.config
     )
